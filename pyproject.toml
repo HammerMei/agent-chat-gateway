@@ -19,6 +19,15 @@ classifiers = [
     "Topic :: Communications :: Chat",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+dependencies = [
+    "websockets>=14.0",
+    "httpx>=0.28.0",
+    "pyyaml>=6.0",
+    "rich>=13.0",
+    "python-dotenv>=1.0",
+    "tree-sitter>=0.23.0",
+    "tree-sitter-bash>=0.23.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/HammerMei/agent-chat-gateway"
@@ -36,16 +45,6 @@ packages = ["gateway"]
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
-
-dependencies = [
-    "websockets>=14.0",
-    "httpx>=0.28.0",
-    "pyyaml>=6.0",
-    "rich>=13.0",
-    "python-dotenv>=1.0",
-    "tree-sitter>=0.23.0",
-    "tree-sitter-bash>=0.23.0",
-]
 
 [dependency-groups]
 dev = [

@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from .config import GatewayConfig
-from .runtime_lock import LOCK_FILE as PID_FILE
+from .runtime_lock import LOCK_FILE as PID_FILE  # noqa: F401 — re-exported for cli.py
 from .runtime_lock import RUNTIME_DIR, locked_pid
 from .runtime_lock import acquire as _lock_acquire
 from .runtime_lock import release as _lock_release
