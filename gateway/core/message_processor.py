@@ -1,0 +1,446 @@
+"""MessageProcessor: per-room message queue and session bookkeeping.
+
+Platform-agnostic replacement for the old gateway/watcher.py.
+
+Responsibilities after decomposition:
+  - Queue orchestration (enqueue / consumer loop)
+  - Lifecycle (start / stop / _stopping gate)
+  - Session-map updates (role, permission thread)
+  - Online/offline notifications
+  - Anonymous user rejection
+
+Delegated to extracted collaborators:
+  - Prompt construction       → :func:`prompt_builder.build_prompt`
+  - Attachment path remapping → :func:`attachment_workspace.localize_attachment_paths`
+  - Agent turn execution      → :class:`agent_turn_runner.AgentTurnRunner`
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from typing import TYPE_CHECKING
+
+from ..agents import AgentBackend
+from ..agents.response import AgentResponse
+from .agent_turn_runner import AgentTurnRunner, _user_facing_agent_error_message
+from .attachment_workspace import localize_attachment_paths
+from .config import CoreConfig
+from .connector import Connector, IncomingMessage, Room, UserRole
+from .context_injector import ContextInjector
+from .prompt_builder import build_prompt
+from .session_maps import SessionMaps
+from .state import WatcherState
+from .config import WatcherConfig
+
+if TYPE_CHECKING:
+    from .permission import PermissionRegistry
+
+logger = logging.getLogger("agent-chat-gateway.core.processor")
+
+# Sentinel placed on the queue by stop() to wake a blocked consumer.
+_DRAIN_SENTINEL = object()
+
+
+class MessageProcessor:
+    """Per-room message queue: dequeues IncomingMessages, runs the agent, posts replies.
+
+    One MessageProcessor is created per watched room/session pair.
+    The Connector fires IncomingMessage objects into enqueue(); the processor
+    serializes them and calls AgentBackend.send() one at a time.
+
+    The processor knows nothing about:
+      - Which platform the message came from
+      - How to parse platform message formats
+      - How to download attachments
+      - How to resolve user roles
+    All of that is the Connector's responsibility.
+    """
+
+    def __init__(
+        self,
+        session_id: str,
+        room: Room,
+        working_directory: str,
+        watcher_id: str,
+        connector: Connector,
+        agent: AgentBackend,
+        config: CoreConfig,
+        agent_name: str = "",
+        permission_registry: "PermissionRegistry | None" = None,
+        session_role_map: dict[str, str] | None = None,
+        session_permission_thread_map: "dict[str, str | None] | None" = None,
+        session_maps: SessionMaps | None = None,
+        context_injector: ContextInjector | None = None,
+        watcher_state: WatcherState | None = None,
+        watcher_config: WatcherConfig | None = None,
+        connector_name: str = "",
+        online_notification: str | None = "✅ _Agent online_",
+        offline_notification: str | None = "❌ _Agent offline_",
+        attachment_local_base: str | None = None,
+    ) -> None:
+        self._session_id = session_id
+        self._room = room
+        self._working_directory = working_directory
+        self._watcher_id = watcher_id
+        self._connector = connector
+        self._agent = agent
+        self._config = config
+        self._agent_name = agent_name
+        self._permission_registry = permission_registry
+        self._session_role_map = session_role_map
+        self._session_permission_thread_map = session_permission_thread_map
+        self._session_maps = session_maps
+        self._context_injector = context_injector
+        self._watcher_state = watcher_state
+        self._watcher_config = watcher_config
+        self._connector_name = connector_name
+        self._online_notification = online_notification
+        self._offline_notification = offline_notification
+        self._attachment_local_base = attachment_local_base
+
+        self._turn_runner = AgentTurnRunner(
+            agent=agent,
+            connector=connector,
+            config=config,
+            agent_name=agent_name,
+            room_name=room.name,
+        )
+
+        self._queue: asyncio.Queue[IncomingMessage | object] = asyncio.Queue(
+            maxsize=self._config.max_queue_depth or 0
+        )
+        self._task: asyncio.Task | None = None
+        self._notify_task: asyncio.Task | None = None
+        # Track short-lived fire-and-forget tasks (e.g. queue-full notifications)
+        # so they can be awaited/cancelled during stop() and don't float free.
+        self._background_tasks: set[asyncio.Task] = set()
+
+        # Processor lifecycle state machine:
+        #   running  → enqueue() accepts, consumer loop runs normally
+        #   draining → enqueue() rejects, consumer finishes queued messages then exits
+        #   stopped  → everything halted
+        self._state: str = "running"  # "running" | "draining" | "stopped"
+        # Event set when the consumer finishes draining (or is forced to stop).
+        self._drained = asyncio.Event()
+        # Cooldown for queue-full notifications to prevent spam storms.
+        self._last_queue_full_notify: float = 0.0
+        self._queue_full_cooldown: float = 30.0  # seconds between notifications
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    def start(self) -> None:
+        """Start the consumer task and post an online notification."""
+        self._task = asyncio.create_task(
+            self._run(), name=f"processor-{self._watcher_id[:8]}"
+        )
+        self._notify_task = asyncio.create_task(self._notify_online())
+        logger.info(
+            "MessageProcessor started: watcher=%s room=%s session=%s agent=%s cwd=%s",
+            self._watcher_id[:8],
+            self._room.name,
+            self._session_id[:8],
+            self._agent_name,
+            self._working_directory,
+        )
+
+    async def stop(self, drain_timeout: float = 30.0) -> None:
+        """Gracefully stop the processor: drain queued messages, then shut down.
+
+        Stop protocol:
+          1. Transition to ``draining`` — ``enqueue()`` immediately rejects new messages.
+          2. Cancel the online-notification task (fire-and-forget startup side effect).
+          3. Wait for the consumer to finish processing all already-queued messages
+             (up to ``drain_timeout`` seconds).  If the timeout expires, the consumer
+             task is force-cancelled — queued messages may be lost in this case.
+          4. Post offline notification — only after drain so users never see
+             "offline" followed by residual replies from queued work.
+          5. Cancel and await any in-flight background tasks.
+          6. Transition to ``stopped``.
+
+        This ensures that watermark capture in ``_stop_processor()`` reflects
+        the last message the processor *actually processed*, not just the last
+        one that was enqueued.
+
+        Args:
+            drain_timeout: Maximum seconds to wait for the queue to drain.
+                Use 0 for immediate cancellation (force stop).
+        """
+        # Guard against double-stop (e.g., concurrent callers or accidental re-entry).
+        if self._state != "running":
+            return
+
+        # Phase 1: stop accepting new messages.
+        self._state = "draining"
+
+        if self._notify_task:
+            self._notify_task.cancel()
+            try:
+                await self._notify_task
+            except asyncio.CancelledError:
+                pass
+            self._notify_task = None
+
+        # Phase 2: wake the consumer (if blocked on empty queue) and wait for drain.
+        if self._task:
+            # Place a sentinel to unblock a consumer waiting on queue.get().
+            try:
+                self._queue.put_nowait(_DRAIN_SENTINEL)
+            except asyncio.QueueFull:
+                pass  # queue is full — consumer will see draining state after each message
+            try:
+                await asyncio.wait_for(self._drained.wait(), timeout=drain_timeout)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Drain timeout (%.1fs) for watcher '%s' — force-cancelling consumer "
+                    "(%d messages may be lost)",
+                    drain_timeout,
+                    self._watcher_id[:8],
+                    self._queue.qsize(),
+                )
+            # Cancel the task (no-op if it already exited from drain completion).
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+
+        # Post offline notification only after drain — users never see "offline"
+        # followed by residual replies from still-draining queued work.
+        await self._notify_offline()
+
+        # Phase 3: clean up background tasks.
+        for task in list(self._background_tasks):
+            task.cancel()
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        self._background_tasks.clear()
+
+        self._state = "stopped"
+        logger.info("MessageProcessor stopped: watcher=%s", self._watcher_id[:8])
+
+    @property
+    def is_accepting(self) -> bool:
+        """True if the processor is running and has queue capacity."""
+        return self._state == "running" and not self._queue.full()
+
+    # ── Inbound ───────────────────────────────────────────────────────────────
+
+    async def enqueue(self, msg: IncomingMessage) -> bool:
+        """Called by MessageDispatcher when a message arrives.
+
+        Permission commands (approve/deny) are already intercepted at the
+        Dispatcher level before fan-out, so this method only handles
+        normal message queueing.
+
+        Returns:
+            True if the message was successfully queued for processing.
+            False if the queue was full and the message was dropped — the caller
+            must NOT advance the dedup watermark in this case, so the message
+            can be re-delivered on reconnect.
+        """
+        if self._state != "running":
+            logger.warning(
+                "enqueue() on stopping processor for room '%s' — rejecting message from %s",
+                self._room.name,
+                msg.sender.username,
+            )
+            return False
+        try:
+            self._queue.put_nowait(msg)
+            return True
+        except asyncio.QueueFull:
+            logger.warning(
+                "Queue full (depth=%d) for room '%s' — dropping message from %s",
+                self._queue.maxsize,
+                self._room.name,
+                msg.sender.username,
+            )
+            # Rate-limit queue-full notifications to prevent spam storms under
+            # bursty load.  Only the first drop in each cooldown window triggers
+            # a user-visible message; subsequent drops are silently logged above.
+            now = asyncio.get_running_loop().time()
+            if now - self._last_queue_full_notify >= self._queue_full_cooldown:
+                self._last_queue_full_notify = now
+                task = asyncio.create_task(
+                    self._connector.send_text(
+                        msg.room.id,
+                        AgentResponse(
+                            text="⚠️ Server busy — your message was dropped. Please retry.",
+                            is_error=True,
+                        ),
+                        thread_id=msg.thread_id,
+                    ),
+                    name=f"queue-full-notify-{self._room.id[:8]}",
+                )
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
+            return False
+
+    # ── Consumer loop ─────────────────────────────────────────────────────────
+
+    async def _run(self) -> None:
+        """Consumer loop: process messages one at a time until drained or cancelled.
+
+        In ``running`` state, blocks on ``queue.get()`` indefinitely.
+        When ``stop()`` transitions to ``draining``, it places a
+        ``_DRAIN_SENTINEL`` on the queue to wake the consumer.  The consumer
+        then finishes all remaining real messages and exits, signalling
+        ``_drained`` so ``stop()`` can proceed.
+        """
+        try:
+            while True:
+                msg = await self._queue.get()
+                if msg is _DRAIN_SENTINEL:
+                    # Drain any remaining real messages that were enqueued
+                    # before the sentinel.
+                    while not self._queue.empty():
+                        remaining = self._queue.get_nowait()
+                        if remaining is not _DRAIN_SENTINEL:
+                            try:
+                                await self._process(remaining)
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception:
+                                logger.exception("Unhandled error in processor loop")
+                    break  # drain complete
+                try:
+                    await self._process(msg)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Unhandled error in processor loop")
+                # After each message, check if we should exit (drain mode + empty).
+                if self._state == "draining" and self._queue.empty():
+                    break
+        finally:
+            self._drained.set()
+
+    async def _process(self, msg: IncomingMessage) -> None:
+        """Process a single IncomingMessage: build prompt, call agent, send reply.
+
+        Orchestrates the extracted collaborators:
+          1. Reject anonymous users (security gate)
+          2. Localize attachment paths (AttachmentLocalizer)
+          3. Build prompt (PromptBuilder)
+          4. Update session maps (permission broker bookkeeping)
+          5. Run agent turn (AgentTurnRunner)
+        """
+        if msg.role == UserRole.ANONYMOUS:
+            logger.warning(
+                "Dropping message from ANONYMOUS user in session %s — "
+                "anonymous users are not permitted",
+                self._session_id,
+            )
+            return
+
+        file_paths = localize_attachment_paths(
+            msg.attachments, self._attachment_local_base
+        )
+
+        try:
+            await self._ensure_context_injected()
+        except Exception as e:
+            logger.exception(
+                "Context injection failed during message processing "
+                "(session=%s room=%s): %s",
+                self._session_id[:8],
+                self._room.name,
+                e,
+            )
+            await self._connector.send_text(
+                msg.room.id,
+                AgentResponse(
+                    text=_user_facing_agent_error_message(
+                        e, session_id=self._session_id
+                    ),
+                    is_error=True,
+                ),
+                thread_id=msg.thread_id,
+            )
+            return
+
+        prefix = self._connector.format_prompt_prefix(msg)
+        prompt = build_prompt(msg.text, prefix, msg.warnings)
+
+        logger.info("Processing [%s] %s", self._room.name, msg.text[:120])
+
+        # Update session maps BEFORE the agent turn so the permission broker
+        # sees the correct role and thread context if a tool-use fires mid-turn.
+        if self._session_role_map is not None:
+            if self._session_maps is not None:
+                self._session_maps.update_role(self._session_id, msg.role.value)
+            else:
+                self._session_role_map[self._session_id] = msg.role.value
+        if self._session_permission_thread_map is not None:
+            permission_thread_id = msg.extra_context.get("permission_thread_id")
+            if self._session_maps is not None:
+                self._session_maps.update_permission_thread(
+                    self._session_id,
+                    permission_thread_id,
+                )
+            else:
+                self._session_permission_thread_map[self._session_id] = (
+                    permission_thread_id
+                )
+
+        role_env: dict[str, str] | None = None
+        if self._agent.supports_per_message_env:
+            role_env = self._config.env_for_role(msg.role, self._agent_name)
+
+        await self._turn_runner.run_turn(
+            session_id=self._session_id,
+            prompt=prompt,
+            working_directory=self._working_directory,
+            room_id=msg.room.id,
+            thread_id=msg.thread_id,
+            file_paths=file_paths or None,
+            role_env=role_env,
+        )
+
+    async def _ensure_context_injected(self) -> None:
+        """Retry context injection safely on message processing when appropriate."""
+        if (
+            self._context_injector is None
+            or self._watcher_state is None
+            or self._watcher_config is None
+        ):
+            return
+        if self._watcher_state.context_injected:
+            return
+
+        status = self._context_injector.status_for(self._session_id)
+        if status.state not in {"not_started", "failed_retryable", "pending"}:
+            return
+
+        await self._context_injector.inject(
+            ws=self._watcher_state,
+            session_id=self._session_id,
+            agent=self._agent,
+            agent_name=self._agent_name,
+            connector_name=self._connector_name,
+            wc=self._watcher_config,
+        )
+
+    # ── Notifications ─────────────────────────────────────────────────────────
+
+    async def _notify_online(self) -> None:
+        if self._online_notification is None:
+            return
+        try:
+            await self._connector.notify_online(
+                self._room.id, self._online_notification
+            )
+        except Exception as e:
+            logger.warning("Failed to post online notification: %s", e)
+
+    async def _notify_offline(self) -> None:
+        if self._offline_notification is None:
+            return
+        try:
+            await self._connector.notify_offline(
+                self._room.id, self._offline_notification
+            )
+        except Exception as e:
+            logger.warning("Failed to post offline notification: %s", e)

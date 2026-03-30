@@ -1,0 +1,848 @@
+"""OpenCode HTTP agent backend.
+
+Implements AgentBackend using the opencode HTTP server (``opencode serve``):
+  - Session creation:  POST /session  {"directory": "..."}
+                       then POST /session/{id}/message  (init prompt)
+  - Message sending:   POST /session/{id}/message  {"parts": [{"type": "text", ...}]}
+
+Both calls are **synchronous** — the server blocks until the full agent turn
+completes (including all tool calls and permission approvals) before returning.
+This is the key advantage over the old ``opencode run`` subprocess approach, which
+returned early when a tool was blocked by a pending permission request.
+
+File attachments are not natively supported by the HTTP API.  They are injected
+into the prompt text via :func:`~gateway.core.adapter_utils.build_attachment_prompt`
+so the agent can access them using the Read tool — the same fallback used by the
+Claude CLI backend.
+
+The ``env`` parameter of :meth:`send` is a no-op in HTTP mode.  ``ACG_ROLE``
+is set on the ``opencode serve`` process at startup via ``sidecar_env``,
+hardcoded to ``"owner"`` in ``GatewayService._build_agent_backend()`` because
+the sidecar always runs as the gateway's own backend process.  Per-message
+guest enforcement (tool allow-lists, permission prompts) is handled by
+:class:`~gateway.core.permission.PermissionBroker`, not by environment variables.
+
+Lifecycle
+---------
+Call :meth:`start` before :meth:`create_session`.  ``start`` spawns
+``opencode serve``, allocates a free port, and waits for the health check to
+pass.  :meth:`stop` terminates the process.  Both methods are idempotent.
+
+When used via :class:`~gateway.agents.session.AgentSession`, ``start``/``stop``
+are called automatically by the context manager — no manual calls needed.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import socket
+from typing import TYPE_CHECKING
+
+import httpx
+
+from .. import AgentBackend, GatewayBrokerConfig
+from ..errors import (
+    AgentExecutionError,
+    AgentPermissionError,
+    AgentRateLimitedError,
+    AgentUnavailableError,
+)
+from ..response import AgentResponse, TokenUsage
+from ...core.adapter_utils import build_attachment_prompt
+
+if TYPE_CHECKING:
+    from ...core.permission import (
+        PermissionBroker,
+        PermissionNotifier,
+        PermissionRegistry,
+    )
+
+logger = logging.getLogger("agent-chat-gateway.agents.opencode")
+
+_INIT_PROMPT = (
+    "Chat session initialized. "
+    "You are a chat assistant standing by to respond to incoming messages. "
+    "Do not take any proactive action — simply wait for the first user message."
+)
+
+_HEALTH_CHECK_PATH = "/session"
+_STARTUP_TIMEOUT = 30  # seconds
+# Circuit-breaker threshold: after this many consecutive failed auto-restarts,
+# _ensure_live_runtime() fast-fails instead of blocking callers for ~30s each.
+_MAX_RESTART_FAILURES = 3
+
+
+def _classify_http_error(status_code: int, message: str) -> AgentExecutionError:
+    """Map opencode HTTP failures to structured backend exceptions."""
+    if status_code == 429:
+        return AgentRateLimitedError(message)
+    if status_code in (401, 403):
+        return AgentPermissionError(message)
+    if status_code in (502, 503, 504):
+        return AgentUnavailableError(message)
+    return AgentExecutionError(message)
+
+
+def _find_free_port() -> int:
+    """Bind to port 0 to let the OS allocate a free ephemeral port, then release it.
+
+    There is a brief TOCTOU window between release and the sidecar binding, but
+    this is acceptable for local loopback use.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class OpenCodeBackend(AgentBackend):
+    """Agent backend that communicates with a running ``opencode serve`` process."""
+
+    def __init__(
+        self,
+        command: str,
+        new_session_args: list[str],
+        timeout: int,
+        sidecar_env: dict[str, str] | None = None,
+        sidecar_cwd: str | None = None,
+        broker_config: GatewayBrokerConfig | None = None,
+    ) -> None:
+        """
+        Args:
+            command: opencode binary name (e.g. ``"opencode"``). Used to build
+                the startup command: ``[command, "serve", "--port", "{port}"]
+                + new_session_args``.
+            new_session_args: Extra flags forwarded to ``opencode serve`` at startup
+                (e.g. ``["--model", "anthropic/claude-sonnet-4-5"]``). Unlike the
+                Claude backend, these are **server startup flags**, not per-message args.
+            timeout: Default HTTP timeout in seconds for all API calls.
+            sidecar_env: Environment variables to inject into the sidecar process.
+                Hardcoded to ``{"ACG_ROLE": "owner"}`` by GatewayService because
+                the sidecar always runs as the gateway's own agent backend.
+                Guest enforcement is handled by the PermissionBroker at the
+                per-request level, not via process environment.
+            sidecar_cwd: Working directory for the ``opencode serve`` process.
+                ``None`` inherits the gateway's cwd. Set this to the project root
+                so opencode can find ``.opencode/opencode.json`` and plugins.
+            broker_config: Optional permission policy settings for gateway broker
+                creation.  ``None`` means permissions are disabled for this agent.
+        """
+        self._command = command
+        self._new_session_args = new_session_args
+        self.timeout = timeout
+        self._sidecar_env: dict[str, str] = sidecar_env or {}
+        self._sidecar_cwd: str | None = sidecar_cwd
+        self._broker_config = broker_config
+        self._base_url: str | None = None
+        self._process: asyncio.subprocess.Process | None = None
+        self._stdout_drain: asyncio.Task | None = None
+        self._stderr_drain: asyncio.Task | None = None
+        # Long-lived HTTP client — reused across health checks, session creation,
+        # and message sending to avoid repeated connection setup/teardown overhead.
+        self._client: httpx.AsyncClient | None = None
+        self._orphan_session_ids: set[str] = set()
+        # Serializes concurrent restart attempts so two simultaneous send() calls
+        # that both detect a dead sidecar cannot race through _ensure_live_runtime()
+        # and spawn duplicate processes.
+        self._restart_lock: asyncio.Lock = asyncio.Lock()
+        # Tracks whether start() has ever succeeded.  Used by _ensure_live_runtime()
+        # to distinguish "never started (caller error)" from "started, then died/failed
+        # restart (auto-recovery eligible)".  Cleared on explicit stop() so that a
+        # manually stopped backend requires a fresh start() call.
+        self._ever_started: bool = False
+        # Circuit-breaker for repeated failed auto-restarts.
+        # After _MAX_RESTART_FAILURES consecutive failures, _ensure_live_runtime()
+        # raises immediately (fast-fail) instead of blocking callers for ~30s each
+        # time.  Reset to 0 on a successful restart or explicit stop().
+        self._consecutive_restart_failures: int = 0
+
+    @property
+    def supports_per_message_env(self) -> bool:
+        """OpenCode HTTP mode ignores per-message env — role is set at sidecar startup."""
+        return False
+
+    def create_gateway_broker(
+        self,
+        registry: "PermissionRegistry",
+        notifier: "PermissionNotifier",
+        session_room_map: dict[str, str],
+        session_role_map: dict[str, str],
+        session_permission_thread_map: "dict[str, str | None]",
+    ) -> "PermissionBroker | None":
+        """Return an OpenCodePermissionBroker wired to the shared notification channel.
+
+        Requires ``start()`` to have been called first so ``_base_url`` is set.
+        ``AgentRuntimeManager.start_all()`` ensures this ordering internally.
+        """
+        if self._broker_config is None:
+            return None
+        if not self._base_url:
+            raise RuntimeError(
+                "OpenCodeBackend has no base_url — call start() before create_gateway_broker()"
+            )
+        from .broker import OpenCodePermissionBroker
+
+        return OpenCodePermissionBroker(
+            registry=registry,
+            notifier=notifier,
+            opencode_base_url=self._base_url,
+            session_room_map=session_room_map,
+            session_role_map=session_role_map,
+            session_permission_thread_map=session_permission_thread_map,
+            owner_allowed_tools=self._broker_config.owner_allowed_tools,
+            guest_allowed_tools=self._broker_config.guest_allowed_tools,
+            timeout_seconds=self._broker_config.timeout,
+            skip_owner_approval=self._broker_config.skip_owner_approval,
+        )
+
+    def create_callable_broker(self, handler, timeout_seconds: int):
+        """Return an OpenCodeCallablePermissionBroker for SSE-based permission callbacks.
+
+        Requires the backend to be started (``start()`` must have been called so
+        ``_base_url`` is populated) before the broker's SSE listener can connect.
+        AgentSession ensures this ordering: ``start()`` is called in ``__aenter__``
+        before the broker is created.
+        """
+        if not self._base_url:
+            raise RuntimeError("OpenCodeBackend has no base_url — call start() first")
+        from .callable_broker import OpenCodeCallablePermissionBroker
+
+        return OpenCodeCallablePermissionBroker(
+            base_url=self._base_url,
+            permission_handler=handler,
+            timeout_seconds=timeout_seconds,
+        )
+
+    # ── Lifecycle ──────────────────────────────────────────────────────────────
+
+    async def _start_inner(self) -> None:
+        """Internal startup logic — **must be called with** ``_restart_lock`` **held**.
+
+        Extracted from :meth:`start` so that :meth:`_ensure_live_runtime` can
+        restart the sidecar without re-acquiring the lock, which would deadlock
+        because ``asyncio.Lock`` is not re-entrant and ``_ensure_live_runtime``
+        already holds ``_restart_lock`` when it calls this method.
+
+        Raises:
+            RuntimeError: If the process fails to become healthy within
+                ``_STARTUP_TIMEOUT`` seconds.
+        """
+        if self._base_url:
+            return  # another caller already finished start() — double-check guard
+
+        port = _find_free_port()
+        base_url = f"http://127.0.0.1:{port}"
+        cmd = [self._command, "serve", "--port", str(port)] + self._new_session_args
+        env = {**os.environ, **self._sidecar_env}
+
+        logger.info(
+            "Starting opencode serve: %s (port=%d, cwd=%s)",
+            cmd[0],
+            port,
+            self._sidecar_cwd or "<inherited>",
+        )
+        self._process = await asyncio.create_subprocess_exec(
+            *cmd,
+            env=env,
+            cwd=self._sidecar_cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        self._stdout_drain = asyncio.create_task(
+            self._drain_pipe(self._process.stdout, logging.DEBUG, "[opencode stdout]"),
+            name="opencode-stdout-drain",
+        )
+        self._stderr_drain = asyncio.create_task(
+            self._drain_pipe(
+                self._process.stderr, logging.WARNING, "[opencode stderr]"
+            ),
+            name="opencode-stderr-drain",
+        )
+
+        try:
+            await self._wait_for_health(base_url)
+        except BaseException:
+            # Health check failed — clean up the partially started sidecar so
+            # we don't leak processes or background tasks.  After cleanup the
+            # backend is in a clean retryable state (same as "never started").
+            #
+            # BaseException (not Exception) is caught here so that
+            # asyncio.CancelledError — raised when the gateway is shutting down
+            # while the health poll is in progress — also triggers cleanup.
+            # Without this, a SIGTERM during startup leaves the opencode serve
+            # subprocess running indefinitely as an orphan.
+            await self._cleanup_partial_start()
+            raise
+
+        self._base_url = base_url
+        self._client = httpx.AsyncClient(base_url=base_url, timeout=self.timeout)
+        self._ever_started = True
+        logger.info("OpenCode server ready at %s", self._base_url)
+
+    async def start(self) -> None:
+        """Spawn ``opencode serve``, allocate a port, and wait for the health check.
+
+        Idempotent — returns immediately if the server is already running.
+
+        Raises:
+            RuntimeError: If the process fails to become healthy within
+                ``_STARTUP_TIMEOUT`` seconds.
+        """
+        if self._base_url:
+            return  # fast path — already running, no lock needed
+
+        # Double-checked locking: a second concurrent caller must not spawn a
+        # second ``opencode serve`` process.  The fast-path check above is
+        # intentionally outside the lock for performance; the re-check inside
+        # ``_start_inner`` is the authoritative guard.  ``_restart_lock`` is also
+        # held by ``_ensure_live_runtime()`` and ``stop()``, so all lifecycle
+        # operations are mutually exclusive.
+        async with self._restart_lock:
+            await self._start_inner()
+
+    async def _cleanup_partial_start(self) -> None:
+        """Clean up after a failed start() — kill process, cancel drain tasks, reset state."""
+        for task in (self._stdout_drain, self._stderr_drain):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        self._stdout_drain = None
+        self._stderr_drain = None
+
+        if self._process:
+            try:
+                self._process.kill()
+                await asyncio.wait_for(self._process.wait(), timeout=5)
+            except Exception:
+                pass
+            self._process = None
+
+        self._base_url = None
+        logger.warning("Cleaned up partially started OpenCode sidecar")
+
+    async def _drain_pipe(
+        self, stream: asyncio.StreamReader, level: int, prefix: str
+    ) -> None:
+        """Read lines from a subprocess pipe and forward them to the logger."""
+        try:
+            async for line in stream:
+                logger.log(
+                    level, "%s %s", prefix, line.decode(errors="replace").rstrip()
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug("Pipe drain stopped: %s", e)
+
+    async def stop(self) -> None:
+        """Terminate the ``opencode serve`` process.
+
+        Idempotent — returns immediately if already stopped.
+
+        Holds ``_restart_lock`` for the entire shutdown so that a concurrent
+        ``_ensure_live_runtime()`` cannot race to restart the sidecar while it
+        is being torn down.  Without the lock, the following sequence is possible:
+
+          1. ``_ensure_live_runtime()`` checks ``_base_url is not None`` → live
+          2. ``stop()`` sets ``_base_url = None`` and closes the client
+          3. ``_ensure_live_runtime()`` uses the now-closed client → crash
+        """
+        if self._process is None:
+            return  # fast path — no lock needed for this trivial check
+        async with self._restart_lock:
+            if self._process is None:
+                return  # double-check: another stop() already finished
+            logger.info("Stopping opencode serve (pid=%d)", self._process.pid)
+            try:
+                # Wrap with a short total timeout so a crashed sidecar (where
+                # every DELETE request blocks for the full client timeout) cannot
+                # stall gateway shutdown for N × self.timeout seconds.  Orphan
+                # cleanup is best-effort — it is acceptable to skip it when the
+                # sidecar is unreachable during shutdown.
+                await asyncio.wait_for(
+                    self._cleanup_orphan_sessions_best_effort(),
+                    timeout=10.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Orphan session cleanup timed out after 10s during shutdown "
+                    "(%d session(s) may remain on the opencode server)",
+                    len(self._orphan_session_ids),
+                )
+            except Exception as e:
+                logger.warning("Failed orphan session cleanup before shutdown: %s", e)
+            for task in (self._stdout_drain, self._stderr_drain):
+                if task:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+            self._stdout_drain = None
+            self._stderr_drain = None
+            try:
+                self._process.terminate()
+                try:
+                    await asyncio.wait_for(self._process.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    logger.warning("opencode serve did not exit after 5s — killing")
+                    self._process.kill()
+                    try:
+                        await asyncio.wait_for(self._process.wait(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        logger.error(
+                            "opencode serve did not exit after SIGKILL — "
+                            "process may be stuck in uninterruptible kernel wait"
+                        )
+            except ProcessLookupError:
+                pass
+            except Exception as e:
+                logger.error("Error stopping opencode serve: %s", e)
+            finally:
+                if self._client:
+                    await self._client.aclose()
+                    self._client = None
+                self._base_url = None
+                self._process = None
+                self._ever_started = False  # explicit stop resets — require new start() call
+                self._consecutive_restart_failures = 0  # clear circuit-breaker on explicit stop
+
+    async def _invalidate_dead_runtime(self) -> None:
+        """Reset client/runtime state after detecting a dead sidecar process."""
+        for task in (self._stdout_drain, self._stderr_drain):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        self._stdout_drain = None
+        self._stderr_drain = None
+        if self._client:
+            await self._client.aclose()
+            self._client = None
+        self._base_url = None
+        self._process = None
+
+    async def _ensure_live_runtime(self) -> None:
+        """Restart the sidecar on demand if a previously started process died.
+
+        Serialized by ``_restart_lock`` to prevent concurrent ``send()`` calls
+        from both detecting a dead sidecar and spawning duplicate processes.
+        Without the lock, two concurrent coroutines could both pass the
+        ``returncode is not None`` check before either completes the restart,
+        resulting in two simultaneous ``opencode serve`` processes and two
+        conflicting ``_base_url`` assignments.
+
+        NOTE: ``_require_base_url()`` is intentionally called AFTER the restart
+        block, not before.  If the previous ``start()`` call failed,
+        ``_base_url`` is None.  Calling ``_require_base_url()`` first would
+        raise before the restart logic can run, making auto-recovery impossible
+        after a failed restart attempt.
+
+        The outer guard covers two cases that both require a restart attempt:
+          1. The sidecar process is present but has exited (returncode is not None).
+          2. start() was previously called (``_ever_started`` is True) but the
+             base_url is gone — this happens when a restart attempt failed and
+             ``_cleanup_partial_start()`` cleared both ``_process`` and
+             ``_base_url``.  Without this second condition, the backend would be
+             permanently stuck after a failed restart.
+        """
+        needs_restart = (
+            (self._process is not None and self._process.returncode is not None)
+            or (self._ever_started and self._base_url is None)
+        )
+        if needs_restart:
+            # Circuit-breaker: if consecutive restart attempts have all failed,
+            # fast-fail immediately instead of letting each incoming request
+            # block for the full _STARTUP_TIMEOUT (~30s).  Cleared on a
+            # successful restart or explicit stop().
+            if self._consecutive_restart_failures >= _MAX_RESTART_FAILURES:
+                raise AgentUnavailableError(
+                    f"opencode sidecar is unavailable after "
+                    f"{self._consecutive_restart_failures} consecutive failed restart "
+                    "attempts — call stop() then start() to reset"
+                )
+            async with self._restart_lock:
+                # Re-check inside the lock: a concurrent coroutine may have
+                # already completed the restart by the time we acquire it.
+                still_needs_restart = (
+                    (self._process is not None and self._process.returncode is not None)
+                    or (self._ever_started and self._base_url is None)
+                )
+                if still_needs_restart:
+                    # Re-check circuit-breaker inside lock too (another coroutine
+                    # may have incremented the counter while we were waiting).
+                    if self._consecutive_restart_failures >= _MAX_RESTART_FAILURES:
+                        raise AgentUnavailableError(
+                            f"opencode sidecar is unavailable after "
+                            f"{self._consecutive_restart_failures} consecutive failed restart "
+                            "attempts — call stop() then start() to reset"
+                        )
+                    exit_code = self._process.returncode if self._process else None
+                    logger.warning(
+                        "Detected dead/unrecovered opencode sidecar (exit=%s) — restarting before request",
+                        exit_code,
+                    )
+                    await self._invalidate_dead_runtime()
+                    try:
+                        # Call _start_inner() directly — NOT start() — because
+                        # _restart_lock is already held here and asyncio.Lock is
+                        # not re-entrant.  Calling start() would deadlock waiting
+                        # to acquire the lock it already owns.
+                        await self._start_inner()
+                        self._consecutive_restart_failures = 0
+                    except Exception:
+                        self._consecutive_restart_failures += 1
+                        logger.error(
+                            "opencode sidecar restart failed (attempt %d/%d)",
+                            self._consecutive_restart_failures,
+                            _MAX_RESTART_FAILURES,
+                        )
+                        raise
+        # Shutdown race guard: a concurrent stop() call may have acquired and
+        # released _restart_lock between when we evaluated `needs_restart`
+        # (outside the lock) and when we entered the lock body.  In that case
+        # `still_needs_restart` evaluated to False (because stop() cleared
+        # _ever_started), we skipped the restart block, and now _base_url is
+        # still None — not because of a programming error, but because the
+        # sidecar was explicitly stopped.  Raise AgentUnavailableError (a
+        # recoverable operational condition) instead of the confusing
+        # RuntimeError("call start() before ...") from _require_base_url().
+        if not self._ever_started and self._base_url is None:
+            raise AgentUnavailableError(
+                "opencode sidecar has been stopped — call start() to restart"
+            )
+        self._require_base_url()
+
+    async def _wait_for_health(self, base_url: str) -> None:
+        """Poll the health-check endpoint until it responds or the deadline passes."""
+        health_url = f"{base_url}{_HEALTH_CHECK_PATH}"
+        deadline = asyncio.get_running_loop().time() + _STARTUP_TIMEOUT
+        last_exc: Exception | None = None
+
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            while asyncio.get_running_loop().time() < deadline:
+                # Check if process died before becoming healthy
+                if self._process and self._process.returncode is not None:
+                    raise RuntimeError(
+                        f"opencode serve exited with code {self._process.returncode} "
+                        "before becoming healthy"
+                    )
+                try:
+                    resp = await client.get(health_url)
+                    # Only 200 is accepted as proof the sidecar is fully ready.
+                    # 404/401/405 mean the endpoint exists but the service is not
+                    # in a known-good state; treat anything other than 200 as not ready.
+                    if resp.status_code == 200:
+                        return
+                except Exception as exc:
+                    last_exc = exc
+                await asyncio.sleep(0.5)
+
+        raise RuntimeError(
+            f"opencode serve did not become healthy within {_STARTUP_TIMEOUT}s "
+            f"(last error: {last_exc})"
+        )
+
+    # ── AgentBackend interface ─────────────────────────────────────────────────
+
+    async def create_session(
+        self,
+        working_directory: str,
+        extra_args: list[str] | None = None,
+        session_title: str | None = None,
+    ) -> str:
+        """Create a new opencode session and return the session_id.
+
+        Args:
+            working_directory: The working directory for the agent (passed to
+                POST /session as ``directory``).
+            extra_args: Ignored in HTTP mode (no per-message subprocess to pass
+                args to). Logged at DEBUG if provided.
+            session_title: Optional session title. Passed as ``title`` in the
+                POST /session body — verify field name against live API.
+        """
+        if extra_args:
+            logger.debug(
+                "extra_args ignored by HTTP adapter (set on server at startup): %s",
+                extra_args,
+            )
+
+        await self._ensure_live_runtime()
+        url = f"{self._base_url}/session"
+        body: dict = {"directory": working_directory}
+        if session_title:
+            # ⚠️ Verify field name against live POST /session response — "title" assumed.
+            body["title"] = session_title
+
+        logger.info("Creating opencode session via HTTP (cwd=%s)", working_directory)
+        try:
+            resp = await self._get_client().post(url, json=body)
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            message = (
+                f"opencode API returned HTTP {exc.response.status_code} "
+                f"for POST /session"
+            )
+            raise _classify_http_error(exc.response.status_code, message) from None
+        data = resp.json()
+
+        session_id = data.get("id", "")
+        if not session_id:
+            raise RuntimeError(f"opencode POST /session returned no session id: {data}")
+
+        # Send init prompt to prime the session (same as old CLI adapter).
+        try:
+            await self._post_message(session_id, _INIT_PROMPT)
+        except Exception:
+            cleaned = await self._cleanup_session_best_effort(session_id)
+            if not cleaned:
+                self._orphan_session_ids.add(session_id)
+                logger.warning(
+                    "OpenCode session %s could not be cleaned up after init failure; marked orphan",
+                    session_id[:16],
+                )
+            raise
+
+        logger.info("Created opencode session: %s", session_id[:16])
+        return session_id
+
+    async def send(
+        self,
+        session_id: str,
+        prompt: str,
+        working_directory: str,
+        timeout: int,
+        attachments: list[str] | None = None,
+        env: dict[str, str] | None = None,
+    ) -> AgentResponse:
+        """Send a message to an existing opencode session and return a normalized AgentResponse.
+
+        File attachments are injected into the prompt text via build_attachment_prompt
+        (no native HTTP upload equivalent to the CLI's ``-f`` flag).
+
+        The ``env`` kwarg is a no-op: ACG_ROLE and other role vars must be set on the
+        opencode server process at startup, not per-message.
+        """
+        if attachments:
+            logger.info(
+                "Injecting %d attachment(s) into prompt text (no native HTTP upload): %s",
+                len(attachments),
+                attachments,
+            )
+        prompt = build_attachment_prompt(prompt, attachments, working_directory)
+
+        if env:
+            logger.debug(
+                "env kwarg ignored by HTTP adapter (set on server at startup): %s",
+                list(env.keys()),
+            )
+
+        await self._ensure_live_runtime()
+        raw = await self._post_message(session_id, prompt, timeout=timeout)
+        return self._parse_http_response(raw, session_id)
+
+    # ── Internal helpers ───────────────────────────────────────────────────────
+
+    def _require_base_url(self) -> None:
+        """Raise clearly if the server URL hasn't been set yet."""
+        if not self._base_url:
+            raise RuntimeError(
+                "OpenCodeBackend has no base_url — "
+                "call start() before create_session() / send(), "
+                "or use AgentSession as a context manager."
+            )
+
+    def _get_client(self) -> httpx.AsyncClient:
+        """Return the long-lived HTTP client, raising if start() hasn't been called.
+
+        Raises ``AgentUnavailableError`` (not ``RuntimeError``) when the client
+        is None so that callers — including ``AgentTurnRunner`` and
+        ``ContextInjector`` — can distinguish a shutdown-race condition from a
+        permanent programming error.  The most common cause of a None client
+        after ``_ensure_live_runtime()`` returns is a concurrent ``stop()``
+        call that cleared ``_client`` between the live-runtime check and the
+        actual HTTP call.
+        """
+        if self._client is None:
+            raise AgentUnavailableError(
+                "opencode sidecar has been stopped — call start() to restart"
+            )
+        return self._client
+
+    async def _post_message(
+        self,
+        session_id: str,
+        text: str,
+        timeout: int | None = None,
+    ) -> dict:
+        """POST a text message to an existing opencode session.
+
+        Raises RuntimeError (sanitized) on non-2xx responses — the original
+        httpx.HTTPStatusError is NOT propagated because it includes the full
+        request URL and response body, which may contain internal server details
+        that should not be exposed to end users or leaked into RC chat.
+
+        Callers must not silently catch 404 and create a new session — let the
+        error propagate so the watcher fails loudly.
+        """
+        url = f"{self._base_url}/session/{session_id}/message"
+        body = {"parts": [{"type": "text", "text": text}]}
+        effective_timeout = timeout if timeout is not None else self.timeout
+
+        try:
+            resp = await self._get_client().post(
+                url, json=body, timeout=effective_timeout
+            )
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            # Sanitize: only expose status code and reason, not the full URL or
+            # response body (which may contain internal opencode server details).
+            message = (
+                f"opencode API returned HTTP {exc.response.status_code} "
+                f"for session {session_id[:16]!r}"
+            )
+            raise _classify_http_error(exc.response.status_code, message) from None
+        return resp.json()
+
+    async def _cleanup_session_best_effort(self, session_id: str) -> bool:
+        """Try to delete a failed session; return True if cleanup succeeded."""
+        if not self._base_url or not session_id or self._client is None:
+            return False
+        url = f"{self._base_url}/session/{session_id}"
+        try:
+            resp = await self._get_client().delete(url)
+            if resp.status_code in (200, 202, 204, 404):
+                logger.info(
+                    "Best-effort cleanup for failed opencode session %s returned HTTP %d",
+                    session_id[:16],
+                    resp.status_code,
+                )
+                self._orphan_session_ids.discard(session_id)
+                return True
+            logger.warning(
+                "Best-effort cleanup for failed opencode session %s returned unexpected HTTP %d",
+                session_id[:16],
+                resp.status_code,
+            )
+        except Exception as e:
+            logger.warning(
+                "Best-effort cleanup failed for opencode session %s: %s",
+                session_id[:16],
+                e,
+            )
+        return False
+
+    async def _cleanup_orphan_sessions_best_effort(self) -> None:
+        """Try to clean up any sessions left orphaned by earlier failures."""
+        if not self._orphan_session_ids or not self._base_url or self._client is None:
+            return
+        for session_id in list(self._orphan_session_ids):
+            cleaned = await self._cleanup_session_best_effort(session_id)
+            if cleaned:
+                self._orphan_session_ids.discard(session_id)
+
+    async def delete_session(self, session_id: str) -> bool:
+        """Best-effort deletion hook used by watcher startup rollback."""
+        return await self._cleanup_session_best_effort(session_id)
+
+    def _parse_http_response(self, data: dict, session_id: str) -> AgentResponse:
+        """Parse the synchronous POST /session/{id}/message response body.
+
+        Response shape::
+
+            {
+              "info": {"duration": <ms>, ...},
+              "parts": [
+                {"type": "text", "text": "..."},
+                {"type": "step-finish", "tokens": {"input": N, "output": N,
+                  "reasoning": N, "cache": {"read": N, "write": N}},
+                  "cost": 0.001},
+                ...
+              ]
+            }
+
+        Notes:
+          - ``step-finish`` uses a hyphen, not an underscore (unlike the old CLI stream).
+          - ``is_error`` is set to True when no text parts are extracted from the
+            response (empty or tool-only turns).  This lets ContextInjector detect
+            failed injection attempts without relying on the HTTP status code.
+          - ``duration_ms`` is read from ``info.duration``; verify field name against
+            a live response.
+        """
+        parts = data.get("parts", [])
+        info = data.get("info", {})
+
+        text_parts: list[str] = []
+        total_input = total_output = total_reasoning = 0
+        total_cache_read = total_cache_write = 0
+        total_cost: float = 0.0
+        num_turns: int = 0
+
+        for part in parts:
+            ptype = part.get("type", "")
+            if ptype == "text":
+                t = part.get("text", "")
+                if t:
+                    text_parts.append(t)
+            elif ptype == "step-finish":
+                num_turns += 1
+                tokens = part.get("tokens", {})
+                total_input += tokens.get("input", 0)
+                total_output += tokens.get("output", 0)
+                total_reasoning += tokens.get("reasoning", 0)
+                cache = tokens.get("cache", {})
+                total_cache_read += cache.get("read", 0)
+                total_cache_write += cache.get("write", 0)
+                total_cost += part.get("cost", 0.0)
+
+        text = "".join(text_parts).strip()
+        is_error = False
+        if not text:
+            # Distinguish tool-only turns (agent ran tools, no text output) from
+            # genuine errors (no parts at all, or only unrecognised part types).
+            # Tool-only turns are valid — they produce step-finish events but no
+            # text blocks.  Marking them as is_error=True would cause ContextInjector
+            # to incorrectly count them as failed injection attempts.
+            has_tool_steps = any(p.get("type") == "step-finish" for p in parts)
+            if has_tool_steps:
+                logger.debug(
+                    "No text extracted from opencode response but tool steps completed "
+                    "(tool-only turn) — not marking as error."
+                )
+            else:
+                logger.warning(
+                    "No text extracted from opencode HTTP response. Parts: %s",
+                    str(parts)[:500],
+                )
+                is_error = True
+            text = "(empty response)"
+
+        has_usage = (total_input + total_output) > 0
+        usage = (
+            TokenUsage(
+                input_tokens=total_input,
+                output_tokens=total_output,
+                cache_read_tokens=total_cache_read,
+                cache_write_tokens=total_cache_write,
+                reasoning_tokens=total_reasoning,
+            )
+            if has_usage
+            else None
+        )
+
+        return AgentResponse(
+            text=text,
+            session_id=session_id,
+            usage=usage,
+            cost_usd=total_cost if total_cost > 0 else None,
+            duration_ms=info.get("duration") or None,
+            num_turns=num_turns if num_turns > 0 else None,
+            is_error=is_error,
+        )

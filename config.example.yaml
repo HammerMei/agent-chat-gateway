@@ -1,0 +1,182 @@
+# agent-chat-gateway — example configuration
+# Copy this file to config.yaml and adjust to your setup.
+#
+# Secrets (passwords, tokens) should never be written here directly.
+# Use environment variables instead: set them in a .env file next to config.yaml
+# (copy .env.example → .env and fill in your values).
+# Any $VAR or ${VAR} reference in this file is automatically expanded at startup.
+
+connectors:
+  - name: rc-home                    # unique name for this connector (used in CLI commands)
+    type: rocketchat
+    server:
+      url: "$RC_URL"                 # e.g. https://chat.example.com
+      username: "$RC_USERNAME"       # bot account username
+      password: "$RC_PASSWORD"       # bot account password (set in .env)
+    allowed_users:
+      owners:
+        - your-admin-username        # full access: can use all tools, approve/deny requests
+      guests: []                     # read-only access: limited to allowed tools only
+        # - alice
+        # - bob
+    attachments:
+      max_file_size_mb: 10           # files larger than this are skipped (0 = no limit)
+      download_timeout: 30           # seconds per file download
+      cache_dir: agent-chat.cache    # relative to watcher's working_directory
+    reply_in_thread: false           # true = start a new thread for every top-level reply
+    permission_reply_in_thread: true # false = post permission notifications at room level
+    context_inject_files: []         # connector-level context injected into every session (layer 1)
+
+agents:
+  # ── Claude backend ────────────────────────────────────────────────────────
+  my-agent:
+    type: claude
+    command: claude
+    new_session_args: []             # extra flags passed only on session creation
+                                     # e.g. ["--agent", "my-agent-name"] to load a custom agent
+    session_prefix: agent-chat       # prefix added to Claude session titles
+    context_inject_files:            # agent-level context files (layer 2); list, resolved relative to config dir
+      - contexts/rc-gateway-context.md
+
+    # ── Tool allow lists ───────────────────────────────────────────────────
+    # Each entry is an object with:
+    #   tool:   (required) regex matched against the tool name
+    #   params: (optional) regex matched against the tool's primary parameter:
+    #             Bash        → tool_input["command"]   (Claude) / patterns[0] (OpenCode)
+    #             WebFetch    → tool_input["url"]        (Claude) / patterns[0] (OpenCode)
+    #             Read/Edit/
+    #             Write       → tool_input["file_path"]  (Claude) / patterns[0] (OpenCode)
+    #             unknown/MCP → full tool_input serialized as JSON (Claude) / patterns[0] (OpenCode)
+    #
+    # owner_allowed_tools: auto-approved for owners — no RC notification sent.
+    #   Anything NOT matched here triggers the human-in-the-loop approval flow.
+    #   Omit this key (or leave empty) to require approval for every tool call.
+    #
+    # guest_allowed_tools: auto-approved for guests — no RC notification sent.
+    #   Anything NOT matched here is auto-denied without notifying the owner.
+
+    owner_allowed_tools:
+      # ── Read-only built-in tools: safe, never need owner approval ──────
+      - tool: "Read"                         # any file read
+      - tool: "Glob"                         # file pattern search
+      - tool: "Grep"                         # content search
+      - tool: "WebSearch"                    # web search
+
+      # ── WebFetch: restrict by domain ───────────────────────────────────
+      # params regex is matched against the full URL (tool_input["url"]).
+      # ⚠️  SECURITY: avoid ".*" as params — it allows fetching internal network
+      # addresses (localhost, 127.0.0.1, 169.254.169.254 AWS metadata, etc.).
+      # Always use explicit domain patterns to prevent SSRF attacks.
+      - tool: "WebFetch"
+        params: "https?://(www\\.)?github\\.com/.*"
+      - tool: "WebFetch"
+        params: "https?://[^/]*\\.wikipedia\\.org/.*"
+
+      # ── Bash: allow specific safe commands only ─────────────────────────
+      # params regex is matched against tool_input["command"]
+      - tool: "Bash"
+        params: "git (log|diff|status|show)( .*)?"   # read-only git commands
+      - tool: "Bash"
+        params: "ls( .*)?"                           # directory listing
+
+      # ── MCP tools: match by server or specific tool name ───────────────
+      # params regex (if set) is matched against full tool_input JSON string
+      - tool: "mcp__rocketchat__get_.*"              # all read-only RC tools
+      - tool: "mcp__rocketchat__list_.*"
+      - tool: "mcp__github__.*"                      # all GitHub MCP tools
+        params: ".*\"action\":\\s*\"(get|list|read)\".*"  # read-only actions only
+
+    guest_allowed_tools:
+      # Guests get a smaller subset — typically read-only tools only
+      - tool: "Read"
+      - tool: "Glob"
+      - tool: "Grep"
+      - tool: "WebFetch"
+        params: "https?://[^/]*\\.wikipedia\\.org/.*"  # guests: Wikipedia only
+      - tool: "mcp__rocketchat__get_.*"
+
+    timeout: 360                     # seconds to wait for agent response; must be > permissions.timeout
+    permissions:
+      enabled: true                  # true = human-in-the-loop tool approval via chat
+      timeout: 300                   # seconds before unanswered requests are auto-denied
+      # skip_owner_approval: false   # ⚠️  CAUTION: when set to true, ALL owner tool calls are
+                                     #    auto-approved without any RC notification or confirmation.
+                                     #    This disables the human-in-the-loop approval flow entirely
+                                     #    for owners. Only enable this when running inside a trusted
+                                     #    sandbox where interactive approval is not practical.
+                                     #    Guests are still subject to their tool allow-list restrictions.
+                                     #    Requires permissions.enabled=true to have any effect.
+                                     #    Default: false
+
+  # ── OpenCode backend (uncomment to use) ───────────────────────────────────
+  # opencode-agent:
+  #   type: opencode
+  #   command: opencode
+  #   new_session_args: []
+  #   working_directory: /path/to/project  # cwd for `opencode serve` — must contain .opencode/opencode.json
+  #   session_prefix: agent-chat
+  #   context_inject_files:
+  #     - contexts/rc-gateway-context.md
+  #
+  #   # Same format as Claude — broker normalizes tool_input differences internally.
+  #   # params regex is always matched against patterns[0] from the SSE permission event.
+  #   owner_allowed_tools:
+  #     - tool: "Read"
+  #     - tool: "Glob"
+  #     - tool: "Grep"
+  #     - tool: "bash"                       # note: opencode uses lowercase tool names
+  #       params: "git (log|diff|status).*"
+  #     - tool: "webfetch"
+  #       params: "https?://[^/]*\\.github\\.com/.*"
+  #   guest_allowed_tools:
+  #     - tool: "read"
+  #     - tool: "glob"
+  #     - tool: "grep"
+  #
+  #   timeout: 360
+  #   permissions:
+  #     enabled: true
+  #     timeout: 300
+
+watchers:
+  # ── Watcher definitions ───────────────────────────────────────────────────
+  # Each watcher binds a connector room to an agent.
+  # Watchers start automatically at gateway startup — no add-watcher command needed.
+  #
+  # CLI controls:
+  #   agent-chat-gateway list                  — show all watchers and their status
+  #   agent-chat-gateway pause  <watcher-name> — stop processing messages temporarily
+  #   agent-chat-gateway resume <watcher-name> — re-enable a paused watcher
+  #   agent-chat-gateway reset  <watcher-name> — clear runtime state, start a fresh session
+  #
+  # session_id:
+  #   null (or omitted) — gateway auto-creates a session on first start and persists the ID.
+  #                        'reset' clears the stored ID so a new session is created next time.
+  #   "ses_abc123"      — gateway always connects to this specific session (sticky).
+  #                        'reset' does NOT clear sticky session IDs.
+  #
+  # context_inject_files: optional watcher-level context files (layer 3).
+  #   These are injected after connector-level and agent-level files.
+  #
+  # online_notification / offline_notification: customize the status message posted when
+  #   this watcher starts or stops. Supports any text, emoji, or RC markdown.
+  #   Set to null (~) to suppress the message entirely for this watcher.
+  #   Defaults: "✅ _Agent online_" / "❌ _Agent offline_"
+
+  - name: general-room               # unique watcher name (used in CLI commands)
+    connector: rc-home               # must match a connector name above
+    room: general                    # room name, or @username for a DM
+    agent: my-agent                  # must match an agent name above
+    session_id: ~                    # null = auto-create
+    context_inject_files: []         # watcher-level extra context (usually empty)
+    online_notification: "✅ _Agent online_"    # set to ~ to suppress
+    offline_notification: "❌ _Agent offline_"  # set to ~ to suppress
+
+  # - name: opencode-room
+  #   connector: rc-home
+  #   room: opencode
+  #   agent: opencode-agent
+  #   session_id: ~
+  #   context_inject_files: []
+  #   online_notification: "✅ _Agent online_"
+  #   offline_notification: "❌ _Agent offline_"

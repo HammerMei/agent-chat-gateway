@@ -1,0 +1,614 @@
+"""Claude CLI agent backend.
+
+Implements AgentBackend using the Claude CLI subprocess:
+  - Session creation:  claude -p --output-format json [extra_args]  (prompt via stdin)
+  - Message sending:   claude -p --resume <session-id> --output-format stream-json --verbose  (prompt via stdin)
+
+Prompts are passed via stdin to avoid OS ARG_MAX limits for large messages.
+
+Output parsing understands Claude's stream-json format: one JSON object per line,
+with type="assistant" content blocks and a type="result" fallback.
+
+Note: claude -p does not support native file attachments.  When attachments are
+provided, their paths are injected into the prompt text via
+:func:`~gateway.core.adapter_utils.build_attachment_prompt` so the agent can
+access them using the Read tool.
+"""
+
+import asyncio
+import json
+import logging
+import os
+from collections import deque
+from typing import TYPE_CHECKING
+
+from .. import AgentBackend, GatewayBrokerConfig
+from ..errors import (
+    AgentExecutionError,
+    AgentPermissionError,
+    AgentProtocolError,
+    AgentRateLimitedError,
+    AgentUnavailableError,
+)
+from ..response import AgentResponse, TokenUsage
+from ...core.adapter_utils import build_attachment_prompt
+
+if TYPE_CHECKING:
+    from ...core.permission import (
+        PermissionBroker,
+        PermissionNotifier,
+        PermissionRegistry,
+    )
+
+logger = logging.getLogger("agent-chat-gateway.agents.claude")
+
+_RATE_LIMIT_PATTERNS = (
+    "usage limit",
+    "rate limit",
+    "quota exceeded",
+    "quota reached",
+    "too many requests",
+)
+_PERMISSION_PATTERNS = (
+    "permission denied",
+    "not permitted",
+    "approval required",
+    "blocked as safe default",
+)
+_UNAVAILABLE_PATTERNS = (
+    "temporarily unavailable",
+    "service unavailable",
+    "backend unavailable",
+)
+
+
+def _classify_claude_error(
+    message: str, subtype: str = ""
+) -> type[AgentExecutionError]:
+    """Map raw Claude CLI error text to a structured backend exception type."""
+    haystack = f"{subtype}\n{message}".lower()
+    if any(pattern in haystack for pattern in _RATE_LIMIT_PATTERNS):
+        return AgentRateLimitedError
+    if any(pattern in haystack for pattern in _PERMISSION_PATTERNS):
+        return AgentPermissionError
+    if any(pattern in haystack for pattern in _UNAVAILABLE_PATTERNS):
+        return AgentUnavailableError
+    if "malformed" in haystack or "parse" in haystack:
+        return AgentProtocolError
+    return AgentExecutionError
+
+
+# Grace period given to the Claude subprocess after SIGTERM before escalating
+# to SIGKILL.  Three seconds is generous enough for claude to flush state yet
+# short enough that a stuck process does not block the gateway for long.
+_SIGTERM_GRACE_SECONDS: float = 3.0
+
+# Maximum bytes of stderr to accumulate for diagnostics.  Keeps memory
+# bounded when the agent writes verbose debug output to stderr.
+_MAX_STDERR_BYTES = 65_536
+
+# Maximum chars of raw stdout to keep for diagnostic logging when no text
+# is extracted.  Only used for the "(empty response)" warning path.
+_MAX_RAW_PREVIEW_CHARS = 500
+
+# Keep the tail of the stream, not just the head.  Claude's final failure
+# details often appear in the last ``result`` event rather than the initial
+# ``system/init`` event.
+_MAX_RAW_TAIL_LINES = 20
+
+
+async def _terminate_gracefully(proc: asyncio.subprocess.Process) -> None:
+    """Signal *proc* with SIGTERM, then escalate to SIGKILL after the grace period.
+
+    Design goals
+    ------------
+    * ``proc.terminate()`` is a synchronous OS call — it runs even if the
+      surrounding coroutine is about to be cancelled, giving the subprocess a
+      chance to flush buffers and exit cleanly.
+    * We then *await* ``proc.wait()`` for at most :data:`_SIGTERM_GRACE_SECONDS`.
+      If cancelled or the timer fires we escalate to SIGKILL.
+    * All exceptions are swallowed — cleanup must never propagate to the caller.
+    """
+    try:
+        proc.terminate()
+    except ProcessLookupError:
+        return  # process already exited — nothing to do
+    except Exception:
+        pass  # e.g. permission error on an unusual platform
+
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=_SIGTERM_GRACE_SECONDS)
+        return  # exited cleanly after SIGTERM
+    except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+        pass  # grace period elapsed or outer task cancelled — escalate
+
+    try:
+        proc.kill()
+    except Exception:
+        pass  # already dead or unrecoverable
+
+
+class _StreamParser:
+    """Incremental parser for Claude's ``stream-json`` output.
+
+    Consumes one JSON line at a time via :meth:`feed_line`, accumulating only
+    the parsed fields (text parts, usage metadata, etc.) — *not* the raw bytes.
+    This keeps peak memory proportional to the agent's response text rather than
+    the full stdout payload (which can be much larger due to verbose JSON framing).
+    """
+
+    __slots__ = (
+        "text_parts",
+        "session_id",
+        "cost_usd",
+        "duration_ms",
+        "num_turns",
+        "is_error",
+        "usage",
+        "_raw_preview",
+        "_raw_tail_lines",
+        "result_subtype",
+        "result_text",
+    )
+
+    def __init__(self) -> None:
+        self.text_parts: list[str] = []
+        self.session_id: str | None = None
+        self.cost_usd: float | None = None
+        self.duration_ms: int | None = None
+        self.num_turns: int | None = None
+        self.is_error: bool = False
+        self.usage: TokenUsage | None = None
+        # Bounded preview of raw lines — only used for diagnostic logging when
+        # no text is extracted.
+        self._raw_preview: str = ""
+        # Tail of raw lines for failure diagnostics.  Keeping the end of the
+        # stream is often more useful than the beginning because the terminal
+        # ``result`` event frequently carries the actual error.
+        self._raw_tail_lines: deque[str] = deque(maxlen=_MAX_RAW_TAIL_LINES)
+        self.result_subtype: str = ""
+        self.result_text: str = ""
+
+    def feed_line(self, line: str) -> None:
+        """Parse a single JSON line and accumulate into internal state."""
+        line = line.strip()
+        if not line:
+            return
+        if len(self._raw_preview) < _MAX_RAW_PREVIEW_CHARS:
+            self._raw_preview += line + "\n"
+            if len(self._raw_preview) > _MAX_RAW_PREVIEW_CHARS:
+                self._raw_preview = self._raw_preview[:_MAX_RAW_PREVIEW_CHARS]
+        self._raw_tail_lines.append(line)
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return
+
+        if event.get("type") == "assistant":
+            message = event.get("message", {})
+            for block in message.get("content", []):
+                if block.get("type") == "text":
+                    self.text_parts.append(block["text"])
+
+        elif event.get("type") == "result":
+            subtype = event.get("subtype", "")
+            self.is_error = bool(event.get("is_error", False))
+            self.session_id = event.get("session_id") or None
+            self.cost_usd = event.get("total_cost_usd") or None
+            self.duration_ms = event.get("duration_ms") or None
+            self.num_turns = event.get("num_turns") or None
+            self.result_subtype = subtype
+            self.result_text = event.get("result", "") or ""
+
+            raw_usage = event.get("usage") or {}
+            if raw_usage:
+                self.usage = TokenUsage(
+                    input_tokens=raw_usage.get("input_tokens", 0),
+                    output_tokens=raw_usage.get("output_tokens", 0),
+                    cache_read_tokens=raw_usage.get("cache_read_input_tokens", 0),
+                    cache_write_tokens=raw_usage.get("cache_creation_input_tokens", 0),
+                )
+
+            if self.is_error or subtype not in ("success", ""):
+                logger.warning(
+                    "Agent result non-success: subtype=%r is_error=%s — "
+                    "if tool access was denied, consider adding it to allowedTools in settings.json. "
+                    "Result preview: %s",
+                    subtype,
+                    self.is_error,
+                    event.get("result", "")[:300],
+                )
+
+            # Fallback text from result event if no assistant blocks found
+            result_text = event.get("result", "")
+            if result_text and not self.text_parts:
+                self.text_parts.append(result_text)
+
+    @property
+    def raw_preview(self) -> str:
+        """Bounded preview of the first raw lines for diagnostic logging."""
+        return self._raw_preview
+
+    @property
+    def raw_tail_preview(self) -> str:
+        return "\n".join(self._raw_tail_lines)
+
+    def build_response(self) -> AgentResponse:
+        """Build the final :class:`AgentResponse` from accumulated state."""
+        text = "\n".join(self.text_parts).strip()
+        if not text:
+            logger.warning(
+                "No text extracted from stream. Raw preview: %s",
+                self._raw_preview[:_MAX_RAW_PREVIEW_CHARS],
+            )
+            text = "(empty response)"
+        return AgentResponse(
+            text=text,
+            session_id=self.session_id,
+            usage=self.usage,
+            cost_usd=self.cost_usd,
+            duration_ms=self.duration_ms,
+            num_turns=self.num_turns,
+            is_error=self.is_error,
+        )
+
+
+class ClaudeBackend(AgentBackend):
+    """Agent backend that drives the Claude CLI subprocess."""
+
+    def __init__(
+        self,
+        command: str,
+        new_session_args: list[str],
+        timeout: int,
+        broker_config: GatewayBrokerConfig | None = None,
+    ):
+        self.command = command
+        self.new_session_args = new_session_args
+        self.timeout = timeout
+        self.settings_path: str = (
+            ""  # patched by ClaudePermissionBroker.start() when active
+        )
+        self._broker_config = broker_config
+
+    def create_gateway_broker(
+        self,
+        registry: "PermissionRegistry",
+        notifier: "PermissionNotifier",
+        session_room_map: dict[str, str],
+        session_role_map: dict[str, str],
+        session_permission_thread_map: "dict[str, str | None]",
+    ) -> "PermissionBroker | None":
+        """Return a ClaudePermissionBroker wired to the shared RC connector maps.
+
+        Passes ``self`` as ``backend`` (Option C) so the broker patches
+        ``self.settings_path`` during ``start()`` — GatewayService never needs
+        to know about this Claude-internal detail.
+        """
+        if self._broker_config is None:
+            return None
+        from .broker import ClaudePermissionBroker
+
+        return ClaudePermissionBroker(
+            registry=registry,
+            notifier=notifier,
+            session_room_map=session_room_map,
+            session_role_map=session_role_map,
+            session_permission_thread_map=session_permission_thread_map,
+            owner_allowed_tools=self._broker_config.owner_allowed_tools,
+            guest_allowed_tools=self._broker_config.guest_allowed_tools,
+            timeout_seconds=self._broker_config.timeout,
+            skip_owner_approval=self._broker_config.skip_owner_approval,
+            backend=self,
+        )
+
+    def create_callable_broker(self, handler, timeout_seconds: int):
+        """Return a CallablePermissionBroker that uses Claude's PreToolUse HTTP hook."""
+        from .callable_broker import CallablePermissionBroker
+
+        return CallablePermissionBroker(handler, timeout_seconds=timeout_seconds)
+
+    def attach_callable_broker(self, broker: object) -> None:
+        """Patch ``settings_path`` so ``create_session()`` uses the broker's hook URL.
+
+        Claude needs the ``--settings`` flag to route tool calls through the
+        broker's HTTP server.  This is a Claude-internal detail that does not
+        belong in AgentSession — the generic wrapper only calls this hook.
+        """
+        sp = getattr(broker, "settings_path", "")
+        if sp:
+            self._pre_broker_settings_path = self.settings_path
+            self.settings_path = sp
+
+    def detach_callable_broker(self) -> None:
+        """Restore ``settings_path`` to its pre-broker value."""
+        if hasattr(self, "_pre_broker_settings_path"):
+            self.settings_path = self._pre_broker_settings_path
+            del self._pre_broker_settings_path
+
+    async def create_session(
+        self,
+        working_directory: str,
+        extra_args: list[str] | None = None,
+        session_title: str | None = None,
+    ) -> str:
+        """Create a new Claude session and return the session_id."""
+        args_to_use = extra_args if extra_args is not None else self.new_session_args
+        cmd = [
+            self.command,
+            "-p",
+            "--output-format",
+            "json",
+            *args_to_use,
+        ]
+        if session_title:
+            cmd += ["--name", session_title]
+        if self.settings_path:
+            # --dangerously-skip-permissions bypasses Claude's native permission
+            # system entirely, making the HTTP hook the sole security gate.
+            # This is required for the permission broker to work correctly —
+            # without it, Claude's native check blocks tool calls before the
+            # hook fires, causing spurious "approval required" responses.
+            cmd += ["--dangerously-skip-permissions", "--settings", self.settings_path]
+
+        init_prompt = (
+            "Chat session initialized. "
+            "You are a chat assistant standing by to respond to incoming messages. "
+            "Do not take any proactive action — simply wait for the first user message."
+        )
+
+        # Strip CLAUDECODE so the subprocess does not inherit the parent session context
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+
+        logger.info("Creating new agent session (cwd=%s)", working_directory)
+        logger.debug("Command: %s", " ".join(cmd))
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=working_directory,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(input=init_prompt.encode()), timeout=self.timeout
+            )
+        except asyncio.TimeoutError:
+            # Graceful SIGTERM first; escalates to SIGKILL after the grace period.
+            await _terminate_gracefully(proc)
+            # Drain and reap with a bounded timeout so we do not block forever.
+            try:
+                await asyncio.wait_for(proc.communicate(), timeout=5)
+            except Exception:
+                pass
+            raise
+        except asyncio.CancelledError:
+            # External task cancellation — give subprocess a chance to flush
+            # before escalating to SIGKILL.  _terminate_gracefully() swallows
+            # any secondary CancelledError so cleanup does not re-raise.
+            await _terminate_gracefully(proc)
+            try:
+                await asyncio.wait_for(proc.communicate(), timeout=5)
+            except Exception:
+                pass
+            raise
+
+        if proc.returncode != 0:
+            err_text = stderr.decode().strip() if stderr else ""
+            out_text = stdout.decode().strip() if stdout else ""
+            logger.error(
+                "Session creation failed (exit %d), stderr: %s",
+                proc.returncode,
+                err_text[:500] or "(empty)",
+            )
+            logger.error("Session creation stdout: %s", out_text[:500] or "(empty)")
+            raise RuntimeError(
+                f"Failed to create session: {err_text or out_text or 'unknown error'}"
+            )
+
+        try:
+            data = json.loads(stdout.decode())
+        except json.JSONDecodeError as exc:
+            raw_out = stdout.decode().strip()
+            raise RuntimeError(
+                f"Failed to parse session creation output as JSON: {exc}. "
+                f"Raw output (first 500 chars): {raw_out[:500]}"
+            ) from exc
+        session_id = data.get("session_id")
+        if not session_id:
+            raise RuntimeError(f"No session_id in agent output: {data}")
+
+        logger.info("Created session: %s", session_id[:8])
+        return session_id
+
+    async def send(
+        self,
+        session_id: str,
+        prompt: str,
+        working_directory: str,
+        timeout: int,
+        attachments: list[str] | None = None,
+        env: dict[str, str] | None = None,
+    ) -> AgentResponse:
+        """Send a message to an existing Claude session and return a normalized AgentResponse."""
+        if attachments:
+            logger.info(
+                "Injecting %d attachment path(s) into prompt text: %s",
+                len(attachments),
+                attachments,
+            )
+            prompt = build_attachment_prompt(prompt, attachments, working_directory)
+
+        cmd = [
+            self.command,
+            "-p",
+            "--resume",
+            session_id,
+            "--output-format",
+            "stream-json",
+            "--verbose",
+        ]
+        if self.settings_path:
+            cmd += ["--dangerously-skip-permissions", "--settings", self.settings_path]
+
+        # Strip CLAUDECODE so the subprocess does not inherit the parent session context,
+        # then merge any role env vars (e.g. ACG_ROLE) for hook enforcement.
+        process_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+        if env:
+            process_env.update(env)
+
+        logger.debug(
+            "Running: %s (cwd=%s)", " ".join(cmd) + " <stdin>", working_directory
+        )
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=working_directory,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=process_env,
+        )
+
+        async def _write_stdin(writer: asyncio.StreamWriter, data: bytes) -> None:
+            """Write prompt to stdin and close it so the subprocess sees EOF."""
+            writer.write(data)
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        parser = _StreamParser()
+
+        async def _read_and_parse_stdout(stream: asyncio.StreamReader) -> None:
+            """Read stdout line-by-line and parse each line incrementally.
+
+            Only the parsed fields (text parts, usage metadata) are kept in
+            memory — the raw bytes are discarded after each line, reducing peak
+            memory from O(full stdout) to O(response text + metadata).
+            """
+            while True:
+                line = await stream.readline()
+                if not line:
+                    break
+                parser.feed_line(line.decode(errors="replace"))
+
+        async def _read_stderr_bounded(stream: asyncio.StreamReader) -> bytes:
+            """Read stderr with a bounded buffer for diagnostics."""
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = await stream.read(4096)
+                if not chunk:
+                    break
+                if total < _MAX_STDERR_BYTES:
+                    sliced = chunk[: _MAX_STDERR_BYTES - total]
+                    chunks.append(sliced)
+                    total += len(sliced)
+            return b"".join(chunks)
+
+        try:
+            # stdin write, stdout parse, and stderr read run concurrently.
+            # Stdout is parsed incrementally — raw bytes are not accumulated.
+            _, _, stderr = await asyncio.wait_for(
+                asyncio.gather(
+                    _write_stdin(proc.stdin, prompt.encode()),
+                    _read_and_parse_stdout(proc.stdout),
+                    _read_stderr_bounded(proc.stderr),
+                ),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            # Graceful SIGTERM first; escalates to SIGKILL after the grace period.
+            await _terminate_gracefully(proc)
+            # Close stdin so the subprocess is not waiting for more input.
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+            # Drain streams and reap the process to avoid ResourceWarning /
+            # zombie processes lingering in the process table.
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        proc.stdout.read(),
+                        proc.stderr.read(),
+                    ),
+                    timeout=5,
+                )
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except Exception:
+                pass
+            raise
+        except asyncio.CancelledError:
+            # Task was cancelled externally (e.g. gateway shutdown).  Give the
+            # subprocess a chance to flush before escalating to SIGKILL.
+            # _terminate_gracefully() is synchronous up to proc.terminate() and
+            # swallows any secondary CancelledError so cleanup does not re-raise.
+            await _terminate_gracefully(proc)
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+            # Best-effort drain and reap.  These awaits may themselves be
+            # interrupted by a subsequent cancellation; that is acceptable —
+            # the process has already been signalled above.
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        proc.stdout.read(),
+                        proc.stderr.read(),
+                    ),
+                    timeout=5,
+                )
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except Exception:
+                pass
+            raise
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=10)
+        except asyncio.TimeoutError:
+            logger.warning("claude process did not exit after pipe drain — killing")
+            proc.kill()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                logger.error("claude process stuck after SIGKILL — leaking process")
+
+        if proc.returncode != 0:
+            err_text = stderr.decode(errors="replace").strip() if stderr else ""
+            out_preview = parser.raw_preview.strip()
+            out_tail = parser.raw_tail_preview.strip()
+            parsed_subtype = parser.result_subtype.strip()
+            parsed_error = parser.result_text.strip()
+            logger.error(
+                "agent exit code %d, stderr: %s",
+                proc.returncode,
+                err_text[:500] or "(empty)",
+            )
+            logger.error("agent stdout preview: %s", out_preview[:500] or "(empty)")
+            logger.error("agent stdout tail: %s", out_tail[:2000] or "(empty)")
+            if parsed_subtype or parsed_error:
+                logger.error(
+                    "agent parsed result: subtype=%s text=%s",
+                    parsed_subtype or "(empty)",
+                    parsed_error[:1000] or "(empty)",
+                )
+            diag = (
+                err_text or parsed_error or out_tail or out_preview or "unknown error"
+            )
+            exc_type = _classify_claude_error(diag, parsed_subtype)
+            raise exc_type(
+                f"agent exited with code {proc.returncode}"
+                f"{f' ({parsed_subtype})' if parsed_subtype else ''}: {diag}"
+            )
+
+        return parser.build_response()

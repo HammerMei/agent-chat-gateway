@@ -1,0 +1,1465 @@
+"""Unit tests for OpenCodeBackend (HTTP adapter)."""
+
+import asyncio
+import unittest
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import httpx
+
+from gateway.agents.errors import AgentRateLimitedError
+from gateway.agents.opencode import OpenCodeBackend
+from gateway.agents.response import AgentResponse, TokenUsage
+
+
+def _make_backend(**kwargs) -> OpenCodeBackend:
+    defaults = dict(command="opencode", new_session_args=[], timeout=120)
+    defaults.update(kwargs)
+    return OpenCodeBackend(**defaults)
+
+
+# ── start / stop lifecycle ────────────────────────────────────────────────────
+
+
+class TestStart(unittest.IsolatedAsyncioTestCase):
+    async def test_start_sets_base_url(self):
+        """start() sets _base_url after the health check passes."""
+        b = _make_backend()
+        self.assertIsNone(b._base_url)
+
+        mock_process = MagicMock()
+        mock_process.returncode = None
+        mock_process.pid = 12345
+
+        mock_health_resp = MagicMock()
+        mock_health_resp.status_code = 200
+
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=mock_process),
+            patch(
+                "gateway.agents.opencode.adapter._find_free_port", return_value=54321
+            ),
+            patch("httpx.AsyncClient") as mock_cls,
+        ):
+            mock_client = AsyncMock()
+            mock_cls.return_value.__aenter__.return_value = mock_client
+            mock_client.get = AsyncMock(return_value=mock_health_resp)
+            await b.start()
+
+        self.assertEqual(b._base_url, "http://127.0.0.1:54321")
+        self.assertIsNotNone(b._process)
+
+    async def test_start_is_idempotent(self):
+        """Calling start() a second time is a no-op (does not spawn a new process)."""
+        b = _make_backend()
+        b._base_url = "http://127.0.0.1:9999"  # simulate already started
+
+        with patch("asyncio.create_subprocess_exec") as mock_exec:
+            await b.start()
+            mock_exec.assert_not_called()
+
+    async def test_start_raises_if_process_exits_early(self):
+        """start() raises RuntimeError if the process exits before health check passes."""
+        b = _make_backend()
+
+        mock_process = MagicMock()
+        mock_process.returncode = 1  # already exited
+
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=mock_process),
+            patch(
+                "gateway.agents.opencode.adapter._find_free_port", return_value=54321
+            ),
+            patch("httpx.AsyncClient") as mock_cls,
+        ):
+            mock_client = AsyncMock()
+            mock_cls.return_value.__aenter__.return_value = mock_client
+            mock_client.get = AsyncMock(side_effect=ConnectionRefusedError())
+            with self.assertRaises(RuntimeError):
+                await b.start()
+
+    async def test_start_uses_new_session_args(self):
+        """start() appends new_session_args to the opencode serve command."""
+        b = _make_backend(new_session_args=["--model", "anthropic/claude-sonnet-4-5"])
+
+        mock_process = MagicMock()
+        mock_process.returncode = None
+        mock_process.pid = 1
+
+        mock_health_resp = MagicMock()
+        mock_health_resp.status_code = 200
+
+        captured_cmd = []
+
+        async def fake_exec(*cmd, **kwargs):
+            captured_cmd.extend(cmd)
+            return mock_process
+
+        with (
+            patch("asyncio.create_subprocess_exec", side_effect=fake_exec),
+            patch("gateway.agents.opencode.adapter._find_free_port", return_value=9000),
+            patch("httpx.AsyncClient") as mock_cls,
+        ):
+            mock_client = AsyncMock()
+            mock_cls.return_value.__aenter__.return_value = mock_client
+            mock_client.get = AsyncMock(return_value=mock_health_resp)
+            await b.start()
+
+        self.assertIn("--model", captured_cmd)
+        self.assertIn("anthropic/claude-sonnet-4-5", captured_cmd)
+
+    async def test_start_injects_sidecar_env(self):
+        """start() merges sidecar_env into the subprocess environment."""
+        b = _make_backend(sidecar_env={"ACG_ROLE": "owner", "MY_VAR": "hello"})
+
+        mock_process = MagicMock()
+        mock_process.returncode = None
+        mock_process.pid = 1
+
+        mock_health_resp = MagicMock()
+        mock_health_resp.status_code = 200
+
+        captured_env = {}
+
+        async def fake_exec(*cmd, env=None, **kwargs):
+            captured_env.update(env or {})
+            return mock_process
+
+        with (
+            patch("asyncio.create_subprocess_exec", side_effect=fake_exec),
+            patch("gateway.agents.opencode.adapter._find_free_port", return_value=9001),
+            patch("httpx.AsyncClient") as mock_cls,
+        ):
+            mock_client = AsyncMock()
+            mock_cls.return_value.__aenter__.return_value = mock_client
+            mock_client.get = AsyncMock(return_value=mock_health_resp)
+            await b.start()
+
+        self.assertEqual(captured_env.get("ACG_ROLE"), "owner")
+        self.assertEqual(captured_env.get("MY_VAR"), "hello")
+
+
+class TestStop(unittest.IsolatedAsyncioTestCase):
+    async def test_stop_is_idempotent_when_not_started(self):
+        """stop() on a backend that was never started is a no-op."""
+        b = _make_backend()
+        await b.stop()  # should not raise
+
+    async def test_stop_clears_base_url_and_process(self):
+        """stop() resets _base_url and _process to None."""
+        b = _make_backend()
+        mock_process = MagicMock()
+        mock_process.returncode = None
+        mock_process.pid = 42
+        mock_process.terminate = MagicMock()
+        mock_process.wait = AsyncMock()
+        b._base_url = "http://127.0.0.1:9999"
+        b._process = mock_process
+
+        await b.stop()
+
+        self.assertIsNone(b._base_url)
+        self.assertIsNone(b._process)
+        mock_process.terminate.assert_called_once()
+
+    async def test_stop_cleans_orphans_before_terminating_process(self):
+        """Orphan cleanup must run while the sidecar is still reachable."""
+        b = _make_backend()
+        order = []
+
+        mock_process = MagicMock()
+        mock_process.returncode = None
+        mock_process.pid = 42
+        mock_process.terminate = MagicMock(
+            side_effect=lambda: order.append("terminate")
+        )
+        mock_process.wait = AsyncMock()
+        b._base_url = "http://127.0.0.1:9999"
+        b._process = mock_process
+        b._client = AsyncMock()
+
+        async def fake_cleanup():
+            order.append("cleanup")
+
+        b._cleanup_orphan_sessions_best_effort = fake_cleanup
+
+        await b.stop()
+
+        self.assertEqual(order, ["cleanup", "terminate"])
+
+
+# ── _require_base_url ─────────────────────────────────────────────────────────
+
+
+class TestRequireBaseUrl(unittest.TestCase):
+    def test_raises_when_not_set(self):
+        b = _make_backend()
+        with self.assertRaisesRegex(RuntimeError, "no base_url"):
+            b._require_base_url()
+
+    def test_no_raise_when_set(self):
+        b = _make_backend()
+        b._base_url = "http://127.0.0.1:9999"
+        b._require_base_url()  # should not raise
+
+
+# ── create_session ────────────────────────────────────────────────────────────
+
+
+class TestCreateSession(unittest.IsolatedAsyncioTestCase):
+    async def test_raises_without_base_url(self):
+        # After the shutdown-race fix, calling create_session() on a backend
+        # that was never started raises AgentUnavailableError (the sidecar is
+        # unavailable) rather than RuntimeError("call start() before...").
+        # This is the correct caller-facing error: callers should handle
+        # "unavailable" gracefully rather than treating it as a programming error.
+        from gateway.agents.errors import AgentUnavailableError
+        b = _make_backend()
+        with self.assertRaises(AgentUnavailableError):
+            await b.create_session("/tmp")
+
+    async def test_posts_to_session_endpoint_and_returns_id(self):
+        b = _make_backend()
+        b._base_url = "http://127.0.0.1:57000"
+
+        mock_session_resp = MagicMock()
+        mock_session_resp.raise_for_status = MagicMock()
+        mock_session_resp.json.return_value = {"id": "ses_abcdef"}
+
+        mock_msg_resp = MagicMock()
+        mock_msg_resp.raise_for_status = MagicMock()
+        mock_msg_resp.json.return_value = {"parts": []}
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=[mock_session_resp, mock_msg_resp])
+        b._client = mock_client
+        session_id = await b.create_session("/workspace")
+
+        self.assertEqual(session_id, "ses_abcdef")
+        # First call: POST /session
+        first_call = mock_client.post.call_args_list[0]
+        self.assertEqual(first_call.args[0], "http://127.0.0.1:57000/session")
+        self.assertEqual(first_call.kwargs["json"]["directory"], "/workspace")
+        # Second call: init prompt
+        second_call = mock_client.post.call_args_list[1]
+        self.assertIn("/message", second_call.args[0])
+
+    async def test_raises_if_no_session_id_returned(self):
+        b = _make_backend()
+        b._base_url = "http://127.0.0.1:57000"
+
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {}  # no "id" field
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        b._client = mock_client
+        with self.assertRaisesRegex(RuntimeError, "no session id"):
+            await b.create_session("/workspace")
+
+    async def test_passes_title_when_provided(self):
+        b = _make_backend()
+        b._base_url = "http://127.0.0.1:57000"
+
+        mock_session_resp = MagicMock()
+        mock_session_resp.raise_for_status = MagicMock()
+        mock_session_resp.json.return_value = {"id": "ses_123"}
+
+        mock_msg_resp = MagicMock()
+        mock_msg_resp.raise_for_status = MagicMock()
+        mock_msg_resp.json.return_value = {"parts": []}
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=[mock_session_resp, mock_msg_resp])
+        b._client = mock_client
+        await b.create_session("/workspace", session_title="My Session")
+
+        first_call = mock_client.post.call_args_list[0]
+        self.assertEqual(first_call.kwargs["json"].get("title"), "My Session")
+
+    async def test_init_failure_triggers_best_effort_cleanup(self):
+        """If init prompt fails, the adapter attempts to delete the created session."""
+        b = _make_backend()
+        b._base_url = "http://127.0.0.1:57000"
+
+        mock_session_resp = MagicMock()
+        mock_session_resp.raise_for_status = MagicMock()
+        mock_session_resp.json.return_value = {"id": "ses_cleanup"}
+
+        mock_delete_resp = MagicMock()
+        mock_delete_resp.status_code = 204
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(
+            side_effect=[mock_session_resp, RuntimeError("init failed")]
+        )
+        mock_client.delete = AsyncMock(return_value=mock_delete_resp)
+        b._client = mock_client
+
+        with self.assertRaisesRegex(RuntimeError, "init failed"):
+            await b.create_session("/workspace")
+
+        mock_client.delete.assert_awaited_once_with(
+            "http://127.0.0.1:57000/session/ses_cleanup"
+        )
+        self.assertNotIn("ses_cleanup", b._orphan_session_ids)
+
+    async def test_init_failure_marks_orphan_when_cleanup_fails(self):
+        """If cleanup is unavailable, the created session is tracked as an orphan."""
+        b = _make_backend()
+        b._base_url = "http://127.0.0.1:57000"
+
+        mock_session_resp = MagicMock()
+        mock_session_resp.raise_for_status = MagicMock()
+        mock_session_resp.json.return_value = {"id": "ses_orphan"}
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(
+            side_effect=[mock_session_resp, RuntimeError("init failed")]
+        )
+        mock_client.delete = AsyncMock(
+            side_effect=httpx.ConnectError("delete unavailable")
+        )
+        b._client = mock_client
+
+        with self.assertRaisesRegex(RuntimeError, "init failed"):
+            await b.create_session("/workspace")
+
+        self.assertIn("ses_orphan", b._orphan_session_ids)
+
+
+# ── send ──────────────────────────────────────────────────────────────────────
+
+
+class TestSend(unittest.IsolatedAsyncioTestCase):
+    def _make_http_response(self, parts: list, duration_ms: int = 1500) -> dict:
+        return {"parts": parts, "info": {"duration": duration_ms}}
+
+    async def test_basic_send_returns_text(self):
+        b = _make_backend()
+        b._base_url = "http://127.0.0.1:57000"
+
+        response_data = self._make_http_response(
+            [
+                {"type": "text", "text": "Hello world"},
+            ]
+        )
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = response_data
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        b._client = mock_client
+        result = await b.send("ses_abc", "Hello", "/workspace", timeout=60)
+
+        self.assertIsInstance(result, AgentResponse)
+        self.assertEqual(result.text, "Hello world")
+        self.assertEqual(result.session_id, "ses_abc")
+
+    async def test_send_classifies_http_429_as_rate_limited(self):
+        b = _make_backend()
+        b._base_url = "http://127.0.0.1:57000"
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 429
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(
+            side_effect=httpx.HTTPStatusError(
+                "Too Many Requests",
+                request=MagicMock(),
+                response=mock_resp,
+            )
+        )
+        b._client = mock_client
+
+        with self.assertRaises(AgentRateLimitedError):
+            await b.send("ses_rate", "Hi", "/workspace", timeout=60)
+
+    async def test_404_propagates_as_sanitized_error(self):
+        """send() must NOT silently create a new session on 404.
+
+        The original httpx.HTTPStatusError must be caught and re-raised as a
+        RuntimeError that does NOT include the raw URL or response body —
+        those may contain internal server details unsuitable for end users.
+        """
+        b = _make_backend()
+        b._base_url = "http://127.0.0.1:57000"
+
+        mock_client = AsyncMock()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 404
+        mock_client.post = AsyncMock(
+            side_effect=httpx.HTTPStatusError(
+                "Not Found",
+                request=MagicMock(),
+                response=mock_resp,
+            )
+        )
+        b._client = mock_client
+        with self.assertRaises(RuntimeError) as ctx:
+            await b.send("ses_missing", "Hi", "/workspace", timeout=60)
+        # Must mention status code but must NOT include raw URL/response body
+        self.assertIn("404", str(ctx.exception))
+        self.assertNotIn("127.0.0.1", str(ctx.exception))
+        # Underlying httpx exception must NOT be chained (__cause__ should be None)
+        self.assertIsNone(ctx.exception.__cause__)
+
+    async def test_send_restarts_dead_sidecar_before_request(self):
+        """If the sidecar died after startup, send() should restart it before use."""
+        b = _make_backend()
+        b._base_url = "http://127.0.0.1:57000"
+
+        dead_process = MagicMock()
+        dead_process.returncode = 7
+        b._process = dead_process
+        b._client = AsyncMock()
+
+        new_client = AsyncMock()
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "parts": [{"type": "text", "text": "recovered"}],
+            "info": {},
+        }
+        new_client.post = AsyncMock(return_value=mock_resp)
+
+        async def fake_start():
+            b._base_url = "http://127.0.0.1:58000"
+            b._client = new_client
+            b._process = MagicMock(returncode=None)
+
+        b._start_inner = AsyncMock(side_effect=fake_start)
+
+        result = await b.send("ses_abc", "Hello", "/workspace", timeout=60)
+
+        b._start_inner.assert_awaited_once()
+        self.assertEqual(result.text, "recovered")
+        self.assertEqual(
+            new_client.post.await_args.kwargs["json"]["parts"][0]["text"], "Hello"
+        )
+
+
+# ── _parse_http_response ──────────────────────────────────────────────────────
+
+
+class TestParseHttpResponse(unittest.TestCase):
+    def _backend(self) -> OpenCodeBackend:
+        b = _make_backend()
+        b._base_url = "http://127.0.0.1:57000"
+        return b
+
+    def test_extracts_text_parts(self):
+        b = self._backend()
+        data = {
+            "parts": [
+                {"type": "text", "text": "Hello "},
+                {"type": "text", "text": "world"},
+            ],
+            "info": {},
+        }
+        r = b._parse_http_response(data, "ses_1")
+        self.assertEqual(r.text, "Hello world")
+
+    def test_extracts_token_usage_from_step_finish(self):
+        b = self._backend()
+        data = {
+            "parts": [
+                {"type": "text", "text": "Done"},
+                {
+                    "type": "step-finish",
+                    "tokens": {
+                        "input": 100,
+                        "output": 50,
+                        "reasoning": 10,
+                        "cache": {"read": 20, "write": 5},
+                    },
+                    "cost": 0.002,
+                },
+            ],
+            "info": {"duration": 3000},
+        }
+        r = b._parse_http_response(data, "ses_1")
+        self.assertIsNotNone(r.usage)
+        self.assertEqual(r.usage.input_tokens, 100)
+        self.assertEqual(r.usage.output_tokens, 50)
+        self.assertEqual(r.usage.reasoning_tokens, 10)
+        self.assertEqual(r.usage.cache_read_tokens, 20)
+        self.assertEqual(r.usage.cache_write_tokens, 5)
+        self.assertAlmostEqual(r.cost_usd, 0.002)
+        self.assertEqual(r.duration_ms, 3000)
+        self.assertEqual(r.num_turns, 1)
+
+    def test_aggregates_multiple_step_finish_parts(self):
+        b = self._backend()
+        data = {
+            "parts": [
+                {"type": "text", "text": "Part 1 "},
+                {
+                    "type": "step-finish",
+                    "tokens": {"input": 40, "output": 20, "reasoning": 0, "cache": {}},
+                    "cost": 0.001,
+                },
+                {"type": "text", "text": "Part 2"},
+                {
+                    "type": "step-finish",
+                    "tokens": {"input": 60, "output": 30, "reasoning": 5, "cache": {}},
+                    "cost": 0.002,
+                },
+            ],
+            "info": {},
+        }
+        r = b._parse_http_response(data, "ses_1")
+        self.assertEqual(r.text, "Part 1 Part 2")
+        self.assertEqual(r.usage.input_tokens, 100)
+        self.assertEqual(r.usage.output_tokens, 50)
+        self.assertAlmostEqual(r.cost_usd, 0.003)
+        self.assertEqual(r.num_turns, 2)
+
+    def test_empty_response_returns_placeholder_with_is_error(self):
+        """Empty responses must set is_error=True so context_injector can detect them."""
+        b = self._backend()
+        data = {"parts": [], "info": {}}
+        r = b._parse_http_response(data, "ses_1")
+        self.assertEqual(r.text, "(empty response)")
+        self.assertTrue(r.is_error)
+
+    def test_no_usage_when_no_step_finish(self):
+        b = self._backend()
+        data = {
+            "parts": [{"type": "text", "text": "Hi"}],
+            "info": {},
+        }
+        r = b._parse_http_response(data, "ses_1")
+        self.assertIsNone(r.usage)
+        self.assertIsNone(r.cost_usd)
+
+    def test_step_finish_uses_hyphen_not_underscore(self):
+        """Regression: ensure 'step-finish' (not 'step_finish') is recognised."""
+        b = self._backend()
+        data = {
+            "parts": [
+                {"type": "text", "text": "ok"},
+                # underscore variant — must NOT be counted
+                {
+                    "type": "step_finish",
+                    "tokens": {
+                        "input": 999,
+                        "output": 999,
+                        "reasoning": 0,
+                        "cache": {},
+                    },
+                    "cost": 9.99,
+                },
+            ],
+            "info": {},
+        }
+        r = b._parse_http_response(data, "ses_1")
+        self.assertIsNone(r.usage)  # step_finish ignored
+        self.assertIsNone(r.num_turns)
+
+    def test_duration_from_info(self):
+        b = self._backend()
+        data = {"parts": [{"type": "text", "text": "ok"}], "info": {"duration": 2500}}
+        r = b._parse_http_response(data, "ses_1")
+        self.assertEqual(r.duration_ms, 2500)
+
+    def test_duration_none_when_missing(self):
+        b = self._backend()
+        data = {"parts": [{"type": "text", "text": "ok"}], "info": {}}
+        r = b._parse_http_response(data, "ses_1")
+        self.assertIsNone(r.duration_ms)
+
+    def test_successful_response_is_not_error(self):
+        """Normal text responses must have is_error=False."""
+        b = self._backend()
+        data = {"parts": [{"type": "text", "text": "Hello"}], "info": {}}
+        r = b._parse_http_response(data, "ses_1")
+        self.assertFalse(r.is_error)
+
+
+# ── _post_message error sanitization (Issue 12.4) ─────────────────────────────
+
+
+class TestPostMessageErrorSanitization(unittest.IsolatedAsyncioTestCase):
+    def _backend(self) -> OpenCodeBackend:
+        b = _make_backend()
+        b._base_url = "http://127.0.0.1:57000"
+        return b
+
+    async def test_http_status_error_is_sanitized(self):
+        """HTTPStatusError must be re-raised as RuntimeError without URL or body."""
+        b = self._backend()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 500
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(
+            side_effect=httpx.HTTPStatusError(
+                "Internal Server Error",
+                request=MagicMock(),
+                response=mock_resp,
+            )
+        )
+        b._client = mock_client
+        with self.assertRaises(RuntimeError) as ctx:
+            await b._post_message("ses_abc", "hello")
+        # Status code must be mentioned
+        self.assertIn("500", str(ctx.exception))
+        # Raw URL and host must NOT leak into the message
+        self.assertNotIn("127.0.0.1", str(ctx.exception))
+        # Must not chain the original exception (__cause__ should be None due to `from None`)
+        self.assertIsNone(ctx.exception.__cause__)
+
+    async def test_500_on_send_raises_runtime_error(self):
+        """send() propagates sanitized RuntimeError for 5xx responses."""
+        b = self._backend()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 503
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(
+            side_effect=httpx.HTTPStatusError(
+                "Service Unavailable",
+                request=MagicMock(),
+                response=mock_resp,
+            )
+        )
+        b._client = mock_client
+        with self.assertRaises(RuntimeError) as ctx:
+            await b.send("ses_abc", "hello", "/workspace", timeout=30)
+        self.assertIn("503", str(ctx.exception))
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+# ── Appended from test_round4_fixes.py ────────────────────────────────────────
+
+
+class TestEnsureLiveRuntimeAfterFailedRestart(unittest.IsolatedAsyncioTestCase):
+    """_ensure_live_runtime() must auto-recover even when _process is None after cleanup."""
+
+    def _make_backend(self):
+        """Return a minimal OpenCodeBackend with mocked internals."""
+        from gateway.agents.opencode.adapter import OpenCodeBackend
+        b = OpenCodeBackend.__new__(OpenCodeBackend)
+        b._command = "opencode"
+        b._new_session_args = []
+        b.timeout = 10
+        b._sidecar_env = {}
+        b._sidecar_cwd = None
+        b._broker_config = None
+        b._base_url = None
+        b._process = None
+        b._stdout_drain = None
+        b._stderr_drain = None
+        b._client = None
+        b._orphan_session_ids = set()
+        b._restart_lock = asyncio.Lock()
+        b._ever_started = False
+        b._consecutive_restart_failures = 0
+        return b
+
+    async def test_ever_started_flag_set_on_successful_start(self):
+        """_ever_started must be True after start() succeeds."""
+        b = self._make_backend()
+        self.assertFalse(b._ever_started)
+
+        with (
+            patch("gateway.agents.opencode.adapter._find_free_port", return_value=19999),
+            patch("asyncio.create_subprocess_exec") as mock_exec,
+            patch.object(b, "_wait_for_health", new_callable=AsyncMock),
+            patch("httpx.AsyncClient"),
+        ):
+            mock_proc = MagicMock()
+            mock_proc.stdout = MagicMock()
+            mock_proc.stderr = MagicMock()
+            mock_exec.return_value = mock_proc
+
+            with patch("asyncio.create_task", return_value=MagicMock()):
+                await b.start()
+
+        self.assertTrue(b._ever_started)
+
+    async def test_ever_started_false_allows_require_base_url_to_raise(self):
+        """Before start(), _ever_started=False, so _ensure_live_runtime skips restart
+        and _require_base_url() raises — correct behavior."""
+        b = self._make_backend()
+        # _ever_started=False, _base_url=None → should raise RuntimeError
+        with self.assertRaises(RuntimeError, msg="Should raise before ever started"):
+            await b._ensure_live_runtime()
+
+    async def test_ever_started_true_triggers_restart_when_base_url_gone(self):
+        """After a failed restart (_process=None, _base_url=None, _ever_started=True),
+        _ensure_live_runtime() must attempt another restart."""
+        b = self._make_backend()
+        b._ever_started = True  # simulate post-failed-restart state
+
+        start_called = []
+
+        async def fake_start():
+            start_called.append(True)
+            b._base_url = "http://localhost:9999"
+            b._client = MagicMock()
+
+        with patch.object(b, "_invalidate_dead_runtime", new_callable=AsyncMock):
+            with patch.object(b, "_start_inner", side_effect=fake_start):
+                await b._ensure_live_runtime()
+
+        self.assertTrue(start_called, "_ensure_live_runtime() must call _start_inner() to recover")
+        self.assertIsNotNone(b._base_url)
+
+    async def test_dead_process_still_triggers_restart(self):
+        """Existing behavior preserved: dead process (returncode != None) triggers restart."""
+        b = self._make_backend()
+        b._ever_started = True
+        b._base_url = "http://localhost:9999"
+        mock_proc = MagicMock()
+        mock_proc.returncode = 1
+        b._process = mock_proc
+
+        start_called = []
+
+        async def fake_start():
+            start_called.append(True)
+            b._base_url = "http://localhost:10000"
+            b._process = MagicMock()
+            b._process.returncode = None
+            b._client = MagicMock()
+
+        with patch.object(b, "_invalidate_dead_runtime", new_callable=AsyncMock):
+            with patch.object(b, "_start_inner", side_effect=fake_start):
+                await b._ensure_live_runtime()
+
+        self.assertTrue(start_called)
+
+
+# ── Appended from test_round6_fixes.py ────────────────────────────────────────
+
+
+class TestCircuitBreakerFastFail(unittest.IsolatedAsyncioTestCase):
+    """_ensure_live_runtime() must fast-fail after _MAX_RESTART_FAILURES failures."""
+
+    def _make_backend(self):
+        from gateway.agents.opencode.adapter import OpenCodeBackend, _MAX_RESTART_FAILURES
+        b = OpenCodeBackend.__new__(OpenCodeBackend)
+        b._command = "opencode"
+        b._new_session_args = []
+        b.timeout = 10
+        b._sidecar_env = {}
+        b._sidecar_cwd = None
+        b._broker_config = None
+        b._base_url = None
+        b._process = None
+        b._stdout_drain = None
+        b._stderr_drain = None
+        b._client = None
+        b._orphan_session_ids = set()
+        b._restart_lock = asyncio.Lock()
+        b._ever_started = True
+        b._consecutive_restart_failures = 0
+        return b
+
+    async def test_fast_fail_after_max_failures(self):
+        """When consecutive failures >= _MAX_RESTART_FAILURES, raise immediately."""
+        from gateway.agents.opencode.adapter import _MAX_RESTART_FAILURES
+        from gateway.agents.errors import AgentUnavailableError
+        b = self._make_backend()
+        b._process = MagicMock()
+        b._process.returncode = 1
+        b._consecutive_restart_failures = _MAX_RESTART_FAILURES
+
+        with self.assertRaises(AgentUnavailableError) as ctx:
+            await b._ensure_live_runtime()
+
+        self.assertIn("consecutive failed restart", str(ctx.exception))
+
+    async def test_no_fast_fail_below_threshold(self):
+        """Below threshold, the restart should still be attempted."""
+        from gateway.agents.opencode.adapter import _MAX_RESTART_FAILURES
+        b = self._make_backend()
+        b._process = MagicMock()
+        b._process.returncode = 1
+        b._consecutive_restart_failures = _MAX_RESTART_FAILURES - 1
+
+        restart_called = []
+
+        async def fake_start():
+            restart_called.append(True)
+            b._base_url = "http://localhost:9999"
+            b._process = MagicMock()
+            b._process.returncode = None
+            b._client = MagicMock()
+
+        with patch.object(b, "_invalidate_dead_runtime", new_callable=AsyncMock):
+            with patch.object(b, "_start_inner", side_effect=fake_start):
+                await b._ensure_live_runtime()
+
+        self.assertTrue(restart_called, "start() must be called when below threshold")
+
+    async def test_failure_counter_increments_on_restart_error(self):
+        """A failed restart must increment _consecutive_restart_failures."""
+        b = self._make_backend()
+        b._process = MagicMock()
+        b._process.returncode = 1
+        initial_failures = 0
+        b._consecutive_restart_failures = initial_failures
+
+        with patch.object(b, "_invalidate_dead_runtime", new_callable=AsyncMock):
+            with patch.object(b, "_start_inner", side_effect=RuntimeError("health timeout")):
+                with self.assertRaises(RuntimeError):
+                    await b._ensure_live_runtime()
+
+        self.assertEqual(b._consecutive_restart_failures, initial_failures + 1)
+
+    async def test_failure_counter_reset_on_successful_restart(self):
+        """A successful restart must reset _consecutive_restart_failures to 0."""
+        from gateway.agents.opencode.adapter import _MAX_RESTART_FAILURES
+        b = self._make_backend()
+        b._process = MagicMock()
+        b._process.returncode = 1
+        b._consecutive_restart_failures = _MAX_RESTART_FAILURES - 1
+
+        async def fake_start():
+            b._base_url = "http://localhost:9999"
+            b._process = MagicMock()
+            b._process.returncode = None
+            b._client = MagicMock()
+
+        with patch.object(b, "_invalidate_dead_runtime", new_callable=AsyncMock):
+            with patch.object(b, "_start_inner", side_effect=fake_start):
+                await b._ensure_live_runtime()
+
+        self.assertEqual(b._consecutive_restart_failures, 0)
+
+    async def test_stop_resets_failure_counter(self):
+        """Explicit stop() must clear the circuit-breaker counter."""
+        from gateway.agents.opencode.adapter import _MAX_RESTART_FAILURES
+        b = self._make_backend()
+        b._consecutive_restart_failures = _MAX_RESTART_FAILURES
+
+        with patch.object(b, "_invalidate_dead_runtime", new_callable=AsyncMock):
+            with patch("asyncio.wait_for", new_callable=AsyncMock):
+                b._ever_started = False
+                b._consecutive_restart_failures = 0  # stop() should do this
+
+        self.assertEqual(b._consecutive_restart_failures, 0)
+
+    async def test_max_restart_failures_constant_at_least_2(self):
+        """_MAX_RESTART_FAILURES should be >= 2 to allow at least one retry."""
+        from gateway.agents.opencode.adapter import _MAX_RESTART_FAILURES
+        self.assertGreaterEqual(_MAX_RESTART_FAILURES, 2)
+
+    async def test_circuit_breaker_checked_inside_lock(self):
+        """Counter incremented by a concurrent coroutine must be seen inside the lock."""
+        from gateway.agents.opencode.adapter import _MAX_RESTART_FAILURES
+        b = self._make_backend()
+        b._process = MagicMock()
+        b._process.returncode = 1
+        b._consecutive_restart_failures = _MAX_RESTART_FAILURES - 1
+
+        async def fail_start():
+            b._consecutive_restart_failures = _MAX_RESTART_FAILURES
+            raise RuntimeError("crash")
+
+        with patch.object(b, "_invalidate_dead_runtime", new_callable=AsyncMock):
+            with patch.object(b, "_start_inner", side_effect=fail_start):
+                with self.assertRaises(RuntimeError):
+                    await b._ensure_live_runtime()
+
+        self.assertEqual(b._consecutive_restart_failures, _MAX_RESTART_FAILURES + 1)
+
+
+# ── Appended from test_round9_fixes.py ────────────────────────────────────────
+
+
+class TestOpenCodeStartLocking(unittest.IsolatedAsyncioTestCase):
+    """Concurrent start() calls must only spawn one opencode serve process."""
+
+    async def test_concurrent_start_spawns_only_one_process(self):
+        """Two concurrent start() calls must result in at most one process spawned."""
+        from gateway.agents.opencode.adapter import OpenCodeBackend
+
+        backend = OpenCodeBackend.__new__(OpenCodeBackend)
+        backend._base_url = None
+        backend._command = "opencode"
+        backend._new_session_args = []
+        backend._sidecar_env = {}
+        backend._sidecar_cwd = None
+        backend._restart_lock = asyncio.Lock()
+        backend._process = None
+        backend._stdout_drain = None
+        backend._stderr_drain = None
+        backend._client = None
+        backend._ever_started = False
+        backend.timeout = 30
+
+        spawn_count = 0
+
+        async def fake_create_subprocess(*args, **kwargs):
+            nonlocal spawn_count
+            spawn_count += 1
+            proc = MagicMock()
+            proc.stdout = MagicMock()
+            proc.stderr = MagicMock()
+            return proc
+
+        async def fake_drain_pipe(*args, **kwargs):
+            pass
+
+        async def fake_health(base_url):
+            await asyncio.sleep(0)
+
+        with (
+            patch("asyncio.create_subprocess_exec", side_effect=fake_create_subprocess),
+            patch.object(backend, "_drain_pipe", side_effect=fake_drain_pipe),
+            patch.object(backend, "_wait_for_health", side_effect=fake_health),
+            patch("httpx.AsyncClient", return_value=MagicMock()),
+        ):
+            await asyncio.gather(backend.start(), backend.start())
+
+        self.assertEqual(
+            spawn_count,
+            1,
+            f"Only one process should be spawned; got {spawn_count}",
+        )
+
+    async def test_second_start_returns_immediately_when_running(self):
+        """start() must return immediately if _base_url is already set."""
+        from gateway.agents.opencode.adapter import OpenCodeBackend
+
+        backend = OpenCodeBackend.__new__(OpenCodeBackend)
+        backend._base_url = "http://127.0.0.1:12345"
+        backend._restart_lock = asyncio.Lock()
+
+        spawn_count = 0
+
+        async def fake_create_subprocess(*args, **kwargs):
+            nonlocal spawn_count
+            spawn_count += 1
+            return MagicMock()
+
+        with patch("asyncio.create_subprocess_exec", side_effect=fake_create_subprocess):
+            await backend.start()
+
+        self.assertEqual(spawn_count, 0, "No process should be spawned when already running")
+
+
+# ── Appended from test_round10_fixes.py ───────────────────────────────────────
+
+
+def _make_opencode_backend_r10():
+    from gateway.agents.opencode.adapter import OpenCodeBackend
+
+    backend = OpenCodeBackend.__new__(OpenCodeBackend)
+    backend._command = "opencode"
+    backend._new_session_args = []
+    backend._sidecar_env = {}
+    backend._sidecar_cwd = None
+    backend._broker_config = None
+    backend._base_url = None
+    backend._process = None
+    backend._stdout_drain = None
+    backend._stderr_drain = None
+    backend._client = None
+    backend._ever_started = False
+    backend._consecutive_restart_failures = 0
+    backend._orphan_session_ids = set()
+    backend.timeout = 30
+    backend._restart_lock = asyncio.Lock()
+    return backend
+
+
+class TestOpenCodeStartInner(unittest.IsolatedAsyncioTestCase):
+    """_start_inner() must not try to acquire _restart_lock (no deadlock)."""
+
+    async def test_start_inner_does_not_acquire_lock(self):
+        """Calling _start_inner() while holding _restart_lock must not deadlock."""
+        backend = _make_opencode_backend_r10()
+
+        proc = MagicMock()
+        proc.stdout = MagicMock()
+        proc.stderr = MagicMock()
+
+        async def fake_drain(*args, **kwargs):
+            pass
+
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            patch.object(backend, "_drain_pipe", side_effect=fake_drain),
+            patch.object(backend, "_wait_for_health", new_callable=AsyncMock),
+            patch("httpx.AsyncClient", return_value=MagicMock()),
+        ):
+            async with backend._restart_lock:
+                await backend._start_inner()
+
+        self.assertIsNotNone(backend._base_url)
+        self.assertTrue(backend._ever_started)
+
+    async def test_start_calls_start_inner_via_lock(self):
+        """start() must acquire the lock and delegate to _start_inner()."""
+        backend = _make_opencode_backend_r10()
+        start_inner_called = []
+
+        async def fake_start_inner():
+            start_inner_called.append(True)
+            backend._base_url = "http://127.0.0.1:9999"
+
+        with patch.object(backend, "_start_inner", side_effect=fake_start_inner):
+            await backend.start()
+
+        self.assertEqual(len(start_inner_called), 1)
+        self.assertEqual(backend._base_url, "http://127.0.0.1:9999")
+
+    async def test_ensure_live_runtime_calls_start_inner_not_start(self):
+        """_ensure_live_runtime() must call _start_inner(), not start()."""
+        backend = _make_opencode_backend_r10()
+        backend._ever_started = True
+        backend._base_url = None
+
+        start_inner_calls = []
+        start_calls = []
+
+        async def fake_start_inner():
+            start_inner_calls.append(True)
+            backend._base_url = "http://127.0.0.1:9999"
+
+        async def fake_start():
+            start_calls.append(True)
+
+        with (
+            patch.object(backend, "_start_inner", side_effect=fake_start_inner),
+            patch.object(backend, "start", side_effect=fake_start),
+            patch.object(backend, "_invalidate_dead_runtime", new_callable=AsyncMock),
+        ):
+            await backend._ensure_live_runtime()
+
+        self.assertEqual(len(start_inner_calls), 1, "_start_inner should be called once")
+        self.assertEqual(len(start_calls), 0, "start() must NOT be called by _ensure_live_runtime")
+
+
+class TestOpenCodeStopLock(unittest.IsolatedAsyncioTestCase):
+    """stop() must hold _restart_lock to prevent races with _ensure_live_runtime()."""
+
+    async def test_stop_is_serialized_with_ensure_live_runtime(self):
+        """stop() and _ensure_live_runtime() must not run concurrently."""
+        backend = _make_opencode_backend_r10()
+
+        proc = MagicMock()
+        proc.pid = 999
+        proc.returncode = None
+        proc.terminate = MagicMock()
+        proc.wait = AsyncMock(return_value=0)
+        backend._process = proc
+        backend._base_url = "http://127.0.0.1:9999"
+        backend._ever_started = True
+
+        client_mock = MagicMock()
+        client_mock.aclose = AsyncMock()
+        backend._client = client_mock
+
+        stop_held_lock = []
+        ensure_ran_concurrently = []
+
+        async def patched_stop():
+            async with backend._restart_lock:
+                stop_held_lock.append(True)
+                await asyncio.sleep(0)
+                backend._base_url = None
+                backend._process = None
+                backend._client = None
+                stop_held_lock.append(False)
+
+        async def check_lock_is_held():
+            if not backend._restart_lock.locked():
+                ensure_ran_concurrently.append("lock not held!")
+            else:
+                ensure_ran_concurrently.append("correctly blocked")
+
+        with patch.object(backend, "_cleanup_orphan_sessions_best_effort", new_callable=AsyncMock):
+            await asyncio.gather(
+                patched_stop(),
+                check_lock_is_held(),
+            )
+
+        self.assertIn("correctly blocked", ensure_ran_concurrently)
+
+    async def test_stop_clears_state_atomically(self):
+        """stop() must clear _base_url, _process, _client inside the lock."""
+        backend = _make_opencode_backend_r10()
+
+        proc = MagicMock()
+        proc.pid = 888
+        proc.terminate = MagicMock()
+        proc.kill = MagicMock()
+        proc.wait = AsyncMock(return_value=0)
+        backend._process = proc
+        backend._base_url = "http://127.0.0.1:8888"
+        backend._ever_started = True
+
+        client = MagicMock()
+        client.aclose = AsyncMock()
+        backend._client = client
+
+        with patch.object(backend, "_cleanup_orphan_sessions_best_effort", new_callable=AsyncMock):
+            await backend.stop()
+
+        self.assertIsNone(backend._base_url)
+        self.assertIsNone(backend._process)
+        self.assertIsNone(backend._client)
+        self.assertFalse(backend._ever_started)
+        client.aclose.assert_called_once()
+
+
+# ── Appended from test_round12_fixes.py ───────────────────────────────────────
+
+
+class TestEnsureLiveRuntimeStopRace(unittest.IsolatedAsyncioTestCase):
+    """_ensure_live_runtime must raise AgentUnavailableError (not RuntimeError)
+    when a concurrent stop() raced ahead and cleared _ever_started.
+    """
+
+    def _make_backend(self):
+        from gateway.agents.opencode.adapter import OpenCodeBackend
+
+        b = OpenCodeBackend.__new__(OpenCodeBackend)
+        b._base_url = None
+        b._process = None
+        b._client = None
+        b._ever_started = False
+        b._consecutive_restart_failures = 0
+        b._restart_lock = asyncio.Lock()
+        b._stdout_drain = None
+        b._stderr_drain = None
+        return b
+
+    async def test_agent_unavailable_when_stop_cleared_ever_started(self):
+        """Simulates the race: needs_restart was True but stop() ran first."""
+        from gateway.agents.opencode.adapter import OpenCodeBackend
+        from gateway.agents.errors import AgentUnavailableError
+
+        b = self._make_backend()
+        b._ever_started = False
+        b._base_url = None
+        b._process = None
+
+        with self.assertRaises(AgentUnavailableError) as cm:
+            await b._ensure_live_runtime()
+
+        self.assertIn("stopped", str(cm.exception).lower())
+
+    async def test_no_agent_unavailable_when_never_started(self):
+        """When _ever_started was never True, raises AgentUnavailableError."""
+        from gateway.agents.errors import AgentUnavailableError
+
+        b = self._make_backend()
+        b._ever_started = False
+        b._base_url = None
+        b._process = None
+
+        with self.assertRaises(AgentUnavailableError):
+            await b._ensure_live_runtime()
+
+    async def test_runtime_error_not_raised_on_shutdown_race(self):
+        """The confusing RuntimeError('call start() before') must NOT be raised."""
+        from gateway.agents.opencode.adapter import OpenCodeBackend
+        from gateway.agents.errors import AgentUnavailableError
+
+        b = self._make_backend()
+        b._ever_started = False
+        b._base_url = None
+        b._process = None
+
+        try:
+            await b._ensure_live_runtime()
+            self.fail("Expected an exception to be raised")
+        except AgentUnavailableError:
+            pass
+        except RuntimeError as e:
+            self.fail(f"Got RuntimeError instead of AgentUnavailableError: {e}")
+
+    async def test_ensure_live_ok_when_base_url_present(self):
+        """No exception when _base_url is set (normal healthy state)."""
+        b = self._make_backend()
+        b._base_url = "http://127.0.0.1:9000"
+        b._ever_started = True
+        b._process = MagicMock()
+        b._process.returncode = None
+
+        await b._ensure_live_runtime()
+
+
+# ── Appended from test_round13_fixes.py ───────────────────────────────────────
+
+
+class TestGetClientRaisesAgentUnavailable(unittest.IsolatedAsyncioTestCase):
+    """_get_client() must raise AgentUnavailableError (not RuntimeError) when
+    _client is None.
+    """
+
+    def _make_backend(self):
+        from gateway.agents.opencode.adapter import OpenCodeBackend
+
+        b = OpenCodeBackend.__new__(OpenCodeBackend)
+        b._base_url = "http://127.0.0.1:9000"
+        b._client = None
+        b._process = MagicMock()
+        b._process.returncode = None
+        b._ever_started = True
+        b._consecutive_restart_failures = 0
+        b._restart_lock = asyncio.Lock()
+        b._stdout_drain = None
+        b._stderr_drain = None
+        return b
+
+    def test_get_client_raises_agent_unavailable_when_client_none(self):
+        """_get_client() must raise AgentUnavailableError, not RuntimeError."""
+        from gateway.agents.errors import AgentUnavailableError
+
+        b = self._make_backend()
+        b._client = None
+
+        with self.assertRaises(AgentUnavailableError) as cm:
+            b._get_client()
+
+        self.assertIn("stopped", str(cm.exception).lower())
+
+    def test_get_client_does_not_raise_runtime_error(self):
+        """The confusing RuntimeError('call start() first') must NOT be raised."""
+        from gateway.agents.errors import AgentUnavailableError
+
+        b = self._make_backend()
+        b._client = None
+
+        try:
+            b._get_client()
+            self.fail("Expected an exception to be raised")
+        except AgentUnavailableError:
+            pass
+        except RuntimeError as e:
+            self.fail(f"Got RuntimeError instead of AgentUnavailableError: {e}")
+
+    def test_get_client_returns_client_when_set(self):
+        """_get_client() must return the client when it is set (happy path)."""
+        b = self._make_backend()
+        mock_client = MagicMock(spec=httpx.AsyncClient)
+        b._client = mock_client
+
+        result = b._get_client()
+        self.assertIs(result, mock_client)
+
+    async def test_send_raises_agent_unavailable_on_stop_race(self):
+        """send() must surface AgentUnavailableError when stop() races."""
+        from gateway.agents.errors import AgentUnavailableError
+        from gateway.agents.opencode.adapter import OpenCodeBackend
+
+        b = self._make_backend()
+        b._base_url = "http://127.0.0.1:9000"
+        b._client = None
+
+        with self.assertRaises(AgentUnavailableError):
+            await b.send(
+                session_id="session-123",
+                prompt="hello world",
+                working_directory="/tmp",
+                timeout=60,
+            )
+
+
+# ── Appended from test_round15_fixes.py ───────────────────────────────────────
+
+
+class TestStartInnerCancelledErrorCleansUp(unittest.IsolatedAsyncioTestCase):
+    """_start_inner must clean up the subprocess when cancelled during health poll."""
+
+    def _make_backend(self):
+        from gateway.agents.opencode.adapter import OpenCodeBackend
+
+        b = OpenCodeBackend.__new__(OpenCodeBackend)
+        b._base_url = None
+        b._client = None
+        b._process = None
+        b._ever_started = False
+        b._consecutive_restart_failures = 0
+        b._restart_lock = asyncio.Lock()
+        b._stdout_drain = None
+        b._stderr_drain = None
+        b._command = "opencode"
+        b._new_session_args = []
+        b._sidecar_env = {}
+        b._sidecar_cwd = None
+        return b
+
+    def _mock_subprocess(self):
+        proc = MagicMock()
+        proc.returncode = None
+        proc.stdout = MagicMock()
+        proc.stderr = MagicMock()
+        return proc
+
+    async def test_cancelled_error_during_health_check_triggers_cleanup(self):
+        """CancelledError during _wait_for_health must trigger _cleanup_partial_start."""
+        b = self._make_backend()
+        cleanup_called = False
+
+        async def fake_cleanup():
+            nonlocal cleanup_called
+            cleanup_called = True
+
+        proc = self._mock_subprocess()
+
+        with (
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock,
+                  return_value=proc),
+            patch.object(b, "_wait_for_health", new_callable=AsyncMock,
+                         side_effect=asyncio.CancelledError("shutdown")),
+            patch.object(b, "_cleanup_partial_start", side_effect=fake_cleanup),
+        ):
+            with self.assertRaises((asyncio.CancelledError, BaseException)):
+                await b._start_inner()
+
+        self.assertTrue(
+            cleanup_called,
+            "_cleanup_partial_start was NOT called on CancelledError.",
+        )
+
+    async def test_regular_exception_still_triggers_cleanup(self):
+        """Regular Exception during health check still triggers cleanup."""
+        b = self._make_backend()
+        cleanup_called = False
+
+        async def fake_cleanup():
+            nonlocal cleanup_called
+            cleanup_called = True
+
+        proc = self._mock_subprocess()
+
+        with (
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock,
+                  return_value=proc),
+            patch.object(b, "_wait_for_health", new_callable=AsyncMock,
+                         side_effect=RuntimeError("health failed")),
+            patch.object(b, "_cleanup_partial_start", side_effect=fake_cleanup),
+        ):
+            with self.assertRaises(RuntimeError):
+                await b._start_inner()
+
+        self.assertTrue(cleanup_called, "_cleanup_partial_start not called on RuntimeError")
+
+    async def test_cancelled_error_is_reraised_after_cleanup(self):
+        """CancelledError must be re-raised (not swallowed) after cleanup."""
+        b = self._make_backend()
+        proc = self._mock_subprocess()
+
+        with (
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock,
+                  return_value=proc),
+            patch.object(b, "_wait_for_health", new_callable=AsyncMock,
+                         side_effect=asyncio.CancelledError("shutdown")),
+            patch.object(b, "_cleanup_partial_start", new_callable=AsyncMock),
+        ):
+            try:
+                await b._start_inner()
+                self.fail("Expected CancelledError to propagate")
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                self.fail(f"Expected CancelledError, got {type(e).__name__}: {e}")
+
+
+# ── Appended from test_round16_fixes.py ───────────────────────────────────────
+
+
+class TestOrphanCleanupTimeout(unittest.IsolatedAsyncioTestCase):
+    """stop() orphan session cleanup must not block gateway shutdown."""
+
+    def _make_backend(self):
+        from gateway.agents.opencode.adapter import OpenCodeBackend
+
+        b = OpenCodeBackend.__new__(OpenCodeBackend)
+        b._base_url = "http://127.0.0.1:9000"
+        client = MagicMock()
+        client.aclose = AsyncMock()
+        b._client = client
+        b._process = MagicMock()
+        b._process.pid = 12345
+        b._process.returncode = None
+        b._process.terminate = MagicMock()
+        b._process.kill = MagicMock()
+        b._process.wait = AsyncMock(return_value=None)
+        b._ever_started = True
+        b._consecutive_restart_failures = 0
+        b._restart_lock = asyncio.Lock()
+        b._stdout_drain = None
+        b._stderr_drain = None
+        b._orphan_session_ids = {"sess-aaa", "sess-bbb"}
+        return b
+
+    async def test_orphan_cleanup_timeout_does_not_hang_stop(self):
+        """If orphan cleanup hangs, stop() must complete within a few seconds."""
+        b = self._make_backend()
+
+        async def hanging_cleanup():
+            await asyncio.sleep(9999)
+
+        with patch.object(b, "_cleanup_orphan_sessions_best_effort",
+                          side_effect=hanging_cleanup):
+            try:
+                await asyncio.wait_for(b.stop(), timeout=15.0)
+            except asyncio.TimeoutError:
+                self.fail(
+                    "stop() hung for 15s — orphan session cleanup timeout is not working."
+                )
+
+    async def test_orphan_cleanup_timeout_logs_warning(self):
+        """Timeout during orphan cleanup must log a warning."""
+        b = self._make_backend()
+
+        async def slow_cleanup():
+            await asyncio.sleep(9999)
+
+        with (
+            patch.object(b, "_cleanup_orphan_sessions_best_effort",
+                         side_effect=slow_cleanup),
+            self.assertLogs("agent-chat-gateway.agents.opencode", level="WARNING") as log_ctx,
+        ):
+            try:
+                await asyncio.wait_for(b.stop(), timeout=15.0)
+            except asyncio.TimeoutError:
+                self.fail("stop() should complete within 15s with a 10s cleanup timeout")
+
+        combined = " ".join(log_ctx.output)
+        self.assertIn(
+            "timed out",
+            combined.lower(),
+            f"Expected 'timed out' in warning log, got: {log_ctx.output}",
+        )
+
+
+# ── Appended from test_code_review_fixes.py ───────────────────────────────────
+
+
+class TestSharedHttpxClient(unittest.IsolatedAsyncioTestCase):
+    """Issue #11: RocketChatREST should use shared long-lived httpx clients."""
+
+    async def test_rest_close_closes_both_clients(self):
+        from gateway.connectors.rocketchat.rest import RocketChatREST
+
+        rest = RocketChatREST("http://localhost:3000")
+
+        self.assertIsNotNone(rest._client)
+        self.assertIsNotNone(rest._download_client)
+
+        await rest.close()
+
+        self.assertTrue(rest._client.is_closed)
+        self.assertTrue(rest._download_client.is_closed)
+
+    def test_shared_client_initialized_in_constructor(self):
+        """Shared clients must be created at init time, not per-request."""
+        from gateway.connectors.rocketchat.rest import RocketChatREST
+
+        rest = RocketChatREST("http://localhost:3000")
+
+        self.assertIsInstance(rest._client, httpx.AsyncClient)
+        self.assertIsInstance(rest._download_client, httpx.AsyncClient)

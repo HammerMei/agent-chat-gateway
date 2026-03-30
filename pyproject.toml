@@ -1,0 +1,84 @@
+[project]
+name = "agent-chat-gateway"
+version = "0.1.0"
+description = "Daemon that bridges chat platforms (Rocket.Chat and more) to AI agent backends (Claude, OpenCode)"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12"
+authors = [
+    { name = "HammerMei", url = "https://github.com/HammerMei" },
+]
+keywords = ["ai", "agent", "chat", "rocketchat", "claude", "opencode", "gateway", "llm"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Chat",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/HammerMei/agent-chat-gateway"
+Repository = "https://github.com/HammerMei/agent-chat-gateway"
+Issues = "https://github.com/HammerMei/agent-chat-gateway/issues"
+Changelog = "https://github.com/HammerMei/agent-chat-gateway/releases"
+
+[project.scripts]
+agent-chat-gateway = "gateway.cli:main"
+gateway-tui = "gateway.tools.tui:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["gateway"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+dependencies = [
+    "websockets>=14.0",
+    "httpx>=0.28.0",
+    "pyyaml>=6.0",
+    "rich>=13.0",
+    "python-dotenv>=1.0",
+    "tree-sitter>=0.23.0",
+    "tree-sitter-bash>=0.23.0",
+]
+
+[dependency-groups]
+dev = [
+    "coverage>=7.13.5",
+    "pytest>=9.0.2",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.4.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: multi-component tests with real I/O or multiple subsystems",
+]
+
+[tool.coverage.run]
+source = ["gateway"]
+
+[tool.coverage.report]
+exclude_also = [
+    # Standard pragma
+    "pragma: no cover",
+]
+omit = [
+    # TUI is a Rich/terminal interactive tool — not unit-testable without a
+    # real terminal.  Excluded from coverage to avoid skewing the numbers.
+    "gateway/tools/tui.py",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
