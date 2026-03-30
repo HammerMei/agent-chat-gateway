@@ -15,12 +15,10 @@ import asyncio
 import logging
 from abc import ABC, abstractmethod
 
-# Re-export domain state types
-from .permission_state import (  # noqa: F401
-    PermissionNotificationError,
-    PermissionRegistry,
-    PermissionRequest,
-    generate_request_id,
+# Re-export notifier types
+from .permission_notifier import (  # noqa: F401
+    ConnectorPermissionNotifier,
+    PermissionNotifier,
 )
 
 # Re-export presentation helpers
@@ -29,10 +27,12 @@ from .permission_presenter import (  # noqa: F401
     format_timeout_msg,
 )
 
-# Re-export notifier types
-from .permission_notifier import (  # noqa: F401
-    ConnectorPermissionNotifier,
-    PermissionNotifier,
+# Re-export domain state types
+from .permission_state import (  # noqa: F401
+    PermissionNotificationError,
+    PermissionRegistry,
+    PermissionRequest,
+    generate_request_id,
 )
 
 # Backward-compat aliases for code that imported the old private names

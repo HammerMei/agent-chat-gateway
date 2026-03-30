@@ -38,7 +38,6 @@ from gateway.core.permission import (
     PermissionRegistry,
 )
 
-
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _make_broker(
@@ -638,8 +637,9 @@ class TestBrokerParseOffloadedToThread(unittest.IsolatedAsyncioTestCase):
         import asyncio
         import json
         from unittest.mock import patch
+
         from gateway.agents.claude.broker import ClaudePermissionBroker
-        from gateway.core.permission import PermissionRegistry, PermissionNotifier
+        from gateway.core.permission import PermissionNotifier, PermissionRegistry
 
         registry = MagicMock(spec=PermissionRegistry)
         notifier = MagicMock(spec=PermissionNotifier)
@@ -664,7 +664,7 @@ class TestBrokerParseOffloadedToThread(unittest.IsolatedAsyncioTestCase):
         })
 
         with patch("gateway.agents.claude.broker.asyncio.to_thread", side_effect=spy_to_thread):
-            result = await broker._handle_hook(body)
+            await broker._handle_hook(body)
 
         self.assertTrue(
             any("get_param_strings_for_claude" in fn for fn in to_thread_fns),
@@ -679,8 +679,9 @@ class TestBrokerStopCancelsConnections(unittest.IsolatedAsyncioTestCase):
     async def test_stop_cancels_pending_connection_task(self):
         """A connection task blocked at request_permission must be cancelled by stop()."""
         import asyncio
+
         from gateway.agents.claude.broker import ClaudePermissionBroker
-        from gateway.core.permission import PermissionRegistry, PermissionNotifier
+        from gateway.core.permission import PermissionNotifier, PermissionRegistry
 
         registry = MagicMock(spec=PermissionRegistry)
         notifier = MagicMock(spec=PermissionNotifier)
@@ -716,8 +717,9 @@ class TestBrokerStopCancelsConnections(unittest.IsolatedAsyncioTestCase):
     async def test_connection_tasks_empty_after_stop(self):
         """_connection_tasks must be empty after stop() completes."""
         import asyncio
+
         from gateway.agents.claude.broker import ClaudePermissionBroker
-        from gateway.core.permission import PermissionRegistry, PermissionNotifier
+        from gateway.core.permission import PermissionNotifier, PermissionRegistry
 
         registry = MagicMock(spec=PermissionRegistry)
         notifier = MagicMock(spec=PermissionNotifier)
@@ -738,7 +740,7 @@ class TestBrokerStopCancelsConnections(unittest.IsolatedAsyncioTestCase):
             finally:
                 broker._connection_tasks.discard(task)
 
-        task = asyncio.create_task(dummy())
+        task = asyncio.create_task(dummy())  # noqa: F841 — used inside dummy() closure
         await asyncio.sleep(0)
         await asyncio.sleep(0)
 
@@ -756,8 +758,9 @@ def _make_decide_broker(
     session_id: str = "ses_test",
 ) -> ClaudePermissionBroker:
     """Minimal broker for _decide() unit tests — no notifier/registry needed."""
-    from unittest.mock import MagicMock, AsyncMock
-    from gateway.core.permission import PermissionRegistry, ConnectorPermissionNotifier
+    from unittest.mock import AsyncMock, MagicMock
+
+    from gateway.core.permission import ConnectorPermissionNotifier, PermissionRegistry
 
     registry = PermissionRegistry()
     connector = MagicMock()

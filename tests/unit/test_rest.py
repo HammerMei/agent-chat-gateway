@@ -13,12 +13,11 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch, call
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 
 from gateway.connectors.rocketchat.rest import RocketChatREST, RoomNotFoundError
-
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -796,7 +795,8 @@ class TestDownloadFileReauthNotNested(unittest.IsolatedAsyncioTestCase):
 
         rest.login = fake_login
 
-        import tempfile, os
+        import os
+        import tempfile
         with tempfile.TemporaryDirectory() as tmpdir:
             dest = os.path.join(tmpdir, "out.bin")
             await rest.download_file("/file/path", dest)
@@ -843,7 +843,8 @@ class TestDownloadFileReauthNotNested(unittest.IsolatedAsyncioTestCase):
         rest._download_client = MagicMock()
         rest._download_client.stream = lambda method, url, **kw: FakeStream()
 
-        import tempfile, os
+        import os
+        import tempfile
         with tempfile.TemporaryDirectory() as tmpdir:
             dest = os.path.join(tmpdir, "out.bin")
             await rest.download_file("/file/path", dest)
@@ -876,7 +877,8 @@ class TestUploadFileNonBlocking(unittest.IsolatedAsyncioTestCase):
         rest._download_client = MagicMock()
         rest._download_client.post = AsyncMock(return_value=mock_response)
 
-        import tempfile, os
+        import os
+        import tempfile
         with tempfile.TemporaryDirectory() as tmpdir:
             fpath = os.path.join(tmpdir, "test.txt")
             Path(fpath).write_bytes(b"hello world")
@@ -934,7 +936,8 @@ class TestDownloadFileUniqueTmpPath(unittest.IsolatedAsyncioTestCase):
         rest._download_client = MagicMock()
         rest._download_client.stream = lambda method, url, **kw: FakeStream()
 
-        import tempfile, os
+        import os
+        import tempfile
 
         with tempfile.TemporaryDirectory() as tmpdir:
             dest = os.path.join(tmpdir, "file.bin")

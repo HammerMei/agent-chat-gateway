@@ -16,7 +16,6 @@ import httpx
 
 from gateway.agents.opencode.callable_broker import OpenCodeCallablePermissionBroker
 
-
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
@@ -364,6 +363,7 @@ class TestSseConnectTimeout(unittest.TestCase):
     def test_sse_client_has_connect_timeout(self):
         """_listen_sse must use httpx.Timeout with a connect value, not timeout=None."""
         import inspect
+
         import gateway.agents.opencode.callable_broker as cb_mod
 
         source = inspect.getsource(cb_mod.OpenCodeCallablePermissionBroker._listen_sse)

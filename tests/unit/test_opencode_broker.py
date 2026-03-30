@@ -5,9 +5,9 @@ import json
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from gateway.agents.opencode.broker import OpenCodePermissionBroker
 from gateway.config import ToolRule
 from gateway.core.permission import PermissionRegistry
-from gateway.agents.opencode.broker import OpenCodePermissionBroker
 
 
 def _make_broker(
@@ -468,6 +468,7 @@ class TestSSEConnectTimeout(unittest.TestCase):
     def test_sse_client_uses_connect_timeout(self):
         """The SSE client must specify a connect timeout (not timeout=None)."""
         import inspect
+
         import gateway.agents.opencode.broker as broker_mod
 
         source = inspect.getsource(broker_mod.OpenCodePermissionBroker._listen_sse)

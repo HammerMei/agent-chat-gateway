@@ -17,24 +17,21 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from ...agents.response import AgentResponse
 from ...core.connector import (
-    Attachment,
     Connector,
     IncomingMessage,
     MessageHandler,
     Room,
-    User,
-    UserRole,
 )
 from .config import RocketChatConfig
 from .normalize import FilterResult, filter_rc_message, normalize_rc_message
 from .outbound import send_media as _send_media
-from .policy import apply_thread_policy
 from .outbound import send_text as _send_text
+from .policy import apply_thread_policy
 from .rest import RocketChatREST, RoomNotFoundError
 from .websocket import RCWebSocketClient
 
@@ -433,8 +430,6 @@ class RocketChatConnector(Connector):
         if not sub:
             logger.warning("Received message for unknown room_id=%s", room_id)
             return
-
-        contexts = self._watcher_contexts.get(room_id, [])
 
         # --- Filter (room-level, evaluated once) ---
         result: FilterResult = filter_rc_message(

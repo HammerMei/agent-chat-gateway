@@ -88,7 +88,7 @@ class TestBuildAttachmentPrompt(unittest.TestCase):
             ["/tmp/a.txt", "/tmp/b.pdf", "/tmp/c.png"],
         )
         lines = result.split("\n")
-        attached_lines = [l for l in lines if l.startswith("[Attached:")]
+        attached_lines = [line for line in lines if line.startswith("[Attached:")]
         self.assertEqual(len(attached_lines), 3)
 
     def test_multiple_attachments_all_filenames_present(self):

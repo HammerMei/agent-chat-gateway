@@ -19,11 +19,10 @@ import json
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-
 # ── Helper: build a minimal client instance without connecting ────────────────
 
 
-def _make_client() -> "RCWebSocketClient":
+def _make_client():
     from gateway.connectors.rocketchat.websocket import RCWebSocketClient
 
     return RCWebSocketClient(

@@ -25,7 +25,6 @@ from gateway.core.permission import (
     _format_timeout_msg,
 )
 
-
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 class _StubBroker(PermissionBroker):

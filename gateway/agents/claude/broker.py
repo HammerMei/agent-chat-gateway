@@ -17,7 +17,12 @@ import json
 import logging
 from typing import TYPE_CHECKING
 
-from ...core.permission import PermissionBroker, PermissionNotificationError, PermissionNotifier, PermissionRegistry
+from ...core.permission import (
+    PermissionBroker,
+    PermissionNotificationError,
+    PermissionNotifier,
+    PermissionRegistry,
+)
 from ...core.tool_match import all_params_match_any, get_param_strings_for_claude
 from ._http_utils import build_error_response, build_http_response, read_http_body
 from .settings_adapter import ClaudeSettingsAdapter

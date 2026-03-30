@@ -49,6 +49,7 @@ import asyncio
 import os
 import sys
 import time
+
 try:
     from rich.console import Console
     from rich.markdown import Markdown
@@ -69,10 +70,10 @@ try:
 except ImportError:
     pass
 
-from gateway.config import GatewayConfig
 from gateway.agents.claude.adapter import ClaudeBackend
 from gateway.agents.opencode.adapter import OpenCodeBackend
 from gateway.agents.session import AgentSession, PermissionHandler
+from gateway.config import GatewayConfig
 from gateway.tools.tui_permission_handler import tui_permission_handler as _tui_permission_handler
 
 console = Console()

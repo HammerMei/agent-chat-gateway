@@ -49,7 +49,7 @@ class TestStatePersistence(unittest.TestCase):
 
     def test_save_and_load_round_trip_single(self):
         """A saved WatcherState survives a load_state() call unchanged."""
-        from gateway.core.state import save_state, load_state
+        from gateway.core.state import load_state, save_state
 
         ws = _make_state()
         save_state("rc", [ws])
@@ -66,7 +66,7 @@ class TestStatePersistence(unittest.TestCase):
 
     def test_save_and_load_multiple_watchers(self):
         """Multiple watchers saved and loaded preserve all entries."""
-        from gateway.core.state import save_state, load_state
+        from gateway.core.state import load_state, save_state
 
         states = [
             _make_state("w1", "s1", "r1"),
@@ -82,7 +82,7 @@ class TestStatePersistence(unittest.TestCase):
 
     def test_save_overwrites_previous(self):
         """A second save_state() replaces the previous file contents."""
-        from gateway.core.state import save_state, load_state
+        from gateway.core.state import load_state, save_state
 
         save_state("rc", [_make_state("original")])
         save_state("rc", [_make_state("updated")])
@@ -93,7 +93,7 @@ class TestStatePersistence(unittest.TestCase):
 
     def test_connector_namespacing(self):
         """Different connector names use separate state files."""
-        from gateway.core.state import save_state, load_state
+        from gateway.core.state import load_state, save_state
 
         save_state("rc-prod", [_make_state("prod-watcher")])
         save_state("rc-staging", [_make_state("staging-watcher")])
@@ -115,7 +115,7 @@ class TestStatePersistence(unittest.TestCase):
 
     def test_save_empty_list_clears_state(self):
         """Saving an empty list produces a valid file that loads back as []."""
-        from gateway.core.state import save_state, load_state
+        from gateway.core.state import load_state, save_state
 
         save_state("rc", [_make_state()])
         save_state("rc", [])
@@ -126,7 +126,7 @@ class TestStatePersistence(unittest.TestCase):
 
     def test_load_legacy_format_migrates_watcher_id_to_watcher_name(self):
         """Legacy records with 'watcher_id' are migrated to 'watcher_name'."""
-        from gateway.core.state import load_state, _state_file
+        from gateway.core.state import _state_file, load_state
 
         state_file = _state_file("rc")
         legacy_data = {
@@ -155,7 +155,7 @@ class TestStatePersistence(unittest.TestCase):
 
     def test_load_legacy_fallback_uses_watcher_id_when_no_room_name(self):
         """Legacy record without room_name falls back to watcher_id as name."""
-        from gateway.core.state import load_state, _state_file
+        from gateway.core.state import _state_file, load_state
 
         state_file = _state_file("rc")
         legacy_data = {
@@ -179,7 +179,7 @@ class TestStatePersistence(unittest.TestCase):
 
     def test_load_corrupt_json_returns_empty_list(self):
         """Corrupt state file → load_state() returns [] and logs a warning."""
-        from gateway.core.state import load_state, _state_file
+        from gateway.core.state import _state_file, load_state
 
         state_file = _state_file("rc")
         state_file.write_text("{this is not valid json}")
@@ -189,7 +189,7 @@ class TestStatePersistence(unittest.TestCase):
 
     def test_load_missing_watcher_name_field_skipped(self):
         """Records with neither watcher_name nor watcher_id are skipped silently."""
-        from gateway.core.state import load_state, _state_file
+        from gateway.core.state import _state_file, load_state
 
         state_file = _state_file("rc")
         data = {"watchers": [{"session_id": "s1", "room_id": "r1"}]}
@@ -202,7 +202,7 @@ class TestStatePersistence(unittest.TestCase):
 
     def test_save_produces_valid_json(self):
         """The written state file is valid JSON with expected structure."""
-        from gateway.core.state import save_state, _state_file
+        from gateway.core.state import _state_file, save_state
 
         ws = _make_state()
         save_state("rc", [ws])
@@ -214,7 +214,7 @@ class TestStatePersistence(unittest.TestCase):
 
     def test_save_cleans_up_tmp_on_write_error(self):
         """If the write fails, the .tmp file is removed (no leftover)."""
-        from gateway.core.state import save_state, _state_file
+        from gateway.core.state import _state_file, save_state
 
         # Find where the tmp file would be created
         state_file = _state_file("rc")
@@ -237,7 +237,7 @@ class TestStatePersistence(unittest.TestCase):
 
     def test_save_no_leftover_tmp_on_success(self):
         """After a successful save, no .tmp file should remain."""
-        from gateway.core.state import save_state, _state_file
+        from gateway.core.state import _state_file, save_state
 
         save_state("rc", [_make_state()])
         state_file = _state_file("rc")
@@ -248,7 +248,7 @@ class TestStatePersistence(unittest.TestCase):
 
     def test_paused_flag_persisted(self):
         """paused=True survives round-trip."""
-        from gateway.core.state import save_state, load_state, WatcherState
+        from gateway.core.state import WatcherState, load_state, save_state
 
         ws = WatcherState(
             watcher_name="paused-watcher",
@@ -262,7 +262,7 @@ class TestStatePersistence(unittest.TestCase):
 
     def test_last_processed_ts_persisted(self):
         """last_processed_ts survives round-trip."""
-        from gateway.core.state import save_state, load_state, WatcherState
+        from gateway.core.state import WatcherState, load_state, save_state
 
         ws = WatcherState(
             watcher_name="ts-watcher",

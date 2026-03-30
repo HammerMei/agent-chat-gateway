@@ -9,16 +9,13 @@ from __future__ import annotations
 
 import os
 import signal
-import sys
 import tempfile
 import unittest
-from io import BytesIO
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import gateway.daemon as daemon_mod
 import gateway.runtime_lock as runtime_lock_mod
-
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -157,7 +154,6 @@ class TestStopDaemon(unittest.TestCase):
 
     def test_stop_sends_sigterm_to_running_pid(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            pid_file = Path(tmpdir) / "gateway.pid"
             fake_pid = 99999
 
             # Patch is_running to pretend a process is running

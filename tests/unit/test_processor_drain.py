@@ -18,11 +18,10 @@ from gateway.agents.errors import AgentUnavailableError
 from gateway.agents.response import AgentResponse
 from gateway.config import WatcherConfig
 from gateway.core.config import AgentConfig, CoreConfig
-from gateway.core.context_injector import ContextInjector, InjectionStatus
 from gateway.core.connector import IncomingMessage, Room, User, UserRole
+from gateway.core.context_injector import ContextInjector, InjectionStatus
 from gateway.core.message_processor import MessageProcessor
 from gateway.core.state import WatcherState
-
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -359,14 +358,13 @@ if __name__ == "__main__":
 
 # ── Appended from test_code_review_fixes.py ───────────────────────────────────
 
-from tests.helpers import IsolatedTestCase as _IsolatedTestCase3
+from tests.helpers import IsolatedTestCase as _IsolatedTestCase3  # noqa: E402
 
 
 class TestProcessorStoppingFlag(_IsolatedTestCase3):
     """P1-1: enqueue() must reject messages when the processor is stopping."""
 
     def _make_processor(self, connector, agent):
-        from gateway.connectors.script import ScriptConnector
         agent_cfg = AgentConfig(timeout=10)
         config = CoreConfig(agents={"default": agent_cfg}, default_agent="default")
         room = Room(id="room-1", name="general", type="channel")

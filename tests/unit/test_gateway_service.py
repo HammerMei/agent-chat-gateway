@@ -143,7 +143,7 @@ class TestWriteStartupSignal(unittest.TestCase):
         self.assertIn("error:watcher bar skipped", payload)
         self.assertIn("ok", payload)
         # ok must appear AFTER error lines (last line)
-        lines = [l for l in payload.splitlines() if l.strip()]
+        lines = [line for line in payload.splitlines() if line.strip()]
         self.assertEqual(lines[-1], "ok")
 
     # ── Fatal path ────────────────────────────────────────────────────────────
@@ -187,7 +187,7 @@ class TestWriteStartupSignal(unittest.TestCase):
         _write_startup_signal(wfd, ["line one\nline two"], fatal=True)
         payload = self._read_pipe(-1, rfd)
         # Must be a single error: line with the newline replaced by space
-        error_lines = [l for l in payload.splitlines() if l.startswith("error:")]
+        error_lines = [line for line in payload.splitlines() if line.startswith("error:")]
         self.assertEqual(len(error_lines), 1)
         self.assertIn("line one line two", error_lines[0])
 
@@ -258,7 +258,6 @@ class TestWriteStartupSignal(unittest.TestCase):
         This simulates the daemon writing only error lines (fatal=True path)
         and verifies the parent correctly interprets absence of 'ok' as failure.
         """
-        import sys
         from gateway.daemon import _wait_for_startup_signal
 
         rfd, wfd = os.pipe()
@@ -420,7 +419,8 @@ class TestStartupFdOnCancel(unittest.IsolatedAsyncioTestCase):
     async def test_startup_fd_written_on_cancelled_error(self):
         """_write_startup_signal must be called in finally even after CancelledError."""
         import asyncio
-        from unittest.mock import AsyncMock, MagicMock, patch
+        from unittest.mock import AsyncMock, MagicMock
+
         from gateway.service import GatewayService
 
         svc = GatewayService.__new__(GatewayService)

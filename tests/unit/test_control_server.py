@@ -17,7 +17,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from gateway.control import ControlServer
 
-
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _make_entry(name: str, dispatch_result: dict | None = None,

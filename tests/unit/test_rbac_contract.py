@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 from gateway.agents import AgentBackend
 from gateway.agents.response import AgentResponse
@@ -19,7 +19,6 @@ from gateway.config import AgentConfig
 from gateway.core.config import CoreConfig
 from gateway.core.connector import IncomingMessage, Room, User, UserRole
 from gateway.core.message_processor import MessageProcessor
-
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 

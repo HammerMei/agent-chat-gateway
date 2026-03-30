@@ -13,9 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..agents import AgentBackend
-from .config import WatcherConfig
+from .config import CoreConfig, WatcherConfig
 from .state import WatcherState
-from .config import CoreConfig
 
 logger = logging.getLogger("agent-chat-gateway.core.context_injector")
 

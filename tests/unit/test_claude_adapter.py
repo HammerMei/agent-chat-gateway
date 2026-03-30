@@ -18,7 +18,6 @@ from gateway.agents.claude.adapter import ClaudeBackend
 from gateway.agents.errors import AgentRateLimitedError
 from gateway.agents.response import AgentResponse
 
-
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 

@@ -16,7 +16,6 @@ Run with:
 """
 
 from __future__ import annotations
-import pytest
 
 import asyncio
 import tempfile
@@ -24,12 +23,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from gateway.agents.response import AgentResponse
 from gateway.config import AgentConfig, WatcherConfig
 from gateway.core.config import CoreConfig
-from gateway.core.context_injector import ContextInjector, _MAX_FILE_SIZE, _MAX_INJECT_ATTEMPTS
+from gateway.core.context_injector import _MAX_FILE_SIZE, _MAX_INJECT_ATTEMPTS, ContextInjector
 from gateway.state import WatcherState
-
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
 
@@ -371,7 +371,7 @@ class TestContextInjectionOrdering(unittest.IsolatedAsyncioTestCase):
     async def _run_test(self, watcher_configs, check_fn):
         from gateway.agents import AgentBackend
         from gateway.agents.response import AgentResponse
-        from gateway.config import AgentConfig, WatcherConfig
+        from gateway.config import AgentConfig
         from gateway.connectors.script import ScriptConnector
         from gateway.core.config import CoreConfig
         from gateway.core.session_manager import SessionManager
@@ -505,7 +505,6 @@ class TestAsyncFileIOInContextInjection(unittest.IsolatedAsyncioTestCase):
         """Verify _inject_context uses asyncio.to_thread (non-blocking I/O)."""
         from gateway.connectors.script import ScriptConnector
         from gateway.core.session_manager import SessionManager
-        from tests.helpers import IsolatedTestCase
 
         # Use IsolatedTestCase patches manually
         _patch_load = patch("gateway.core.state_store.load_state", return_value=[])

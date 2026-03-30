@@ -7,7 +7,6 @@ import logging
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
 
 import websockets
 

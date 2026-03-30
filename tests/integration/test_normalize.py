@@ -14,7 +14,6 @@ Run with:
 """
 
 from __future__ import annotations
-import pytest
 
 import asyncio
 import tempfile
@@ -22,8 +21,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from tests.helpers import IsolatedTestCase
+import pytest
 
+from tests.helpers import IsolatedTestCase
 
 # ── Tests: path traversal check ──────────────────────────────────────────────
 

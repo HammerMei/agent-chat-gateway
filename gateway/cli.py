@@ -135,12 +135,12 @@ def main():
         stop_daemon()
 
     elif args.command == "restart":
-        from .daemon import stop_daemon, start_daemon
+        from .daemon import start_daemon, stop_daemon
         stop_daemon()
         start_daemon(args.config)
 
     elif args.command == "status":
-        from .daemon import is_running, PID_FILE, LOG_FILE
+        from .daemon import LOG_FILE, PID_FILE, is_running
         running, pid = is_running()
         if running:
             # Get uptime

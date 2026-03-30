@@ -10,11 +10,9 @@ Run with:
 
 from __future__ import annotations
 
-import asyncio
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
-
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -27,8 +25,8 @@ def _make_config(
     owners: list[str] | None = None,
 ):
     """Build a minimal RocketChatConfig for testing."""
-    from gateway.connectors.rocketchat.config import RocketChatConfig
     from gateway.config import AttachmentConfig
+    from gateway.connectors.rocketchat.config import RocketChatConfig
     return RocketChatConfig(
         server_url=server_url,
         username=username,
@@ -99,8 +97,8 @@ class TestConnectorWatermarkAfterHandler(unittest.IsolatedAsyncioTestCase):
         }
 
         from gateway.connectors.rocketchat.config import (
-            RocketChatConfig,
             AttachmentConfig,
+            RocketChatConfig,
         )
         from gateway.connectors.rocketchat.normalize import FilterResult
 
@@ -246,11 +244,11 @@ class TestWatermarkAdvancement(unittest.IsolatedAsyncioTestCase):
     """Issue #8: dedup watermark must advance only after handler success."""
 
     def _make_connector_and_sub(self):
+        from gateway.connectors.rocketchat.config import RocketChatConfig
         from gateway.connectors.rocketchat.connector import (
             RocketChatConnector,
             _RoomSubscription,
         )
-        from gateway.connectors.rocketchat.config import RocketChatConfig
         from gateway.core.connector import Room
 
         config = MagicMock(spec=RocketChatConfig)
@@ -513,7 +511,8 @@ class TestConnectorProperties(unittest.TestCase):
 
     def test_register_capacity_check_stores_callable(self):
         connector = _make_connector()
-        check = lambda room_id: True
+        def check(room_id: str) -> bool:
+            return True
         connector.register_capacity_check(check)
         self.assertIs(connector._capacity_check, check)
 

@@ -12,16 +12,15 @@ Covers:
 from __future__ import annotations
 
 import asyncio
-from types import MappingProxyType
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
+from types import MappingProxyType
+from unittest.mock import AsyncMock, MagicMock
 
 from gateway.agents import AgentBackend
 from gateway.agents.response import AgentResponse
 from gateway.core.permission import PermissionRegistry
 from gateway.core.session_maps import SessionMaps
 from gateway.service import AgentRuntimeManager
-
 
 # ── Test backend ──────────────────────────────────────────────────────────────
 

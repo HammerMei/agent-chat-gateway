@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import logging
 
-from .state import WatcherState, load_state, save_state
 from .connector import Connector
+from .state import WatcherState, load_state, save_state
 
 logger = logging.getLogger("agent-chat-gateway.core.state_store")
 

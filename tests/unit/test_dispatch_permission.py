@@ -16,15 +16,12 @@ Run with:
 
 from __future__ import annotations
 
-import asyncio
 import unittest
 from unittest.mock import AsyncMock, MagicMock
 
-from gateway.agents.response import AgentResponse
 from gateway.core.connector import IncomingMessage, Room, User, UserRole
 from gateway.core.dispatch import MessageDispatcher
 from gateway.core.permission import PermissionRegistry, PermissionRequest
-
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -279,9 +276,9 @@ if __name__ == "__main__":
 
 # ── Appended from test_code_review_fixes.py ───────────────────────────────────
 
-from gateway.agents import AgentBackend as _AgentBackend
-from gateway.agents.response import AgentResponse as _AgentResponse
-from tests.helpers import IsolatedTestCase as _IsolatedTestCase
+from gateway.agents import AgentBackend as _AgentBackend  # noqa: E402
+from gateway.agents.response import AgentResponse as _AgentResponse  # noqa: E402
+from tests.helpers import IsolatedTestCase as _IsolatedTestCase  # noqa: E402
 
 
 class _MockAgentBackend(_AgentBackend):
@@ -309,7 +306,7 @@ def _make_watcher_cr(room="script", name=None):
 
 
 def _make_permission_request_cr(registry, room_id="script", session_id="mock-session-0001"):
-    from gateway.core.permission import _generate_id, PermissionRequest
+    from gateway.core.permission import PermissionRequest, _generate_id
     req = PermissionRequest(
         request_id=_generate_id(),
         tool_name="Bash",
@@ -322,8 +319,6 @@ def _make_permission_request_cr(registry, room_id="script", session_id="mock-ses
 
 
 def _make_manager_cr(connector, agent, watcher_configs=None, permission_registry=None):
-    from gateway.agents.response import AgentResponse
-    from gateway.agents import AgentBackend
     from gateway.config import AgentConfig
     from gateway.core.config import CoreConfig
     from gateway.core.session_manager import SessionManager
@@ -346,8 +341,8 @@ class TestPermissionCommandPreFanOut(_IsolatedTestCase):
     async def test_approve_command_resolves_permission(self):
         """An 'approve XXXX' message from an owner resolves the pending request."""
         from gateway.connectors.script import ScriptConnector
-        from gateway.core.permission import PermissionRegistry
         from gateway.core.connector import UserRole
+        from gateway.core.permission import PermissionRegistry
 
         connector = ScriptConnector()
         agent = _MockAgentBackend()
@@ -368,8 +363,8 @@ class TestPermissionCommandPreFanOut(_IsolatedTestCase):
 
     async def test_deny_command_resolves_permission(self):
         from gateway.connectors.script import ScriptConnector
-        from gateway.core.permission import PermissionRegistry
         from gateway.core.connector import UserRole
+        from gateway.core.permission import PermissionRegistry
 
         connector = ScriptConnector()
         agent = _MockAgentBackend()
@@ -388,8 +383,8 @@ class TestPermissionCommandPreFanOut(_IsolatedTestCase):
 
     async def test_permission_command_not_forwarded_to_agent(self):
         from gateway.connectors.script import ScriptConnector
-        from gateway.core.permission import PermissionRegistry
         from gateway.core.connector import UserRole
+        from gateway.core.permission import PermissionRegistry
 
         connector = ScriptConnector()
         agent = _MockAgentBackend()
@@ -410,8 +405,8 @@ class TestPermissionCommandPreFanOut(_IsolatedTestCase):
 
     async def test_invalid_request_id_length_rejected(self):
         from gateway.connectors.script import ScriptConnector
-        from gateway.core.permission import PermissionRegistry
         from gateway.core.connector import UserRole
+        from gateway.core.permission import PermissionRegistry
 
         connector = ScriptConnector()
         agent = _MockAgentBackend()
@@ -429,8 +424,8 @@ class TestPermissionCommandPreFanOut(_IsolatedTestCase):
 
     async def test_unknown_request_id_gets_no_pending_reply(self):
         from gateway.connectors.script import ScriptConnector
-        from gateway.core.permission import PermissionRegistry
         from gateway.core.connector import UserRole
+        from gateway.core.permission import PermissionRegistry
 
         connector = ScriptConnector()
         agent = _MockAgentBackend()
@@ -448,8 +443,8 @@ class TestPermissionCommandPreFanOut(_IsolatedTestCase):
 
     async def test_guest_cannot_approve(self):
         from gateway.connectors.script import ScriptConnector
-        from gateway.core.permission import PermissionRegistry
         from gateway.core.connector import UserRole
+        from gateway.core.permission import PermissionRegistry
 
         connector = ScriptConnector()
         agent = _MockAgentBackend()
@@ -470,8 +465,8 @@ class TestPermissionCommandPreFanOut(_IsolatedTestCase):
 
     async def test_non_permission_messages_still_fan_out(self):
         from gateway.connectors.script import ScriptConnector
-        from gateway.core.permission import PermissionRegistry
         from gateway.core.connector import UserRole
+        from gateway.core.permission import PermissionRegistry
 
         connector = ScriptConnector()
         agent = _MockAgentBackend(responses=["hello back"])

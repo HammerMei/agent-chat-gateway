@@ -12,7 +12,6 @@ import logging
 
 from ..agents import AgentBackend
 from .adapter_utils import ts_gt as _ts_gt
-from .state import WatcherState
 from .attachment_workspace import AttachmentWorkspace
 from .config import CoreConfig, WatcherConfig
 from .connector import Connector
@@ -21,6 +20,7 @@ from .dispatch import MessageDispatcher
 from .message_processor import MessageProcessor
 from .permission import PermissionRegistry
 from .session_maps import SessionMaps
+from .state import WatcherState
 from .state_store import StateStore
 
 logger = logging.getLogger("agent-chat-gateway.core.watcher_lifecycle")

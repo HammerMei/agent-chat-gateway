@@ -11,12 +11,12 @@ Consolidates tests from:
 """
 
 from __future__ import annotations
-import pytest
 
 import asyncio
 import unittest
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from gateway.agents import AgentBackend
 from gateway.agents.response import AgentResponse
@@ -24,7 +24,6 @@ from gateway.config import AgentConfig, WatcherConfig
 from gateway.connectors.script import ScriptConnector
 from gateway.core.config import CoreConfig
 from gateway.core.session_manager import SessionManager
-
 from tests.helpers import IsolatedTestCase
 
 # Patch load_state/save_state globally so tests never touch live state files.
@@ -98,8 +97,9 @@ def make_manager(connector, agent, watcher_configs=None, permission_registry=Non
 
 def _make_lifecycle_r14(watcher_names=None):
     """Build a minimal WatcherLifecycle with mocked collaborators."""
+    from gateway.core.config import CoreConfig
+    from gateway.core.config import WatcherConfig as CoreWatcherConfig
     from gateway.core.watcher_lifecycle import WatcherLifecycle
-    from gateway.core.config import WatcherConfig as CoreWatcherConfig, CoreConfig
 
     if watcher_names is None:
         watcher_names = ["support"]
@@ -275,7 +275,6 @@ class TestAttachmentWorkspaceInThread(unittest.IsolatedAsyncioTestCase):
     async def test_setup_called_via_to_thread(self):
         """setup() must be wrapped in asyncio.to_thread(), not called directly."""
         from gateway.core.watcher_lifecycle import WatcherLifecycle
-        from gateway.state import WatcherState
 
         lc = WatcherLifecycle.__new__(WatcherLifecycle)
         lc._states = {}
@@ -352,7 +351,6 @@ class TestAttachmentWorkspaceRollback(unittest.IsolatedAsyncioTestCase):
     async def test_states_and_maps_rolled_back_on_setup_failure(self):
         """If attachment_workspace.setup() raises, state and maps must be cleaned up."""
         from gateway.core.watcher_lifecycle import WatcherLifecycle
-        from gateway.state import WatcherState
 
         lc = WatcherLifecycle.__new__(WatcherLifecycle)
         lc._states = {}

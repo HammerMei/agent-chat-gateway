@@ -3,7 +3,6 @@
 import asyncio
 import logging
 import mimetypes
-import os
 import secrets
 from pathlib import Path
 from typing import Any

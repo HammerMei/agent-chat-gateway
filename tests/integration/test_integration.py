@@ -8,13 +8,14 @@ Run with:
 """
 
 from __future__ import annotations
-import pytest
 
 import asyncio
 import unittest
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
+
+import pytest
 
 from gateway.agents import AgentBackend
 from gateway.agents.response import AgentResponse
@@ -614,8 +615,9 @@ class TestRCRefcount(unittest.IsolatedAsyncioTestCase):
     def _make_connector(self):
         """Return a RocketChatConnector with all network deps mocked out."""
         from unittest.mock import AsyncMock, MagicMock
-        from gateway.connectors.rocketchat.connector import RocketChatConnector
+
         from gateway.connectors.rocketchat.config import RocketChatConfig
+        from gateway.connectors.rocketchat.connector import RocketChatConnector
 
         config = MagicMock(spec=RocketChatConfig)
         config.server_url = "http://localhost:3000"
@@ -683,8 +685,9 @@ class TestMultiWatcherDispatch(unittest.IsolatedAsyncioTestCase):
 
     def _make_connector(self):
         from unittest.mock import AsyncMock, MagicMock
-        from gateway.connectors.rocketchat.connector import RocketChatConnector
+
         from gateway.connectors.rocketchat.config import RocketChatConfig
+        from gateway.connectors.rocketchat.connector import RocketChatConnector
 
         config = MagicMock(spec=RocketChatConfig)
         config.server_url = "http://localhost:3000"
@@ -712,7 +715,8 @@ class TestMultiWatcherDispatch(unittest.IsolatedAsyncioTestCase):
     async def test_handler_called_once_for_two_watcher_contexts(self):
         """One DDP message → handler called exactly once, regardless of watcher count."""
         from unittest.mock import AsyncMock, MagicMock, patch
-        from gateway.core.connector import Room, IncomingMessage, User, UserRole
+
+        from gateway.core.connector import IncomingMessage, Room, User, UserRole
 
         connector = self._make_connector()
         room = Room(id="room-multi", name="general", type="channel")
@@ -772,7 +776,8 @@ class TestMultiWatcherDispatch(unittest.IsolatedAsyncioTestCase):
     async def test_handler_called_once_for_single_watcher(self):
         """Baseline: single watcher also results in exactly one handler call."""
         from unittest.mock import AsyncMock, MagicMock, patch
-        from gateway.core.connector import Room, IncomingMessage, User, UserRole
+
+        from gateway.core.connector import IncomingMessage, Room, User, UserRole
 
         connector = self._make_connector()
         room = Room(id="room-single", name="dev", type="channel")
@@ -823,6 +828,7 @@ class TestMultiWatcherDispatch(unittest.IsolatedAsyncioTestCase):
     async def test_handler_not_called_when_message_filtered(self):
         """Filtered messages must never reach the handler, regardless of watcher count."""
         from unittest.mock import AsyncMock, MagicMock, patch
+
         from gateway.core.connector import Room
 
         connector = self._make_connector()
@@ -871,8 +877,9 @@ class TestMultiWatcherDispatch(unittest.IsolatedAsyncioTestCase):
 
     async def test_send_text_splits_long_messages_using_connector_chunk_limit(self):
         """RocketChatConnector.send_text should pass text_chunk_limit through outbound helper."""
-        from gateway.agents.response import AgentResponse
         from unittest.mock import AsyncMock
+
+        from gateway.agents.response import AgentResponse
 
         connector = self._make_connector()
         connector._rest.post_message = AsyncMock()
@@ -889,7 +896,7 @@ class TestWatermarkPersistence(IsolatedTestCase):
 
     async def test_watermark_pulled_from_connector_on_save(self):
         """_save_state() reads the live ts from the connector before serializing."""
-        from unittest.mock import MagicMock, patch
+        from unittest.mock import patch
 
         connector = ScriptConnector()
         agent = MockAgentBackend()
@@ -915,6 +922,7 @@ class TestWatermarkPersistence(IsolatedTestCase):
     async def test_watermark_restored_into_connector_on_start(self):
         """On startup, last_processed_ts from persisted state is pushed into the connector."""
         from unittest.mock import patch
+
         from gateway.state import WatcherState
 
         persisted_ts = "1234567890.000001"
@@ -970,7 +978,6 @@ class TestDeferredRegistration(IsolatedTestCase):
 
     async def test_startup_failure_in_inject_context_leaves_no_state(self):
         """If _inject_context raises, the watcher is not registered in _states or _processors."""
-        from unittest.mock import patch, AsyncMock
 
         connector = ScriptConnector()
         agent = MockAgentBackend()
@@ -1001,7 +1008,7 @@ class TestDeferredRegistration(IsolatedTestCase):
     async def test_startup_failure_in_subscribe_room_leaves_no_state(self):
         """If subscribe_room raises, _processors is cleared but _states retains the
         partial WatcherState so that context_injected is preserved on retry."""
-        from unittest.mock import patch, AsyncMock
+        from unittest.mock import patch
 
         connector = ScriptConnector()
         agent = MockAgentBackend()
@@ -1187,6 +1194,7 @@ class TestDuplicateSessionIdValidation(unittest.TestCase):
         """Two watchers sharing the same sticky session_id → ValueError on from_file()."""
         import tempfile
         import textwrap
+
         from gateway.config import GatewayConfig
 
         cfg = textwrap.dedent("""\
@@ -1223,6 +1231,7 @@ class TestDuplicateSessionIdValidation(unittest.TestCase):
         """Two watchers with different sticky session_ids → no error."""
         import tempfile
         import textwrap
+
         from gateway.config import GatewayConfig
 
         cfg = textwrap.dedent("""\
@@ -1258,6 +1267,7 @@ class TestDuplicateSessionIdValidation(unittest.TestCase):
         """Watchers without sticky session_ids (auto-create) must never trigger the check."""
         import tempfile
         import textwrap
+
         from gateway.config import GatewayConfig
 
         cfg = textwrap.dedent("""\
@@ -1293,8 +1303,9 @@ class TestAttachmentCachePath(unittest.IsolatedAsyncioTestCase):
 
     def _make_connector(self):
         from unittest.mock import AsyncMock, MagicMock
-        from gateway.connectors.rocketchat.connector import RocketChatConnector
+
         from gateway.connectors.rocketchat.config import RocketChatConfig
+        from gateway.connectors.rocketchat.connector import RocketChatConnector
 
         config = MagicMock(spec=RocketChatConfig)
         config.server_url = "http://localhost:3000"
@@ -1321,8 +1332,9 @@ class TestAttachmentCachePath(unittest.IsolatedAsyncioTestCase):
 
     async def test_normalize_receives_global_cache_dir_with_room_id(self):
         """normalize_rc_message must be called with cache_dir = _attachments_cache_base / room_id."""
-        from unittest.mock import AsyncMock, MagicMock, patch, call
-        from gateway.core.connector import Room, IncomingMessage, User, UserRole
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from gateway.core.connector import IncomingMessage, Room, User, UserRole
 
         connector = self._make_connector()
         room = Room(id="ROOM-XYZ", name="general", type="channel")
@@ -1378,8 +1390,9 @@ class TestAttachmentCachePath(unittest.IsolatedAsyncioTestCase):
         """_download_attachments must use file_id (not idx) as the filename key."""
         import tempfile
         from unittest.mock import AsyncMock, MagicMock
-        from gateway.connectors.rocketchat.normalize import _download_attachments
+
         from gateway.config import AttachmentConfig
+        from gateway.connectors.rocketchat.normalize import _download_attachments
 
         config = MagicMock()
         config.attachments = AttachmentConfig(
@@ -1413,7 +1426,7 @@ class TestAttachmentCachePath(unittest.IsolatedAsyncioTestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             cache_dir = Path(tmpdir)
-            results = await _download_attachments(doc, config, rest, cache_dir)
+            await _download_attachments(doc, config, rest, cache_dir)
 
         # Verify file_id is present in each dest path
         downloaded_paths = [call.args[1] for call in rest.download_file.call_args_list]
@@ -1436,8 +1449,9 @@ class TestAttachmentCachePath(unittest.IsolatedAsyncioTestCase):
         different dest paths — no silent overwrite."""
         import tempfile
         from unittest.mock import AsyncMock, MagicMock
-        from gateway.connectors.rocketchat.normalize import _download_attachments
+
         from gateway.config import AttachmentConfig
+        from gateway.connectors.rocketchat.normalize import _download_attachments
 
         config = MagicMock()
         config.attachments = AttachmentConfig(

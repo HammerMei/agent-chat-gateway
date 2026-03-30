@@ -3,7 +3,7 @@
 import json
 import subprocess
 from pathlib import Path
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import yaml
@@ -15,7 +15,6 @@ from gateway.onboard import (
     load_install_meta,
     write_install_meta,
 )
-
 
 # ---------------------------------------------------------------------------
 # detect_agent_backends

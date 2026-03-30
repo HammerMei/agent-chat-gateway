@@ -17,7 +17,6 @@ from gateway.agents.response import AgentResponse
 from gateway.agents.session import AgentSession
 from tests.integration.test_integration import MockAgentBackend
 
-
 # ── Basic send/receive ─────────────────────────────────────────────────────────
 
 class TestAgentSessionBasic(unittest.IsolatedAsyncioTestCase):

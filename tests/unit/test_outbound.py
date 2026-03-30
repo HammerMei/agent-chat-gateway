@@ -8,7 +8,6 @@ Covers:
 
 from __future__ import annotations
 
-import asyncio
 import unittest
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -18,7 +17,6 @@ from gateway.connectors.rocketchat.outbound import (
     _split_text,
     send_text,
 )
-
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -72,7 +70,6 @@ class TestSplitText(unittest.TestCase):
         limit = 50
         result = _split_text(text, limit=limit)
         # Reassembled text (stripped) matches the original (stripped)
-        reassembled = " ".join(result)  # chunks are stripped — content is preserved
         for chunk in result:
             self.assertLessEqual(len(chunk), limit)
         self.assertGreater(len(result), 1)

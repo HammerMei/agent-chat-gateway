@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 from gateway.connectors.rocketchat.websocket import RCWebSocketClient
 
@@ -251,7 +251,6 @@ class TestReconnectFailure(unittest.IsolatedAsyncioTestCase):
         client._ws = mock_ws
 
         reconnect_called = False
-        original_reconnect = client._reconnect
 
         async def tracked_reconnect():
             nonlocal reconnect_called

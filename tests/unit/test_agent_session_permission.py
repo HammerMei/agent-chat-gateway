@@ -9,10 +9,9 @@ from __future__ import annotations
 import asyncio
 import json
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 from gateway.agents.session import AgentSession
-
 
 # ── Minimal mock backend ───────────────────────────────────────────────────────
 
@@ -157,6 +156,7 @@ class TestCallablePermissionBroker(unittest.IsolatedAsyncioTestCase):
     async def test_settings_path_written_after_start(self):
         """settings_path is non-empty after start() and cleaned up after stop()."""
         import os
+
         from gateway.agents.claude.callable_broker import CallablePermissionBroker
 
         broker = CallablePermissionBroker(AsyncMock(return_value=True))
@@ -169,7 +169,6 @@ class TestCallablePermissionBroker(unittest.IsolatedAsyncioTestCase):
 
     async def test_settings_file_contains_hook_url(self):
         """The written settings JSON points to the broker's localhost port."""
-        import os
         from gateway.agents.claude.callable_broker import CallablePermissionBroker
 
         broker = CallablePermissionBroker(AsyncMock(return_value=True))

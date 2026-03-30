@@ -66,8 +66,8 @@ def _get_bash_parser():
         return _bash_parser
 
     try:
-        from tree_sitter import Language, Parser  # type: ignore[import]
         import tree_sitter_bash as tsbash  # type: ignore[import]
+        from tree_sitter import Language, Parser  # type: ignore[import]
 
         lang = Language(tsbash.language())
         parser = Parser(lang)

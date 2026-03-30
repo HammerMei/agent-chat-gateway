@@ -1,14 +1,12 @@
 """Unit tests for gateway.upgrade."""
 
 import json
-import subprocess
 from pathlib import Path
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from gateway.upgrade import load_install_meta, run_migrations
-
 
 # ---------------------------------------------------------------------------
 # load_install_meta

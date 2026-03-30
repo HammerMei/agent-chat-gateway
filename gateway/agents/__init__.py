@@ -11,8 +11,6 @@ from .response import AgentResponse
 if TYPE_CHECKING:
     # Avoid circular imports — only used in type annotations
     PermissionHandler = Callable[[str, dict], Awaitable[bool]]
-    from ..config import ToolRule
-    from ..core.connector import Connector
     from ..core.permission import (
         PermissionBroker,
         PermissionNotifier,

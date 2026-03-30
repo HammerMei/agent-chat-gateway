@@ -16,9 +16,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from gateway.agents.response import AgentResponse
 from gateway.config import AgentConfig, WatcherConfig
 from gateway.core.config import CoreConfig
-from gateway.core.context_injector import ContextInjector, _MAX_INJECT_ATTEMPTS
+from gateway.core.context_injector import _MAX_INJECT_ATTEMPTS, ContextInjector
 from gateway.state import WatcherState
-
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -187,14 +186,8 @@ class TestUnsubscribeRoomRefcount(unittest.TestCase):
     def _make_connector(self):
         """Return a minimal RocketChatConnector with mocked internals."""
         from unittest.mock import MagicMock
+
         from gateway.connectors.rocketchat.connector import RocketChatConnector
-        from gateway.connectors.rocketchat.config import RocketChatConfig
-        cfg = RocketChatConfig(
-            name="rc",
-            server_url="http://localhost",
-            username="bot",
-            password="pw",
-        )
         c = RocketChatConnector.__new__(RocketChatConnector)
         c._rooms = {}
         c._watcher_contexts = {}

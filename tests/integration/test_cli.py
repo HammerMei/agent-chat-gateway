@@ -9,21 +9,20 @@ Run with:
 """
 
 from __future__ import annotations
-import pytest
 
 import io
 import json
 import shutil
 import socket
-import sys
 import tempfile
 import threading
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
+import pytest
 
 # ---------------------------------------------------------------------------
 # Helpers

@@ -14,7 +14,6 @@ from dataclasses import dataclass, field
 
 from .connector import UserRole
 
-
 # ── Shared config types ──────────────────────────────────────────────────────
 
 @dataclass

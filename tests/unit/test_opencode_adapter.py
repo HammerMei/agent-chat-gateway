@@ -8,7 +8,7 @@ import httpx
 
 from gateway.agents.errors import AgentRateLimitedError
 from gateway.agents.opencode import OpenCodeBackend
-from gateway.agents.response import AgentResponse, TokenUsage
+from gateway.agents.response import AgentResponse
 
 
 def _make_backend(**kwargs) -> OpenCodeBackend:
@@ -741,7 +741,7 @@ class TestCircuitBreakerFastFail(unittest.IsolatedAsyncioTestCase):
     """_ensure_live_runtime() must fast-fail after _MAX_RESTART_FAILURES failures."""
 
     def _make_backend(self):
-        from gateway.agents.opencode.adapter import OpenCodeBackend, _MAX_RESTART_FAILURES
+        from gateway.agents.opencode.adapter import OpenCodeBackend
         b = OpenCodeBackend.__new__(OpenCodeBackend)
         b._command = "opencode"
         b._new_session_args = []
@@ -762,8 +762,8 @@ class TestCircuitBreakerFastFail(unittest.IsolatedAsyncioTestCase):
 
     async def test_fast_fail_after_max_failures(self):
         """When consecutive failures >= _MAX_RESTART_FAILURES, raise immediately."""
-        from gateway.agents.opencode.adapter import _MAX_RESTART_FAILURES
         from gateway.agents.errors import AgentUnavailableError
+        from gateway.agents.opencode.adapter import _MAX_RESTART_FAILURES
         b = self._make_backend()
         b._process = MagicMock()
         b._process.returncode = 1
@@ -1135,7 +1135,6 @@ class TestEnsureLiveRuntimeStopRace(unittest.IsolatedAsyncioTestCase):
 
     async def test_agent_unavailable_when_stop_cleared_ever_started(self):
         """Simulates the race: needs_restart was True but stop() ran first."""
-        from gateway.agents.opencode.adapter import OpenCodeBackend
         from gateway.agents.errors import AgentUnavailableError
 
         b = self._make_backend()
@@ -1162,7 +1161,6 @@ class TestEnsureLiveRuntimeStopRace(unittest.IsolatedAsyncioTestCase):
 
     async def test_runtime_error_not_raised_on_shutdown_race(self):
         """The confusing RuntimeError('call start() before') must NOT be raised."""
-        from gateway.agents.opencode.adapter import OpenCodeBackend
         from gateway.agents.errors import AgentUnavailableError
 
         b = self._make_backend()
@@ -1251,7 +1249,6 @@ class TestGetClientRaisesAgentUnavailable(unittest.IsolatedAsyncioTestCase):
     async def test_send_raises_agent_unavailable_on_stop_race(self):
         """send() must surface AgentUnavailableError when stop() races."""
         from gateway.agents.errors import AgentUnavailableError
-        from gateway.agents.opencode.adapter import OpenCodeBackend
 
         b = self._make_backend()
         b._base_url = "http://127.0.0.1:9000"

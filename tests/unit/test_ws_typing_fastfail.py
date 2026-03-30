@@ -12,7 +12,7 @@ import asyncio
 import json
 import time
 import unittest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 from gateway.connectors.rocketchat.websocket import RCWebSocketClient
 

@@ -21,7 +21,6 @@ from gateway.core.tool_match import (
     matches_rule,
 )
 
-
 # ── _normalize_path ─────────────────────────────────────────────────────────
 
 

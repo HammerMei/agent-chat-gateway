@@ -10,7 +10,7 @@ without reaching up to the gateway application layer.
 import json
 import logging
 import os
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 logger = logging.getLogger("agent-chat-gateway.state")

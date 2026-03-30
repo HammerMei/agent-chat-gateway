@@ -25,13 +25,12 @@ from ..agents import AgentBackend
 from ..agents.response import AgentResponse
 from .agent_turn_runner import AgentTurnRunner, _user_facing_agent_error_message
 from .attachment_workspace import localize_attachment_paths
-from .config import CoreConfig
+from .config import CoreConfig, WatcherConfig
 from .connector import Connector, IncomingMessage, Room, UserRole
 from .context_injector import ContextInjector
 from .prompt_builder import build_prompt
 from .session_maps import SessionMaps
 from .state import WatcherState
-from .config import WatcherConfig
 
 if TYPE_CHECKING:
     from .permission import PermissionRegistry

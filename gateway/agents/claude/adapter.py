@@ -22,6 +22,7 @@ import os
 from collections import deque
 from typing import TYPE_CHECKING
 
+from ...core.adapter_utils import build_attachment_prompt
 from .. import AgentBackend, GatewayBrokerConfig
 from ..errors import (
     AgentExecutionError,
@@ -31,7 +32,6 @@ from ..errors import (
     AgentUnavailableError,
 )
 from ..response import AgentResponse, TokenUsage
-from ...core.adapter_utils import build_attachment_prompt
 
 if TYPE_CHECKING:
     from ...core.permission import (

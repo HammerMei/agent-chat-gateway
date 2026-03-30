@@ -20,7 +20,6 @@ from gateway.config import AgentConfig
 from gateway.core.agent_turn_runner import AgentTurnRunner
 from gateway.core.config import CoreConfig
 
-
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 

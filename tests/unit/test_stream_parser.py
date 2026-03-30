@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import unittest
 
-from gateway.agents.claude.adapter import _StreamParser, _MAX_RAW_PREVIEW_CHARS
+from gateway.agents.claude.adapter import _MAX_RAW_PREVIEW_CHARS, _StreamParser
 
 
 def _assistant_line(text: str) -> str:

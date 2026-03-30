@@ -9,9 +9,8 @@ Run with:
 
 from __future__ import annotations
 
-import asyncio
 import unittest
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock
 
 
 def _make_manager():
@@ -244,9 +243,9 @@ if __name__ == "__main__":
 
 # ── Appended from test_code_review_fixes.py ───────────────────────────────────
 
-from gateway.agents import AgentBackend as _AgentBackend2
-from gateway.agents.response import AgentResponse as _AgentResponse2
-from tests.helpers import IsolatedTestCase as _IsolatedTestCase2
+from gateway.agents import AgentBackend as _AgentBackend2  # noqa: E402
+from gateway.agents.response import AgentResponse as _AgentResponse2  # noqa: E402
+from tests.helpers import IsolatedTestCase as _IsolatedTestCase2  # noqa: E402
 
 
 class _MockAgentBackend2(_AgentBackend2):

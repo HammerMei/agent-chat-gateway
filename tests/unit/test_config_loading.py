@@ -18,7 +18,6 @@ from pathlib import Path
 
 from gateway.config import GatewayConfig
 
-
 # ── Tests: working_directory validation ──────────────────────────────────────
 
 
