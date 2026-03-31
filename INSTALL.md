@@ -3,6 +3,7 @@
 ## Prerequisites
 
 - **Python 3.12+** — https://python.org
+- **git** — https://git-scm.com (required by the installer and `upgrade` command)
 - **uv** — https://docs.astral.sh/uv/getting-started/installation/
 - **Agent backend** (at least one):
   - **Claude Code** — https://claude.ai/download

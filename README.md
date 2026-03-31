@@ -55,18 +55,34 @@ See [docs/user-guide.md](docs/user-guide.md) for configuration examples for each
 
 ## Quick Start
 
+### Recommended: AI-guided install
+
+The easiest way to install is to ask your AI agent to do it for you — it handles missing dependencies, config setup, and troubleshooting automatically:
+
+**Claude Code:**
+```
+claude "Please install agent-chat-gateway by following the instructions at https://raw.githubusercontent.com/HammerMei/agent-chat-gateway/main/docs/install-agent.md"
+```
+
+**OpenCode:**
+```
+opencode "Please install agent-chat-gateway by following the instructions at https://raw.githubusercontent.com/HammerMei/agent-chat-gateway/main/docs/install-agent.md"
+```
+
+### Manual install
+
 ```bash
-# 1. Install (macOS / Linux)
+# Requires: Python 3.12+, git
 curl -fsSL https://raw.githubusercontent.com/HammerMei/agent-chat-gateway/main/install.sh | bash
 ```
 
 The installer checks Python 3.12+, installs [uv](https://docs.astral.sh/uv/) if needed, clones the repo, and launches the interactive setup wizard.
 
 ```bash
-# 2. Start the daemon
-agent-chat-gateway start --config config.yaml
+# Start the daemon
+agent-chat-gateway start
 
-# 3. Check it's running
+# Check it's running
 agent-chat-gateway status
 agent-chat-gateway list
 ```

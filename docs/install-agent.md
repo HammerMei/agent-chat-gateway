@@ -9,6 +9,7 @@ Follow this guide to install `agent-chat-gateway` and set up your first agent wa
 Before starting, ensure you have:
 
 - **Python 3.12 or later** — Run `python3 --version` to check
+- **git** — Run `git --version` to check
 - **Claude CLI** or **OpenCode CLI** installed and authenticated
   - Claude CLI: https://claude.ai/download
   - OpenCode CLI: https://opencode.ai
@@ -21,31 +22,7 @@ Before starting, ensure you have:
 
 ## Step 1: Install the Gateway
 
-### Option A: One-line installer (recommended)
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/HammerMei/agent-chat-gateway/main/install.sh | bash
-```
-
-The script will:
-1. Check for Python 3.12+
-2. Install [uv](https://docs.astral.sh/uv/) if not already present
-3. Clone the repository to `~/agent-chat-gateway`
-4. Set up the virtual environment
-5. Symlink `agent-chat-gateway` into `~/.local/bin`
-6. Launch the interactive `onboard` wizard to guide you through initial config
-
-If the `onboard` wizard completes successfully, **skip to [Step 4](#step-4-start-the-daemon)**.
-
-### Option B: From Source (manual)
-
-```bash
-git clone https://github.com/HammerMei/agent-chat-gateway.git
-cd agent-chat-gateway
-uv sync                           # or: pip install -e .
-```
-
-### Option C: From PyPI
+### Option A: From PyPI (recommended)
 
 ```bash
 pip install agent-chat-gateway
@@ -57,6 +34,25 @@ agent-chat-gateway --help
 ```
 
 You should see the available commands: `start`, `stop`, `status`, `list`, `pause`, `resume`, `reset`, `send`, `onboard`, `upgrade`.
+
+### Option B: From Source
+
+```bash
+git clone https://github.com/HammerMei/agent-chat-gateway.git ~/agent-chat-gateway
+cd ~/agent-chat-gateway
+uv sync
+mkdir -p ~/.local/bin
+ln -sf ~/agent-chat-gateway/.venv/bin/agent-chat-gateway ~/.local/bin/agent-chat-gateway
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+### Option C: One-line installer (interactive — for human use)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/HammerMei/agent-chat-gateway/main/install.sh | bash
+```
+
+> ⚠️ This script launches an interactive setup wizard at the end. If running as an AI agent, use Option A or B and follow Steps 2–4 below to configure manually.
 
 ---
 
