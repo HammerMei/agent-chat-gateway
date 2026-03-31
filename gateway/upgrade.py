@@ -66,12 +66,61 @@ def _read_current_version(repo_path: Path) -> str:
     return "unknown"
 
 
+def _is_pip_installed() -> bool:
+    """Return True if the package is installed as a regular pip/PyPI package."""
+    try:
+        import importlib.metadata
+
+        importlib.metadata.version("agent-chat-gateway")
+        # Confirm it's not a local editable install (editable installs have a direct_url.json
+        # with "editable": true, or a .pth file pointing to a local path)
+        dist = importlib.metadata.distribution("agent-chat-gateway")
+        direct_url_text = None
+        for f in dist.files or []:
+            if f.name == "direct_url.json":
+                try:
+                    direct_url_text = f.read_text()
+                except Exception:
+                    pass
+                break
+        if direct_url_text:
+            import json as _json
+
+            info = _json.loads(direct_url_text)
+            # Editable or local directory installs are not "pip from PyPI"
+            if info.get("dir_info", {}).get("editable") or "url" not in info:
+                return False
+            if info["url"].startswith("file://"):
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _do_pip_upgrade() -> None:
+    """Upgrade via pip install --upgrade."""
+    console.print("  Detected install method: [bold]pip (PyPI)[/bold]")
+    console.print("  Running [bold]pip install --upgrade agent-chat-gateway[/bold] ...")
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--upgrade", "agent-chat-gateway"],
+        check=False,
+    )
+    if result.returncode != 0:
+        console.print("[red]Error:[/red] pip upgrade failed.")
+        sys.exit(1)
+    console.print("[green]Upgrade complete![/green]")
+
+
 def run_upgrade() -> None:
     """Entry point called by CLI."""
     console.print("[bold cyan]agent-chat-gateway upgrade[/bold cyan]")
 
     meta = load_install_meta()
     if not meta:
+        # No install_meta.json — check if installed via pip before giving up
+        if _is_pip_installed():
+            _do_pip_upgrade()
+            return
         console.print(
             "[yellow]Warning:[/yellow] install_meta.json not found.\n"
             "Cannot determine install method. Please upgrade manually:\n"

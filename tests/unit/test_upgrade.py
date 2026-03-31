@@ -277,16 +277,119 @@ class TestRunUpgrade:
 
         assert exc_info.value.code == 1
 
-    def test_run_upgrade_missing_meta(self, tmp_path: Path):
-        """Exits with error when install_meta.json does not exist."""
+    def test_run_upgrade_missing_meta_not_pip(self, tmp_path: Path):
+        """Exits with error when install_meta.json does not exist and not a pip install."""
         from gateway.upgrade import run_upgrade
 
         meta_file = tmp_path / "nonexistent_meta.json"
 
         with (
             patch("gateway.upgrade.META_FILE", meta_file),
+            patch("gateway.upgrade._is_pip_installed", return_value=False),
             pytest.raises(SystemExit) as exc_info,
         ):
             run_upgrade()
 
         assert exc_info.value.code == 1
+
+    def test_run_upgrade_pip_no_meta(self, tmp_path: Path):
+        """When install_meta.json is missing but pip-installed, runs pip upgrade."""
+        from gateway.upgrade import run_upgrade
+
+        meta_file = tmp_path / "nonexistent_meta.json"
+        ok_result = MagicMock()
+        ok_result.returncode = 0
+
+        with (
+            patch("gateway.upgrade.META_FILE", meta_file),
+            patch("gateway.upgrade._is_pip_installed", return_value=True),
+            patch("subprocess.run", return_value=ok_result) as mock_run,
+        ):
+            run_upgrade()
+
+        called_cmd = mock_run.call_args.args[0]
+        assert called_cmd[-2:] == ["--upgrade", "agent-chat-gateway"]
+
+    def test_run_upgrade_pip_failure(self, tmp_path: Path):
+        """Exits with error when pip upgrade fails."""
+        from gateway.upgrade import run_upgrade
+
+        meta_file = tmp_path / "nonexistent_meta.json"
+        fail_result = MagicMock()
+        fail_result.returncode = 1
+
+        with (
+            patch("gateway.upgrade.META_FILE", meta_file),
+            patch("gateway.upgrade._is_pip_installed", return_value=True),
+            patch("subprocess.run", return_value=fail_result),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            run_upgrade()
+
+        assert exc_info.value.code == 1
+
+
+class TestIsPipInstalled:
+    """Tests for _is_pip_installed detection logic."""
+
+    def test_returns_false_when_package_not_found(self):
+        """Returns False when importlib.metadata raises PackageNotFoundError."""
+        import importlib.metadata
+
+        from gateway.upgrade import _is_pip_installed
+
+        with patch.object(importlib.metadata, "version", side_effect=importlib.metadata.PackageNotFoundError):
+            assert _is_pip_installed() is False
+
+    def test_returns_true_when_no_direct_url(self):
+        """Returns True when package found and no direct_url.json (regular PyPI install)."""
+        import importlib.metadata
+
+        from gateway.upgrade import _is_pip_installed
+
+        mock_dist = MagicMock()
+        mock_dist.files = []  # no direct_url.json
+
+        with (
+            patch.object(importlib.metadata, "version", return_value="0.1.0"),
+            patch.object(importlib.metadata, "distribution", return_value=mock_dist),
+        ):
+            assert _is_pip_installed() is True
+
+    def test_returns_false_for_editable_install(self):
+        """Returns False when direct_url.json indicates editable install."""
+        import importlib.metadata
+
+        from gateway.upgrade import _is_pip_installed
+
+        mock_file = MagicMock()
+        mock_file.name = "direct_url.json"
+        mock_file.read_text.return_value = '{"url": "file:///home/user/repo", "dir_info": {"editable": true}}'
+
+        mock_dist = MagicMock()
+        mock_dist.files = [mock_file]
+
+        with (
+            patch.object(importlib.metadata, "version", return_value="0.1.0"),
+            patch.object(importlib.metadata, "distribution", return_value=mock_dist),
+        ):
+            assert _is_pip_installed() is False
+
+    def test_returns_false_for_local_directory_install(self):
+        """Returns False when direct_url.json indicates local directory install."""
+        import importlib.metadata
+
+        from gateway.upgrade import _is_pip_installed
+
+        mock_file = MagicMock()
+        mock_file.name = "direct_url.json"
+        mock_file.read_text.return_value = '{"url": "file:///home/user/repo", "dir_info": {"editable": false}}'
+
+        mock_dist = MagicMock()
+        mock_dist.files = [mock_file]
+
+        with (
+            patch.object(importlib.metadata, "version", return_value="0.1.0"),
+            patch.object(importlib.metadata, "distribution", return_value=mock_dist),
+        ):
+            assert _is_pip_installed() is False
