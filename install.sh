@@ -1,8 +1,22 @@
 #!/usr/bin/env bash
 # agent-chat-gateway installer
-# Usage:  bash install.sh
+# Usage:  bash install.sh [--no-onboard]
 # Or:     curl -fsSL https://raw.githubusercontent.com/HammerMei/agent-chat-gateway/main/install.sh | bash
+# Or:     curl -fsSL https://raw.githubusercontent.com/HammerMei/agent-chat-gateway/main/install.sh | bash -s -- --no-onboard
+#
+# Flags:
+#   --no-onboard   Skip the interactive setup wizard (for AI agents / automated installs)
 set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Parse flags
+# ---------------------------------------------------------------------------
+NO_ONBOARD=false
+for arg in "$@"; do
+  case "$arg" in
+    --no-onboard) NO_ONBOARD=true ;;
+  esac
+done
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -128,10 +142,17 @@ case ":$PATH:" in
 esac
 
 # ---------------------------------------------------------------------------
-# Run onboard wizard
+# Run onboard wizard (skipped when --no-onboard is passed)
 # ---------------------------------------------------------------------------
-info "Launching setup wizard..."
-"$VENV_BIN" onboard --repo-path "$REPO_DIR"
+if [ "$NO_ONBOARD" = true ]; then
+  info "Skipping setup wizard (--no-onboard). Configure manually:"
+  info "  1. Create ~/.agent-chat-gateway/.env with RC_URL, RC_USERNAME, RC_PASSWORD"
+  info "  2. Create ~/.agent-chat-gateway/config.yaml"
+  info "  3. Run: agent-chat-gateway start"
+else
+  info "Launching setup wizard..."
+  "$VENV_BIN" onboard --repo-path "$REPO_DIR"
+fi
 
 # ---------------------------------------------------------------------------
 # Next steps

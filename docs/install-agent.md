@@ -22,18 +22,18 @@ Before starting, ensure you have:
 
 ## Step 1: Install the Gateway
 
-### Option A: From PyPI (recommended)
+Run the one-line installer with `--no-onboard` to skip the interactive setup wizard:
 
 ```bash
-pip install agent-chat-gateway
+curl -fsSL https://raw.githubusercontent.com/HammerMei/agent-chat-gateway/main/install.sh | bash -s -- --no-onboard
 ```
 
-Add to PATH and make it persistent (skip if `~/.local/bin` is already in PATH):
-```bash
-mkdir -p ~/.local/bin
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
-export PATH="$HOME/.local/bin:$PATH"
-```
+This will:
+1. Check Python 3.12+ and install `uv` if missing
+2. Clone the repo to `~/agent-chat-gateway`
+3. Install dependencies with `uv sync`
+4. Create a symlink at `~/.local/bin/agent-chat-gateway`
+5. Add `~/.local/bin` to PATH in `~/.bashrc` / `~/.zshrc` if needed
 
 Verify the installation:
 ```bash
@@ -41,25 +41,6 @@ agent-chat-gateway --help
 ```
 
 You should see the available commands: `start`, `stop`, `status`, `list`, `pause`, `resume`, `reset`, `send`, `onboard`, `upgrade`.
-
-### Option B: From Source
-
-```bash
-git clone https://github.com/HammerMei/agent-chat-gateway.git ~/agent-chat-gateway
-cd ~/agent-chat-gateway
-uv sync
-mkdir -p ~/.local/bin
-ln -sf ~/agent-chat-gateway/.venv/bin/agent-chat-gateway ~/.local/bin/agent-chat-gateway
-export PATH="$HOME/.local/bin:$PATH"
-```
-
-### Option C: One-line installer (interactive — for human use)
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/HammerMei/agent-chat-gateway/main/install.sh | bash
-```
-
-> ⚠️ This script launches an interactive setup wizard at the end. If running as an AI agent, use Option A or B and follow Steps 2–4 below to configure manually.
 
 ---
 
