@@ -202,6 +202,7 @@ class TestRunUpgrade:
         with (
             patch("gateway.upgrade.META_FILE", meta_file),
             patch("gateway.upgrade.is_running", return_value=(False, None)),
+            patch("gateway.upgrade._find_uv", return_value="uv"),
             patch("subprocess.run", return_value=ok_result) as mock_run,
         ):
             run_upgrade()
@@ -243,6 +244,7 @@ class TestRunUpgrade:
             patch("gateway.upgrade.is_running", return_value=(True, 12345)),
             patch("gateway.upgrade.stop_daemon", stop_mock),
             patch("gateway.upgrade.start_daemon", start_mock),
+            patch("gateway.upgrade._find_uv", return_value="uv"),
             patch("subprocess.run", return_value=ok_result),
         ):
             run_upgrade()
@@ -270,6 +272,7 @@ class TestRunUpgrade:
         with (
             patch("gateway.upgrade.META_FILE", meta_file),
             patch("gateway.upgrade.is_running", return_value=(False, None)),
+            patch("gateway.upgrade._find_uv", return_value="uv"),
             patch("subprocess.run", return_value=fail_result),
             pytest.raises(SystemExit) as exc_info,
         ):
