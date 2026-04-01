@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.4] - 2026-04-01
+
+### Fixed
+- `install.sh`: always write `install_meta.json` so that `upgrade` works even
+  when `--no-onboard` skips the interactive wizard.
+- `upgrade`: resolve `uv` via common fallback paths (`~/.local/bin/uv`,
+  `~/.cargo/bin/uv`) when it is absent from PATH — common in SSH sessions.
+
+---
+
 ## [0.1.3] - 2026-04-01
 
 ### Added
