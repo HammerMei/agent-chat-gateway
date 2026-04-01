@@ -146,6 +146,22 @@ case ":$PATH:" in
 esac
 
 # ---------------------------------------------------------------------------
+# Write install_meta.json — always, regardless of --no-onboard
+# This is required by `agent-chat-gateway upgrade` to locate the repo.
+# ---------------------------------------------------------------------------
+ACG_VERSION=$(grep '^version' "$REPO_DIR/pyproject.toml" | sed 's/version = "\(.*\)"/\1/')
+RUNTIME_DIR="$HOME/.agent-chat-gateway"
+mkdir -p "$RUNTIME_DIR"
+cat > "$RUNTIME_DIR/install_meta.json" << EOF
+{
+  "method": "git",
+  "repo_path": "$REPO_DIR",
+  "version": "$ACG_VERSION"
+}
+EOF
+success "Wrote install_meta.json (version=$ACG_VERSION, repo=$REPO_DIR)"
+
+# ---------------------------------------------------------------------------
 # Run onboard wizard (skipped when --no-onboard is passed)
 # ---------------------------------------------------------------------------
 if [ "$NO_ONBOARD" = true ]; then

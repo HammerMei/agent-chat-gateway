@@ -24,6 +24,27 @@ def load_install_meta(meta_file: Path | None = None) -> dict:
         return {}
 
 
+def _find_uv() -> str:
+    """Return the path to the uv executable.
+
+    SSH sessions often have a minimal PATH that omits ~/.local/bin, so
+    shutil.which() may fail even when uv is installed.  Fall back to the
+    standard installation locations used by the official uv installer.
+    """
+    import shutil
+
+    if path := shutil.which("uv"):
+        return path
+    for candidate in [
+        Path.home() / ".local" / "bin" / "uv",
+        Path.home() / ".cargo" / "bin" / "uv",
+    ]:
+        if candidate.exists():
+            return str(candidate)
+    console.print("[red]Error:[/red] uv not found. Install from https://docs.astral.sh/uv/")
+    sys.exit(1)
+
+
 def do_git_upgrade(repo_path: Path) -> None:
     """git pull + uv sync in the given repo directory."""
     console.print(f"  Running [bold]git pull[/bold] in {repo_path} ...")
@@ -35,9 +56,10 @@ def do_git_upgrade(repo_path: Path) -> None:
         console.print("[red]Error:[/red] git pull failed.")
         sys.exit(1)
 
+    uv = _find_uv()
     console.print("  Running [bold]uv sync[/bold] ...")
     result = subprocess.run(
-        ["uv", "sync"],
+        [uv, "sync"],
         cwd=str(repo_path),
         check=False,
     )
