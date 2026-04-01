@@ -24,6 +24,96 @@ def load_install_meta(meta_file: Path | None = None) -> dict:
         return {}
 
 
+def _file_hash(path: Path) -> str | None:
+    """Return SHA256 hex digest of a file, or None if the file does not exist."""
+    import hashlib
+
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _snapshot_context_hashes(repo_path: Path) -> dict[str, str]:
+    """Return {filename: sha256} for all files in repo/contexts/ before git pull.
+
+    Called before git pull so we can later tell whether the repo file changed
+    and whether the user's runtime copy still matches the old repo version.
+    """
+    ctx_dir = repo_path / "contexts"
+    if not ctx_dir.is_dir():
+        return {}
+    return {
+        f.name: h
+        for f in ctx_dir.iterdir()
+        if f.is_file() and (h := _file_hash(f)) is not None
+    }
+
+
+def _sync_context_files(
+    repo_path: Path,
+    runtime_dir: Path,
+    pre_pull_hashes: dict[str, str],
+) -> None:
+    """Sync context files from repo to runtime dir after git pull.
+
+    Decision table for each file in repo/contexts/:
+      - Repo file is brand-new (wasn't in pre-pull snapshot) → copy unconditionally.
+      - User is missing the file (first upgrade from old install) → copy unconditionally.
+      - Repo file unchanged after pull → skip (nothing new to deliver).
+      - Repo file changed + user copy unmodified (hash matches old repo) → overwrite.
+      - Repo file changed + user copy modified (hash differs from old repo) → save new
+        version as <name>.default and warn the user to merge manually.
+    """
+    import shutil
+
+    ctx_src = repo_path / "contexts"
+    ctx_dst = runtime_dir / "contexts"
+
+    if not ctx_src.is_dir():
+        return
+
+    ctx_dst.mkdir(parents=True, exist_ok=True)
+
+    for src_file in sorted(ctx_src.iterdir()):
+        if not src_file.is_file():
+            continue
+
+        name = src_file.name
+        dst_file = ctx_dst / name
+        new_hash = _file_hash(src_file)
+        old_repo_hash = pre_pull_hashes.get(name)
+        user_hash = _file_hash(dst_file)
+
+        # Brand-new file added to repo, or user is missing the file entirely
+        # (e.g. upgrading from an old install that predates context file copying).
+        # Copy unconditionally in both cases.
+        if old_repo_hash is None or user_hash is None:
+            shutil.copy2(src_file, dst_file)
+            console.print(f"  New context file: contexts/{name}")
+            continue
+
+        # Repo file unchanged after pull — nothing to do.
+        if new_hash == old_repo_hash:
+            continue
+
+        # Repo file changed. User copy is "unmodified" when it still matches
+        # the old repo version.
+        user_modified = user_hash != old_repo_hash
+
+        if not user_modified:
+            shutil.copy2(src_file, dst_file)
+            console.print(f"  Updated context file: contexts/{name}")
+        else:
+            default_file = ctx_dst / f"{name}.default"
+            shutil.copy2(src_file, default_file)
+            console.print(
+                f"  [yellow]Warning:[/yellow] contexts/{name} has local changes.\n"
+                f"    New version saved as contexts/{name}.default\n"
+                f"    Review and merge manually — check release notes for details."
+            )
+
+
 def _find_uv() -> str:
     """Return the path to the uv executable.
 
@@ -46,7 +136,11 @@ def _find_uv() -> str:
 
 
 def do_git_upgrade(repo_path: Path) -> None:
-    """git pull + uv sync in the given repo directory."""
+    """git pull + uv sync + context file sync in the given repo directory."""
+    # Snapshot context file hashes BEFORE git pull so we can compare afterwards
+    # to determine which files changed and whether users have local modifications.
+    pre_pull_hashes = _snapshot_context_hashes(repo_path)
+
     console.print(f"  Running [bold]git pull[/bold] in {repo_path} ...")
     result = subprocess.run(
         ["git", "-C", str(repo_path), "pull"],
@@ -66,6 +160,8 @@ def do_git_upgrade(repo_path: Path) -> None:
     if result.returncode != 0:
         console.print("[red]Error:[/red] uv sync failed.")
         sys.exit(1)
+
+    _sync_context_files(repo_path, RUNTIME_DIR, pre_pull_hashes)
 
 
 def run_migrations(from_version: str) -> None:

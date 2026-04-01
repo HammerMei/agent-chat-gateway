@@ -146,12 +146,28 @@ case ":$PATH:" in
 esac
 
 # ---------------------------------------------------------------------------
+# Ensure runtime dir exists (needed by both context copy and install_meta.json)
+# ---------------------------------------------------------------------------
+RUNTIME_DIR="$HOME/.agent-chat-gateway"
+mkdir -p "$RUNTIME_DIR"
+
+# ---------------------------------------------------------------------------
+# Copy bundled context files to runtime dir
+# These are reference files (e.g. rc-gateway-context.md) that config.yaml
+# points to.  Copied (not symlinked) so users can safely edit them without
+# touching the git repo.  Upgrade handles smart merge via upgrade.py.
+# ---------------------------------------------------------------------------
+if [ -d "$REPO_DIR/contexts" ]; then
+    mkdir -p "$RUNTIME_DIR/contexts"
+    cp "$REPO_DIR/contexts/"* "$RUNTIME_DIR/contexts/"
+    success "Copied context files to $RUNTIME_DIR/contexts/"
+fi
+
+# ---------------------------------------------------------------------------
 # Write install_meta.json — always, regardless of --no-onboard
 # This is required by `agent-chat-gateway upgrade` to locate the repo.
 # ---------------------------------------------------------------------------
 ACG_VERSION=$(grep '^version' "$REPO_DIR/pyproject.toml" | sed 's/version = "\(.*\)"/\1/')
-RUNTIME_DIR="$HOME/.agent-chat-gateway"
-mkdir -p "$RUNTIME_DIR"
 cat > "$RUNTIME_DIR/install_meta.json" << EOF
 {
   "method": "git",

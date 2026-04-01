@@ -105,7 +105,7 @@ def generate_config_yaml(
         },
         "reply_in_thread": False,
         "permission_reply_in_thread": True,
-        "context_inject_files": [],
+        "context_inject_files": ["contexts/rc-gateway-context.md"],
     }
 
     agent_command = agent_type  # "claude" or "opencode"
