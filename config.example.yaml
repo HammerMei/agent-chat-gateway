@@ -78,6 +78,8 @@ agents:
         params: "git (log|diff|status|show)( .*)?"   # read-only git commands
       - tool: "Bash"
         params: "ls( .*)?"                           # directory listing
+      - tool: "Bash"
+        params: "agent-chat-gateway\\s+send\\s+.*"   # agent-initiated file/message send to RC
 
       # ── MCP tools: match by server or specific tool name ───────────────
       # params regex (if set) is matched against full tool_input JSON string
@@ -94,6 +96,8 @@ agents:
       - tool: "WebFetch"
         params: "https?://[^/]*\\.wikipedia\\.org/.*"  # guests: Wikipedia only
       - tool: "mcp__rocketchat__get_.*"
+      - tool: "Bash"
+        params: "agent-chat-gateway\\s+send\\s+.*"     # agent-initiated file/message send to RC
 
     timeout: 360                     # seconds to wait for agent response; must be > permissions.timeout
     permissions:
@@ -128,10 +132,14 @@ agents:
   #       params: "git (log|diff|status).*"
   #     - tool: "webfetch"
   #       params: "https?://[^/]*\\.github\\.com/.*"
+  #     - tool: "bash"
+  #       params: "agent-chat-gateway\\s+send\\s+.*"  # agent-initiated file/message send to RC
   #   guest_allowed_tools:
   #     - tool: "read"
   #     - tool: "glob"
   #     - tool: "grep"
+  #     - tool: "bash"
+  #       params: "agent-chat-gateway\\s+send\\s+.*"  # agent-initiated file/message send to RC
   #
   #   timeout: 360
   #   permissions:
