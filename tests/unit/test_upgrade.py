@@ -408,6 +408,7 @@ class TestFileHash:
     def test_returns_sha256_for_existing_file(self, tmp_path: Path):
         """Returns a hex SHA256 digest for a file that exists."""
         import hashlib
+
         from gateway.upgrade import _file_hash
 
         f = tmp_path / "test.txt"
@@ -458,6 +459,7 @@ class TestSnapshotContextHashes:
     def test_returns_hashes_for_all_files(self, tmp_path: Path):
         """Returns a filename→hash dict for every file in contexts/."""
         import hashlib
+
         from gateway.upgrade import _snapshot_context_hashes
 
         ctx = tmp_path / "contexts"
@@ -529,6 +531,7 @@ class TestSyncContextFiles:
     def test_missing_user_file_is_copied(self, tmp_path: Path):
         """A file that exists in the repo but not in runtime is copied (first-upgrade case)."""
         import hashlib
+
         from gateway.upgrade import _sync_context_files
 
         content = b"existing content"
@@ -546,6 +549,7 @@ class TestSyncContextFiles:
     def test_unchanged_repo_file_is_skipped(self, tmp_path: Path):
         """When repo file hasn't changed (hash matches pre-pull), user copy is not touched."""
         import hashlib
+
         from gateway.upgrade import _sync_context_files
 
         content = b"unchanged content"
@@ -562,6 +566,7 @@ class TestSyncContextFiles:
     def test_changed_file_unmodified_by_user_is_overwritten(self, tmp_path: Path):
         """Repo file changed + user copy still matches old repo → overwrite with new version."""
         import hashlib
+
         from gateway.upgrade import _sync_context_files
 
         old_content = b"old repo content"
@@ -579,6 +584,7 @@ class TestSyncContextFiles:
     def test_changed_file_modified_by_user_saves_default(self, tmp_path: Path):
         """Repo file changed + user copy diverged → save new version as .default, warn."""
         import hashlib
+
         from gateway.upgrade import _sync_context_files
 
         old_content = b"old repo content"
@@ -623,6 +629,7 @@ class TestSyncContextFiles:
     def test_multiple_files_handled_independently(self, tmp_path: Path):
         """Each file follows its own decision path independently."""
         import hashlib
+
         from gateway.upgrade import _sync_context_files
 
         old_a = b"old-a"
