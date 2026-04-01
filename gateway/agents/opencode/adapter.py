@@ -709,7 +709,20 @@ class OpenCodeBackend(AgentBackend):
                 f"for session {session_id[:16]!r}"
             )
             raise _classify_http_error(exc.response.status_code, message) from None
-        return resp.json()
+
+        if not resp.content:
+            raise AgentUnavailableError(
+                f"opencode API returned empty response body (HTTP {resp.status_code}) "
+                f"for session {session_id[:16]!r} — "
+                "server may have returned a non-JSON response or crashed mid-request"
+            )
+        try:
+            return resp.json()
+        except Exception as exc:
+            raise AgentUnavailableError(
+                f"opencode API returned non-JSON response (HTTP {resp.status_code}) "
+                f"for session {session_id[:16]!r}: {resp.text[:200]!r}"
+            ) from exc
 
     async def _cleanup_session_best_effort(self, session_id: str) -> bool:
         """Try to delete a failed session; return True if cleanup succeeded."""
