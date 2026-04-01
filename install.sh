@@ -155,15 +155,27 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Detect shell config file for source hint
+# ---------------------------------------------------------------------------
+case "$SHELL" in
+  */zsh)  SHELL_RC="~/.zshrc" ;;
+  */fish) SHELL_RC="~/.config/fish/config.fish" ;;
+  *)      SHELL_RC="~/.bashrc" ;;
+esac
+
+# ---------------------------------------------------------------------------
 # Next steps
 # ---------------------------------------------------------------------------
 printf '\n'
 success "Installation complete!"
 printf '\n'
+printf '  Executable installed at: ~/.local/bin/agent-chat-gateway\n'
+printf '\n'
+printf '  To use agent-chat-gateway in your current shell, run:\n'
+printf '    source %s\n' "$SHELL_RC"
+printf '  Or restart your terminal.\n'
+printf '\n'
 printf '  Start the gateway:   agent-chat-gateway start\n'
 printf '  Check status:        agent-chat-gateway status\n'
 printf '  View logs:           tail -f ~/.agent-chat-gateway/gateway.log\n'
-printf '\n'
-printf '  If agent-chat-gateway is not found, restart your shell or run:\n'
-printf '    export PATH="$HOME/.local/bin:$PATH"\n'
 printf '\n'

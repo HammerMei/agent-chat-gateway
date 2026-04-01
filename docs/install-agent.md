@@ -35,9 +35,15 @@ This will:
 4. Create a symlink at `~/.local/bin/agent-chat-gateway`
 5. Add `~/.local/bin` to PATH in `~/.bashrc` / `~/.zshrc` if needed
 
+After the installer finishes, it will print:
+- The executable location: `~/.local/bin/agent-chat-gateway`
+- The `source` command needed to activate it in the current shell (e.g. `source ~/.zshrc`)
+
+**Inform the user:** The executable has been installed at `~/.local/bin/agent-chat-gateway`. They need to run `source ~/.zshrc` (or `source ~/.bashrc`, depending on their shell) — or restart their terminal — before `agent-chat-gateway` will work as a direct command.
+
 Verify the installation:
 ```bash
-agent-chat-gateway --help
+~/.local/bin/agent-chat-gateway --help
 ```
 
 You should see the available commands: `start`, `stop`, `status`, `list`, `pause`, `resume`, `reset`, `send`, `onboard`, `upgrade`.
