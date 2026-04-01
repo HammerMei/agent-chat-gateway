@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.5] - 2026-04-01
+
+### Added
+- Context files (`contexts/`) are now copied to `~/.agent-chat-gateway/contexts/`
+  on install so that `config.yaml` path references resolve correctly without
+  pointing into the git repo.
+- `upgrade` now syncs context files after `git pull` with smart merge:
+  unchanged user copies are overwritten; user-modified copies are saved as
+  `<name>.default` with a warning to merge manually.
+
+### Changed
+- `config.example.yaml`: moved `contexts/rc-gateway-context.md` from
+  agent-level to connector-level `context_inject_files` so it is shared
+  across all agents using that connector.
+- `onboard.py`: generated config now sets connector-level
+  `context_inject_files` (was incorrectly empty before).
+
+### Fixed
+- `install.sh`: `RUNTIME_DIR` is now defined before the context copy block
+  (was referenced before assignment in the previous release).
+
+---
+
 ## [0.1.4] - 2026-04-01
 
 ### Fixed
