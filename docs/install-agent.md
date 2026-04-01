@@ -30,10 +30,11 @@ curl -fsSL https://raw.githubusercontent.com/HammerMei/agent-chat-gateway/main/i
 
 This will:
 1. Check Python 3.12+ and install `uv` if missing
-2. Clone the repo to `~/agent-chat-gateway`
+2. Clone the repo to `~/.agent-chat-gateway/repo`
 3. Install dependencies with `uv sync`
-4. Create a symlink at `~/.local/bin/agent-chat-gateway`
-5. Add `~/.local/bin` to PATH in `~/.bashrc` / `~/.zshrc` if needed
+4. Copy bundled context files to `~/.agent-chat-gateway/contexts/`
+5. Create a symlink at `~/.local/bin/agent-chat-gateway`
+6. Add `~/.local/bin` to PATH in `~/.bashrc` / `~/.zshrc` if needed
 
 After the installer finishes, it will print:
 - The executable location: `~/.local/bin/agent-chat-gateway`
@@ -107,6 +108,8 @@ connectors:
       max_file_size_mb: 10
       download_timeout: 30
     reply_in_thread: false
+    context_inject_files:
+      - contexts/rc-gateway-context.md  # injected once per session: RC format, RBAC rules
 
 agents:
   my-agent:
@@ -114,6 +117,37 @@ agents:
     command: claude
     working_directory: ~/.agent-chat-gateway/work
     session_prefix: agent-chat
+    context_inject_files: []            # agent-level extra context (usually empty)
+
+    # ── Tool allow-lists ───────────────────────────────────────────────────
+    # Tools matched here are auto-approved for that role — no RC notification.
+    # Anything NOT matched triggers the human-in-the-loop approval flow.
+    # Each entry: tool (regex on tool name) + optional params (regex on primary param).
+    owner_allowed_tools:
+      - tool: "Read"
+      - tool: "Glob"
+      - tool: "Grep"
+      - tool: "WebSearch"
+      - tool: "WebFetch"
+        params: "https?://(www\\.)?github\\.com/.*"
+      - tool: "WebFetch"
+        params: "https?://[^/]*\\.wikipedia\\.org/.*"
+      - tool: "Bash"
+        params: "git (log|diff|status|show)( .*)?"   # read-only git
+      - tool: "Bash"
+        params: "ls( .*)?"
+      - tool: "Bash"
+        params: "agent-chat-gateway\\s+send\\s+.*"   # agent-initiated file send to RC
+
+    guest_allowed_tools:
+      - tool: "Read"
+      - tool: "Glob"
+      - tool: "Grep"
+      - tool: "WebFetch"
+        params: "https?://[^/]*\\.wikipedia\\.org/.*"
+      - tool: "Bash"
+        params: "agent-chat-gateway\\s+send\\s+.*"
+
     timeout: 360
     permissions:
       enabled: true
@@ -125,6 +159,7 @@ watchers:
     room: "@your-username"
     agent: my-agent
     session_id: null
+    context_inject_files: []            # watcher-level extra context (usually empty)
     online_notification: "✅ _Agent online_"
     offline_notification: "❌ _Agent offline_"
 EOF
@@ -135,6 +170,15 @@ EOF
 - `your-rocket-chat-server.com` — your Rocket.Chat server URL
 - `~/.agent-chat-gateway/work` — **the project folder where Claude Code or OpenCode will run tasks and create files**. Default to the current project directory (`pwd`); ask the user to confirm or change it before proceeding.
 - If using OpenCode instead of Claude, change `type: claude` and `command: claude` to `type: opencode` and `command: opencode`
+
+> **About `context_inject_files`:** The file `contexts/rc-gateway-context.md` is copied to
+> `~/.agent-chat-gateway/contexts/` by the installer. It tells the agent about the RC message
+> format, RBAC rules, and how to send files. Paths are resolved relative to `~/.agent-chat-gateway/`.
+
+> **About `owner_allowed_tools`:** Any tool call not matched by these rules triggers a
+> human-in-the-loop approval notification in RC. Adjust the list to match your security needs —
+> the example above allows common read-only tools and safe bash commands. See
+> `config.example.yaml` for more patterns and documentation.
 
 Create the working directory if it doesn't already exist:
 ```bash
