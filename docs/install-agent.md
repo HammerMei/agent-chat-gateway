@@ -28,6 +28,13 @@ Before starting, ensure you have:
 pip install agent-chat-gateway
 ```
 
+Add to PATH and make it persistent (skip if `~/.local/bin` is already in PATH):
+```bash
+mkdir -p ~/.local/bin
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+export PATH="$HOME/.local/bin:$PATH"
+```
+
 Verify the installation:
 ```bash
 agent-chat-gateway --help
