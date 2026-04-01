@@ -137,13 +137,14 @@ EOF
 ```
 
 **Replace:**
-- `your-username` with your Rocket.Chat username (the one who will own the bot)
-- `your-rocket-chat-server.com` with your actual server URL
+- `your-username` — your Rocket.Chat username (the one who will own the bot)
+- `your-rocket-chat-server.com` — your Rocket.Chat server URL
+- `~/.agent-chat-gateway/work` — **the project folder where Claude Code or OpenCode will run tasks and create files**. Default to the current project directory (`pwd`); ask the user to confirm or change it before proceeding.
 - If using OpenCode instead of Claude, change `type: claude` and `command: claude` to `type: opencode` and `command: opencode`
 
-Create the working directory:
+Create the working directory if it doesn't already exist:
 ```bash
-mkdir -p ~/.agent-chat-gateway/work
+mkdir -p <working_directory>
 ```
 
 ---
