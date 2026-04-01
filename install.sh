@@ -85,7 +85,8 @@ if [ -z "$SCRIPT_SOURCE" ] || [ "$SCRIPT_SOURCE" = "/dev/stdin" ] || [ "$SCRIPT_
 fi
 
 if [ "$CURL_PIPE" = true ]; then
-  REPO_DIR="$HOME/agent-chat-gateway"
+  REPO_DIR="$HOME/.agent-chat-gateway/repo"
+  mkdir -p "$HOME/.agent-chat-gateway"
   info "Running via curl|bash — will clone to $REPO_DIR"
   if [ -d "$REPO_DIR/.git" ]; then
     info "Repo already exists at $REPO_DIR — pulling latest..."
@@ -169,6 +170,7 @@ esac
 printf '\n'
 success "Installation complete!"
 printf '\n'
+printf '  Repository cloned to:    ~/.agent-chat-gateway/repo\n'
 printf '  Executable installed at: ~/.local/bin/agent-chat-gateway\n'
 printf '\n'
 printf '  To use agent-chat-gateway in your current shell, run:\n'

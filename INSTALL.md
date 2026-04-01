@@ -52,21 +52,21 @@ See the [Manual Steps](#manual-steps) section below.
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/HammerMei/agent-chat-gateway.git ~/agent-chat-gateway
-cd ~/agent-chat-gateway
+mkdir -p ~/.agent-chat-gateway
+git clone https://github.com/HammerMei/agent-chat-gateway.git ~/.agent-chat-gateway/repo
 ```
 
 ### 2. Install dependencies
 
 ```bash
-uv sync
+uv sync --project ~/.agent-chat-gateway/repo
 ```
 
 ### 3. Create the symlink
 
 ```bash
 mkdir -p ~/.local/bin
-ln -sf ~/agent-chat-gateway/.venv/bin/agent-chat-gateway ~/.local/bin/agent-chat-gateway
+ln -sf ~/.agent-chat-gateway/repo/.venv/bin/agent-chat-gateway ~/.local/bin/agent-chat-gateway
 ```
 
 Add `~/.local/bin` to your PATH if needed (add to `~/.zshrc` or `~/.bashrc`):
@@ -77,7 +77,7 @@ export PATH="$HOME/.local/bin:$PATH"
 ### 4. Run the setup wizard
 
 ```bash
-agent-chat-gateway onboard --repo-path ~/agent-chat-gateway
+agent-chat-gateway onboard --repo-path ~/.agent-chat-gateway/repo
 ```
 
 ---
@@ -120,11 +120,8 @@ agent-chat-gateway stop
 # Remove the symlink
 rm -f ~/.local/bin/agent-chat-gateway
 
-# Remove config and runtime data (optional — this deletes your config!)
+# Remove all data — repo, config, logs (this deletes everything!)
 rm -rf ~/.agent-chat-gateway
-
-# Remove the repo (optional)
-rm -rf ~/agent-chat-gateway
 ```
 
 ---
