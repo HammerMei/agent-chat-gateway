@@ -41,24 +41,7 @@ esac
 info "Detected OS: $OS_NAME ($ARCH)"
 
 # ---------------------------------------------------------------------------
-# Python 3.12+ check
-# ---------------------------------------------------------------------------
-if ! command -v python3 &>/dev/null; then
-  error "python3 not found. Install Python 3.12+ from https://python.org"
-fi
-
-PYTHON_VERSION="$(python3 --version 2>&1 | awk '{print $2}')"
-PYTHON_MAJOR="$(echo "$PYTHON_VERSION" | cut -d. -f1)"
-PYTHON_MINOR="$(echo "$PYTHON_VERSION" | cut -d. -f2)"
-
-if [ "$PYTHON_MAJOR" -lt 3 ] || { [ "$PYTHON_MAJOR" -eq 3 ] && [ "$PYTHON_MINOR" -lt 12 ]; }; then
-  error "Python 3.12+ required (found $PYTHON_VERSION). Install from https://python.org"
-fi
-
-info "Python $PYTHON_VERSION — OK"
-
-# ---------------------------------------------------------------------------
-# uv check / install
+# uv check / install (must come before Python check — uv can manage Python)
 # ---------------------------------------------------------------------------
 if ! command -v uv &>/dev/null; then
   warn "uv not found. Installing uv..."
@@ -71,6 +54,26 @@ if ! command -v uv &>/dev/null; then
   success "uv installed."
 else
   info "uv found: $(uv --version)"
+fi
+
+# ---------------------------------------------------------------------------
+# Python 3.12+ check — use uv to install if system Python is too old
+# ---------------------------------------------------------------------------
+PYTHON_OK=false
+if command -v python3 &>/dev/null; then
+  PYTHON_VERSION="$(python3 --version 2>&1 | awk '{print $2}')"
+  PYTHON_MAJOR="$(echo "$PYTHON_VERSION" | cut -d. -f1)"
+  PYTHON_MINOR="$(echo "$PYTHON_VERSION" | cut -d. -f2)"
+  if [ "$PYTHON_MAJOR" -gt 3 ] || { [ "$PYTHON_MAJOR" -eq 3 ] && [ "$PYTHON_MINOR" -ge 12 ]; }; then
+    PYTHON_OK=true
+    info "Python $PYTHON_VERSION — OK"
+  fi
+fi
+
+if [ "$PYTHON_OK" = false ]; then
+  warn "Python 3.12+ not found on system. Using uv to install Python 3.12..."
+  uv python install 3.12
+  success "Python 3.12 installed via uv."
 fi
 
 # ---------------------------------------------------------------------------
