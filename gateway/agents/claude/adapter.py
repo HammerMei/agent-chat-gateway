@@ -31,7 +31,7 @@ from ..errors import (
     AgentRateLimitedError,
     AgentUnavailableError,
 )
-from ..response import AgentResponse, TokenUsage
+from ..response import AgentEvent, AgentResponse, TokenUsage
 
 if TYPE_CHECKING:
     from ...core.permission import (
@@ -95,6 +95,44 @@ _MAX_RAW_PREVIEW_CHARS = 500
 # details often appear in the last ``result`` event rather than the initial
 # ``system/init`` event.
 _MAX_RAW_TAIL_LINES = 20
+
+
+def _parse_intermediate_events(line: str) -> list[AgentEvent]:
+    """Extract zero or more intermediate :class:`AgentEvent` objects from one stream-json line.
+
+    Recognises tool-use invocations and extended-thinking blocks emitted by
+    ``type="assistant"`` events.  All other event types (text blocks, result,
+    user/tool-result, system, etc.) return an empty list — they are handled
+    separately by :class:`_StreamParser`.
+
+    Args:
+        line: A single raw line from Claude's ``stream-json`` stdout.
+
+    Returns:
+        A (possibly empty) list of intermediate :class:`AgentEvent` objects.
+    """
+    try:
+        event = json.loads(line.strip())
+    except (json.JSONDecodeError, ValueError):
+        return []
+
+    if event.get("type") != "assistant":
+        return []
+
+    events: list[AgentEvent] = []
+    for block in event.get("message", {}).get("content", []):
+        block_type = block.get("type")
+        if block_type == "tool_use":
+            tool_name = block.get("name", "tool")
+            events.append(AgentEvent(kind="tool_call", text=f"🔧 {tool_name}"))
+        elif block_type == "thinking":
+            thinking = block.get("thinking", "").strip()
+            if thinking:
+                preview = thinking[:80]
+                if len(thinking) > 80:
+                    preview += "..."
+                events.append(AgentEvent(kind="thinking", text=f"💭 {preview}"))
+    return events
 
 
 async def _terminate_gracefully(proc: asyncio.subprocess.Process) -> None:
@@ -612,3 +650,164 @@ class ClaudeBackend(AgentBackend):
             )
 
         return parser.build_response()
+
+    async def stream(
+        self,
+        session_id: str,
+        prompt: str,
+        working_directory: str,
+        timeout: int,
+        attachments: list[str] | None = None,
+        env: dict[str, str] | None = None,
+    ):
+        """Stream Claude events, yielding intermediate tool/thinking events then a final one.
+
+        Reads Claude's ``stream-json`` stdout line-by-line.  For each line,
+        :func:`_parse_intermediate_events` extracts any tool-call or thinking
+        blocks and yields them immediately so the caller can forward them to the
+        connector for live status updates.  Lines are also fed to
+        :class:`_StreamParser` to accumulate the final :class:`AgentResponse`.
+
+        The generator guarantees exactly one ``final`` :class:`AgentEvent` as
+        its last item.  ``asyncio.TimeoutError`` and ``asyncio.CancelledError``
+        are re-raised after gracefully terminating the subprocess.
+        """
+        if attachments:
+            logger.info(
+                "Injecting %d attachment path(s) into prompt text: %s",
+                len(attachments),
+                attachments,
+            )
+            prompt = build_attachment_prompt(prompt, attachments, working_directory)
+
+        cmd = [
+            self.command,
+            "-p",
+            "--resume",
+            session_id,
+            "--output-format",
+            "stream-json",
+            "--verbose",
+        ]
+        if self.settings_path:
+            cmd += ["--dangerously-skip-permissions", "--settings", self.settings_path]
+
+        process_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+        if env:
+            process_env.update(env)
+
+        logger.debug(
+            "Running (stream): %s (cwd=%s)", " ".join(cmd) + " <stdin>", working_directory
+        )
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=working_directory,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=process_env,
+        )
+
+        # Write stdin in a background task so it does not block stdout reading.
+        async def _write_stdin() -> None:
+            proc.stdin.write(prompt.encode())
+            await proc.stdin.drain()
+            proc.stdin.close()
+            await proc.stdin.wait_closed()
+
+        # Read stderr in a background task with a bounded buffer.
+        async def _read_stderr() -> bytes:
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = await proc.stderr.read(4096)
+                if not chunk:
+                    break
+                if total < _MAX_STDERR_BYTES:
+                    sliced = chunk[: _MAX_STDERR_BYTES - total]
+                    chunks.append(sliced)
+                    total += len(sliced)
+            return b"".join(chunks)
+
+        stdin_task: asyncio.Task[None] = asyncio.create_task(_write_stdin())
+        stderr_task: asyncio.Task[bytes] = asyncio.create_task(_read_stderr())
+        parser = _StreamParser()
+        deadline = asyncio.get_event_loop().time() + timeout
+
+        try:
+            # Read stdout line-by-line, yielding intermediate events as they arrive.
+            while True:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError()
+                line_bytes = await asyncio.wait_for(
+                    proc.stdout.readline(), timeout=remaining
+                )
+                if not line_bytes:
+                    break  # EOF — subprocess closed stdout
+                line = line_bytes.decode(errors="replace")
+                for intermediate in _parse_intermediate_events(line):
+                    yield intermediate
+                parser.feed_line(line)
+
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            stdin_task.cancel()
+            stderr_task.cancel()
+            await _terminate_gracefully(proc)
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(proc.stdout.read(), proc.stderr.read()),
+                    timeout=5,
+                )
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except Exception:
+                pass
+            raise
+
+        # Stdout drained normally — collect stderr and reap the process.
+        stdin_task.cancel()
+        stderr_bytes: bytes = b""
+        try:
+            stderr_bytes = await asyncio.wait_for(stderr_task, timeout=5)
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=10)
+        except asyncio.TimeoutError:
+            logger.warning("claude stream process did not exit after stdout drain — killing")
+            proc.kill()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except Exception:
+                pass
+
+        if proc.returncode and proc.returncode != 0:
+            err_text = stderr_bytes.decode(errors="replace").strip()
+            out_preview = parser.raw_preview.strip()
+            out_tail = parser.raw_tail_preview.strip()
+            parsed_subtype = parser.result_subtype.strip()
+            parsed_error = parser.result_text.strip()
+            logger.error(
+                "agent stream exit code %d, stderr: %s",
+                proc.returncode,
+                err_text[:500] or "(empty)",
+            )
+            logger.error("agent stream stdout preview: %s", out_preview[:500] or "(empty)")
+            logger.error("agent stream stdout tail: %s", out_tail[:2000] or "(empty)")
+            diag = err_text or parsed_error or out_tail or out_preview or "unknown error"
+            exc_type = _classify_claude_error(diag, parsed_subtype)
+            raise exc_type(
+                f"agent exited with code {proc.returncode}"
+                f"{f' ({parsed_subtype})' if parsed_subtype else ''}: {diag}"
+            )
+
+        yield AgentEvent(kind="final", response=parser.build_response())
+

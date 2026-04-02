@@ -16,7 +16,11 @@ from __future__ import annotations
 import json
 import unittest
 
-from gateway.agents.claude.adapter import _MAX_RAW_PREVIEW_CHARS, _StreamParser
+from gateway.agents.claude.adapter import (
+    _MAX_RAW_PREVIEW_CHARS,
+    _StreamParser,
+    _parse_intermediate_events,
+)
 
 
 def _assistant_line(text: str) -> str:
@@ -147,6 +151,87 @@ class TestStreamParser(unittest.TestCase):
         resp = parser.build_response()
         self.assertEqual(resp.usage.cache_read_tokens, 80)
         self.assertEqual(resp.usage.cache_write_tokens, 20)
+
+
+class TestParseIntermediateEvents(unittest.TestCase):
+    """Tests for _parse_intermediate_events helper."""
+
+    def _tool_use_line(self, name: str) -> str:
+        return json.dumps({
+            "type": "assistant",
+            "message": {"content": [{"type": "tool_use", "id": "t1", "name": name, "input": {}}]},
+        })
+
+    def _thinking_line(self, thinking: str) -> str:
+        return json.dumps({
+            "type": "assistant",
+            "message": {"content": [{"type": "thinking", "thinking": thinking}]},
+        })
+
+    def _text_line(self, text: str) -> str:
+        return json.dumps({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": text}]},
+        })
+
+    def test_tool_use_block_yields_tool_call_event(self):
+        events = _parse_intermediate_events(self._tool_use_line("Bash"))
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].kind, "tool_call")
+        self.assertEqual(events[0].text, "🔧 Bash")
+
+    def test_thinking_block_yields_thinking_event(self):
+        events = _parse_intermediate_events(self._thinking_line("Let me think"))
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].kind, "thinking")
+        self.assertIn("💭", events[0].text)
+        self.assertIn("Let me think", events[0].text)
+
+    def test_thinking_block_truncated_at_80_chars(self):
+        long_thought = "x" * 100
+        events = _parse_intermediate_events(self._thinking_line(long_thought))
+        self.assertEqual(len(events), 1)
+        self.assertIn("...", events[0].text)
+        # text should be 💭 + space + 80 chars + "..."
+        self.assertLessEqual(len(events[0].text), 90)
+
+    def test_text_block_returns_empty(self):
+        events = _parse_intermediate_events(self._text_line("Hello world"))
+        self.assertEqual(events, [])
+
+    def test_result_event_returns_empty(self):
+        line = json.dumps({"type": "result", "subtype": "success", "session_id": "s1"})
+        events = _parse_intermediate_events(line)
+        self.assertEqual(events, [])
+
+    def test_user_event_returns_empty(self):
+        line = json.dumps({
+            "type": "user",
+            "message": {"content": [{"type": "tool_result", "tool_use_id": "t1"}]},
+        })
+        events = _parse_intermediate_events(line)
+        self.assertEqual(events, [])
+
+    def test_malformed_json_returns_empty(self):
+        events = _parse_intermediate_events("{not valid json")
+        self.assertEqual(events, [])
+
+    def test_multiple_blocks_in_one_event(self):
+        line = json.dumps({
+            "type": "assistant",
+            "message": {"content": [
+                {"type": "tool_use", "id": "t1", "name": "Read", "input": {}},
+                {"type": "tool_use", "id": "t2", "name": "Bash", "input": {}},
+            ]},
+        })
+        events = _parse_intermediate_events(line)
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0].text, "🔧 Read")
+        self.assertEqual(events[1].text, "🔧 Bash")
+
+    def test_empty_thinking_block_ignored(self):
+        events = _parse_intermediate_events(self._thinking_line(""))
+        self.assertEqual(events, [])
 
 
 if __name__ == "__main__":

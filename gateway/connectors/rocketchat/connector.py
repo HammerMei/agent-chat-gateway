@@ -20,7 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from ...agents.response import AgentResponse
+from ...agents.response import AgentEvent, AgentResponse
 from ...core.connector import (
     Connector,
     IncomingMessage,
@@ -36,6 +36,26 @@ from .rest import RocketChatREST, RoomNotFoundError
 from .websocket import RCWebSocketClient
 
 logger = logging.getLogger("agent-chat-gateway.connectors.rocketchat")
+
+
+# ---------------------------------------------------------------------------
+# Agent event formatting
+# ---------------------------------------------------------------------------
+
+
+def _format_agent_event_text(event: AgentEvent) -> str:
+    """Return a short human-readable status string for a live placeholder update.
+
+    Returns an empty string for event kinds that should not produce a visible
+    status update (e.g. unknown kinds added in future versions).
+    """
+    if event.kind == "tool_call":
+        return event.text  # e.g. "🔧 Bash"
+    if event.kind == "thinking":
+        return event.text  # e.g. "💭 Let me think..."
+    if event.kind == "tool_result":
+        return event.text  # e.g. "✓ Bash"
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +140,12 @@ class RocketChatConnector(Connector):
         self._attachments_cache_base = (
             Path(config.attachments.cache_dir_global).expanduser() / config.name
         )
+        # Tracks the RC message _id of the live status placeholder posted during
+        # an agent turn, keyed by room_id.  Agent turns are sequential per room
+        # (the message processor queue ensures this), so at most one placeholder
+        # exists per room at any time.  Cleared by send_text() after the final
+        # response is delivered.
+        self._turn_placeholder_msg_id: dict[str, str] = {}
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -162,7 +188,21 @@ class RocketChatConnector(Connector):
         is True the text is delivered as-is (already contains an error prefix).
         ``thread_id`` is forwarded as RC's ``tmid`` so the reply lands in the
         correct thread.
+
+        If a status placeholder was posted during the turn via
+        :meth:`notify_agent_event`, it is deleted before the final response is
+        posted so the placeholder does not linger alongside the real reply.
         """
+        # Best-effort cleanup of the live status placeholder, if any.
+        placeholder_id = self._turn_placeholder_msg_id.pop(room_id, None)
+        if placeholder_id:
+            try:
+                await self._rest.delete_message(room_id, placeholder_id)
+            except Exception as exc:
+                logger.debug(
+                    "Failed to delete agent event placeholder %s: %s", placeholder_id, exc
+                )
+
         await _send_text(
             self._rest,
             room_id,
@@ -170,6 +210,45 @@ class RocketChatConnector(Connector):
             chunk_limit=self.text_chunk_limit,
             tmid=thread_id,
         )
+
+    async def notify_agent_event(
+        self,
+        room_id: str,
+        event: AgentEvent,
+        thread_id: str | None = None,
+    ) -> None:
+        """Post or update a live status placeholder for the current agent turn.
+
+        On the first intermediate event for a room, posts a new placeholder
+        message and stores its ``_id``.  On subsequent events, updates that
+        message in-place via ``chat.update`` so the room does not flood with
+        status messages.
+
+        The placeholder is automatically cleaned up (deleted) by :meth:`send_text`
+        when the final agent response is delivered.
+
+        All errors are silently swallowed — a failed status update must never
+        abort an agent turn.
+        """
+        status_text = _format_agent_event_text(event)
+        if not status_text:
+            return
+
+        existing_id = self._turn_placeholder_msg_id.get(room_id)
+        try:
+            if existing_id is None:
+                msg_id = await self._rest.post_message_returning_id(
+                    room_id, status_text, tmid=thread_id
+                )
+                self._turn_placeholder_msg_id[room_id] = msg_id
+            else:
+                await self._rest.update_message(room_id, existing_id, status_text)
+        except Exception as exc:
+            logger.debug(
+                "Failed to post/update agent event placeholder in room %s: %s",
+                room_id,
+                exc,
+            )
 
     async def send_media(self, room_id: str, file_path: str, caption: str = "") -> None:
         """Upload a local file to the room."""
