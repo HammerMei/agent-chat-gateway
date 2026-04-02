@@ -190,10 +190,25 @@ class RocketChatConnector(Connector):
         correct thread.
 
         If a status placeholder was posted during the turn via
-        :meth:`notify_agent_event`, it is deleted before the final response is
-        posted so the placeholder does not linger alongside the real reply.
+        :meth:`notify_agent_event`, it is deleted *after* the final response is
+        successfully posted.  Deleting after posting ensures that if delivery
+        fails the placeholder remains visible (the user can see the last tool
+        status rather than an empty room), and the placeholder ID is retained in
+        ``_turn_placeholder_msg_id`` for the next retry attempt.
         """
-        # Best-effort cleanup of the live status placeholder, if any.
+        await _send_text(
+            self._rest,
+            room_id,
+            response.text,
+            chunk_limit=self.text_chunk_limit,
+            tmid=thread_id,
+        )
+
+        # Best-effort cleanup: delete the placeholder only after the final
+        # response has been posted successfully.  If _send_text raised above
+        # (caught by AgentTurnRunner._deliver_response), we never reach here and
+        # the placeholder ID stays in the dict so it can be cleaned up on the
+        # next successful send_text call for this room.
         placeholder_id = self._turn_placeholder_msg_id.pop(room_id, None)
         if placeholder_id:
             try:
@@ -202,14 +217,6 @@ class RocketChatConnector(Connector):
                 logger.debug(
                     "Failed to delete agent event placeholder %s: %s", placeholder_id, exc
                 )
-
-        await _send_text(
-            self._rest,
-            room_id,
-            response.text,
-            chunk_limit=self.text_chunk_limit,
-            tmid=thread_id,
-        )
 
     async def notify_agent_event(
         self,
@@ -244,7 +251,7 @@ class RocketChatConnector(Connector):
             else:
                 await self._rest.update_message(room_id, existing_id, status_text)
         except Exception as exc:
-            logger.debug(
+            logger.warning(
                 "Failed to post/update agent event placeholder in room %s: %s",
                 room_id,
                 exc,

@@ -20,6 +20,7 @@ import json
 import logging
 import os
 from collections import deque
+from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING
 
 from ...core.adapter_utils import build_attachment_prompt
@@ -111,6 +112,13 @@ def _parse_intermediate_events(line: str) -> list[AgentEvent]:
     Returns:
         A (possibly empty) list of intermediate :class:`AgentEvent` objects.
     """
+    # Fast-path: only assistant events carry tool_use / thinking blocks.
+    # Skipping JSON parsing for result / user / system lines avoids the
+    # allocation cost on large tool-result payloads (file contents, command
+    # output) which can be many kilobytes per line.
+    if '"assistant"' not in line:
+        return []
+
     try:
         event = json.loads(line.strip())
     except (json.JSONDecodeError, ValueError):
@@ -659,7 +667,7 @@ class ClaudeBackend(AgentBackend):
         timeout: int,
         attachments: list[str] | None = None,
         env: dict[str, str] | None = None,
-    ):
+    ) -> AsyncIterator[AgentEvent]:
         """Stream Claude events, yielding intermediate tool/thinking events then a final one.
 
         Reads Claude's ``stream-json`` stdout line-by-line.  For each line,
@@ -733,12 +741,12 @@ class ClaudeBackend(AgentBackend):
         stdin_task: asyncio.Task[None] = asyncio.create_task(_write_stdin())
         stderr_task: asyncio.Task[bytes] = asyncio.create_task(_read_stderr())
         parser = _StreamParser()
-        deadline = asyncio.get_event_loop().time() + timeout
+        deadline = asyncio.get_running_loop().time() + timeout
 
         try:
             # Read stdout line-by-line, yielding intermediate events as they arrive.
             while True:
-                remaining = deadline - asyncio.get_event_loop().time()
+                remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
                     raise asyncio.TimeoutError()
                 line_bytes = await asyncio.wait_for(
@@ -766,6 +774,15 @@ class ClaudeBackend(AgentBackend):
                 )
             except Exception:
                 pass
+            # Reap cancelled tasks so their CancelledErrors are observed and
+            # Python does not emit "Task exception was never retrieved" warnings.
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(stdin_task, stderr_task, return_exceptions=True),
+                    timeout=2,
+                )
+            except Exception:
+                pass
             try:
                 await asyncio.wait_for(proc.wait(), timeout=5)
             except Exception:
@@ -774,6 +791,12 @@ class ClaudeBackend(AgentBackend):
 
         # Stdout drained normally — collect stderr and reap the process.
         stdin_task.cancel()
+        # Await the cancelled task so its CancelledError is observed — avoids
+        # "Task exception was never retrieved" warnings in Python 3.11+.
+        try:
+            await asyncio.gather(stdin_task, return_exceptions=True)
+        except Exception:
+            pass
         stderr_bytes: bytes = b""
         try:
             stderr_bytes = await asyncio.wait_for(stderr_task, timeout=5)
