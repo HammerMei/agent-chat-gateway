@@ -579,6 +579,25 @@ class TestParseHttpResponse(unittest.TestCase):
         r = b._parse_http_response(data, "ses_1")
         self.assertFalse(r.is_error)
 
+    def test_step_finish_cache_null_does_not_crash(self):
+        """Explicit JSON null for 'cache' field must not raise AttributeError."""
+        b = self._backend()
+        data = {
+            "parts": [
+                {"type": "text", "text": "done"},
+                {
+                    "type": "step-finish",
+                    "tokens": {"input": 10, "output": 5, "reasoning": 0, "cache": None},
+                    "cost": 0.001,
+                },
+            ],
+            "info": {},
+        }
+        r = b._parse_http_response(data, "ses_1")
+        # Must not raise; cache tokens default to 0
+        self.assertEqual(r.usage.cache_read_tokens, 0)
+        self.assertEqual(r.usage.cache_write_tokens, 0)
+
 
 # ── _post_message error sanitization (Issue 12.4) ─────────────────────────────
 
@@ -1551,6 +1570,19 @@ class TestPostMessageAsync(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(AgentRateLimitedError):
             await b._post_message_async("sess-1", "hi", timeout=30)
 
+    async def test_503_raises_agent_unavailable(self):
+        """HTTP 503 (sidecar crashed mid-turn) maps to AgentUnavailableError."""
+        b = _make_started_backend()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 503
+        b._client.post = AsyncMock(
+            side_effect=httpx.HTTPStatusError(
+                "service unavailable", request=MagicMock(), response=mock_resp
+            )
+        )
+        with self.assertRaises(AgentUnavailableError):
+            await b._post_message_async("sess-1", "hi", timeout=30)
+
 
 class TestParseSSEEvents(unittest.IsolatedAsyncioTestCase):
     """_parse_sse_events() maps OpenCode SSE events to AgentEvents.
@@ -1819,6 +1851,58 @@ class TestParseSSEEvents(unittest.IsolatedAsyncioTestCase):
         # The early delta must not appear in final text
         self.assertNotIn("leaked reasoning", events[-1].response.text)
 
+    async def test_duplicate_tool_running_yields_only_one_tool_call(self):
+        """Repeated running-status updates for the same tool part emit only one tool_call."""
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "p1", "type": "tool", "tool": "Bash",
+                            "state": {"status": "running"}}),
+            # Second running update for the same part (state refresh)
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "p1", "type": "tool", "tool": "Bash",
+                            "state": {"status": "running"}}),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        tool_calls = [e for e in events if e.kind == "tool_call"]
+        self.assertEqual(len(tool_calls), 1, "Expected exactly one tool_call event")
+
+    async def test_duplicate_tool_completed_yields_only_one_tool_result(self):
+        """Repeated completed-status updates for the same tool part emit only one tool_result."""
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "p1", "type": "tool", "tool": "Read",
+                            "state": {"status": "running"}}),
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "p1", "type": "tool", "tool": "Read",
+                            "state": {"status": "completed"}}),
+            # Duplicate completed update
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "p1", "type": "tool", "tool": "Read",
+                            "state": {"status": "completed"}}),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        tool_results = [e for e in events if e.kind == "tool_result"]
+        self.assertEqual(len(tool_results), 1, "Expected exactly one tool_result event")
+
+    async def test_duplicate_step_finish_does_not_double_count_tokens(self):
+        """Repeated message.part.updated for same step-finish part counts tokens only once."""
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "sf1", "type": "step-finish",
+                            "tokens": {"input": 100, "output": 50, "reasoning": 0, "cache": {}},
+                            "cost": 0.01}),
+            # Duplicate (e.g. state finalization event)
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "sf1", "type": "step-finish",
+                            "tokens": {"input": 100, "output": 50, "reasoning": 0, "cache": {}},
+                            "cost": 0.01}),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        final = events[-1].response
+        self.assertEqual(final.num_turns, 1, "num_turns should be 1, not 2")
+        self.assertEqual(final.usage.input_tokens, 100, "input tokens must not be doubled")
+        self.assertAlmostEqual(final.cost_usd, 0.01, places=6)
+
 
 class TestStream(unittest.IsolatedAsyncioTestCase):
     """stream() end-to-end: SSE handshake, prompt posting, event lifecycle."""
@@ -1957,3 +2041,58 @@ class TestStream(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(final.response.is_error)
         # Also exercises the cache=null guard: no crash
         self.assertEqual(final.response.num_turns, 1)
+
+    async def test_stream_propagates_post_message_failure(self):
+        """If _post_message_async raises, stream() propagates the error and cancels SSE task."""
+        from gateway.agents.errors import AgentUnavailableError as _AUE
+        b = _make_started_backend()
+        b._ensure_live_runtime = AsyncMock()
+        b._post_message_async = AsyncMock(
+            side_effect=_AUE("sidecar rejected prompt with 503")
+        )
+
+        # SSE connects successfully but _post_message_async blows up
+        sse_lines: list[str] = []  # never gets consumed
+        mock_sse_resp = self._make_sse_response(sse_lines)
+        mock_sse_client = AsyncMock()
+        mock_sse_client.stream = MagicMock(return_value=mock_sse_resp)
+        mock_sse_client.__aenter__ = AsyncMock(return_value=mock_sse_client)
+        mock_sse_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("gateway.agents.opencode.adapter.httpx.AsyncClient",
+                   return_value=mock_sse_client):
+            with self.assertRaises(_AUE):
+                async for _ in b.stream("sess-1", "hi", "/tmp", timeout=30):
+                    pass
+
+    async def test_stream_timeout_raises_asyncio_timeout_error(self):
+        """stream() raises asyncio.TimeoutError when the deadline elapses mid-stream."""
+        b = _make_started_backend()
+        b._ensure_live_runtime = AsyncMock()
+        b._post_message_async = AsyncMock()
+
+        # SSE stream that never delivers session.status idle — just hangs
+        async def _hanging_lines():
+            # Yield one event then block forever
+            yield _sse_line("sess-1", "message.part.updated",
+                            part={"id": "t1", "type": "text"})
+            # simulate a very long wait by just not yielding anything else
+            await asyncio.sleep(999)
+
+        mock_resp = AsyncMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.aiter_lines = _hanging_lines
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+        mock_sse_client = AsyncMock()
+        mock_sse_client.stream = MagicMock(return_value=mock_resp)
+        mock_sse_client.__aenter__ = AsyncMock(return_value=mock_sse_client)
+        mock_sse_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("gateway.agents.opencode.adapter.httpx.AsyncClient",
+                   return_value=mock_sse_client):
+            # Use a very short timeout so the test doesn't actually wait long
+            with self.assertRaises(asyncio.TimeoutError):
+                async for _ in b.stream("sess-1", "hi", "/tmp", timeout=1):
+                    pass

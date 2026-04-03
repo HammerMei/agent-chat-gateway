@@ -70,6 +70,9 @@ logger = logging.getLogger("agent-chat-gateway.agents.opencode")
 _SSE_READY = "__opencode_sse_ready__"
 # Maximum seconds to block on queue.get() — keeps the deadline check responsive.
 _SSE_QUEUE_POLL_INTERVAL = 30.0
+# Maximum seconds to wait for the SSE connection to be established before
+# giving up with AgentUnavailableError.  Always capped to the caller's deadline.
+_SSE_CONNECT_TIMEOUT = 15.0
 
 _INIT_PROMPT = (
     "Chat session initialized. "
@@ -737,9 +740,9 @@ class OpenCodeBackend(AgentBackend):
 
         sse_task = asyncio.create_task(_collect_sse(), name="opencode-stream-sse")
         try:
-            # Wait for SSE to connect — capped at 15 s but never exceeds the
-            # caller's own deadline so short timeouts don't block extra long.
-            _SSE_CONNECT_TIMEOUT = 15.0
+            # Wait for SSE to connect — capped at _SSE_CONNECT_TIMEOUT but
+            # never exceeds the caller's own deadline so short timeouts don't
+            # block extra long.
             sse_connect_timeout = min(
                 _SSE_CONNECT_TIMEOUT,
                 max(0.1, deadline - asyncio.get_running_loop().time()),
@@ -749,7 +752,7 @@ class OpenCodeBackend(AgentBackend):
             except asyncio.TimeoutError:
                 raise AgentUnavailableError(
                     "OpenCode SSE stream did not connect within "
-                    f"{sse_connect_timeout:.0f}s"
+                    f"{sse_connect_timeout:.2g}s"
                 )
             if isinstance(ready, Exception):
                 raise AgentUnavailableError(
@@ -825,6 +828,12 @@ class OpenCodeBackend(AgentBackend):
         text_part_order: list[str] = []         # ordered text partIDs
         text_accumulator: dict[str, str] = {}   # partID → accumulated delta text
         emitted_thinking: set[str] = set()      # partIDs whose thinking event was yielded
+        # De-duplicate repeated message.part.updated events for the same part:
+        # OpenCode may stream incremental state updates (e.g. pending→running→
+        # completed) so the same part ID can arrive more than once.
+        tool_call_emitted: set[str] = set()     # partIDs for which tool_call was yielded
+        tool_result_emitted: set[str] = set()   # partIDs for which tool_result was yielded
+        seen_step_finish_ids: set[str] = set()  # partIDs whose tokens were accumulated
         total_cost = 0.0
         total_input = total_output = total_reasoning = 0
         total_cache_read = total_cache_write = 0
@@ -901,12 +910,16 @@ class OpenCodeBackend(AgentBackend):
 
                 if part_type == "tool":
                     state = part.get("state", {})
-                    status = state.get("status", "")
+                    tool_status = state.get("status", "")
                     tool_name = part.get("tool", "")
-                    if status == "running" and tool_name:
-                        yield AgentEvent(kind="tool_call", text=f"🔧 {tool_name}")
-                    elif status in ("completed", "error") and tool_name:
-                        yield AgentEvent(kind="tool_result", text=f"✓ {tool_name}")
+                    if tool_status == "running" and tool_name:
+                        if part_id not in tool_call_emitted:
+                            tool_call_emitted.add(part_id)
+                            yield AgentEvent(kind="tool_call", text=f"🔧 {tool_name}")
+                    elif tool_status in ("completed", "error") and tool_name:
+                        if part_id not in tool_result_emitted:
+                            tool_result_emitted.add(part_id)
+                            yield AgentEvent(kind="tool_result", text=f"✓ {tool_name}")
 
                 elif part_type == "reasoning":
                     # Yield a single thinking event when the reasoning text
@@ -921,17 +934,22 @@ class OpenCodeBackend(AgentBackend):
                         )
 
                 elif part_type == "step-finish":
-                    num_turns += 1
-                    tokens = part.get("tokens", {})
-                    total_input += tokens.get("input", 0)
-                    total_output += tokens.get("output", 0)
-                    total_reasoning += tokens.get("reasoning", 0)
-                    # Guard against explicit JSON null: `tokens.get("cache", {})` would
-                    # return None when the key is present with value null.
-                    cache = tokens.get("cache") or {}
-                    total_cache_read += cache.get("read", 0)
-                    total_cache_write += cache.get("write", 0)
-                    total_cost += part.get("cost", 0.0)
+                    # Guard against double-counting: OpenCode may emit multiple
+                    # message.part.updated events for the same step-finish part
+                    # (e.g. pending → finalized state transitions).
+                    if part_id not in seen_step_finish_ids:
+                        seen_step_finish_ids.add(part_id)
+                        num_turns += 1
+                        tokens = part.get("tokens", {})
+                        total_input += tokens.get("input", 0)
+                        total_output += tokens.get("output", 0)
+                        total_reasoning += tokens.get("reasoning", 0)
+                        # Guard against explicit JSON null: `tokens.get("cache", {})` would
+                        # return None when the key is present with value null.
+                        cache = tokens.get("cache") or {}
+                        total_cache_read += cache.get("read", 0)
+                        total_cache_write += cache.get("write", 0)
+                        total_cost += part.get("cost", 0.0)
 
             # ── Turn completion ────────────────────────────────────────────
             # NOTE: we expect exactly one session.status idle event per turn.
