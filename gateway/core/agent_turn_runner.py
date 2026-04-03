@@ -85,21 +85,26 @@ class AgentTurnRunner:
         """Execute one turn: send prompt to agent, post response (or error) to room.
 
         Two separate error boundaries:
-          - **Stage 1** (agent execution): agent.send() failure produces an error
+          - **Stage 1** (agent execution): agent.stream() failure produces an error
             response object but does not touch the connector.
           - **Stage 2** (delivery): connector.send_text() failure is logged
             distinctly and does NOT attempt to send another error message through
             the same potentially broken transport (avoids recursive error loops).
 
         Typing indicators bracket both stages regardless of outcome.
+        Intermediate events from agent.stream() are forwarded to
+        connector.notify_agent_event() on a best-effort basis — errors there
+        are silently swallowed and never abort the turn.
         """
         await self._notify_typing(room_id, True)
         try:
-            # Stage 1: execute agent turn
+            # Stage 1: execute agent turn (may emit intermediate events)
             response = await self._execute_agent(
                 session_id,
                 prompt,
                 working_directory,
+                room_id,
+                thread_id,
                 file_paths,
                 role_env,
             )
@@ -114,33 +119,60 @@ class AgentTurnRunner:
         session_id: str,
         prompt: str,
         working_directory: str,
+        room_id: str,
+        thread_id: str | None,
         file_paths: list[str] | None,
         role_env: dict[str, str] | None,
     ) -> AgentResponse:
-        """Run the agent backend and return a response (or an error response).
+        """Iterate agent.stream() and return the final AgentResponse.
 
-        Exceptions from the agent are caught here and converted to error
-        AgentResponse objects so the delivery stage always has something to post.
+        Intermediate events are forwarded to connector.notify_agent_event() on a
+        best-effort basis.  Exceptions from the agent are caught here and
+        converted to error AgentResponse objects so the delivery stage always
+        has something to post.
         """
         try:
-            response = await self._agent.send(
+            async for event in self._agent.stream(
                 session_id=session_id,
                 prompt=prompt,
                 working_directory=working_directory,
                 timeout=self._config.timeout_for(self._agent_name),
                 attachments=file_paths,
                 env=role_env,
+            ):
+                if event.kind == "final":
+                    response = event.response or AgentResponse(
+                        text="(empty response)", is_error=True
+                    )
+                    if response.usage:
+                        logger.info(
+                            "Agent usage [%s] in=%d out=%d cache_read=%d cost=%s",
+                            self._room_name,
+                            response.usage.input_tokens,
+                            response.usage.output_tokens,
+                            response.usage.cache_read_tokens,
+                            f"${response.cost_usd:.4f}" if response.cost_usd else "n/a",
+                        )
+                    return response
+                # Intermediate event — notify connector (best-effort, never aborts)
+                try:
+                    await self._connector.notify_agent_event(
+                        room_id, event, thread_id=thread_id
+                    )
+                except Exception as notify_err:
+                    logger.debug(
+                        "notify_agent_event error (ignored): %s", notify_err
+                    )
+
+            # stream() ended without a final event — should not happen in practice
+            logger.error(
+                "Agent stream ended without a final event (session=%s)",
+                session_id[:8],
             )
-            if response.usage:
-                logger.info(
-                    "Agent usage [%s] in=%d out=%d cache_read=%d cost=%s",
-                    self._room_name,
-                    response.usage.input_tokens,
-                    response.usage.output_tokens,
-                    response.usage.cache_read_tokens,
-                    f"${response.cost_usd:.4f}" if response.cost_usd else "n/a",
-                )
-            return response
+            return AgentResponse(
+                text="❌ Agent response was empty. Please try again.",
+                is_error=True,
+            )
         except asyncio.TimeoutError:
             logger.error("Agent timed out for message: %s", prompt[:80])
             return AgentResponse(
