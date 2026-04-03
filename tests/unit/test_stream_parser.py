@@ -18,8 +18,8 @@ import unittest
 
 from gateway.agents.claude.adapter import (
     _MAX_RAW_PREVIEW_CHARS,
-    _StreamParser,
     _parse_intermediate_events,
+    _StreamParser,
 )
 
 
