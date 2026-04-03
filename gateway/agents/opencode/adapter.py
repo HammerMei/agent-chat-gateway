@@ -35,9 +35,11 @@ are called automatically by the context manager — no manual calls needed.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import socket
+from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING
 
 import httpx
@@ -50,7 +52,7 @@ from ..errors import (
     AgentRateLimitedError,
     AgentUnavailableError,
 )
-from ..response import AgentResponse, TokenUsage
+from ..response import AgentEvent, AgentResponse, TokenUsage
 
 if TYPE_CHECKING:
     from ...core.permission import (
@@ -60,6 +62,12 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger("agent-chat-gateway.agents.opencode")
+
+# Sentinel string placed in the SSE queue by _collect_sse() once the HTTP
+# streaming connection is established.  Using a module-level constant (rather
+# than a bare string literal) makes isinstance checks unnecessary and guards
+# against accidental collision with real SSE line content.
+_SSE_READY = "__opencode_sse_ready__"
 
 _INIT_PROMPT = (
     "Chat session initialized. "
@@ -647,6 +655,302 @@ class OpenCodeBackend(AgentBackend):
         await self._ensure_live_runtime()
         raw = await self._post_message(session_id, prompt, timeout=timeout)
         return self._parse_http_response(raw, session_id)
+
+    async def stream(
+        self,
+        session_id: str,
+        prompt: str,
+        working_directory: str,
+        timeout: int,
+        attachments: list[str] | None = None,
+        env: dict[str, str] | None = None,
+    ) -> AsyncIterator[AgentEvent]:
+        """Stream intermediate agent events for an OpenCode session turn.
+
+        Submits the prompt via ``POST /session/{id}/prompt_async`` (returns
+        immediately), then consumes the ``GET /event`` SSE stream, yielding
+        :class:`~gateway.agents.response.AgentEvent` objects as content arrives.
+
+        The SSE connection is established **before** the prompt is posted to
+        eliminate the race condition where a very fast turn would complete and
+        emit ``session.status idle`` before we started listening.
+
+        Yields:
+            ``AgentEvent(kind="tool_call")``   — when a tool transitions to
+                ``running`` state.
+            ``AgentEvent(kind="tool_result")`` — when a tool reaches
+                ``completed`` or ``error`` state.
+            ``AgentEvent(kind="thinking")``    — on the first non-empty snapshot
+                of a ``reasoning`` part.
+            ``AgentEvent(kind="final")``       — with the completed
+                :class:`~gateway.agents.response.AgentResponse` when the
+                session status becomes ``idle``.
+
+        Raises:
+            asyncio.TimeoutError: If the turn doesn't complete within ``timeout``
+                seconds.
+            AgentExecutionError: On ``session.error`` events or SSE parse failures.
+            AgentUnavailableError: If the SSE connection cannot be established.
+        """
+        if attachments:
+            logger.info(
+                "Injecting %d attachment(s) into prompt text (no native HTTP upload): %s",
+                len(attachments),
+                attachments,
+            )
+        prompt = build_attachment_prompt(prompt, attachments, working_directory)
+
+        if env:
+            logger.debug(
+                "env kwarg ignored by HTTP adapter (set on server at startup): %s",
+                list(env.keys()),
+            )
+
+        await self._ensure_live_runtime()
+
+        deadline = asyncio.get_running_loop().time() + timeout
+
+        # ── Phase 1: open SSE connection BEFORE posting the prompt ────────────
+        # Events are not replayed on reconnect — we must be listening before
+        # the prompt is submitted to guarantee we see session.status idle.
+        # A background task drains the SSE stream into a queue; the main
+        # coroutine reads from the queue so it can also enforce the deadline.
+        queue: asyncio.Queue[str | Exception] = asyncio.Queue()
+
+        async def _collect_sse() -> None:
+            url = f"{self._base_url}/event"
+            try:
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
+                ) as sse_client:
+                    async with sse_client.stream("GET", url) as response:
+                        response.raise_for_status()
+                        await queue.put(_SSE_READY)
+                        async for line in response.aiter_lines():
+                            await queue.put(line)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await queue.put(exc)
+
+        sse_task = asyncio.create_task(_collect_sse(), name="opencode-stream-sse")
+        try:
+            # Wait for SSE to connect (give it up to 15 s)
+            try:
+                ready = await asyncio.wait_for(queue.get(), timeout=15.0)
+            except asyncio.TimeoutError:
+                raise AgentUnavailableError(
+                    "OpenCode SSE stream did not connect within 15s"
+                )
+            if isinstance(ready, Exception):
+                raise AgentUnavailableError(
+                    f"OpenCode SSE connection failed: {ready}"
+                ) from ready
+
+            # ── Phase 2: post the prompt (SSE is now listening) ───────────────
+            await self._post_message_async(session_id, prompt)
+
+            # ── Phase 3: consume SSE events and yield AgentEvents ─────────────
+            async for event in self._parse_sse_events(
+                session_id, queue, deadline, timeout
+            ):
+                yield event
+
+        finally:
+            sse_task.cancel()
+            await asyncio.gather(sse_task, return_exceptions=True)
+
+    async def _post_message_async(self, session_id: str, text: str) -> None:
+        """POST a prompt to the async endpoint — returns immediately (HTTP 202).
+
+        Unlike :meth:`_post_message` (which blocks until the turn completes),
+        this method returns as soon as the server acknowledges the request.
+        Progress arrives via the ``GET /event`` SSE stream.
+
+        .. note::
+            Endpoint path ``/session/{id}/prompt_async`` — verify against a
+            live opencode server if the API version changes.
+        """
+        url = f"{self._base_url}/session/{session_id}/prompt_async"
+        body = {"parts": [{"type": "text", "text": text}]}
+        try:
+            resp = await self._get_client().post(url, json=body, timeout=30)
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            message = (
+                f"opencode API returned HTTP {exc.response.status_code} "
+                f"for POST /session/{session_id[:16]!r}/prompt_async"
+            )
+            raise _classify_http_error(exc.response.status_code, message) from None
+
+    async def _parse_sse_events(
+        self,
+        session_id: str,
+        queue: asyncio.Queue[str | Exception],
+        deadline: float,
+        timeout: int,
+    ) -> AsyncIterator[AgentEvent]:
+        """Consume SSE lines from *queue* and yield :class:`AgentEvent` objects.
+
+        Filters to events whose ``properties.sessionID`` matches *session_id*.
+        Tracks accumulated text and usage data across the turn; yields a
+        ``final`` event when ``session.status`` becomes ``idle``.
+
+        Args:
+            session_id: OpenCode session ID to filter events for.
+            queue:      Async queue populated by the SSE collector task.
+            deadline:   ``loop.time()`` deadline; raises :exc:`asyncio.TimeoutError`
+                        if exceeded.
+            timeout:    Original timeout in seconds (used in error messages only).
+        """
+        # Accumulated state for the final AgentResponse
+        part_types: dict[str, str] = {}        # partID → part type
+        text_part_order: list[str] = []         # ordered text partIDs
+        text_accumulator: dict[str, str] = {}   # partID → accumulated delta text
+        emitted_thinking: set[str] = set()      # partIDs whose thinking event was yielded
+        total_cost = 0.0
+        total_input = total_output = total_reasoning = 0
+        total_cache_read = total_cache_write = 0
+        num_turns = 0
+
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError(
+                    f"OpenCode session {session_id[:16]!r} did not complete "
+                    f"within {timeout}s"
+                )
+
+            try:
+                item = await asyncio.wait_for(
+                    queue.get(), timeout=min(remaining, 30.0)
+                )
+            except asyncio.TimeoutError:
+                raise asyncio.TimeoutError(
+                    f"OpenCode session {session_id[:16]!r} did not complete "
+                    f"within {timeout}s"
+                )
+
+            if isinstance(item, Exception):
+                raise AgentUnavailableError(
+                    f"OpenCode SSE stream error: {item}"
+                ) from item
+
+            line: str = item
+            if not line.startswith("data:"):
+                continue
+            raw = line[5:].strip()
+            if not raw:
+                continue
+
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                logger.debug("Malformed OpenCode SSE JSON: %r", raw[:200])
+                continue
+
+            event_type = payload.get("type", "")
+            props = payload.get("properties", {})
+
+            # Filter to our session only (the SSE stream is global)
+            if props.get("sessionID") != session_id:
+                continue
+
+            # ── Text / reasoning streaming ─────────────────────────────────
+            if event_type == "message.part.delta":
+                part_id = props.get("partID", "")
+                field = props.get("field", "")
+                delta = props.get("delta", "")
+                if not (part_id and field == "text" and delta):
+                    continue
+                # Accumulate only text parts — reasoning parts are handled
+                # via message.part.updated and emitted as thinking events
+                if part_types.get(part_id, "text") == "text":
+                    if part_id not in text_accumulator:
+                        text_part_order.append(part_id)
+                    text_accumulator[part_id] = (
+                        text_accumulator.get(part_id, "") + delta
+                    )
+
+            # ── Part creation / state transitions ──────────────────────────
+            elif event_type == "message.part.updated":
+                part = props.get("part", {})
+                part_id = part.get("id", "")
+                part_type = part.get("type", "")
+                if not part_id:
+                    continue
+                part_types[part_id] = part_type
+
+                if part_type == "tool":
+                    state = part.get("state", {})
+                    status = state.get("status", "")
+                    tool_name = part.get("tool", "")
+                    if status == "running" and tool_name:
+                        yield AgentEvent(kind="tool_call", text=f"🔧 {tool_name}")
+                    elif status in ("completed", "error") and tool_name:
+                        yield AgentEvent(kind="tool_result", text=f"✓ {tool_name}")
+
+                elif part_type == "reasoning":
+                    # Yield a single thinking event when the reasoning text
+                    # first becomes non-empty (it may be updated incrementally,
+                    # but we only need one notification per reasoning block).
+                    reasoning_text = part.get("text", "")
+                    if reasoning_text and part_id not in emitted_thinking:
+                        emitted_thinking.add(part_id)
+                        yield AgentEvent(
+                            kind="thinking",
+                            text=f"💭 {reasoning_text[:80]}",
+                        )
+
+                elif part_type == "step-finish":
+                    num_turns += 1
+                    tokens = part.get("tokens", {})
+                    total_input += tokens.get("input", 0)
+                    total_output += tokens.get("output", 0)
+                    total_reasoning += tokens.get("reasoning", 0)
+                    cache = tokens.get("cache", {})
+                    total_cache_read += cache.get("read", 0)
+                    total_cache_write += cache.get("write", 0)
+                    total_cost += part.get("cost", 0.0)
+
+            # ── Turn completion ────────────────────────────────────────────
+            elif event_type == "session.status":
+                status = props.get("status", {})
+                if status.get("type") == "idle":
+                    text = "".join(
+                        text_accumulator.get(pid, "") for pid in text_part_order
+                    ).strip()
+                    if not text:
+                        text = "(empty response)"
+
+                    has_usage = (total_input + total_output) > 0
+                    usage = (
+                        TokenUsage(
+                            input_tokens=total_input,
+                            output_tokens=total_output,
+                            cache_read_tokens=total_cache_read,
+                            cache_write_tokens=total_cache_write,
+                            reasoning_tokens=total_reasoning,
+                        )
+                        if has_usage
+                        else None
+                    )
+                    yield AgentEvent(
+                        kind="final",
+                        response=AgentResponse(
+                            text=text,
+                            session_id=session_id,
+                            usage=usage,
+                            cost_usd=total_cost if total_cost > 0 else None,
+                            num_turns=num_turns if num_turns > 0 else None,
+                        ),
+                    )
+                    return
+
+            # ── Server-side error ──────────────────────────────────────────
+            elif event_type == "session.error":
+                error = props.get("error", {})
+                raise AgentExecutionError(f"OpenCode session error: {error!s}")
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 

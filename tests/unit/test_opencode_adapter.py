@@ -1,14 +1,16 @@
 """Unit tests for OpenCodeBackend (HTTP adapter)."""
 
 import asyncio
+import json
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 
-from gateway.agents.errors import AgentRateLimitedError
+from gateway.agents.errors import AgentExecutionError, AgentRateLimitedError, AgentUnavailableError
 from gateway.agents.opencode import OpenCodeBackend
-from gateway.agents.response import AgentResponse
+from gateway.agents.opencode.adapter import _SSE_READY
+from gateway.agents.response import AgentEvent, AgentResponse
 
 
 def _make_backend(**kwargs) -> OpenCodeBackend:
@@ -1460,3 +1462,274 @@ class TestSharedHttpxClient(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsInstance(rest._client, httpx.AsyncClient)
         self.assertIsInstance(rest._download_client, httpx.AsyncClient)
+
+
+# ── OpenCodeBackend.stream() — SSE-based streaming ───────────────────────────
+
+
+def _make_started_backend() -> OpenCodeBackend:
+    """Backend pre-configured as if start() already succeeded."""
+    b = OpenCodeBackend(command="opencode", new_session_args=[], timeout=120)
+    b._base_url = "http://127.0.0.1:54321"
+    b._ever_started = True
+    b._client = AsyncMock(spec=httpx.AsyncClient)
+    return b
+
+
+def _sse_line(session_id: str, event_type: str, **props) -> str:
+    """Build a ``data:`` SSE line for the given event type and properties."""
+    payload = {
+        "type": event_type,
+        "properties": {"sessionID": session_id, **props},
+    }
+    return f"data: {json.dumps(payload)}"
+
+
+async def _fill_queue(queue: asyncio.Queue, lines: list[str]) -> None:
+    """Populate *queue* with _SSE_READY sentinel then the given SSE lines."""
+    await queue.put(_SSE_READY)
+    for line in lines:
+        await queue.put(line)
+
+
+class TestPostMessageAsync(unittest.IsolatedAsyncioTestCase):
+    """_post_message_async() targets the correct endpoint."""
+
+    async def test_posts_to_prompt_async_endpoint(self):
+        b = _make_started_backend()
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        b._client.post = AsyncMock(return_value=mock_resp)
+
+        await b._post_message_async("sess-1", "hello world")
+
+        b._client.post.assert_awaited_once()
+        url = b._client.post.call_args[0][0]
+        self.assertIn("/session/sess-1/prompt_async", url)
+
+    async def test_posts_correct_body(self):
+        b = _make_started_backend()
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        b._client.post = AsyncMock(return_value=mock_resp)
+
+        await b._post_message_async("sess-1", "my prompt")
+
+        body = b._client.post.call_args[1]["json"]
+        self.assertEqual(body, {"parts": [{"type": "text", "text": "my prompt"}]})
+
+    async def test_http_error_mapped_to_agent_error(self):
+        b = _make_started_backend()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 429
+        b._client.post = AsyncMock(
+            side_effect=httpx.HTTPStatusError("rate limited", request=MagicMock(), response=mock_resp)
+        )
+
+        from gateway.agents.errors import AgentRateLimitedError
+        with self.assertRaises(AgentRateLimitedError):
+            await b._post_message_async("sess-1", "hi")
+
+
+class TestParseSSEEvents(unittest.IsolatedAsyncioTestCase):
+    """_parse_sse_events() maps OpenCode SSE events to AgentEvents.
+
+    Tests drive the parser directly via a pre-populated asyncio.Queue,
+    avoiding any HTTP layer.
+    """
+
+    def _deadline(self, seconds: int = 60) -> float:
+        return asyncio.get_event_loop().time() + seconds
+
+    async def _collect(self, session_id: str, lines: list[str]) -> list[AgentEvent]:
+        b = _make_started_backend()
+        queue: asyncio.Queue = asyncio.Queue()
+        for line in lines:
+            await queue.put(line)
+        return [
+            e async for e in b._parse_sse_events(
+                session_id, queue, self._deadline(), 60
+            )
+        ]
+
+    async def test_tool_running_yields_tool_call(self):
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "p1", "type": "tool", "tool": "Bash",
+                            "state": {"status": "running"}}),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        tool_calls = [e for e in events if e.kind == "tool_call"]
+        self.assertEqual(len(tool_calls), 1)
+        self.assertIn("Bash", tool_calls[0].text)
+
+    async def test_tool_completed_yields_tool_result(self):
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "p1", "type": "tool", "tool": "Read",
+                            "state": {"status": "completed"}}),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        results = [e for e in events if e.kind == "tool_result"]
+        self.assertEqual(len(results), 1)
+        self.assertIn("Read", results[0].text)
+
+    async def test_tool_error_state_yields_tool_result(self):
+        """error state is treated the same as completed for UX purposes."""
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "p1", "type": "tool", "tool": "Bash",
+                            "state": {"status": "error"}}),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        results = [e for e in events if e.kind == "tool_result"]
+        self.assertEqual(len(results), 1)
+
+    async def test_reasoning_part_yields_thinking(self):
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "r1", "type": "reasoning", "text": "Let me think..."}),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        thinking = [e for e in events if e.kind == "thinking"]
+        self.assertEqual(len(thinking), 1)
+        self.assertIn("💭", thinking[0].text)
+
+    async def test_reasoning_thinking_emitted_only_once(self):
+        """Multiple updates to the same reasoning part yield only one thinking event."""
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "r1", "type": "reasoning", "text": "first chunk"}),
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "r1", "type": "reasoning", "text": "longer text now"}),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        thinking = [e for e in events if e.kind == "thinking"]
+        self.assertEqual(len(thinking), 1)
+
+    async def test_text_deltas_accumulated_in_final_response(self):
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "t1", "type": "text"}),
+            _sse_line("s1", "message.part.delta",
+                      partID="t1", field="text", delta="Hello "),
+            _sse_line("s1", "message.part.delta",
+                      partID="t1", field="text", delta="world"),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        final = events[-1]
+        self.assertEqual(final.kind, "final")
+        self.assertEqual(final.response.text, "Hello world")
+
+    async def test_reasoning_deltas_excluded_from_final_text(self):
+        """Deltas for reasoning parts must not bleed into the final response text."""
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "r1", "type": "reasoning", "text": "thinking"}),
+            _sse_line("s1", "message.part.delta",
+                      partID="r1", field="text", delta="internal reasoning"),
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "t1", "type": "text"}),
+            _sse_line("s1", "message.part.delta",
+                      partID="t1", field="text", delta="actual answer"),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        final = events[-1]
+        self.assertEqual(final.response.text, "actual answer")
+        self.assertNotIn("internal reasoning", final.response.text)
+
+    async def test_step_finish_contributes_usage_to_final(self):
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "sf1", "type": "step-finish",
+                            "tokens": {"input": 100, "output": 50, "reasoning": 10,
+                                       "cache": {"read": 20, "write": 5}},
+                            "cost": 0.001}),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        final = events[-1]
+        self.assertIsNotNone(final.response.usage)
+        self.assertEqual(final.response.usage.input_tokens, 100)
+        self.assertEqual(final.response.usage.output_tokens, 50)
+        self.assertEqual(final.response.usage.cache_read_tokens, 20)
+        self.assertEqual(final.response.usage.cache_write_tokens, 5)
+        self.assertAlmostEqual(final.response.cost_usd, 0.001)
+
+    async def test_other_session_events_filtered_out(self):
+        """Events for a different sessionID must be ignored."""
+        events = await self._collect("s1", [
+            _sse_line("other-sess", "message.part.updated",
+                      part={"id": "p1", "type": "tool", "tool": "Bash",
+                            "state": {"status": "running"}}),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].kind, "final")
+
+    async def test_session_error_raises_agent_execution_error(self):
+        b = _make_started_backend()
+        queue: asyncio.Queue = asyncio.Queue()
+        await queue.put(
+            _sse_line("s1", "session.error", error={"message": "tool failed"})
+        )
+        with self.assertRaises(AgentExecutionError):
+            async for _ in b._parse_sse_events(
+                "s1", queue, self._deadline(), 60
+            ):
+                pass
+
+    async def test_malformed_json_lines_silently_skipped(self):
+        events = await self._collect("s1", [
+            "data: {not valid json",
+            "not even data prefix",
+            "data:",
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].kind, "final")
+
+    async def test_empty_response_placeholder_when_no_text(self):
+        events = await self._collect("s1", [
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        self.assertEqual(events[0].response.text, "(empty response)")
+
+    async def test_infrastructure_events_ignored(self):
+        """server.heartbeat and session.updated events are silently ignored."""
+        events = await self._collect("s1", [
+            _sse_line("s1", "server.heartbeat"),
+            _sse_line("s1", "session.updated", info={}),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].kind, "final")
+
+    async def test_sse_exception_in_queue_raises_unavailable(self):
+        """An Exception object in the queue raises AgentUnavailableError."""
+        b = _make_started_backend()
+        queue: asyncio.Queue = asyncio.Queue()
+        await queue.put(ConnectionError("SSE dropped"))
+        with self.assertRaises(AgentUnavailableError):
+            async for _ in b._parse_sse_events(
+                "s1", queue, self._deadline(), 60
+            ):
+                pass
+
+    async def test_full_turn_sequence_tool_then_text(self):
+        """Full realistic sequence: tool call → tool result → text → final."""
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "p1", "type": "tool", "tool": "Bash",
+                            "state": {"status": "running"}}),
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "p1", "type": "tool", "tool": "Bash",
+                            "state": {"status": "completed"}}),
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "t1", "type": "text"}),
+            _sse_line("s1", "message.part.delta",
+                      partID="t1", field="text", delta="Done!"),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        kinds = [e.kind for e in events]
+        self.assertEqual(kinds, ["tool_call", "tool_result", "final"])
+        self.assertEqual(events[-1].response.text, "Done!")
