@@ -16,6 +16,10 @@ Usage::
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    pass  # AgentResponse referenced below after its definition
 
 
 @dataclass
@@ -92,3 +96,30 @@ class AgentResponse:
             f"tokens={tokens}, cost={cost}, turns={self.num_turns}, "
             f"is_error={self.is_error})"
         )
+
+
+@dataclass
+class AgentEvent:
+    """An intermediate or final event emitted by :meth:`AgentBackend.stream`.
+
+    Intermediate events (``kind != "final"``) carry a human-readable ``text``
+    label suitable for display as a live status update in the chat room, e.g.
+    ``"🔧 Bash"`` or ``"💭 thinking..."``.
+
+    The final event (``kind == "final"``) carries the complete
+    :class:`AgentResponse` in ``response``.  ``text`` is empty for final events
+    — consumers should read ``response.text`` instead.
+
+    Attributes:
+        kind     : Event category.
+                   ``"tool_call"``   — agent is invoking a tool.
+                   ``"tool_result"`` — tool returned a result.
+                   ``"thinking"``    — extended-thinking step in progress.
+                   ``"final"``       — turn complete; ``response`` is populated.
+        text     : Human-readable status label for intermediate events.
+        response : Populated only when ``kind == "final"``.
+    """
+
+    kind: Literal["tool_call", "tool_result", "thinking", "final"]
+    text: str = ""
+    response: AgentResponse | None = None

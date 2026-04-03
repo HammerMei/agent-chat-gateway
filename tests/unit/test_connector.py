@@ -54,7 +54,6 @@ def _make_connector():
     connector._ws = MagicMock()
     connector._config = _make_config()
     connector._attachments_cache_base = Path("/tmp/test-cache")
-
     room = Room(id="room-1", name="general", type="channel")
     connector._rooms["room-1"] = _RoomSubscription(room=room, last_processed_ts=None)
     connector._watcher_contexts["room-1"] = []
@@ -833,6 +832,119 @@ class TestHandlerSendBusy(unittest.IsolatedAsyncioTestCase):
         connector._rest.post_message.assert_awaited_once()
         call_kwargs = connector._rest.post_message.call_args
         self.assertIsNone(call_kwargs[1].get("thread_id"))
+
+
+# ── Tests: notify_agent_event + send_text placeholder lifecycle ──────────────
+
+
+class TestNotifyAgentEvent(unittest.IsolatedAsyncioTestCase):
+    """RocketChatConnector.notify_agent_event() — typing-refresh behavior.
+
+    Covers:
+    - Non-final events (tool_call, tool_result, thinking) refresh typing indicator
+    - final-kind events are a no-op (typing not called)
+    - Errors from notify_typing are silently swallowed
+    - send_text() posts the response without any placeholder management
+    """
+
+    def _make_conn(self):
+        from gateway.connectors.rocketchat.connector import RocketChatConnector
+        connector = RocketChatConnector.__new__(RocketChatConnector)
+        connector._config = _make_config()
+        connector._rest = MagicMock()
+        connector._ws = MagicMock()
+        connector._ws.call_method = AsyncMock()
+        return connector
+
+    async def test_tool_call_event_refreshes_typing(self):
+        """tool_call event triggers notify_typing(room_id, True) to keep indicator alive."""
+        connector = self._make_conn()
+        connector.notify_typing = AsyncMock()
+
+        from gateway.agents.response import AgentEvent
+        await connector.notify_agent_event(
+            "room-1", AgentEvent(kind="tool_call", text="🔧 Bash"), thread_id=None
+        )
+
+        connector.notify_typing.assert_awaited_once_with("room-1", True)
+
+    async def test_thinking_event_refreshes_typing(self):
+        """thinking event triggers notify_typing(room_id, True)."""
+        connector = self._make_conn()
+        connector.notify_typing = AsyncMock()
+
+        from gateway.agents.response import AgentEvent
+        await connector.notify_agent_event(
+            "room-1", AgentEvent(kind="thinking", text="💭 ..."), thread_id=None
+        )
+
+        connector.notify_typing.assert_awaited_once_with("room-1", True)
+
+    async def test_tool_result_event_refreshes_typing(self):
+        """tool_result event triggers notify_typing(room_id, True)."""
+        connector = self._make_conn()
+        connector.notify_typing = AsyncMock()
+
+        from gateway.agents.response import AgentEvent
+        await connector.notify_agent_event(
+            "room-1", AgentEvent(kind="tool_result", text="✓ Bash")
+        )
+
+        connector.notify_typing.assert_awaited_once_with("room-1", True)
+
+    async def test_final_event_is_noop(self):
+        """final events must not refresh typing — the turn is done."""
+        connector = self._make_conn()
+        connector.notify_typing = AsyncMock()
+
+        from gateway.agents.response import AgentEvent, AgentResponse
+        await connector.notify_agent_event(
+            "room-1",
+            AgentEvent(kind="final", response=AgentResponse(text="done")),
+        )
+
+        connector.notify_typing.assert_not_awaited()
+
+    async def test_multiple_events_each_refresh_typing(self):
+        """Each successive event re-triggers the typing indicator independently."""
+        connector = self._make_conn()
+        connector.notify_typing = AsyncMock()
+
+        from gateway.agents.response import AgentEvent
+        await connector.notify_agent_event("room-1", AgentEvent(kind="thinking", text="💭"))
+        await connector.notify_agent_event("room-1", AgentEvent(kind="tool_call", text="🔧 Bash"))
+        await connector.notify_agent_event("room-1", AgentEvent(kind="tool_result", text="✓ Bash"))
+
+        self.assertEqual(connector.notify_typing.await_count, 3)
+
+    async def test_notify_agent_event_error_is_swallowed(self):
+        """notify_typing failure must not propagate — agent turn must continue."""
+        connector = self._make_conn()
+        connector.notify_typing = AsyncMock(side_effect=RuntimeError("WS down"))
+
+        from gateway.agents.response import AgentEvent
+        # Must not raise
+        await connector.notify_agent_event(
+            "room-1", AgentEvent(kind="tool_call", text="🔧 Bash")
+        )
+
+    async def test_send_text_posts_response_without_placeholder_management(self):
+        """send_text() posts the final response with no delete/cleanup side-effects."""
+        from unittest.mock import patch
+
+        from gateway.agents.response import AgentResponse
+        connector = self._make_conn()
+
+        with patch(
+            "gateway.connectors.rocketchat.connector._send_text",
+            new_callable=AsyncMock,
+        ) as mock_send:
+            await connector.send_text("room-1", AgentResponse(text="final answer"))
+            mock_send.assert_awaited_once()
+
+        # No REST calls for placeholder management should occur
+        connector._rest.delete_message.assert_not_called()
+        connector._rest.update_message.assert_not_called()
 
 
 if __name__ == "__main__":
