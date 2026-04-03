@@ -726,6 +726,11 @@ class OpenCodeBackend(AgentBackend):
             url = f"{self._base_url}/event"
             try:
                 async with httpx.AsyncClient(
+                    # TCP-level connect timeout is intentionally shorter than
+                    # _SSE_CONNECT_TIMEOUT (15 s): if the TCP handshake itself
+                    # hangs for >10 s the socket is broken regardless, so we
+                    # fail fast at the httpx layer and let _collect_sse put the
+                    # ConnectTimeout in the queue as an AgentUnavailableError.
                     timeout=httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
                 ) as sse_client:
                     async with sse_client.stream("GET", url) as response:
@@ -871,9 +876,11 @@ class OpenCodeBackend(AgentBackend):
                 )
 
             if isinstance(item, Exception):
-                raise AgentUnavailableError(
-                    f"OpenCode SSE stream error: {item}"
-                ) from item
+                # EOFError = clean stream close before idle (protocol gap, not
+                # a transport failure); surface its self-describing message directly.
+                # All other exceptions = transport / parse failures.
+                prefix = "" if isinstance(item, EOFError) else "OpenCode SSE stream error: "
+                raise AgentUnavailableError(f"{prefix}{item}") from item
 
             line: str = item
             if not line.startswith("data:"):
@@ -962,17 +969,22 @@ class OpenCodeBackend(AgentBackend):
                     if part_id not in seen_step_finish_ids:
                         seen_step_finish_ids.add(part_id)
                         num_turns += 1
-                        # Guard against explicit JSON null for both "tokens"
-                        # and "cache" sub-fields.
+                        # Guard against null and non-numeric values: use
+                        # isinstance so string-typed numbers don't cause TypeError.
                         tokens = part.get("tokens") or {}
-                        total_input += tokens.get("input", 0)
-                        total_output += tokens.get("output", 0)
-                        total_reasoning += tokens.get("reasoning", 0)
+                        _inp = tokens.get("input", 0)
+                        _out = tokens.get("output", 0)
+                        _rsn = tokens.get("reasoning", 0)
+                        total_input += _inp if isinstance(_inp, (int, float)) else 0
+                        total_output += _out if isinstance(_out, (int, float)) else 0
+                        total_reasoning += _rsn if isinstance(_rsn, (int, float)) else 0
                         cache = tokens.get("cache") or {}
-                        total_cache_read += cache.get("read", 0)
-                        total_cache_write += cache.get("write", 0)
-                        # Guard against explicit JSON null for "cost".
-                        total_cost += part.get("cost") or 0.0
+                        _cr = cache.get("read", 0)
+                        _cw = cache.get("write", 0)
+                        total_cache_read += _cr if isinstance(_cr, (int, float)) else 0
+                        total_cache_write += _cw if isinstance(_cw, (int, float)) else 0
+                        _cost = part.get("cost")
+                        total_cost += _cost if isinstance(_cost, (int, float)) else 0.0
 
             # ── Turn completion ────────────────────────────────────────────
             # NOTE: we expect exactly one session.status idle event per turn.
@@ -1198,15 +1210,21 @@ class OpenCodeBackend(AgentBackend):
                     text_parts.append(t)
             elif ptype == "step-finish":
                 num_turns += 1
-                # Guard against explicit JSON null for tokens, cache, and cost.
+                # Guard against null and non-numeric values (same as SSE path).
                 tokens = part.get("tokens") or {}
-                total_input += tokens.get("input", 0)
-                total_output += tokens.get("output", 0)
-                total_reasoning += tokens.get("reasoning", 0)
+                _inp = tokens.get("input", 0)
+                _out = tokens.get("output", 0)
+                _rsn = tokens.get("reasoning", 0)
+                total_input += _inp if isinstance(_inp, (int, float)) else 0
+                total_output += _out if isinstance(_out, (int, float)) else 0
+                total_reasoning += _rsn if isinstance(_rsn, (int, float)) else 0
                 cache = tokens.get("cache") or {}
-                total_cache_read += cache.get("read", 0)
-                total_cache_write += cache.get("write", 0)
-                total_cost += part.get("cost") or 0.0
+                _cr = cache.get("read", 0)
+                _cw = cache.get("write", 0)
+                total_cache_read += _cr if isinstance(_cr, (int, float)) else 0
+                total_cache_write += _cw if isinstance(_cw, (int, float)) else 0
+                _cost = part.get("cost")
+                total_cost += _cost if isinstance(_cost, (int, float)) else 0.0
 
         text = "".join(text_parts).strip()
         is_error = False

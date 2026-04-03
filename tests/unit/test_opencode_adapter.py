@@ -2148,6 +2148,53 @@ class TestParseSSEEvents(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertEqual(events[-1].kind, "final")
 
+    async def test_tool_result_without_prior_tool_call_still_emits(self):
+        """tool_result is emitted even if the running state was never seen.
+
+        Documents intended behaviour: when a server skips the running→completed
+        transition and sends only a completed-status update, one tool_result
+        event (and no tool_call) should be yielded.
+        """
+        events = await self._collect("s1", [
+            # No running update — server jumps straight to completed
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "p1", "type": "tool", "tool": "Read",
+                            "state": {"status": "completed"}}),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        tool_calls = [e for e in events if e.kind == "tool_call"]
+        tool_results = [e for e in events if e.kind == "tool_result"]
+        self.assertEqual(len(tool_calls), 0, "no running update → no tool_call")
+        self.assertEqual(len(tool_results), 1, "completed update → one tool_result")
+        self.assertIn("Read", tool_results[0].text)
+
+    async def test_string_typed_cost_does_not_crash(self):
+        """String-typed cost field must be treated as 0.0, not cause TypeError."""
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "sf1", "type": "step-finish",
+                            "tokens": {"input": 5, "output": 5, "reasoning": 0, "cache": {}},
+                            "cost": "0.01"}),  # string instead of float
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        final = events[-1].response
+        # String cost is skipped → defaults to 0 → cost_usd is None
+        self.assertIsNone(final.cost_usd)
+
+    async def test_string_typed_tokens_do_not_crash(self):
+        """String-typed token fields must be treated as 0, not cause TypeError."""
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "sf1", "type": "step-finish",
+                            "tokens": {"input": "100", "output": "50",
+                                       "reasoning": 0, "cache": {}},
+                            "cost": 0.0}),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        final = events[-1].response
+        # String token values are skipped → no usage object
+        self.assertIsNone(final.usage)
+
 
 class TestStream(unittest.IsolatedAsyncioTestCase):
     """stream() end-to-end: SSE handshake, prompt posting, event lifecycle."""
@@ -2426,18 +2473,26 @@ class TestStream(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(actual_prompt, "check this file")
 
     async def test_stream_sse_connect_timeout_capped_by_deadline(self):
-        """SSE connect timeout is capped to remaining deadline, not always 15s."""
+        """SSE connect timeout is capped to remaining deadline, not always 15s.
+
+        The test blocks inside the streaming context manager __aenter__ so that
+        _SSE_READY is never put into the queue. This is the only way to exercise
+        the asyncio.wait_for(queue.get(), timeout=sse_connect_timeout) branch.
+        Blocking inside aiter_lines() would be too late — _SSE_READY is enqueued
+        before aiter_lines() is called.
+        """
         b = _make_started_backend()
         b._ensure_live_runtime = AsyncMock()
 
-        # SSE queue that never delivers the _SSE_READY sentinel
-        async def _never_connects():
-            await asyncio.sleep(999)
-
+        # Block inside the stream() context manager so _SSE_READY is never queued
         mock_resp = AsyncMock()
         mock_resp.raise_for_status = MagicMock()
-        mock_resp.aiter_lines = _never_connects
-        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+
+        async def _slow_enter(_self=None):
+            await asyncio.sleep(999)  # blocks before _SSE_READY is enqueued
+            return mock_resp
+
+        mock_resp.__aenter__ = _slow_enter
         mock_resp.__aexit__ = AsyncMock(return_value=False)
 
         mock_sse_client = AsyncMock()
@@ -2455,3 +2510,52 @@ class TestStream(unittest.IsolatedAsyncioTestCase):
         elapsed = time.monotonic() - start
         # With timeout=1, the connect wait is capped to ~1s, not the full 15s
         self.assertLess(elapsed, 5.0, "SSE connect should be capped by the caller timeout")
+
+    async def test_stream_sse_task_cancelled_on_early_break(self):
+        """SSE background task is cancelled when caller breaks out of stream() early."""
+        b = _make_started_backend()
+        b._ensure_live_runtime = AsyncMock()
+        b._post_message_async = AsyncMock()
+
+        # SSE stream that keeps yielding tool_call events (different part IDs
+        # to bypass dedup) so _parse_sse_events always has events to yield.
+        async def _infinite_lines():
+            i = 0
+            while True:
+                yield _sse_line("sess-1", "message.part.updated",
+                                part={"id": f"tool-{i}", "type": "tool",
+                                      "tool": "Bash", "state": {"status": "running"}})
+                i += 1
+                await asyncio.sleep(0)
+
+        mock_resp = AsyncMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.aiter_lines = _infinite_lines
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+        mock_sse_client = AsyncMock()
+        mock_sse_client.stream = MagicMock(return_value=mock_resp)
+        mock_sse_client.__aenter__ = AsyncMock(return_value=mock_sse_client)
+        mock_sse_client.__aexit__ = AsyncMock(return_value=False)
+
+        sse_tasks_seen: list[asyncio.Task] = []
+        original_create_task = asyncio.create_task
+
+        def _tracking_create_task(coro, **kwargs):
+            task = original_create_task(coro, **kwargs)
+            sse_tasks_seen.append(task)
+            return task
+
+        with patch("gateway.agents.opencode.adapter.httpx.AsyncClient",
+                   return_value=mock_sse_client):
+            with patch("asyncio.create_task", side_effect=_tracking_create_task):
+                gen = b.stream("sess-1", "hi", "/tmp", timeout=30)
+                # Consume the first event then break early (AgentTurnRunner pattern)
+                async for event in gen:
+                    break
+                await gen.aclose()
+
+        # The SSE task must be done after early exit
+        for task in sse_tasks_seen:
+            self.assertTrue(task.done(), "SSE task should be done after early break")
