@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Awaitable, Callable, Literal
 
-from ..agents.response import AgentResponse
+from ..agents.response import AgentEvent, AgentResponse
 
 # ---------------------------------------------------------------------------
 # Roles
@@ -490,6 +490,35 @@ class Connector(ABC):
         Default: no-op.  Override for platforms that support status messages.
         """
         pass
+
+    async def notify_agent_event(
+        self,
+        room_id: str,
+        event: AgentEvent,
+        thread_id: str | None = None,
+    ) -> None:
+        """Handle an intermediate agent event during a turn.
+
+        Called by :class:`~gateway.core.agent_turn_runner.AgentTurnRunner` for
+        each non-``final`` :class:`~gateway.agents.response.AgentEvent` yielded
+        by :meth:`~gateway.agents.AgentBackend.stream`.
+
+        Default implementation: **no-op**.  Connectors that do not support live
+        status updates (e.g. :class:`~gateway.connectors.script.connector.ScriptConnector`)
+        need not override this method.
+
+        Connectors that override (e.g. RC) can post a placeholder status message
+        on the first call and update it on subsequent calls, giving users real-time
+        visibility into what the agent is doing.
+
+        Errors raised by this method are silently swallowed by the turn runner —
+        a failed status update must never abort an agent turn.
+
+        Args:
+            room_id  : Opaque platform room ID.
+            event    : Intermediate AgentEvent (``kind != "final"``).
+            thread_id: Thread ID to post into, if applicable.
+        """
 
     async def notify_typing(self, room_id: str, is_typing: bool) -> None:
         """Signal that the agent is (or has stopped) typing in a room.
