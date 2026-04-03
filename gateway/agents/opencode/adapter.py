@@ -733,6 +733,12 @@ class OpenCodeBackend(AgentBackend):
                         await queue.put(_SSE_READY)
                         async for line in response.aiter_lines():
                             await queue.put(line)
+                        # Natural stream close before session.status idle —
+                        # notify _parse_sse_events immediately so it doesn't
+                        # stall until the next poll-interval timeout fires.
+                        await queue.put(
+                            EOFError("OpenCode SSE stream closed before session.status idle")
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -881,6 +887,11 @@ class OpenCodeBackend(AgentBackend):
                 logger.debug("Malformed OpenCode SSE JSON: %r", raw[:200])
                 continue
 
+            # SSE lines may be valid JSON but non-dict (null, array, string…).
+            if not isinstance(payload, dict):
+                logger.debug("Unexpected non-dict OpenCode SSE payload: %r", raw[:200])
+                continue
+
             event_type = payload.get("type", "")
             # Guard against explicit JSON null ("properties": null).
             props = payload.get("properties") or {}
@@ -957,7 +968,8 @@ class OpenCodeBackend(AgentBackend):
                         cache = tokens.get("cache") or {}
                         total_cache_read += cache.get("read", 0)
                         total_cache_write += cache.get("write", 0)
-                        total_cost += part.get("cost", 0.0)
+                        # Guard against explicit JSON null for "cost".
+                        total_cost += part.get("cost") or 0.0
 
             # ── Turn completion ────────────────────────────────────────────
             # NOTE: we expect exactly one session.status idle event per turn.
@@ -1154,8 +1166,9 @@ class OpenCodeBackend(AgentBackend):
           - ``duration_ms`` is read from ``info.duration``; verify field name against
             a live response.
         """
-        parts = data.get("parts", [])
-        info = data.get("info", {})
+        # Guard against explicit JSON null for top-level fields.
+        parts = data.get("parts") or []
+        info = data.get("info") or {}
 
         text_parts: list[str] = []
         total_input = total_output = total_reasoning = 0
@@ -1171,15 +1184,15 @@ class OpenCodeBackend(AgentBackend):
                     text_parts.append(t)
             elif ptype == "step-finish":
                 num_turns += 1
-                tokens = part.get("tokens", {})
+                # Guard against explicit JSON null for tokens, cache, and cost.
+                tokens = part.get("tokens") or {}
                 total_input += tokens.get("input", 0)
                 total_output += tokens.get("output", 0)
                 total_reasoning += tokens.get("reasoning", 0)
-                # Guard against explicit JSON null (same as SSE parser).
                 cache = tokens.get("cache") or {}
                 total_cache_read += cache.get("read", 0)
                 total_cache_write += cache.get("write", 0)
-                total_cost += part.get("cost", 0.0)
+                total_cost += part.get("cost") or 0.0
 
         text = "".join(text_parts).strip()
         is_error = False

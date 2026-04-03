@@ -614,6 +614,54 @@ class TestParseHttpResponse(unittest.TestCase):
         self.assertIsNotNone(r.usage, "usage must not be None for reasoning-only turns")
         self.assertEqual(r.usage.reasoning_tokens, 100)
 
+    def test_step_finish_tokens_null_does_not_crash(self):
+        """Explicit JSON null for 'tokens' in HTTP step-finish must not crash."""
+        b = self._backend()
+        data = {
+            "parts": [
+                {"type": "text", "text": "done"},
+                {"type": "step-finish", "tokens": None, "cost": 0.001},
+            ],
+            "info": {},
+        }
+        r = b._parse_http_response(data, "ses_1")
+        # tokens null → all token counts default to 0 → no usage object
+        self.assertIsNone(r.usage)
+
+    def test_step_finish_cost_null_does_not_crash(self):
+        """Explicit JSON null for 'cost' in HTTP step-finish must not crash."""
+        b = self._backend()
+        data = {
+            "parts": [
+                {"type": "text", "text": "done"},
+                {
+                    "type": "step-finish",
+                    "tokens": {"input": 5, "output": 5, "reasoning": 0, "cache": {}},
+                    "cost": None,
+                },
+            ],
+            "info": {},
+        }
+        r = b._parse_http_response(data, "ses_1")
+        # cost null → defaults to 0.0 → cost_usd is None (not positive)
+        self.assertIsNone(r.cost_usd)
+
+    def test_null_parts_does_not_crash(self):
+        """Explicit JSON null for top-level 'parts' must not raise TypeError."""
+        b = self._backend()
+        data = {"parts": None, "info": {}}
+        r = b._parse_http_response(data, "ses_1")
+        self.assertEqual(r.text, "(empty response)")
+        self.assertTrue(r.is_error)
+
+    def test_null_info_does_not_crash(self):
+        """Explicit JSON null for top-level 'info' must not raise AttributeError."""
+        b = self._backend()
+        data = {"parts": [{"type": "text", "text": "hello"}], "info": None}
+        r = b._parse_http_response(data, "ses_1")
+        self.assertEqual(r.text, "hello")
+        self.assertIsNone(r.duration_ms)
+
 
 # ── _post_message error sanitization (Issue 12.4) ─────────────────────────────
 
@@ -722,8 +770,8 @@ class TestEnsureLiveRuntimeAfterFailedRestart(unittest.IsolatedAsyncioTestCase):
         """Before start(), _ever_started=False, so _ensure_live_runtime skips restart
         and _require_base_url() raises — correct behavior."""
         b = self._make_backend()
-        # _ever_started=False, _base_url=None → should raise RuntimeError
-        with self.assertRaises(RuntimeError, msg="Should raise before ever started"):
+        # _ever_started=False, _base_url=None → raises AgentUnavailableError
+        with self.assertRaises(AgentUnavailableError):
             await b._ensure_live_runtime()
 
     async def test_ever_started_true_triggers_restart_when_base_url_gone(self):
@@ -2004,6 +2052,38 @@ class TestParseSSEEvents(unittest.IsolatedAsyncioTestCase):
         events = [e async for e in b._parse_sse_events("s1", queue, self._deadline(), 60)]
         self.assertEqual(events[-1].kind, "final")
 
+    async def test_step_finish_cost_null_does_not_crash(self):
+        """Explicit JSON null for 'cost' in step-finish must not raise TypeError."""
+        import json as _json
+        b = _make_started_backend()
+        queue: asyncio.Queue = asyncio.Queue()
+        null_cost_line = 'data: ' + _json.dumps({
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "s1",
+                "part": {"id": "sf1", "type": "step-finish",
+                         "tokens": {"input": 5, "output": 5, "reasoning": 0, "cache": {}},
+                         "cost": None},
+            },
+        })
+        await queue.put(null_cost_line)
+        await queue.put(_sse_line("s1", "session.status", status={"type": "idle"}))
+        events = [e async for e in b._parse_sse_events("s1", queue, self._deadline(), 60)]
+        # Must not raise; cost defaults to 0
+        self.assertIsNone(events[-1].response.cost_usd)
+
+    async def test_non_dict_json_payload_is_skipped(self):
+        """SSE lines with valid but non-dict JSON (null, array, string) are skipped."""
+        import json as _json
+        b = _make_started_backend()
+        queue: asyncio.Queue = asyncio.Queue()
+        for non_dict_val in [None, [], [1, 2], "hello", 42]:
+            await queue.put(f"data: {_json.dumps(non_dict_val)}")
+        await queue.put(_sse_line("s1", "session.status", status={"type": "idle"}))
+        # None of the non-dict lines should crash; parser terminates normally
+        events = [e async for e in b._parse_sse_events("s1", queue, self._deadline(), 60)]
+        self.assertEqual(events[-1].kind, "final")
+
 
 class TestStream(unittest.IsolatedAsyncioTestCase):
     """stream() end-to-end: SSE handshake, prompt posting, event lifecycle."""
@@ -2196,4 +2276,59 @@ class TestStream(unittest.IsolatedAsyncioTestCase):
             # Use a very short timeout so the test doesn't actually wait long
             with self.assertRaises(asyncio.TimeoutError):
                 async for _ in b.stream("sess-1", "hi", "/tmp", timeout=1):
+                    pass
+
+    async def test_stream_raises_unavailable_on_sse_eof_before_idle(self):
+        """AgentUnavailableError is raised when the SSE stream closes before session.status idle."""
+        b = _make_started_backend()
+        b._ensure_live_runtime = AsyncMock()
+        b._post_message_async = AsyncMock()
+
+        # SSE stream that closes immediately after sending one event (no idle)
+        async def _eof_lines():
+            yield _sse_line("sess-1", "message.part.updated",
+                            part={"id": "t1", "type": "text"})
+            # Generator returns here — natural stream close
+
+        mock_resp = AsyncMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.aiter_lines = _eof_lines
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+        mock_sse_client = AsyncMock()
+        mock_sse_client.stream = MagicMock(return_value=mock_resp)
+        mock_sse_client.__aenter__ = AsyncMock(return_value=mock_sse_client)
+        mock_sse_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("gateway.agents.opencode.adapter.httpx.AsyncClient",
+                   return_value=mock_sse_client):
+            with self.assertRaises(AgentUnavailableError):
+                async for _ in b.stream("sess-1", "hi", "/tmp", timeout=30):
+                    pass
+
+    async def test_stream_raises_unavailable_on_sse_http_error(self):
+        """AgentUnavailableError raised when GET /event returns an HTTP error status."""
+        b = _make_started_backend()
+        b._ensure_live_runtime = AsyncMock()
+
+        mock_resp = AsyncMock()
+        mock_resp.raise_for_status = MagicMock(
+            side_effect=httpx.HTTPStatusError(
+                "503", request=MagicMock(),
+                response=MagicMock(status_code=503)
+            )
+        )
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+        mock_sse_client = AsyncMock()
+        mock_sse_client.stream = MagicMock(return_value=mock_resp)
+        mock_sse_client.__aenter__ = AsyncMock(return_value=mock_sse_client)
+        mock_sse_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("gateway.agents.opencode.adapter.httpx.AsyncClient",
+                   return_value=mock_sse_client):
+            with self.assertRaises(AgentUnavailableError):
+                async for _ in b.stream("sess-1", "hi", "/tmp", timeout=30):
                     pass
