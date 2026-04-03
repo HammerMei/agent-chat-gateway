@@ -764,6 +764,7 @@ class OpenCodeBackend(AgentBackend):
                 raise AgentUnavailableError(
                     f"OpenCode SSE connection failed: {ready}"
                 ) from ready
+            assert ready == _SSE_READY, f"Unexpected first SSE queue item: {ready!r}"
 
             # ── Phase 2: post the prompt (SSE is now listening) ───────────────
             await self._post_message_async(session_id, prompt, timeout=timeout)
@@ -905,7 +906,7 @@ class OpenCodeBackend(AgentBackend):
                 part_id = props.get("partID", "")
                 field = props.get("field", "")
                 delta = props.get("delta", "")
-                if not (part_id and field == "text" and delta):
+                if not (part_id and field == "text" and isinstance(delta, str) and delta):
                     continue
                 # Accumulate only confirmed text parts — skip unregistered
                 # parts (part_type unknown) to avoid reasoning deltas bleeding
@@ -931,6 +932,8 @@ class OpenCodeBackend(AgentBackend):
                     state = part.get("state") or {}
                     tool_status = state.get("status", "")
                     tool_name = part.get("tool", "")
+                    if not isinstance(tool_name, str):
+                        tool_name = ""
                     if tool_status == "running" and tool_name:
                         if part_id not in tool_call_emitted:
                             tool_call_emitted.add(part_id)
@@ -1177,6 +1180,8 @@ class OpenCodeBackend(AgentBackend):
         num_turns: int = 0
 
         for part in parts:
+            if not isinstance(part, dict):
+                continue
             ptype = part.get("type", "")
             if ptype == "text":
                 t = part.get("text", "")
@@ -1236,7 +1241,7 @@ class OpenCodeBackend(AgentBackend):
             session_id=session_id,
             usage=usage,
             cost_usd=total_cost if total_cost > 0 else None,
-            duration_ms=info.get("duration") or None,
+            duration_ms=info.get("duration"),
             num_turns=num_turns if num_turns > 0 else None,
             is_error=is_error,
         )

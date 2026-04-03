@@ -339,6 +339,7 @@ class TestSend(unittest.IsolatedAsyncioTestCase):
     async def test_basic_send_returns_text(self):
         b = _make_backend()
         b._base_url = "http://127.0.0.1:57000"
+        b._ever_started = True
 
         response_data = self._make_http_response(
             [
@@ -361,6 +362,7 @@ class TestSend(unittest.IsolatedAsyncioTestCase):
     async def test_send_classifies_http_429_as_rate_limited(self):
         b = _make_backend()
         b._base_url = "http://127.0.0.1:57000"
+        b._ever_started = True
 
         mock_resp = MagicMock()
         mock_resp.status_code = 429
@@ -386,6 +388,7 @@ class TestSend(unittest.IsolatedAsyncioTestCase):
         """
         b = _make_backend()
         b._base_url = "http://127.0.0.1:57000"
+        b._ever_started = True
 
         mock_client = AsyncMock()
         mock_resp = MagicMock()
@@ -410,6 +413,7 @@ class TestSend(unittest.IsolatedAsyncioTestCase):
         """If the sidecar died after startup, send() should restart it before use."""
         b = _make_backend()
         b._base_url = "http://127.0.0.1:57000"
+        b._ever_started = True
 
         dead_process = MagicMock()
         dead_process.returncode = 7
@@ -429,6 +433,7 @@ class TestSend(unittest.IsolatedAsyncioTestCase):
             b._base_url = "http://127.0.0.1:58000"
             b._client = new_client
             b._process = MagicMock(returncode=None)
+            b._ever_started = True
 
         b._start_inner = AsyncMock(side_effect=fake_start)
 
@@ -661,6 +666,28 @@ class TestParseHttpResponse(unittest.TestCase):
         r = b._parse_http_response(data, "ses_1")
         self.assertEqual(r.text, "hello")
         self.assertIsNone(r.duration_ms)
+
+    def test_null_element_in_parts_list_is_skipped(self):
+        """null or non-dict elements inside parts list must be skipped without crashing."""
+        b = self._backend()
+        data = {
+            "parts": [
+                None,
+                "unexpected string",
+                {"type": "text", "text": "valid"},
+                42,
+            ],
+            "info": {},
+        }
+        r = b._parse_http_response(data, "ses_1")
+        self.assertEqual(r.text, "valid")
+
+    def test_duration_zero_not_coerced_to_none(self):
+        """info.duration == 0 must be returned as 0, not None."""
+        b = self._backend()
+        data = {"parts": [{"type": "text", "text": "ok"}], "info": {"duration": 0}}
+        r = b._parse_http_response(data, "ses_1")
+        self.assertEqual(r.duration_ms, 0)
 
 
 # ── _post_message error sanitization (Issue 12.4) ─────────────────────────────
