@@ -737,12 +737,19 @@ class OpenCodeBackend(AgentBackend):
 
         sse_task = asyncio.create_task(_collect_sse(), name="opencode-stream-sse")
         try:
-            # Wait for SSE to connect (give it up to 15 s)
+            # Wait for SSE to connect — capped at 15 s but never exceeds the
+            # caller's own deadline so short timeouts don't block extra long.
+            _SSE_CONNECT_TIMEOUT = 15.0
+            sse_connect_timeout = min(
+                _SSE_CONNECT_TIMEOUT,
+                max(0.1, deadline - asyncio.get_running_loop().time()),
+            )
             try:
-                ready = await asyncio.wait_for(queue.get(), timeout=15.0)
+                ready = await asyncio.wait_for(queue.get(), timeout=sse_connect_timeout)
             except asyncio.TimeoutError:
                 raise AgentUnavailableError(
-                    "OpenCode SSE stream did not connect within 15s"
+                    "OpenCode SSE stream did not connect within "
+                    f"{sse_connect_timeout:.0f}s"
                 )
             if isinstance(ready, Exception):
                 raise AgentUnavailableError(
@@ -919,7 +926,9 @@ class OpenCodeBackend(AgentBackend):
                     total_input += tokens.get("input", 0)
                     total_output += tokens.get("output", 0)
                     total_reasoning += tokens.get("reasoning", 0)
-                    cache = tokens.get("cache", {})
+                    # Guard against explicit JSON null: `tokens.get("cache", {})` would
+                    # return None when the key is present with value null.
+                    cache = tokens.get("cache") or {}
                     total_cache_read += cache.get("read", 0)
                     total_cache_write += cache.get("write", 0)
                     total_cost += part.get("cost", 0.0)
@@ -1134,7 +1143,8 @@ class OpenCodeBackend(AgentBackend):
                 total_input += tokens.get("input", 0)
                 total_output += tokens.get("output", 0)
                 total_reasoning += tokens.get("reasoning", 0)
-                cache = tokens.get("cache", {})
+                # Guard against explicit JSON null (same as SSE parser).
+                cache = tokens.get("cache") or {}
                 total_cache_read += cache.get("read", 0)
                 total_cache_write += cache.get("write", 0)
                 total_cost += part.get("cost", 0.0)

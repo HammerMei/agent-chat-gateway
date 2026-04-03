@@ -840,11 +840,20 @@ class TestCircuitBreakerFastFail(unittest.IsolatedAsyncioTestCase):
         b = self._make_backend()
         b._consecutive_restart_failures = _MAX_RESTART_FAILURES
 
-        with patch.object(b, "_invalidate_dead_runtime", new_callable=AsyncMock):
-            with patch("asyncio.wait_for", new_callable=AsyncMock):
-                b._ever_started = False
-                b._consecutive_restart_failures = 0  # stop() should do this
+        # Build enough state for stop() to enter the non-trivial path:
+        # _process must be non-None so it doesn't return via the fast path.
+        mock_proc = AsyncMock()
+        mock_proc.pid = 12345
+        mock_proc.terminate = MagicMock()
+        mock_proc.wait = AsyncMock(return_value=0)
+        b._process = mock_proc
+        b._client = AsyncMock(spec=httpx.AsyncClient)
+        b._ever_started = True
 
+        with patch.object(b, "_cleanup_orphan_sessions_best_effort", new_callable=AsyncMock):
+            await b.stop()
+
+        # stop() must have zeroed the counter in its finally block
         self.assertEqual(b._consecutive_restart_failures, 0)
 
     async def test_max_restart_failures_constant_at_least_2(self):
@@ -1860,6 +1869,8 @@ class TestStream(unittest.IsolatedAsyncioTestCase):
         final = events[-1]
         self.assertEqual(final.kind, "final")
         self.assertEqual(final.response.text, "Hi there!")
+        # Verify _post_message_async received the correct arguments
+        b._post_message_async.assert_awaited_once_with("sess-1", "hello", timeout=30)
 
     async def test_stream_cancels_sse_task_on_completion(self):
         """The SSE background task is cancelled after stream() completes."""
@@ -1910,3 +1921,39 @@ class TestStream(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(AgentUnavailableError):
                 async for _ in b.stream("sess-1", "hi", "/tmp", timeout=30):
                     pass
+
+    async def test_stream_tool_only_turn_is_error_false(self):
+        """stream() final event for a tool-only turn (step-finish, no text) is not an error."""
+        b = _make_started_backend()
+        b._ensure_live_runtime = AsyncMock()
+        b._post_message_async = AsyncMock()
+
+        sse_lines = [
+            _sse_line("sess-1", "message.part.updated",
+                      part={"id": "p1", "type": "tool", "tool": "Bash",
+                            "state": {"status": "running"}}),
+            _sse_line("sess-1", "message.part.updated",
+                      part={"id": "p1", "type": "tool", "tool": "Bash",
+                            "state": {"status": "completed"}}),
+            _sse_line("sess-1", "message.part.updated",
+                      part={"id": "sf1", "type": "step-finish",
+                            "tokens": {"input": 10, "output": 5, "cache": None},
+                            "cost": 0.001}),
+            _sse_line("sess-1", "session.status", status={"type": "idle"}),
+        ]
+        mock_sse_resp = self._make_sse_response(sse_lines)
+        mock_sse_client = AsyncMock()
+        mock_sse_client.stream = MagicMock(return_value=mock_sse_resp)
+        mock_sse_client.__aenter__ = AsyncMock(return_value=mock_sse_client)
+        mock_sse_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("gateway.agents.opencode.adapter.httpx.AsyncClient",
+                   return_value=mock_sse_client):
+            events = [e async for e in b.stream("sess-1", "run tool", "/tmp", timeout=30)]
+
+        final = events[-1]
+        self.assertEqual(final.kind, "final")
+        # step-finish was seen so is_error must be False
+        self.assertFalse(final.response.is_error)
+        # Also exercises the cache=null guard: no crash
+        self.assertEqual(final.response.num_turns, 1)
