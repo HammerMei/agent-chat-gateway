@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Awaitable, Callable
 
-from .response import AgentResponse
+from .response import AgentEvent, AgentResponse
 
 if TYPE_CHECKING:
     # Avoid circular imports — only used in type annotations
@@ -228,3 +229,48 @@ class AgentBackend(ABC):
             JSON stream.
         """
         ...
+
+    async def stream(
+        self,
+        session_id: str,
+        prompt: str,
+        working_directory: str,
+        timeout: int,
+        attachments: list[str] | None = None,
+        env: dict[str, str] | None = None,
+    ) -> AsyncIterator[AgentEvent]:
+        """Stream agent events for a turn, yielding intermediate events then a final one.
+
+        Yields :class:`~gateway.agents.response.AgentEvent` objects as the agent
+        processes the request.  Intermediate events (``kind != "final"``) carry a
+        human-readable ``text`` label for live status updates.  The last event
+        always has ``kind == "final"`` and its ``response`` field is the complete
+        :class:`AgentResponse`.
+
+        **Default implementation**: wraps :meth:`send` — yields only a single
+        ``final`` event.  Backends that support native streaming (Claude
+        ``stream-json``, OpenCode SSE) override this to emit intermediate events.
+        Backends that do not override remain fully functional; callers receive
+        exactly one ``final`` event per turn with no intermediate updates.
+
+        Args:
+            session_id       : Persistent session ID from :meth:`create_session`.
+            prompt           : Text prompt to send.
+            working_directory: Working directory for the agent subprocess.
+            timeout          : Seconds before the call times out.
+            attachments      : Optional local file paths to attach.
+            env              : Optional extra environment variables.
+
+        Yields:
+            :class:`AgentEvent` — zero or more intermediate events followed by
+            exactly one ``final`` event.
+        """
+        response = await self.send(
+            session_id=session_id,
+            prompt=prompt,
+            working_directory=working_directory,
+            timeout=timeout,
+            attachments=attachments,
+            env=env,
+        )
+        yield AgentEvent(kind="final", response=response)

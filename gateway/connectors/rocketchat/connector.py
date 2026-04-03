@@ -20,7 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from ...agents.response import AgentResponse
+from ...agents.response import AgentEvent, AgentResponse
 from ...core.connector import (
     Connector,
     IncomingMessage,
@@ -170,6 +170,34 @@ class RocketChatConnector(Connector):
             chunk_limit=self.text_chunk_limit,
             tmid=thread_id,
         )
+
+    async def notify_agent_event(
+        self,
+        room_id: str,
+        event: AgentEvent,
+        thread_id: str | None = None,
+    ) -> None:
+        """Refresh the typing indicator on each intermediate agent event.
+
+        RC's typing indicator auto-expires after ~10 seconds.  For long-running
+        turns (tool calls, permission approvals, extended thinking) this means
+        the indicator vanishes mid-turn, leaving the user with no feedback.
+
+        Re-triggering it on every non-final AgentEvent keeps it alive for the
+        full duration without posting any messages (no delete permissions needed,
+        no placeholder race conditions).
+
+        All errors are silently swallowed — a failed typing refresh must never
+        abort an agent turn.
+        """
+        if event.kind == "final":
+            return
+        try:
+            await self.notify_typing(room_id, True)
+        except Exception as exc:
+            logger.debug(
+                "Failed to refresh typing indicator for room %s: %s", room_id, exc
+            )
 
     async def send_media(self, room_id: str, file_path: str, caption: str = "") -> None:
         """Upload a local file to the room."""
