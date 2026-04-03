@@ -39,7 +39,7 @@ import json
 import logging
 import os
 import socket
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from typing import TYPE_CHECKING
 
 import httpx
@@ -68,6 +68,8 @@ logger = logging.getLogger("agent-chat-gateway.agents.opencode")
 # than a bare string literal) makes isinstance checks unnecessary and guards
 # against accidental collision with real SSE line content.
 _SSE_READY = "__opencode_sse_ready__"
+# Maximum seconds to block on queue.get() — keeps the deadline check responsive.
+_SSE_QUEUE_POLL_INTERVAL = 30.0
 
 _INIT_PROMPT = (
     "Chat session initialized. "
@@ -664,7 +666,7 @@ class OpenCodeBackend(AgentBackend):
         timeout: int,
         attachments: list[str] | None = None,
         env: dict[str, str] | None = None,
-    ) -> AsyncIterator[AgentEvent]:
+    ) -> AsyncGenerator[AgentEvent, None]:
         """Stream intermediate agent events for an OpenCode session turn.
 
         Submits the prompt via ``POST /session/{id}/prompt_async`` (returns
@@ -748,7 +750,7 @@ class OpenCodeBackend(AgentBackend):
                 ) from ready
 
             # ── Phase 2: post the prompt (SSE is now listening) ───────────────
-            await self._post_message_async(session_id, prompt)
+            await self._post_message_async(session_id, prompt, timeout=timeout)
 
             # ── Phase 3: consume SSE events and yield AgentEvents ─────────────
             async for event in self._parse_sse_events(
@@ -760,12 +762,20 @@ class OpenCodeBackend(AgentBackend):
             sse_task.cancel()
             await asyncio.gather(sse_task, return_exceptions=True)
 
-    async def _post_message_async(self, session_id: str, text: str) -> None:
+    async def _post_message_async(
+        self, session_id: str, text: str, *, timeout: int
+    ) -> None:
         """POST a prompt to the async endpoint — returns immediately (HTTP 202).
 
         Unlike :meth:`_post_message` (which blocks until the turn completes),
         this method returns as soon as the server acknowledges the request.
         Progress arrives via the ``GET /event`` SSE stream.
+
+        Args:
+            session_id: OpenCode session ID.
+            text:       Prompt text to send.
+            timeout:    HTTP connect/write timeout in seconds (not the turn
+                        deadline — the server responds immediately with 202).
 
         .. note::
             Endpoint path ``/session/{id}/prompt_async`` — verify against a
@@ -774,7 +784,7 @@ class OpenCodeBackend(AgentBackend):
         url = f"{self._base_url}/session/{session_id}/prompt_async"
         body = {"parts": [{"type": "text", "text": text}]}
         try:
-            resp = await self._get_client().post(url, json=body, timeout=30)
+            resp = await self._get_client().post(url, json=body, timeout=timeout)
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
             message = (
@@ -789,7 +799,7 @@ class OpenCodeBackend(AgentBackend):
         queue: asyncio.Queue[str | Exception],
         deadline: float,
         timeout: int,
-    ) -> AsyncIterator[AgentEvent]:
+    ) -> AsyncGenerator[AgentEvent, None]:
         """Consume SSE lines from *queue* and yield :class:`AgentEvent` objects.
 
         Filters to events whose ``properties.sessionID`` matches *session_id*.
@@ -823,7 +833,7 @@ class OpenCodeBackend(AgentBackend):
 
             try:
                 item = await asyncio.wait_for(
-                    queue.get(), timeout=min(remaining, 30.0)
+                    queue.get(), timeout=min(remaining, _SSE_QUEUE_POLL_INTERVAL)
                 )
             except asyncio.TimeoutError:
                 raise asyncio.TimeoutError(
@@ -863,9 +873,10 @@ class OpenCodeBackend(AgentBackend):
                 delta = props.get("delta", "")
                 if not (part_id and field == "text" and delta):
                     continue
-                # Accumulate only text parts — reasoning parts are handled
-                # via message.part.updated and emitted as thinking events
-                if part_types.get(part_id, "text") == "text":
+                # Accumulate only confirmed text parts — skip unregistered
+                # parts (part_type unknown) to avoid reasoning deltas bleeding
+                # in before the corresponding message.part.updated arrives.
+                if part_types.get(part_id) == "text":
                     if part_id not in text_accumulator:
                         text_part_order.append(part_id)
                     text_accumulator[part_id] = (
@@ -914,12 +925,20 @@ class OpenCodeBackend(AgentBackend):
                     total_cost += part.get("cost", 0.0)
 
             # ── Turn completion ────────────────────────────────────────────
+            # NOTE: we expect exactly one session.status idle event per turn.
+            # If OpenCode ever emits multiple idle transitions (e.g. for
+            # parallel sub-sessions), this return would cut the stream early.
             elif event_type == "session.status":
                 status = props.get("status", {})
                 if status.get("type") == "idle":
                     text = "".join(
                         text_accumulator.get(pid, "") for pid in text_part_order
                     ).strip()
+                    # Mirror _parse_http_response: empty text + no step-finish
+                    # events signals an error turn (e.g. the model refused or
+                    # the request was rejected before any content was produced).
+                    has_step_finish = num_turns > 0
+                    is_error = not text and not has_step_finish
                     if not text:
                         text = "(empty response)"
 
@@ -943,6 +962,7 @@ class OpenCodeBackend(AgentBackend):
                             usage=usage,
                             cost_usd=total_cost if total_cost > 0 else None,
                             num_turns=num_turns if num_turns > 0 else None,
+                            is_error=is_error,
                         ),
                     )
                     return

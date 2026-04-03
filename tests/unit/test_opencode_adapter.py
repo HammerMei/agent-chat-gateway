@@ -1501,7 +1501,7 @@ class TestPostMessageAsync(unittest.IsolatedAsyncioTestCase):
         mock_resp.raise_for_status = MagicMock()
         b._client.post = AsyncMock(return_value=mock_resp)
 
-        await b._post_message_async("sess-1", "hello world")
+        await b._post_message_async("sess-1", "hello world", timeout=30)
 
         b._client.post.assert_awaited_once()
         url = b._client.post.call_args[0][0]
@@ -1513,10 +1513,22 @@ class TestPostMessageAsync(unittest.IsolatedAsyncioTestCase):
         mock_resp.raise_for_status = MagicMock()
         b._client.post = AsyncMock(return_value=mock_resp)
 
-        await b._post_message_async("sess-1", "my prompt")
+        await b._post_message_async("sess-1", "my prompt", timeout=30)
 
         body = b._client.post.call_args[1]["json"]
         self.assertEqual(body, {"parts": [{"type": "text", "text": "my prompt"}]})
+
+    async def test_timeout_forwarded_to_http_client(self):
+        """The caller's timeout value is forwarded to the HTTP client call."""
+        b = _make_started_backend()
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        b._client.post = AsyncMock(return_value=mock_resp)
+
+        await b._post_message_async("sess-1", "text", timeout=45)
+
+        kwargs = b._client.post.call_args[1]
+        self.assertEqual(kwargs["timeout"], 45)
 
     async def test_http_error_mapped_to_agent_error(self):
         b = _make_started_backend()
@@ -1528,7 +1540,7 @@ class TestPostMessageAsync(unittest.IsolatedAsyncioTestCase):
 
         from gateway.agents.errors import AgentRateLimitedError
         with self.assertRaises(AgentRateLimitedError):
-            await b._post_message_async("sess-1", "hi")
+            await b._post_message_async("sess-1", "hi", timeout=30)
 
 
 class TestParseSSEEvents(unittest.IsolatedAsyncioTestCase):
@@ -1539,7 +1551,7 @@ class TestParseSSEEvents(unittest.IsolatedAsyncioTestCase):
     """
 
     def _deadline(self, seconds: int = 60) -> float:
-        return asyncio.get_event_loop().time() + seconds
+        return asyncio.get_running_loop().time() + seconds
 
     async def _collect(self, session_id: str, lines: list[str]) -> list[AgentEvent]:
         b = _make_started_backend()
@@ -1733,3 +1745,168 @@ class TestParseSSEEvents(unittest.IsolatedAsyncioTestCase):
         kinds = [e.kind for e in events]
         self.assertEqual(kinds, ["tool_call", "tool_result", "final"])
         self.assertEqual(events[-1].response.text, "Done!")
+
+    async def test_is_error_false_when_text_present(self):
+        """is_error is False when the final response contains text."""
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated", part={"id": "t1", "type": "text"}),
+            _sse_line("s1", "message.part.delta",
+                      partID="t1", field="text", delta="hello"),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        final = events[-1].response
+        self.assertFalse(final.is_error)
+        self.assertEqual(final.text, "hello")
+
+    async def test_is_error_false_when_step_finish_present(self):
+        """is_error is False when step-finish events arrived (non-empty turn)."""
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "sf1", "type": "step-finish",
+                            "tokens": {"input": 10, "output": 5}, "cost": 0.001}),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        final = events[-1].response
+        self.assertFalse(final.is_error)
+
+    async def test_is_error_true_when_no_text_and_no_step_finish(self):
+        """is_error is True when neither text nor step-finish events arrived."""
+        events = await self._collect("s1", [
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        final = events[-1].response
+        self.assertTrue(final.is_error)
+        self.assertEqual(final.text, "(empty response)")
+
+    async def test_multi_part_text_order_preserved(self):
+        """Text from multiple parts is concatenated in arrival order."""
+        events = await self._collect("s1", [
+            # Register p1 as text, accumulate "Hello "
+            _sse_line("s1", "message.part.updated", part={"id": "p1", "type": "text"}),
+            _sse_line("s1", "message.part.delta",
+                      partID="p1", field="text", delta="Hello "),
+            # Register p2 as text, accumulate "world"
+            _sse_line("s1", "message.part.updated", part={"id": "p2", "type": "text"}),
+            _sse_line("s1", "message.part.delta",
+                      partID="p2", field="text", delta="world"),
+            # Interleaved second chunk for p1
+            _sse_line("s1", "message.part.delta",
+                      partID="p1", field="text", delta="— "),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        # p1 was seen first, so its text ("Hello — ") comes before p2's ("world")
+        self.assertEqual(events[-1].response.text, "Hello — world")
+
+    async def test_delta_before_part_registered_is_skipped(self):
+        """Deltas for unregistered (unknown-type) parts are silently dropped."""
+        events = await self._collect("s1", [
+            # Delta arrives before the corresponding message.part.updated
+            _sse_line("s1", "message.part.delta",
+                      partID="unknown-p", field="text", delta="leaked reasoning"),
+            # Register as text too late; no delta was accumulated
+            _sse_line("s1", "message.part.updated", part={"id": "unknown-p", "type": "text"}),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        # The early delta must not appear in final text
+        self.assertNotIn("leaked reasoning", events[-1].response.text)
+
+
+class TestStream(unittest.IsolatedAsyncioTestCase):
+    """stream() end-to-end: SSE handshake, prompt posting, event lifecycle."""
+
+    def _make_sse_response(self, lines: list[str]) -> AsyncMock:
+        """Build a mock httpx streaming response that yields the given lines."""
+        async def _aiter_lines():
+            for line in lines:
+                yield line
+
+        mock_resp = AsyncMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.aiter_lines = _aiter_lines
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+        return mock_resp
+
+    async def test_stream_yields_final_event(self):
+        """stream() yields a final AgentEvent after a minimal SSE sequence."""
+        b = _make_started_backend()
+
+        # Patch _ensure_live_runtime so we don't need a running process
+        b._ensure_live_runtime = AsyncMock()
+
+        # Patch _post_message_async so no real HTTP call is made
+        b._post_message_async = AsyncMock()
+
+        sse_lines = [
+            _sse_line("sess-1", "message.part.updated", part={"id": "t1", "type": "text"}),
+            _sse_line("sess-1", "message.part.delta",
+                      partID="t1", field="text", delta="Hi there!"),
+            _sse_line("sess-1", "session.status", status={"type": "idle"}),
+        ]
+        mock_sse_resp = self._make_sse_response(sse_lines)
+
+        mock_sse_client = AsyncMock()
+        mock_sse_client.stream = MagicMock(return_value=mock_sse_resp)
+        mock_sse_client.__aenter__ = AsyncMock(return_value=mock_sse_client)
+        mock_sse_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("gateway.agents.opencode.adapter.httpx.AsyncClient",
+                   return_value=mock_sse_client):
+            events = [e async for e in b.stream(
+                "sess-1", "hello", "/tmp", timeout=30
+            )]
+
+        self.assertTrue(len(events) >= 1)
+        final = events[-1]
+        self.assertEqual(final.kind, "final")
+        self.assertEqual(final.response.text, "Hi there!")
+
+    async def test_stream_cancels_sse_task_on_completion(self):
+        """The SSE background task is cancelled after stream() completes."""
+        b = _make_started_backend()
+        b._ensure_live_runtime = AsyncMock()
+        b._post_message_async = AsyncMock()
+
+        sse_lines = [
+            _sse_line("sess-1", "session.status", status={"type": "idle"}),
+        ]
+        mock_sse_resp = self._make_sse_response(sse_lines)
+        mock_sse_client = AsyncMock()
+        mock_sse_client.stream = MagicMock(return_value=mock_sse_resp)
+        mock_sse_client.__aenter__ = AsyncMock(return_value=mock_sse_client)
+        mock_sse_client.__aexit__ = AsyncMock(return_value=False)
+
+        sse_tasks_created = []
+        original_create_task = asyncio.create_task
+
+        def _tracking_create_task(coro, **kwargs):
+            task = original_create_task(coro, **kwargs)
+            sse_tasks_created.append(task)
+            return task
+
+        with patch("gateway.agents.opencode.adapter.httpx.AsyncClient",
+                   return_value=mock_sse_client):
+            with patch("asyncio.create_task", side_effect=_tracking_create_task):
+                async for _ in b.stream("sess-1", "hi", "/tmp", timeout=30):
+                    pass
+
+        # The SSE task should be done (cancelled or finished) after stream exits
+        for task in sse_tasks_created:
+            self.assertTrue(task.done(), "SSE task should be done after stream() exits")
+
+    async def test_stream_raises_unavailable_on_sse_connect_failure(self):
+        """AgentUnavailableError raised when SSE connection fails immediately."""
+        b = _make_started_backend()
+        b._ensure_live_runtime = AsyncMock()
+
+        mock_sse_client = AsyncMock()
+        # Simulate connection error during SSE setup
+        mock_sse_client.stream = MagicMock(side_effect=httpx.ConnectError("refused"))
+        mock_sse_client.__aenter__ = AsyncMock(return_value=mock_sse_client)
+        mock_sse_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("gateway.agents.opencode.adapter.httpx.AsyncClient",
+                   return_value=mock_sse_client):
+            with self.assertRaises(AgentUnavailableError):
+                async for _ in b.stream("sess-1", "hi", "/tmp", timeout=30):
+                    pass
