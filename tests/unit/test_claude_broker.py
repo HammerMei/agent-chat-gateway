@@ -395,6 +395,94 @@ class TestSkipOwnerApproval(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["decision"], "block")
 
 
+# ── Meta-tool auto-allow tests ───────────────────────────────────────────────
+
+class TestMetaToolAutoAllow(unittest.IsolatedAsyncioTestCase):
+    """Claude Code meta-tools (e.g. ToolSearch) are always auto-allowed.
+
+    ToolSearch loads deferred tool schemas and has no side-effects.  It must
+    never surface as a spurious approval request regardless of role, allow-list
+    configuration, or skip_owner_approval setting.
+    """
+
+    async def test_toolsearch_auto_allowed_for_owner(self):
+        """ToolSearch is allowed for owner even when not in owner_allowed_tools."""
+        broker = _make_broker(
+            session_room_map={"ses_o": "room_o"},
+            session_role_map={"ses_o": "owner"},
+            owner_allowed_tools=[],   # empty — would normally trigger "ask"
+        )
+        broker.request_permission = AsyncMock(return_value=True)
+
+        body = _hook_body(
+            "ToolSearch",
+            {"query": "select:WebSearch", "max_results": 1},
+            session_id="ses_o",
+        )
+        result = json.loads(await broker._handle_hook(body))
+
+        self.assertEqual(result["decision"], "allow")
+        broker.request_permission.assert_not_called()
+
+    async def test_toolsearch_auto_allowed_for_guest(self):
+        """ToolSearch is allowed for guest even when not in guest_allowed_tools."""
+        broker = _make_broker(
+            session_room_map={"ses_g": "room_g"},
+            session_role_map={"ses_g": "guest"},
+            guest_allowed_tools=["Read"],   # ToolSearch not listed → would block
+        )
+        body = _hook_body(
+            "ToolSearch",
+            {"query": "select:WebSearch", "max_results": 1},
+            session_id="ses_g",
+        )
+        result = json.loads(await broker._handle_hook(body))
+
+        self.assertEqual(result["decision"], "allow")
+
+    async def test_toolsearch_auto_allowed_no_room_mapping(self):
+        """ToolSearch is allowed even when the session has no room mapping.
+
+        Without this, a guest/owner with no room would hit the 'no room mapping'
+        block path instead of auto-allowing the meta-tool.
+        """
+        broker = _make_broker(
+            session_room_map={},
+            session_role_map={"ses_o": "owner"},
+            owner_allowed_tools=[],
+        )
+        body = _hook_body("ToolSearch", {"query": "select:Bash"}, session_id="ses_o")
+        result = json.loads(await broker._handle_hook(body))
+
+        self.assertEqual(result["decision"], "allow")
+
+    async def test_toolsearch_auto_allowed_with_skip_owner_approval(self):
+        """ToolSearch remains allowed when skip_owner_approval is also set."""
+        broker = _make_broker(
+            session_room_map={"ses_o": "room_o"},
+            session_role_map={"ses_o": "owner"},
+            owner_allowed_tools=[],
+            skip_owner_approval=True,
+        )
+        body = _hook_body("ToolSearch", {"query": "select:Grep"}, session_id="ses_o")
+        result = json.loads(await broker._handle_hook(body))
+
+        self.assertEqual(result["decision"], "allow")
+
+    async def test_non_meta_tool_not_auto_allowed(self):
+        """Non-meta tools (e.g. WebSearch) are NOT auto-allowed by the meta-tool path."""
+        broker = _make_broker(
+            session_room_map={"ses_g": "room_g"},
+            session_role_map={"ses_g": "guest"},
+            guest_allowed_tools=["Read"],
+        )
+        body = _hook_body("WebSearch", {"query": "hello"}, session_id="ses_g")
+        result = json.loads(await broker._handle_hook(body))
+
+        # WebSearch not in guest_allowed_tools → block (meta-tool path not triggered)
+        self.assertEqual(result["decision"], "block")
+
+
 # ── Malformed input handling ─────────────────────────────────────────────────
 
 class TestMalformedInput(unittest.IsolatedAsyncioTestCase):

@@ -35,6 +35,11 @@ logger = logging.getLogger("agent-chat-gateway.permissions.claude")
 
 _HOST = "127.0.0.1"
 
+# Claude Code meta-tools that load deferred tool schemas — no side effects,
+# always safe to auto-allow regardless of role or allow-list configuration.
+# Real security is enforced when the *actual* tool (e.g. WebSearch) is invoked.
+_CLAUDE_META_TOOLS: frozenset[str] = frozenset({"ToolSearch"})
+
 
 class ClaudePermissionBroker(PermissionBroker):
     """Broker that intercepts Claude Code tool calls via HTTP PreToolUse hook.
@@ -177,6 +182,12 @@ class ClaudePermissionBroker(PermissionBroker):
         ``reason`` is a human-readable string (meaningful only when
         ``action == "block"``; empty otherwise).
         """
+        # Meta-tools (e.g. ToolSearch) only load deferred schemas — no side
+        # effects.  Always auto-allow before any role check so they never surface
+        # as a spurious approval request.
+        if tool_name in _CLAUDE_META_TOOLS:
+            return "allow", ""
+
         if role == "guest":
             if all_params_match_any(self._guest_allowed_tools, tool_name, param_strings):
                 return "allow", ""
