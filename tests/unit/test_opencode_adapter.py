@@ -9,7 +9,6 @@ import httpx
 
 from gateway.agents.errors import AgentExecutionError, AgentRateLimitedError, AgentUnavailableError
 from gateway.agents.opencode import OpenCodeBackend
-from gateway.agents.opencode.adapter import _SSE_READY
 from gateway.agents.response import AgentEvent, AgentResponse
 
 
@@ -598,6 +597,23 @@ class TestParseHttpResponse(unittest.TestCase):
         self.assertEqual(r.usage.cache_read_tokens, 0)
         self.assertEqual(r.usage.cache_write_tokens, 0)
 
+    def test_reasoning_only_produces_usage_object(self):
+        """A turn with only reasoning tokens still produces a non-None usage object."""
+        b = self._backend()
+        data = {
+            "parts": [
+                {
+                    "type": "step-finish",
+                    "tokens": {"input": 0, "output": 0, "reasoning": 100, "cache": {}},
+                    "cost": 0.0,
+                },
+            ],
+            "info": {},
+        }
+        r = b._parse_http_response(data, "ses_1")
+        self.assertIsNotNone(r.usage, "usage must not be None for reasoning-only turns")
+        self.assertEqual(r.usage.reasoning_tokens, 100)
+
 
 # ── _post_message error sanitization (Issue 12.4) ─────────────────────────────
 
@@ -1177,7 +1193,7 @@ class TestEnsureLiveRuntimeStopRace(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("stopped", str(cm.exception).lower())
 
-    async def test_no_agent_unavailable_when_never_started(self):
+    async def test_agent_unavailable_when_never_started(self):
         """When _ever_started was never True, raises AgentUnavailableError."""
         from gateway.agents.errors import AgentUnavailableError
 
@@ -1513,13 +1529,6 @@ def _sse_line(session_id: str, event_type: str, **props) -> str:
     return f"data: {json.dumps(payload)}"
 
 
-async def _fill_queue(queue: asyncio.Queue, lines: list[str]) -> None:
-    """Populate *queue* with _SSE_READY sentinel then the given SSE lines."""
-    await queue.put(_SSE_READY)
-    for line in lines:
-        await queue.put(line)
-
-
 class TestPostMessageAsync(unittest.IsolatedAsyncioTestCase):
     """_post_message_async() targets the correct endpoint."""
 
@@ -1579,6 +1588,24 @@ class TestPostMessageAsync(unittest.IsolatedAsyncioTestCase):
             side_effect=httpx.HTTPStatusError(
                 "service unavailable", request=MagicMock(), response=mock_resp
             )
+        )
+        with self.assertRaises(AgentUnavailableError):
+            await b._post_message_async("sess-1", "hi", timeout=30)
+
+    async def test_connect_error_raises_agent_unavailable(self):
+        """httpx.ConnectError (sidecar unreachable) maps to AgentUnavailableError."""
+        b = _make_started_backend()
+        b._client.post = AsyncMock(
+            side_effect=httpx.ConnectError("connection refused")
+        )
+        with self.assertRaises(AgentUnavailableError):
+            await b._post_message_async("sess-1", "hi", timeout=30)
+
+    async def test_timeout_error_raises_agent_unavailable(self):
+        """httpx.TimeoutException maps to AgentUnavailableError."""
+        b = _make_started_backend()
+        b._client.post = AsyncMock(
+            side_effect=httpx.TimeoutException("timed out")
         )
         with self.assertRaises(AgentUnavailableError):
             await b._post_message_async("sess-1", "hi", timeout=30)
@@ -1902,6 +1929,80 @@ class TestParseSSEEvents(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final.num_turns, 1, "num_turns should be 1, not 2")
         self.assertEqual(final.usage.input_tokens, 100, "input tokens must not be doubled")
         self.assertAlmostEqual(final.cost_usd, 0.01, places=6)
+
+    async def test_null_properties_does_not_crash(self):
+        """An SSE event with 'properties': null is silently skipped (not a crash)."""
+        import json as _json
+        b = _make_started_backend()
+        queue: asyncio.Queue = asyncio.Queue()
+        # Craft a raw data line with null properties
+        null_props_line = 'data: ' + _json.dumps({"type": "server.heartbeat", "properties": None})
+        await queue.put(null_props_line)
+        await queue.put(_sse_line("s1", "session.status", status={"type": "idle"}))
+        events = [e async for e in b._parse_sse_events("s1", queue, self._deadline(), 60)]
+        self.assertEqual(events[-1].kind, "final")
+
+    async def test_null_part_in_message_part_updated_does_not_crash(self):
+        """A message.part.updated event with 'part': null is silently skipped."""
+        import json as _json
+        b = _make_started_backend()
+        queue: asyncio.Queue = asyncio.Queue()
+        null_part_line = 'data: ' + _json.dumps({
+            "type": "message.part.updated",
+            "properties": {"sessionID": "s1", "part": None},
+        })
+        await queue.put(null_part_line)
+        await queue.put(_sse_line("s1", "session.status", status={"type": "idle"}))
+        events = [e async for e in b._parse_sse_events("s1", queue, self._deadline(), 60)]
+        self.assertEqual(events[-1].kind, "final")
+
+    async def test_null_tokens_in_step_finish_does_not_crash(self):
+        """A step-finish event with 'tokens': null does not raise AttributeError."""
+        import json as _json
+        b = _make_started_backend()
+        queue: asyncio.Queue = asyncio.Queue()
+        null_tokens_line = 'data: ' + _json.dumps({
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "s1",
+                "part": {"id": "sf1", "type": "step-finish", "tokens": None, "cost": 0.001},
+            },
+        })
+        await queue.put(null_tokens_line)
+        await queue.put(_sse_line("s1", "session.status", status={"type": "idle"}))
+        events = [e async for e in b._parse_sse_events("s1", queue, self._deadline(), 60)]
+        final = events[-1].response
+        self.assertEqual(final.num_turns, 1)
+        self.assertIsNone(final.usage)  # no tokens → no usage object
+
+    async def test_reasoning_only_turn_produces_usage_object(self):
+        """A turn with only reasoning tokens still produces a non-None usage object."""
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "sf1", "type": "step-finish",
+                            "tokens": {"input": 0, "output": 0, "reasoning": 50, "cache": {}},
+                            "cost": 0.0}),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        final = events[-1].response
+        self.assertIsNotNone(final.usage, "usage must not be None for reasoning-only turns")
+        self.assertEqual(final.usage.reasoning_tokens, 50)
+
+    async def test_string_status_in_session_status_does_not_crash(self):
+        """session.status with a plain string value is gracefully ignored."""
+        import json as _json
+        b = _make_started_backend()
+        queue: asyncio.Queue = asyncio.Queue()
+        # Simulate server sending "status": "idle" as a string instead of a dict
+        string_status_line = 'data: ' + _json.dumps({
+            "type": "session.status",
+            "properties": {"sessionID": "s1", "status": "idle"},
+        })
+        await queue.put(string_status_line)
+        # Follow up with the proper dict-shaped idle so the parser can terminate
+        await queue.put(_sse_line("s1", "session.status", status={"type": "idle"}))
+        events = [e async for e in b._parse_sse_events("s1", queue, self._deadline(), 60)]
+        self.assertEqual(events[-1].kind, "final")
 
 
 class TestStream(unittest.IsolatedAsyncioTestCase):

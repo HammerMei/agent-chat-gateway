@@ -784,8 +784,10 @@ class OpenCodeBackend(AgentBackend):
         Args:
             session_id: OpenCode session ID.
             text:       Prompt text to send.
-            timeout:    HTTP connect/write timeout in seconds (not the turn
-                        deadline — the server responds immediately with 202).
+            timeout:    Uniform HTTP timeout in seconds passed to httpx (covers
+                        connect, read, write, and pool phases).  This is NOT the
+                        agent turn deadline — the server returns 202 immediately
+                        after queuing the prompt.
 
         .. note::
             Endpoint path ``/session/{id}/prompt_async`` — verify against a
@@ -802,6 +804,10 @@ class OpenCodeBackend(AgentBackend):
                 f"for POST /session/{session_id[:16]!r}/prompt_async"
             )
             raise _classify_http_error(exc.response.status_code, message) from None
+        except (httpx.ConnectError, httpx.TimeoutException) as exc:
+            raise AgentUnavailableError(
+                f"opencode sidecar unreachable during POST /prompt_async: {exc}"
+            ) from exc
 
     async def _parse_sse_events(
         self,
@@ -876,7 +882,8 @@ class OpenCodeBackend(AgentBackend):
                 continue
 
             event_type = payload.get("type", "")
-            props = payload.get("properties", {})
+            # Guard against explicit JSON null ("properties": null).
+            props = payload.get("properties") or {}
 
             # Filter to our session only (the SSE stream is global)
             if props.get("sessionID") != session_id:
@@ -901,7 +908,8 @@ class OpenCodeBackend(AgentBackend):
 
             # ── Part creation / state transitions ──────────────────────────
             elif event_type == "message.part.updated":
-                part = props.get("part", {})
+                # Guard against explicit JSON null for "part" or "state".
+                part = props.get("part") or {}
                 part_id = part.get("id", "")
                 part_type = part.get("type", "")
                 if not part_id:
@@ -909,7 +917,7 @@ class OpenCodeBackend(AgentBackend):
                 part_types[part_id] = part_type
 
                 if part_type == "tool":
-                    state = part.get("state", {})
+                    state = part.get("state") or {}
                     tool_status = state.get("status", "")
                     tool_name = part.get("tool", "")
                     if tool_status == "running" and tool_name:
@@ -940,12 +948,12 @@ class OpenCodeBackend(AgentBackend):
                     if part_id not in seen_step_finish_ids:
                         seen_step_finish_ids.add(part_id)
                         num_turns += 1
-                        tokens = part.get("tokens", {})
+                        # Guard against explicit JSON null for both "tokens"
+                        # and "cache" sub-fields.
+                        tokens = part.get("tokens") or {}
                         total_input += tokens.get("input", 0)
                         total_output += tokens.get("output", 0)
                         total_reasoning += tokens.get("reasoning", 0)
-                        # Guard against explicit JSON null: `tokens.get("cache", {})` would
-                        # return None when the key is present with value null.
                         cache = tokens.get("cache") or {}
                         total_cache_read += cache.get("read", 0)
                         total_cache_write += cache.get("write", 0)
@@ -956,8 +964,10 @@ class OpenCodeBackend(AgentBackend):
             # If OpenCode ever emits multiple idle transitions (e.g. for
             # parallel sub-sessions), this return would cut the stream early.
             elif event_type == "session.status":
-                status = props.get("status", {})
-                if status.get("type") == "idle":
+                # Guard against null and non-dict payloads: the server may
+                # send "status": "idle" (a string) or "status": null.
+                status = props.get("status") or {}
+                if isinstance(status, dict) and status.get("type") == "idle":
                     text = "".join(
                         text_accumulator.get(pid, "") for pid in text_part_order
                     ).strip()
@@ -969,7 +979,11 @@ class OpenCodeBackend(AgentBackend):
                     if not text:
                         text = "(empty response)"
 
-                    has_usage = (total_input + total_output) > 0
+                    # Include reasoning tokens in the has_usage check so that
+                    # reasoning-only turns (e.g. thinking models that report
+                    # reasoning tokens but zero input/output) still get a usage
+                    # object rather than silently dropping the token count.
+                    has_usage = (total_input + total_output + total_reasoning) > 0
                     usage = (
                         TokenUsage(
                             input_tokens=total_input,
@@ -1189,7 +1203,9 @@ class OpenCodeBackend(AgentBackend):
                 is_error = True
             text = "(empty response)"
 
-        has_usage = (total_input + total_output) > 0
+        # Include reasoning tokens so reasoning-only turns still produce a
+        # usage object (same fix applied to the SSE path).
+        has_usage = (total_input + total_output + total_reasoning) > 0
         usage = (
             TokenUsage(
                 input_tokens=total_input,
