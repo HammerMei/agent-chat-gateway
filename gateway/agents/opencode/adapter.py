@@ -808,7 +808,7 @@ class OpenCodeBackend(AgentBackend):
         except httpx.HTTPStatusError as exc:
             message = (
                 f"opencode API returned HTTP {exc.response.status_code} "
-                f"for POST /session/{session_id[:16]!r}/prompt_async"
+                f"for session {session_id[:16]!r} (prompt_async)"
             )
             raise _classify_http_error(exc.response.status_code, message) from None
         except (httpx.ConnectError, httpx.TimeoutException) as exc:
@@ -1025,8 +1025,17 @@ class OpenCodeBackend(AgentBackend):
 
             # ── Server-side error ──────────────────────────────────────────
             elif event_type == "session.error":
-                error = props.get("error", {})
-                raise AgentExecutionError(f"OpenCode session error: {error!s}")
+                error = props.get("error")
+                # Extract a readable message: prefer "message" key in dict,
+                # fall back to str() of non-empty non-dict values, then
+                # fall back to a generic string for null / empty payloads.
+                if isinstance(error, dict):
+                    error_msg = error.get("message") or (str(error) if error else "unknown error")
+                elif error:
+                    error_msg = str(error)
+                else:
+                    error_msg = "unknown error"
+                raise AgentExecutionError(f"OpenCode session error: {error_msg}")
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 
@@ -1207,7 +1216,9 @@ class OpenCodeBackend(AgentBackend):
             # Tool-only turns are valid — they produce step-finish events but no
             # text blocks.  Marking them as is_error=True would cause ContextInjector
             # to incorrectly count them as failed injection attempts.
-            has_tool_steps = any(p.get("type") == "step-finish" for p in parts)
+            has_tool_steps = any(
+                isinstance(p, dict) and p.get("type") == "step-finish" for p in parts
+            )
             if has_tool_steps:
                 logger.debug(
                     "No text extracted from opencode response but tool steps completed "

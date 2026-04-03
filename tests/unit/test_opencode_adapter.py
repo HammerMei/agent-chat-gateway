@@ -1693,7 +1693,8 @@ class TestParseSSEEvents(unittest.IsolatedAsyncioTestCase):
     avoiding any HTTP layer.
     """
 
-    def _deadline(self, seconds: int = 60) -> float:
+    def _deadline(self, seconds: int = 5) -> float:
+        """Default 5 s so a missing idle event fails fast instead of hanging 60 s."""
         return asyncio.get_running_loop().time() + seconds
 
     async def _collect(self, session_id: str, lines: list[str]) -> list[AgentEvent]:
@@ -2111,6 +2112,42 @@ class TestParseSSEEvents(unittest.IsolatedAsyncioTestCase):
         events = [e async for e in b._parse_sse_events("s1", queue, self._deadline(), 60)]
         self.assertEqual(events[-1].kind, "final")
 
+    async def test_session_error_with_message_key_uses_it(self):
+        """session.error with a 'message' key produces a readable error string."""
+        b = _make_started_backend()
+        queue: asyncio.Queue = asyncio.Queue()
+        await queue.put(_sse_line("s1", "session.error",
+                                  error={"message": "tool execution failed", "code": 500}))
+        with self.assertRaises(AgentExecutionError) as ctx:
+            async for _ in b._parse_sse_events("s1", queue, self._deadline(), 5):
+                pass
+        self.assertIn("tool execution failed", str(ctx.exception))
+
+    async def test_session_error_null_error_field_does_not_crash(self):
+        """session.error with error=null produces a clean 'unknown error' message."""
+        import json as _json
+        b = _make_started_backend()
+        queue: asyncio.Queue = asyncio.Queue()
+        null_error_line = 'data: ' + _json.dumps({
+            "type": "session.error",
+            "properties": {"sessionID": "s1", "error": None},
+        })
+        await queue.put(null_error_line)
+        with self.assertRaises(AgentExecutionError) as ctx:
+            async for _ in b._parse_sse_events("s1", queue, self._deadline(), 5):
+                pass
+        self.assertIn("unknown error", str(ctx.exception))
+
+    async def test_session_error_from_other_session_is_ignored(self):
+        """session.error for a different sessionID must not affect the listener."""
+        events = await self._collect("s1", [
+            # Error from session "other" — should be silently ignored
+            _sse_line("other", "session.error", error={"message": "other session crashed"}),
+            # Our session completes normally
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        self.assertEqual(events[-1].kind, "final")
+
 
 class TestStream(unittest.IsolatedAsyncioTestCase):
     """stream() end-to-end: SSE handshake, prompt posting, event lifecycle."""
@@ -2229,7 +2266,7 @@ class TestStream(unittest.IsolatedAsyncioTestCase):
                             "state": {"status": "completed"}}),
             _sse_line("sess-1", "message.part.updated",
                       part={"id": "sf1", "type": "step-finish",
-                            "tokens": {"input": 10, "output": 5, "cache": None},
+                            "tokens": {"input": 10, "output": 5, "reasoning": 0, "cache": None},
                             "cost": 0.001}),
             _sse_line("sess-1", "session.status", status={"type": "idle"}),
         ]
@@ -2359,3 +2396,62 @@ class TestStream(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(AgentUnavailableError):
                 async for _ in b.stream("sess-1", "hi", "/tmp", timeout=30):
                     pass
+
+    async def test_stream_injects_attachments_into_prompt(self):
+        """Attachments are injected into the prompt text before posting."""
+        b = _make_started_backend()
+        b._ensure_live_runtime = AsyncMock()
+        b._post_message_async = AsyncMock()
+
+        sse_lines = [
+            _sse_line("sess-1", "session.status", status={"type": "idle"}),
+        ]
+        mock_sse_resp = self._make_sse_response(sse_lines)
+        mock_sse_client = AsyncMock()
+        mock_sse_client.stream = MagicMock(return_value=mock_sse_resp)
+        mock_sse_client.__aenter__ = AsyncMock(return_value=mock_sse_client)
+        mock_sse_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("gateway.agents.opencode.adapter.httpx.AsyncClient",
+                   return_value=mock_sse_client):
+            async for _ in b.stream(
+                "sess-1", "check this file", "/workspace",
+                timeout=30, attachments=["/workspace/file.txt"]
+            ):
+                pass
+
+        # The prompt passed to _post_message_async must include attachment content
+        actual_prompt = b._post_message_async.call_args[0][1]
+        self.assertIn("file.txt", actual_prompt)
+        self.assertNotEqual(actual_prompt, "check this file")
+
+    async def test_stream_sse_connect_timeout_capped_by_deadline(self):
+        """SSE connect timeout is capped to remaining deadline, not always 15s."""
+        b = _make_started_backend()
+        b._ensure_live_runtime = AsyncMock()
+
+        # SSE queue that never delivers the _SSE_READY sentinel
+        async def _never_connects():
+            await asyncio.sleep(999)
+
+        mock_resp = AsyncMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.aiter_lines = _never_connects
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+        mock_sse_client = AsyncMock()
+        mock_sse_client.stream = MagicMock(return_value=mock_resp)
+        mock_sse_client.__aenter__ = AsyncMock(return_value=mock_sse_client)
+        mock_sse_client.__aexit__ = AsyncMock(return_value=False)
+
+        import time
+        start = time.monotonic()
+        with patch("gateway.agents.opencode.adapter.httpx.AsyncClient",
+                   return_value=mock_sse_client):
+            with self.assertRaises(AgentUnavailableError):
+                async for _ in b.stream("sess-1", "hi", "/tmp", timeout=1):
+                    pass
+        elapsed = time.monotonic() - start
+        # With timeout=1, the connect wait is capped to ~1s, not the full 15s
+        self.assertLess(elapsed, 5.0, "SSE connect should be capped by the caller timeout")
