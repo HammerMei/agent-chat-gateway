@@ -68,8 +68,11 @@ logger = logging.getLogger("agent-chat-gateway.agents.opencode")
 # than a bare string literal) makes isinstance checks unnecessary and guards
 # against accidental collision with real SSE line content.
 _SSE_READY = "__opencode_sse_ready__"
-# Maximum seconds to block on queue.get() — keeps the deadline check responsive.
-_SSE_QUEUE_POLL_INTERVAL = 30.0
+# Maximum seconds queue.get() may block before returning to re-check the
+# deadline.  This is an *upper bound* on wait time — not a polling interval.
+# Must be kept well below the typical caller timeout so that short deadlines
+# are enforced promptly.  Increasing this value degrades deadline granularity.
+_SSE_QUEUE_MAX_WAIT = 30.0
 # Maximum seconds to wait for the SSE connection to be established before
 # giving up with AgentUnavailableError.  Always capped to the caller's deadline.
 _SSE_CONNECT_TIMEOUT = 15.0
@@ -747,8 +750,12 @@ class OpenCodeBackend(AgentBackend):
                         async for line in response.aiter_lines():
                             await queue.put(line)
                         # Natural stream close before session.status idle —
-                        # notify _parse_sse_events immediately so it doesn't
-                        # stall until the next poll-interval timeout fires.
+                        # signal _parse_sse_events so it can raise promptly
+                        # rather than waiting for the next _SSE_QUEUE_MAX_WAIT
+                        # poll to expire.  Note: if sse_task is cancelled
+                        # (e.g. because _post_message_async raised) this put
+                        # may itself be interrupted by CancelledError — that
+                        # is safe because the EOFError sentinel is then unused.
                         await queue.put(
                             EOFError("OpenCode SSE stream closed before session.status idle")
                         )
@@ -774,10 +781,19 @@ class OpenCodeBackend(AgentBackend):
                     f"{sse_connect_timeout:.2g}s"
                 )
             if isinstance(ready, Exception):
+                # Sanitize: do not interpolate the raw exception — its __str__
+                # often contains the internal URL (host:port) from httpx.
                 raise AgentUnavailableError(
-                    f"OpenCode SSE connection failed: {ready}"
-                ) from ready
-            assert ready == _SSE_READY, f"Unexpected first SSE queue item: {ready!r}"
+                    "OpenCode SSE connection failed for session "
+                    f"{session_id[:16]!r} — sidecar may be unreachable"
+                ) from None
+            if ready != _SSE_READY:
+                # Should never happen given the current _collect_sse
+                # implementation, but guard defensively so a future change
+                # cannot silently pass a raw SSE line to _parse_sse_events.
+                raise AgentUnavailableError(
+                    f"OpenCode SSE returned unexpected handshake item: {ready!r}"
+                )
 
             # ── Phase 2: post the prompt (SSE is now listening) ───────────────
             await self._post_message_async(session_id, prompt)
@@ -881,7 +897,7 @@ class OpenCodeBackend(AgentBackend):
 
             try:
                 item = await asyncio.wait_for(
-                    queue.get(), timeout=min(remaining, _SSE_QUEUE_POLL_INTERVAL)
+                    queue.get(), timeout=min(remaining, _SSE_QUEUE_MAX_WAIT)
                 )
             except asyncio.TimeoutError:
                 raise asyncio.TimeoutError(
@@ -989,14 +1005,14 @@ class OpenCodeBackend(AgentBackend):
                         _inp = tokens.get("input", 0)
                         _out = tokens.get("output", 0)
                         _rsn = tokens.get("reasoning", 0)
-                        total_input += _inp if isinstance(_inp, (int, float)) else 0
-                        total_output += _out if isinstance(_out, (int, float)) else 0
-                        total_reasoning += _rsn if isinstance(_rsn, (int, float)) else 0
+                        total_input += int(_inp) if isinstance(_inp, (int, float)) else 0
+                        total_output += int(_out) if isinstance(_out, (int, float)) else 0
+                        total_reasoning += int(_rsn) if isinstance(_rsn, (int, float)) else 0
                         cache = tokens.get("cache") or {}
                         _cr = cache.get("read", 0)
                         _cw = cache.get("write", 0)
-                        total_cache_read += _cr if isinstance(_cr, (int, float)) else 0
-                        total_cache_write += _cw if isinstance(_cw, (int, float)) else 0
+                        total_cache_read += int(_cr) if isinstance(_cr, (int, float)) else 0
+                        total_cache_write += int(_cw) if isinstance(_cw, (int, float)) else 0
                         _cost = part.get("cost")
                         total_cost += _cost if isinstance(_cost, (int, float)) else 0.0
 
@@ -1206,8 +1222,9 @@ class OpenCodeBackend(AgentBackend):
           - ``is_error`` is set to True when no text parts are extracted from the
             response (empty or tool-only turns).  This lets ContextInjector detect
             failed injection attempts without relying on the HTTP status code.
-          - ``duration_ms`` is read from ``info.duration``; verify field name against
-            a live response.
+          - ``duration_ms`` is read from ``info.duration`` and coerced to ``int``.
+            opencode returns this as a numeric millisecond count; non-numeric or
+            null values are treated as unavailable (``None``).
         """
         # Guard against explicit JSON null for top-level fields.
         parts = data.get("parts") or []
@@ -1234,14 +1251,14 @@ class OpenCodeBackend(AgentBackend):
                 _inp = tokens.get("input", 0)
                 _out = tokens.get("output", 0)
                 _rsn = tokens.get("reasoning", 0)
-                total_input += _inp if isinstance(_inp, (int, float)) else 0
-                total_output += _out if isinstance(_out, (int, float)) else 0
-                total_reasoning += _rsn if isinstance(_rsn, (int, float)) else 0
+                total_input += int(_inp) if isinstance(_inp, (int, float)) else 0
+                total_output += int(_out) if isinstance(_out, (int, float)) else 0
+                total_reasoning += int(_rsn) if isinstance(_rsn, (int, float)) else 0
                 cache = tokens.get("cache") or {}
                 _cr = cache.get("read", 0)
                 _cw = cache.get("write", 0)
-                total_cache_read += _cr if isinstance(_cr, (int, float)) else 0
-                total_cache_write += _cw if isinstance(_cw, (int, float)) else 0
+                total_cache_read += int(_cr) if isinstance(_cr, (int, float)) else 0
+                total_cache_write += int(_cw) if isinstance(_cw, (int, float)) else 0
                 _cost = part.get("cost")
                 total_cost += _cost if isinstance(_cost, (int, float)) else 0.0
 
@@ -1289,7 +1306,11 @@ class OpenCodeBackend(AgentBackend):
             session_id=session_id,
             usage=usage,
             cost_usd=total_cost if total_cost > 0 else None,
-            duration_ms=info.get("duration"),
+            duration_ms=(
+                int(_dur)
+                if isinstance(_dur := info.get("duration"), (int, float))
+                else None
+            ),
             num_turns=num_turns if num_turns > 0 else None,
             is_error=is_error,
         )

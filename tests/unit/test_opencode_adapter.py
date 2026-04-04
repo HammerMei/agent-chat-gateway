@@ -2330,16 +2330,23 @@ class TestStream(unittest.IsolatedAsyncioTestCase):
         b._ensure_live_runtime = AsyncMock()
 
         mock_sse_client = AsyncMock()
-        # Simulate connection error during SSE setup
-        mock_sse_client.stream = MagicMock(side_effect=httpx.ConnectError("refused"))
+        # Simulate connection error during SSE setup — raw httpx error includes host:port
+        mock_sse_client.stream = MagicMock(
+            side_effect=httpx.ConnectError("Connection refused to http://127.0.0.1:54321/event")
+        )
         mock_sse_client.__aenter__ = AsyncMock(return_value=mock_sse_client)
         mock_sse_client.__aexit__ = AsyncMock(return_value=False)
 
         with patch("gateway.agents.opencode.adapter.httpx.AsyncClient",
                    return_value=mock_sse_client):
-            with self.assertRaises(AgentUnavailableError):
+            with self.assertRaises(AgentUnavailableError) as cm:
                 async for _ in b.stream("sess-1", "hi", "/tmp", timeout=30):
                     pass
+
+        # Error message must be sanitized — host:port must not leak to caller
+        err = str(cm.exception)
+        self.assertNotIn("127.0.0.1", err)
+        self.assertNotIn("54321", err)
 
     async def test_stream_tool_only_turn_is_error_false(self):
         """stream() final event for a tool-only turn (step-finish, no text) is not an error."""
@@ -2400,21 +2407,19 @@ class TestStream(unittest.IsolatedAsyncioTestCase):
                 async for _ in b.stream("sess-1", "hi", "/tmp", timeout=30):
                     pass
 
-    async def test_stream_post_error_wins_over_concurrent_sse_eof(self):
-        """When SSE closes with EOF just as _post_message_async fails, the post error propagates.
+    async def test_stream_sse_closes_immediately_after_post_succeeds(self):
+        """When SSE stream closes before session.status idle (post succeeds), raises AgentUnavailableError.
 
-        This covers the race where the SSE stream closes before the main coroutine
-        reaches _parse_sse_events.  The post error must win — callers should not
-        see a confusing EOFError from the closed stream.
+        This covers the race where the background SSE task closes the stream
+        (putting an EOFError in the queue) before or while _parse_sse_events starts
+        consuming it.  stream() must raise AgentUnavailableError, not hang or
+        raise a confusing internal EOFError.
         """
-        from gateway.agents.errors import AgentUnavailableError as _AUE
         b = _make_started_backend()
         b._ensure_live_runtime = AsyncMock()
-        b._post_message_async = AsyncMock(
-            side_effect=_AUE("sidecar down during prompt_async")
-        )
+        b._post_message_async = AsyncMock()  # succeeds — post is fine
 
-        # SSE stream closes immediately after sending _SSE_READY (no data lines)
+        # SSE stream closes immediately after _SSE_READY (no data lines at all)
         sse_lines: list[str] = []
         mock_sse_resp = self._make_sse_response(sse_lines)
         mock_sse_client = AsyncMock()
@@ -2424,12 +2429,9 @@ class TestStream(unittest.IsolatedAsyncioTestCase):
 
         with patch("gateway.agents.opencode.adapter.httpx.AsyncClient",
                    return_value=mock_sse_client):
-            with self.assertRaises(_AUE) as cm:
+            with self.assertRaises(AgentUnavailableError):
                 async for _ in b.stream("sess-1", "hi", "/tmp", timeout=30):
                     pass
-
-        # The caller sees the post error, not a generic EOFError
-        self.assertIn("sidecar down", str(cm.exception))
 
     async def test_stream_timeout_raises_asyncio_timeout_error(self):
         """stream() raises asyncio.TimeoutError when the deadline elapses mid-stream."""
