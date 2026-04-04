@@ -73,6 +73,10 @@ _SSE_QUEUE_POLL_INTERVAL = 30.0
 # Maximum seconds to wait for the SSE connection to be established before
 # giving up with AgentUnavailableError.  Always capped to the caller's deadline.
 _SSE_CONNECT_TIMEOUT = 15.0
+# Maximum seconds to wait for HTTP 202 from /session/{id}/prompt_async.
+# This endpoint returns immediately after queuing the prompt — 30 s is
+# generous for a local sidecar; it is NOT the full agent-turn deadline.
+_PROMPT_ASYNC_POST_TIMEOUT = 30
 
 _INIT_PROMPT = (
     "Chat session initialized. "
@@ -722,8 +726,12 @@ class OpenCodeBackend(AgentBackend):
         # coroutine reads from the queue so it can also enforce the deadline.
         queue: asyncio.Queue[str | Exception] = asyncio.Queue()
 
+        # Capture base_url before creating the background task so that a
+        # concurrent stop() call cannot null out self._base_url mid-flight.
+        base_url = self._base_url
+
         async def _collect_sse() -> None:
-            url = f"{self._base_url}/event"
+            url = f"{base_url}/event"
             try:
                 async with httpx.AsyncClient(
                     # TCP-level connect timeout is intentionally shorter than
@@ -772,7 +780,7 @@ class OpenCodeBackend(AgentBackend):
             assert ready == _SSE_READY, f"Unexpected first SSE queue item: {ready!r}"
 
             # ── Phase 2: post the prompt (SSE is now listening) ───────────────
-            await self._post_message_async(session_id, prompt, timeout=timeout)
+            await self._post_message_async(session_id, prompt)
 
             # ── Phase 3: consume SSE events and yield AgentEvents ─────────────
             async for event in self._parse_sse_events(
@@ -785,7 +793,7 @@ class OpenCodeBackend(AgentBackend):
             await asyncio.gather(sse_task, return_exceptions=True)
 
     async def _post_message_async(
-        self, session_id: str, text: str, *, timeout: int
+        self, session_id: str, text: str
     ) -> None:
         """POST a prompt to the async endpoint — returns immediately (HTTP 202).
 
@@ -793,13 +801,17 @@ class OpenCodeBackend(AgentBackend):
         this method returns as soon as the server acknowledges the request.
         Progress arrives via the ``GET /event`` SSE stream.
 
+        The HTTP timeout is fixed at :data:`_PROMPT_ASYNC_POST_TIMEOUT` seconds.
+        This is NOT the agent-turn deadline — the server returns 202 immediately
+        after queuing the prompt, so a short timeout is appropriate.
+
         Args:
             session_id: OpenCode session ID.
             text:       Prompt text to send.
-            timeout:    Uniform HTTP timeout in seconds passed to httpx (covers
-                        connect, read, write, and pool phases).  This is NOT the
-                        agent turn deadline — the server returns 202 immediately
-                        after queuing the prompt.
+
+        Raises:
+            AgentExecutionError:   Server rejected the request (4xx/5xx, including 404).
+            AgentUnavailableError: Sidecar unreachable or timed-out at TCP level.
 
         .. note::
             Endpoint path ``/session/{id}/prompt_async`` — verify against a
@@ -808,7 +820,9 @@ class OpenCodeBackend(AgentBackend):
         url = f"{self._base_url}/session/{session_id}/prompt_async"
         body = {"parts": [{"type": "text", "text": text}]}
         try:
-            resp = await self._get_client().post(url, json=body, timeout=timeout)
+            resp = await self._get_client().post(
+                url, json=body, timeout=_PROMPT_ASYNC_POST_TIMEOUT
+            )
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
             message = (
@@ -816,10 +830,10 @@ class OpenCodeBackend(AgentBackend):
                 f"for session {session_id[:16]!r} (prompt_async)"
             )
             raise _classify_http_error(exc.response.status_code, message) from None
-        except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        except (httpx.ConnectError, httpx.TimeoutException):
             raise AgentUnavailableError(
-                f"opencode sidecar unreachable during POST /prompt_async: {exc}"
-            ) from exc
+                f"opencode sidecar unreachable (prompt_async) for session {session_id[:16]!r}"
+            ) from None
 
     async def _parse_sse_events(
         self,
@@ -1022,6 +1036,10 @@ class OpenCodeBackend(AgentBackend):
                         if has_usage
                         else None
                     )
+                    # duration_ms is intentionally omitted here: the SSE stream
+                    # does not carry timing metadata.  The blocking _post_message
+                    # path derives duration_ms from info.duration in the JSON
+                    # response body, but that field is unavailable over SSE.
                     yield AgentEvent(
                         kind="final",
                         response=AgentResponse(
@@ -1085,7 +1103,8 @@ class OpenCodeBackend(AgentBackend):
     ) -> dict:
         """POST a text message to an existing opencode session.
 
-        Raises RuntimeError (sanitized) on non-2xx responses — the original
+        Raises :class:`AgentNotFoundError`, :class:`AgentExecutionError`, or
+        :class:`AgentUnavailableError` on non-2xx responses — the original
         httpx.HTTPStatusError is NOT propagated because it includes the full
         request URL and response body, which may contain internal server details
         that should not be exposed to end users or leaked into RC chat.

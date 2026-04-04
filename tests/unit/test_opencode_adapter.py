@@ -1613,7 +1613,7 @@ class TestPostMessageAsync(unittest.IsolatedAsyncioTestCase):
         mock_resp.raise_for_status = MagicMock()
         b._client.post = AsyncMock(return_value=mock_resp)
 
-        await b._post_message_async("sess-1", "hello world", timeout=30)
+        await b._post_message_async("sess-1", "hello world")
 
         b._client.post.assert_awaited_once()
         url = b._client.post.call_args[0][0]
@@ -1625,22 +1625,23 @@ class TestPostMessageAsync(unittest.IsolatedAsyncioTestCase):
         mock_resp.raise_for_status = MagicMock()
         b._client.post = AsyncMock(return_value=mock_resp)
 
-        await b._post_message_async("sess-1", "my prompt", timeout=30)
+        await b._post_message_async("sess-1", "my prompt")
 
         body = b._client.post.call_args[1]["json"]
         self.assertEqual(body, {"parts": [{"type": "text", "text": "my prompt"}]})
 
-    async def test_timeout_forwarded_to_http_client(self):
-        """The caller's timeout value is forwarded to the HTTP client call."""
+    async def test_uses_internal_timeout_constant(self):
+        """The internal _PROMPT_ASYNC_POST_TIMEOUT constant is used, not a caller-supplied value."""
+        from gateway.agents.opencode.adapter import _PROMPT_ASYNC_POST_TIMEOUT
         b = _make_started_backend()
         mock_resp = MagicMock()
         mock_resp.raise_for_status = MagicMock()
         b._client.post = AsyncMock(return_value=mock_resp)
 
-        await b._post_message_async("sess-1", "text", timeout=45)
+        await b._post_message_async("sess-1", "text")
 
         kwargs = b._client.post.call_args[1]
-        self.assertEqual(kwargs["timeout"], 45)
+        self.assertEqual(kwargs["timeout"], _PROMPT_ASYNC_POST_TIMEOUT)
 
     async def test_http_error_mapped_to_agent_error(self):
         b = _make_started_backend()
@@ -1652,7 +1653,36 @@ class TestPostMessageAsync(unittest.IsolatedAsyncioTestCase):
 
         from gateway.agents.errors import AgentRateLimitedError
         with self.assertRaises(AgentRateLimitedError):
-            await b._post_message_async("sess-1", "hi", timeout=30)
+            await b._post_message_async("sess-1", "hi")
+
+    async def test_404_raises_agent_execution_error(self):
+        """HTTP 404 (session not found) maps to AgentExecutionError with (prompt_async) label."""
+        from gateway.agents.errors import AgentExecutionError
+        b = _make_started_backend()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 404
+        b._client.post = AsyncMock(
+            side_effect=httpx.HTTPStatusError("not found", request=MagicMock(), response=mock_resp)
+        )
+        with self.assertRaises(AgentExecutionError) as cm:
+            await b._post_message_async("sess-1", "hi")
+        self.assertIn("404", str(cm.exception))
+        self.assertIn("prompt_async", str(cm.exception))
+
+    async def test_http_error_message_contains_prompt_async_label(self):
+        """Error messages for HTTP failures include the '(prompt_async)' label."""
+        from gateway.agents.errors import AgentExecutionError
+        b = _make_started_backend()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 500
+        b._client.post = AsyncMock(
+            side_effect=httpx.HTTPStatusError(
+                "server error", request=MagicMock(), response=mock_resp
+            )
+        )
+        with self.assertRaises(AgentExecutionError) as cm:
+            await b._post_message_async("sess-1", "hi")
+        self.assertIn("prompt_async", str(cm.exception))
 
     async def test_503_raises_agent_unavailable(self):
         """HTTP 503 (sidecar crashed mid-turn) maps to AgentUnavailableError."""
@@ -1665,7 +1695,7 @@ class TestPostMessageAsync(unittest.IsolatedAsyncioTestCase):
             )
         )
         with self.assertRaises(AgentUnavailableError):
-            await b._post_message_async("sess-1", "hi", timeout=30)
+            await b._post_message_async("sess-1", "hi")
 
     async def test_connect_error_raises_agent_unavailable(self):
         """httpx.ConnectError (sidecar unreachable) maps to AgentUnavailableError."""
@@ -1674,7 +1704,20 @@ class TestPostMessageAsync(unittest.IsolatedAsyncioTestCase):
             side_effect=httpx.ConnectError("connection refused")
         )
         with self.assertRaises(AgentUnavailableError):
-            await b._post_message_async("sess-1", "hi", timeout=30)
+            await b._post_message_async("sess-1", "hi")
+
+    async def test_connect_error_message_sanitized(self):
+        """ConnectError message must not leak host:port from the raw httpx exception."""
+        b = _make_started_backend()
+        b._client.post = AsyncMock(
+            side_effect=httpx.ConnectError("Connection refused to http://localhost:3000")
+        )
+        with self.assertRaises(AgentUnavailableError) as cm:
+            await b._post_message_async("sess-1", "hi")
+        err = str(cm.exception)
+        self.assertNotIn("localhost", err)
+        self.assertNotIn("3000", err)
+        self.assertIn("prompt_async", err)
 
     async def test_timeout_error_raises_agent_unavailable(self):
         """httpx.TimeoutException maps to AgentUnavailableError."""
@@ -1683,7 +1726,7 @@ class TestPostMessageAsync(unittest.IsolatedAsyncioTestCase):
             side_effect=httpx.TimeoutException("timed out")
         )
         with self.assertRaises(AgentUnavailableError):
-            await b._post_message_async("sess-1", "hi", timeout=30)
+            await b._post_message_async("sess-1", "hi")
 
 
 class TestParseSSEEvents(unittest.IsolatedAsyncioTestCase):
@@ -2246,7 +2289,7 @@ class TestStream(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final.kind, "final")
         self.assertEqual(final.response.text, "Hi there!")
         # Verify _post_message_async received the correct arguments
-        b._post_message_async.assert_awaited_once_with("sess-1", "hello", timeout=30)
+        b._post_message_async.assert_awaited_once_with("sess-1", "hello")
 
     async def test_stream_cancels_sse_task_on_completion(self):
         """The SSE background task is cancelled after stream() completes."""
@@ -2356,6 +2399,37 @@ class TestStream(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(_AUE):
                 async for _ in b.stream("sess-1", "hi", "/tmp", timeout=30):
                     pass
+
+    async def test_stream_post_error_wins_over_concurrent_sse_eof(self):
+        """When SSE closes with EOF just as _post_message_async fails, the post error propagates.
+
+        This covers the race where the SSE stream closes before the main coroutine
+        reaches _parse_sse_events.  The post error must win — callers should not
+        see a confusing EOFError from the closed stream.
+        """
+        from gateway.agents.errors import AgentUnavailableError as _AUE
+        b = _make_started_backend()
+        b._ensure_live_runtime = AsyncMock()
+        b._post_message_async = AsyncMock(
+            side_effect=_AUE("sidecar down during prompt_async")
+        )
+
+        # SSE stream closes immediately after sending _SSE_READY (no data lines)
+        sse_lines: list[str] = []
+        mock_sse_resp = self._make_sse_response(sse_lines)
+        mock_sse_client = AsyncMock()
+        mock_sse_client.stream = MagicMock(return_value=mock_sse_resp)
+        mock_sse_client.__aenter__ = AsyncMock(return_value=mock_sse_client)
+        mock_sse_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("gateway.agents.opencode.adapter.httpx.AsyncClient",
+                   return_value=mock_sse_client):
+            with self.assertRaises(_AUE) as cm:
+                async for _ in b.stream("sess-1", "hi", "/tmp", timeout=30):
+                    pass
+
+        # The caller sees the post error, not a generic EOFError
+        self.assertIn("sidecar down", str(cm.exception))
 
     async def test_stream_timeout_raises_asyncio_timeout_error(self):
         """stream() raises asyncio.TimeoutError when the deadline elapses mid-stream."""
