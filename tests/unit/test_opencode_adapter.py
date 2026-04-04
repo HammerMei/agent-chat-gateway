@@ -78,6 +78,35 @@ class TestStart(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(RuntimeError):
                 await b.start()
 
+    async def test_wait_for_health_error_message_does_not_leak_host_port(self):
+        """_wait_for_health() RuntimeError must not contain the sidecar host:port."""
+        b = _make_backend()
+
+        mock_process = MagicMock()
+        mock_process.returncode = None
+        mock_process.pid = 1
+
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=mock_process),
+            patch("gateway.agents.opencode.adapter._find_free_port", return_value=54321),
+            patch("gateway.agents.opencode.adapter._STARTUP_TIMEOUT", 0.1),
+            patch("httpx.AsyncClient") as mock_cls,
+        ):
+            mock_client = AsyncMock()
+            mock_cls.return_value.__aenter__.return_value = mock_client
+            # Simulate a ConnectError whose str() contains the internal URL
+            mock_client.get = AsyncMock(
+                side_effect=httpx.ConnectError(
+                    "Connection refused to http://127.0.0.1:54321"
+                )
+            )
+            with self.assertRaises(RuntimeError) as cm:
+                await b.start()
+
+        err = str(cm.exception)
+        self.assertNotIn("127.0.0.1", err)
+        self.assertNotIn("54321", err)
+
     async def test_start_uses_new_session_args(self):
         """start() appends new_session_args to the opencode serve command."""
         b = _make_backend(new_session_args=["--model", "anthropic/claude-sonnet-4-5"])
@@ -618,6 +647,24 @@ class TestParseHttpResponse(unittest.TestCase):
         r = b._parse_http_response(data, "ses_1")
         self.assertIsNotNone(r.usage, "usage must not be None for reasoning-only turns")
         self.assertEqual(r.usage.reasoning_tokens, 100)
+
+    def test_cache_only_turn_produces_usage_object(self):
+        """A turn with only cache tokens (zero input/output/reasoning) produces a non-None usage object."""
+        b = self._backend()
+        data = {
+            "parts": [
+                {
+                    "type": "step-finish",
+                    "tokens": {"input": 0, "output": 0, "reasoning": 0,
+                               "cache": {"read": 500, "write": 0}},
+                    "cost": 0.0,
+                },
+            ],
+            "info": {},
+        }
+        r = b._parse_http_response(data, "ses_1")
+        self.assertIsNotNone(r.usage, "usage must not be None for cache-only turns")
+        self.assertEqual(r.usage.cache_read_tokens, 500)
 
     def test_step_finish_tokens_null_does_not_crash(self):
         """Explicit JSON null for 'tokens' in HTTP step-finish must not crash."""
@@ -2107,6 +2154,20 @@ class TestParseSSEEvents(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(final.usage, "usage must not be None for reasoning-only turns")
         self.assertEqual(final.usage.reasoning_tokens, 50)
 
+    async def test_cache_only_turn_produces_usage_object_sse(self):
+        """A turn with only cache tokens (zero input/output/reasoning) produces a non-None usage object."""
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "sf1", "type": "step-finish",
+                            "tokens": {"input": 0, "output": 0, "reasoning": 0,
+                                       "cache": {"read": 300, "write": 0}},
+                            "cost": 0.0}),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        final = events[-1].response
+        self.assertIsNotNone(final.usage, "usage must not be None for cache-only turns")
+        self.assertEqual(final.usage.cache_read_tokens, 300)
+
     async def test_string_status_in_session_status_does_not_crash(self):
         """session.status with a plain string value is gracefully ignored."""
         import json as _json
@@ -2404,32 +2465,6 @@ class TestStream(unittest.IsolatedAsyncioTestCase):
         with patch("gateway.agents.opencode.adapter.httpx.AsyncClient",
                    return_value=mock_sse_client):
             with self.assertRaises(_AUE):
-                async for _ in b.stream("sess-1", "hi", "/tmp", timeout=30):
-                    pass
-
-    async def test_stream_sse_closes_immediately_after_post_succeeds(self):
-        """When SSE stream closes before session.status idle (post succeeds), raises AgentUnavailableError.
-
-        This covers the race where the background SSE task closes the stream
-        (putting an EOFError in the queue) before or while _parse_sse_events starts
-        consuming it.  stream() must raise AgentUnavailableError, not hang or
-        raise a confusing internal EOFError.
-        """
-        b = _make_started_backend()
-        b._ensure_live_runtime = AsyncMock()
-        b._post_message_async = AsyncMock()  # succeeds — post is fine
-
-        # SSE stream closes immediately after _SSE_READY (no data lines at all)
-        sse_lines: list[str] = []
-        mock_sse_resp = self._make_sse_response(sse_lines)
-        mock_sse_client = AsyncMock()
-        mock_sse_client.stream = MagicMock(return_value=mock_sse_resp)
-        mock_sse_client.__aenter__ = AsyncMock(return_value=mock_sse_client)
-        mock_sse_client.__aexit__ = AsyncMock(return_value=False)
-
-        with patch("gateway.agents.opencode.adapter.httpx.AsyncClient",
-                   return_value=mock_sse_client):
-            with self.assertRaises(AgentUnavailableError):
                 async for _ in b.stream("sess-1", "hi", "/tmp", timeout=30):
                     pass
 

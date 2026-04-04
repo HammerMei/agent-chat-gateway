@@ -478,11 +478,15 @@ class OpenCodeBackend(AgentBackend):
             or (self._ever_started and self._base_url is None)
         )
         if needs_restart:
-            # Circuit-breaker: if consecutive restart attempts have all failed,
-            # fast-fail immediately instead of letting each incoming request
-            # block for the full _STARTUP_TIMEOUT (~30s).  Cleared on a
-            # successful restart or explicit stop().
+            # Circuit-breaker fast-fail: skip the lock and fail immediately if
+            # the counter is already at the limit.  This is a *performance hint*
+            # only — it avoids blocking for the full _STARTUP_TIMEOUT when the
+            # sidecar is known-dead.  A concurrent increment could race past
+            # this check; the authoritative guard is the re-check inside the
+            # lock below.  Cleared on a successful restart or explicit stop().
             if self._consecutive_restart_failures >= _MAX_RESTART_FAILURES:
+                # The failure count is intentionally included: it is operational
+                # diagnostic info for administrators/operators, not a secret.
                 raise AgentUnavailableError(
                     f"opencode sidecar is unavailable after "
                     f"{self._consecutive_restart_failures} consecutive failed restart "
@@ -499,6 +503,8 @@ class OpenCodeBackend(AgentBackend):
                     # Re-check circuit-breaker inside lock too (another coroutine
                     # may have incremented the counter while we were waiting).
                     if self._consecutive_restart_failures >= _MAX_RESTART_FAILURES:
+                        # Authoritative guard (outer check is a performance hint only).
+                        # Failure count is intentional diagnostic info for operators.
                         raise AgentUnavailableError(
                             f"opencode sidecar is unavailable after "
                             f"{self._consecutive_restart_failures} consecutive failed restart "
@@ -565,9 +571,12 @@ class OpenCodeBackend(AgentBackend):
                     last_exc = exc
                 await asyncio.sleep(0.5)
 
+        # Sanitize: do not interpolate last_exc directly — its __str__ often
+        # contains the internal URL (host:port) from the httpx request.
+        exc_type = type(last_exc).__name__ if last_exc is not None else "unknown"
         raise RuntimeError(
             f"opencode serve did not become healthy within {_STARTUP_TIMEOUT}s "
-            f"(last error: {last_exc})"
+            f"(last error type: {exc_type})"
         )
 
     # ── AgentBackend interface ─────────────────────────────────────────────────
@@ -909,8 +918,11 @@ class OpenCodeBackend(AgentBackend):
                 # EOFError = clean stream close before idle (protocol gap, not
                 # a transport failure); surface its self-describing message directly.
                 # All other exceptions = transport / parse failures.
+                # Use from None to prevent chaining the raw exception as __cause__:
+                # transport exceptions (httpx.RemoteProtocolError etc.) can carry
+                # internal URLs in their string representation.
                 prefix = "" if isinstance(item, EOFError) else "OpenCode SSE stream error: "
-                raise AgentUnavailableError(f"{prefix}{item}") from item
+                raise AgentUnavailableError(f"{prefix}{item}") from None
 
             line: str = item
             if not line.startswith("data:"):
@@ -1036,11 +1048,14 @@ class OpenCodeBackend(AgentBackend):
                     if not text:
                         text = "(empty response)"
 
-                    # Include reasoning tokens in the has_usage check so that
-                    # reasoning-only turns (e.g. thinking models that report
-                    # reasoning tokens but zero input/output) still get a usage
-                    # object rather than silently dropping the token count.
-                    has_usage = (total_input + total_output + total_reasoning) > 0
+                    # Include all token buckets so that any non-zero token
+                    # count — including reasoning-only or cache-only turns —
+                    # produces a TokenUsage object rather than silently dropping
+                    # the data.
+                    has_usage = (
+                        total_input + total_output + total_reasoning
+                        + total_cache_read + total_cache_write
+                    ) > 0
                     usage = (
                         TokenUsage(
                             input_tokens=total_input,
@@ -1154,11 +1169,19 @@ class OpenCodeBackend(AgentBackend):
             )
         try:
             return resp.json()
-        except Exception as exc:
+        except Exception:
+            # Log raw body at DEBUG only — it may contain sidecar stack traces
+            # or file-system paths that should not appear in user-facing messages.
+            logger.debug(
+                "opencode non-JSON response body for session %s (HTTP %d): %r",
+                session_id[:16],
+                resp.status_code,
+                resp.text[:200],
+            )
             raise AgentUnavailableError(
                 f"opencode API returned non-JSON response (HTTP {resp.status_code}) "
-                f"for session {session_id[:16]!r}: {resp.text[:200]!r}"
-            ) from exc
+                f"for session {session_id[:16]!r}"
+            ) from None
 
     async def _cleanup_session_best_effort(self, session_id: str) -> bool:
         """Try to delete a failed session; return True if cleanup succeeded."""
@@ -1286,9 +1309,12 @@ class OpenCodeBackend(AgentBackend):
                 is_error = True
             text = "(empty response)"
 
-        # Include reasoning tokens so reasoning-only turns still produce a
-        # usage object (same fix applied to the SSE path).
-        has_usage = (total_input + total_output + total_reasoning) > 0
+        # Include all token buckets — reasoning-only and cache-only turns must
+        # also produce a TokenUsage object (same logic as SSE path).
+        has_usage = (
+            total_input + total_output + total_reasoning
+            + total_cache_read + total_cache_write
+        ) > 0
         usage = (
             TokenUsage(
                 input_tokens=total_input,
