@@ -67,7 +67,10 @@ class AgentResponse:
                       Note: opencode reports cost per step; reliability varies.
         duration_ms : Wall-clock duration of the entire agent turn in ms.
                       Claude: from the ``result`` event.
-                      opencode: derived from first/last event timestamps.
+                      opencode (blocking path): derived from ``info.duration``
+                      in the HTTP response body.
+                      opencode (SSE/streaming path): not populated — the SSE
+                      stream does not carry timing metadata.
                       ``None`` if not available.
         num_turns   : Number of agentic loop iterations (tool-use round trips).
                       Claude: from the ``result`` event.
