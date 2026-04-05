@@ -247,9 +247,8 @@ This document clearly communicates what agent-chat-gateway supports today, what 
   - Long responses automatically chunked
   - Very long messages may split mid-sentence (no intelligent wrapping)
 
-- ❌ **Thread replies**: Replies posted to channel, not in threads
-  - Thread support planned for future release
-  - All approvals and agent responses appear in main room timeline
+- ✅ **Thread replies** — configurable via `reply_in_thread` (default: false) and
+  `permission_reply_in_thread` (default: true for approval notifications)
 
 - ❌ **Slash command conflict**: Permission approve/deny cannot use `/` prefix
   - Rocket.Chat intercepts `/` commands
@@ -298,10 +297,6 @@ This document clearly communicates what agent-chat-gateway supports today, what 
 - 🔄 **Slack connector** — Real-time message routing via Slack API/WebSocket
 - 🔄 **Discord connector** — Message routing via Discord API
 - 🔄 **Generic webhook connector** — Support push-based events from any platform
-
-#### Rocket.Chat Enhancements
-- 🔄 **Thread support** — Replies appear in conversation threads
-- 🔄 **Permission notifications in threads** — Approval requests visible in thread context
 
 #### Operational Features
 - 🔄 **Config hot-reload** — Update configuration without restart

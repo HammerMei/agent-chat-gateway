@@ -108,6 +108,7 @@ connectors:
       max_file_size_mb: 10
       download_timeout: 30
     reply_in_thread: false
+    permission_reply_in_thread: true    # post approval requests inside a thread
     context_inject_files:
       - contexts/rc-gateway-context.md  # injected once per session: RC format, RBAC rules
 
@@ -116,7 +117,8 @@ agents:
     type: claude
     command: claude
     working_directory: ~/.agent-chat-gateway/work
-    session_prefix: agent-chat
+    new_session_args: []                # extra CLI flags passed when creating a new session
+    session_prefix: "agent-chat"
     context_inject_files: []            # agent-level extra context (usually empty)
 
     # ── Tool allow-lists ───────────────────────────────────────────────────
@@ -274,6 +276,8 @@ To monitor additional rooms:
 | `agent-chat-gateway pause WATCHER` | Pause a watcher |
 | `agent-chat-gateway resume WATCHER` | Resume a paused watcher |
 | `agent-chat-gateway reset WATCHER` | Reset a watcher session |
-| `agent-chat-gateway send ROOM MESSAGE` | Send a message to a room |
+| `agent-chat-gateway send ROOM MESSAGE` | Send a text message to a room |
+| `agent-chat-gateway send ROOM --file FILE` | Send message from a file (or `-` for stdin) |
+| `agent-chat-gateway send ROOM --attach FILE` | Upload a file attachment to a room |
 | `tail -f ~/.agent-chat-gateway/gateway.log` | View logs |
 | `agent-chat-gateway onboard` | Interactive setup wizard (alternative to manual config) |
