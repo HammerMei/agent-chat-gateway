@@ -35,9 +35,11 @@ are called automatically by the context manager — no manual calls needed.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import socket
+from collections.abc import AsyncGenerator
 from typing import TYPE_CHECKING
 
 import httpx
@@ -50,7 +52,7 @@ from ..errors import (
     AgentRateLimitedError,
     AgentUnavailableError,
 )
-from ..response import AgentResponse, TokenUsage
+from ..response import AgentEvent, AgentResponse, TokenUsage
 
 if TYPE_CHECKING:
     from ...core.permission import (
@@ -60,6 +62,24 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger("agent-chat-gateway.agents.opencode")
+
+# Sentinel string placed in the SSE queue by _collect_sse() once the HTTP
+# streaming connection is established.  Using a module-level constant (rather
+# than a bare string literal) makes isinstance checks unnecessary and guards
+# against accidental collision with real SSE line content.
+_SSE_READY = "__opencode_sse_ready__"
+# Maximum seconds queue.get() may block before returning to re-check the
+# deadline.  This is an *upper bound* on wait time — not a polling interval.
+# Must be kept well below the typical caller timeout so that short deadlines
+# are enforced promptly.  Increasing this value degrades deadline granularity.
+_SSE_QUEUE_MAX_WAIT = 30.0
+# Maximum seconds to wait for the SSE connection to be established before
+# giving up with AgentUnavailableError.  Always capped to the caller's deadline.
+_SSE_CONNECT_TIMEOUT = 15.0
+# Maximum seconds to wait for HTTP 202 from /session/{id}/prompt_async.
+# This endpoint returns immediately after queuing the prompt — 30 s is
+# generous for a local sidecar; it is NOT the full agent-turn deadline.
+_PROMPT_ASYNC_POST_TIMEOUT = 30
 
 _INIT_PROMPT = (
     "Chat session initialized. "
@@ -458,11 +478,15 @@ class OpenCodeBackend(AgentBackend):
             or (self._ever_started and self._base_url is None)
         )
         if needs_restart:
-            # Circuit-breaker: if consecutive restart attempts have all failed,
-            # fast-fail immediately instead of letting each incoming request
-            # block for the full _STARTUP_TIMEOUT (~30s).  Cleared on a
-            # successful restart or explicit stop().
+            # Circuit-breaker fast-fail: skip the lock and fail immediately if
+            # the counter is already at the limit.  This is a *performance hint*
+            # only — it avoids blocking for the full _STARTUP_TIMEOUT when the
+            # sidecar is known-dead.  A concurrent increment could race past
+            # this check; the authoritative guard is the re-check inside the
+            # lock below.  Cleared on a successful restart or explicit stop().
             if self._consecutive_restart_failures >= _MAX_RESTART_FAILURES:
+                # The failure count is intentionally included: it is operational
+                # diagnostic info for administrators/operators, not a secret.
                 raise AgentUnavailableError(
                     f"opencode sidecar is unavailable after "
                     f"{self._consecutive_restart_failures} consecutive failed restart "
@@ -479,6 +503,8 @@ class OpenCodeBackend(AgentBackend):
                     # Re-check circuit-breaker inside lock too (another coroutine
                     # may have incremented the counter while we were waiting).
                     if self._consecutive_restart_failures >= _MAX_RESTART_FAILURES:
+                        # Authoritative guard (outer check is a performance hint only).
+                        # Failure count is intentional diagnostic info for operators.
                         raise AgentUnavailableError(
                             f"opencode sidecar is unavailable after "
                             f"{self._consecutive_restart_failures} consecutive failed restart "
@@ -545,9 +571,12 @@ class OpenCodeBackend(AgentBackend):
                     last_exc = exc
                 await asyncio.sleep(0.5)
 
+        # Sanitize: do not interpolate last_exc directly — its __str__ often
+        # contains the internal URL (host:port) from the httpx request.
+        exc_type = type(last_exc).__name__ if last_exc is not None else "unknown"
         raise RuntimeError(
             f"opencode serve did not become healthy within {_STARTUP_TIMEOUT}s "
-            f"(last error: {last_exc})"
+            f"(last error type: {exc_type})"
         )
 
     # ── AgentBackend interface ─────────────────────────────────────────────────
@@ -595,7 +624,10 @@ class OpenCodeBackend(AgentBackend):
 
         session_id = data.get("id", "")
         if not session_id:
-            raise RuntimeError(f"opencode POST /session returned no session id: {data}")
+            # Log raw body at DEBUG only — response may contain internal paths
+            # or server details that should not appear in user-facing messages.
+            logger.debug("opencode POST /session response missing id: %r", data)
+            raise RuntimeError("opencode POST /session returned no session id")
 
         # Send init prompt to prime the session (same as old CLI adapter).
         try:
@@ -648,6 +680,431 @@ class OpenCodeBackend(AgentBackend):
         raw = await self._post_message(session_id, prompt, timeout=timeout)
         return self._parse_http_response(raw, session_id)
 
+    async def stream(
+        self,
+        session_id: str,
+        prompt: str,
+        working_directory: str,
+        timeout: int,
+        attachments: list[str] | None = None,
+        env: dict[str, str] | None = None,
+    ) -> AsyncGenerator[AgentEvent, None]:
+        """Stream intermediate agent events for an OpenCode session turn.
+
+        Submits the prompt via ``POST /session/{id}/prompt_async`` (returns
+        immediately), then consumes the ``GET /event`` SSE stream, yielding
+        :class:`~gateway.agents.response.AgentEvent` objects as content arrives.
+
+        The SSE connection is established **before** the prompt is posted to
+        eliminate the race condition where a very fast turn would complete and
+        emit ``session.status idle`` before we started listening.
+
+        Yields:
+            ``AgentEvent(kind="tool_call")``   — when a tool transitions to
+                ``running`` state.
+            ``AgentEvent(kind="tool_result")`` — when a tool reaches
+                ``completed`` or ``error`` state.
+            ``AgentEvent(kind="thinking")``    — on the first non-empty snapshot
+                of a ``reasoning`` part.
+            ``AgentEvent(kind="final")``       — with the completed
+                :class:`~gateway.agents.response.AgentResponse` when the
+                session status becomes ``idle``.
+
+        Raises:
+            asyncio.TimeoutError: If the turn doesn't complete within ``timeout``
+                seconds.
+            AgentExecutionError: On ``session.error`` events or SSE parse failures.
+            AgentUnavailableError: If the SSE connection cannot be established.
+        """
+        if attachments:
+            logger.info(
+                "Injecting %d attachment(s) into prompt text (no native HTTP upload): %s",
+                len(attachments),
+                attachments,
+            )
+        prompt = build_attachment_prompt(prompt, attachments, working_directory)
+
+        if env:
+            logger.debug(
+                "env kwarg ignored by HTTP adapter (set on server at startup): %s",
+                list(env.keys()),
+            )
+
+        await self._ensure_live_runtime()
+
+        deadline = asyncio.get_running_loop().time() + timeout
+
+        # ── Phase 1: open SSE connection BEFORE posting the prompt ────────────
+        # Events are not replayed on reconnect — we must be listening before
+        # the prompt is submitted to guarantee we see session.status idle.
+        # A background task drains the SSE stream into a queue; the main
+        # coroutine reads from the queue so it can also enforce the deadline.
+        queue: asyncio.Queue[str | Exception] = asyncio.Queue()
+
+        # Capture base_url before creating the background task so that a
+        # concurrent stop() call cannot null out self._base_url mid-flight.
+        base_url = self._base_url
+
+        async def _collect_sse() -> None:
+            url = f"{base_url}/event"
+            try:
+                async with httpx.AsyncClient(
+                    # TCP-level connect timeout is intentionally shorter than
+                    # _SSE_CONNECT_TIMEOUT (15 s): if the TCP handshake itself
+                    # hangs for >10 s the socket is broken regardless, so we
+                    # fail fast at the httpx layer and let _collect_sse put the
+                    # ConnectTimeout in the queue as an AgentUnavailableError.
+                    timeout=httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
+                ) as sse_client:
+                    async with sse_client.stream("GET", url) as response:
+                        response.raise_for_status()
+                        await queue.put(_SSE_READY)
+                        async for line in response.aiter_lines():
+                            await queue.put(line)
+                        # Natural stream close before session.status idle —
+                        # signal _parse_sse_events so it can raise promptly
+                        # rather than waiting for the next _SSE_QUEUE_MAX_WAIT
+                        # poll to expire.  Note: if sse_task is cancelled
+                        # (e.g. because _post_message_async raised) this put
+                        # may itself be interrupted by CancelledError — that
+                        # is safe because the EOFError sentinel is then unused.
+                        await queue.put(
+                            EOFError("OpenCode SSE stream closed before session.status idle")
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await queue.put(exc)
+
+        sse_task = asyncio.create_task(_collect_sse(), name="opencode-stream-sse")
+        try:
+            # Wait for SSE to connect — capped at _SSE_CONNECT_TIMEOUT but
+            # never exceeds the caller's own deadline so short timeouts don't
+            # block extra long.
+            sse_connect_timeout = min(
+                _SSE_CONNECT_TIMEOUT,
+                max(0.1, deadline - asyncio.get_running_loop().time()),
+            )
+            try:
+                ready = await asyncio.wait_for(queue.get(), timeout=sse_connect_timeout)
+            except asyncio.TimeoutError:
+                raise AgentUnavailableError(
+                    "OpenCode SSE stream did not connect within "
+                    f"{sse_connect_timeout:.2g}s"
+                )
+            if isinstance(ready, Exception):
+                # Sanitize: do not interpolate the raw exception — its __str__
+                # often contains the internal URL (host:port) from httpx.
+                raise AgentUnavailableError(
+                    "OpenCode SSE connection failed for session "
+                    f"{session_id[:16]!r} — sidecar may be unreachable"
+                ) from None
+            if ready != _SSE_READY:
+                # Should never happen given the current _collect_sse
+                # implementation, but guard defensively so a future change
+                # cannot silently pass a raw SSE line to _parse_sse_events.
+                raise AgentUnavailableError(
+                    f"OpenCode SSE returned unexpected handshake item: {ready!r}"
+                )
+
+            # ── Phase 2: post the prompt (SSE is now listening) ───────────────
+            await self._post_message_async(session_id, prompt)
+
+            # ── Phase 3: consume SSE events and yield AgentEvents ─────────────
+            async for event in self._parse_sse_events(
+                session_id, queue, deadline, timeout
+            ):
+                yield event
+
+        finally:
+            sse_task.cancel()
+            await asyncio.gather(sse_task, return_exceptions=True)
+
+    async def _post_message_async(
+        self, session_id: str, text: str
+    ) -> None:
+        """POST a prompt to the async endpoint — returns immediately (HTTP 202).
+
+        Unlike :meth:`_post_message` (which blocks until the turn completes),
+        this method returns as soon as the server acknowledges the request.
+        Progress arrives via the ``GET /event`` SSE stream.
+
+        The HTTP timeout is fixed at :data:`_PROMPT_ASYNC_POST_TIMEOUT` seconds.
+        This is NOT the agent-turn deadline — the server returns 202 immediately
+        after queuing the prompt, so a short timeout is appropriate.
+
+        Args:
+            session_id: OpenCode session ID.
+            text:       Prompt text to send.
+
+        Raises:
+            AgentExecutionError:   Server rejected the request (4xx/5xx, including 404).
+            AgentUnavailableError: Sidecar unreachable or timed-out at TCP level.
+
+        .. note::
+            Endpoint path ``/session/{id}/prompt_async`` — verify against a
+            live opencode server if the API version changes.
+        """
+        url = f"{self._base_url}/session/{session_id}/prompt_async"
+        body = {"parts": [{"type": "text", "text": text}]}
+        try:
+            resp = await self._get_client().post(
+                url, json=body, timeout=_PROMPT_ASYNC_POST_TIMEOUT
+            )
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            message = (
+                f"opencode API returned HTTP {exc.response.status_code} "
+                f"for session {session_id[:16]!r} (prompt_async)"
+            )
+            raise _classify_http_error(exc.response.status_code, message) from None
+        except (httpx.ConnectError, httpx.TimeoutException):
+            raise AgentUnavailableError(
+                f"opencode sidecar unreachable (prompt_async) for session {session_id[:16]!r}"
+            ) from None
+
+    async def _parse_sse_events(
+        self,
+        session_id: str,
+        queue: asyncio.Queue[str | Exception],
+        deadline: float,
+        timeout: int,
+    ) -> AsyncGenerator[AgentEvent, None]:
+        """Consume SSE lines from *queue* and yield :class:`AgentEvent` objects.
+
+        Filters to events whose ``properties.sessionID`` matches *session_id*.
+        Tracks accumulated text and usage data across the turn; yields a
+        ``final`` event when ``session.status`` becomes ``idle``.
+
+        Args:
+            session_id: OpenCode session ID to filter events for.
+            queue:      Async queue populated by the SSE collector task.
+            deadline:   ``loop.time()`` deadline; raises :exc:`asyncio.TimeoutError`
+                        if exceeded.
+            timeout:    Original timeout in seconds (used in error messages only).
+        """
+        # Accumulated state for the final AgentResponse
+        part_types: dict[str, str] = {}        # partID → part type
+        text_part_order: list[str] = []         # ordered text partIDs
+        text_accumulator: dict[str, str] = {}   # partID → accumulated delta text
+        emitted_thinking: set[str] = set()      # partIDs whose thinking event was yielded
+        # De-duplicate repeated message.part.updated events for the same part:
+        # OpenCode may stream incremental state updates (e.g. pending→running→
+        # completed) so the same part ID can arrive more than once.
+        tool_call_emitted: set[str] = set()     # partIDs for which tool_call was yielded
+        tool_result_emitted: set[str] = set()   # partIDs for which tool_result was yielded
+        seen_step_finish_ids: set[str] = set()  # partIDs whose tokens were accumulated
+        total_cost = 0.0
+        total_input = total_output = total_reasoning = 0
+        total_cache_read = total_cache_write = 0
+        num_turns = 0
+
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError(
+                    f"OpenCode session {session_id[:16]!r} did not complete "
+                    f"within {timeout}s"
+                )
+
+            try:
+                item = await asyncio.wait_for(
+                    queue.get(), timeout=min(remaining, _SSE_QUEUE_MAX_WAIT)
+                )
+            except asyncio.TimeoutError:
+                raise asyncio.TimeoutError(
+                    f"OpenCode session {session_id[:16]!r} did not complete "
+                    f"within {timeout}s"
+                )
+
+            if isinstance(item, Exception):
+                if isinstance(item, EOFError):
+                    # Clean stream close before session.status idle — the
+                    # EOFError message is gateway-controlled text, safe to surface.
+                    raise AgentUnavailableError(str(item)) from None
+                # Transport / parse failure from httpx or the SSE layer.
+                # Do NOT interpolate str(item): transport exceptions carry
+                # internal URLs in their string representation.  Only emit
+                # the exception type name, consistent with _wait_for_health.
+                raise AgentUnavailableError(
+                    f"OpenCode SSE stream error ({type(item).__name__}) "
+                    f"for session {session_id[:16]!r}"
+                ) from None
+
+            line: str = item
+            if not line.startswith("data:"):
+                continue
+            raw = line[5:].strip()
+            if not raw:
+                continue
+
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                logger.debug("Malformed OpenCode SSE JSON: %r", raw[:200])
+                continue
+
+            # SSE lines may be valid JSON but non-dict (null, array, string…).
+            if not isinstance(payload, dict):
+                logger.debug("Unexpected non-dict OpenCode SSE payload: %r", raw[:200])
+                continue
+
+            event_type = payload.get("type", "")
+            # Guard against explicit JSON null ("properties": null).
+            props = payload.get("properties") or {}
+
+            # Filter to our session only (the SSE stream is global)
+            if props.get("sessionID") != session_id:
+                continue
+
+            # ── Text / reasoning streaming ─────────────────────────────────
+            if event_type == "message.part.delta":
+                part_id = props.get("partID", "")
+                field = props.get("field", "")
+                delta = props.get("delta", "")
+                if not (part_id and field == "text" and isinstance(delta, str) and delta):
+                    continue
+                # Accumulate only confirmed text parts — skip unregistered
+                # parts (part_type unknown) to avoid reasoning deltas bleeding
+                # in before the corresponding message.part.updated arrives.
+                if part_types.get(part_id) == "text":
+                    if part_id not in text_accumulator:
+                        text_part_order.append(part_id)
+                    text_accumulator[part_id] = (
+                        text_accumulator.get(part_id, "") + delta
+                    )
+
+            # ── Part creation / state transitions ──────────────────────────
+            elif event_type == "message.part.updated":
+                # Guard against explicit JSON null for "part" or "state".
+                part = props.get("part") or {}
+                part_id = part.get("id", "")
+                part_type = part.get("type", "")
+                if not part_id:
+                    continue
+                part_types[part_id] = part_type
+
+                if part_type == "tool":
+                    state = part.get("state") or {}
+                    tool_status = state.get("status", "")
+                    tool_name = part.get("tool", "")
+                    if not isinstance(tool_name, str):
+                        tool_name = ""
+                    if tool_status == "running" and tool_name:
+                        if part_id not in tool_call_emitted:
+                            tool_call_emitted.add(part_id)
+                            yield AgentEvent(kind="tool_call", text=f"🔧 {tool_name}")
+                    elif tool_status in ("completed", "error") and tool_name:
+                        if part_id not in tool_result_emitted:
+                            tool_result_emitted.add(part_id)
+                            yield AgentEvent(kind="tool_result", text=f"✓ {tool_name}")
+
+                elif part_type == "reasoning":
+                    # Yield a single thinking event when the reasoning text
+                    # first becomes non-empty (it may be updated incrementally,
+                    # but we only need one notification per reasoning block).
+                    reasoning_text = part.get("text", "")
+                    if reasoning_text and part_id not in emitted_thinking:
+                        emitted_thinking.add(part_id)
+                        yield AgentEvent(
+                            kind="thinking",
+                            text=f"💭 {reasoning_text[:80]}",
+                        )
+
+                elif part_type == "step-finish":
+                    # Guard against double-counting: OpenCode may emit multiple
+                    # message.part.updated events for the same step-finish part
+                    # (e.g. pending → finalized state transitions).
+                    if part_id not in seen_step_finish_ids:
+                        seen_step_finish_ids.add(part_id)
+                        num_turns += 1
+                        # Guard against null and non-numeric values: use
+                        # isinstance so string-typed numbers don't cause TypeError.
+                        tokens = part.get("tokens") or {}
+                        _inp = tokens.get("input", 0)
+                        _out = tokens.get("output", 0)
+                        _rsn = tokens.get("reasoning", 0)
+                        total_input += int(_inp) if isinstance(_inp, (int, float)) else 0
+                        total_output += int(_out) if isinstance(_out, (int, float)) else 0
+                        total_reasoning += int(_rsn) if isinstance(_rsn, (int, float)) else 0
+                        cache = tokens.get("cache") or {}
+                        _cr = cache.get("read", 0)
+                        _cw = cache.get("write", 0)
+                        total_cache_read += int(_cr) if isinstance(_cr, (int, float)) else 0
+                        total_cache_write += int(_cw) if isinstance(_cw, (int, float)) else 0
+                        _cost = part.get("cost")
+                        total_cost += _cost if isinstance(_cost, (int, float)) else 0.0
+
+            # ── Turn completion ────────────────────────────────────────────
+            # NOTE: we expect exactly one session.status idle event per turn.
+            # If OpenCode ever emits multiple idle transitions (e.g. for
+            # parallel sub-sessions), this return would cut the stream early.
+            elif event_type == "session.status":
+                # Guard against null and non-dict payloads: the server may
+                # send "status": "idle" (a string) or "status": null.
+                status = props.get("status") or {}
+                if isinstance(status, dict) and status.get("type") == "idle":
+                    text = "".join(
+                        text_accumulator.get(pid, "") for pid in text_part_order
+                    ).strip()
+                    # Mirror _parse_http_response: empty text + no step-finish
+                    # events signals an error turn (e.g. the model refused or
+                    # the request was rejected before any content was produced).
+                    has_step_finish = num_turns > 0
+                    is_error = not text and not has_step_finish
+                    if not text:
+                        text = "(empty response)"
+
+                    # Include all token buckets so that any non-zero token
+                    # count — including reasoning-only or cache-only turns —
+                    # produces a TokenUsage object rather than silently dropping
+                    # the data.
+                    has_usage = (
+                        total_input + total_output + total_reasoning
+                        + total_cache_read + total_cache_write
+                    ) > 0
+                    usage = (
+                        TokenUsage(
+                            input_tokens=total_input,
+                            output_tokens=total_output,
+                            cache_read_tokens=total_cache_read,
+                            cache_write_tokens=total_cache_write,
+                            reasoning_tokens=total_reasoning,
+                        )
+                        if has_usage
+                        else None
+                    )
+                    # duration_ms is intentionally omitted here: the SSE stream
+                    # does not carry timing metadata.  The blocking _post_message
+                    # path derives duration_ms from info.duration in the JSON
+                    # response body, but that field is unavailable over SSE.
+                    yield AgentEvent(
+                        kind="final",
+                        response=AgentResponse(
+                            text=text,
+                            session_id=session_id,
+                            usage=usage,
+                            cost_usd=total_cost if total_cost > 0 else None,
+                            num_turns=num_turns if num_turns > 0 else None,
+                            is_error=is_error,
+                        ),
+                    )
+                    return
+
+            # ── Server-side error ──────────────────────────────────────────
+            elif event_type == "session.error":
+                error = props.get("error")
+                # Extract a readable message: prefer "message" key in dict,
+                # fall back to str() of non-empty non-dict values, then
+                # fall back to a generic string for null / empty payloads.
+                if isinstance(error, dict):
+                    error_msg = error.get("message") or (str(error) if error else "unknown error")
+                elif error:
+                    error_msg = str(error)
+                else:
+                    error_msg = "unknown error"
+                raise AgentExecutionError(f"OpenCode session error: {error_msg}")
+
     # ── Internal helpers ───────────────────────────────────────────────────────
 
     def _require_base_url(self) -> None:
@@ -684,7 +1141,8 @@ class OpenCodeBackend(AgentBackend):
     ) -> dict:
         """POST a text message to an existing opencode session.
 
-        Raises RuntimeError (sanitized) on non-2xx responses — the original
+        Raises :class:`AgentNotFoundError`, :class:`AgentExecutionError`, or
+        :class:`AgentUnavailableError` on non-2xx responses — the original
         httpx.HTTPStatusError is NOT propagated because it includes the full
         request URL and response body, which may contain internal server details
         that should not be exposed to end users or leaked into RC chat.
@@ -718,11 +1176,19 @@ class OpenCodeBackend(AgentBackend):
             )
         try:
             return resp.json()
-        except Exception as exc:
+        except Exception:
+            # Log raw body at DEBUG only — it may contain sidecar stack traces
+            # or file-system paths that should not appear in user-facing messages.
+            logger.debug(
+                "opencode non-JSON response body for session %s (HTTP %d): %r",
+                session_id[:16],
+                resp.status_code,
+                resp.text[:200],
+            )
             raise AgentUnavailableError(
                 f"opencode API returned non-JSON response (HTTP {resp.status_code}) "
-                f"for session {session_id[:16]!r}: {resp.text[:200]!r}"
-            ) from exc
+                f"for session {session_id[:16]!r}"
+            ) from None
 
     async def _cleanup_session_best_effort(self, session_id: str) -> bool:
         """Try to delete a failed session; return True if cleanup succeeded."""
@@ -786,11 +1252,13 @@ class OpenCodeBackend(AgentBackend):
           - ``is_error`` is set to True when no text parts are extracted from the
             response (empty or tool-only turns).  This lets ContextInjector detect
             failed injection attempts without relying on the HTTP status code.
-          - ``duration_ms`` is read from ``info.duration``; verify field name against
-            a live response.
+          - ``duration_ms`` is read from ``info.duration`` and coerced to ``int``.
+            opencode returns this as a numeric millisecond count; non-numeric or
+            null values are treated as unavailable (``None``).
         """
-        parts = data.get("parts", [])
-        info = data.get("info", {})
+        # Guard against explicit JSON null for top-level fields.
+        parts = data.get("parts") or []
+        info = data.get("info") or {}
 
         text_parts: list[str] = []
         total_input = total_output = total_reasoning = 0
@@ -799,6 +1267,8 @@ class OpenCodeBackend(AgentBackend):
         num_turns: int = 0
 
         for part in parts:
+            if not isinstance(part, dict):
+                continue
             ptype = part.get("type", "")
             if ptype == "text":
                 t = part.get("text", "")
@@ -806,14 +1276,21 @@ class OpenCodeBackend(AgentBackend):
                     text_parts.append(t)
             elif ptype == "step-finish":
                 num_turns += 1
-                tokens = part.get("tokens", {})
-                total_input += tokens.get("input", 0)
-                total_output += tokens.get("output", 0)
-                total_reasoning += tokens.get("reasoning", 0)
-                cache = tokens.get("cache", {})
-                total_cache_read += cache.get("read", 0)
-                total_cache_write += cache.get("write", 0)
-                total_cost += part.get("cost", 0.0)
+                # Guard against null and non-numeric values (same as SSE path).
+                tokens = part.get("tokens") or {}
+                _inp = tokens.get("input", 0)
+                _out = tokens.get("output", 0)
+                _rsn = tokens.get("reasoning", 0)
+                total_input += int(_inp) if isinstance(_inp, (int, float)) else 0
+                total_output += int(_out) if isinstance(_out, (int, float)) else 0
+                total_reasoning += int(_rsn) if isinstance(_rsn, (int, float)) else 0
+                cache = tokens.get("cache") or {}
+                _cr = cache.get("read", 0)
+                _cw = cache.get("write", 0)
+                total_cache_read += int(_cr) if isinstance(_cr, (int, float)) else 0
+                total_cache_write += int(_cw) if isinstance(_cw, (int, float)) else 0
+                _cost = part.get("cost")
+                total_cost += _cost if isinstance(_cost, (int, float)) else 0.0
 
         text = "".join(text_parts).strip()
         is_error = False
@@ -823,7 +1300,9 @@ class OpenCodeBackend(AgentBackend):
             # Tool-only turns are valid — they produce step-finish events but no
             # text blocks.  Marking them as is_error=True would cause ContextInjector
             # to incorrectly count them as failed injection attempts.
-            has_tool_steps = any(p.get("type") == "step-finish" for p in parts)
+            has_tool_steps = any(
+                isinstance(p, dict) and p.get("type") == "step-finish" for p in parts
+            )
             if has_tool_steps:
                 logger.debug(
                     "No text extracted from opencode response but tool steps completed "
@@ -837,7 +1316,12 @@ class OpenCodeBackend(AgentBackend):
                 is_error = True
             text = "(empty response)"
 
-        has_usage = (total_input + total_output) > 0
+        # Include all token buckets — reasoning-only and cache-only turns must
+        # also produce a TokenUsage object (same logic as SSE path).
+        has_usage = (
+            total_input + total_output + total_reasoning
+            + total_cache_read + total_cache_write
+        ) > 0
         usage = (
             TokenUsage(
                 input_tokens=total_input,
@@ -855,7 +1339,11 @@ class OpenCodeBackend(AgentBackend):
             session_id=session_id,
             usage=usage,
             cost_usd=total_cost if total_cost > 0 else None,
-            duration_ms=info.get("duration") or None,
+            duration_ms=(
+                int(_dur)
+                if isinstance(_dur := info.get("duration"), (int, float))
+                else None
+            ),
             num_turns=num_turns if num_turns > 0 else None,
             is_error=is_error,
         )
