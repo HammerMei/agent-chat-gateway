@@ -624,7 +624,10 @@ class OpenCodeBackend(AgentBackend):
 
         session_id = data.get("id", "")
         if not session_id:
-            raise RuntimeError(f"opencode POST /session returned no session id: {data}")
+            # Log raw body at DEBUG only — response may contain internal paths
+            # or server details that should not appear in user-facing messages.
+            logger.debug("opencode POST /session response missing id: %r", data)
+            raise RuntimeError("opencode POST /session returned no session id")
 
         # Send init prompt to prime the session (same as old CLI adapter).
         try:
@@ -915,14 +918,18 @@ class OpenCodeBackend(AgentBackend):
                 )
 
             if isinstance(item, Exception):
-                # EOFError = clean stream close before idle (protocol gap, not
-                # a transport failure); surface its self-describing message directly.
-                # All other exceptions = transport / parse failures.
-                # Use from None to prevent chaining the raw exception as __cause__:
-                # transport exceptions (httpx.RemoteProtocolError etc.) can carry
-                # internal URLs in their string representation.
-                prefix = "" if isinstance(item, EOFError) else "OpenCode SSE stream error: "
-                raise AgentUnavailableError(f"{prefix}{item}") from None
+                if isinstance(item, EOFError):
+                    # Clean stream close before session.status idle — the
+                    # EOFError message is gateway-controlled text, safe to surface.
+                    raise AgentUnavailableError(str(item)) from None
+                # Transport / parse failure from httpx or the SSE layer.
+                # Do NOT interpolate str(item): transport exceptions carry
+                # internal URLs in their string representation.  Only emit
+                # the exception type name, consistent with _wait_for_health.
+                raise AgentUnavailableError(
+                    f"OpenCode SSE stream error ({type(item).__name__}) "
+                    f"for session {session_id[:16]!r}"
+                ) from None
 
             line: str = item
             if not line.startswith("data:"):
