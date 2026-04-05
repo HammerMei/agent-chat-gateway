@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.6] - 2026-04-04
+
+### Added
+- **OpenCode SSE streaming** (`stream()` method on `OpenCodeBackend`): intermediate
+  agent events — tool calls, text deltas, step completions — are now surfaced in
+  real time via the `GET /event` SSE endpoint instead of waiting for the full turn
+  to complete. Events are consumed via an `asyncio.Queue` background task and yielded
+  as `AgentEvent` objects with deduplication and deadline enforcement.
+- `_post_message_async()`: new fire-and-forget POST to `/session/{id}/prompt_async`
+  (HTTP 202) using a dedicated `_PROMPT_ASYNC_POST_TIMEOUT` internal constant.
+- RC typing-indicator is now refreshed periodically during long SSE streaming turns.
+
+### Changed
+- `_SSE_QUEUE_POLL_INTERVAL` renamed to `_SSE_QUEUE_MAX_WAIT` to more accurately
+  describe its role as an upper bound on `queue.get()` blocking time.
+- `has_usage` token sentinel now includes cache token buckets so that cache-only
+  turns correctly produce a `TokenUsage` object instead of returning `None`.
+- `duration_ms` in `AgentResponse` is coerced to `int` (or `None`) from the HTTP
+  response; the SSE path explicitly does not populate this field.
+- All error messages across the OpenCode adapter are now sanitized: no raw exception
+  strings, response bodies, or internal host:port values appear in user-facing errors.
+
+### Fixed
+- `base_url` is captured before spawning the SSE background task to eliminate a
+  race with concurrent `stop()` calls that could null out `self._base_url`.
+- `assert` statement replaced with `if/raise` for the SSE handshake invariant check
+  (bare asserts are stripped under Python `-O` optimization flag).
+- Token accumulator fields (`input_tokens`, `output_tokens`, etc.) now apply
+  `int()` coercion in both SSE and HTTP parse paths, preventing silent float
+  violations of `TokenUsage`'s `int` type contract.
+- `create_session` no longer includes the raw API response dict in `RuntimeError`
+  messages; raw body is logged at `DEBUG` level instead.
+
+---
+
 ## [0.1.5] - 2026-04-01
 
 ### Added
