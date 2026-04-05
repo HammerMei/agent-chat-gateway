@@ -1,14 +1,15 @@
 """Unit tests for OpenCodeBackend (HTTP adapter)."""
 
 import asyncio
+import json
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 
-from gateway.agents.errors import AgentRateLimitedError
+from gateway.agents.errors import AgentExecutionError, AgentRateLimitedError, AgentUnavailableError
 from gateway.agents.opencode import OpenCodeBackend
-from gateway.agents.response import AgentResponse
+from gateway.agents.response import AgentEvent, AgentResponse
 
 
 def _make_backend(**kwargs) -> OpenCodeBackend:
@@ -76,6 +77,35 @@ class TestStart(unittest.IsolatedAsyncioTestCase):
             mock_client.get = AsyncMock(side_effect=ConnectionRefusedError())
             with self.assertRaises(RuntimeError):
                 await b.start()
+
+    async def test_wait_for_health_error_message_does_not_leak_host_port(self):
+        """_wait_for_health() RuntimeError must not contain the sidecar host:port."""
+        b = _make_backend()
+
+        mock_process = MagicMock()
+        mock_process.returncode = None
+        mock_process.pid = 1
+
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=mock_process),
+            patch("gateway.agents.opencode.adapter._find_free_port", return_value=54321),
+            patch("gateway.agents.opencode.adapter._STARTUP_TIMEOUT", 0.1),
+            patch("httpx.AsyncClient") as mock_cls,
+        ):
+            mock_client = AsyncMock()
+            mock_cls.return_value.__aenter__.return_value = mock_client
+            # Simulate a ConnectError whose str() contains the internal URL
+            mock_client.get = AsyncMock(
+                side_effect=httpx.ConnectError(
+                    "Connection refused to http://127.0.0.1:54321"
+                )
+            )
+            with self.assertRaises(RuntimeError) as cm:
+                await b.start()
+
+        err = str(cm.exception)
+        self.assertNotIn("127.0.0.1", err)
+        self.assertNotIn("54321", err)
 
     async def test_start_uses_new_session_args(self):
         """start() appends new_session_args to the opencode serve command."""
@@ -338,6 +368,7 @@ class TestSend(unittest.IsolatedAsyncioTestCase):
     async def test_basic_send_returns_text(self):
         b = _make_backend()
         b._base_url = "http://127.0.0.1:57000"
+        b._ever_started = True
 
         response_data = self._make_http_response(
             [
@@ -360,6 +391,7 @@ class TestSend(unittest.IsolatedAsyncioTestCase):
     async def test_send_classifies_http_429_as_rate_limited(self):
         b = _make_backend()
         b._base_url = "http://127.0.0.1:57000"
+        b._ever_started = True
 
         mock_resp = MagicMock()
         mock_resp.status_code = 429
@@ -385,6 +417,7 @@ class TestSend(unittest.IsolatedAsyncioTestCase):
         """
         b = _make_backend()
         b._base_url = "http://127.0.0.1:57000"
+        b._ever_started = True
 
         mock_client = AsyncMock()
         mock_resp = MagicMock()
@@ -409,6 +442,7 @@ class TestSend(unittest.IsolatedAsyncioTestCase):
         """If the sidecar died after startup, send() should restart it before use."""
         b = _make_backend()
         b._base_url = "http://127.0.0.1:57000"
+        b._ever_started = True
 
         dead_process = MagicMock()
         dead_process.returncode = 7
@@ -428,6 +462,7 @@ class TestSend(unittest.IsolatedAsyncioTestCase):
             b._base_url = "http://127.0.0.1:58000"
             b._client = new_client
             b._process = MagicMock(returncode=None)
+            b._ever_started = True
 
         b._start_inner = AsyncMock(side_effect=fake_start)
 
@@ -577,6 +612,130 @@ class TestParseHttpResponse(unittest.TestCase):
         r = b._parse_http_response(data, "ses_1")
         self.assertFalse(r.is_error)
 
+    def test_step_finish_cache_null_does_not_crash(self):
+        """Explicit JSON null for 'cache' field must not raise AttributeError."""
+        b = self._backend()
+        data = {
+            "parts": [
+                {"type": "text", "text": "done"},
+                {
+                    "type": "step-finish",
+                    "tokens": {"input": 10, "output": 5, "reasoning": 0, "cache": None},
+                    "cost": 0.001,
+                },
+            ],
+            "info": {},
+        }
+        r = b._parse_http_response(data, "ses_1")
+        # Must not raise; cache tokens default to 0
+        self.assertEqual(r.usage.cache_read_tokens, 0)
+        self.assertEqual(r.usage.cache_write_tokens, 0)
+
+    def test_reasoning_only_produces_usage_object(self):
+        """A turn with only reasoning tokens still produces a non-None usage object."""
+        b = self._backend()
+        data = {
+            "parts": [
+                {
+                    "type": "step-finish",
+                    "tokens": {"input": 0, "output": 0, "reasoning": 100, "cache": {}},
+                    "cost": 0.0,
+                },
+            ],
+            "info": {},
+        }
+        r = b._parse_http_response(data, "ses_1")
+        self.assertIsNotNone(r.usage, "usage must not be None for reasoning-only turns")
+        self.assertEqual(r.usage.reasoning_tokens, 100)
+
+    def test_cache_only_turn_produces_usage_object(self):
+        """A turn with only cache tokens (zero input/output/reasoning) produces a non-None usage object."""
+        b = self._backend()
+        data = {
+            "parts": [
+                {
+                    "type": "step-finish",
+                    "tokens": {"input": 0, "output": 0, "reasoning": 0,
+                               "cache": {"read": 500, "write": 0}},
+                    "cost": 0.0,
+                },
+            ],
+            "info": {},
+        }
+        r = b._parse_http_response(data, "ses_1")
+        self.assertIsNotNone(r.usage, "usage must not be None for cache-only turns")
+        self.assertEqual(r.usage.cache_read_tokens, 500)
+
+    def test_step_finish_tokens_null_does_not_crash(self):
+        """Explicit JSON null for 'tokens' in HTTP step-finish must not crash."""
+        b = self._backend()
+        data = {
+            "parts": [
+                {"type": "text", "text": "done"},
+                {"type": "step-finish", "tokens": None, "cost": 0.001},
+            ],
+            "info": {},
+        }
+        r = b._parse_http_response(data, "ses_1")
+        # tokens null → all token counts default to 0 → no usage object
+        self.assertIsNone(r.usage)
+
+    def test_step_finish_cost_null_does_not_crash(self):
+        """Explicit JSON null for 'cost' in HTTP step-finish must not crash."""
+        b = self._backend()
+        data = {
+            "parts": [
+                {"type": "text", "text": "done"},
+                {
+                    "type": "step-finish",
+                    "tokens": {"input": 5, "output": 5, "reasoning": 0, "cache": {}},
+                    "cost": None,
+                },
+            ],
+            "info": {},
+        }
+        r = b._parse_http_response(data, "ses_1")
+        # cost null → defaults to 0.0 → cost_usd is None (not positive)
+        self.assertIsNone(r.cost_usd)
+
+    def test_null_parts_does_not_crash(self):
+        """Explicit JSON null for top-level 'parts' must not raise TypeError."""
+        b = self._backend()
+        data = {"parts": None, "info": {}}
+        r = b._parse_http_response(data, "ses_1")
+        self.assertEqual(r.text, "(empty response)")
+        self.assertTrue(r.is_error)
+
+    def test_null_info_does_not_crash(self):
+        """Explicit JSON null for top-level 'info' must not raise AttributeError."""
+        b = self._backend()
+        data = {"parts": [{"type": "text", "text": "hello"}], "info": None}
+        r = b._parse_http_response(data, "ses_1")
+        self.assertEqual(r.text, "hello")
+        self.assertIsNone(r.duration_ms)
+
+    def test_null_element_in_parts_list_is_skipped(self):
+        """null or non-dict elements inside parts list must be skipped without crashing."""
+        b = self._backend()
+        data = {
+            "parts": [
+                None,
+                "unexpected string",
+                {"type": "text", "text": "valid"},
+                42,
+            ],
+            "info": {},
+        }
+        r = b._parse_http_response(data, "ses_1")
+        self.assertEqual(r.text, "valid")
+
+    def test_duration_zero_not_coerced_to_none(self):
+        """info.duration == 0 must be returned as 0, not None."""
+        b = self._backend()
+        data = {"parts": [{"type": "text", "text": "ok"}], "info": {"duration": 0}}
+        r = b._parse_http_response(data, "ses_1")
+        self.assertEqual(r.duration_ms, 0)
+
 
 # ── _post_message error sanitization (Issue 12.4) ─────────────────────────────
 
@@ -685,8 +844,8 @@ class TestEnsureLiveRuntimeAfterFailedRestart(unittest.IsolatedAsyncioTestCase):
         """Before start(), _ever_started=False, so _ensure_live_runtime skips restart
         and _require_base_url() raises — correct behavior."""
         b = self._make_backend()
-        # _ever_started=False, _base_url=None → should raise RuntimeError
-        with self.assertRaises(RuntimeError, msg="Should raise before ever started"):
+        # _ever_started=False, _base_url=None → raises AgentUnavailableError
+        with self.assertRaises(AgentUnavailableError):
             await b._ensure_live_runtime()
 
     async def test_ever_started_true_triggers_restart_when_base_url_gone(self):
@@ -838,11 +997,20 @@ class TestCircuitBreakerFastFail(unittest.IsolatedAsyncioTestCase):
         b = self._make_backend()
         b._consecutive_restart_failures = _MAX_RESTART_FAILURES
 
-        with patch.object(b, "_invalidate_dead_runtime", new_callable=AsyncMock):
-            with patch("asyncio.wait_for", new_callable=AsyncMock):
-                b._ever_started = False
-                b._consecutive_restart_failures = 0  # stop() should do this
+        # Build enough state for stop() to enter the non-trivial path:
+        # _process must be non-None so it doesn't return via the fast path.
+        mock_proc = AsyncMock()
+        mock_proc.pid = 12345
+        mock_proc.terminate = MagicMock()
+        mock_proc.wait = AsyncMock(return_value=0)
+        b._process = mock_proc
+        b._client = AsyncMock(spec=httpx.AsyncClient)
+        b._ever_started = True
 
+        with patch.object(b, "_cleanup_orphan_sessions_best_effort", new_callable=AsyncMock):
+            await b.stop()
+
+        # stop() must have zeroed the counter in its finally block
         self.assertEqual(b._consecutive_restart_failures, 0)
 
     async def test_max_restart_failures_constant_at_least_2(self):
@@ -1147,7 +1315,7 @@ class TestEnsureLiveRuntimeStopRace(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("stopped", str(cm.exception).lower())
 
-    async def test_no_agent_unavailable_when_never_started(self):
+    async def test_agent_unavailable_when_never_started(self):
         """When _ever_started was never True, raises AgentUnavailableError."""
         from gateway.agents.errors import AgentUnavailableError
 
@@ -1460,3 +1628,1045 @@ class TestSharedHttpxClient(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsInstance(rest._client, httpx.AsyncClient)
         self.assertIsInstance(rest._download_client, httpx.AsyncClient)
+
+
+# ── OpenCodeBackend.stream() — SSE-based streaming ───────────────────────────
+
+
+def _make_started_backend() -> OpenCodeBackend:
+    """Backend pre-configured as if start() already succeeded."""
+    b = OpenCodeBackend(command="opencode", new_session_args=[], timeout=120)
+    b._base_url = "http://127.0.0.1:54321"
+    b._ever_started = True
+    b._client = AsyncMock(spec=httpx.AsyncClient)
+    return b
+
+
+def _sse_line(session_id: str, event_type: str, **props) -> str:
+    """Build a ``data:`` SSE line for the given event type and properties."""
+    payload = {
+        "type": event_type,
+        "properties": {"sessionID": session_id, **props},
+    }
+    return f"data: {json.dumps(payload)}"
+
+
+class TestPostMessageAsync(unittest.IsolatedAsyncioTestCase):
+    """_post_message_async() targets the correct endpoint."""
+
+    async def test_posts_to_prompt_async_endpoint(self):
+        b = _make_started_backend()
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        b._client.post = AsyncMock(return_value=mock_resp)
+
+        await b._post_message_async("sess-1", "hello world")
+
+        b._client.post.assert_awaited_once()
+        url = b._client.post.call_args[0][0]
+        self.assertIn("/session/sess-1/prompt_async", url)
+
+    async def test_posts_correct_body(self):
+        b = _make_started_backend()
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        b._client.post = AsyncMock(return_value=mock_resp)
+
+        await b._post_message_async("sess-1", "my prompt")
+
+        body = b._client.post.call_args[1]["json"]
+        self.assertEqual(body, {"parts": [{"type": "text", "text": "my prompt"}]})
+
+    async def test_uses_internal_timeout_constant(self):
+        """The internal _PROMPT_ASYNC_POST_TIMEOUT constant is used, not a caller-supplied value."""
+        from gateway.agents.opencode.adapter import _PROMPT_ASYNC_POST_TIMEOUT
+        b = _make_started_backend()
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        b._client.post = AsyncMock(return_value=mock_resp)
+
+        await b._post_message_async("sess-1", "text")
+
+        kwargs = b._client.post.call_args[1]
+        self.assertEqual(kwargs["timeout"], _PROMPT_ASYNC_POST_TIMEOUT)
+
+    async def test_http_error_mapped_to_agent_error(self):
+        b = _make_started_backend()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 429
+        b._client.post = AsyncMock(
+            side_effect=httpx.HTTPStatusError("rate limited", request=MagicMock(), response=mock_resp)
+        )
+
+        from gateway.agents.errors import AgentRateLimitedError
+        with self.assertRaises(AgentRateLimitedError):
+            await b._post_message_async("sess-1", "hi")
+
+    async def test_404_raises_agent_execution_error(self):
+        """HTTP 404 (session not found) maps to AgentExecutionError with (prompt_async) label."""
+        from gateway.agents.errors import AgentExecutionError
+        b = _make_started_backend()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 404
+        b._client.post = AsyncMock(
+            side_effect=httpx.HTTPStatusError("not found", request=MagicMock(), response=mock_resp)
+        )
+        with self.assertRaises(AgentExecutionError) as cm:
+            await b._post_message_async("sess-1", "hi")
+        self.assertIn("404", str(cm.exception))
+        self.assertIn("prompt_async", str(cm.exception))
+
+    async def test_http_error_message_contains_prompt_async_label(self):
+        """Error messages for HTTP failures include the '(prompt_async)' label."""
+        from gateway.agents.errors import AgentExecutionError
+        b = _make_started_backend()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 500
+        b._client.post = AsyncMock(
+            side_effect=httpx.HTTPStatusError(
+                "server error", request=MagicMock(), response=mock_resp
+            )
+        )
+        with self.assertRaises(AgentExecutionError) as cm:
+            await b._post_message_async("sess-1", "hi")
+        self.assertIn("prompt_async", str(cm.exception))
+
+    async def test_503_raises_agent_unavailable(self):
+        """HTTP 503 (sidecar crashed mid-turn) maps to AgentUnavailableError."""
+        b = _make_started_backend()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 503
+        b._client.post = AsyncMock(
+            side_effect=httpx.HTTPStatusError(
+                "service unavailable", request=MagicMock(), response=mock_resp
+            )
+        )
+        with self.assertRaises(AgentUnavailableError):
+            await b._post_message_async("sess-1", "hi")
+
+    async def test_connect_error_raises_agent_unavailable(self):
+        """httpx.ConnectError (sidecar unreachable) maps to AgentUnavailableError."""
+        b = _make_started_backend()
+        b._client.post = AsyncMock(
+            side_effect=httpx.ConnectError("connection refused")
+        )
+        with self.assertRaises(AgentUnavailableError):
+            await b._post_message_async("sess-1", "hi")
+
+    async def test_connect_error_message_sanitized(self):
+        """ConnectError message must not leak host:port from the raw httpx exception."""
+        b = _make_started_backend()
+        b._client.post = AsyncMock(
+            side_effect=httpx.ConnectError("Connection refused to http://localhost:3000")
+        )
+        with self.assertRaises(AgentUnavailableError) as cm:
+            await b._post_message_async("sess-1", "hi")
+        err = str(cm.exception)
+        self.assertNotIn("localhost", err)
+        self.assertNotIn("3000", err)
+        self.assertIn("prompt_async", err)
+
+    async def test_timeout_error_raises_agent_unavailable(self):
+        """httpx.TimeoutException maps to AgentUnavailableError."""
+        b = _make_started_backend()
+        b._client.post = AsyncMock(
+            side_effect=httpx.TimeoutException("timed out")
+        )
+        with self.assertRaises(AgentUnavailableError):
+            await b._post_message_async("sess-1", "hi")
+
+
+class TestParseSSEEvents(unittest.IsolatedAsyncioTestCase):
+    """_parse_sse_events() maps OpenCode SSE events to AgentEvents.
+
+    Tests drive the parser directly via a pre-populated asyncio.Queue,
+    avoiding any HTTP layer.
+    """
+
+    def _deadline(self, seconds: int = 5) -> float:
+        """Default 5 s so a missing idle event fails fast instead of hanging 60 s."""
+        return asyncio.get_running_loop().time() + seconds
+
+    async def _collect(self, session_id: str, lines: list[str]) -> list[AgentEvent]:
+        b = _make_started_backend()
+        queue: asyncio.Queue = asyncio.Queue()
+        for line in lines:
+            await queue.put(line)
+        return [
+            e async for e in b._parse_sse_events(
+                session_id, queue, self._deadline(), 60
+            )
+        ]
+
+    async def test_tool_running_yields_tool_call(self):
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "p1", "type": "tool", "tool": "Bash",
+                            "state": {"status": "running"}}),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        tool_calls = [e for e in events if e.kind == "tool_call"]
+        self.assertEqual(len(tool_calls), 1)
+        self.assertIn("Bash", tool_calls[0].text)
+
+    async def test_tool_completed_yields_tool_result(self):
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "p1", "type": "tool", "tool": "Read",
+                            "state": {"status": "completed"}}),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        results = [e for e in events if e.kind == "tool_result"]
+        self.assertEqual(len(results), 1)
+        self.assertIn("Read", results[0].text)
+
+    async def test_tool_error_state_yields_tool_result(self):
+        """error state is treated the same as completed for UX purposes."""
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "p1", "type": "tool", "tool": "Bash",
+                            "state": {"status": "error"}}),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        results = [e for e in events if e.kind == "tool_result"]
+        self.assertEqual(len(results), 1)
+
+    async def test_reasoning_part_yields_thinking(self):
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "r1", "type": "reasoning", "text": "Let me think..."}),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        thinking = [e for e in events if e.kind == "thinking"]
+        self.assertEqual(len(thinking), 1)
+        self.assertIn("💭", thinking[0].text)
+
+    async def test_reasoning_thinking_emitted_only_once(self):
+        """Multiple updates to the same reasoning part yield only one thinking event."""
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "r1", "type": "reasoning", "text": "first chunk"}),
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "r1", "type": "reasoning", "text": "longer text now"}),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        thinking = [e for e in events if e.kind == "thinking"]
+        self.assertEqual(len(thinking), 1)
+
+    async def test_text_deltas_accumulated_in_final_response(self):
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "t1", "type": "text"}),
+            _sse_line("s1", "message.part.delta",
+                      partID="t1", field="text", delta="Hello "),
+            _sse_line("s1", "message.part.delta",
+                      partID="t1", field="text", delta="world"),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        final = events[-1]
+        self.assertEqual(final.kind, "final")
+        self.assertEqual(final.response.text, "Hello world")
+
+    async def test_reasoning_deltas_excluded_from_final_text(self):
+        """Deltas for reasoning parts must not bleed into the final response text."""
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "r1", "type": "reasoning", "text": "thinking"}),
+            _sse_line("s1", "message.part.delta",
+                      partID="r1", field="text", delta="internal reasoning"),
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "t1", "type": "text"}),
+            _sse_line("s1", "message.part.delta",
+                      partID="t1", field="text", delta="actual answer"),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        final = events[-1]
+        self.assertEqual(final.response.text, "actual answer")
+        self.assertNotIn("internal reasoning", final.response.text)
+
+    async def test_step_finish_contributes_usage_to_final(self):
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "sf1", "type": "step-finish",
+                            "tokens": {"input": 100, "output": 50, "reasoning": 10,
+                                       "cache": {"read": 20, "write": 5}},
+                            "cost": 0.001}),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        final = events[-1]
+        self.assertIsNotNone(final.response.usage)
+        self.assertEqual(final.response.usage.input_tokens, 100)
+        self.assertEqual(final.response.usage.output_tokens, 50)
+        self.assertEqual(final.response.usage.cache_read_tokens, 20)
+        self.assertEqual(final.response.usage.cache_write_tokens, 5)
+        self.assertAlmostEqual(final.response.cost_usd, 0.001)
+
+    async def test_other_session_events_filtered_out(self):
+        """Events for a different sessionID must be ignored."""
+        events = await self._collect("s1", [
+            _sse_line("other-sess", "message.part.updated",
+                      part={"id": "p1", "type": "tool", "tool": "Bash",
+                            "state": {"status": "running"}}),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].kind, "final")
+
+    async def test_session_error_raises_agent_execution_error(self):
+        b = _make_started_backend()
+        queue: asyncio.Queue = asyncio.Queue()
+        await queue.put(
+            _sse_line("s1", "session.error", error={"message": "tool failed"})
+        )
+        with self.assertRaises(AgentExecutionError):
+            async for _ in b._parse_sse_events(
+                "s1", queue, self._deadline(), 60
+            ):
+                pass
+
+    async def test_malformed_json_lines_silently_skipped(self):
+        events = await self._collect("s1", [
+            "data: {not valid json",
+            "not even data prefix",
+            "data:",
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].kind, "final")
+
+    async def test_empty_response_placeholder_when_no_text(self):
+        events = await self._collect("s1", [
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        self.assertEqual(events[0].response.text, "(empty response)")
+
+    async def test_infrastructure_events_ignored(self):
+        """server.heartbeat and session.updated events are silently ignored."""
+        events = await self._collect("s1", [
+            _sse_line("s1", "server.heartbeat"),
+            _sse_line("s1", "session.updated", info={}),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].kind, "final")
+
+    async def test_sse_exception_in_queue_raises_unavailable(self):
+        """An Exception object in the queue raises AgentUnavailableError."""
+        b = _make_started_backend()
+        queue: asyncio.Queue = asyncio.Queue()
+        await queue.put(ConnectionError("SSE dropped"))
+        with self.assertRaises(AgentUnavailableError):
+            async for _ in b._parse_sse_events(
+                "s1", queue, self._deadline(), 60
+            ):
+                pass
+
+    async def test_full_turn_sequence_tool_then_text(self):
+        """Full realistic sequence: tool call → tool result → text → final."""
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "p1", "type": "tool", "tool": "Bash",
+                            "state": {"status": "running"}}),
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "p1", "type": "tool", "tool": "Bash",
+                            "state": {"status": "completed"}}),
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "t1", "type": "text"}),
+            _sse_line("s1", "message.part.delta",
+                      partID="t1", field="text", delta="Done!"),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        kinds = [e.kind for e in events]
+        self.assertEqual(kinds, ["tool_call", "tool_result", "final"])
+        self.assertEqual(events[-1].response.text, "Done!")
+
+    async def test_is_error_false_when_text_present(self):
+        """is_error is False when the final response contains text."""
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated", part={"id": "t1", "type": "text"}),
+            _sse_line("s1", "message.part.delta",
+                      partID="t1", field="text", delta="hello"),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        final = events[-1].response
+        self.assertFalse(final.is_error)
+        self.assertEqual(final.text, "hello")
+
+    async def test_is_error_false_when_step_finish_present(self):
+        """is_error is False when step-finish events arrived (non-empty turn)."""
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "sf1", "type": "step-finish",
+                            "tokens": {"input": 10, "output": 5}, "cost": 0.001}),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        final = events[-1].response
+        self.assertFalse(final.is_error)
+
+    async def test_is_error_true_when_no_text_and_no_step_finish(self):
+        """is_error is True when neither text nor step-finish events arrived."""
+        events = await self._collect("s1", [
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        final = events[-1].response
+        self.assertTrue(final.is_error)
+        self.assertEqual(final.text, "(empty response)")
+
+    async def test_multi_part_text_order_preserved(self):
+        """Text from multiple parts is concatenated in arrival order."""
+        events = await self._collect("s1", [
+            # Register p1 as text, accumulate "Hello "
+            _sse_line("s1", "message.part.updated", part={"id": "p1", "type": "text"}),
+            _sse_line("s1", "message.part.delta",
+                      partID="p1", field="text", delta="Hello "),
+            # Register p2 as text, accumulate "world"
+            _sse_line("s1", "message.part.updated", part={"id": "p2", "type": "text"}),
+            _sse_line("s1", "message.part.delta",
+                      partID="p2", field="text", delta="world"),
+            # Interleaved second chunk for p1
+            _sse_line("s1", "message.part.delta",
+                      partID="p1", field="text", delta="— "),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        # p1 was seen first, so its text ("Hello — ") comes before p2's ("world")
+        self.assertEqual(events[-1].response.text, "Hello — world")
+
+    async def test_delta_before_part_registered_is_skipped(self):
+        """Deltas for unregistered (unknown-type) parts are silently dropped."""
+        events = await self._collect("s1", [
+            # Delta arrives before the corresponding message.part.updated
+            _sse_line("s1", "message.part.delta",
+                      partID="unknown-p", field="text", delta="leaked reasoning"),
+            # Register as text too late; no delta was accumulated
+            _sse_line("s1", "message.part.updated", part={"id": "unknown-p", "type": "text"}),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        # The early delta must not appear in final text
+        self.assertNotIn("leaked reasoning", events[-1].response.text)
+
+    async def test_duplicate_tool_running_yields_only_one_tool_call(self):
+        """Repeated running-status updates for the same tool part emit only one tool_call."""
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "p1", "type": "tool", "tool": "Bash",
+                            "state": {"status": "running"}}),
+            # Second running update for the same part (state refresh)
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "p1", "type": "tool", "tool": "Bash",
+                            "state": {"status": "running"}}),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        tool_calls = [e for e in events if e.kind == "tool_call"]
+        self.assertEqual(len(tool_calls), 1, "Expected exactly one tool_call event")
+
+    async def test_duplicate_tool_completed_yields_only_one_tool_result(self):
+        """Repeated completed-status updates for the same tool part emit only one tool_result."""
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "p1", "type": "tool", "tool": "Read",
+                            "state": {"status": "running"}}),
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "p1", "type": "tool", "tool": "Read",
+                            "state": {"status": "completed"}}),
+            # Duplicate completed update
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "p1", "type": "tool", "tool": "Read",
+                            "state": {"status": "completed"}}),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        tool_results = [e for e in events if e.kind == "tool_result"]
+        self.assertEqual(len(tool_results), 1, "Expected exactly one tool_result event")
+
+    async def test_duplicate_step_finish_does_not_double_count_tokens(self):
+        """Repeated message.part.updated for same step-finish part counts tokens only once."""
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "sf1", "type": "step-finish",
+                            "tokens": {"input": 100, "output": 50, "reasoning": 0, "cache": {}},
+                            "cost": 0.01}),
+            # Duplicate (e.g. state finalization event)
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "sf1", "type": "step-finish",
+                            "tokens": {"input": 100, "output": 50, "reasoning": 0, "cache": {}},
+                            "cost": 0.01}),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        final = events[-1].response
+        self.assertEqual(final.num_turns, 1, "num_turns should be 1, not 2")
+        self.assertEqual(final.usage.input_tokens, 100, "input tokens must not be doubled")
+        self.assertAlmostEqual(final.cost_usd, 0.01, places=6)
+
+    async def test_null_properties_does_not_crash(self):
+        """An SSE event with 'properties': null is silently skipped (not a crash)."""
+        import json as _json
+        b = _make_started_backend()
+        queue: asyncio.Queue = asyncio.Queue()
+        # Craft a raw data line with null properties
+        null_props_line = 'data: ' + _json.dumps({"type": "server.heartbeat", "properties": None})
+        await queue.put(null_props_line)
+        await queue.put(_sse_line("s1", "session.status", status={"type": "idle"}))
+        events = [e async for e in b._parse_sse_events("s1", queue, self._deadline(), 60)]
+        self.assertEqual(events[-1].kind, "final")
+
+    async def test_null_part_in_message_part_updated_does_not_crash(self):
+        """A message.part.updated event with 'part': null is silently skipped."""
+        import json as _json
+        b = _make_started_backend()
+        queue: asyncio.Queue = asyncio.Queue()
+        null_part_line = 'data: ' + _json.dumps({
+            "type": "message.part.updated",
+            "properties": {"sessionID": "s1", "part": None},
+        })
+        await queue.put(null_part_line)
+        await queue.put(_sse_line("s1", "session.status", status={"type": "idle"}))
+        events = [e async for e in b._parse_sse_events("s1", queue, self._deadline(), 60)]
+        self.assertEqual(events[-1].kind, "final")
+
+    async def test_null_tokens_in_step_finish_does_not_crash(self):
+        """A step-finish event with 'tokens': null does not raise AttributeError."""
+        import json as _json
+        b = _make_started_backend()
+        queue: asyncio.Queue = asyncio.Queue()
+        null_tokens_line = 'data: ' + _json.dumps({
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "s1",
+                "part": {"id": "sf1", "type": "step-finish", "tokens": None, "cost": 0.001},
+            },
+        })
+        await queue.put(null_tokens_line)
+        await queue.put(_sse_line("s1", "session.status", status={"type": "idle"}))
+        events = [e async for e in b._parse_sse_events("s1", queue, self._deadline(), 60)]
+        final = events[-1].response
+        self.assertEqual(final.num_turns, 1)
+        self.assertIsNone(final.usage)  # no tokens → no usage object
+
+    async def test_reasoning_only_turn_produces_usage_object(self):
+        """A turn with only reasoning tokens still produces a non-None usage object."""
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "sf1", "type": "step-finish",
+                            "tokens": {"input": 0, "output": 0, "reasoning": 50, "cache": {}},
+                            "cost": 0.0}),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        final = events[-1].response
+        self.assertIsNotNone(final.usage, "usage must not be None for reasoning-only turns")
+        self.assertEqual(final.usage.reasoning_tokens, 50)
+
+    async def test_cache_only_turn_produces_usage_object_sse(self):
+        """A turn with only cache tokens (zero input/output/reasoning) produces a non-None usage object."""
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "sf1", "type": "step-finish",
+                            "tokens": {"input": 0, "output": 0, "reasoning": 0,
+                                       "cache": {"read": 300, "write": 0}},
+                            "cost": 0.0}),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        final = events[-1].response
+        self.assertIsNotNone(final.usage, "usage must not be None for cache-only turns")
+        self.assertEqual(final.usage.cache_read_tokens, 300)
+
+    async def test_string_status_in_session_status_does_not_crash(self):
+        """session.status with a plain string value is gracefully ignored."""
+        import json as _json
+        b = _make_started_backend()
+        queue: asyncio.Queue = asyncio.Queue()
+        # Simulate server sending "status": "idle" as a string instead of a dict
+        string_status_line = 'data: ' + _json.dumps({
+            "type": "session.status",
+            "properties": {"sessionID": "s1", "status": "idle"},
+        })
+        await queue.put(string_status_line)
+        # Follow up with the proper dict-shaped idle so the parser can terminate
+        await queue.put(_sse_line("s1", "session.status", status={"type": "idle"}))
+        events = [e async for e in b._parse_sse_events("s1", queue, self._deadline(), 60)]
+        self.assertEqual(events[-1].kind, "final")
+
+    async def test_step_finish_cost_null_does_not_crash(self):
+        """Explicit JSON null for 'cost' in step-finish must not raise TypeError."""
+        import json as _json
+        b = _make_started_backend()
+        queue: asyncio.Queue = asyncio.Queue()
+        null_cost_line = 'data: ' + _json.dumps({
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "s1",
+                "part": {"id": "sf1", "type": "step-finish",
+                         "tokens": {"input": 5, "output": 5, "reasoning": 0, "cache": {}},
+                         "cost": None},
+            },
+        })
+        await queue.put(null_cost_line)
+        await queue.put(_sse_line("s1", "session.status", status={"type": "idle"}))
+        events = [e async for e in b._parse_sse_events("s1", queue, self._deadline(), 60)]
+        # Must not raise; cost defaults to 0
+        self.assertIsNone(events[-1].response.cost_usd)
+
+    async def test_non_dict_json_payload_is_skipped(self):
+        """SSE lines with valid but non-dict JSON (null, array, string) are skipped."""
+        import json as _json
+        b = _make_started_backend()
+        queue: asyncio.Queue = asyncio.Queue()
+        for non_dict_val in [None, [], [1, 2], "hello", 42]:
+            await queue.put(f"data: {_json.dumps(non_dict_val)}")
+        await queue.put(_sse_line("s1", "session.status", status={"type": "idle"}))
+        # None of the non-dict lines should crash; parser terminates normally
+        events = [e async for e in b._parse_sse_events("s1", queue, self._deadline(), 60)]
+        self.assertEqual(events[-1].kind, "final")
+
+    async def test_session_error_with_message_key_uses_it(self):
+        """session.error with a 'message' key produces a readable error string."""
+        b = _make_started_backend()
+        queue: asyncio.Queue = asyncio.Queue()
+        await queue.put(_sse_line("s1", "session.error",
+                                  error={"message": "tool execution failed", "code": 500}))
+        with self.assertRaises(AgentExecutionError) as ctx:
+            async for _ in b._parse_sse_events("s1", queue, self._deadline(), 5):
+                pass
+        self.assertIn("tool execution failed", str(ctx.exception))
+
+    async def test_session_error_null_error_field_does_not_crash(self):
+        """session.error with error=null produces a clean 'unknown error' message."""
+        import json as _json
+        b = _make_started_backend()
+        queue: asyncio.Queue = asyncio.Queue()
+        null_error_line = 'data: ' + _json.dumps({
+            "type": "session.error",
+            "properties": {"sessionID": "s1", "error": None},
+        })
+        await queue.put(null_error_line)
+        with self.assertRaises(AgentExecutionError) as ctx:
+            async for _ in b._parse_sse_events("s1", queue, self._deadline(), 5):
+                pass
+        self.assertIn("unknown error", str(ctx.exception))
+
+    async def test_session_error_from_other_session_is_ignored(self):
+        """session.error for a different sessionID must not affect the listener."""
+        events = await self._collect("s1", [
+            # Error from session "other" — should be silently ignored
+            _sse_line("other", "session.error", error={"message": "other session crashed"}),
+            # Our session completes normally
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        self.assertEqual(events[-1].kind, "final")
+
+    async def test_tool_result_without_prior_tool_call_still_emits(self):
+        """tool_result is emitted even if the running state was never seen.
+
+        Documents intended behaviour: when a server skips the running→completed
+        transition and sends only a completed-status update, one tool_result
+        event (and no tool_call) should be yielded.
+        """
+        events = await self._collect("s1", [
+            # No running update — server jumps straight to completed
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "p1", "type": "tool", "tool": "Read",
+                            "state": {"status": "completed"}}),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        tool_calls = [e for e in events if e.kind == "tool_call"]
+        tool_results = [e for e in events if e.kind == "tool_result"]
+        self.assertEqual(len(tool_calls), 0, "no running update → no tool_call")
+        self.assertEqual(len(tool_results), 1, "completed update → one tool_result")
+        self.assertIn("Read", tool_results[0].text)
+
+    async def test_string_typed_cost_does_not_crash(self):
+        """String-typed cost field must be treated as 0.0, not cause TypeError."""
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "sf1", "type": "step-finish",
+                            "tokens": {"input": 5, "output": 5, "reasoning": 0, "cache": {}},
+                            "cost": "0.01"}),  # string instead of float
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        final = events[-1].response
+        # String cost is skipped → defaults to 0 → cost_usd is None
+        self.assertIsNone(final.cost_usd)
+
+    async def test_string_typed_tokens_do_not_crash(self):
+        """String-typed token fields must be treated as 0, not cause TypeError."""
+        events = await self._collect("s1", [
+            _sse_line("s1", "message.part.updated",
+                      part={"id": "sf1", "type": "step-finish",
+                            "tokens": {"input": "100", "output": "50",
+                                       "reasoning": 0, "cache": {}},
+                            "cost": 0.0}),
+            _sse_line("s1", "session.status", status={"type": "idle"}),
+        ])
+        final = events[-1].response
+        # String token values are skipped → no usage object
+        self.assertIsNone(final.usage)
+
+
+class TestStream(unittest.IsolatedAsyncioTestCase):
+    """stream() end-to-end: SSE handshake, prompt posting, event lifecycle."""
+
+    def _make_sse_response(self, lines: list[str]) -> AsyncMock:
+        """Build a mock httpx streaming response that yields the given lines."""
+        async def _aiter_lines():
+            for line in lines:
+                yield line
+
+        mock_resp = AsyncMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.aiter_lines = _aiter_lines
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+        return mock_resp
+
+    async def test_stream_yields_final_event(self):
+        """stream() yields a final AgentEvent after a minimal SSE sequence."""
+        b = _make_started_backend()
+
+        # Patch _ensure_live_runtime so we don't need a running process
+        b._ensure_live_runtime = AsyncMock()
+
+        # Patch _post_message_async so no real HTTP call is made
+        b._post_message_async = AsyncMock()
+
+        sse_lines = [
+            _sse_line("sess-1", "message.part.updated", part={"id": "t1", "type": "text"}),
+            _sse_line("sess-1", "message.part.delta",
+                      partID="t1", field="text", delta="Hi there!"),
+            _sse_line("sess-1", "session.status", status={"type": "idle"}),
+        ]
+        mock_sse_resp = self._make_sse_response(sse_lines)
+
+        mock_sse_client = AsyncMock()
+        mock_sse_client.stream = MagicMock(return_value=mock_sse_resp)
+        mock_sse_client.__aenter__ = AsyncMock(return_value=mock_sse_client)
+        mock_sse_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("gateway.agents.opencode.adapter.httpx.AsyncClient",
+                   return_value=mock_sse_client):
+            events = [e async for e in b.stream(
+                "sess-1", "hello", "/tmp", timeout=30
+            )]
+
+        self.assertTrue(len(events) >= 1)
+        final = events[-1]
+        self.assertEqual(final.kind, "final")
+        self.assertEqual(final.response.text, "Hi there!")
+        # Verify _post_message_async received the correct arguments
+        b._post_message_async.assert_awaited_once_with("sess-1", "hello")
+
+    async def test_stream_cancels_sse_task_on_completion(self):
+        """The SSE background task is cancelled after stream() completes."""
+        b = _make_started_backend()
+        b._ensure_live_runtime = AsyncMock()
+        b._post_message_async = AsyncMock()
+
+        sse_lines = [
+            _sse_line("sess-1", "session.status", status={"type": "idle"}),
+        ]
+        mock_sse_resp = self._make_sse_response(sse_lines)
+        mock_sse_client = AsyncMock()
+        mock_sse_client.stream = MagicMock(return_value=mock_sse_resp)
+        mock_sse_client.__aenter__ = AsyncMock(return_value=mock_sse_client)
+        mock_sse_client.__aexit__ = AsyncMock(return_value=False)
+
+        sse_tasks_created = []
+        original_create_task = asyncio.create_task
+
+        def _tracking_create_task(coro, **kwargs):
+            task = original_create_task(coro, **kwargs)
+            sse_tasks_created.append(task)
+            return task
+
+        with patch("gateway.agents.opencode.adapter.httpx.AsyncClient",
+                   return_value=mock_sse_client):
+            with patch("asyncio.create_task", side_effect=_tracking_create_task):
+                async for _ in b.stream("sess-1", "hi", "/tmp", timeout=30):
+                    pass
+
+        # The SSE task should be done (cancelled or finished) after stream exits
+        for task in sse_tasks_created:
+            self.assertTrue(task.done(), "SSE task should be done after stream() exits")
+
+    async def test_stream_raises_unavailable_on_sse_connect_failure(self):
+        """AgentUnavailableError raised when SSE connection fails immediately."""
+        b = _make_started_backend()
+        b._ensure_live_runtime = AsyncMock()
+
+        mock_sse_client = AsyncMock()
+        # Simulate connection error during SSE setup — raw httpx error includes host:port
+        mock_sse_client.stream = MagicMock(
+            side_effect=httpx.ConnectError("Connection refused to http://127.0.0.1:54321/event")
+        )
+        mock_sse_client.__aenter__ = AsyncMock(return_value=mock_sse_client)
+        mock_sse_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("gateway.agents.opencode.adapter.httpx.AsyncClient",
+                   return_value=mock_sse_client):
+            with self.assertRaises(AgentUnavailableError) as cm:
+                async for _ in b.stream("sess-1", "hi", "/tmp", timeout=30):
+                    pass
+
+        # Error message must be sanitized — host:port must not leak to caller
+        err = str(cm.exception)
+        self.assertNotIn("127.0.0.1", err)
+        self.assertNotIn("54321", err)
+
+    async def test_stream_tool_only_turn_is_error_false(self):
+        """stream() final event for a tool-only turn (step-finish, no text) is not an error."""
+        b = _make_started_backend()
+        b._ensure_live_runtime = AsyncMock()
+        b._post_message_async = AsyncMock()
+
+        sse_lines = [
+            _sse_line("sess-1", "message.part.updated",
+                      part={"id": "p1", "type": "tool", "tool": "Bash",
+                            "state": {"status": "running"}}),
+            _sse_line("sess-1", "message.part.updated",
+                      part={"id": "p1", "type": "tool", "tool": "Bash",
+                            "state": {"status": "completed"}}),
+            _sse_line("sess-1", "message.part.updated",
+                      part={"id": "sf1", "type": "step-finish",
+                            "tokens": {"input": 10, "output": 5, "reasoning": 0, "cache": None},
+                            "cost": 0.001}),
+            _sse_line("sess-1", "session.status", status={"type": "idle"}),
+        ]
+        mock_sse_resp = self._make_sse_response(sse_lines)
+        mock_sse_client = AsyncMock()
+        mock_sse_client.stream = MagicMock(return_value=mock_sse_resp)
+        mock_sse_client.__aenter__ = AsyncMock(return_value=mock_sse_client)
+        mock_sse_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("gateway.agents.opencode.adapter.httpx.AsyncClient",
+                   return_value=mock_sse_client):
+            events = [e async for e in b.stream("sess-1", "run tool", "/tmp", timeout=30)]
+
+        final = events[-1]
+        self.assertEqual(final.kind, "final")
+        # step-finish was seen so is_error must be False
+        self.assertFalse(final.response.is_error)
+        # Also exercises the cache=null guard: no crash
+        self.assertEqual(final.response.num_turns, 1)
+
+    async def test_stream_propagates_post_message_failure(self):
+        """If _post_message_async raises, stream() propagates the error and cancels SSE task."""
+        from gateway.agents.errors import AgentUnavailableError as _AUE
+        b = _make_started_backend()
+        b._ensure_live_runtime = AsyncMock()
+        b._post_message_async = AsyncMock(
+            side_effect=_AUE("sidecar rejected prompt with 503")
+        )
+
+        # SSE connects successfully but _post_message_async blows up
+        sse_lines: list[str] = []  # never gets consumed
+        mock_sse_resp = self._make_sse_response(sse_lines)
+        mock_sse_client = AsyncMock()
+        mock_sse_client.stream = MagicMock(return_value=mock_sse_resp)
+        mock_sse_client.__aenter__ = AsyncMock(return_value=mock_sse_client)
+        mock_sse_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("gateway.agents.opencode.adapter.httpx.AsyncClient",
+                   return_value=mock_sse_client):
+            with self.assertRaises(_AUE):
+                async for _ in b.stream("sess-1", "hi", "/tmp", timeout=30):
+                    pass
+
+    async def test_stream_timeout_raises_asyncio_timeout_error(self):
+        """stream() raises asyncio.TimeoutError when the deadline elapses mid-stream."""
+        b = _make_started_backend()
+        b._ensure_live_runtime = AsyncMock()
+        b._post_message_async = AsyncMock()
+
+        # SSE stream that never delivers session.status idle — just hangs
+        async def _hanging_lines():
+            # Yield one event then block forever
+            yield _sse_line("sess-1", "message.part.updated",
+                            part={"id": "t1", "type": "text"})
+            # simulate a very long wait by just not yielding anything else
+            await asyncio.sleep(999)
+
+        mock_resp = AsyncMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.aiter_lines = _hanging_lines
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+        mock_sse_client = AsyncMock()
+        mock_sse_client.stream = MagicMock(return_value=mock_resp)
+        mock_sse_client.__aenter__ = AsyncMock(return_value=mock_sse_client)
+        mock_sse_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("gateway.agents.opencode.adapter.httpx.AsyncClient",
+                   return_value=mock_sse_client):
+            # Use a very short timeout so the test doesn't actually wait long
+            with self.assertRaises(asyncio.TimeoutError):
+                async for _ in b.stream("sess-1", "hi", "/tmp", timeout=1):
+                    pass
+
+    async def test_stream_raises_unavailable_on_sse_eof_before_idle(self):
+        """AgentUnavailableError is raised when the SSE stream closes before session.status idle."""
+        b = _make_started_backend()
+        b._ensure_live_runtime = AsyncMock()
+        b._post_message_async = AsyncMock()
+
+        # SSE stream that closes immediately after sending one event (no idle)
+        async def _eof_lines():
+            yield _sse_line("sess-1", "message.part.updated",
+                            part={"id": "t1", "type": "text"})
+            # Generator returns here — natural stream close
+
+        mock_resp = AsyncMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.aiter_lines = _eof_lines
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+        mock_sse_client = AsyncMock()
+        mock_sse_client.stream = MagicMock(return_value=mock_resp)
+        mock_sse_client.__aenter__ = AsyncMock(return_value=mock_sse_client)
+        mock_sse_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("gateway.agents.opencode.adapter.httpx.AsyncClient",
+                   return_value=mock_sse_client):
+            with self.assertRaises(AgentUnavailableError):
+                async for _ in b.stream("sess-1", "hi", "/tmp", timeout=30):
+                    pass
+
+    async def test_stream_raises_unavailable_on_sse_http_error(self):
+        """AgentUnavailableError raised when GET /event returns an HTTP error status."""
+        b = _make_started_backend()
+        b._ensure_live_runtime = AsyncMock()
+
+        mock_resp = AsyncMock()
+        mock_resp.raise_for_status = MagicMock(
+            side_effect=httpx.HTTPStatusError(
+                "503", request=MagicMock(),
+                response=MagicMock(status_code=503)
+            )
+        )
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+        mock_sse_client = AsyncMock()
+        mock_sse_client.stream = MagicMock(return_value=mock_resp)
+        mock_sse_client.__aenter__ = AsyncMock(return_value=mock_sse_client)
+        mock_sse_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("gateway.agents.opencode.adapter.httpx.AsyncClient",
+                   return_value=mock_sse_client):
+            with self.assertRaises(AgentUnavailableError):
+                async for _ in b.stream("sess-1", "hi", "/tmp", timeout=30):
+                    pass
+
+    async def test_stream_injects_attachments_into_prompt(self):
+        """Attachments are injected into the prompt text before posting."""
+        b = _make_started_backend()
+        b._ensure_live_runtime = AsyncMock()
+        b._post_message_async = AsyncMock()
+
+        sse_lines = [
+            _sse_line("sess-1", "session.status", status={"type": "idle"}),
+        ]
+        mock_sse_resp = self._make_sse_response(sse_lines)
+        mock_sse_client = AsyncMock()
+        mock_sse_client.stream = MagicMock(return_value=mock_sse_resp)
+        mock_sse_client.__aenter__ = AsyncMock(return_value=mock_sse_client)
+        mock_sse_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("gateway.agents.opencode.adapter.httpx.AsyncClient",
+                   return_value=mock_sse_client):
+            async for _ in b.stream(
+                "sess-1", "check this file", "/workspace",
+                timeout=30, attachments=["/workspace/file.txt"]
+            ):
+                pass
+
+        # The prompt passed to _post_message_async must include attachment content
+        actual_prompt = b._post_message_async.call_args[0][1]
+        self.assertIn("file.txt", actual_prompt)
+        self.assertNotEqual(actual_prompt, "check this file")
+
+    async def test_stream_sse_connect_timeout_capped_by_deadline(self):
+        """SSE connect timeout is capped to remaining deadline, not always 15s.
+
+        The test blocks inside the streaming context manager __aenter__ so that
+        _SSE_READY is never put into the queue. This is the only way to exercise
+        the asyncio.wait_for(queue.get(), timeout=sse_connect_timeout) branch.
+        Blocking inside aiter_lines() would be too late — _SSE_READY is enqueued
+        before aiter_lines() is called.
+        """
+        b = _make_started_backend()
+        b._ensure_live_runtime = AsyncMock()
+
+        # Block inside the stream() context manager so _SSE_READY is never queued
+        mock_resp = AsyncMock()
+        mock_resp.raise_for_status = MagicMock()
+
+        async def _slow_enter(_self=None):
+            await asyncio.sleep(999)  # blocks before _SSE_READY is enqueued
+            return mock_resp
+
+        mock_resp.__aenter__ = _slow_enter
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+        mock_sse_client = AsyncMock()
+        mock_sse_client.stream = MagicMock(return_value=mock_resp)
+        mock_sse_client.__aenter__ = AsyncMock(return_value=mock_sse_client)
+        mock_sse_client.__aexit__ = AsyncMock(return_value=False)
+
+        import time
+        start = time.monotonic()
+        with patch("gateway.agents.opencode.adapter.httpx.AsyncClient",
+                   return_value=mock_sse_client):
+            with self.assertRaises(AgentUnavailableError):
+                async for _ in b.stream("sess-1", "hi", "/tmp", timeout=1):
+                    pass
+        elapsed = time.monotonic() - start
+        # With timeout=1, the connect wait is capped to ~1s, not the full 15s
+        self.assertLess(elapsed, 5.0, "SSE connect should be capped by the caller timeout")
+
+    async def test_stream_sse_task_cancelled_on_early_break(self):
+        """SSE background task is cancelled when caller breaks out of stream() early."""
+        b = _make_started_backend()
+        b._ensure_live_runtime = AsyncMock()
+        b._post_message_async = AsyncMock()
+
+        # SSE stream that keeps yielding tool_call events (different part IDs
+        # to bypass dedup) so _parse_sse_events always has events to yield.
+        async def _infinite_lines():
+            i = 0
+            while True:
+                yield _sse_line("sess-1", "message.part.updated",
+                                part={"id": f"tool-{i}", "type": "tool",
+                                      "tool": "Bash", "state": {"status": "running"}})
+                i += 1
+                await asyncio.sleep(0)
+
+        mock_resp = AsyncMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.aiter_lines = _infinite_lines
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+        mock_sse_client = AsyncMock()
+        mock_sse_client.stream = MagicMock(return_value=mock_resp)
+        mock_sse_client.__aenter__ = AsyncMock(return_value=mock_sse_client)
+        mock_sse_client.__aexit__ = AsyncMock(return_value=False)
+
+        sse_tasks_seen: list[asyncio.Task] = []
+        original_create_task = asyncio.create_task
+
+        def _tracking_create_task(coro, **kwargs):
+            task = original_create_task(coro, **kwargs)
+            sse_tasks_seen.append(task)
+            return task
+
+        with patch("gateway.agents.opencode.adapter.httpx.AsyncClient",
+                   return_value=mock_sse_client):
+            with patch("asyncio.create_task", side_effect=_tracking_create_task):
+                gen = b.stream("sess-1", "hi", "/tmp", timeout=30)
+                # Consume the first event then break early (AgentTurnRunner pattern)
+                async for event in gen:
+                    break
+                await gen.aclose()
+
+        # The SSE task must be done after early exit
+        for task in sse_tasks_seen:
+            self.assertTrue(task.done(), "SSE task should be done after early break")
