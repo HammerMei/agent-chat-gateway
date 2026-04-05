@@ -41,15 +41,22 @@ personalize your tone, language, and response style for each person in the room.
 
 2. Replace the example profiles with the real people in your room.
 
-3. Reference the file in your `config.yaml` under the appropriate watcher or connector:
+3. Reference the files in your `config.yaml`. `rc-gateway-context.md` belongs at the
+   **connector level** (shared across all rooms); room profiles are **watcher-level**
+   (specific to each room):
    ```yaml
+   connectors:
+     - name: rc-main
+       ...
+       context_inject_files:
+         - contexts/rc-gateway-context.md   # Gateway behavior rules — shared across all rooms
+
    watchers:
      - name: general
        connector: rc-main
        room: general
        agent: claude
        context_inject_files:
-         - contexts/rc-gateway-context.md   # Gateway behavior rules
          - contexts/rc-room-profiles.md     # Room member profiles (this file)
    ```
 

@@ -22,7 +22,7 @@ connectors:
     attachments:
       max_file_size_mb: 10           # files larger than this are skipped (0 = no limit)
       download_timeout: 30           # seconds per file download
-      cache_dir: agent-chat.cache    # relative to watcher's working_directory
+      # cache_dir_global: ~/.agent-chat-gateway/attachments  # optional: override download cache location
     reply_in_thread: false           # true = start a new thread for every top-level reply
     permission_reply_in_thread: true # false = post permission notifications at room level
     context_inject_files:             # connector-level context injected into every session (layer 1)
@@ -33,6 +33,7 @@ agents:
   my-agent:
     type: claude
     command: claude
+    working_directory: ~/.agent-chat-gateway/work  # required: directory where the agent runs and creates files
     new_session_args: []             # extra flags passed only on session creation
                                      # e.g. ["--agent", "my-agent-name"] to load a custom agent
     session_prefix: agent-chat       # prefix added to Claude session titles

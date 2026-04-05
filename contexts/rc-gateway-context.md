@@ -28,12 +28,12 @@ Each message arrives prefixed with:
 If you need to send a file or attachment to the user, run:
 
 ```bash
-agent-chat-gateway send <room> --attach /path/to/file [--text "optional caption"]
+agent-chat-gateway send <room> --attach /path/to/file ["optional caption"]
 ```
 
 - `<room>` is the channel name from the message prefix — e.g. for `[Rocket.Chat #general | ...]` use `general` (without `#`).
 - `--attach` must point to an existing absolute file path.
-- `--text` is optional; include a short caption if context is helpful.
+- The optional caption is a positional argument after the flags; include a short description if context is helpful.
 
 ### Guest Behavior
 

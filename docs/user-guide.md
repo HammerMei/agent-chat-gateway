@@ -69,7 +69,7 @@ agents:
   claude:
     type: claude
     command: claude
-    working_directory: /tmp/acg
+    working_directory: ~/.agent-chat-gateway/work
     timeout: 360
     permissions:
       enabled: true
@@ -137,7 +137,7 @@ agents:
   claude:
     type: claude
     command: claude
-    working_directory: /tmp/acg-claude
+    working_directory: ~/.agent-chat-gateway/work
     timeout: 360
     permissions:
       enabled: true
@@ -155,7 +155,7 @@ agents:
   opencode:
     type: opencode
     command: opencode
-    working_directory: /tmp/acg-opencode
+    working_directory: ~/.agent-chat-gateway/opencode-work
     timeout: 360
     permissions:
       enabled: true
@@ -167,21 +167,21 @@ watchers:
     room: general
     agent: claude
     context_inject_files:
-      - context/team-assistant.md    # team-specific system prompt
+      - contexts/team-assistant.md    # team-specific system prompt
 
   - name: dev
     connector: rc-company
     room: dev
     agent: opencode
     context_inject_files:
-      - context/engineering-context.md
+      - contexts/engineering-context.md
 
   - name: support
     connector: rc-company
     room: support
     agent: claude
     context_inject_files:
-      - context/support-runbook.md
+      - contexts/support-runbook.md
 ```
 
 **Key settings for this use case:**
@@ -343,7 +343,7 @@ connectors:
     attachments:
       max_file_size_mb: 50           # 0 = no limit
       download_timeout: 30            # Seconds
-      cache_dir: ~/.agent-chat-gateway/attachments
+      cache_dir_global: ~/.agent-chat-gateway/attachments  # connector-global cache directory
     reply_in_thread: false            # Start new thread for replies
     permission_reply_in_thread: true  # Post permission requests in thread
     context_inject_files: []          # Files sent to agent on session start
@@ -362,7 +362,7 @@ connectors:
 | `allowed_users.guests` | list | No | Usernames with restricted tool access |
 | `attachments.max_file_size_mb` | integer | No | Maximum file size; 0 = unlimited |
 | `attachments.download_timeout` | integer | No | Seconds to wait per file download |
-| `attachments.cache_dir` | string | No | Where to cache downloaded files |
+| `attachments.cache_dir_global` | string | No | Download cache directory (default: `~/.agent-chat-gateway/attachments`; only needed to override the default) |
 | `reply_in_thread` | boolean | No | Reply in thread for every message |
 | `permission_reply_in_thread` | boolean | No | Post permission requests in threads |
 | `context_inject_files` | list | No | Context files for all sessions on this connector |
@@ -376,7 +376,7 @@ agents:
   claude:
     type: claude
     command: claude
-    working_directory: /tmp/acg
+    working_directory: ~/.agent-chat-gateway/work
     new_session_args: []
     session_prefix: "agent-chat"
     context_inject_files: []
@@ -615,6 +615,99 @@ The agent uses this header to determine:
 
 ---
 
+## User-Aware Responses
+
+Every message the gateway forwards to the agent is prefixed with a trusted header:
+
+```
+[Rocket.Chat #general | from: alice | role: owner]  Hey, can you review this PR?
+```
+
+The `from: <username>` field tells the agent exactly who sent the message. Combined with a
+**room profiles context file**, the agent can greet people by name, reply in their preferred
+language, match their communication style, and adjust detail level based on their background —
+automatically, for every message.
+
+### How It Works
+
+1. **The gateway injects** sender identity and role on every message (trusted, cannot be spoofed)
+2. **The agent reads** the `from:` field to look up the sender's profile
+3. **The agent personalizes** tone, language, and response style accordingly
+
+The profile file is just a plain text context file you inject at session start — no code
+changes needed.
+
+### Example Profile File
+
+Create a file like `contexts/rc-room-profiles.md` (you can copy the template from
+[`contexts/rc-room-profiles.example.md`](../contexts/rc-room-profiles.example.md)):
+
+```markdown
+## Rocket.Chat Room Profiles
+
+**IMPORTANT — scope:** The profiles below apply **only** when interacting via the
+Rocket.Chat gateway (i.e., when the `[Rocket.Chat #<room> | from: <username> | role: ...]`
+message prefix is present). Do NOT apply these profiles during CLI/terminal sessions.
+
+Cross-reference the `from: <username>` field in the message prefix with the profiles
+below to personalize your tone, language, and response style for each person in the room.
+
+---
+
+### alice
+- **Display name:** Alice
+- **Title:** Engineering Lead
+- **Language:** English
+- **Notes:** Prefers concise technical answers. Comfortable with code snippets.
+  Appreciates bullet points over paragraphs.
+
+### bob
+- **Display name:** Bob
+- **Title:** Product Manager
+- **Language:** English
+- **Notes:** Non-technical — avoid jargon, use plain language and analogies.
+  Focuses on business impact, not implementation details.
+
+### charlie
+- **Display name:** Charlie
+- **Language:** English / Traditional Chinese (reply in whichever language Charlie writes in)
+- **Notes:** Guest role. Primarily asks questions about docs and project status.
+  Keep responses factual; do not share internal system details.
+```
+
+Then add it to your config. `rc-gateway-context.md` belongs at the **connector level** so it
+applies to every room automatically. Room profiles are **watcher-level** since each room has
+its own set of people:
+
+```yaml
+connectors:
+  - name: rc-main
+    ...
+    context_inject_files:
+      - contexts/rc-gateway-context.md   # Gateway behavior rules — shared across all rooms
+
+watchers:
+  - name: general
+    connector: rc-main
+    room: general
+    agent: claude
+    context_inject_files:
+      - contexts/rc-room-profiles.md     # Room member profiles — specific to this room
+```
+
+Restart or reset the watcher to load the new context:
+
+```bash
+agent-chat-gateway reset general
+```
+
+> **Tip:** `contexts/rc-gateway-context.md` (included in the repo) sets up baseline gateway
+> behavior: message format parsing, injection protection, response length, and guest access
+> rules. Placing it at the connector level ensures every room benefits from it without
+> repeating it in each watcher.
+
+---
+
 ## Permission Approval System
 
 When `permissions.enabled: true` and a user attempts a tool call not in their allow-list, the gateway intercepts it and requires explicit approval from an owner.
@@ -742,22 +835,29 @@ cp contexts/rc-room-profiles.example.md contexts/rc-room-profiles.md
 # Edit rc-room-profiles.md with your team's actual profiles
 ```
 
-Then reference it in your watcher:
+Then reference it in your config. `rc-gateway-context.md` belongs at the **connector level**
+(shared across all rooms); room profiles are **watcher-level** (room-specific):
 
 ```yaml
+connectors:
+  - name: rc-main
+    ...
+    context_inject_files:
+      - contexts/rc-gateway-context.md   # Gateway behavior rules — shared across all rooms
+
 watchers:
   - name: general
     connector: rc-main
     room: general
     agent: claude
     context_inject_files:
-      - contexts/rc-gateway-context.md   # Gateway behavior rules (see contexts/ folder)
-      - contexts/rc-room-profiles.md     # Room member profiles
+      - contexts/rc-room-profiles.md     # Room member profiles — specific to this room
 ```
 
-The `contexts/rc-gateway-context.md` file (also included in the repo) sets up baseline
-gateway behavior: response length, message format parsing, injection protection, and guest
-access rules. Pair it with a profiles file for best results.
+`contexts/rc-gateway-context.md` (included in the repo) sets up baseline gateway behavior:
+response length, message format parsing, injection protection, and guest access rules.
+Placing it at the connector level means you only need to list it once, and every room
+on that connector automatically benefits from it.
 
 ### Limits
 
@@ -780,7 +880,7 @@ connectors:
     attachments:
       max_file_size_mb: 50          # Skip files larger than this
       download_timeout: 30           # Seconds to wait per download
-      cache_dir: ~/.agent-chat-gateway/attachments
+      cache_dir_global: ~/.agent-chat-gateway/attachments  # preferred: connector-global cache
 ```
 
 ### What Happens
@@ -950,7 +1050,7 @@ agents:
   claude:
     type: claude
     command: claude
-    working_directory: /tmp/claude-work
+    working_directory: ~/.agent-chat-gateway/work
     timeout: 360
     permissions:
       enabled: true
@@ -959,7 +1059,7 @@ agents:
   opencode:
     type: opencode
     command: opencode
-    working_directory: /tmp/opencode-work
+    working_directory: ~/.agent-chat-gateway/opencode-work
     timeout: 360
     permissions:
       enabled: true
