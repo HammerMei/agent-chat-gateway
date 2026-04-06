@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.9] - 2026-04-06
+
+### Changed
+- Re-release of 0.1.8 to fix PyPI publish after history rewrite removed
+  `docker_env/` (which contained sensitive data) from all prior commits.
+  No functional code changes from 0.1.8.
+
+---
+
 ## [0.1.8] - 2026-04-06
 
 ### Added
