@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.8] - 2026-04-06
+
+### Added
+- **Docker support**: `Dockerfile.acg`, `docker/entrypoint.acg.sh`, and
+  `docker/docker-compose.example/` for deploying ACG via Docker. The image
+  is published to `ghcr.io/hammermei/agent-chat-gateway` on every release.
+- **GitHub Container Registry**: `.github/workflows/docker.yml` builds and
+  pushes `linux/amd64` + `linux/arm64` images on every `v*` tag.
+
+---
+
 ## [0.1.7] - 2026-04-06
 
 ### Fixed
