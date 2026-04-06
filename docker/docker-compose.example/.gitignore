@@ -1,0 +1,4 @@
+# This directory is intentionally committed as an example template.
+# Override the root .gitignore so .env and config.yaml are tracked here.
+!.env
+!config.yaml

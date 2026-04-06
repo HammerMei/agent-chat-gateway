@@ -1,0 +1,113 @@
+# agent-chat-gateway config — Docker example
+# Based on docker_env/config/config.yaml
+#
+# Place this file at:  ./config/config.yaml
+# Place credentials at: ./config/.env  (see .env example)
+
+connectors:
+  - name: rocketchat
+    type: rocketchat
+    server:
+      url: "$RC_URL"           # set in ./config/.env
+      username: "$RC_USERNAME"
+      password: "$RC_PASSWORD"
+    allowed_users:
+      owners:
+        - your-username        # change to your RC username
+      guests: []
+    attachments:
+      max_file_size_mb: 10
+      download_timeout: 30
+    reply_in_thread: false
+    permission_reply_in_thread: true
+    context_inject_files:
+      - /root/.agent-chat-gateway/contexts/rc-gateway-context.md
+
+agents:
+  # ── Claude Code backend ──────────────────────────────────────────────────
+  claude_agent:
+    type: claude
+    command: claude
+    new_session_args: []
+    session_prefix: agent-chat
+    context_inject_files: []
+    working_directory: /root/.agent-chat-gateway/work/claude_agent
+    owner_allowed_tools:
+      - tool: "Read"
+      - tool: "Glob"
+      - tool: "Grep"
+      - tool: "WebSearch"
+      - tool: "WebFetch"
+        params: "https?://.*"
+      - tool: "Bash"
+        params: "git (log|diff|status|show)( .*)?"
+      - tool: "Bash"
+        params: "agent-chat-gateway\\s+send\\s+.*"
+    guest_allowed_tools:
+      - tool: "Read"
+      - tool: "Grep"
+      - tool: "Glob"
+      - tool: "WebSearch"
+      - tool: "WebFetch"
+        params: "https?://.*"
+      - tool: "Bash"
+        params: "agent-chat-gateway\\s+send\\s+.*"
+    timeout: 360
+    permissions:
+      enabled: true
+      timeout: 300
+      skip_owner_approval: false
+
+  # ── OpenCode backend ─────────────────────────────────────────────────────
+  opencode_agent:
+    type: opencode
+    command: opencode
+    new_session_args: []
+    session_prefix: agent-chat
+    context_inject_files: []
+    working_directory: /root/.agent-chat-gateway/work/opencode_agent
+    owner_allowed_tools:
+      - tool: "read"           # opencode uses lowercase tool names
+      - tool: "glob"
+      - tool: "grep"
+      - tool: "websearch"
+      - tool: "webfetch"
+        params: "https?://.*"
+      - tool: "bash"
+        params: "git (log|diff|status|show)( .*)?"
+      - tool: "bash"
+        params: "agent-chat-gateway\\s+send\\s+.*"
+    guest_allowed_tools:
+      - tool: "read"
+      - tool: "grep"
+      - tool: "glob"
+      - tool: "websearch"
+      - tool: "webfetch"
+        params: "https?://.*"
+      - tool: "bash"
+        params: "agent-chat-gateway\\s+send\\s+.*"
+    timeout: 360
+    permissions:
+      enabled: true
+      timeout: 300
+
+watchers:
+  # DM watcher — OpenCode agent
+  - name: dm
+    connector: rocketchat
+    room: "@your-username"     # DM with owner, e.g. "@alice"
+    agent: opencode_agent
+    session_id: ~
+    context_inject_files: []
+    online_notification: "✅ _Agent online_"
+    offline_notification: "❌ _Agent offline_"
+
+  # Channel watcher — Claude agent
+  - name: room
+    connector: rocketchat
+    room: "general"            # channel name (no @)
+    agent: claude_agent
+    session_id: ~
+    context_inject_files: []
+    online_notification: "✅ _Agent online_"
+    offline_notification: "❌ _Agent offline_"

@@ -1,0 +1,67 @@
+# =============================================================================
+# ACG Docker Compose — example based on docker_env/ layout
+#
+# Directory structure:
+#   your-deploy-dir/
+#   ├── docker-compose.yml        (this file, renamed)
+#   ├── .env                      (secrets — never commit this)
+#   ├── config/
+#   │   ├── config.yaml           (gateway config)
+#   │   └── .env                  (RC credentials)
+#   ├── agents/                   (agent working directories, auto-created)
+#   │   ├── claude_agent/
+#   │   └── opencode_agent/
+#   └── contexts/                 (context files, defaults restored if empty)
+#
+# Setup (one-time):
+#   1. Copy this directory to your deployment location
+#   2. vim .env                                      # fill in CLAUDE_CODE_OAUTH_TOKEN
+#   3. vim config/.env                               # fill in RC_URL, RC_USERNAME, RC_PASSWORD
+#   4. vim config/config.yaml                        # set owners, rooms, agents
+#
+# Optional — customize agent personas/context per agent backend:
+#   vim agents/claude_agent/CLAUDE.md                # Claude Code agent persona & instructions
+#   vim agents/opencode_agent/AGENTS.md              # OpenCode agent persona & instructions
+#
+# Start:   docker compose up -d
+# Logs:    docker compose logs -f
+# Stop:    docker compose down
+# =============================================================================
+
+services:
+  acg:
+    image: ghcr.io/hammermei/agent-chat-gateway:latest
+    container_name: acg
+    restart: unless-stopped
+
+    volumes:
+      # ── ACG config ────────────────────────────────────────────────────────
+      # config.yaml + .env (RC credentials) — symlinked into runtime dir
+      - ./config:/root/.agent-chat-gateway/config
+
+      # ── Agent working directories ─────────────────────────────────────────
+      # Files created by agents are visible locally under ./agents/
+      - ./agents:/root/.agent-chat-gateway/work
+
+      # ── Context files ─────────────────────────────────────────────────────
+      # Injected into every agent session. Defaults restored if empty.
+      - ./contexts:/root/.agent-chat-gateway/contexts
+
+      # ── OpenCode config (uncomment if using OpenCode backend) ─────────────
+      # - ${HOME}/.config/opencode:/root/.config/opencode
+
+    environment:
+      # ── Claude Code auth (pick one) ───────────────────────────────────────
+      # Option A (recommended): OAuth token — Claude.ai subscription,
+      #   supports context management, no ~/.claude mount needed.
+      #   Set CLAUDE_CODE_OAUTH_TOKEN in .env file (never hardcode here).
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
+
+      # Option B: direct Anthropic API key
+      # - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
