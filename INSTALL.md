@@ -51,31 +51,41 @@ Run ACG as a container — no Python, Node.js, or Claude Code required on the ho
 
 **Prerequisites:** Docker with Compose plugin installed.
 
-```bash
-# 1. Copy the example compose setup
-curl -fsSL https://raw.githubusercontent.com/HammerMei/agent-chat-gateway/main/docker/docker-compose.example/docker-compose.yml -o docker-compose.yml
+**Setup:**
 
-# 2. Claude Code auth — set your OAuth token in .env
-echo "CLAUDE_CODE_OAUTH_TOKEN=your_token_here" > .env
+1. **Copy the example directory** to your deployment location:
+   ```bash
+   cp -r docker/docker-compose.example my-acg
+   cd my-acg
+   ```
+   If you don't have the repo, download it:
+   ```bash
+   curl -fsSL https://github.com/HammerMei/agent-chat-gateway/archive/refs/heads/main.tar.gz \
+     | tar -xz --strip-components=2 agent-chat-gateway-main/docker/docker-compose.example
+   cd docker-compose.example
+   ```
 
-# 3. Rocket.Chat credentials — create config/.env
-mkdir -p config
-cat > config/.env <<EOF
-RC_URL=https://your-rocketchat.example.com
-RC_USERNAME=bot
-RC_PASSWORD=yourpassword
-EOF
+2. **Fill in `.env`** — Claude Code OAuth token (see the file for instructions on how to obtain it)
 
-# 4. Gateway config — create config/config.yaml
-#    See docker/docker-compose.example/ for a full annotated example
-#    At minimum, set: owners, connectors[].watcher_rooms, agents
+3. **Fill in `config/.env`** — Rocket.Chat credentials:
+   ```
+   RC_URL=https://your-rocketchat.example.com
+   RC_USERNAME=bot
+   RC_PASSWORD=yourpassword
+   ```
 
-# 5. Start
-docker compose up -d
+4. **Edit `config/config.yaml`** — set your owners, watcher rooms, and agent config.
+   A commented example is included in the file.
 
-# Logs
-docker compose logs -f
-```
+5. *(Optional)* Customize agent personas:
+   - `agents/claude_agent/CLAUDE.md` — Claude Code persona & instructions
+   - `agents/opencode_agent/AGENTS.md` — OpenCode persona & instructions
+
+6. **Start:**
+   ```bash
+   docker compose up -d
+   docker compose logs -f
+   ```
 
 **Volume layout:**
 
@@ -86,8 +96,6 @@ docker compose logs -f
 | `./contexts/` | `~/.agent-chat-gateway/contexts/` | Context files injected into agent sessions |
 
 **Image:** `ghcr.io/hammermei/agent-chat-gateway:latest`
-
-See [`docker/docker-compose.example/`](docker/docker-compose.example/) for the full annotated example including optional agent persona files (`CLAUDE.md`, `AGENTS.md`).
 
 ---
 

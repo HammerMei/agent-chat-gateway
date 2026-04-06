@@ -55,25 +55,23 @@ Please install agent-chat-gateway by following the instructions at https://raw.g
 If you'd rather skip installing Python, Node.js, or Claude Code locally, run ACG in a container:
 
 ```bash
-# 1. Copy the example compose file
-curl -fsSL https://raw.githubusercontent.com/HammerMei/agent-chat-gateway/main/docker/docker-compose.example/docker-compose.yml -o docker-compose.yml
+# 1. Copy the example directory to your deployment location
+cp -r docker/docker-compose.example my-acg
+cd my-acg
 
-# 2. Set your Claude Code OAuth token
-echo "CLAUDE_CODE_OAUTH_TOKEN=your_token_here" > .env
+# 2. Fill in your credentials and settings
+#    .env          — Claude Code OAuth token (see file for instructions)
+#    config/.env   — Rocket.Chat URL, username, password
+#    config/config.yaml — owners, rooms, agents
 
-# 3. Set your Rocket.Chat credentials
-mkdir -p config
-cat > config/.env <<EOF
-RC_URL=https://your-rocketchat.example.com
-RC_USERNAME=bot
-RC_PASSWORD=yourpassword
-EOF
-
-# 4. Set owners and rooms in config/config.yaml, then start
+# 3. Start
 docker compose up -d
+
+# Logs
+docker compose logs -f
 ```
 
-See [`docker/docker-compose.example/`](docker/docker-compose.example/) for the full example with annotations.
+See [`docker/docker-compose.example/`](docker/docker-compose.example/) for the full annotated setup — all files are pre-structured and ready to fill in.
 
 > Prefer a native install? See [INSTALL.md](INSTALL.md) for step-by-step instructions.
 
