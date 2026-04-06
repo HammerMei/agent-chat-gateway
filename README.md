@@ -1,6 +1,7 @@
 # agent-chat-gateway
 
 [![CI](https://github.com/HammerMei/agent-chat-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/HammerMei/agent-chat-gateway/actions/workflows/ci.yml)
+[![Docker](https://ghcr-badge.egpl.dev/hammermei/agent-chat-gateway/latest_tag?trim=major&label=docker&color=blue)](https://github.com/HammerMei/agent-chat-gateway/pkgs/container/agent-chat-gateway)
 ![Python](https://img.shields.io/badge/python-%3E%3D3.12-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
@@ -39,6 +40,8 @@ Inspired by [OpenClaw](https://github.com/openclaw/openclaw)'s vision of making 
 
 ## Quick Start
 
+### Option A — AI-guided install (recommended)
+
 The easiest way to install is to ask your AI agent to do it for you — it handles dependencies, configuration, and any troubleshooting automatically.
 
 In Claude Code or OpenCode, run this prompt:
@@ -47,7 +50,32 @@ In Claude Code or OpenCode, run this prompt:
 Please install agent-chat-gateway by following the instructions at https://raw.githubusercontent.com/HammerMei/agent-chat-gateway/main/docs/install-agent.md
 ```
 
-> Prefer to install manually? See [INSTALL.md](INSTALL.md) for step-by-step instructions.
+### Option B — Docker (no local dependencies)
+
+If you'd rather skip installing Python, Node.js, or Claude Code locally, run ACG in a container:
+
+```bash
+# 1. Copy the example compose file
+curl -fsSL https://raw.githubusercontent.com/HammerMei/agent-chat-gateway/main/docker/docker-compose.example/docker-compose.yml -o docker-compose.yml
+
+# 2. Set your Claude Code OAuth token
+echo "CLAUDE_CODE_OAUTH_TOKEN=your_token_here" > .env
+
+# 3. Set your Rocket.Chat credentials
+mkdir -p config
+cat > config/.env <<EOF
+RC_URL=https://your-rocketchat.example.com
+RC_USERNAME=bot
+RC_PASSWORD=yourpassword
+EOF
+
+# 4. Set owners and rooms in config/config.yaml, then start
+docker compose up -d
+```
+
+See [`docker/docker-compose.example/`](docker/docker-compose.example/) for the full example with annotations.
+
+> Prefer a native install? See [INSTALL.md](INSTALL.md) for step-by-step instructions.
 
 ---
 
