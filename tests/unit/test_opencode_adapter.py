@@ -2670,3 +2670,162 @@ class TestStream(unittest.IsolatedAsyncioTestCase):
         # The SSE task must be done after early exit
         for task in sse_tasks_seen:
             self.assertTrue(task.done(), "SSE task should be done after early break")
+
+
+# ── _build_safe_opencode_config ───────────────────────────────────────────────
+
+
+class TestBuildSafeOpencodeConfig(unittest.TestCase):
+    """Tests for _build_safe_opencode_config() and its integration in __init__."""
+
+    def setUp(self):
+        from gateway.agents.opencode.adapter import (
+            _DEFAULT_BASH_ALLOW_PATTERNS,
+            _build_safe_opencode_config,
+        )
+        self.fn = _build_safe_opencode_config
+        self.default_patterns = _DEFAULT_BASH_ALLOW_PATTERNS
+
+    # ── no existing config ────────────────────────────────────────────────────
+
+    def test_empty_env_injects_full_defaults(self):
+        """No OPENCODE_CONFIG_CONTENT → full default bash config is injected."""
+        result = self.fn({})
+        self.assertIsNotNone(result)
+        config = json.loads(result)
+        bash = config["permission"]["bash"]
+        self.assertEqual(bash["*"], "ask")
+        for p in self.default_patterns:
+            self.assertEqual(bash[p], "allow", f"Expected '{p}' to be 'allow'")
+
+    def test_empty_string_value_treated_as_no_config(self):
+        """OPENCODE_CONFIG_CONTENT='' is equivalent to no config."""
+        result = self.fn({"OPENCODE_CONFIG_CONTENT": ""})
+        self.assertIsNotNone(result)
+        config = json.loads(result)
+        self.assertEqual(config["permission"]["bash"]["*"], "ask")
+
+    # ── user has bash key but no "*" catch-all ────────────────────────────────
+
+    def test_user_bash_without_catchall_gets_catchall_appended(self):
+        """Existing bash rules preserved; missing '*' catch-all is appended."""
+        existing = json.dumps({"permission": {"bash": {"git log *": "allow"}}})
+        result = self.fn({"OPENCODE_CONFIG_CONTENT": existing})
+        self.assertIsNotNone(result)
+        config = json.loads(result)
+        bash = config["permission"]["bash"]
+        self.assertEqual(bash["*"], "ask")
+        # User's original rule must be preserved
+        self.assertEqual(bash["git log *"], "allow")
+
+    def test_user_bash_patterns_not_overwritten_by_defaults(self):
+        """If user already has a default pattern set, ACG must not overwrite it."""
+        existing = json.dumps({
+            "permission": {"bash": {"git log *": "deny"}}  # user explicitly denies
+        })
+        result = self.fn({"OPENCODE_CONFIG_CONTENT": existing})
+        self.assertIsNotNone(result)
+        config = json.loads(result)
+        bash = config["permission"]["bash"]
+        # User's "deny" must not be overwritten to "allow"
+        self.assertEqual(bash["git log *"], "deny")
+        self.assertEqual(bash["*"], "ask")
+
+    def test_default_allow_patterns_added_when_absent(self):
+        """Default allow patterns are added when not present in user config."""
+        existing = json.dumps({"permission": {"bash": {"my-custom *": "allow"}}})
+        result = self.fn({"OPENCODE_CONFIG_CONTENT": existing})
+        self.assertIsNotNone(result)
+        config = json.loads(result)
+        bash = config["permission"]["bash"]
+        # All default patterns injected
+        for p in self.default_patterns:
+            self.assertIn(p, bash, f"Expected default pattern '{p}' to be injected")
+        # Custom user pattern preserved
+        self.assertEqual(bash["my-custom *"], "allow")
+
+    # ── user has "*" catch-all — no injection ─────────────────────────────────
+
+    def test_user_catchall_allow_respected(self):
+        """bash['*'] = 'allow' → user's explicit choice, return None."""
+        existing = json.dumps({"permission": {"bash": {"*": "allow"}}})
+        result = self.fn({"OPENCODE_CONFIG_CONTENT": existing})
+        self.assertIsNone(result)
+
+    def test_user_catchall_ask_respected(self):
+        """bash['*'] = 'ask' already set → already secure, return None."""
+        existing = json.dumps({"permission": {"bash": {"*": "ask", "ls *": "allow"}}})
+        result = self.fn({"OPENCODE_CONFIG_CONTENT": existing})
+        self.assertIsNone(result)
+
+    def test_user_catchall_deny_respected(self):
+        """bash['*'] = 'deny' → user's explicit choice, return None."""
+        existing = json.dumps({"permission": {"bash": {"*": "deny"}}})
+        result = self.fn({"OPENCODE_CONFIG_CONTENT": existing})
+        self.assertIsNone(result)
+
+    # ── user has no bash key but has other permission keys ────────────────────
+
+    def test_other_permission_keys_preserved(self):
+        """Existing non-bash permission config is preserved when merging."""
+        existing = json.dumps({"permission": {"read": {"*": "allow"}}})
+        result = self.fn({"OPENCODE_CONFIG_CONTENT": existing})
+        self.assertIsNotNone(result)
+        config = json.loads(result)
+        # Existing read config preserved
+        self.assertEqual(config["permission"]["read"]["*"], "allow")
+        # bash defaults injected
+        self.assertEqual(config["permission"]["bash"]["*"], "ask")
+
+    def test_non_permission_keys_preserved(self):
+        """Top-level keys other than 'permission' are left untouched."""
+        existing = json.dumps({"model": "anthropic/claude-sonnet", "theme": "dark"})
+        result = self.fn({"OPENCODE_CONFIG_CONTENT": existing})
+        self.assertIsNotNone(result)
+        config = json.loads(result)
+        self.assertEqual(config["model"], "anthropic/claude-sonnet")
+        self.assertEqual(config["theme"], "dark")
+        self.assertEqual(config["permission"]["bash"]["*"], "ask")
+
+    # ── error handling ────────────────────────────────────────────────────────
+
+    def test_malformed_json_raises_valueerror(self):
+        """Invalid JSON in OPENCODE_CONFIG_CONTENT must raise ValueError."""
+        with self.assertRaises(ValueError) as cm:
+            self.fn({"OPENCODE_CONFIG_CONTENT": "{not valid json"})
+        self.assertIn("invalid JSON", str(cm.exception))
+
+    def test_malformed_json_error_does_not_silently_drop_config(self):
+        """ValueError message must hint at the fix, not just say 'error'."""
+        with self.assertRaises(ValueError) as cm:
+            self.fn({"OPENCODE_CONFIG_CONTENT": "!!!"})
+        msg = str(cm.exception)
+        self.assertIn("OPENCODE_CONFIG_CONTENT", msg)
+
+    # ── __init__ integration ──────────────────────────────────────────────────
+
+    def test_init_injects_config_when_no_existing_env(self):
+        """OpenCodeBackend.__init__ injects OPENCODE_CONFIG_CONTENT by default."""
+        b = _make_backend()
+        self.assertIn("OPENCODE_CONFIG_CONTENT", b._sidecar_env)
+        config = json.loads(b._sidecar_env["OPENCODE_CONFIG_CONTENT"])
+        self.assertEqual(config["permission"]["bash"]["*"], "ask")
+
+    def test_init_merges_with_existing_sidecar_env(self):
+        """__init__ merges injection with other sidecar_env vars."""
+        b = _make_backend(sidecar_env={"ACG_ROLE": "owner"})
+        self.assertEqual(b._sidecar_env["ACG_ROLE"], "owner")
+        self.assertIn("OPENCODE_CONFIG_CONTENT", b._sidecar_env)
+
+    def test_init_respects_user_catchall_in_sidecar_env(self):
+        """__init__ does not overwrite user's explicit '*' catch-all."""
+        user_config = json.dumps({"permission": {"bash": {"*": "allow"}}})
+        b = _make_backend(sidecar_env={"OPENCODE_CONFIG_CONTENT": user_config})
+        stored = json.loads(b._sidecar_env["OPENCODE_CONFIG_CONTENT"])
+        # Must not have been changed — user chose "allow"
+        self.assertEqual(stored["permission"]["bash"]["*"], "allow")
+
+    def test_init_raises_on_malformed_opencode_config_content(self):
+        """__init__ raises ValueError immediately if OPENCODE_CONFIG_CONTENT is invalid JSON."""
+        with self.assertRaises(ValueError):
+            _make_backend(sidecar_env={"OPENCODE_CONFIG_CONTENT": "{bad json"})

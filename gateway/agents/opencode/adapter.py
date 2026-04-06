@@ -93,6 +93,90 @@ _STARTUP_TIMEOUT = 30  # seconds
 # _ensure_live_runtime() fast-fails instead of blocking callers for ~30s each.
 _MAX_RESTART_FAILURES = 3
 
+# ── OpenCode bash permission injection ───────────────────────────────────────
+#
+# OpenCode's default permission ruleset uses ``"*": "allow"`` which means ALL
+# bash commands run without emitting a ``permission.asked`` SSE event.  This
+# completely bypasses ACG's permission broker, so guest and owner tool
+# restrictions defined in ``guest_allowed_tools`` / ``owner_allowed_tools``
+# have no effect for bash in the default configuration.
+#
+# Fix: inject ``bash["*"] = "ask"`` via OPENCODE_CONFIG_CONTENT so OpenCode
+# emits ``permission.asked`` for every bash command, letting ACG enforce its
+# own allow-lists and approval flow.  A short set of read-only patterns is
+# pre-approved so common safe operations do not require manual approval.
+#
+# See ``_build_safe_opencode_config()`` for the full merge logic.
+
+_DEFAULT_BASH_ALLOW_PATTERNS: list[str] = [
+    "git log *",
+    "git diff *",
+    "git status *",
+    "git show *",
+    "agent-chat-gateway send *",
+]
+
+
+def _build_safe_opencode_config(sidecar_env: dict[str, str]) -> str | None:
+    """Return a safe ``OPENCODE_CONFIG_CONTENT`` value with bash permission defaults.
+
+    OpenCode's default bash permission is ``"allow"`` (all bash commands run
+    without asking), which bypasses ACG's permission broker entirely.  This
+    function ensures ``bash["*"] = "ask"`` is always present so that ACG can
+    intercept bash tool calls and enforce its own ``owner_allowed_tools`` /
+    ``guest_allowed_tools`` rules.
+
+    Merge rules
+    -----------
+    1. ``OPENCODE_CONFIG_CONTENT`` contains invalid JSON
+       → raise ``ValueError`` — never silently drop the user's config.
+    2. ``bash["*"]`` is already set (e.g. user explicitly chose ``"allow"`` or
+       ``"ask"``) → return ``None`` (respect the user's explicit choice).
+    3. ``bash["*"]`` is not set → append ``_DEFAULT_BASH_ALLOW_PATTERNS`` for
+       known-safe read-only commands, then add ``"*": "ask"`` as the catch-all.
+       Existing user-defined bash patterns are preserved unchanged.
+
+    Args:
+        sidecar_env: The environment dict that will be passed to the sidecar
+            process.  Only ``OPENCODE_CONFIG_CONTENT`` is read from this dict.
+
+    Returns:
+        The new JSON string to assign to ``OPENCODE_CONFIG_CONTENT``, or
+        ``None`` if no injection is needed.
+
+    Raises:
+        ValueError: If ``OPENCODE_CONFIG_CONTENT`` contains malformed JSON.
+    """
+    existing_str = sidecar_env.get("OPENCODE_CONFIG_CONTENT", "")
+
+    if existing_str:
+        try:
+            config: dict = json.loads(existing_str)
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"OPENCODE_CONFIG_CONTENT contains invalid JSON: {e}. "
+                "Fix the env var or remove it to use ACG's safe defaults."
+            ) from e
+    else:
+        config = {}
+
+    perms: dict = config.setdefault("permission", {})
+    bash: dict = perms.setdefault("bash", {})
+
+    # User explicitly set a "*" catch-all — respect their decision, no injection.
+    if "*" in bash:
+        return None
+
+    # Append default allow patterns only if not already configured by the user.
+    for pattern in _DEFAULT_BASH_ALLOW_PATTERNS:
+        if pattern not in bash:
+            bash[pattern] = "allow"
+
+    # Always add the "*": "ask" catch-all so unlisted commands route through ACG.
+    bash["*"] = "ask"
+
+    return json.dumps(config)
+
 
 def _classify_http_error(status_code: int, message: str) -> AgentExecutionError:
     """Map opencode HTTP failures to structured backend exceptions."""
@@ -142,6 +226,10 @@ class OpenCodeBackend(AgentBackend):
                 the sidecar always runs as the gateway's own agent backend.
                 Guest enforcement is handled by the PermissionBroker at the
                 per-request level, not via process environment.
+                ``OPENCODE_CONFIG_CONTENT`` in this dict is merged with ACG's
+                safe bash permission defaults (``bash["*"] = "ask"``) unless
+                the user has already set a ``"*"`` catch-all.  Raises
+                ``ValueError`` if the value is malformed JSON.
             sidecar_cwd: Working directory for the ``opencode serve`` process.
                 ``None`` inherits the gateway's cwd. Set this to the project root
                 so opencode can find ``.opencode/opencode.json`` and plugins.
@@ -151,7 +239,19 @@ class OpenCodeBackend(AgentBackend):
         self._command = command
         self._new_session_args = new_session_args
         self.timeout = timeout
-        self._sidecar_env: dict[str, str] = sidecar_env or {}
+        # Inject safe bash permission defaults before storing sidecar_env.
+        # OpenCode's built-in default allows ALL bash commands without asking,
+        # which bypasses ACG's permission broker.  _build_safe_opencode_config()
+        # ensures "bash": {"*": "ask"} is set via OPENCODE_CONFIG_CONTENT so
+        # ACG can enforce owner_allowed_tools / guest_allowed_tools for bash.
+        # Raises ValueError on malformed OPENCODE_CONFIG_CONTENT so the caller
+        # gets a clear error rather than silently losing their config.
+        _env: dict[str, str] = sidecar_env or {}
+        _safe_config = _build_safe_opencode_config(_env)
+        if _safe_config is not None:
+            _env = {**_env, "OPENCODE_CONFIG_CONTENT": _safe_config}
+            logger.info("Injected safe bash permission defaults via OPENCODE_CONFIG_CONTENT")
+        self._sidecar_env: dict[str, str] = _env
         self._sidecar_cwd: str | None = sidecar_cwd
         self._broker_config = broker_config
         self._base_url: str | None = None
