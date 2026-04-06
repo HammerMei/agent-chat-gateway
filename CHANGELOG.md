@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.7] - 2026-04-06
+
+### Fixed
+- **OpenCode bash permission bypass**: OpenCode's default permission ruleset
+  uses `"*": "allow"`, which caused all bash commands to run without emitting
+  a `permission.asked` SSE event, completely bypassing ACG's permission broker.
+  ACG now injects `bash["*"] = "ask"` via `OPENCODE_CONFIG_CONTENT` at sidecar
+  startup so that bash tool calls are properly intercepted and enforced by
+  `owner_allowed_tools` / `guest_allowed_tools`. A set of read-only git commands
+  and `agent-chat-gateway send` are pre-approved as safe defaults. Users who
+  explicitly set a `"*"` catch-all in their own `OPENCODE_CONFIG_CONTENT` are
+  unaffected.
+
+---
+
 ## [0.1.6] - 2026-04-04
 
 ### Added
