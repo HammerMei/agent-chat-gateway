@@ -11,3 +11,5 @@ dist
 .env
 *.log
 .DS_Store
+docker_env/
+*.tar.gz
