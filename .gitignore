@@ -18,3 +18,5 @@ config.yaml
 example-agents/**/node_modules/
 .claude
 .opencode
+docker_env/
+*.tar.gz
