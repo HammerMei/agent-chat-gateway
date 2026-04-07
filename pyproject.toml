@@ -51,6 +51,7 @@ dev = [
     "coverage>=7.13.5",
     "pytest>=9.0.2",
     "pytest-cov>=7.1.0",
+    "pytest-timeout>=2.3",
     "ruff>=0.4.0",
 ]
 
@@ -58,6 +59,7 @@ dev = [
 testpaths = ["tests"]
 markers = [
     "integration: multi-component tests with real I/O or multiple subsystems",
+    "e2e: end-to-end tests requiring Docker + ANTHROPIC_API_KEY (run via make e2e-test)",
 ]
 
 [tool.coverage.run]

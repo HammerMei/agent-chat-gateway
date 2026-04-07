@@ -1,0 +1,149 @@
+# =============================================================================
+# ACG E2E Test Configuration
+#
+# This config is mounted into the ACG Docker container at:
+#   /root/.agent-chat-gateway/config/config.yaml
+#
+# Credentials are in ./acg-config/.env (RC_URL, RC_USERNAME, RC_PASSWORD).
+#
+# Room layout:
+#   DM:  @test_user  →  OpenCode agent
+#   Channel: acg-e2e-claude      →  Claude Code agent
+#   Channel: acg-e2e-permission  →  Claude Code (empty allowlist, for permission tests)
+# =============================================================================
+
+connectors:
+  - name: rc-e2e
+    type: rocketchat
+    server:
+      url: "$RC_URL"
+      username: "$RC_USERNAME"
+      password: "$RC_PASSWORD"
+    allowed_users:
+      owners:
+        - test_user
+      guests: []
+    attachments:
+      max_file_size_mb: 10
+      download_timeout: 30
+    reply_in_thread: false
+    permission_reply_in_thread: false
+    context_inject_files:
+      - /root/.agent-chat-gateway/contexts/rc-gateway-context.md
+
+agents:
+  # ── OpenCode — bound to DM ────────────────────────────────────────────────
+  e2e-opencode:
+    type: opencode
+    command: opencode
+    new_session_args: []
+    session_prefix: e2e-oc
+    context_inject_files: []
+    working_directory: /root/.agent-chat-gateway/work
+    owner_allowed_tools:
+      - tool: "read"
+      - tool: "glob"
+      - tool: "grep"
+      - tool: "write"
+      - tool: "external_directory"
+      - tool: "bash"
+    guest_allowed_tools: []
+    timeout: 180
+    permissions:
+      enabled: true
+      timeout: 60
+      skip_owner_approval: false
+
+  # ── Claude Code — bound to team channel ───────────────────────────────────
+  e2e-claude:
+    type: claude
+    command: claude
+    new_session_args: []
+    session_prefix: e2e-cc
+    context_inject_files: []
+    working_directory: /root/.agent-chat-gateway/work
+    owner_allowed_tools:
+      - tool: "Read"
+      - tool: "Glob"
+      - tool: "Grep"
+      - tool: "Write"
+      - tool: "Bash"
+    guest_allowed_tools: []
+    timeout: 180
+    permissions:
+      enabled: true
+      timeout: 60
+      skip_owner_approval: false
+
+  # ── Claude Code — permission test only (empty allowlist) ──────────────────
+  e2e-claude-permission:
+    type: claude
+    command: claude
+    new_session_args: []
+    session_prefix: e2e-perm
+    context_inject_files: []
+    working_directory: /root/.agent-chat-gateway/work
+    owner_allowed_tools: []
+    guest_allowed_tools: []
+    timeout: 180
+    permissions:
+      enabled: true
+      timeout: 60
+      skip_owner_approval: false
+
+  # ── OpenCode — permission test only (empty allowlist) ─────────────────────
+  e2e-opencode-permission:
+    type: opencode
+    command: opencode
+    new_session_args: []
+    session_prefix: e2e-oc-perm
+    context_inject_files: []
+    working_directory: /root/.agent-chat-gateway/work
+    owner_allowed_tools: []
+    guest_allowed_tools: []
+    timeout: 180
+    permissions:
+      enabled: true
+      timeout: 60
+      skip_owner_approval: false
+
+watchers:
+  # DM: test_user ↔ acg_bot → OpenCode
+  - name: e2e-dm
+    connector: rc-e2e
+    room: "@test_user"
+    agent: e2e-opencode
+    session_id: null
+    context_inject_files: []
+    online_notification: null
+    offline_notification: null
+
+  # Team channel → Claude Code
+  - name: e2e-claude-channel
+    connector: rc-e2e
+    room: "acg-e2e-claude"
+    agent: e2e-claude
+    session_id: null
+    context_inject_files: []
+    online_notification: null
+    offline_notification: null
+
+  # Permission test channel → Claude Code (empty allowlist)
+  - name: e2e-permission
+    connector: rc-e2e
+    room: "acg-e2e-permission"
+    agent: e2e-claude-permission
+    session_id: null
+    context_inject_files: []
+    online_notification: null
+    offline_notification: null
+
+  # Permission test channel → OpenCode (empty allowlist)
+  - name: e2e-opencode-permission
+    connector: rc-e2e
+    room: "acg-e2e-opencode-permission"
+    agent: e2e-opencode-permission
+    session_id: null
+    context_inject_files: []
+    online_notification: null
+    offline_notification: null

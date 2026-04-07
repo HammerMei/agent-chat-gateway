@@ -1,0 +1,10 @@
+# E2E generated artifacts
+__pycache__/
+*.pyc
+.pytest_cache/
+# Secrets — never commit (contains CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY)
+.env
+# Never ignore acg-config — it contains committed test config
+!acg-config/
+!acg-config/config.yaml
+!acg-config/.env

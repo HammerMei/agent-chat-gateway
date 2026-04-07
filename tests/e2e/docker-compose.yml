@@ -1,0 +1,122 @@
+# =============================================================================
+# E2E Test Infrastructure — Rocket.Chat + MongoDB + ACG
+#
+# Usage (via Makefile):
+#   Phase 1 — infrastructure only:
+#     docker compose -f tests/e2e/docker-compose.yml up -d mongodb rocketchat
+#   Phase 2 — accounts created, then start ACG:
+#     docker compose -f tests/e2e/docker-compose.yml up -d acg
+#   Teardown:
+#     docker compose -f tests/e2e/docker-compose.yml down -v
+#
+# Port layout:
+#   RC:  host:3100  (avoids conflict with dev RC on port 3000)
+#
+# ACG internal URL to RC: http://rocketchat:3100  (Docker network)
+# Test runner URL to RC:  http://localhost:3100   (host-mapped port)
+# =============================================================================
+
+services:
+
+  # ── MongoDB ─────────────────────────────────────────────────────────────────
+  # Uses the official MongoDB Community Server image as recommended by RC.
+  # Reference: https://forums.rocket.chat/t/22693
+  #
+  # The custom entrypoint starts mongod with --replSet, waits for it to be
+  # ready, then calls rs.initiate() if the replica set is not yet configured.
+  mongodb:
+    image: mongodb/mongodb-community-server:8.2-ubi8
+    platform: linux/amd64   # no arm64 image; runs via Rosetta 2 on Apple Silicon
+    container_name: acg-e2e-mongodb
+    restart: unless-stopped
+    entrypoint: >
+      bash -c "
+        mongod --replSet rs0 --bind_ip_all --port 27017 &
+        MONGOD_PID=$$!
+        until mongosh --quiet --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1; do
+          sleep 1
+        done
+        mongosh --quiet --eval '
+          try { rs.status() }
+          catch(e) { rs.initiate({_id:\"rs0\",members:[{_id:0,host:\"mongodb:27017\"}]}) }
+        '
+        wait $$MONGOD_PID
+      "
+    volumes:
+      - acg_e2e_mongodb:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand({ping:1})"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 40s
+
+  # ── Rocket.Chat ──────────────────────────────────────────────────────────────
+  rocketchat:
+    image: rocket.chat:6.12
+    platform: linux/amd64   # no arm64 image; runs via Rosetta 2 on Apple Silicon
+    container_name: acg-e2e-rocketchat
+    restart: unless-stopped
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    environment:
+      MONGO_URL: mongodb://mongodb:27017/rocketchat?replicaSet=rs0
+      MONGO_OPLOG_URL: mongodb://mongodb:27017/local?replicaSet=rs0
+      ROOT_URL: http://localhost:3100
+      PORT: 3100
+      DEPLOY_PLATFORM: docker
+      # Bootstrap admin account (effective on first boot only)
+      ADMIN_USERNAME: admin
+      ADMIN_PASS: admin_e2e_2024
+      ADMIN_EMAIL: admin@e2e.local
+      ADMIN_NAME: E2E Admin
+      # Skip the interactive setup wizard
+      OVERWRITE_SETTING_Show_Setup_Wizard: completed
+    ports:
+      - "3100:3100"
+    volumes:
+      - acg_e2e_rc_uploads:/app/uploads
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3100/health', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 90s
+
+  # ── ACG ─────────────────────────────────────────────────────────────────────
+  # Started separately (after setup.py creates RC accounts).
+  # Config is pre-written in tests/e2e/acg-config/.
+  acg:
+    image: ghcr.io/hammermei/agent-chat-gateway:latest
+    container_name: acg-e2e
+    restart: unless-stopped
+    depends_on:
+      rocketchat:
+        condition: service_healthy
+    environment:
+      # Claude Code auth — pick ONE (same env vars as the production ACG image).
+      # Option A (recommended): OAuth token — works with Claude.ai subscription.
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
+      # Option B: direct Anthropic API key
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+    volumes:
+      # ACG config: config.yaml + .env (pre-written by tests/e2e/acg-config/)
+      - ./acg-config:/root/.agent-chat-gateway/config
+      # Agent working directories
+      - acg_e2e_work:/root/.agent-chat-gateway/work
+      # Context files (defaults restored by entrypoint if empty)
+      - acg_e2e_contexts:/root/.agent-chat-gateway/contexts
+      # Claude Code auth (OAuth token / API key stored here)
+      - ~/.claude:/root/.claude
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  acg_e2e_mongodb:
+  acg_e2e_rc_uploads:
+  acg_e2e_work:
+  acg_e2e_contexts:
