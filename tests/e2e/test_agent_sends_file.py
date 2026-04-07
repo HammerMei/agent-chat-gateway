@@ -29,7 +29,19 @@ def test_agent_sends_file(
     e2e_room: dict[str, Any],
     rc_setup: dict[str, Any],
 ) -> None:
-    """Agent creates a file and sends it to the room."""
+    """Agent creates a file and sends it to the room.
+
+    Note: OpenCode (DM variant) is skipped — its free API is less reliable
+    for multi-step CLI tasks (write file + run gateway send) within CI timeouts.
+    Claude Code (channel variant) covers the full functionality.
+    """
+    if e2e_room["agent"] == "opencode":
+        pytest.skip(
+            "test_agent_sends_file skipped for OpenCode: "
+            "the free API is unreliable for multi-step CLI tasks within CI timeouts. "
+            "Claude Code (channel) covers the agent-sends-file functionality."
+        )
+
     before_ts = int(time.time() * 1000)
 
     # Tell the agent which room to send to
