@@ -59,18 +59,81 @@ def rc_setup() -> dict[str, Any]:
 
 @pytest.fixture(scope="session")
 def acg(rc_setup: dict[str, Any]) -> None:
-    """Wait for the ACG Docker container to be ready.
+    """Wait for the ACG Docker container to be ready, then warm up agents.
 
     Expects the container to already be started (by Makefile / CI).
     Polls `docker exec acg-e2e agent-chat-gateway status` until it succeeds
     or times out.
+
+    After ACG reports ready, sends a warm-up ping to both the DM (OpenCode)
+    and the team channel (Claude Code).  OpenCode starts its subprocess lazily
+    on the first request, so without this warm-up the first real test can time
+    out waiting for the cold-start initialisation to complete.
     """
     print(f"\n[acg] Waiting for ACG container '{ACG_CONTAINER}' ...", flush=True)
     _wait_for_acg(timeout=ACG_READY_TIMEOUT, interval=ACG_READY_INTERVAL)
     print("[acg] ACG is ready.", flush=True)
+
+    # ── Warm-up: trigger both agents so their subprocesses are initialised ────
+    _warmup_agents(rc_setup)
+
     yield
     # Do NOT stop the container here — Makefile / CI handles lifecycle.
     # This lets tests be re-run quickly without restarting ACG.
+
+
+def _warmup_agents(rc_setup: dict[str, Any]) -> None:
+    """Send a warm-up ping to DM (OpenCode) and channel (Claude Code).
+
+    OpenCode initialises its subprocess lazily on the first message, which can
+    take 60–90 s.  This function fires a simple 'pong' request at both agents
+    and waits up to 120 s for each response — ensuring they are fully warmed up
+    before the test suite starts.  Failures here are non-fatal (a warning is
+    printed) so that individual tests can still provide actionable failure info.
+    """
+    rc_url = rc_setup["rc_url"]
+    warmup_timeout = 120
+
+    with RCClient(rc_url) as c:
+        c.login(rc_setup["test_user_username"], rc_setup["test_user_password"])
+
+        # ── DM → OpenCode ─────────────────────────────────────────────────────
+        try:
+            print("[acg] Warming up OpenCode (DM) ...", flush=True)
+            dm_room_id = c.get_dm_room_id(BOT_USERNAME)
+            before_ts = int(time.time() * 1000)
+            c.post_message(dm_room_id, "respond with exactly the single word 'ready'")
+            c.poll_for_message(
+                dm_room_id,
+                before_ts,
+                predicate=lambda m: m["u"]["username"] == BOT_USERNAME,
+                timeout=warmup_timeout,
+                room_type="dm",
+            )
+            print("[acg] OpenCode (DM) warm-up done.", flush=True)
+        except Exception as exc:
+            print(f"[acg] WARNING: OpenCode warm-up failed: {exc}", flush=True)
+
+        # ── Channel → Claude Code ──────────────────────────────────────────────
+        try:
+            print("[acg] Warming up Claude Code (channel) ...", flush=True)
+            ch = c.get_channel(rc_setup["claude_channel"])
+            if ch:
+                before_ts = int(time.time() * 1000)
+                c.post_message(
+                    ch["_id"],
+                    f"@{BOT_USERNAME} respond with exactly the single word 'ready'",
+                )
+                c.poll_for_message(
+                    ch["_id"],
+                    before_ts,
+                    predicate=lambda m: m["u"]["username"] == BOT_USERNAME,
+                    timeout=warmup_timeout,
+                    room_type="channel",
+                )
+                print("[acg] Claude Code (channel) warm-up done.", flush=True)
+        except Exception as exc:
+            print(f"[acg] WARNING: Claude Code warm-up failed: {exc}", flush=True)
 
 
 def _wait_for_acg(timeout: float, interval: float) -> None:
