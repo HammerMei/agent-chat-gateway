@@ -1,11 +1,9 @@
 name: E2E Tests
 
 on:
-  # Run manually from GitHub Actions UI
+  # Run manually from GitHub Actions UI only
+  # (E2E tests are slow and consume API credits — trigger deliberately)
   workflow_dispatch:
-  # Run on push to main (not every PR — tests are slow and cost API credits)
-  push:
-    branches: [main]
 
 jobs:
   e2e:
