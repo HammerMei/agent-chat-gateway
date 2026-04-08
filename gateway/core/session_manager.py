@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
+from datetime import UTC, datetime
 
 from ..agents import AgentBackend
 from .config import CoreConfig, WatcherConfig
-from .connector import Connector
+from .connector import Connector, IncomingMessage, Room, User, UserRole
 from .context_injector import ContextInjector
 from .dispatch import MessageDispatcher
 from .permission import PermissionRegistry
@@ -131,6 +133,10 @@ class SessionManager:
         """Return the WatcherState for a watcher, or None if not found."""
         return self._lifecycle.get_watcher_state(name)
 
+    def get_watcher_config(self, name: str):
+        """Return the WatcherConfig for a watcher name, or None if not found."""
+        return self._lifecycle.get_watcher_config(name)
+
     async def pause_watcher(self, name: str) -> None:
         await self._lifecycle.pause_watcher(name)
 
@@ -139,6 +145,53 @@ class SessionManager:
 
     async def reset_watcher(self, name: str) -> None:
         await self._lifecycle.reset_watcher(name)
+
+    async def inject_message(self, watcher_name: str, text: str) -> bool:
+        """Inject a synthetic OWNER-role message directly into a watcher's queue.
+
+        Bypasses the connector layer entirely, avoiding the self-message filter
+        that drops messages sent by the bot's own username.  The injected message
+        is treated as if it came from a trusted owner, so it is processed without
+        permission approval prompts.
+
+        Returns True if the message was accepted into the queue, False otherwise
+        (e.g. watcher not running, queue full, or watcher not found).
+        """
+        processor = self._lifecycle.get_processor(watcher_name)
+        if processor is None:
+            logger.warning(
+                "inject_message: no active processor for watcher %r — "
+                "watcher may be paused, stopped, or not configured",
+                watcher_name,
+            )
+            return False
+
+        # Build a minimal Room from persisted state (room_id + room_type)
+        state = self._lifecycle.get_watcher_state(watcher_name)
+        wc = self._lifecycle.get_watcher_config(watcher_name)
+        room_id = state.room_id if state else ""
+        room_name = wc.room if wc else watcher_name
+        room_type = state.room_type if state else "channel"
+
+        msg = IncomingMessage(
+            id=f"sched-{secrets.token_hex(8)}",
+            timestamp=datetime.now(UTC).isoformat(),
+            room=Room(id=room_id, name=room_name, type=room_type),
+            sender=User(id="scheduler", username="scheduler", display_name="Scheduler"),
+            role=UserRole.OWNER,
+            text=text,
+            attachments=[],
+            warnings=[],
+            thread_id=None,
+            raw={},
+        )
+        accepted = await processor.enqueue(msg)
+        if not accepted:
+            logger.warning(
+                "inject_message: message for watcher %r was dropped (queue full or processor stopped)",
+                watcher_name,
+            )
+        return accepted
 
     # ── Control command dispatch (called by GatewayService) ───────────────────
 

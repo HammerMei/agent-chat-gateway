@@ -30,11 +30,13 @@ from .control import ControlServer
 from .core.config import CoreConfig
 from .core.connector import Connector
 from .core.expiry_task import run_expiry_task
+from .core.job_store import JobStore
 from .core.permission import (
     ConnectorPermissionNotifier,
     PermissionBroker,
     PermissionRegistry,
 )
+from .core.scheduler import JobScheduler
 from .core.session_manager import SessionManager
 from .core.session_maps import SessionMaps
 
@@ -257,6 +259,8 @@ class GatewayService:
         self._maps = SessionMaps()
         # Expiry background task handle
         self._expiry_task: asyncio.Task | None = None
+        # Scheduler task handle
+        self._scheduler_task: asyncio.Task | None = None
 
         # Build agents — runtime manager handles backend + broker lifecycle
         agents: dict[str, AgentBackend] = {
@@ -286,7 +290,20 @@ class GatewayService:
                 ConnectorEntry(name=cc.name, connector=connector, session_manager=sm)
             )
 
-        self._control = ControlServer(self._entries)
+        # Build JobStore + JobScheduler
+        self._job_store = JobStore()
+        session_managers = {e.name: e.session_manager for e in self._entries}
+        self._job_scheduler = JobScheduler(
+            store=self._job_store,
+            session_managers=session_managers,
+            completed_job_ttl_days=config.scheduler.completed_job_ttl_days,
+        )
+
+        self._control = ControlServer(
+            self._entries,
+            job_store=self._job_store,
+            default_timezone=config.scheduler.default_timezone,
+        )
 
     async def run(self, startup_fd: int = -1) -> None:
         """Connect all connectors, start unified control socket, block until cancelled.
@@ -333,6 +350,16 @@ class GatewayService:
             )
             for errs in sm_error_lists:
                 startup_errors.extend(errs)
+
+            # Load persisted jobs and start the job scheduler AFTER connectors are
+            # connected and watchers are up.  Starting it before run_once() would
+            # cause catch-up messages to be dropped (processors not yet started).
+            if getattr(self, "_job_store", None) is not None:
+                self._job_store.load()
+                self._scheduler_task = asyncio.create_task(
+                    self._job_scheduler.run(),
+                    name="job-scheduler",
+                )
 
             await self._control.start()
             names = ", ".join(e.name for e in self._entries)
@@ -421,6 +448,17 @@ class GatewayService:
                 logger.error("Error stopping permission expiry task: %s", e)
             finally:
                 self._expiry_task = None
+        # Step 5: cancel the job scheduler task.
+        if getattr(self, "_scheduler_task", None):
+            self._scheduler_task.cancel()
+            try:
+                await self._scheduler_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error("Error stopping job scheduler task: %s", e)
+            finally:
+                self._scheduler_task = None  # type: ignore[assignment]
         logger.info("GatewayService shut down")
 
     # Control socket has been extracted to gateway.control.ControlServer.

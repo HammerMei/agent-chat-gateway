@@ -120,6 +120,77 @@ def main():
         help="Connector to send through (default: first configured connector)",
     )
 
+    # schedule (sub-subcommands)
+    schedule_p = sub.add_parser("schedule", help="Manage scheduled agent tasks")
+    schedule_sub = schedule_p.add_subparsers(dest="schedule_cmd", help="Schedule subcommands")
+
+    # schedule create
+    sched_create_p = schedule_sub.add_parser("create", help="Create a new scheduled task")
+    sched_create_p.add_argument("watcher", help="Watcher name as defined in config.yaml")
+    sched_create_p.add_argument("message", help="Message text to inject into the agent session")
+    sched_create_p.add_argument(
+        "--every",
+        default=None,
+        metavar="INTERVAL",
+        help="Recurrence interval: 30m, 1h, 6h, 1d, 1w",
+    )
+    sched_create_p.add_argument(
+        "--at",
+        default=None,
+        metavar="TIME",
+        help=(
+            "Time for the next run. With --every: time-of-day (e.g. '09:00' or 'Mon 10:00'). "
+            "Without --every: specific datetime (e.g. '2026-04-10 15:30') for a one-shot task."
+        ),
+    )
+    sched_create_p.add_argument(
+        "--times",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Number of times to run (0 = forever, default: 0)",
+    )
+    sched_create_p.add_argument(
+        "--tz",
+        default=None,
+        metavar="TIMEZONE",
+        help="IANA timezone (e.g. 'Asia/Taipei', 'America/New_York', 'UTC'). "
+             "Fallback: scheduler.default_timezone in config, then server local.",
+    )
+    sched_create_p.add_argument(
+        "--connector",
+        default=None,
+        metavar="NAME",
+        help="Connector the watcher belongs to (default: auto-detect)",
+    )
+
+    # schedule list
+    sched_list_p = schedule_sub.add_parser("list", help="List scheduled tasks")
+    sched_list_p.add_argument(
+        "--connector",
+        default=None,
+        metavar="NAME",
+        help="Filter by connector name",
+    )
+    sched_list_p.add_argument(
+        "--all",
+        action="store_true",
+        dest="include_completed",
+        help="Also show recently completed tasks (within TTL window)",
+    )
+
+    # schedule delete
+    sched_delete_p = schedule_sub.add_parser("delete", help="Delete a scheduled task")
+    sched_delete_p.add_argument("job_id", help="Job ID (e.g. acg-a3f2b1c0)")
+
+    # schedule pause
+    sched_pause_p = schedule_sub.add_parser("pause", help="Pause a scheduled task")
+    sched_pause_p.add_argument("job_id", help="Job ID")
+
+    # schedule resume
+    sched_resume_p = schedule_sub.add_parser("resume", help="Resume a paused scheduled task")
+    sched_resume_p.add_argument("job_id", help="Job ID")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -242,6 +313,9 @@ def main():
     elif args.command == "send":
         _run_send(args)
 
+    elif args.command == "schedule":
+        _run_schedule(args)
+
 
 def _run_send(args) -> None:
     """Handle the 'send' subcommand: post a message or upload a file via the control socket.
@@ -302,6 +376,268 @@ def _run_send(args) -> None:
     else:
         print(f"Error: {result.get('error')}", file=sys.stderr)
         sys.exit(1)
+
+
+def _run_schedule(args) -> None:
+    """Handle 'schedule' subcommands."""
+    if not hasattr(args, "schedule_cmd") or not args.schedule_cmd:
+        print("Usage: agent-chat-gateway schedule {create,list,delete,pause,resume}")
+        sys.exit(1)
+
+    if args.schedule_cmd == "create":
+        _run_schedule_create(args)
+    elif args.schedule_cmd == "list":
+        _run_schedule_list(args)
+    elif args.schedule_cmd == "delete":
+        _run_schedule_delete(args)
+    elif args.schedule_cmd == "pause":
+        _run_schedule_pause(args)
+    elif args.schedule_cmd == "resume":
+        _run_schedule_resume(args)
+    else:
+        print(f"Unknown schedule subcommand: {args.schedule_cmd}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _run_schedule_create(args) -> None:
+    """Handle 'schedule create': parse interval, build cron, send to daemon."""
+    try:
+        cron = _build_cron_expression(args.every, args.at)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # For one-shot tasks (--at datetime, no --every), enforce times=1 to prevent
+    # the job from re-firing every year (5-field cron has no year field).
+    times = args.times
+    if args.every is None and times == 0:
+        times = 1  # default one-shot to exactly 1 run
+
+    cmd_data: dict = {
+        "cmd": "schedule-create",
+        "watcher": args.watcher,
+        "message": args.message,
+        "cron": cron,
+        "times": times,
+    }
+    if args.tz:
+        cmd_data["timezone"] = args.tz
+    if args.connector:
+        cmd_data["connector"] = args.connector
+
+    result = _send_command(cmd_data)
+    if result["ok"]:
+        job_id = result.get("job_id", "?")
+        next_run = result.get("next_run", "?")
+        print(f"Scheduled job created: {job_id}")
+        print(f"Next run:              {next_run}")
+        if args.times == 0:
+            print(f"Recurrence:            {args.every or 'see cron: ' + cron} (forever)")
+        else:
+            print(f"Runs:                  {args.times} time(s)")
+    else:
+        print(f"Error: {result.get('error')}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _run_schedule_list(args) -> None:
+    """Handle 'schedule list': display jobs in a tabular format."""
+    import textwrap
+    from datetime import UTC, datetime
+
+    cmd_data: dict = {"cmd": "schedule-list", "include_completed": args.include_completed}
+    if args.connector:
+        cmd_data["connector"] = args.connector
+
+    result = _send_command(cmd_data)
+    if not result["ok"]:
+        print(f"Error: {result.get('error')}", file=sys.stderr)
+        sys.exit(1)
+
+    jobs = result.get("jobs", [])
+    if not jobs:
+        print("No scheduled tasks.")
+        return
+
+    # Header
+    print(
+        f"{'ID':<14}  {'WATCHER':<20}  {'STATUS':<10}  "
+        f"{'RUNS':<12}  {'NEXT RUN (UTC)':<25}  MESSAGE"
+    )
+    print("-" * 110)
+
+    for j in jobs:
+        job_id = j.get("id", "?")
+        watcher = j.get("watcher", "?")
+        status = j.get("status", "?")
+        run_count = j.get("run_count", 0)
+        times = j.get("times", 0)
+        runs_str = f"{run_count}/∞" if times == 0 else f"{run_count}/{times}"
+        next_run = j.get("next_run") or j.get("completed_at") or "-"
+        message = textwrap.shorten(j.get("message", ""), width=40, placeholder="…")
+        print(
+            f"{job_id:<14}  {watcher:<20}  {status:<10}  "
+            f"{runs_str:<12}  {next_run:<25}  {message}"
+        )
+
+
+def _run_schedule_delete(args) -> None:
+    result = _send_command({"cmd": "schedule-delete", "job_id": args.job_id})
+    if result["ok"]:
+        print(f"Scheduled job {args.job_id!r} deleted.")
+    else:
+        print(f"Error: {result.get('error')}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _run_schedule_pause(args) -> None:
+    result = _send_command({"cmd": "schedule-pause", "job_id": args.job_id})
+    if result["ok"]:
+        print(f"Scheduled job {args.job_id!r} paused.")
+    else:
+        print(f"Error: {result.get('error')}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _run_schedule_resume(args) -> None:
+    result = _send_command({"cmd": "schedule-resume", "job_id": args.job_id})
+    if result["ok"]:
+        next_run = result.get("next_run", "?")
+        print(f"Scheduled job {args.job_id!r} resumed.")
+        print(f"Next run: {next_run}")
+    else:
+        print(f"Error: {result.get('error')}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _build_cron_expression(every: str | None, at: str | None) -> str:
+    """Convert ``--every INTERVAL`` + optional ``--at TIME`` to a 5-field cron string.
+
+    Supported intervals: 30m, 1h, 6h, 12h, 1d, 1w
+    Supported --at formats (with --every):
+      - "09:00"         → set hour/minute for a daily/weekly schedule
+      - "Mon 09:00"     → set day-of-week + time for weekly schedules
+    Supported --at formats (without --every, one-shot):
+      - "2026-04-10 15:30" → specific datetime → "30 15 10 4 *"
+
+    Raises ValueError on invalid input.
+    """
+    _INTERVAL_MAP: dict[str, tuple[str, str]] = {
+        # interval_str: (default_cron, description)
+        # default_cron uses * for time fields; overridden by --at
+        "1m":  ("* * * * *",    "every minute"),
+        "5m":  ("*/5 * * * *",  "every 5 minutes"),
+        "10m": ("*/10 * * * *", "every 10 minutes"),
+        "15m": ("*/15 * * * *", "every 15 minutes"),
+        "30m": ("*/30 * * * *", "every 30 minutes"),
+        "1h":  ("0 * * * *",    "every hour"),
+        "2h":  ("0 */2 * * *",  "every 2 hours"),
+        "3h":  ("0 */3 * * *",  "every 3 hours"),
+        "6h":  ("0 */6 * * *",  "every 6 hours"),
+        "12h": ("0 */12 * * *", "every 12 hours"),
+        "1d":  ("0 9 * * *",    "every day"),     # default 09:00
+        "1w":  ("0 9 * * 1",    "every week"),    # default Monday 09:00
+    }
+
+    _DOW_MAP: dict[str, str] = {
+        "sun": "0", "mon": "1", "tue": "2", "wed": "3",
+        "thu": "4", "fri": "5", "sat": "6",
+    }
+
+    if every is None and at is None:
+        raise ValueError("Specify --every INTERVAL and/or --at TIME. See --help for details.")
+
+    if every is None:
+        # One-shot: --at "2026-04-10 15:30"
+        if not at:
+            raise ValueError("--at requires a datetime value when --every is not specified.")
+        return _parse_one_shot_at(at)
+
+    # Recurring: --every INTERVAL [--at TIME]
+    every_lower = every.strip().lower()
+    if every_lower not in _INTERVAL_MAP:
+        supported = ", ".join(sorted(_INTERVAL_MAP))
+        raise ValueError(
+            f"Unsupported interval {every!r}. Supported: {supported}"
+        )
+
+    default_cron, _ = _INTERVAL_MAP[every_lower]
+
+    if at is None:
+        return default_cron
+
+    # Apply --at override to the default cron
+    at_stripped = at.strip()
+    parts = default_cron.split()  # [minute, hour, dom, month, dow]
+
+    # Check for "Mon 09:00" style (weekly with day override)
+    at_parts = at_stripped.split()
+    if len(at_parts) == 2:
+        day_str, time_str = at_parts
+        dow = _DOW_MAP.get(day_str.lower())
+        if dow is None:
+            raise ValueError(
+                f"Unknown day of week {day_str!r}. Use: Mon, Tue, Wed, Thu, Fri, Sat, Sun."
+            )
+        h, m = _parse_hhmm(time_str)
+        if every_lower != "1w":
+            raise ValueError("Day-of-week syntax (e.g. 'Mon 09:00') is only valid with --every 1w")
+        return f"{m} {h} * * {dow}"
+
+    # Plain "HH:MM" time override
+    h, m = _parse_hhmm(at_stripped)
+    if every_lower in ("30m", "1m", "5m", "10m", "15m"):
+        raise ValueError(f"--at HH:MM is not applicable with --every {every} (sub-hourly interval)")
+    if every_lower in ("1h", "2h", "3h", "6h", "12h"):
+        # For sub-daily intervals, only the minute component of --at applies.
+        # The hour is silently discarded since these jobs fire every N hours
+        # regardless of starting hour.  Warn the user if they specified a non-zero hour.
+        if h != 0:
+            print(
+                f"Warning: --at {at_stripped!r} with --every {every}: "
+                f"the hour ({h:02d}) is ignored for sub-daily intervals. "
+                f"Only the minute :{m:02d} is applied.",
+                file=sys.stderr,
+            )
+        parts[0] = str(m)
+        return " ".join(parts)
+    # Daily / weekly: set hour and minute
+    parts[0] = str(m)
+    parts[1] = str(h)
+    return " ".join(parts)
+
+
+def _parse_one_shot_at(at: str) -> str:
+    """Parse a 'YYYY-MM-DD HH:MM' string into a one-shot cron expression."""
+    from datetime import datetime
+    formats = ["%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y/%m/%d %H:%M"]
+    dt = None
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(at.strip(), fmt)
+            break
+        except ValueError:
+            continue
+    if dt is None:
+        raise ValueError(
+            f"Cannot parse --at value {at!r}. "
+            "Expected format: 'YYYY-MM-DD HH:MM' (e.g. '2026-04-10 15:30')."
+        )
+    return f"{dt.minute} {dt.hour} {dt.day} {dt.month} *"
+
+
+def _parse_hhmm(time_str: str) -> tuple[int, int]:
+    """Parse 'HH:MM' → (hour, minute). Raises ValueError on bad input."""
+    parts = time_str.split(":")
+    if len(parts) != 2:
+        raise ValueError(f"Expected HH:MM format, got {time_str!r}")
+    try:
+        h, m = int(parts[0]), int(parts[1])
+    except ValueError:
+        raise ValueError(f"Expected HH:MM format, got {time_str!r}")
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        raise ValueError(f"Invalid time {time_str!r}: hour must be 0-23, minute 0-59")
+    return h, m
 
 
 def _send_command(request: dict) -> dict:

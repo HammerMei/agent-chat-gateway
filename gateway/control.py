@@ -14,17 +14,43 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from . import runtime_lock
 from .runtime_lock import RUNTIME_DIR
 
 if TYPE_CHECKING:
+    from .core.job_store import JobStore
     from .service import ConnectorEntry
 
 logger = logging.getLogger("agent-chat-gateway.control")
 
 CONTROL_SOCK = RUNTIME_DIR / "control.sock"
+
+
+def _server_local_timezone() -> str:
+    """Return the IANA timezone name for the server's local timezone.
+
+    Reads the /etc/localtime symlink (standard on Linux/macOS) to extract the
+    IANA timezone name (e.g. "Asia/Taipei").  Falls back to "UTC" if the
+    symlink is absent, broken, or points to an unexpected path.
+
+    NOTE: ``datetime.now().astimezone().tzinfo`` returns a UTC-offset object
+    (str: "UTC+08:00") which is NOT a valid IANA name and would cause
+    ``zoneinfo.ZoneInfo()`` to raise ``ZoneInfoNotFoundError``.  Do NOT use
+    that approach.
+    """
+    import pathlib
+    try:
+        tz_path = pathlib.Path("/etc/localtime")
+        if tz_path.is_symlink():
+            target = str(tz_path.resolve())
+            if "zoneinfo/" in target:
+                return target.split("zoneinfo/", 1)[1]  # e.g. "Asia/Taipei"
+    except Exception:
+        pass
+    return "UTC"
 
 
 class ControlServer:
@@ -40,8 +66,15 @@ class ControlServer:
         await server.stop()
     """
 
-    def __init__(self, entries: "list[ConnectorEntry]") -> None:
+    def __init__(
+        self,
+        entries: "list[ConnectorEntry]",
+        job_store: "JobStore | None" = None,
+        default_timezone: str = "",
+    ) -> None:
         self._entries = entries
+        self._job_store = job_store
+        self._default_timezone = default_timezone
         self._server: asyncio.Server | None = None
 
     async def start(self) -> None:
@@ -206,6 +239,10 @@ class ControlServer:
         if cmd == "send":
             return await self._handle_send(request, connector_name)
 
+        # schedule-*: managed by JobStore (no connector routing needed)
+        if cmd and cmd.startswith("schedule-"):
+            return await self._handle_schedule(cmd, request)
+
         # All other commands: route to a specific entry
         entry = self._resolve_entry(connector_name)
         if isinstance(entry, dict):
@@ -236,6 +273,158 @@ class ControlServer:
                 ),
             }
         return self._entries[0]
+
+    async def _handle_schedule(self, cmd: str, request: dict) -> dict:
+        """Route schedule-* commands to the JobStore."""
+        if self._job_store is None:
+            return {"ok": False, "error": "Scheduler is not enabled (JobStore not configured)"}
+
+        if cmd == "schedule-create":
+            return self._handle_schedule_create(request)
+        if cmd == "schedule-list":
+            return self._handle_schedule_list(request)
+        if cmd == "schedule-delete":
+            return self._handle_schedule_delete(request)
+        if cmd == "schedule-pause":
+            return self._handle_schedule_pause(request)
+        if cmd == "schedule-resume":
+            return self._handle_schedule_resume(request)
+        return {"ok": False, "error": f"Unknown schedule command: {cmd!r}"}
+
+    def _handle_schedule_create(self, request: dict) -> dict:
+        from datetime import UTC, datetime
+        from .core.scheduler import compute_next_run
+        from .schedule_types import ScheduledJob, JobStatus
+
+        watcher = request.get("watcher", "")
+        connector = request.get("connector", "")
+        message = request.get("message", "")
+        cron = request.get("cron", "")
+        timezone = request.get("timezone") or self._default_timezone or _server_local_timezone()
+        times = request.get("times", 0)
+
+        if not watcher:
+            return {"ok": False, "error": "Missing 'watcher' field"}
+        if not message:
+            return {"ok": False, "error": "Missing 'message' field"}
+        if not isinstance(message, str) or len(message) > 4096:
+            return {"ok": False, "error": "'message' must be a string of at most 4096 characters"}
+        if not cron:
+            return {"ok": False, "error": "Missing 'cron' field"}
+        if not isinstance(times, int) or times < 0:
+            return {"ok": False, "error": "'times' must be a non-negative integer (0 = forever)"}
+
+        # Validate cron expression
+        try:
+            from croniter import croniter  # type: ignore[import-untyped]
+            if not croniter.is_valid(cron):
+                return {"ok": False, "error": f"Invalid cron expression: {cron!r}"}
+        except Exception as e:
+            return {"ok": False, "error": f"Failed to validate cron expression: {e}"}
+
+        now = datetime.now(UTC)
+        try:
+            next_run = compute_next_run(cron, timezone, after=now)
+        except Exception as e:
+            return {"ok": False, "error": f"Failed to compute next run time: {e}"}
+
+        # Auto-detect connector from watcher if not supplied
+        if not connector:
+            connector = self._find_connector_for_watcher(watcher)
+            if not connector:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"Could not determine connector for watcher {watcher!r}. "
+                        f"Specify --connector NAME."
+                    ),
+                }
+
+        job = ScheduledJob(
+            watcher=watcher,
+            connector=connector,
+            message=message,
+            cron=cron,
+            timezone=timezone,
+            times=times,
+            status=JobStatus.ACTIVE,
+            created_at=now.isoformat(),
+            next_run=next_run,
+        )
+        try:
+            self._job_store.add(job)
+        except Exception as e:
+            return {"ok": False, "error": f"Failed to save job: {e}"}
+        return {"ok": True, "job_id": job.id, "next_run": next_run}
+
+    def _handle_schedule_list(self, request: dict) -> dict:
+        connector = request.get("connector")
+        include_completed = request.get("include_completed", False)
+        try:
+            jobs = self._job_store.list_jobs(connector=connector, include_completed=include_completed)
+            return {"ok": True, "jobs": [j.to_dict() for j in jobs]}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def _handle_schedule_delete(self, request: dict) -> dict:
+        job_id = request.get("job_id", "")
+        if not job_id:
+            return {"ok": False, "error": "Missing 'job_id' field"}
+        removed = self._job_store.remove(job_id)
+        if not removed:
+            return {"ok": False, "error": f"Job {job_id!r} not found"}
+        return {"ok": True}
+
+    def _handle_schedule_pause(self, request: dict) -> dict:
+        from .schedule_types import JobStatus
+        job_id = request.get("job_id", "")
+        if not job_id:
+            return {"ok": False, "error": "Missing 'job_id' field"}
+        job = self._job_store.get(job_id)
+        if not job:
+            return {"ok": False, "error": f"Job {job_id!r} not found"}
+        if job.status == JobStatus.COMPLETED:
+            return {"ok": False, "error": f"Job {job_id!r} is already completed"}
+        job.status = JobStatus.PAUSED
+        try:
+            self._job_store.update(job)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True}
+
+    def _handle_schedule_resume(self, request: dict) -> dict:
+        from datetime import UTC, datetime
+        from .core.scheduler import compute_next_run
+        from .schedule_types import JobStatus
+        job_id = request.get("job_id", "")
+        if not job_id:
+            return {"ok": False, "error": "Missing 'job_id' field"}
+        job = self._job_store.get(job_id)
+        if not job:
+            return {"ok": False, "error": f"Job {job_id!r} not found"}
+        if job.status == JobStatus.COMPLETED:
+            return {"ok": False, "error": f"Job {job_id!r} is already completed and cannot be resumed"}
+        job.status = JobStatus.ACTIVE
+        # Recompute next_run from now in case we paused for a while
+        try:
+            job.next_run = compute_next_run(job.cron, job.timezone, after=datetime.now(UTC))
+            self._job_store.update(job)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "next_run": job.next_run}
+
+    def _find_connector_for_watcher(self, watcher_name: str) -> str:
+        """Find the connector name for a watcher by searching all entries."""
+        for entry in self._entries:
+            sm = entry.session_manager
+            # Check running watcher state first (watcher is active)
+            if sm.get_watcher_state(watcher_name) is not None:
+                return entry.name
+        # Fallback: check watcher configs (watcher defined but may be paused/stopped)
+        for entry in self._entries:
+            if entry.session_manager.get_watcher_config(watcher_name) is not None:
+                return entry.name
+        return ""
 
     async def _handle_send(self, request: dict, connector_name: str | None) -> dict:
         """Handle the 'send' command: route to a connector's send_to_room method."""
