@@ -382,6 +382,9 @@ class TestScheduleCreate(_ScheduleCLITestBase):
         */5 * * * * fires at the next :05/:10/… boundary (could be 0–5 min away),
         not exactly 5 minutes from now.  The fix computes now + 5m and generates a
         specific datetime cron so the job fires at the correct time.
+
+        Also verifies that arbitrary non-cron-aligned intervals (7m, 23m, 90m) are
+        accepted for one-shot jobs.
         """
         import re
         from datetime import UTC, datetime, timedelta
@@ -439,6 +442,60 @@ class TestScheduleCreate(_ScheduleCLITestBase):
             fire_dt, window_high,
             f"Fire time {fire_dt} is more than 1m too late (expected <= {window_high})",
         )
+
+    def test_create_one_shot_arbitrary_interval_7m(self):
+        """--every 7m --times 1 is accepted and produces a specific datetime cron.
+
+        7m is not in _INTERVAL_MAP (not cron-aligned), but is valid for one-shot
+        jobs since we compute now+7m directly.
+        """
+        import re
+        from datetime import UTC, datetime, timedelta
+
+        received: list[dict] = []
+
+        def _capture(req):
+            received.append(req)
+            return {
+                "ok": True,
+                "job_id": "acg-7m000001",
+                "next_run": "2026-04-09T07:49:00+00:00",
+            }
+
+        self._start_daemon({"schedule-create": _capture})
+
+        before = datetime.now(UTC)
+        _, _, code = self._run([
+            "schedule", "create", "e2e-dm",
+            "Remind me in 7 minutes",
+            "--every", "7m",
+            "--times", "1",
+        ])
+        after = datetime.now(UTC)
+
+        self.assertEqual(code, 0, "7m one-shot job should be accepted")
+        self.assertEqual(len(received), 1)
+
+        cron = received[0]["cron"]
+        m = re.fullmatch(r"(\d+) (\d+) (\d+) (\d+) \*", cron)
+        self.assertIsNotNone(m, f"Expected specific datetime cron, got: {cron!r}")
+
+        minute, hour, day, month = int(m[1]), int(m[2]), int(m[3]), int(m[4])
+        fire_dt = datetime(before.year, month, day, hour, minute, tzinfo=UTC)
+        self.assertGreaterEqual(fire_dt, before + timedelta(minutes=6))
+        self.assertLessEqual(fire_dt, after + timedelta(minutes=8))
+
+    def test_create_recurring_arbitrary_interval_rejected(self):
+        """--every 7m without --times 1 is rejected (not cron-aligned for recurring)."""
+        # No daemon needed — validation fires before the socket call.
+        _, stderr, code = self._run([
+            "schedule", "create", "e2e-dm",
+            "Every 7 minutes",
+            "--every", "7m",
+            # no --times 1 → recurring job
+        ])
+        self.assertEqual(code, 1, "Non-cron-aligned interval for recurring job should fail")
+        self.assertIn("Unsupported interval", stderr)
 
 
 # ---------------------------------------------------------------------------

@@ -401,31 +401,34 @@ def _run_schedule(args) -> None:
 
 def _run_schedule_create(args) -> None:
     """Handle 'schedule create': parse interval, build cron, send to daemon."""
-    try:
-        cron = _build_cron_expression(args.every, args.at)
-    except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
-
     # For one-shot tasks (--at datetime, no --every), enforce times=1 to prevent
     # the job from re-firing every year (5-field cron has no year field).
     times = args.times
     if args.every is None and times == 0:
         times = 1  # default one-shot to exactly 1 run
 
+    cron: str | None = None
+
     # ── One-shot relative reminders: fire exactly N minutes from now ──────────
-    # When --every Nm --times 1 (no --at), the periodic cron (e.g. */5 * * * *)
-    # fires at the next cron-aligned boundary, not N minutes from now.
-    # Example: --every 5m created at 07:42 → */5 fires at 07:45 (only 3 min!).
-    # Fix: for sub-hourly one-shot jobs, compute now + interval and generate a
-    # specific one-shot datetime cron (e.g. "47 7 9 4 *") instead.
+    # For --every Nm/Nh --times 1 (no --at), accept ANY positive integer interval
+    # (e.g. 7m, 23m, 90m) and compute now + N to generate a one-shot datetime
+    # cron.  This bypasses _INTERVAL_MAP — arbitrary durations are valid here
+    # because we're not building a recurring cron pattern (*/7 is not valid cron).
     if times == 1 and args.at is None and args.every is not None:
         from datetime import UTC, datetime, timedelta
 
-        interval_minutes = _ONE_SHOT_MINUTE_INTERVALS.get(args.every.strip().lower())
+        interval_minutes = _parse_one_shot_interval(args.every)
         if interval_minutes is not None:
             target = datetime.now(UTC) + timedelta(minutes=interval_minutes)
             cron = f"{target.minute} {target.hour} {target.day} {target.month} *"
+
+    # ── Recurring or --at-based: validate against _INTERVAL_MAP ──────────────
+    if cron is None:
+        try:
+            cron = _build_cron_expression(args.every, args.at)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
 
     cmd_data: dict = {
         "cmd": "schedule-create",
@@ -537,23 +540,35 @@ def _run_schedule_resume(args) -> None:
         sys.exit(1)
 
 
-# Sub-hourly intervals that support the "exactly N minutes from now" one-shot
-# behaviour.  When --every <key> --times 1 is used without --at, the CLI
-# computes now + interval_minutes and generates a specific one-shot cron instead
-# of the periodic pattern (e.g. */5 * * * * fires at the next :05/:10/… boundary,
-# not exactly 5 minutes from now).
-_ONE_SHOT_MINUTE_INTERVALS: dict[str, int] = {
-    "1m":  1,
-    "5m":  5,
-    "10m": 10,
-    "15m": 15,
-    "30m": 30,
-    "1h":  60,
-    "2h":  120,
-    "3h":  180,
-    "6h":  360,
-    "12h": 720,
-}
+def _parse_one_shot_interval(every: str) -> int | None:
+    """Parse an arbitrary interval string for one-shot relative reminders.
+
+    Accepts any positive integer followed by ``m`` (minutes) or ``h`` (hours).
+    Returns the total number of minutes, or ``None`` if the format is not
+    a simple Nm/Nh expression (e.g. ``"1d"``, ``"1w"`` return ``None`` and
+    fall through to ``_build_cron_expression``).
+
+    Unlike ``_INTERVAL_MAP``, this accepts arbitrary values such as ``7m``,
+    ``23m``, ``90m``, ``3h`` — because we compute ``now + N`` and generate a
+    specific one-shot datetime cron, so cron-alignment is not required.
+
+    Examples::
+
+        _parse_one_shot_interval("7m")   → 7
+        _parse_one_shot_interval("23m")  → 23
+        _parse_one_shot_interval("90m")  → 90
+        _parse_one_shot_interval("2h")   → 120
+        _parse_one_shot_interval("1d")   → None  (falls through to _INTERVAL_MAP)
+        _parse_one_shot_interval("bad")  → None
+    """
+    import re as _re
+    m = _re.fullmatch(r"(\d+)(m|h)", every.strip().lower())
+    if not m:
+        return None
+    value, unit = int(m.group(1)), m.group(2)
+    if value <= 0:
+        return None
+    return value if unit == "m" else value * 60
 
 # Interval → (default_cron, description).  default_cron uses * for unset fields;
 # --at overrides the time components.  Defined at module level (not inside the

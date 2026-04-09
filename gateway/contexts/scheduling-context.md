@@ -9,7 +9,7 @@ agent-chat-gateway schedule create <watcher> "<message>" [OPTIONS]
 ```
 
 **Options:**
-- `--every INTERVAL` — Recurrence interval: `1m`, `5m`, `10m`, `15m`, `30m`, `1h`, `2h`, `3h`, `6h`, `12h`, `1d`, `1w`
+- `--every INTERVAL` — Recurrence interval. For **one-shot jobs** (`--times 1`): any `Nm` or `Nh` value works (e.g. `7m`, `23m`, `90m`, `3h`). For **recurring jobs** (`--times 0` or omitted): use a cron-aligned value: `1m`, `5m`, `10m`, `15m`, `30m`, `1h`, `2h`, `3h`, `6h`, `12h`, `1d`, `1w`.
 - `--at TIME` — Time override. With `--every`: set hour/minute (e.g. `09:00` or `Mon 09:00`). Without `--every`: specific datetime for a one-shot task (e.g. `2026-04-10 15:30`).
 - `--times N` — Number of runs. `0` = forever (default). `N` = stop after N runs.
 - `--tz TIMEZONE` — IANA timezone (e.g. `America/New_York`, `Europe/Berlin`, `UTC`). Only relevant for daily/weekly jobs anchored to a specific local time — **omit for sub-hourly intervals** (`1m`–`12h`), which fire on a fixed cadence regardless of timezone.
@@ -78,10 +78,12 @@ When the user asks for a reminder "in N minutes" or "in N hours", **always** use
 **Never** use shell command substitution like `$(date ...)` in `--at` — it is not needed and causes permission errors.
 
 ```bash
-# ✅ CORRECT — "remind me in 3 minutes"
+# ✅ CORRECT — any number of minutes works for one-shot reminders
 agent-chat-gateway schedule create <watcher> "<message>" --every 3m --times 1
+agent-chat-gateway schedule create <watcher> "<message>" --every 7m --times 1
+agent-chat-gateway schedule create <watcher> "<message>" --every 23m --times 1
 
-# ✅ CORRECT — "remind me in 2 hours"
+# ✅ CORRECT — hours also work
 agent-chat-gateway schedule create <watcher> "<message>" --every 2h --times 1
 
 # ❌ WRONG — never do this
