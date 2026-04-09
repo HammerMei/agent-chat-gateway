@@ -375,6 +375,71 @@ class TestScheduleCreate(_ScheduleCLITestBase):
                     self._daemon.stop()
                     self._daemon = None
 
+    def test_create_one_shot_relative_uses_exact_datetime_cron(self):
+        """--every 5m --times 1 → one-shot cron (MM HH DD MM *), NOT */5 * * * *.
+
+        Regression test for the "fires too early" bug:
+        */5 * * * * fires at the next :05/:10/… boundary (could be 0–5 min away),
+        not exactly 5 minutes from now.  The fix computes now + 5m and generates a
+        specific datetime cron so the job fires at the correct time.
+        """
+        import re
+        from datetime import UTC, datetime, timedelta
+
+        received: list[dict] = []
+
+        def _capture(req):
+            received.append(req)
+            return {
+                "ok": True,
+                "job_id": "acg-oneshot01",
+                "next_run": "2026-04-09T07:47:00+00:00",
+            }
+
+        self._start_daemon({"schedule-create": _capture})
+
+        before = datetime.now(UTC)
+        _, _, code = self._run([
+            "schedule", "create", "e2e-dm",
+            "Remind me in 5 minutes",
+            "--every", "5m",
+            "--times", "1",
+        ])
+        after = datetime.now(UTC)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(received), 1)
+
+        cron = received[0]["cron"]
+
+        # Must NOT be the periodic pattern
+        self.assertNotEqual(
+            cron,
+            "*/5 * * * *",
+            "One-shot job must not use periodic cron */5 * * * *",
+        )
+
+        # Must be a 5-field specific datetime cron: M H D Mo *
+        m = re.fullmatch(r"(\d+) (\d+) (\d+) (\d+) \*", cron)
+        self.assertIsNotNone(m, f"Expected datetime cron 'M H D Mo *', got: {cron!r}")
+
+        # Parse and verify the fire time is approximately now + 5 minutes.
+        # Cron has 1-minute granularity (seconds are truncated), so we allow
+        # a ±1-minute window: fire must be in [now+4m, now+6m].
+        minute, hour, day, month = int(m[1]), int(m[2]), int(m[3]), int(m[4])
+        year = before.year
+        fire_dt = datetime(year, month, day, hour, minute, tzinfo=UTC)
+        window_low = before + timedelta(minutes=4)
+        window_high = after + timedelta(minutes=6)
+        self.assertGreaterEqual(
+            fire_dt, window_low,
+            f"Fire time {fire_dt} is more than 1m too early (expected >= {window_low})",
+        )
+        self.assertLessEqual(
+            fire_dt, window_high,
+            f"Fire time {fire_dt} is more than 1m too late (expected <= {window_high})",
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests: schedule list

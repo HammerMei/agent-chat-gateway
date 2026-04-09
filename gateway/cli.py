@@ -413,6 +413,20 @@ def _run_schedule_create(args) -> None:
     if args.every is None and times == 0:
         times = 1  # default one-shot to exactly 1 run
 
+    # ── One-shot relative reminders: fire exactly N minutes from now ──────────
+    # When --every Nm --times 1 (no --at), the periodic cron (e.g. */5 * * * *)
+    # fires at the next cron-aligned boundary, not N minutes from now.
+    # Example: --every 5m created at 07:42 → */5 fires at 07:45 (only 3 min!).
+    # Fix: for sub-hourly one-shot jobs, compute now + interval and generate a
+    # specific one-shot datetime cron (e.g. "47 7 9 4 *") instead.
+    if times == 1 and args.at is None and args.every is not None:
+        from datetime import UTC, datetime, timedelta
+
+        interval_minutes = _ONE_SHOT_MINUTE_INTERVALS.get(args.every.strip().lower())
+        if interval_minutes is not None:
+            target = datetime.now(UTC) + timedelta(minutes=interval_minutes)
+            cron = f"{target.minute} {target.hour} {target.day} {target.month} *"
+
     cmd_data: dict = {
         "cmd": "schedule-create",
         "watcher": args.watcher,
@@ -522,6 +536,24 @@ def _run_schedule_resume(args) -> None:
         print(f"Error: {result.get('error')}", file=sys.stderr)
         sys.exit(1)
 
+
+# Sub-hourly intervals that support the "exactly N minutes from now" one-shot
+# behaviour.  When --every <key> --times 1 is used without --at, the CLI
+# computes now + interval_minutes and generates a specific one-shot cron instead
+# of the periodic pattern (e.g. */5 * * * * fires at the next :05/:10/… boundary,
+# not exactly 5 minutes from now).
+_ONE_SHOT_MINUTE_INTERVALS: dict[str, int] = {
+    "1m":  1,
+    "5m":  5,
+    "10m": 10,
+    "15m": 15,
+    "30m": 30,
+    "1h":  60,
+    "2h":  120,
+    "3h":  180,
+    "6h":  360,
+    "12h": 720,
+}
 
 # Interval → (default_cron, description).  default_cron uses * for unset fields;
 # --at overrides the time components.  Defined at module level (not inside the
