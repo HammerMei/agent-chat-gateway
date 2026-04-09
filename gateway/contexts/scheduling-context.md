@@ -9,7 +9,7 @@ agent-chat-gateway schedule create <watcher> "<message>" [OPTIONS]
 ```
 
 **Options:**
-- `--every INTERVAL` — Recurrence interval. For **one-shot jobs** (`--times 1`): any `Nm` or `Nh` value works (e.g. `7m`, `23m`, `90m`, `3h`). For **recurring jobs** (`--times 0` or omitted): use a cron-aligned value: `1m`, `5m`, `10m`, `15m`, `30m`, `1h`, `2h`, `3h`, `6h`, `12h`, `1d`, `1w`.
+- `--every INTERVAL` — Recurrence interval. Accepts any `Nm` (1–59 minutes) or `Nh` (1–23 hours), plus `1d` and `1w`. Examples: `2m`, `7m`, `30m`, `3h`, `1d`, `1w`.
 - `--at TIME` — Time override. With `--every`: set hour/minute (e.g. `09:00` or `Mon 09:00`). Without `--every`: specific datetime for a one-shot task (e.g. `2026-04-10 15:30`).
 - `--times N` — Number of runs. `0` = forever (default). `N` = stop after N runs.
 - `--tz TIMEZONE` — IANA timezone (e.g. `America/New_York`, `Europe/Berlin`, `UTC`). Only relevant for daily/weekly jobs anchored to a specific local time — **omit for sub-hourly intervals** (`1m`–`12h`), which fire on a fixed cadence regardless of timezone.

@@ -497,17 +497,21 @@ class TestScheduleCreate(_ScheduleCLITestBase):
         # Timezone must be UTC to prevent local-tz double-apply.
         self.assertEqual(received[0].get("timezone"), "UTC")
 
-    def test_create_recurring_arbitrary_interval_rejected(self):
-        """--every 7m without --times 1 is rejected (not cron-aligned for recurring)."""
-        # No daemon needed — validation fires before the socket call.
-        _, stderr, code = self._run([
-            "schedule", "create", "e2e-dm",
-            "Every 7 minutes",
-            "--every", "7m",
-            # no --times 1 → recurring job
-        ])
-        self.assertEqual(code, 1, "Non-cron-aligned interval for recurring job should fail")
-        self.assertIn("Unsupported interval", stderr)
+    def test_create_recurring_out_of_range_interval_rejected(self):
+        """Out-of-range intervals are rejected for recurring jobs."""
+        # 60m is out of range (1–59 only); 0m is also invalid.
+        for bad_interval in ("60m", "0m", "24h", "bad"):
+            with self.subTest(interval=bad_interval):
+                _, stderr, code = self._run([
+                    "schedule", "create", "e2e-dm",
+                    "Invalid interval",
+                    "--every", bad_interval,
+                ])
+                self.assertEqual(code, 1, f"--every {bad_interval} should fail")
+                self.assertTrue(
+                    len(stderr) > 0,
+                    f"Expected an error message for --every {bad_interval}",
+                )
 
 
 # ---------------------------------------------------------------------------

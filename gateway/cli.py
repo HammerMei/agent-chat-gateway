@@ -609,7 +609,11 @@ _DOW_MAP: dict[str, str] = {
 def _build_cron_expression(every: str | None, at: str | None) -> str:
     """Convert ``--every INTERVAL`` + optional ``--at TIME`` to a 5-field cron string.
 
-    Supported intervals: 30m, 1h, 6h, 12h, 1d, 1w
+    Supported intervals:
+      - Any ``Nm`` (1 ≤ N ≤ 59): ``*/N * * * *``  e.g. ``2m`` → ``*/2 * * * *``
+      - Any ``Nh`` (1 ≤ N ≤ 23): ``0 */N * * *``  e.g. ``3h`` → ``0 */3 * * *``
+      - Named: ``1d``, ``1w`` (with optional ``--at`` for time/day anchoring)
+
     Supported --at formats (with --every):
       - "09:00"         → set hour/minute for a daily/weekly schedule
       - "Mon 09:00"     → set day-of-week + time for weekly schedules
@@ -618,6 +622,8 @@ def _build_cron_expression(every: str | None, at: str | None) -> str:
 
     Raises ValueError on invalid input.
     """
+    import re as _re
+
     if every is None and at is None:
         raise ValueError("Specify --every INTERVAL and/or --at TIME. See --help for details.")
 
@@ -629,16 +635,39 @@ def _build_cron_expression(every: str | None, at: str | None) -> str:
 
     # Recurring: --every INTERVAL [--at TIME]
     every_lower = every.strip().lower()
-    if every_lower not in _INTERVAL_MAP:
-        supported = ", ".join(sorted(_INTERVAL_MAP))
+
+    # ── Named intervals (daily / weekly with --at support) ────────────────────
+    if every_lower in _INTERVAL_MAP:
+        default_cron, _ = _INTERVAL_MAP[every_lower]
+        if at is None:
+            return default_cron
+        # fall through to --at override logic below
+
+    # ── Arbitrary Nm / Nh (any positive integer) ──────────────────────────────
+    elif _m := _re.fullmatch(r"(\d+)(m|h)", every_lower):
+        n, unit = int(_m.group(1)), _m.group(2)
+        if unit == "m":
+            if not 1 <= n <= 59:
+                raise ValueError(
+                    f"Minute interval must be between 1 and 59 (got {n}m)."
+                )
+            default_cron = f"*/{n} * * * *" if n > 1 else "* * * * *"
+        else:  # hours
+            if not 1 <= n <= 23:
+                raise ValueError(
+                    f"Hour interval must be between 1 and 23 (got {n}h)."
+                )
+            default_cron = f"0 */{n} * * *" if n > 1 else "0 * * * *"
+
+        if at is None:
+            return default_cron
+        # with --at override, fall through (sub-hourly + --at is unusual but allowed)
+
+    else:
         raise ValueError(
-            f"Unsupported interval {every!r}. Supported: {supported}"
+            f"Unsupported interval {every!r}. Use Nm (e.g. 2m, 15m), Nh (e.g. 1h, 6h), "
+            f"or 1d / 1w for daily/weekly."
         )
-
-    default_cron, _ = _INTERVAL_MAP[every_lower]
-
-    if at is None:
-        return default_cron
 
     # Apply --at override to the default cron
     at_stripped = at.strip()
@@ -654,15 +683,22 @@ def _build_cron_expression(every: str | None, at: str | None) -> str:
                 f"Unknown day of week {day_str!r}. Use: Mon, Tue, Wed, Thu, Fri, Sat, Sun."
             )
         h, m = _parse_hhmm(time_str)
-        if every_lower != "1w":
+        if every_lower not in ("1w",):
             raise ValueError("Day-of-week syntax (e.g. 'Mon 09:00') is only valid with --every 1w")
         return f"{m} {h} * * {dow}"
 
     # Plain "HH:MM" time override
     h, m = _parse_hhmm(at_stripped)
-    if every_lower in ("30m", "1m", "5m", "10m", "15m"):
-        raise ValueError(f"--at HH:MM is not applicable with --every {every} (sub-hourly interval)")
-    if every_lower in ("1h", "2h", "3h", "6h", "12h"):
+    # Classify the interval for --at semantics:
+    #   sub-hourly (Nm): --at HH:MM makes no sense → reject
+    #   hourly (Nh, 1h–23h): only minute part applies; hour is ignored
+    #   daily/weekly: full HH:MM applies
+    _at_m = _re.fullmatch(r"(\d+)(m|h)", every_lower)
+    if _at_m and _at_m.group(2) == "m":
+        raise ValueError(
+            f"--at HH:MM is not applicable with --every {every} (sub-hourly interval)"
+        )
+    if _at_m and _at_m.group(2) == "h":
         # For sub-daily intervals, only the minute component of --at applies.
         # The hour is silently discarded since these jobs fire every N hours
         # regardless of starting hour.  Warn the user if they specified a non-zero hour.
