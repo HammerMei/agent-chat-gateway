@@ -430,6 +430,160 @@ class TestBuildCronExpression(unittest.TestCase):
         self.assertEqual(_parse_hhmm("23:59"), (23, 59))
         self.assertEqual(_parse_hhmm("00:00"), (0, 0))
 
+    # ── Boundary cron values ──────────────────────────────────────────────────
+
+    def test_arbitrary_2m_recurring(self):
+        """2m (not in _INTERVAL_MAP, but valid 1-59 range) → */2 * * * *."""
+        self.assertEqual(self._build("2m"), "*/2 * * * *")
+
+    def test_arbitrary_59m_recurring(self):
+        """59m is the upper boundary for sub-hourly intervals → */59 * * * *."""
+        self.assertEqual(self._build("59m"), "*/59 * * * *")
+
+    def test_arbitrary_23h_recurring(self):
+        """23h is the upper boundary for hourly intervals → 0 */23 * * *."""
+        self.assertEqual(self._build("23h"), "0 */23 * * *")
+
+    def test_arbitrary_7h_recurring(self):
+        """7h (not in _INTERVAL_MAP) → 0 */7 * * *."""
+        self.assertEqual(self._build("7h"), "0 */7 * * *")
+
+    def test_60m_raises(self):
+        """60m exceeds the 1-59 minute range → ValueError."""
+        with self.assertRaises(ValueError):
+            self._build("60m")
+
+    def test_0h_raises(self):
+        """0h is below the 1-23 hour range → ValueError."""
+        with self.assertRaises(ValueError):
+            self._build("0h")
+
+    def test_24h_raises(self):
+        """24h exceeds the 1-23 hour range → ValueError."""
+        with self.assertRaises(ValueError):
+            self._build("24h")
+
+    # ── Daily/weekly --at boundary times ─────────────────────────────────────
+
+    def test_daily_at_midnight(self):
+        """1d + 00:00 → '0 0 * * *'."""
+        self.assertEqual(self._build("1d", "00:00"), "0 0 * * *")
+
+    def test_daily_at_end_of_day(self):
+        """1d + 23:59 → '59 23 * * *'."""
+        self.assertEqual(self._build("1d", "23:59"), "59 23 * * *")
+
+    def test_weekly_plain_hhmm_preserves_monday_dow(self):
+        """1w + '15:00' (no DOW token) preserves the default DOW=1 (Monday)."""
+        result = self._build("1w", "15:00")
+        self.assertEqual(result, "0 15 * * 1")
+
+    # ── --at with hourly interval: non-zero hour triggers warning ─────────────
+
+    def test_hourly_at_nonzero_hour_emits_warning(self):
+        """1h + '09:00' discards the hour with a warning; minute stays 0."""
+        import io
+        from contextlib import redirect_stderr
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            result = self._build("1h", "09:00")
+        self.assertIn("ignored", buf.getvalue())
+        self.assertEqual(result, "0 * * * *")
+
+    def test_6h_at_nonzero_hour_only_applies_minute(self):
+        """6h + '03:45' discards hour=3, applies only minute=45."""
+        import io
+        from contextlib import redirect_stderr
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            result = self._build("6h", "03:45")
+        parts = result.split()
+        self.assertEqual(parts[0], "45")   # minute applied
+        self.assertEqual(parts[1], "*/6")  # hour unchanged
+        self.assertIn("ignored", buf.getvalue())
+
+    # ── One-shot --at past-date emits warning but succeeds ────────────────────
+
+    def test_one_shot_past_date_warns_but_returns_cron(self):
+        """A past --at datetime emits a warning but still returns a valid cron."""
+        import io
+        from contextlib import redirect_stderr
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            result = self._build(at="2000-01-01 09:00")
+        self.assertIn("past", buf.getvalue().lower())
+        self.assertEqual(result, "0 9 1 1 *")
+
+    def test_one_shot_boundary_dec31(self):
+        """Boundary one-shot date Dec 31 23:59 → '59 23 31 12 *'."""
+        import io
+        from contextlib import redirect_stderr
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            result = self._build(at="2099-12-31 23:59")
+        self.assertEqual(result, "59 23 31 12 *")
+
+
+# ── Tests: _parse_one_shot_interval ──────────────────────────────────────────
+
+
+class TestParseOneShotInterval(unittest.TestCase):
+    """Tests for _parse_one_shot_interval (arbitrary Nm/Nh for one-shot reminders)."""
+
+    def _parse(self, s: str):
+        from gateway.cli import _parse_one_shot_interval
+        return _parse_one_shot_interval(s)
+
+    def test_1m_returns_1(self):
+        self.assertEqual(self._parse("1m"), 1)
+
+    def test_7m_returns_7(self):
+        self.assertEqual(self._parse("7m"), 7)
+
+    def test_59m_returns_59(self):
+        self.assertEqual(self._parse("59m"), 59)
+
+    def test_90m_returns_90(self):
+        """Values above 59 are allowed for one-shot: 90m = 90 minutes from now."""
+        self.assertEqual(self._parse("90m"), 90)
+
+    def test_2h_returns_120(self):
+        """2h → 120 minutes."""
+        self.assertEqual(self._parse("2h"), 120)
+
+    def test_1h_returns_60(self):
+        self.assertEqual(self._parse("1h"), 60)
+
+    def test_0m_returns_none(self):
+        """0m is not a valid positive interval → None (falls through to _build)."""
+        self.assertIsNone(self._parse("0m"))
+
+    def test_1d_returns_none(self):
+        """1d is not an Nm/Nh expression → None (falls through to _INTERVAL_MAP)."""
+        self.assertIsNone(self._parse("1d"))
+
+    def test_1w_returns_none(self):
+        """1w is not an Nm/Nh expression → None."""
+        self.assertIsNone(self._parse("1w"))
+
+    def test_bad_string_returns_none(self):
+        """Non-matching garbage → None."""
+        self.assertIsNone(self._parse("bad"))
+
+    def test_empty_string_returns_none(self):
+        self.assertIsNone(self._parse(""))
+
+    def test_case_insensitive_uppercase_M(self):
+        """Uppercase M is accepted (input is lowercased before parsing)."""
+        self.assertEqual(self._parse("5M"), 5)
+
+    def test_case_insensitive_uppercase_H(self):
+        self.assertEqual(self._parse("2H"), 120)
+
+    def test_with_leading_whitespace(self):
+        """strip() normalizes surrounding whitespace before parsing."""
+        self.assertEqual(self._parse("  5m  "), 5)
+
 
 if __name__ == "__main__":
     unittest.main()
