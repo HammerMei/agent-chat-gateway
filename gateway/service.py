@@ -54,7 +54,7 @@ def _build_agent_backend(agent_cfg: AgentConfig) -> AgentBackend:
         )
     broker_config = (
         GatewayBrokerConfig(
-            owner_allowed_tools=agent_cfg.owner_allowed_tools,
+            owner_allowed_tools=agent_cfg.effective_owner_allowed_tools(),
             guest_allowed_tools=agent_cfg.guest_allowed_tools,
             timeout=agent_cfg.permissions.timeout,
             skip_owner_approval=agent_cfg.permissions.skip_owner_approval,
@@ -410,9 +410,11 @@ class GatewayService:
              (pause/resume/reset) can arrive while session managers are
              tearing down.  A command reaching an already-shut-down
              WatcherLifecycle would produce confusing errors.
-          2. Shut down session managers (drain processors, cancel permissions).
-          3. Stop agent runtime (brokers, backends).
-          4. Cancel the permission expiry task.
+          2. Cancel the job scheduler BEFORE session managers shut down so
+             that an in-progress fire cannot race a draining queue.
+          3. Shut down session managers (drain processors, cancel permissions).
+          4. Stop agent runtime (brokers, backends).
+          5. Cancel the permission expiry task.
         """
         logger.info("GatewayService shutting down")
         # Step 1: close the control socket so no new commands arrive during teardown.
@@ -420,7 +422,20 @@ class GatewayService:
             await self._control.stop()
         except Exception as e:
             logger.error("Error stopping control server: %s", e)
-        # Step 2: shut down session managers.
+        # Step 2: cancel the job scheduler before session managers stop.
+        # This prevents a scheduler tick from trying to inject into a processor
+        # that is in the middle of draining its queue.
+        if getattr(self, "_scheduler_task", None):
+            self._scheduler_task.cancel()
+            try:
+                await self._scheduler_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error("Error stopping job scheduler task: %s", e)
+            finally:
+                self._scheduler_task = None  # type: ignore[assignment]
+        # Step 3: shut down session managers.
         sm_results = await asyncio.gather(
             *[e.session_manager.shutdown() for e in self._entries],
             return_exceptions=True,
@@ -432,12 +447,12 @@ class GatewayService:
                     entry.name,
                     result,
                 )
-        # Step 3: stop agent runtime (brokers, backends).
+        # Step 4: stop agent runtime (brokers, backends).
         try:
             await self._runtime_manager.stop_all()
         except Exception as e:
             logger.error("Error stopping agent runtime manager: %s", e)
-        # Step 4: cancel the permission expiry task.
+        # Step 5: cancel the permission expiry task.
         if self._expiry_task:
             self._expiry_task.cancel()
             try:
@@ -448,17 +463,6 @@ class GatewayService:
                 logger.error("Error stopping permission expiry task: %s", e)
             finally:
                 self._expiry_task = None
-        # Step 5: cancel the job scheduler task.
-        if getattr(self, "_scheduler_task", None):
-            self._scheduler_task.cancel()
-            try:
-                await self._scheduler_task
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                logger.error("Error stopping job scheduler task: %s", e)
-            finally:
-                self._scheduler_task = None  # type: ignore[assignment]
         logger.info("GatewayService shut down")
 
     # Control socket has been extracted to gateway.control.ControlServer.

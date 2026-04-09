@@ -6,9 +6,12 @@ the CLI, and the control socket command handlers.
 
 from __future__ import annotations
 
+import logging
 import secrets
 from dataclasses import dataclass, field
 from enum import Enum
+
+logger = logging.getLogger("agent-chat-gateway.schedule_types")
 
 
 class JobStatus(str, Enum):
@@ -98,8 +101,16 @@ class ScheduledJob:
     @staticmethod
     def from_dict(data: dict) -> "ScheduledJob":
         """Deserialize from a JSON-compatible dict. Unknown fields are ignored."""
+        job_id = data.get("id")
+        if not job_id:
+            job_id = _new_job_id()
+            logger.warning(
+                "ScheduledJob record missing 'id' field — assigned new id %r. "
+                "Check jobs.json for manually edited or corrupted entries.",
+                job_id,
+            )
         return ScheduledJob(
-            id=data.get("id", _new_job_id()),
+            id=job_id,
             watcher=data.get("watcher", ""),
             connector=data.get("connector", ""),
             message=data.get("message", ""),

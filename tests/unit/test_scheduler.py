@@ -108,6 +108,15 @@ class TestComputeAllMissed(unittest.TestCase):
         missed = compute_all_missed("0 9 * * *", "UTC", after, before)
         self.assertEqual(len(missed), 1)
 
+    def test_cap_prevents_oom_on_frequent_long_downtime(self):
+        """compute_all_missed must not return more than _MAX_MISSED_CATCHUP entries."""
+        from gateway.core.scheduler import _MAX_MISSED_CATCHUP
+        # Every-minute cron, 2 years of downtime → would produce >1M entries uncapped
+        after = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+        before = datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)
+        missed = compute_all_missed("* * * * *", "UTC", after, before)
+        self.assertLessEqual(len(missed), _MAX_MISSED_CATCHUP)
+
 
 class TestJobSchedulerFiring(unittest.IsolatedAsyncioTestCase):
     def _make_store_and_scheduler(self, **job_kwargs) -> tuple[JobStore, JobScheduler, ScheduledJob]:
@@ -203,6 +212,32 @@ class TestJobSchedulerFiring(unittest.IsolatedAsyncioTestCase):
         updated = store.get(job.id)
         self.assertEqual(updated.run_count, 1)  # count incremented despite failure
 
+    async def test_broken_job_does_not_block_other_jobs(self):
+        """Per-job isolation: an exception in one job must not prevent others from firing."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = JobStore(jobs_file=Path(tmp.name) / "jobs.json")
+        store.load()
+        sm = MagicMock()
+        sm.inject_message = AsyncMock(return_value=True)
+        scheduler = JobScheduler(store=store, session_managers={"rc-home": sm}, completed_job_ttl_days=7)
+
+        due_time = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
+        # A job with a bad cron expression that will raise in compute_next_run
+        bad_job = store.add(_make_job(cron="not-a-cron", next_run=due_time))
+        good_job = store.add(_make_job(cron="0 * * * *", next_run=due_time))
+
+        # Should not raise despite bad_job's broken cron
+        await scheduler._fire_due_jobs()
+
+        # The good job must have fired
+        self.assertEqual(store.get(good_job.id).run_count, 1)
+        # The bad job's run_count also increments (fire ran up to the cron error), but next_run is cleared
+        bad_updated = store.get(bad_job.id)
+        self.assertEqual(bad_updated.run_count, 1)
+        self.assertIsNone(bad_updated.next_run)
+        self.assertEqual(bad_updated.status, JobStatus.PAUSED)
+
 
 class TestJobSchedulerCatchUp(unittest.IsolatedAsyncioTestCase):
     async def test_catch_up_fires_missed_jobs(self):
@@ -213,20 +248,22 @@ class TestJobSchedulerCatchUp(unittest.IsolatedAsyncioTestCase):
         sm = MagicMock()
         sm.inject_message = AsyncMock(return_value=True)
 
-        # Daily job that should have run 2 hours ago
+        # Hourly job created 4 h ago, last fired 3 h ago, next fire was 2 h ago
+        now = datetime.now(UTC)
         job = store.add(_make_job(
             cron="0 * * * *",  # hourly
             times=0,
-            next_run=(datetime.now(UTC) - timedelta(hours=2)).isoformat(),
-            last_run=(datetime.now(UTC) - timedelta(hours=3)).isoformat(),
+            created_at=(now - timedelta(hours=4)).isoformat(),
+            next_run=(now - timedelta(hours=2)).isoformat(),
+            last_run=(now - timedelta(hours=3)).isoformat(),
         ))
 
         scheduler = JobScheduler(store=store, session_managers={"rc-home": sm}, completed_job_ttl_days=7)
         await scheduler._catch_up_missed()
 
         updated = store.get(job.id)
-        # Should have fired at least once for each missed hour
-        self.assertGreaterEqual(updated.run_count, 2)
+        # last_run = now-3h; hourly fires at (now-2h), (now-1h), now → exactly 3 missed
+        self.assertEqual(updated.run_count, 3)
 
     async def test_catch_up_one_shot_fires_once(self):
         tmp = tempfile.TemporaryDirectory()
@@ -270,6 +307,128 @@ class TestJobSchedulerPurge(unittest.IsolatedAsyncioTestCase):
         await scheduler._tick()
 
         self.assertIsNone(store.get(old_completed.id))
+
+
+# ── Tests: _build_cron_expression ────────────────────────────────────────────
+
+
+class TestBuildCronExpression(unittest.TestCase):
+    """Tests for the CLI helper _build_cron_expression and _parse_one_shot_at."""
+
+    def _build(self, every=None, at=None):
+        from gateway.cli import _build_cron_expression
+        return _build_cron_expression(every, at)
+
+    # ── No arguments ──────────────────────────────────────────────────────────
+
+    def test_no_args_raises(self):
+        with self.assertRaises(ValueError):
+            self._build()
+
+    # ── Basic intervals (no --at) ─────────────────────────────────────────────
+
+    def test_1m(self):
+        self.assertEqual(self._build("1m"), "* * * * *")
+
+    def test_5m(self):
+        self.assertEqual(self._build("5m"), "*/5 * * * *")
+
+    def test_30m(self):
+        self.assertEqual(self._build("30m"), "*/30 * * * *")
+
+    def test_1h(self):
+        self.assertEqual(self._build("1h"), "0 * * * *")
+
+    def test_6h(self):
+        self.assertEqual(self._build("6h"), "0 */6 * * *")
+
+    def test_1d(self):
+        self.assertEqual(self._build("1d"), "0 9 * * *")
+
+    def test_1w(self):
+        self.assertEqual(self._build("1w"), "0 9 * * 1")
+
+    def test_unsupported_interval_raises(self):
+        with self.assertRaises(ValueError, msg="should reject unknown interval"):
+            self._build("2d")
+
+    # ── --every + --at HH:MM ──────────────────────────────────────────────────
+
+    def test_daily_with_at_time(self):
+        self.assertEqual(self._build("1d", "14:30"), "30 14 * * *")
+
+    def test_weekly_with_at_time(self):
+        self.assertEqual(self._build("1w", "08:00"), "0 8 * * 1")
+
+    def test_hourly_with_at_minute_only(self):
+        # Sub-daily: only the minute is applied; hour is discarded
+        self.assertEqual(self._build("1h", "00:15"), "15 * * * *")
+
+    def test_sub_daily_at_non_zero_hour_still_applies_minute(self):
+        # Hour is ignored for sub-daily, but minute is still applied
+        result = self._build("6h", "02:30")
+        self.assertEqual(result.split()[0], "30")   # minute = 30
+        self.assertEqual(result.split()[1], "*/6")  # hour unchanged
+
+    def test_sub_minute_interval_rejects_at_hhmm(self):
+        with self.assertRaises(ValueError):
+            self._build("30m", "09:00")
+
+    # ── --every 1w + --at DOW HH:MM ───────────────────────────────────────────
+
+    def test_weekly_with_dow_time(self):
+        self.assertEqual(self._build("1w", "Fri 17:00"), "0 17 * * 5")
+
+    def test_weekly_dow_case_insensitive(self):
+        self.assertEqual(self._build("1w", "fri 17:00"), "0 17 * * 5")
+
+    def test_weekly_sunday(self):
+        self.assertEqual(self._build("1w", "Sun 00:00"), "0 0 * * 0")
+
+    def test_dow_syntax_only_with_1w(self):
+        with self.assertRaises(ValueError):
+            self._build("1d", "Mon 09:00")
+
+    def test_unknown_dow_raises(self):
+        with self.assertRaises(ValueError):
+            self._build("1w", "Xyz 09:00")
+
+    # ── One-shot (no --every, --at datetime) ──────────────────────────────────
+
+    def test_one_shot_at_datetime(self):
+        self.assertEqual(self._build(at="2026-04-10 15:30"), "30 15 10 4 *")
+
+    def test_one_shot_at_iso_format(self):
+        self.assertEqual(self._build(at="2026-04-10T15:30"), "30 15 10 4 *")
+
+    def test_one_shot_at_slash_format(self):
+        self.assertEqual(self._build(at="2026/04/10 15:30"), "30 15 10 4 *")
+
+    def test_one_shot_at_invalid_format_raises(self):
+        with self.assertRaises(ValueError):
+            self._build(at="not-a-date")
+
+    def test_one_shot_at_empty_raises(self):
+        with self.assertRaises(ValueError):
+            self._build(at="")
+
+    # ── _parse_hhmm edge cases ─────────────────────────────────────────────────
+
+    def test_invalid_hhmm_raises(self):
+        from gateway.cli import _parse_hhmm
+        with self.assertRaises(ValueError):
+            _parse_hhmm("25:00")  # hour out of range
+
+    def test_invalid_hhmm_no_colon_raises(self):
+        from gateway.cli import _parse_hhmm
+        with self.assertRaises(ValueError):
+            _parse_hhmm("0900")
+
+    def test_valid_hhmm(self):
+        from gateway.cli import _parse_hhmm
+        self.assertEqual(_parse_hhmm("09:05"), (9, 5))
+        self.assertEqual(_parse_hhmm("23:59"), (23, 59))
+        self.assertEqual(_parse_hhmm("00:00"), (0, 0))
 
 
 if __name__ == "__main__":

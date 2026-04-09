@@ -14,7 +14,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import datetime
 from typing import TYPE_CHECKING
 
 from . import runtime_lock
@@ -40,6 +39,10 @@ def _server_local_timezone() -> str:
     (str: "UTC+08:00") which is NOT a valid IANA name and would cause
     ``zoneinfo.ZoneInfo()`` to raise ``ZoneInfoNotFoundError``.  Do NOT use
     that approach.
+
+    Platform support: Linux and macOS only (both use ``/etc/localtime``).
+    Windows does not have ``/etc/localtime`` and will always fall back to "UTC".
+    If Windows support is ever needed, use the ``tzlocal`` package instead.
     """
     import pathlib
     try:
@@ -296,7 +299,7 @@ class ControlServer:
         from .core.scheduler import compute_next_run
         from .schedule_types import ScheduledJob, JobStatus
 
-        watcher = request.get("watcher", "")
+        watcher = (request.get("watcher") or "").strip()
         connector = request.get("connector", "")
         message = request.get("message", "")
         cron = request.get("cron", "")
@@ -305,10 +308,12 @@ class ControlServer:
 
         if not watcher:
             return {"ok": False, "error": "Missing 'watcher' field"}
+        if not isinstance(message, str):
+            return {"ok": False, "error": "'message' must be a string"}
         if not message:
             return {"ok": False, "error": "Missing 'message' field"}
-        if not isinstance(message, str) or len(message) > 4096:
-            return {"ok": False, "error": "'message' must be a string of at most 4096 characters"}
+        if len(message) > 4096:
+            return {"ok": False, "error": "'message' must be at most 4096 characters"}
         if not cron:
             return {"ok": False, "error": "Missing 'cron' field"}
         if not isinstance(times, int) or times < 0:
@@ -385,6 +390,8 @@ class ControlServer:
             return {"ok": False, "error": f"Job {job_id!r} not found"}
         if job.status == JobStatus.COMPLETED:
             return {"ok": False, "error": f"Job {job_id!r} is already completed"}
+        if job.status == JobStatus.PAUSED:
+            return {"ok": True}  # idempotent: already paused
         job.status = JobStatus.PAUSED
         try:
             self._job_store.update(job)
@@ -404,10 +411,17 @@ class ControlServer:
             return {"ok": False, "error": f"Job {job_id!r} not found"}
         if job.status == JobStatus.COMPLETED:
             return {"ok": False, "error": f"Job {job_id!r} is already completed and cannot be resumed"}
-        job.status = JobStatus.ACTIVE
-        # Recompute next_run from now in case we paused for a while
+        if job.status == JobStatus.ACTIVE:
+            return {"ok": True, "next_run": job.next_run}  # idempotent: already active
+        # Compute next_run BEFORE mutating status so that a bad cron expression
+        # leaves the job in its current (paused) state rather than half-resuming.
         try:
-            job.next_run = compute_next_run(job.cron, job.timezone, after=datetime.now(UTC))
+            next_run = compute_next_run(job.cron, job.timezone, after=datetime.now(UTC))
+        except Exception as e:
+            return {"ok": False, "error": f"Failed to compute next_run: {e}"}
+        job.status = JobStatus.ACTIVE
+        job.next_run = next_run
+        try:
             self._job_store.update(job)
         except Exception as e:
             return {"ok": False, "error": str(e)}

@@ -431,10 +431,10 @@ def _run_schedule_create(args) -> None:
         next_run = result.get("next_run", "?")
         print(f"Scheduled job created: {job_id}")
         print(f"Next run:              {next_run}")
-        if args.times == 0:
+        if times == 0:
             print(f"Recurrence:            {args.every or 'see cron: ' + cron} (forever)")
         else:
-            print(f"Runs:                  {args.times} time(s)")
+            print(f"Runs:                  {times} time(s)")
     else:
         print(f"Error: {result.get('error')}", file=sys.stderr)
         sys.exit(1)
@@ -459,25 +459,38 @@ def _run_schedule_list(args) -> None:
         print("No scheduled tasks.")
         return
 
+    def _fmt_ts(ts: str | None) -> str:
+        """Format an ISO 8601 UTC timestamp for display, stripping the +00:00 suffix."""
+        if not ts:
+            return "-"
+        # Strip trailing +00:00 / Z for readability; header already says (UTC)
+        return ts.replace("+00:00", "").replace("Z", "").replace("T", " ")
+
     # Header
     print(
         f"{'ID':<14}  {'WATCHER':<20}  {'STATUS':<10}  "
-        f"{'RUNS':<12}  {'NEXT RUN (UTC)':<25}  MESSAGE"
+        f"{'CRON':<16}  {'RUNS':<12}  {'NEXT RUN (UTC)':<22}  MESSAGE"
     )
-    print("-" * 110)
+    print("-" * 120)
 
     for j in jobs:
         job_id = j.get("id", "?")
         watcher = j.get("watcher", "?")
         status = j.get("status", "?")
+        cron = j.get("cron", "?")
         run_count = j.get("run_count", 0)
         times = j.get("times", 0)
         runs_str = f"{run_count}/∞" if times == 0 else f"{run_count}/{times}"
-        next_run = j.get("next_run") or j.get("completed_at") or "-"
+        # For completed jobs, show completed_at under a different label
+        if status == "completed":
+            raw_ts = j.get("completed_at")
+            next_run_str = f"done {_fmt_ts(raw_ts)}" if raw_ts else "done"
+        else:
+            next_run_str = _fmt_ts(j.get("next_run"))
         message = textwrap.shorten(j.get("message", ""), width=40, placeholder="…")
         print(
             f"{job_id:<14}  {watcher:<20}  {status:<10}  "
-            f"{runs_str:<12}  {next_run:<25}  {message}"
+            f"{cron:<16}  {runs_str:<12}  {next_run_str:<22}  {message}"
         )
 
 
@@ -510,6 +523,30 @@ def _run_schedule_resume(args) -> None:
         sys.exit(1)
 
 
+# Interval → (default_cron, description).  default_cron uses * for unset fields;
+# --at overrides the time components.  Defined at module level (not inside the
+# function) so the dict is not rebuilt on every call.
+_INTERVAL_MAP: dict[str, tuple[str, str]] = {
+    "1m":  ("* * * * *",    "every minute"),
+    "5m":  ("*/5 * * * *",  "every 5 minutes"),
+    "10m": ("*/10 * * * *", "every 10 minutes"),
+    "15m": ("*/15 * * * *", "every 15 minutes"),
+    "30m": ("*/30 * * * *", "every 30 minutes"),
+    "1h":  ("0 * * * *",    "every hour"),
+    "2h":  ("0 */2 * * *",  "every 2 hours"),
+    "3h":  ("0 */3 * * *",  "every 3 hours"),
+    "6h":  ("0 */6 * * *",  "every 6 hours"),
+    "12h": ("0 */12 * * *", "every 12 hours"),
+    "1d":  ("0 9 * * *",    "every day"),     # default 09:00
+    "1w":  ("0 9 * * 1",    "every week"),    # default Monday 09:00
+}
+
+_DOW_MAP: dict[str, str] = {
+    "sun": "0", "mon": "1", "tue": "2", "wed": "3",
+    "thu": "4", "fri": "5", "sat": "6",
+}
+
+
 def _build_cron_expression(every: str | None, at: str | None) -> str:
     """Convert ``--every INTERVAL`` + optional ``--at TIME`` to a 5-field cron string.
 
@@ -522,28 +559,6 @@ def _build_cron_expression(every: str | None, at: str | None) -> str:
 
     Raises ValueError on invalid input.
     """
-    _INTERVAL_MAP: dict[str, tuple[str, str]] = {
-        # interval_str: (default_cron, description)
-        # default_cron uses * for time fields; overridden by --at
-        "1m":  ("* * * * *",    "every minute"),
-        "5m":  ("*/5 * * * *",  "every 5 minutes"),
-        "10m": ("*/10 * * * *", "every 10 minutes"),
-        "15m": ("*/15 * * * *", "every 15 minutes"),
-        "30m": ("*/30 * * * *", "every 30 minutes"),
-        "1h":  ("0 * * * *",    "every hour"),
-        "2h":  ("0 */2 * * *",  "every 2 hours"),
-        "3h":  ("0 */3 * * *",  "every 3 hours"),
-        "6h":  ("0 */6 * * *",  "every 6 hours"),
-        "12h": ("0 */12 * * *", "every 12 hours"),
-        "1d":  ("0 9 * * *",    "every day"),     # default 09:00
-        "1w":  ("0 9 * * 1",    "every week"),    # default Monday 09:00
-    }
-
-    _DOW_MAP: dict[str, str] = {
-        "sun": "0", "mon": "1", "tue": "2", "wed": "3",
-        "thu": "4", "fri": "5", "sat": "6",
-    }
-
     if every is None and at is None:
         raise ValueError("Specify --every INTERVAL and/or --at TIME. See --help for details.")
 
@@ -609,6 +624,7 @@ def _build_cron_expression(every: str | None, at: str | None) -> str:
 
 def _parse_one_shot_at(at: str) -> str:
     """Parse a 'YYYY-MM-DD HH:MM' string into a one-shot cron expression."""
+    import sys
     from datetime import datetime
     formats = ["%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y/%m/%d %H:%M"]
     dt = None
@@ -622,6 +638,14 @@ def _parse_one_shot_at(at: str) -> str:
         raise ValueError(
             f"Cannot parse --at value {at!r}. "
             "Expected format: 'YYYY-MM-DD HH:MM' (e.g. '2026-04-10 15:30')."
+        )
+    # Warn if the specified datetime is in the past — the job will fire
+    # on the next scheduler tick (within 60 s) rather than at the intended time.
+    if dt < datetime.now():
+        print(
+            f"Warning: --at {at!r} is in the past. "
+            "The job will fire immediately on the next scheduler tick.",
+            file=sys.stderr,
         )
     return f"{dt.minute} {dt.hour} {dt.day} {dt.month} *"
 

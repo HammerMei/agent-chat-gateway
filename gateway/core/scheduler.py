@@ -84,6 +84,9 @@ def compute_next_run(cron: str, timezone: str, after: datetime | None = None) ->
     return next_utc.isoformat()
 
 
+_MAX_MISSED_CATCHUP = 500  # cap to prevent OOM on very long downtimes with frequent crons
+
+
 def compute_all_missed(
     cron: str,
     timezone: str,
@@ -94,6 +97,10 @@ def compute_all_missed(
 
     Used for catch-up: determines how many times a job should have fired while
     the daemon was down.
+
+    Capped at ``_MAX_MISSED_CATCHUP`` entries to prevent unbounded memory use
+    when a frequent cron (e.g. ``* * * * *``) is combined with a long downtime.
+    A warning is logged when the cap is hit.
     """
     try:
         tz = zoneinfo.ZoneInfo(timezone)
@@ -105,10 +112,23 @@ def compute_all_missed(
     times = []
     while True:
         t: datetime = it.get_next(datetime)
+        # Defensive: croniter may return naive datetimes on some versions.
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=tz)
         t_utc = t.astimezone(UTC)
         if t_utc > before_utc:
             break
         times.append(t_utc)
+        if len(times) >= _MAX_MISSED_CATCHUP:
+            logger.warning(
+                "compute_all_missed: capped at %d entries for cron %r "
+                "(downtime window %s → %s). Remaining missed fires will be skipped.",
+                _MAX_MISSED_CATCHUP,
+                cron,
+                after_utc.isoformat(),
+                before_utc.isoformat(),
+            )
+            break
     return times
 
 
@@ -144,6 +164,11 @@ class JobScheduler:
         except asyncio.CancelledError:
             logger.info("JobScheduler cancelled")
             raise
+        except Exception as e:
+            # Log immediately so the scheduler death is visible in runtime logs
+            # rather than only surfacing when the task future is awaited at shutdown.
+            logger.error("JobScheduler terminated unexpectedly: %s", e, exc_info=True)
+            raise
 
     # ── Startup catch-up ─────────────────────────────────────────────────────
 
@@ -164,31 +189,35 @@ class JobScheduler:
         missed occurrence (respecting ``times`` limit).  For one-shot jobs,
         fires once and completes.
         """
+        def _parse_utc(ts: str) -> datetime | None:
+            """Parse an ISO 8601 timestamp and ensure it is UTC-aware."""
+            try:
+                dt = datetime.fromisoformat(ts)
+                if dt.tzinfo is None:
+                    # Hand-edited or legacy value without offset — assume UTC.
+                    dt = dt.replace(tzinfo=UTC)
+                return dt
+            except ValueError:
+                return None
+
         # Determine how many times this job should have fired since last_run
         last_run_dt: datetime | None = None
         if job.last_run:
-            try:
-                last_run_dt = datetime.fromisoformat(job.last_run)
-            except ValueError:
-                pass
+            last_run_dt = _parse_utc(job.last_run)
 
         if last_run_dt is None:
             # Never ran before — try creation time as the start anchor
             if job.created_at:
-                try:
-                    last_run_dt = datetime.fromisoformat(job.created_at)
-                except ValueError:
-                    pass
+                last_run_dt = _parse_utc(job.created_at)
             # If created_at is also missing/malformed, fall back to next_run itself
             # (which is already in the past — see list_due() precondition).
             # Using `now` would produce an empty missed-fires list and silently
             # skip the catch-up, so next_run is a better anchor.
             if last_run_dt is None and job.next_run:
-                try:
-                    # Anchor one minute before next_run so the job fires exactly once
-                    last_run_dt = datetime.fromisoformat(job.next_run) - timedelta(minutes=1)
-                except ValueError:
-                    pass
+                # Anchor one minute before next_run so the job fires exactly once
+                nr = _parse_utc(job.next_run)
+                if nr is not None:
+                    last_run_dt = nr - timedelta(minutes=1)
             if last_run_dt is None:
                 # Last resort: fire once unconditionally
                 logger.warning(
@@ -198,8 +227,11 @@ class JobScheduler:
                 await self._fire_once(job, now)
                 return
 
-        # For one-shot jobs (times==1), fire once regardless of how long they were missed
-        if job.times == 1 and job.run_count == 0:
+        # For jobs with exactly one remaining run, fire once regardless of how long
+        # they were missed — calling compute_all_missed on a large downtime window
+        # could return many entries, but only one more fire is allowed.
+        remaining = job.times - job.run_count if job.times > 0 else None
+        if remaining == 1:
             await self._fire_once(job, now)
             return
 
@@ -229,14 +261,31 @@ class JobScheduler:
             # actual wall-clock time the scheduler polled (which can drift slightly).
             try:
                 fire_time = datetime.fromisoformat(job.next_run) if job.next_run else datetime.now(UTC)
+                # Guard: fromisoformat returns naive datetimes for legacy / hand-edited
+                # values without a UTC offset.  astimezone() on a naive datetime uses
+                # the system local timezone, silently producing a wrong next_run.
+                if fire_time.tzinfo is None:
+                    fire_time = fire_time.replace(tzinfo=UTC)
             except ValueError:
                 fire_time = datetime.now(UTC)
-            await self._fire_once(job, fire_time)
+            try:
+                await self._fire_once(job, fire_time)
+            except Exception as e:
+                # Per-job isolation: one broken job must not kill the scheduler
+                # or prevent other jobs from firing in the same tick.
+                logger.error("Unexpected error firing job %s — skipping: %s", job.id, e)
 
     # ── Job execution ─────────────────────────────────────────────────────────
 
     async def _fire_once(self, job: ScheduledJob, fire_time: datetime) -> None:
-        """Fire a single job: inject message, update state, persist."""
+        """Fire a single job: inject message, update state, persist.
+
+        ``run_count`` is incremented and ``next_run`` is advanced even when
+        injection fails.  This is intentional: silently retrying a failed
+        injection on every subsequent tick would flood the queue if the watcher
+        stays down for an extended period.  Users can resume the watcher and
+        the next scheduled fire will deliver the message normally.
+        """
         logger.info(
             "Firing scheduled job %s (watcher=%s, run=%d/%s)",
             job.id,
@@ -265,8 +314,19 @@ class JobScheduler:
             job.completed_at = datetime.now(UTC).isoformat()
             logger.info("Job %s completed all %d run(s)", job.id, job.times)
         else:
-            # Compute next fire time from now
-            job.next_run = compute_next_run(job.cron, job.timezone, after=fire_time)
+            # Compute next fire time.  Guard against a corrupted/empty cron field
+            # that slipped past validation (e.g. hand-edited jobs.json).  A bad
+            # cron would otherwise propagate an exception that kills the scheduler
+            # task for ALL jobs, not just this one.
+            try:
+                job.next_run = compute_next_run(job.cron, job.timezone, after=fire_time)
+            except Exception as e:
+                logger.error(
+                    "Job %s: failed to compute next_run (cron=%r): %s — pausing job",
+                    job.id, job.cron, e,
+                )
+                job.status = JobStatus.PAUSED
+                job.next_run = None
 
         try:
             self._store.update(job)

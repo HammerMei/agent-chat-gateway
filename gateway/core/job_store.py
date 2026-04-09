@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from ..schedule_types import JobStatus, ScheduledJob
@@ -50,7 +51,7 @@ class JobStore:
 
     def load(self) -> None:
         """Load jobs from disk. Call once at daemon startup."""
-        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        self._file.parent.mkdir(parents=True, exist_ok=True)
         if not self._file.exists():
             logger.info("No jobs file found at %s — starting with empty job list", self._file)
             self._loaded = True
@@ -72,7 +73,7 @@ class JobStore:
 
     def save(self) -> None:
         """Atomically write current job list to disk."""
-        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        self._file.parent.mkdir(parents=True, exist_ok=True)
         data = {
             "version": _SCHEMA_VERSION,
             "jobs": [j.to_dict() for j in self._jobs.values()],
@@ -88,8 +89,17 @@ class JobStore:
 
     # ── CRUD ──────────────────────────────────────────────────────────────────
 
+    def _assert_loaded(self) -> None:
+        """Raise RuntimeError if load() has not been called yet."""
+        if not self._loaded:
+            raise RuntimeError(
+                "JobStore.load() must be called before any CRUD operation. "
+                "Did you forget to call load() at daemon startup?"
+            )
+
     def add(self, job: ScheduledJob) -> ScheduledJob:
         """Add a new job and persist. Returns the saved job."""
+        self._assert_loaded()
         self._jobs[job.id] = job
         self.save()
         logger.info("Scheduled job created: %s (watcher=%s, cron=%r)", job.id, job.watcher, job.cron)
@@ -97,6 +107,7 @@ class JobStore:
 
     def update(self, job: ScheduledJob) -> None:
         """Update an existing job in place and persist."""
+        self._assert_loaded()
         if job.id not in self._jobs:
             raise KeyError(f"Job {job.id!r} not found")
         self._jobs[job.id] = job
@@ -104,6 +115,7 @@ class JobStore:
 
     def remove(self, job_id: str) -> bool:
         """Remove a job by ID. Returns True if found and removed."""
+        self._assert_loaded()
         if job_id not in self._jobs:
             return False
         del self._jobs[job_id]
@@ -117,7 +129,7 @@ class JobStore:
         If ttl_days == 0, removes all completed jobs immediately.
         Returns the number of jobs removed.
         """
-        from datetime import UTC, datetime, timedelta
+        self._assert_loaded()
         if ttl_days < 0:
             return 0
         cutoff = datetime.now(UTC) - timedelta(days=ttl_days)
@@ -146,6 +158,7 @@ class JobStore:
 
     def get(self, job_id: str) -> ScheduledJob | None:
         """Return a job by ID, or None if not found."""
+        self._assert_loaded()
         return self._jobs.get(job_id)
 
     def list_jobs(
@@ -159,6 +172,7 @@ class JobStore:
         By default only ACTIVE and PAUSED jobs are returned. Pass
         ``include_completed=True`` to also include COMPLETED jobs.
         """
+        self._assert_loaded()
         jobs = list(self._jobs.values())
         if not include_completed:
             jobs = [j for j in jobs if j.status != JobStatus.COMPLETED]
@@ -168,7 +182,7 @@ class JobStore:
 
     def list_due(self) -> list[ScheduledJob]:
         """Return ACTIVE jobs whose next_run is at or before now (UTC)."""
-        from datetime import UTC, datetime
+        self._assert_loaded()
         now = datetime.now(UTC)
         due = []
         for job in self._jobs.values():

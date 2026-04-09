@@ -55,7 +55,14 @@ def _sync_context_files(
     runtime_dir: Path,
     pre_pull_hashes: dict[str, str],
 ) -> None:
-    """Sync context files from repo to runtime dir after git pull.
+    """Sync user-facing context files from repo to runtime dir after git pull.
+
+    Built-in system context files (rc-gateway-context.md, scheduling-context.md)
+    are bundled inside the gateway Python package (gateway/contexts/) and
+    auto-injected at runtime — they are NOT synced here.
+
+    Only user-editable example files in repo/contexts/ (e.g. rc-room-profiles.example.md)
+    are synced to the runtime dir.
 
     Decision table for each file in repo/contexts/:
       - Repo file is brand-new (wasn't in pre-pull snapshot) → copy unconditionally.

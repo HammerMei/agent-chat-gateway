@@ -72,21 +72,37 @@ class TestJobStoreLoadSave(unittest.TestCase):
         self.assertEqual(tmp_files, [], "No .tmp files should remain after save")
 
     def test_load_skips_malformed_entries(self):
-        """Malformed job entries are skipped, valid ones are loaded."""
+        """Entries with an invalid 'status' value raise inside from_dict and are skipped."""
         data = {
             "version": 1,
             "jobs": [
-                {"watcher": "ok-watcher", "message": "ok", "cron": "0 9 * * *", "times": 0},
-                {"INVALID": True},  # malformed: no required fields
+                {"watcher": "ok-watcher", "message": "ok", "cron": "0 9 * * *", "times": 0,
+                 "status": "active"},
+                {"watcher": "bad", "status": "NOT_A_VALID_STATUS"},  # ValueError in JobStatus()
+            ],
+        }
+        self.jobs_file.write_text(json.dumps(data))
+        store = self._store()
+        store.load()
+        jobs = store.list_jobs(include_completed=True)
+        # Only the valid entry should be loaded; the bad-status entry is skipped
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0].watcher, "ok-watcher")
+
+    def test_load_does_not_crash_on_unknown_fields(self):
+        """Extra unknown fields in a job dict are silently ignored."""
+        data = {
+            "version": 1,
+            "jobs": [
+                {"watcher": "w", "message": "m", "cron": "0 9 * * *",
+                 "status": "active", "UNKNOWN_FUTURE_FIELD": "value"},
             ],
         }
         self.jobs_file.write_text(json.dumps(data))
         store = self._store()
         store.load()
         jobs = store.list_jobs()
-        # Both entries parse (ScheduledJob.from_dict doesn't raise on missing optional fields)
-        # The test verifies the store doesn't crash on loading
-        self.assertGreaterEqual(len(jobs), 1)
+        self.assertEqual(len(jobs), 1)
 
 
 class TestJobStoreCRUD(unittest.TestCase):
@@ -237,6 +253,61 @@ class TestJobStoreTTLPurge(unittest.TestCase):
         ))
         purged = self.store.remove_expired_completed(ttl_days=-1)
         self.assertEqual(purged, 0)
+        self.assertIsNotNone(self.store.get(job.id))
+
+    def test_malformed_completed_at_is_purged(self):
+        """A completed job with an unparseable completed_at should be purged defensively."""
+        job = self.store.add(_make_job(
+            status=JobStatus.COMPLETED,
+            completed_at="NOT-A-TIMESTAMP",
+        ))
+        purged = self.store.remove_expired_completed(ttl_days=7)
+        self.assertEqual(purged, 1)
+        self.assertIsNone(self.store.get(job.id))
+
+
+class TestJobStoreLoadGuard(unittest.TestCase):
+    """All public methods raise RuntimeError if load() has not been called."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = JobStore(jobs_file=Path(self.tmp.name) / "jobs.json")
+        # deliberately do NOT call self.store.load()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_add_before_load_raises(self):
+        with self.assertRaises(RuntimeError, msg="add() must require prior load()"):
+            self.store.add(_make_job())
+
+    def test_update_before_load_raises(self):
+        with self.assertRaises(RuntimeError):
+            self.store.update(_make_job())
+
+    def test_remove_before_load_raises(self):
+        with self.assertRaises(RuntimeError):
+            self.store.remove("acg-00000000")
+
+    def test_get_before_load_raises(self):
+        with self.assertRaises(RuntimeError):
+            self.store.get("acg-00000000")
+
+    def test_list_jobs_before_load_raises(self):
+        with self.assertRaises(RuntimeError):
+            self.store.list_jobs()
+
+    def test_list_due_before_load_raises(self):
+        with self.assertRaises(RuntimeError):
+            self.store.list_due()
+
+    def test_remove_expired_before_load_raises(self):
+        with self.assertRaises(RuntimeError):
+            self.store.remove_expired_completed(ttl_days=7)
+
+    def test_after_load_no_error(self):
+        self.store.load()
+        job = self.store.add(_make_job())
         self.assertIsNotNone(self.store.get(job.id))
 
 

@@ -25,8 +25,14 @@ connectors:
       # cache_dir_global: ~/.agent-chat-gateway/attachments  # optional: override download cache location
     reply_in_thread: false           # true = start a new thread for every top-level reply
     permission_reply_in_thread: true # false = post permission notifications at room level
-    context_inject_files:             # connector-level context injected into every session (layer 1)
-      - contexts/rc-gateway-context.md  # RC message format, RBAC rules, injection protection
+    # Built-in context files are injected automatically — no config needed:
+    #   contexts/rc-gateway-context.md  — RC message format, RBAC rules, injection protection
+    #   contexts/scheduling-context.md  — teaches agent the acg schedule CLI commands
+    #
+    # Add your own files below to extend agent behavior (e.g. room-specific personas,
+    # project context, or custom instructions).  Listed files are injected AFTER the
+    # built-in files, so they can override or extend any defaults.
+    context_inject_files: []          # connector-level user context (layer 1); add paths here
 
 agents:
   # ── Claude backend ────────────────────────────────────────────────────────
@@ -57,6 +63,11 @@ agents:
     #   Anything NOT matched here is auto-denied without notifying the owner.
 
     owner_allowed_tools:
+      # ── Built-in gateway commands (auto-included — no config needed) ────
+      # These are ALWAYS auto-approved for owners, regardless of what you list here:
+      #   agent-chat-gateway send ...      — send messages / attach files to RC rooms
+      #   agent-chat-gateway schedule ...  — create/list/delete/pause/resume scheduled jobs
+      #
       # ── Read-only built-in tools: safe, never need owner approval ──────
       - tool: "Read"                         # any file read
       - tool: "Glob"                         # file pattern search
@@ -79,8 +90,6 @@ agents:
         params: "git (log|diff|status|show)( .*)?"   # read-only git commands
       - tool: "Bash"
         params: "ls( .*)?"                           # directory listing
-      - tool: "Bash"
-        params: "agent-chat-gateway\\s+send\\s+.*"   # agent-initiated file/message send to RC
 
       # ── MCP tools: match by server or specific tool name ───────────────
       # params regex (if set) is matched against full tool_input JSON string
@@ -189,3 +198,25 @@ watchers:
   #   context_inject_files: []
   #   online_notification: "✅ _Agent online_"
   #   offline_notification: "❌ _Agent offline_"
+
+# ── Scheduler (optional) ──────────────────────────────────────────────────────
+# Controls the built-in cron scheduler.  All fields have sensible defaults
+# so this entire section can be omitted if you do not use scheduling.
+#
+# CLI usage:
+#   agent-chat-gateway schedule create WATCHER MESSAGE --every 1d --at 09:00
+#   agent-chat-gateway schedule list
+#   agent-chat-gateway schedule delete JOB_ID
+#   agent-chat-gateway schedule pause JOB_ID
+#   agent-chat-gateway schedule resume JOB_ID
+#
+# Jobs are stored in ~/.agent-chat-gateway/jobs.json.
+# The daemon must be running for schedule commands to work (they use the control socket).
+
+# scheduler:
+#   default_timezone: "Asia/Taipei"   # IANA timezone used when --tz is not specified.
+#                                     # Falls back to ACG server's local timezone if omitted.
+#                                     # Examples: "UTC", "America/New_York", "Europe/London"
+#   completed_job_ttl_days: 7         # How long completed jobs are kept in jobs.json before purge.
+#                                     # 0 = delete immediately when a job completes.
+#                                     # Use "acg schedule list --all" to see completed jobs.
