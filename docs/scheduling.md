@@ -50,7 +50,7 @@ agent-chat-gateway schedule create WATCHER MESSAGE [OPTIONS]
 | `--every INTERVAL` | Recurring interval. Accepted values: `1m`, `5m`, `10m`, `15m`, `30m`, `1h`, `2h`, `3h`, `6h`, `12h`, `1d`, `1w` |
 | `--at TIME` | One-shot or recurring at a fixed time. Accepts `"09:00"`, `"Mon 09:00"`, or `"2026-04-10 15:30"` |
 | `--times N` | Max number of runs. `0` means run forever (default). `1` means run once then mark completed. |
-| `--tz TIMEZONE` | IANA timezone, e.g. `"Asia/Taipei"`, `"America/New_York"`. Defaults to UTC. |
+| `--tz TIMEZONE` | IANA timezone, e.g. `"America/New_York"`, `"Europe/Berlin"`, `"UTC"`. Defaults to the `scheduler.default_timezone` config value, or the ACG server's local timezone if unset. Only relevant for daily/weekly schedules — omit for sub-hourly intervals. |
 | `--connector NAME` | Which connector to use. Auto-detected when only one connector is configured. |
 
 ### Examples

@@ -12,7 +12,7 @@ agent-chat-gateway schedule create <watcher> "<message>" [OPTIONS]
 - `--every INTERVAL` — Recurrence interval: `1m`, `5m`, `10m`, `15m`, `30m`, `1h`, `2h`, `3h`, `6h`, `12h`, `1d`, `1w`
 - `--at TIME` — Time override. With `--every`: set hour/minute (e.g. `09:00` or `Mon 09:00`). Without `--every`: specific datetime for a one-shot task (e.g. `2026-04-10 15:30`).
 - `--times N` — Number of runs. `0` = forever (default). `N` = stop after N runs.
-- `--tz TIMEZONE` — IANA timezone (e.g. `Asia/Taipei`, `America/New_York`, `UTC`)
+- `--tz TIMEZONE` — IANA timezone (e.g. `America/New_York`, `Europe/Berlin`, `UTC`). Only relevant for daily/weekly jobs anchored to a specific local time — **omit for sub-hourly intervals** (`1m`–`12h`), which fire on a fixed cadence regardless of timezone.
 - `--connector NAME` — Connector name (auto-detected if omitted)
 
 **Examples:**
@@ -36,8 +36,11 @@ agent-chat-gateway schedule create general-watcher "Generate the weekly report" 
 # One-time reminder at a specific date/time
 agent-chat-gateway schedule create general-watcher "Reminder: feature freeze today" --at "2026-04-10 15:30"
 
-# Monitor every 30 minutes, forever, in a specific timezone
-agent-chat-gateway schedule create ops-watcher "Check server health" --every 30m --tz "Asia/Taipei" --times 0
+# Monitor every 30 minutes, forever (no --tz needed for sub-hourly jobs)
+agent-chat-gateway schedule create ops-watcher "Check server health" --every 30m --times 0
+
+# Daily standup at 09:00 in a specific timezone — use --tz here
+agent-chat-gateway schedule create general-watcher "Run daily standup" --every 1d --at "09:00" --tz "America/New_York"
 ```
 
 ## List scheduled tasks
