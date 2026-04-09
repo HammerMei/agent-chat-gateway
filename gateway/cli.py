@@ -408,6 +408,11 @@ def _run_schedule_create(args) -> None:
         times = 1  # default one-shot to exactly 1 run
 
     cron: str | None = None
+    # Tracks whether we generated a UTC-coordinate one-shot cron.  When True,
+    # the daemon must interpret the cron in UTC — not in the server's local
+    # timezone — otherwise the offset is double-applied (e.g. UTC-7 shifts the
+    # fire time 7 hours into the future instead of N minutes).
+    _one_shot_utc_cron = False
 
     # ── One-shot relative reminders: fire exactly N minutes from now ──────────
     # For --every Nm/Nh --times 1 (no --at), accept ANY positive integer interval
@@ -421,6 +426,7 @@ def _run_schedule_create(args) -> None:
         if interval_minutes is not None:
             target = datetime.now(UTC) + timedelta(minutes=interval_minutes)
             cron = f"{target.minute} {target.hour} {target.day} {target.month} *"
+            _one_shot_utc_cron = True
 
     # ── Recurring or --at-based: validate against _INTERVAL_MAP ──────────────
     if cron is None:
@@ -437,7 +443,13 @@ def _run_schedule_create(args) -> None:
         "cron": cron,
         "times": times,
     }
-    if args.tz:
+    if _one_shot_utc_cron:
+        # Cron coordinates are UTC — force UTC so the daemon doesn't apply a
+        # local-timezone offset that would shift the fire time by hours.
+        # Any --tz flag is intentionally ignored: timezone is irrelevant for
+        # relative one-shot reminders ("in 7 minutes" means the same everywhere).
+        cmd_data["timezone"] = "UTC"
+    elif args.tz:
         cmd_data["timezone"] = args.tz
     if args.connector:
         cmd_data["connector"] = args.connector

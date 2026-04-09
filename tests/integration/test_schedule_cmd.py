@@ -443,6 +443,15 @@ class TestScheduleCreate(_ScheduleCLITestBase):
             f"Fire time {fire_dt} is more than 1m too late (expected <= {window_high})",
         )
 
+        # Timezone must be UTC — cron coordinates are UTC and the daemon must
+        # not apply a local-timezone offset (regression: UTC-7 was shifting the
+        # fire time 7 hours forward instead of N minutes).
+        self.assertEqual(
+            received[0].get("timezone"),
+            "UTC",
+            "One-shot relative reminders must always send timezone=UTC",
+        )
+
     def test_create_one_shot_arbitrary_interval_7m(self):
         """--every 7m --times 1 is accepted and produces a specific datetime cron.
 
@@ -484,6 +493,9 @@ class TestScheduleCreate(_ScheduleCLITestBase):
         fire_dt = datetime(before.year, month, day, hour, minute, tzinfo=UTC)
         self.assertGreaterEqual(fire_dt, before + timedelta(minutes=6))
         self.assertLessEqual(fire_dt, after + timedelta(minutes=8))
+
+        # Timezone must be UTC to prevent local-tz double-apply.
+        self.assertEqual(received[0].get("timezone"), "UTC")
 
     def test_create_recurring_arbitrary_interval_rejected(self):
         """--every 7m without --times 1 is rejected (not cron-aligned for recurring)."""
