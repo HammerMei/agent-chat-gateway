@@ -93,7 +93,7 @@ services:
     # :latest image only tracks the main branch.
     build:
       context: ../..
-      dockerfile: Dockerfile.acg
+      dockerfile: docker/Dockerfile.acg
     image: acg-e2e-local
     container_name: acg-e2e
     restart: unless-stopped
