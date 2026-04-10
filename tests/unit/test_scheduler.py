@@ -146,15 +146,21 @@ class TestJobSchedulerFiring(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(updated.last_run)
 
     async def test_fire_advances_next_run(self):
+        original_next_run = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
         store, scheduler, job = self._make_store_and_scheduler(
             cron="0 * * * *",  # hourly
-            next_run=(datetime.now(UTC) - timedelta(minutes=1)).isoformat()
+            next_run=original_next_run,
         )
         await scheduler._fire_due_jobs()
         updated = store.get(job.id)
-        # next_run should now be in the future
+        # next_run must be strictly later than the job's original scheduled time.
+        # We compare against the original next_run (not datetime.now()) because
+        # the scheduler uses fire_time (the canonical schedule) as the croniter
+        # base — on a slow CI machine the computed next_run could still be in
+        # the past relative to wall-clock time if the test runs near an hour boundary.
         next_dt = datetime.fromisoformat(updated.next_run)
-        self.assertGreater(next_dt, datetime.now(UTC))
+        original_dt = datetime.fromisoformat(original_next_run)
+        self.assertGreater(next_dt, original_dt)
 
     async def test_fire_completes_times_job(self):
         store, scheduler, job = self._make_store_and_scheduler(
