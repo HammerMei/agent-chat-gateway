@@ -23,6 +23,7 @@ Dependencies
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -239,8 +240,9 @@ class JobScheduler:
             )
             job.status = JobStatus.COMPLETED
             job.next_run = None
-            if not job.completed_at:
-                job.completed_at = datetime.now(UTC).isoformat()
+            # Always reset completed_at to now — a hand-edited future timestamp
+            # would otherwise make the job immune to TTL purge.
+            job.completed_at = datetime.now(UTC).isoformat()
             await asyncio.to_thread(self._store.update, job)
             return
 
@@ -270,7 +272,9 @@ class JobScheduler:
         for fire_time in missed:
             if job.status != JobStatus.ACTIVE:
                 break  # completed during catch-up
-            await self._fire_once(job, fire_time)
+            # _fire_once returns the updated copy; re-assign so the next
+            # iteration sees the incremented run_count / updated status.
+            job = await self._fire_once(job, fire_time)
 
     # ── Per-tick ──────────────────────────────────────────────────────────────
 
@@ -306,15 +310,30 @@ class JobScheduler:
 
     # ── Job execution ─────────────────────────────────────────────────────────
 
-    async def _fire_once(self, job: ScheduledJob, fire_time: datetime) -> None:
+    async def _fire_once(self, job: ScheduledJob, fire_time: datetime) -> ScheduledJob:
         """Fire a single job: inject message, update state, persist.
+
+        Returns the updated job object (a shallow copy).  Callers that fire the
+        same job multiple times (e.g. the catch-up loop) must re-assign their
+        local reference to the return value so subsequent iterations see the
+        correct ``run_count`` and ``status``.
 
         ``run_count`` is incremented and ``next_run`` is advanced even when
         injection fails.  This is intentional: silently retrying a failed
         injection on every subsequent tick would flood the queue if the watcher
         stays down for an extended period.  Users can resume the watcher and
         the next scheduled fire will deliver the message normally.
+
+        All field mutations are applied to a shallow copy of the job object so
+        that concurrent ``list_jobs()`` / ``list_due()`` callers on the event-
+        loop thread never observe a partially mutated state.  ``store.update``
+        atomically replaces the reference in the in-memory dict under the lock,
+        so readers either see the old state or the fully-updated state.
         """
+        # Shallow copy is sufficient: all ScheduledJob fields are immutable
+        # scalar types (str, int, enum) so there are no nested mutable objects.
+        job = copy.copy(job)
+
         logger.info(
             "Firing scheduled job %s (watcher=%s, run=%d/%s)",
             job.id,
@@ -359,13 +378,14 @@ class JobScheduler:
 
         try:
             # Offload the file-write to a thread pool so the event loop is not
-            # blocked while jobs.json is being written.  The in-memory dict update
-            # (store.update sets _jobs[job.id]) already happened synchronously above,
-            # so other coroutines see the updated state immediately; only the disk
-            # flush is deferred to the thread.
+            # blocked while jobs.json is being written.  store.update() replaces
+            # _jobs[job.id] under the lock, making the updated copy visible to
+            # all subsequent readers atomically.
             await asyncio.to_thread(self._store.update, job)
         except Exception as e:
             logger.error("Failed to persist job %s after fire: %s", job.id, e)
+
+        return job
 
     async def _inject(self, job: ScheduledJob) -> bool:
         """Inject the job message into the target watcher via SessionManager.

@@ -393,6 +393,43 @@ class TestJobSchedulerCatchUp(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sm.inject_message.call_count, 0,
             "inject_message must not be called for an already-exhausted job")
 
+    async def test_catch_up_remaining_zero_overwrites_future_completed_at(self):
+        """m-R4-1: remaining<=0 guard always resets completed_at to now.
+
+        A hand-edited jobs.json could have completed_at set to a far-future date,
+        which would make the job immune to TTL purge.  The guard must overwrite it
+        unconditionally with datetime.now(UTC) so TTL purge works correctly.
+        """
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = JobStore(jobs_file=Path(tmp.name) / "jobs.json")
+        store.load()
+        sm = MagicMock()
+        sm.inject_message = AsyncMock(return_value=True)
+
+        now = datetime.now(UTC)
+        far_future = (now + timedelta(days=9999)).isoformat()
+        job = store.add(_make_job(
+            times=1,
+            run_count=1,
+            status=JobStatus.ACTIVE,
+            next_run=(now - timedelta(minutes=1)).isoformat(),
+            completed_at=far_future,  # hand-edited future timestamp
+        ))
+
+        scheduler = JobScheduler(store=store, session_managers={"rc-home": sm}, completed_job_ttl_days=7)
+        await scheduler._catch_up_missed()
+
+        updated = store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.COMPLETED)
+        # completed_at must be reset to approximately now, NOT the far-future value
+        completed_dt = datetime.fromisoformat(updated.completed_at)
+        self.assertLess(
+            abs((completed_dt - now).total_seconds()), 5.0,
+            f"completed_at should be ~now, not the hand-edited future value {far_future!r}",
+        )
+        self.assertEqual(sm.inject_message.call_count, 0)
+
 
 class TestJobSchedulerPurge(unittest.IsolatedAsyncioTestCase):
     async def test_tick_purges_expired_completed(self):

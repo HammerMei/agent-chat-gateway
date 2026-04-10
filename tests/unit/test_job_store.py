@@ -311,5 +311,103 @@ class TestJobStoreLoadGuard(unittest.TestCase):
         self.assertIsNotNone(self.store.get(job.id))
 
 
+class TestJobStoreConcurrency(unittest.TestCase):
+    """Thread-safety smoke tests for the JobStore lock.
+
+    These tests verify that concurrent add/list_jobs and
+    remove_expired_completed/add operations do not raise
+    'RuntimeError: dictionary changed size during iteration'.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.store = JobStore(jobs_file=Path(self._tmp.name) / "jobs.json")
+        self.store.load()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_concurrent_add_and_list_jobs_no_error(self):
+        """Concurrent add() from one thread and list_jobs() from another must not raise."""
+        import threading
+
+        errors: list[Exception] = []
+        stop = threading.Event()
+
+        def _reader():
+            while not stop.is_set():
+                try:
+                    self.store.list_jobs(include_completed=True)
+                except Exception as e:
+                    errors.append(e)
+                    break
+
+        def _writer():
+            for _ in range(50):
+                try:
+                    job = self.store.add(_make_job())
+                    self.store.remove(job.id)
+                except Exception as e:
+                    errors.append(e)
+                    break
+            stop.set()
+
+        reader = threading.Thread(target=_reader, daemon=True)
+        writer = threading.Thread(target=_writer)
+        reader.start()
+        writer.start()
+        writer.join(timeout=10)
+        stop.set()
+        reader.join(timeout=5)
+
+        self.assertEqual(errors, [], f"Concurrent access raised: {errors}")
+
+    def test_concurrent_remove_expired_and_add_no_error(self):
+        """remove_expired_completed() running concurrently with add() must not raise."""
+        import threading
+        from datetime import UTC, datetime, timedelta
+
+        errors: list[Exception] = []
+
+        # Pre-populate with completed jobs for the purge to iterate over
+        now = datetime.now(UTC)
+        for _ in range(20):
+            self.store.add(_make_job(
+                status=JobStatus.COMPLETED,
+                completed_at=(now - timedelta(days=10)).isoformat(),
+                next_run=None,
+            ))
+
+        stop = threading.Event()
+
+        def _purger():
+            while not stop.is_set():
+                try:
+                    self.store.remove_expired_completed(ttl_days=7)
+                except Exception as e:
+                    errors.append(e)
+                    break
+
+        def _adder():
+            for _ in range(50):
+                try:
+                    job = self.store.add(_make_job())
+                    self.store.remove(job.id)
+                except Exception as e:
+                    errors.append(e)
+                    break
+            stop.set()
+
+        purger = threading.Thread(target=_purger, daemon=True)
+        adder = threading.Thread(target=_adder)
+        purger.start()
+        adder.start()
+        adder.join(timeout=10)
+        stop.set()
+        purger.join(timeout=5)
+
+        self.assertEqual(errors, [], f"Concurrent access raised: {errors}")
+
+
 if __name__ == "__main__":
     unittest.main()

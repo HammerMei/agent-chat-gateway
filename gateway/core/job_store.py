@@ -25,6 +25,7 @@ import os
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import get_ident as _thread_ident
 
 from ..schedule_types import JobStatus, ScheduledJob
 
@@ -91,7 +92,9 @@ class JobStore:
             snapshot = [j.to_dict() for j in self._jobs.values()]
         self._file.parent.mkdir(parents=True, exist_ok=True)
         data = {"version": _SCHEMA_VERSION, "jobs": snapshot}
-        tmp = self._file.with_name(f"{self._file.name}.{os.getpid()}.tmp")
+        # Include thread ident so concurrent save() calls from different
+        # asyncio.to_thread() workers don't clobber each other's temp file.
+        tmp = self._file.with_name(f"{self._file.name}.{os.getpid()}.{_thread_ident()}.tmp")
         try:
             tmp.write_text(json.dumps(data, indent=2))
             tmp.replace(self._file)
