@@ -1032,6 +1032,76 @@ class TestScheduleCreate(_ScheduleCLITestBase):
         result = server._handle_schedule_create(request)
         self.assertTrue(result.get("ok"), f"Expected success, got: {result}")
 
+    def test_control_handle_schedule_create_rejects_bool_times(self):
+        """C2: _handle_schedule_create rejects True/False for 'times' (bool is a subclass of int)."""
+        from gateway.control import ControlServer
+        from unittest.mock import MagicMock
+
+        mock_store = MagicMock()
+        server = ControlServer(entries=[], job_store=mock_store, default_timezone="UTC")
+        server._find_connector_for_watcher = MagicMock(return_value="rc-home")
+
+        for bad_times in (True, False):
+            with self.subTest(times=bad_times):
+                request = {
+                    "cmd": "schedule-create",
+                    "watcher": "test-watcher",
+                    "message": "test",
+                    "cron": "* * * * *",
+                    "times": bad_times,
+                }
+                result = server._handle_schedule_create(request)
+                self.assertFalse(result.get("ok"), f"Expected rejection for times={bad_times!r}")
+                self.assertIn("times", result.get("error", "").lower())
+
+    def test_control_handle_schedule_create_rejects_past_next_run(self):
+        """C3: _handle_schedule_create rejects a next_run value that is in the past."""
+        from gateway.control import ControlServer
+        from unittest.mock import MagicMock
+
+        mock_store = MagicMock()
+        server = ControlServer(entries=[], job_store=mock_store, default_timezone="UTC")
+        server._find_connector_for_watcher = MagicMock(return_value="rc-home")
+
+        request = {
+            "cmd": "schedule-create",
+            "watcher": "test-watcher",
+            "message": "test",
+            "cron": "* * * * *",
+            "times": 1,
+            "next_run": "2000-01-01T00:00:00+00:00",  # clearly in the past
+        }
+        result = server._handle_schedule_create(request)
+        self.assertFalse(result.get("ok"), f"Expected rejection for past next_run, got: {result}")
+        error = result.get("error", "").lower()
+        self.assertTrue(
+            "past" in error or "next_run" in error,
+            f"Expected error mentioning 'past' or 'next_run', got: {result.get('error')!r}",
+        )
+
+    def test_control_handle_schedule_create_rejects_invalid_timezone(self):
+        """M6: _handle_schedule_create rejects unknown IANA timezone names."""
+        from gateway.control import ControlServer
+        from unittest.mock import MagicMock
+
+        mock_store = MagicMock()
+        server = ControlServer(entries=[], job_store=mock_store, default_timezone="UTC")
+        server._find_connector_for_watcher = MagicMock(return_value="rc-home")
+
+        for bad_tz in ("Mars/Olympus", "NotATimezone", "Bogus/Zone", "GMT+8"):
+            with self.subTest(timezone=bad_tz):
+                request = {
+                    "cmd": "schedule-create",
+                    "watcher": "test-watcher",
+                    "message": "test",
+                    "cron": "* * * * *",
+                    "times": 0,
+                    "timezone": bad_tz,
+                }
+                result = server._handle_schedule_create(request)
+                self.assertFalse(result.get("ok"), f"Expected rejection for tz={bad_tz!r}, got: {result}")
+                self.assertIn("timezone", result.get("error", "").lower())
+
 
 # ---------------------------------------------------------------------------
 # Tests: schedule list

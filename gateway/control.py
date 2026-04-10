@@ -298,8 +298,19 @@ class ControlServer:
             return {"ok": False, "error": "'message' must be at most 4096 characters"}
         if not cron:
             return {"ok": False, "error": "Missing 'cron' field"}
-        if not isinstance(times, int) or times < 0:
+        if isinstance(times, bool) or not isinstance(times, int) or times < 0:
             return {"ok": False, "error": "'times' must be a non-negative integer (0 = forever)"}
+
+        # Validate timezone string (M6): reject invalid IANA names at creation time
+        # so the job is never stored with a timezone that compute_next_run silently
+        # falls back from, emitting a spurious warning on every tick.
+        try:
+            import zoneinfo as _zi
+            _zi.ZoneInfo(timezone)
+        except (_zi.ZoneInfoNotFoundError, KeyError):
+            return {"ok": False, "error": f"Unknown timezone {timezone!r}. Use an IANA name (e.g. 'America/Los_Angeles', 'UTC')."}
+        except Exception as e:
+            return {"ok": False, "error": f"Failed to validate timezone {timezone!r}: {e}"}
 
         # Validate cron expression
         try:
@@ -333,6 +344,16 @@ class ControlServer:
                     "error": (
                         f"'next_run' value {next_run_override!r} is missing timezone info. "
                         "Use UTC offset (e.g. '+00:00') or 'Z'."
+                    ),
+                }
+            # C3: reject past timestamps — a past next_run causes the scheduler
+            # to fire the job on the very next tick, bypassing the intended schedule.
+            if nr_dt < now:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"'next_run' value {next_run_override!r} is in the past. "
+                        "Provide a future datetime."
                     ),
                 }
             next_run = next_run_override

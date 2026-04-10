@@ -428,11 +428,16 @@ def _run_schedule_create(args) -> None:
     _one_shot_utc_cron = False
     parsed: "_ParsedStarting | None" = None
 
+    # M4: capture now_utc once and reuse across all branches.  Two separate
+    # datetime.now(UTC) calls in Branch 1 and Branch 2 could straddle a minute
+    # boundary if the process is preempted between them, causing the generated
+    # one-shot cron to reflect a minute that is already in the past.
+    now_utc = datetime.now(UTC)
+
     tz_name = args.tz or None
 
     # ── Branch 1: --starting provided ─────────────────────────────────────────
     if args.starting is not None:
-        now_utc = datetime.now(UTC)
         try:
             parsed = _parse_starting(args.starting, tz_name, now_utc)
         except ValueError as e:
@@ -483,7 +488,7 @@ def _run_schedule_create(args) -> None:
 
         interval_minutes = _parse_one_shot_interval(args.every)
         if interval_minutes is not None:
-            target = datetime.now(UTC) + timedelta(minutes=interval_minutes)
+            target = now_utc + timedelta(minutes=interval_minutes)
             cron = f"{target.minute} {target.hour} {target.day} {target.month} *"
             _one_shot_utc_cron = True
 
@@ -644,10 +649,12 @@ def _advance_by_one_year(candidate: "datetime") -> "datetime":
             return candidate.replace(year=target_year + offset)
         except ValueError:
             continue
-    # Unreachable in practice (leap years repeat every 4 years at most)
+    # This is mathematically unreachable: leap years occur at least once every 4 years,
+    # so within an 8-year search window there is always a valid Feb 29.  The raise
+    # exists only as a defensive guard against a bug in the loop itself.
     raise ValueError(
-        f"Cannot advance {candidate.strftime('%b %d')} to a valid future date — "
-        "no Feb 29 exists within the next 8 years."
+        f"Internal error: _advance_by_one_year could not find a valid date for "
+        f"{candidate.strftime('%b %d')} within 8 years — this is a bug, please report it."
     )
 
 
@@ -1017,7 +1024,11 @@ def _parse_one_shot_at(at: str) -> str:
         )
     # Warn if the specified datetime is in the past — the job will fire
     # on the next scheduler tick (within 60 s) rather than at the intended time.
-    if dt < datetime.now():
+    # NOTE: this function is an internal helper only reachable via _build_cron_expression
+    # with an explicit `at` argument; the public CLI path uses _parse_starting instead.
+    # C1: use UTC-aware comparison to avoid timezone-wrong result on non-UTC servers.
+    from datetime import UTC as _UTC
+    if dt.replace(tzinfo=_UTC) < datetime.now(_UTC):
         print(
             f"Warning: --at {at!r} is in the past. "
             "The job will fire immediately on the next scheduler tick.",

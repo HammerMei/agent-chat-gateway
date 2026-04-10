@@ -249,7 +249,9 @@ class JobScheduler:
 
     async def _tick(self) -> None:
         """One scheduler tick: purge expired + fire due jobs."""
-        self._store.remove_expired_completed(self._ttl_days)
+        # Offload the purge file-write to a thread so the event loop is not
+        # blocked while jobs.json is being written.
+        await asyncio.to_thread(self._store.remove_expired_completed, self._ttl_days)
         await self._fire_due_jobs()
 
     async def _fire_due_jobs(self) -> None:
@@ -329,7 +331,12 @@ class JobScheduler:
                 job.next_run = None
 
         try:
-            self._store.update(job)
+            # Offload the file-write to a thread pool so the event loop is not
+            # blocked while jobs.json is being written.  The in-memory dict update
+            # (store.update sets _jobs[job.id]) already happened synchronously above,
+            # so other coroutines see the updated state immediately; only the disk
+            # flush is deferred to the thread.
+            await asyncio.to_thread(self._store.update, job)
         except Exception as e:
             logger.error("Failed to persist job %s after fire: %s", job.id, e)
 
