@@ -589,6 +589,7 @@ class TestBuiltinOwnerToolRuleAutoInjection(unittest.TestCase):
     def test_send_rule_matches_actual_command(self):
         """The send rule must actually match a realistic agent-chat-gateway send command."""
         import re
+
         from gateway.core.config import _BUILTIN_OWNER_TOOL_RULES
         send_rule = next(r for r in _BUILTIN_OWNER_TOOL_RULES
                          if r.params and "send" in r.params)
@@ -601,6 +602,7 @@ class TestBuiltinOwnerToolRuleAutoInjection(unittest.TestCase):
     def test_schedule_rule_matches_actual_command(self):
         """The schedule rule must actually match a realistic agent-chat-gateway schedule command."""
         import re
+
         from gateway.core.config import _BUILTIN_OWNER_TOOL_RULES
         sched_rule = next(r for r in _BUILTIN_OWNER_TOOL_RULES
                           if r.params and "schedule" in r.params)
@@ -623,6 +625,7 @@ class TestBuiltinOwnerToolRuleAutoInjection(unittest.TestCase):
     def test_date_rule_matches_bare_date(self):
         """The date rule must match 'date' with no arguments."""
         import re
+
         from gateway.core.config import _BUILTIN_OWNER_TOOL_RULES
         date_rule = next(r for r in _BUILTIN_OWNER_TOOL_RULES
                          if r.params and "date" in r.params
@@ -636,6 +639,7 @@ class TestBuiltinOwnerToolRuleAutoInjection(unittest.TestCase):
     def test_date_rule_matches_date_with_flags(self):
         """The date rule must match date commands used for timestamp calculation."""
         import re
+
         from gateway.core.config import _BUILTIN_OWNER_TOOL_RULES
         date_rule = next(r for r in _BUILTIN_OWNER_TOOL_RULES
                          if r.params and "date" in r.params
