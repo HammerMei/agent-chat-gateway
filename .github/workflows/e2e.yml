@@ -33,6 +33,10 @@ jobs:
       - name: Create RC accounts (waits for RC health)
         run: uv run python tests/e2e/setup.py --rc-url http://localhost:3100
 
+      - name: Build ACG image from source
+        run: |
+          docker compose -f tests/e2e/docker-compose.yml build acg
+
       - name: Start ACG (phase 2)
         env:
           # Use whichever secret is configured (OAuth token takes precedence)

@@ -11,8 +11,22 @@ belong in the connector's own config (e.g. RocketChatConfig).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .connector import UserRole
+
+# Built-in context files shipped inside the gateway package.
+# Resolved relative to this file: gateway/core/config.py → gateway/core/ → gateway/ → gateway/contexts/
+_BUILTIN_CONTEXTS_DIR = Path(__file__).parent.parent / "contexts"
+
+# Built-in tool rules automatically prepended to every agent's owner_allowed_tools.
+# These are gateway-specific Bash commands that the agent should always be able to
+# call without triggering a 🔐 human-approval prompt — they are the gateway's own
+# management interface, not arbitrary shell commands.
+#
+# Rule: `agent-chat-gateway send ...` — send messages / attach files to RC rooms.
+# Rule: `agent-chat-gateway schedule ...` — create/list/delete/pause/resume jobs.
+_BUILTIN_OWNER_TOOL_RULES: "list[ToolRule]" = []  # populated after ToolRule is defined
 
 # ── Shared config types ──────────────────────────────────────────────────────
 
@@ -79,6 +93,19 @@ class ToolRule:
         )
 
 
+# Populate the built-in owner tool rules now that ToolRule is defined.
+# These allow agents to call gateway management commands (send / schedule)
+# without triggering a 🔐 human-approval prompt in Rocket.Chat.
+_BUILTIN_OWNER_TOOL_RULES = [
+    ToolRule(tool="Bash", params="agent-chat-gateway\\s+send\\s+.*"),
+    ToolRule(tool="Bash", params="agent-chat-gateway\\s+schedule\\s+.*"),
+    # date is a read-only command used by agents to compute timestamps.
+    # It is safe to auto-approve for owners so that compound bash commands
+    # containing $(date ...) sub-expressions do not trigger approval prompts.
+    ToolRule(tool="Bash", params="date(\\s+.*)?"),
+]
+
+
 @dataclass
 class AgentConfig:
     name: str = "default"
@@ -92,6 +119,17 @@ class AgentConfig:
     guest_allowed_tools: list[ToolRule] = field(default_factory=list)  # auto-approved for guests
     timeout: int = 360           # seconds to wait for the agent to respond; must be > permissions.timeout
     permissions: PermissionConfig = field(default_factory=PermissionConfig)
+
+    def effective_owner_allowed_tools(self) -> "list[ToolRule]":
+        """Return owner_allowed_tools with built-in gateway rules prepended.
+
+        The built-in rules (``agent-chat-gateway send`` and
+        ``agent-chat-gateway schedule``) are always included so that agents can
+        call gateway management commands without triggering a 🔐 human-approval
+        prompt — no user config required.  User-defined rules follow the
+        built-in ones so that custom patterns can further extend the allow list.
+        """
+        return list(_BUILTIN_OWNER_TOOL_RULES) + list(self.owner_allowed_tools)
 
 
 @dataclass
@@ -183,19 +221,36 @@ class CoreConfig:
     ) -> list[str]:
         """Return the ordered list of context files to inject for a watcher session.
 
-        Concatenates three layers in order:
+        Concatenates four layers in order:
+          0. Built-in system files (auto-injected; no user config needed):
+               - rc-gateway-context.md  — injected for every Rocket.Chat connector
+               - scheduling-context.md  — injected for every configured connector
           1. Connector-level files (from ConnectorConfig.context_inject_files)
           2. Agent-level files    (from AgentConfig.context_inject_files)
           3. Watcher-level files  (passed in directly as watcher_ctx)
+
+        Built-in injection only fires when ConnectorConfig exists for the given
+        connector name.  This keeps unit-test CoreConfigs (which typically have no
+        connector entries) unaffected by auto-injection.
 
         Empty lists at any level are silently skipped.
         """
         result: list[str] = []
         connector_cfg = self.connector_configs.get(connector_name)
-        if connector_cfg:
+
+        # Layer 0: built-in system context files (shipped inside the package)
+        if connector_cfg is not None:
+            if connector_cfg.type == "rocketchat":
+                result.append(str(_BUILTIN_CONTEXTS_DIR / "rc-gateway-context.md"))
+            result.append(str(_BUILTIN_CONTEXTS_DIR / "scheduling-context.md"))
+            # Layer 1: connector-level user files
             result.extend(connector_cfg.context_inject_files)
+
+        # Layer 2: agent-level user files
         agent_cfg = self.agent_config(agent_name)
         result.extend(agent_cfg.context_inject_files)
+
+        # Layer 3: watcher-level user files
         result.extend(watcher_ctx)
         return result
 

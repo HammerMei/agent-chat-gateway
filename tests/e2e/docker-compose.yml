@@ -88,7 +88,13 @@ services:
   # Started separately (after setup.py creates RC accounts).
   # Config is pre-written in tests/e2e/acg-config/.
   acg:
-    image: ghcr.io/hammermei/agent-chat-gateway:latest
+    # Build from the current branch source so that unreleased features (e.g.
+    # the scheduling CLI) are available during E2E tests.  The published
+    # :latest image only tracks the main branch.
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile.acg
+    image: acg-e2e-local
     container_name: acg-e2e
     restart: unless-stopped
     depends_on:
