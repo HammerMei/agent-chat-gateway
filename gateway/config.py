@@ -34,12 +34,31 @@ class AttachmentConfig:
 
 
 @dataclass
+class SchedulerConfig:
+    """Configuration for the built-in job scheduler.
+
+    default_timezone:
+        IANA timezone used when ``--tz`` is not specified on ``acg schedule create``.
+        Example: ``"Asia/Taipei"``, ``"America/New_York"``, ``"UTC"``.
+        When empty, the ACG server's local timezone is used (and a warning is logged).
+
+    completed_job_ttl_days:
+        How long to retain COMPLETED jobs in jobs.json before purging them.
+        0 = remove immediately when completed.
+        Default: 7 days.
+    """
+    default_timezone: str = ""          # IANA timezone; empty = server local (with warning)
+    completed_job_ttl_days: int = 7     # days to keep completed jobs (0 = delete immediately)
+
+
+@dataclass
 class GatewayConfig:
     connectors: list[ConnectorConfig]
     agents: dict[str, AgentConfig]
     default_agent: str
     watchers: list[WatcherConfig] = field(default_factory=list)
     max_queue_depth: int = 100  # max pending messages per room queue; 0 = unbounded
+    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
 
     @property
     def agent(self) -> AgentConfig:
@@ -327,12 +346,30 @@ class GatewayConfig:
         if max_queue_depth < 0:
             raise ValueError("config.yaml 'max_queue_depth' must be >= 0")
 
+        # ── Scheduler ─────────────────────────────────────────────────────────
+
+        scheduler_raw = raw.get("scheduler", {}) or {}
+        if not isinstance(scheduler_raw, Mapping):
+            raise ValueError(
+                f"config.yaml 'scheduler:' must be a mapping (got {type(scheduler_raw).__name__})."
+            )
+        scheduler_ttl = scheduler_raw.get("completed_job_ttl_days", 7)
+        if not isinstance(scheduler_ttl, int) or scheduler_ttl < 0:
+            raise ValueError(
+                "config.yaml 'scheduler.completed_job_ttl_days' must be a non-negative integer."
+            )
+        scheduler_cfg = SchedulerConfig(
+            default_timezone=scheduler_raw.get("default_timezone", ""),
+            completed_job_ttl_days=scheduler_ttl,
+        )
+
         return GatewayConfig(
             connectors=connectors,
             agents=agents,
             default_agent=default_agent,
             watchers=watchers,
             max_queue_depth=max_queue_depth,
+            scheduler=scheduler_cfg,
         )
 
 

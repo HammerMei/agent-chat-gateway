@@ -169,6 +169,17 @@ class ContextInjector:
                 self._inject_status[session_id] = InjectionStatus(state="injected")
                 return
 
+            # Prepend a small dynamic header so the agent knows its own identity.
+            # This is added only when there is real file content to inject (i.e. we
+            # skip it for the "all files oversized" path above to avoid a pointless
+            # agent round-trip for just metadata).
+            dynamic_header = (
+                f"## ACG Session Identity\n"
+                f"- **Watcher name:** `{wc.name}`\n"
+                f"- **Connector:** `{connector_name}`\n"
+            )
+            combined_context.insert(0, dynamic_header)
+
             full_context = "\n\n".join(combined_context)
             encoded = full_context.encode()
             if len(encoded) > _MAX_CONTEXT_SIZE:

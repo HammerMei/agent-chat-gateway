@@ -803,5 +803,81 @@ class TestNoContextFilesImmediatelyInjected(unittest.IsolatedAsyncioTestCase):
         agent.send.assert_not_awaited()
 
 
+class TestContextInjectorDynamicHeader(unittest.IsolatedAsyncioTestCase):
+    """Dynamic watcher-identity header is prepended before static context files."""
+
+    async def test_dynamic_header_prepended_before_file_content(self):
+        """inject() must prepend ACG Session Identity before any static context."""
+        injector = _make_injector()
+        ws = _make_ws()
+        wc = WatcherConfig(
+            name="my-watcher",
+            connector="rc-home",
+            room="general",
+            agent="default",
+            context_inject_files=["/tmp/ctx.md"],
+        )
+        agent = MagicMock()
+
+        sent_prompt = None
+
+        async def capture_send(**kwargs):
+            nonlocal sent_prompt
+            sent_prompt = kwargs.get("prompt", "")
+            return AgentResponse(text="ok")
+
+        agent.send = capture_send
+
+        async def fake_to_thread(fn, *args, **kwargs):
+            name = getattr(fn, "__name__", str(fn))
+            if "exists" in name:
+                return True
+            if "stat" in name:
+                s = MagicMock()
+                s.st_size = 50
+                return s
+            if "read_text" in name:
+                return "# Static Context\nHello!"
+            return None
+
+        with patch("gateway.core.context_injector.asyncio.to_thread", side_effect=fake_to_thread):
+            await injector.inject(ws, "ses_header_test", agent, "default", "rc-home", wc)
+
+        self.assertIsNotNone(sent_prompt, "agent.send must have been called")
+        # Dynamic header must appear before the static file content
+        header_pos = sent_prompt.find("## ACG Session Identity")
+        static_pos = sent_prompt.find("# Static Context")
+        self.assertGreater(header_pos, -1, "Dynamic header must be present in injected context")
+        self.assertGreater(static_pos, -1, "Static file content must be present")
+        self.assertLess(header_pos, static_pos, "Header must come before static content")
+        # Watcher name and connector must appear in the header
+        self.assertIn("my-watcher", sent_prompt)
+        self.assertIn("rc-home", sent_prompt)
+
+    async def test_dynamic_header_not_sent_when_all_files_oversized(self):
+        """When all context files are oversized, agent.send must NOT be called."""
+        injector = _make_injector()
+        ws = _make_ws()
+        wc = _make_wc(["/tmp/ctx.md"])
+        agent = MagicMock()
+        agent.send = AsyncMock()
+
+        async def fake_to_thread(fn, *args, **kwargs):
+            name = getattr(fn, "__name__", str(fn))
+            if "exists" in name:
+                return True
+            if "stat" in name:
+                s = MagicMock()
+                s.st_size = _MAX_FILE_SIZE + 1  # oversized
+                return s
+            return None
+
+        with patch("gateway.core.context_injector.asyncio.to_thread", side_effect=fake_to_thread):
+            await injector.inject(ws, "ses_oversized", agent, "default", "rc", wc)
+
+        agent.send.assert_not_awaited()
+        self.assertTrue(ws.context_injected, "Should still be marked injected even when all oversized")
+
+
 if __name__ == "__main__":
     unittest.main()

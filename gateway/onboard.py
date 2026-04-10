@@ -105,7 +105,7 @@ def generate_config_yaml(
         },
         "reply_in_thread": False,
         "permission_reply_in_thread": True,
-        "context_inject_files": ["contexts/rc-gateway-context.md"],
+        "context_inject_files": [],  # built-in context files are auto-injected; add user files here
     }
 
     agent_command = agent_type  # "claude" or "opencode"
@@ -530,7 +530,16 @@ def run_onboard(repo_path: Path | None = None) -> None:
             "Start the gateway:\n"
             "  [bold]agent-chat-gateway start[/bold]\n\n"
             "Check status:\n"
-            "  [bold]agent-chat-gateway status[/bold]",
+            "  [bold]agent-chat-gateway status[/bold]\n\n"
+            "[dim]── Scheduling (optional) ──────────────────────────────[/dim]\n"
+            "Your agent automatically receives the built-in context files\n"
+            "(RC rules + scheduling commands) — no config needed.\n\n"
+            "You can ask the agent to schedule tasks, or use the CLI:\n"
+            "  [bold]agent-chat-gateway schedule create WATCHER MSG --every 1d --at 09:00[/bold]\n"
+            "  [bold]agent-chat-gateway schedule list[/bold]\n\n"
+            "To set a default timezone, add to your config.yaml:\n"
+            "  [dim]scheduler:\n"
+            "    default_timezone: \"Asia/Taipei\"[/dim]",
             border_style="green",
         )
     )

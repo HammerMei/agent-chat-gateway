@@ -4,6 +4,7 @@ Covers:
   - working_directory required and validated at config load (code_review Issue #6)
   - Config validation hardening: uniqueness, required fields, types (code_review)
   - cache_dir_global path resolution (code_review Issue #7)
+  - Built-in context auto-injection via context_inject_files_for() (layer-0 system files)
 
 Run with:
     uv run python -m pytest tests/test_config_loading.py -v
@@ -420,6 +421,234 @@ class TestGatewayConfigAgentProperty(unittest.TestCase):
             _ = cfg.agent
         error_str = str(ctx.exception)
         self.assertIn("gamma", error_str)
+
+
+# ── Tests: built-in context auto-injection ────────────────────────────────────
+
+
+class TestBuiltinContextAutoInjection(unittest.TestCase):
+    """Built-in system context files are auto-prepended in context_inject_files_for().
+
+    rc-gateway-context.md  → injected for every Rocket.Chat connector
+    scheduling-context.md  → injected for every configured connector
+    """
+
+    def _make_core_config(self, connector_type: str, user_ctx: list[str] | None = None):
+        from gateway.core.config import AgentConfig, ConnectorConfig, CoreConfig
+        connector = ConnectorConfig(
+            name="rc",
+            type=connector_type,
+            raw={},
+            context_inject_files=user_ctx or [],
+        )
+        agent = AgentConfig(name="default", timeout=10)
+        return CoreConfig(
+            connector_configs={"rc": connector},
+            agents={"default": agent},
+            default_agent="default",
+        )
+
+    def test_rc_connector_gets_both_builtin_files(self):
+        """RC connector → rc-gateway-context.md + scheduling-context.md prepended."""
+        config = self._make_core_config("rocketchat")
+        files = config.context_inject_files_for("rc", "default", [])
+        basenames = [Path(f).name for f in files]
+        self.assertIn("rc-gateway-context.md", basenames)
+        self.assertIn("scheduling-context.md", basenames)
+
+    def test_rc_gateway_context_comes_before_scheduling(self):
+        """rc-gateway-context.md must appear before scheduling-context.md."""
+        config = self._make_core_config("rocketchat")
+        files = config.context_inject_files_for("rc", "default", [])
+        basenames = [Path(f).name for f in files]
+        rc_idx = basenames.index("rc-gateway-context.md")
+        sched_idx = basenames.index("scheduling-context.md")
+        self.assertLess(rc_idx, sched_idx)
+
+    def test_non_rc_connector_gets_scheduling_only(self):
+        """Non-RC connector → only scheduling-context.md injected (no rc-gateway-context.md)."""
+        config = self._make_core_config("script")
+        files = config.context_inject_files_for("rc", "default", [])
+        basenames = [Path(f).name for f in files]
+        self.assertNotIn("rc-gateway-context.md", basenames)
+        self.assertIn("scheduling-context.md", basenames)
+
+    def test_builtin_files_precede_user_connector_files(self):
+        """Built-in layer 0 files must come before user-configured connector files."""
+        config = self._make_core_config("rocketchat", user_ctx=["/user/custom.md"])
+        files = config.context_inject_files_for("rc", "default", [])
+        basenames = [Path(f).name for f in files]
+        sched_idx = basenames.index("scheduling-context.md")
+        custom_idx = basenames.index("custom.md")
+        self.assertLess(sched_idx, custom_idx)
+
+    def test_builtin_files_are_absolute_paths(self):
+        """Built-in file paths must be absolute (so ContextInjector can read them)."""
+        config = self._make_core_config("rocketchat")
+        files = config.context_inject_files_for("rc", "default", [])
+        builtin = [f for f in files if Path(f).name in ("rc-gateway-context.md", "scheduling-context.md")]
+        for f in builtin:
+            self.assertTrue(Path(f).is_absolute(), f"{f} must be absolute")
+
+    def test_builtin_files_actually_exist_in_package(self):
+        """Built-in context files must be present in the installed package."""
+        config = self._make_core_config("rocketchat")
+        files = config.context_inject_files_for("rc", "default", [])
+        builtin = [f for f in files if Path(f).name in ("rc-gateway-context.md", "scheduling-context.md")]
+        for f in builtin:
+            self.assertTrue(Path(f).exists(), f"Built-in context file missing: {f}")
+
+    def test_no_connector_config_skips_builtin_injection(self):
+        """When ConnectorConfig is absent (e.g. tests), no built-in files are prepended."""
+        from gateway.core.config import AgentConfig, CoreConfig
+        config = CoreConfig(agents={"default": AgentConfig(timeout=10)}, default_agent="default")
+        files = config.context_inject_files_for("unknown-connector", "default", [])
+        basenames = [Path(f).name for f in files]
+        self.assertNotIn("rc-gateway-context.md", basenames)
+        self.assertNotIn("scheduling-context.md", basenames)
+
+    def test_watcher_user_files_appended_after_builtin(self):
+        """Watcher-level user files are appended last, after all built-in and agent files."""
+        config = self._make_core_config("rocketchat")
+        files = config.context_inject_files_for("rc", "default", ["/watcher/extra.md"])
+        basenames = [Path(f).name for f in files]
+        sched_idx = basenames.index("scheduling-context.md")
+        extra_idx = basenames.index("extra.md")
+        self.assertLess(sched_idx, extra_idx)
+
+
+# ── Tests: built-in owner tool rule auto-injection ────────────────────────────
+
+
+class TestBuiltinOwnerToolRuleAutoInjection(unittest.TestCase):
+    """Built-in gateway tool rules are always prepended to owner_allowed_tools.
+
+    These ensure that `agent-chat-gateway send`, `agent-chat-gateway schedule`,
+    and `date` never require a 🔐 human-approval prompt.  The first two are the
+    gateway's own commands; `date` is a read-only command used by agents to
+    compute timestamps in compound bash expressions (e.g. ``$(date ...)``).
+    """
+
+    def _make_agent(self, extra_rules=None):
+        from gateway.core.config import AgentConfig, ToolRule
+        rules = []
+        if extra_rules:
+            rules = [ToolRule(tool="Bash", params=p) for p in extra_rules]
+        return AgentConfig(name="test", owner_allowed_tools=rules)
+
+    def test_effective_includes_send_rule(self):
+        """effective_owner_allowed_tools() must include 'agent-chat-gateway send .*'."""
+        agent = self._make_agent()
+        effective = agent.effective_owner_allowed_tools()
+        params = [r.params for r in effective if r.tool == "Bash"]
+        self.assertTrue(
+            any("agent-chat-gateway" in (p or "") and "send" in (p or "") for p in params),
+            "Built-in send rule must be in effective_owner_allowed_tools",
+        )
+
+    def test_effective_includes_schedule_rule(self):
+        """effective_owner_allowed_tools() must include 'agent-chat-gateway schedule .*'."""
+        agent = self._make_agent()
+        effective = agent.effective_owner_allowed_tools()
+        params = [r.params for r in effective if r.tool == "Bash"]
+        self.assertTrue(
+            any("agent-chat-gateway" in (p or "") and "schedule" in (p or "") for p in params),
+            "Built-in schedule rule must be in effective_owner_allowed_tools",
+        )
+
+    def test_builtin_rules_precede_user_rules(self):
+        """Built-in rules must come before user-defined rules."""
+        from gateway.core.config import _BUILTIN_OWNER_TOOL_RULES
+        agent = self._make_agent(extra_rules=["git log.*"])
+        effective = agent.effective_owner_allowed_tools()
+        builtin_count = len(_BUILTIN_OWNER_TOOL_RULES)
+        # First N entries must match the built-in rules
+        for i, builtin_rule in enumerate(_BUILTIN_OWNER_TOOL_RULES):
+            self.assertEqual(effective[i].tool, builtin_rule.tool)
+            self.assertEqual(effective[i].params, builtin_rule.params)
+        # The user rule follows after
+        self.assertEqual(effective[builtin_count].params, "git log.*")
+
+    def test_owner_allowed_tools_field_unchanged(self):
+        """effective_owner_allowed_tools() must NOT mutate owner_allowed_tools in place."""
+        from gateway.core.config import ToolRule
+        user_rule = ToolRule(tool="Bash", params="ls.*")
+        agent = self._make_agent()
+        agent.owner_allowed_tools = [user_rule]
+        original_len = len(agent.owner_allowed_tools)
+        agent.effective_owner_allowed_tools()
+        self.assertEqual(len(agent.owner_allowed_tools), original_len)
+
+    def test_empty_owner_list_still_gets_builtins(self):
+        """An agent with an empty owner_allowed_tools still gets the built-in rules."""
+        from gateway.core.config import _BUILTIN_OWNER_TOOL_RULES
+        agent = self._make_agent()
+        effective = agent.effective_owner_allowed_tools()
+        self.assertGreaterEqual(len(effective), len(_BUILTIN_OWNER_TOOL_RULES))
+
+    def test_send_rule_matches_actual_command(self):
+        """The send rule must actually match a realistic agent-chat-gateway send command."""
+        import re
+
+        from gateway.core.config import _BUILTIN_OWNER_TOOL_RULES
+        send_rule = next(r for r in _BUILTIN_OWNER_TOOL_RULES
+                         if r.params and "send" in r.params)
+        cmd = 'agent-chat-gateway send general "Hello RC"'
+        self.assertIsNotNone(
+            re.fullmatch(send_rule.params, cmd, re.IGNORECASE | re.DOTALL),
+            f"Send rule {send_rule.params!r} must match command {cmd!r}",
+        )
+
+    def test_schedule_rule_matches_actual_command(self):
+        """The schedule rule must actually match a realistic agent-chat-gateway schedule command."""
+        import re
+
+        from gateway.core.config import _BUILTIN_OWNER_TOOL_RULES
+        sched_rule = next(r for r in _BUILTIN_OWNER_TOOL_RULES
+                          if r.params and "schedule" in r.params)
+        cmd = 'agent-chat-gateway schedule create dm "Remind me to cook" --every 1d --at 09:00'
+        self.assertIsNotNone(
+            re.fullmatch(sched_rule.params, cmd, re.IGNORECASE | re.DOTALL),
+            f"Schedule rule {sched_rule.params!r} must match command {cmd!r}",
+        )
+
+    def test_effective_includes_date_rule(self):
+        """effective_owner_allowed_tools() must include a rule that auto-approves date."""
+        agent = self._make_agent()
+        effective = agent.effective_owner_allowed_tools()
+        params = [r.params for r in effective if r.tool == "Bash"]
+        self.assertTrue(
+            any("date" in (p or "") for p in params),
+            "Built-in date rule must be in effective_owner_allowed_tools",
+        )
+
+    def test_date_rule_matches_bare_date(self):
+        """The date rule must match 'date' with no arguments."""
+        import re
+
+        from gateway.core.config import _BUILTIN_OWNER_TOOL_RULES
+        date_rule = next(r for r in _BUILTIN_OWNER_TOOL_RULES
+                         if r.params and "date" in r.params
+                         and "agent-chat-gateway" not in r.params)
+        cmd = "date"
+        self.assertIsNotNone(
+            re.fullmatch(date_rule.params, cmd, re.IGNORECASE | re.DOTALL),
+            f"Date rule {date_rule.params!r} must match command {cmd!r}",
+        )
+
+    def test_date_rule_matches_date_with_flags(self):
+        """The date rule must match date commands used for timestamp calculation."""
+        import re
+
+        from gateway.core.config import _BUILTIN_OWNER_TOOL_RULES
+        date_rule = next(r for r in _BUILTIN_OWNER_TOOL_RULES
+                         if r.params and "date" in r.params
+                         and "agent-chat-gateway" not in r.params)
+        cmd = "date -v+1M '+%Y-%m-%d %H:%M'"
+        self.assertIsNotNone(
+            re.fullmatch(date_rule.params, cmd, re.IGNORECASE | re.DOTALL),
+            f"Date rule {date_rule.params!r} must match command {cmd!r}",
+        )
 
 
 if __name__ == "__main__":

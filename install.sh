@@ -152,15 +152,16 @@ RUNTIME_DIR="$HOME/.agent-chat-gateway"
 mkdir -p "$RUNTIME_DIR"
 
 # ---------------------------------------------------------------------------
-# Copy bundled context files to runtime dir
-# These are reference files (e.g. rc-gateway-context.md) that config.yaml
-# points to.  Copied (not symlinked) so users can safely edit them without
-# touching the git repo.  Upgrade handles smart merge via upgrade.py.
+# Copy user-facing example context files to runtime dir.
+# Built-in system files (rc-gateway-context.md, scheduling-context.md) are
+# bundled inside the gateway Python package and auto-injected at runtime —
+# they no longer need to be copied here.
+# Only user-editable examples (e.g. rc-room-profiles.example.md) are copied.
 # ---------------------------------------------------------------------------
-if [ -d "$REPO_DIR/contexts" ]; then
+if [ -d "$REPO_DIR/contexts" ] && [ -n "$(ls "$REPO_DIR/contexts/" 2>/dev/null)" ]; then
     mkdir -p "$RUNTIME_DIR/contexts"
     cp "$REPO_DIR/contexts/"* "$RUNTIME_DIR/contexts/"
-    success "Copied context files to $RUNTIME_DIR/contexts/"
+    success "Copied example context files to $RUNTIME_DIR/contexts/"
 fi
 
 # ---------------------------------------------------------------------------

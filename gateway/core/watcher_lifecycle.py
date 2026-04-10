@@ -300,6 +300,19 @@ class WatcherLifecycle:
         """Return the WatcherState for a watcher, or None if not found."""
         return self._states.get(name)
 
+    def get_processor(self, watcher_name: str) -> "MessageProcessor | None":
+        """Return the active MessageProcessor for a watcher, or None if not running.
+
+        Used by the scheduler to inject synthetic messages directly into the
+        processing queue, bypassing the connector layer entirely (and therefore
+        the self-message filter that would drop messages sent by the bot user).
+        """
+        return self._processors.get(watcher_name)
+
+    def get_watcher_config(self, watcher_name: str) -> "WatcherConfig | None":
+        """Return the WatcherConfig for a watcher name, or None if not found."""
+        return next((wc for wc in self._watcher_configs if wc.name == watcher_name), None)
+
     # ── Shutdown ──────────────────────────────────────────────────────────────
 
     async def stop_all(self) -> None:
