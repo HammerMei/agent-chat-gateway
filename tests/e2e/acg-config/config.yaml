@@ -28,8 +28,7 @@ connectors:
       download_timeout: 30
     reply_in_thread: false
     permission_reply_in_thread: false
-    context_inject_files:
-      - /root/.agent-chat-gateway/contexts/rc-gateway-context.md
+    context_inject_files: []  # rc-gateway-context.md is auto-injected by ACG at layer 0
 
 agents:
   # ── OpenCode — bound to DM ────────────────────────────────────────────────
