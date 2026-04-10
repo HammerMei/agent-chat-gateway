@@ -169,6 +169,14 @@ class SessionManager:
         # Build a minimal Room from persisted state (room_id + room_type)
         state = self._lifecycle.get_watcher_state(watcher_name)
         wc = self._lifecycle.get_watcher_config(watcher_name)
+        if state is None:
+            logger.warning(
+                "inject_message: no persisted state for watcher %r — "
+                "room_id will be empty, which may cause the agent response to "
+                "be posted to the wrong room or dropped. "
+                "Ensure the watcher has been active at least once so its state is persisted.",
+                watcher_name,
+            )
         room_id = state.room_id if state else ""
         room_name = wc.room if wc else watcher_name
         room_type = state.room_type if state else "channel"

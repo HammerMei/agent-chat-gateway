@@ -410,6 +410,13 @@ def _run_schedule_create(args) -> None:
     # the job from re-firing every year (5-field cron has no year field).
     times = args.times
     if args.every is None and times == 0:
+        # No recurring interval + default times=0 (forever) → treat as one-shot.
+        # This branch only fires when --starting is provided without --every
+        # (pure datetime one-shot).  Branch 2 below (relative one-shot via --every
+        # Nm/Nh --times 1) does NOT reach here because args.every is not None.
+        # The two branches are mutually exclusive: Branch 1 fires when
+        # args.starting is not None; Branch 2 fires when args.every is not None
+        # and times (after this assignment) is 1.
         times = 1  # default one-shot to exactly 1 run
 
     cron: str | None = None
@@ -559,9 +566,9 @@ def _run_schedule_list(args) -> None:
     # Header
     print(
         f"{'ID':<14}  {'WATCHER':<20}  {'STATUS':<10}  "
-        f"{'CRON':<16}  {'RUNS':<12}  {'NEXT RUN (UTC)':<22}  MESSAGE"
+        f"{'CRON':<20}  {'RUNS':<12}  {'NEXT RUN (UTC)':<22}  MESSAGE"
     )
-    print("-" * 120)
+    print("-" * 124)
 
     for j in jobs:
         job_id = j.get("id", "?")
@@ -580,7 +587,7 @@ def _run_schedule_list(args) -> None:
         message = textwrap.shorten(j.get("message", ""), width=40, placeholder="…")
         print(
             f"{job_id:<14}  {watcher:<20}  {status:<10}  "
-            f"{cron:<16}  {runs_str:<12}  {next_run_str:<22}  {message}"
+            f"{cron:<20}  {runs_str:<12}  {next_run_str:<22}  {message}"
         )
 
 
@@ -614,21 +621,34 @@ def _run_schedule_resume(args) -> None:
 
 
 def _get_local_tz_name() -> str:
-    """Return the server's local IANA timezone name (e.g. 'America/Los_Angeles').
+    """Return the server's local IANA timezone name.
 
-    Reads /etc/localtime symlink which works on macOS and most Linux distros.
-    Falls back to a UTC-offset abbreviation if the symlink cannot be resolved.
+    Delegates to the canonical shared implementation in ``gateway.core.tz_utils``
+    to avoid duplicating the /etc/localtime parsing logic here.
     """
-    import os
-    try:
-        link = os.readlink("/etc/localtime")
-        for prefix in ("/var/db/timezone/zoneinfo/", "/usr/share/zoneinfo/"):
-            if link.startswith(prefix):
-                return link[len(prefix):]
-    except (OSError, AttributeError, ValueError):
-        pass
-    # Last resort: "%Z" gives "PST"/"PDT" — not a valid IANA name but better than UTC.
-    return datetime.now().astimezone().strftime("%Z")
+    from gateway.core.tz_utils import local_iana_timezone
+    return local_iana_timezone()
+
+
+def _advance_by_one_year(candidate: "datetime") -> "datetime":
+    """Return candidate advanced by one year, handling Feb 29 in non-leap years.
+
+    ``datetime.replace(year=y+1)`` raises ``ValueError`` when the candidate is
+    Feb 29 and the next year is not a leap year.  In that case we search forward
+    for the next leap year (guaranteed within 8 years).
+    """
+    from datetime import timedelta as _td
+    target_year = candidate.year + 1
+    for offset in range(8):
+        try:
+            return candidate.replace(year=target_year + offset)
+        except ValueError:
+            continue
+    # Unreachable in practice (leap years repeat every 4 years at most)
+    raise ValueError(
+        f"Cannot advance {candidate.strftime('%b %d')} to a valid future date — "
+        "no Feb 29 exists within the next 8 years."
+    )
 
 
 @dataclass
@@ -665,13 +685,17 @@ def _parse_starting(starting_str: str, tz_name: str | None, now_utc: datetime) -
             tz = ZoneInfo(tz_name)
             tz_str = tz_name
         else:
-            # Fall back to the server's local timezone (not UTC) so that
+            # Fall back to the server's local IANA timezone (not UTC) so that
             # times like "22:38" are interpreted as local wall-clock time.
-            tz = datetime.now().astimezone().tzinfo  # type: ignore[assignment]
+            # IMPORTANT: use ZoneInfo(tz_str), NOT datetime.now().astimezone().tzinfo.
+            # The latter returns a fixed UTC-offset object (e.g. UTC-7) that does not
+            # observe DST transitions, so tz and tz_str would silently diverge when
+            # the clock changes — schedules could be off by one hour post-transition.
             tz_str = _get_local_tz_name()
+            tz = ZoneInfo(tz_str)
     except ZoneInfoNotFoundError:
-        tz = datetime.now().astimezone().tzinfo  # type: ignore[assignment]
-        tz_str = _get_local_tz_name()
+        tz_str = "UTC"
+        tz = ZoneInfo("UTC")
 
     # Convert now_utc to local time for comparisons
     now_local = now_utc.astimezone(tz)
@@ -740,7 +764,7 @@ def _parse_starting(starting_str: str, tz_name: str | None, now_utc: datetime) -
             raise ValueError(f"Invalid date in --starting: {e}") from e
         was_past = candidate <= now_local
         if was_past:
-            candidate = candidate.replace(year=candidate.year + 1)
+            candidate = _advance_by_one_year(candidate)
         first_run = candidate.astimezone(UTC)
         return _ParsedStarting(first_run=first_run, hour=h, minute=m, dow=None, was_past=was_past, tz_str=tz_str)
 
@@ -758,27 +782,41 @@ def _parse_starting(starting_str: str, tz_name: str | None, now_utc: datetime) -
             raise ValueError(f"Invalid date in --starting: {e}") from e
         was_past = candidate <= now_local
         if was_past:
-            candidate = candidate.replace(year=candidate.year + 1)
+            candidate = _advance_by_one_year(candidate)
         first_run = candidate.astimezone(UTC)
         return _ParsedStarting(first_run=first_run, hour=h, minute=m, dow=None, was_past=was_past, tz_str=tz_str)
 
     # ── Format 5: "YYYY-MM-DD HH:MM" (explicit full datetime) ─────────────────
+    # Unlike partial formats (HH:MM, Mon HH:MM, etc.) which auto-advance to the
+    # next occurrence, a full explicit datetime represents a single unambiguous
+    # point in time.  If that point is in the past, it's almost certainly a typo
+    # — raise an error rather than silently creating a job that fires immediately.
     full_dt_formats = ["%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y/%m/%d %H:%M"]
     for fmt in full_dt_formats:
         try:
             naive_dt = datetime.strptime(stripped, fmt)
             candidate = naive_dt.replace(tzinfo=tz)
-            was_past = candidate.astimezone(UTC) <= now_utc
             first_run = candidate.astimezone(UTC)
+            was_past = first_run <= now_utc
+            if was_past:
+                raise ValueError(
+                    f"--starting {starting_str!r} is in the past "
+                    f"({first_run.strftime('%Y-%m-%d %H:%M UTC')}). "
+                    "Please provide a future datetime."
+                )
             return _ParsedStarting(
                 first_run=first_run,
                 hour=naive_dt.hour,
                 minute=naive_dt.minute,
                 dow=None,
-                was_past=was_past,
+                was_past=False,
                 tz_str=tz_str,
             )
-        except ValueError:
+        except ValueError as exc:
+            # If we raised the "is in the past" error above, propagate it.
+            # Otherwise (strptime format mismatch), try the next format.
+            if "is in the past" in str(exc):
+                raise
             continue
 
     raise ValueError(
@@ -809,6 +847,10 @@ def _parse_one_shot_interval(every: str) -> int | None:
         _parse_one_shot_interval("1d")   → None  (falls through to _INTERVAL_MAP)
         _parse_one_shot_interval("bad")  → None
     """
+    # Cap at 1 year to prevent absurdly far-future one-shot jobs that would be
+    # hard to cancel and may not be the user's intent (e.g. "100000h").
+    _MAX_ONE_SHOT_MINUTES = 365 * 24 * 60  # 525 600 minutes ≈ 1 year
+
     import re as _re
     m = _re.fullmatch(r"(\d+)(m|h)", every.strip().lower())
     if not m:
@@ -816,7 +858,10 @@ def _parse_one_shot_interval(every: str) -> int | None:
     value, unit = int(m.group(1)), m.group(2)
     if value <= 0:
         return None
-    return value if unit == "m" else value * 60
+    total_minutes = value if unit == "m" else value * 60
+    if total_minutes > _MAX_ONE_SHOT_MINUTES:
+        return None  # reject; caller falls through to _build_cron_expression which will error
+    return total_minutes
 
 # Interval → (default_cron, description).  default_cron uses * for unset fields;
 # --at overrides the time components.  Defined at module level (not inside the

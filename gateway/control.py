@@ -28,32 +28,7 @@ logger = logging.getLogger("agent-chat-gateway.control")
 CONTROL_SOCK = RUNTIME_DIR / "control.sock"
 
 
-def _server_local_timezone() -> str:
-    """Return the IANA timezone name for the server's local timezone.
-
-    Reads the /etc/localtime symlink (standard on Linux/macOS) to extract the
-    IANA timezone name (e.g. "Asia/Taipei").  Falls back to "UTC" if the
-    symlink is absent, broken, or points to an unexpected path.
-
-    NOTE: ``datetime.now().astimezone().tzinfo`` returns a UTC-offset object
-    (str: "UTC+08:00") which is NOT a valid IANA name and would cause
-    ``zoneinfo.ZoneInfo()`` to raise ``ZoneInfoNotFoundError``.  Do NOT use
-    that approach.
-
-    Platform support: Linux and macOS only (both use ``/etc/localtime``).
-    Windows does not have ``/etc/localtime`` and will always fall back to "UTC".
-    If Windows support is ever needed, use the ``tzlocal`` package instead.
-    """
-    import pathlib
-    try:
-        tz_path = pathlib.Path("/etc/localtime")
-        if tz_path.is_symlink():
-            target = str(tz_path.resolve())
-            if "zoneinfo/" in target:
-                return target.split("zoneinfo/", 1)[1]  # e.g. "Asia/Taipei"
-    except Exception:
-        pass
-    return "UTC"
+from .core.tz_utils import local_iana_timezone as _server_local_timezone
 
 
 class ControlServer:
@@ -244,7 +219,7 @@ class ControlServer:
 
         # schedule-*: managed by JobStore (no connector routing needed)
         if cmd and cmd.startswith("schedule-"):
-            return await self._handle_schedule(cmd, request)
+            return self._handle_schedule(cmd, request)
 
         # All other commands: route to a specific entry
         entry = self._resolve_entry(connector_name)
@@ -277,8 +252,15 @@ class ControlServer:
             }
         return self._entries[0]
 
-    async def _handle_schedule(self, cmd: str, request: dict) -> dict:
-        """Route schedule-* commands to the JobStore."""
+    def _handle_schedule(self, cmd: str, request: dict) -> dict:
+        """Route schedule-* commands to the JobStore.
+
+        All sub-handlers are synchronous (they call JobStore.save() which is
+        synchronous file I/O).  This method is therefore a plain def — not async —
+        to make the call-site ``return self._handle_schedule(cmd, request)`` in
+        ``dispatch_command`` accurate and avoid the misleading impression that there
+        is any I/O awaiting happening here.
+        """
         if self._job_store is None:
             return {"ok": False, "error": "Scheduler is not enabled (JobStore not configured)"}
 
@@ -329,7 +311,30 @@ class ControlServer:
 
         now = datetime.now(UTC)
         next_run_override = request.get("next_run")
-        if next_run_override:
+        if next_run_override is not None:
+            # Validate: must be a parseable, timezone-aware ISO 8601 string.
+            # An untrusted or malformed value stored verbatim would cause the
+            # scheduler to skip the job (ValueError on parse) or fire it
+            # immediately on every tick (past timestamp).
+            try:
+                nr_dt = datetime.fromisoformat(next_run_override)
+            except ValueError:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"Invalid 'next_run' value {next_run_override!r}: "
+                        "must be an ISO 8601 datetime string "
+                        "(e.g. '2026-04-10T15:30:00+00:00')"
+                    ),
+                }
+            if nr_dt.tzinfo is None:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"'next_run' value {next_run_override!r} is missing timezone info. "
+                        "Use UTC offset (e.g. '+00:00') or 'Z'."
+                    ),
+                }
             next_run = next_run_override
         else:
             try:

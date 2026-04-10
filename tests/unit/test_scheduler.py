@@ -287,6 +287,40 @@ class TestJobSchedulerCatchUp(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(updated.run_count, 1)
         self.assertEqual(updated.status, JobStatus.COMPLETED)
 
+    async def test_catch_up_remaining_one_fires_exactly_once(self):
+        """T6: remaining==1 fast-path in _fire_catch_up fires exactly once.
+
+        A job with times=2 and run_count=1 has exactly 1 remaining run.
+        The catch-up fast-path should fire it once and mark it COMPLETED,
+        without calling compute_all_missed (which would be wasteful and
+        could over-count for long downtime windows).
+        """
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = JobStore(jobs_file=Path(tmp.name) / "jobs.json")
+        store.load()
+        sm = MagicMock()
+        sm.inject_message = AsyncMock(return_value=True)
+
+        now = datetime.now(UTC)
+        job = store.add(_make_job(
+            cron="* * * * *",   # every minute — would produce many missed fires
+            times=2,
+            run_count=1,        # 1 run already done → remaining = 1
+            next_run=(now - timedelta(days=7)).isoformat(),  # very overdue
+            last_run=(now - timedelta(days=7, minutes=1)).isoformat(),
+        ))
+
+        scheduler = JobScheduler(store=store, session_managers={"rc-home": sm}, completed_job_ttl_days=7)
+        await scheduler._catch_up_missed()
+
+        updated = store.get(job.id)
+        # Must fire exactly once (not many times due to the 7-day backlog)
+        self.assertEqual(updated.run_count, 2)
+        self.assertEqual(updated.status, JobStatus.COMPLETED)
+        # inject_message must be called exactly once
+        self.assertEqual(sm.inject_message.call_count, 1)
+
 
 class TestJobSchedulerPurge(unittest.IsolatedAsyncioTestCase):
     async def test_tick_purges_expired_completed(self):
@@ -707,13 +741,18 @@ class TestParseStarting(unittest.TestCase):
         self.assertEqual(result.hour, 9)
         self.assertEqual(result.minute, 0)
 
-    def test_full_datetime_past_was_past_true(self):
-        """'2000-01-01 09:00' (past) → was_past=True, first_run still that datetime."""
+    def test_full_datetime_past_raises_error(self):
+        """'2000-01-01 09:00' (past full datetime) → ValueError (not silently created).
+
+        Unlike partial formats (HH:MM, Mon HH:MM) which auto-advance to the next
+        occurrence, an explicit full datetime in the past is almost certainly a typo.
+        We raise an error so the user can correct it rather than creating a job
+        that fires immediately.
+        """
         now = datetime(2026, 4, 9, 10, 0, 0, tzinfo=UTC)
-        result = self._parse("2000-01-01 09:00", now_utc=now)
-        self.assertTrue(result.was_past)
-        # first_run is the literal datetime (no auto-advance for full explicit datetimes)
-        self.assertEqual(result.first_run.astimezone(UTC).year, 2000)
+        with self.assertRaises(ValueError) as ctx:
+            self._parse("2000-01-01 09:00", now_utc=now)
+        self.assertIn("in the past", str(ctx.exception))
 
     # ── Timezone handling ─────────────────────────────────────────────────────
 
@@ -757,6 +796,114 @@ class TestParseStarting(unittest.TestCase):
         """Empty string raises ValueError."""
         with self.assertRaises(ValueError):
             self._parse("")
+
+    # ── T2: Feb 29 year-advance ───────────────────────────────────────────────
+
+    def test_feb29_advance_skips_non_leap_year(self):
+        """'Feb 29 09:00' on a leap year that has passed → advances to next leap year."""
+        # 2028-02-29 is a real date; 2029 is not a leap year.
+        # Simulate: today is 2028-03-01 (past Feb 29, 2028).
+        from zoneinfo import ZoneInfo
+        now = datetime(2028, 3, 1, 10, 0, 0, tzinfo=UTC)
+        result = self._parse("Feb 29 09:00", now_utc=now)
+        self.assertTrue(result.was_past)
+        # first_run must be a real date (Feb 29 exists in the advanced year)
+        fr = result.first_run.astimezone(UTC)
+        self.assertEqual(fr.month, 2)
+        self.assertEqual(fr.day, 29)
+        self.assertGreater(fr.year, 2028)
+
+    def test_feb29_mmdd_advance_skips_non_leap_year(self):
+        """'02-29 09:00' (MM-DD format) on a past leap year → advances to next leap year."""
+        now = datetime(2028, 3, 1, 10, 0, 0, tzinfo=UTC)
+        result = self._parse("02-29 09:00", now_utc=now)
+        self.assertTrue(result.was_past)
+        fr = result.first_run.astimezone(UTC)
+        self.assertEqual(fr.month, 2)
+        self.assertEqual(fr.day, 29)
+        self.assertGreater(fr.year, 2028)
+
+    # ── T5: local_iana_timezone fallback ─────────────────────────────────────
+
+    def test_local_iana_timezone_returns_valid_string(self):
+        """local_iana_timezone() returns a non-empty string on the current system."""
+        from gateway.core.tz_utils import local_iana_timezone
+        result = local_iana_timezone()
+        self.assertIsInstance(result, str)
+        self.assertTrue(result, "Expected a non-empty timezone string")
+
+    def test_local_iana_timezone_fallback_when_not_symlink(self, *args):
+        """local_iana_timezone() falls back to 'UTC' when /etc/localtime cannot be read."""
+        from unittest.mock import patch
+        from gateway.core.tz_utils import local_iana_timezone
+        # Simulate /etc/localtime not being a symlink (e.g. Alpine container)
+        with patch("pathlib.Path.is_symlink", return_value=False):
+            result = local_iana_timezone()
+        self.assertEqual(result, "UTC")
+
+    # ── T7: DOW same-day past + MM-DD year rollover ──────────────────────────
+
+    def test_dow_same_day_past_advances_by_7(self):
+        """'Mon 09:00' on a Monday at 10:00 (09:00 already past) → next Monday (+7 days)."""
+        # 2026-04-13 is a Monday; now is 10:00 (past 09:00)
+        now = datetime(2026, 4, 13, 10, 0, 0, tzinfo=UTC)
+        result = self._parse("Mon 09:00", now_utc=now)
+        self.assertTrue(result.was_past)
+        # first_run should be the NEXT Monday (Apr 20)
+        fr = result.first_run.astimezone(UTC)
+        self.assertEqual(fr.date().isoformat(), "2026-04-20")
+        self.assertEqual(result.dow, "1")
+
+    def test_mmdd_past_advances_one_year(self):
+        """'04-15 09:00' when today is Apr 16 → next year's Apr 15."""
+        now = datetime(2026, 4, 16, 10, 0, 0, tzinfo=UTC)
+        result = self._parse("04-15 09:00", now_utc=now)
+        self.assertTrue(result.was_past)
+        fr = result.first_run.astimezone(UTC)
+        self.assertEqual(fr.year, 2027)
+        self.assertEqual(fr.month, 4)
+        self.assertEqual(fr.day, 15)
+
+
+class TestInjectMessageStateNone(unittest.IsolatedAsyncioTestCase):
+    """T3: inject_message logs a warning when persisted state is None (room_id unknown)."""
+
+    async def test_inject_message_warns_when_state_is_none(self):
+        """inject_message should log a warning when get_watcher_state() returns None.
+
+        When no state exists (watcher never joined a room), room_id is empty.
+        The message should still be injected (if a processor exists) but a warning
+        must be emitted so operators can diagnose missing room routing.
+        """
+        import logging
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from gateway.core.session_manager import SessionManager
+
+        # Build a minimal SessionManager with mocked collaborators
+        mock_connector = MagicMock()
+        mock_connector.connect = AsyncMock()
+        mock_connector.register_handler = MagicMock()
+        mock_connector.register_capacity_check = MagicMock()
+
+        mock_processor = MagicMock()
+        mock_processor.enqueue = AsyncMock(return_value=True)
+
+        mock_lifecycle = MagicMock()
+        mock_lifecycle.get_processor = MagicMock(return_value=mock_processor)
+        mock_lifecycle.get_watcher_state = MagicMock(return_value=None)   # ← no state
+        mock_lifecycle.get_watcher_config = MagicMock(return_value=None)
+
+        sm = SessionManager.__new__(SessionManager)
+        sm._lifecycle = mock_lifecycle
+
+        with self.assertLogs("agent-chat-gateway.core.session_manager", level=logging.WARNING) as log_ctx:
+            result = await sm.inject_message("test-watcher", "hello")
+
+        self.assertTrue(result, "inject_message should succeed even without state")
+        # Verify warning was logged about missing state
+        warning_msgs = [r for r in log_ctx.output if "no persisted state" in r]
+        self.assertTrue(warning_msgs, "Expected a warning about missing watcher state")
 
 
 if __name__ == "__main__":
