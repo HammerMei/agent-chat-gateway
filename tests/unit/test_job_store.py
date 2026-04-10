@@ -319,7 +319,10 @@ class TestJobStoreConcurrency(unittest.TestCase):
     """
 
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
+        # ignore_cleanup_errors=True: Python 3.13 on macOS raises OSError when
+        # cleanup runs while a background thread is still writing a temp file
+        # inside the directory.  The flag was added in Python 3.10.
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.store = JobStore(jobs_file=Path(self._tmp.name) / "jobs.json")
         self.store.load()
 
