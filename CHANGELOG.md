@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.2.0] - 2026-04-10
+
+### Added
+- **In-process job scheduler** (`acg schedule`): schedule recurring or one-shot
+  agent tasks without leaving the chat. Jobs persist across restarts in
+  `~/.agent-chat-gateway/jobs.json` with atomic writes.
+- **`acg schedule create`**: create recurring jobs (`--every 1h`, `--every 1d`,
+  `--every 1w`) or one-shot reminders (`--in 30m`, `--in 2h`), with optional
+  `--times N` run limit and `--tz` timezone support.
+- **`acg schedule list`**: display active/paused jobs in a formatted table;
+  `--all` includes recently completed jobs.
+- **`acg schedule delete / pause / resume`**: full lifecycle management.
+- **Direct message injection**: scheduled jobs bypass the Rocket.Chat self-message
+  filter entirely — messages are injected directly into the watcher's message
+  processor queue as `OWNER`-role messages.
+- **Catch-up on restart**: all missed fires are replayed immediately on daemon
+  startup, with correct run-count tracking.
+- **`scheduling-context.md`**: built-in context file auto-injected into every
+  agent session, teaching the agent the `acg schedule` CLI commands.
+- **Thread-safe `JobStore`**: `threading.Lock` + copy-on-write pattern ensures
+  concurrent reads/writes from `asyncio.to_thread()` workers are safe.
+- **TTL-based completed job purge**: completed jobs are automatically removed
+  after `scheduler.completed_job_ttl_days` (default 7 days).
+- **`gateway/core/tz_utils.py`**: cross-platform IANA timezone detection utility.
+- **New dependency**: `croniter>=2.0.0` for cron expression parsing.
+
+### Changed
+- Built-in context files (`rc-gateway-context.md`, `scheduling-context.md`)
+  moved from `contexts/` to `gateway/contexts/` (shipped inside the Python
+  package) so they are always available regardless of install method.
+- `config.py`: built-in context files are now auto-injected at Layer 0 for all
+  connectors; no manual `context_inject_files` entry needed for the defaults.
+
+---
+
 ## [0.1.9] - 2026-04-06
 
 ### Changed
