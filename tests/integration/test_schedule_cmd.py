@@ -804,8 +804,6 @@ class TestScheduleCreate(_ScheduleCLITestBase):
 
     def test_create_subhourly_plus_starting_sets_next_run(self):
         """--every 7m --starting '09:00' → cron stays '*/7 * * * *', next_run override set."""
-        import re
-        from datetime import UTC, datetime
 
         received: list[dict] = []
 
@@ -923,7 +921,6 @@ class TestScheduleCreate(_ScheduleCLITestBase):
 
         def _reject_bad(req):
             # Simulate what the daemon does: validate next_run and reject
-            from gateway.control import ControlServer
             # Use the real _handle_schedule_create validation by routing through it
             errors.append(req)
             return {"ok": False, "error": "Invalid 'next_run' value 'not-a-date'"}
@@ -931,8 +928,8 @@ class TestScheduleCreate(_ScheduleCLITestBase):
         self._start_daemon({"schedule-create": _reject_bad})
         # Directly test the daemon validation by calling with a known-bad next_run.
         # We simulate this through the mock daemon's response.
-        from tests.integration.test_schedule_cmd import _ScheduleCLITestBase
-        import json, socket
+        import json
+        import socket
         sock_path = self._daemon._sock_path
 
         # Manually send a schedule-create with garbage next_run over the socket
@@ -967,7 +964,8 @@ class TestScheduleCreate(_ScheduleCLITestBase):
 
     def test_control_handle_schedule_create_rejects_bad_next_run(self):
         """T1 (control.py unit): _handle_schedule_create rejects malformed next_run values."""
-        from unittest.mock import MagicMock, patch
+        from unittest.mock import MagicMock
+
         from gateway.control import ControlServer
 
         mock_job_store = MagicMock()
@@ -994,8 +992,9 @@ class TestScheduleCreate(_ScheduleCLITestBase):
 
     def test_control_handle_schedule_create_rejects_naive_next_run(self):
         """T1 (control.py unit): _handle_schedule_create rejects timezone-naive next_run."""
-        from gateway.control import ControlServer
         from unittest.mock import MagicMock
+
+        from gateway.control import ControlServer
 
         server = ControlServer(entries=[], job_store=MagicMock(), default_timezone="UTC")
         request = {
@@ -1012,8 +1011,9 @@ class TestScheduleCreate(_ScheduleCLITestBase):
 
     def test_control_handle_schedule_create_accepts_valid_next_run(self):
         """T1 (control.py unit): _handle_schedule_create accepts well-formed next_run."""
-        from gateway.control import ControlServer
         from unittest.mock import MagicMock
+
+        from gateway.control import ControlServer
 
         mock_store = MagicMock()
         mock_store.add = MagicMock(return_value=MagicMock(id="acg-test001"))
@@ -1034,8 +1034,9 @@ class TestScheduleCreate(_ScheduleCLITestBase):
 
     def test_control_handle_schedule_create_rejects_bool_times(self):
         """C2: _handle_schedule_create rejects True/False for 'times' (bool is a subclass of int)."""
-        from gateway.control import ControlServer
         from unittest.mock import MagicMock
+
+        from gateway.control import ControlServer
 
         mock_store = MagicMock()
         server = ControlServer(entries=[], job_store=mock_store, default_timezone="UTC")
@@ -1056,8 +1057,9 @@ class TestScheduleCreate(_ScheduleCLITestBase):
 
     def test_control_handle_schedule_create_rejects_past_next_run(self):
         """C3: _handle_schedule_create rejects a next_run value that is in the past."""
-        from gateway.control import ControlServer
         from unittest.mock import MagicMock
+
+        from gateway.control import ControlServer
 
         mock_store = MagicMock()
         server = ControlServer(entries=[], job_store=mock_store, default_timezone="UTC")
@@ -1081,8 +1083,9 @@ class TestScheduleCreate(_ScheduleCLITestBase):
 
     def test_control_handle_schedule_create_rejects_invalid_timezone(self):
         """M6: _handle_schedule_create rejects unknown IANA timezone names."""
-        from gateway.control import ControlServer
         from unittest.mock import MagicMock
+
+        from gateway.control import ControlServer
 
         mock_store = MagicMock()
         server = ControlServer(entries=[], job_store=mock_store, default_timezone="UTC")
@@ -1323,8 +1326,9 @@ class TestScheduleResume(_ScheduleCLITestBase):
 
     def test_control_resume_idempotent_for_active_job(self):
         """TC-4: resuming an already-ACTIVE job returns ok=True without mutating state."""
-        from gateway.control import ControlServer
         from unittest.mock import MagicMock
+
+        from gateway.control import ControlServer
         from gateway.schedule_types import JobStatus
 
         mock_store = MagicMock()
@@ -1343,8 +1347,9 @@ class TestScheduleResume(_ScheduleCLITestBase):
 
     def test_control_resume_completed_job_returns_error(self):
         """TC-4: resuming a COMPLETED job returns ok=False with a clear error message."""
-        from gateway.control import ControlServer
         from unittest.mock import MagicMock
+
+        from gateway.control import ControlServer
         from gateway.schedule_types import JobStatus
 
         mock_store = MagicMock()

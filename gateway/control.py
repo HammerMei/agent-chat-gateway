@@ -17,6 +17,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from . import runtime_lock
+from .core.tz_utils import local_iana_timezone as _server_local_timezone
 from .runtime_lock import RUNTIME_DIR
 
 if TYPE_CHECKING:
@@ -26,9 +27,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger("agent-chat-gateway.control")
 
 CONTROL_SOCK = RUNTIME_DIR / "control.sock"
-
-
-from .core.tz_utils import local_iana_timezone as _server_local_timezone
 
 
 class ControlServer:
@@ -278,8 +276,9 @@ class ControlServer:
 
     def _handle_schedule_create(self, request: dict) -> dict:
         from datetime import UTC, datetime
+
         from .core.scheduler import compute_next_run
-        from .schedule_types import ScheduledJob, JobStatus
+        from .schedule_types import JobStatus, ScheduledJob
 
         watcher = (request.get("watcher") or "").strip()
         connector = request.get("connector", "")
@@ -431,6 +430,7 @@ class ControlServer:
 
     def _handle_schedule_resume(self, request: dict) -> dict:
         from datetime import UTC, datetime
+
         from .core.scheduler import compute_next_run
         from .schedule_types import JobStatus
         job_id = request.get("job_id", "")

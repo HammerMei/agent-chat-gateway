@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
@@ -867,7 +866,6 @@ class TestParseStarting(unittest.TestCase):
 
     def test_tz_shifts_first_run_to_utc(self):
         """'09:00' with tz='America/New_York' → UTC = 09:00 + offset."""
-        from zoneinfo import ZoneInfo
         now = datetime(2026, 4, 9, 10, 0, 0, tzinfo=UTC)
         result = self._parse("09:00", tz_name="America/New_York", now_utc=now)
         # America/New_York is UTC-4 in April (EDT)
@@ -912,7 +910,6 @@ class TestParseStarting(unittest.TestCase):
         """'Feb 29 09:00' on a leap year that has passed → advances to next leap year."""
         # 2028-02-29 is a real date; 2029 is not a leap year.
         # Simulate: today is 2028-03-01 (past Feb 29, 2028).
-        from zoneinfo import ZoneInfo
         now = datetime(2028, 3, 1, 10, 0, 0, tzinfo=UTC)
         result = self._parse("Feb 29 09:00", now_utc=now)
         self.assertTrue(result.was_past)
@@ -943,7 +940,6 @@ class TestParseStarting(unittest.TestCase):
 
     def test_local_iana_timezone_fallback_when_not_symlink(self, *args):
         """local_iana_timezone() falls back to 'UTC' when /etc/localtime cannot be read."""
-        from unittest.mock import patch
         from gateway.core.tz_utils import local_iana_timezone
         # Simulate /etc/localtime not being a symlink (e.g. Alpine container)
         with patch("pathlib.Path.is_symlink", return_value=False):
@@ -963,7 +959,7 @@ class TestParseStarting(unittest.TestCase):
         self.assertEqual(fr.date().isoformat(), "2026-04-20")
         self.assertEqual(result.dow, "1")
 
-    def test_mmdd_past_advances_one_year(self):
+    def test_mmdd_past_same_month_advances_one_year(self):
         """'04-15 09:00' when today is Apr 16 → next year's Apr 15."""
         now = datetime(2026, 4, 16, 10, 0, 0, tzinfo=UTC)
         result = self._parse("04-15 09:00", now_utc=now)
@@ -985,7 +981,7 @@ class TestInjectMessageStateNone(unittest.IsolatedAsyncioTestCase):
         must be emitted so operators can diagnose missing room routing.
         """
         import logging
-        from unittest.mock import AsyncMock, MagicMock, patch
+        from unittest.mock import AsyncMock, MagicMock
 
         from gateway.core.session_manager import SessionManager
 

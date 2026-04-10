@@ -545,7 +545,6 @@ def _run_schedule_create(args) -> None:
 def _run_schedule_list(args) -> None:
     """Handle 'schedule list': display jobs in a tabular format."""
     import textwrap
-    from datetime import UTC, datetime
 
     cmd_data: dict = {"cmd": "schedule-list", "include_completed": args.include_completed}
     if args.connector:
@@ -642,7 +641,6 @@ def _advance_by_one_year(candidate: "datetime") -> "datetime":
     Feb 29 and the next year is not a leap year.  In that case we search forward
     for the next leap year (guaranteed within 8 years).
     """
-    from datetime import timedelta as _td
     target_year = candidate.year + 1
     for offset in range(8):
         try:
