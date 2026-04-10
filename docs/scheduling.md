@@ -48,10 +48,24 @@ agent-chat-gateway schedule create WATCHER MESSAGE [OPTIONS]
 | Option | Description |
 |---|---|
 | `--every INTERVAL` | Recurring interval. Accepted values: `1m`, `5m`, `10m`, `15m`, `30m`, `1h`, `2h`, `3h`, `6h`, `12h`, `1d`, `1w` |
-| `--at TIME` | One-shot or recurring at a fixed time. Accepts `"09:00"`, `"Mon 09:00"`, or `"2026-04-10 15:30"` |
+| `--starting TIME` | Time anchor / start time. With `--every`: sets the first run and (for `1d`/`1w`) pins the cron time-of-day. Without `--every`: one-shot specific datetime. Accepts smart partial inputs: `"09:00"`, `"Apr 15 09:00"`, `"04-15 09:00"`, `"Mon 09:00"`, `"2026-05-01 09:00"`. |
 | `--times N` | Max number of runs. `0` means run forever (default). `1` means run once then mark completed. |
-| `--tz TIMEZONE` | IANA timezone, e.g. `"America/New_York"`, `"Europe/Berlin"`, `"UTC"`. Defaults to the `scheduler.default_timezone` config value, or the ACG server's local timezone if unset. Only relevant for daily/weekly schedules — omit for sub-hourly intervals. |
+| `--tz TIMEZONE` | IANA timezone, e.g. `"America/New_York"`, `"Europe/Berlin"`, `"UTC"`. The `--starting` time is interpreted in this timezone. Defaults to the `scheduler.default_timezone` config value, or the ACG server's local timezone if unset. Only relevant for daily/weekly schedules — omit for sub-hourly intervals. |
 | `--connector NAME` | Which connector to use. Auto-detected when only one connector is configured. |
+
+### Smart date inference for `--starting`
+
+You do **not** need to type full dates in most cases:
+
+| Input | Meaning |
+|---|---|
+| `"09:00"` | Today at 09:00; auto-advances to tomorrow if already past |
+| `"Apr 15 09:00"` | This year, April 15 at 09:00; advances one year if past |
+| `"04-15 09:00"` | This year, April 15 at 09:00 (MM-DD format) |
+| `"Mon 09:00"` | Next Monday at 09:00 |
+| `"2026-05-01 09:00"` | Explicit full datetime (for cross-year scheduling) |
+
+If the resolved time is already in the past, ACG prints a warning and automatically advances to the next sensible occurrence (tomorrow for `HH:MM`, next year for `MM-DD` or `Mon DD`, etc.).
 
 ### Examples
 
@@ -60,19 +74,22 @@ agent-chat-gateway schedule create WATCHER MESSAGE [OPTIONS]
 agent-chat-gateway schedule create general-watcher "Reminder: check the oven" --every 5m --times 1
 
 # Daily standup at 09:00 every day
-agent-chat-gateway schedule create general-watcher "Run the daily standup" --every 1d --at "09:00" --tz "Asia/Taipei"
+agent-chat-gateway schedule create general-watcher "Run the daily standup" --every 1d --starting "09:00" --tz "Asia/Taipei"
 
-# Weekly report every Friday
-agent-chat-gateway schedule create ops-watcher "Generate weekly ops summary" --at "Fri 17:00" --tz "America/New_York"
+# Weekly report every Friday — infer "this Friday" automatically
+agent-chat-gateway schedule create ops-watcher "Generate weekly ops summary" --every 1w --starting "Fri 17:00" --tz "America/New_York"
 
 # One-shot at a specific datetime
-agent-chat-gateway schedule create general-watcher "Review Q2 roadmap" --at "2026-04-10 15:30" --tz "Asia/Taipei"
+agent-chat-gateway schedule create general-watcher "Review Q2 roadmap" --starting "2026-04-10 15:30" --tz "Asia/Taipei"
 
 # Health check every 30 minutes, forever
 agent-chat-gateway schedule create ops-watcher "Check server health and report status" --every 30m
 
 # Run exactly 3 times, every hour
 agent-chat-gateway schedule create general-watcher "Hourly check-in" --every 1h --times 3
+
+# Start firing every minute, 5 times, beginning at 14:00
+agent-chat-gateway schedule create general-watcher "Pulse check" --every 1m --times 5 --starting "14:00"
 ```
 
 ---
@@ -94,21 +111,21 @@ Or ask the agent directly:
 
 ```bash
 agent-chat-gateway schedule create general-watcher "Good morning! Summarize yesterday's GitHub activity." \
-  --every 1d --at "09:00" --tz "Asia/Taipei"
+  --every 1d --starting "09:00" --tz "Asia/Taipei"
 ```
 
 ### Weekly report
 
 ```bash
 agent-chat-gateway schedule create ops-watcher "Generate weekly infrastructure cost report and post summary." \
-  --at "Fri 16:00" --tz "America/New_York"
+  --every 1w --starting "Fri 16:00" --tz "America/New_York"
 ```
 
 ### One-shot at a specific future datetime
 
 ```bash
 agent-chat-gateway schedule create general-watcher "It's launch day — post the release announcement." \
-  --at "2026-04-15 10:00" --tz "Europe/Berlin" --times 1
+  --starting "2026-04-15 10:00" --tz "Europe/Berlin"
 ```
 
 Once the job fires, it is automatically marked `completed` and will not run again.
@@ -190,7 +207,7 @@ agents:
       # Let guests ask the agent to run schedule commands
       - tool: "Bash"
         params: "agent-chat-gateway\\s+schedule\\s+.*"
-      # Let the agent use date to compute relative times (used in --at values)
+      # Let the agent use date to compute relative times (used in --starting values)
       - tool: "Bash"
         params: "date(\\s+.*)?"
 ```
@@ -226,7 +243,7 @@ Each job record contains:
 |---|---|
 | `id` | Unique job identifier, format `acg-xxxxxxxx` |
 | `watcher` | The watcher name the job targets |
-| `cron` | The cron expression derived from `--every` or `--at` |
+| `cron` | The cron expression derived from `--every` or `--starting` |
 | `timezone` | IANA timezone string |
 | `times` | Max runs (`0` = forever) |
 | `run_count` | How many times the job has fired so far |
@@ -238,14 +255,14 @@ You can inspect or back up `jobs.json` directly. Do not edit it while ACG is run
 
 ## Timezone Handling
 
-All times you specify with `--at` are interpreted in the timezone given by `--tz`. If `--tz` is omitted, UTC is used.
+All times you specify with `--starting` are interpreted in the timezone given by `--tz`. If `--tz` is omitted, the server's configured timezone (or UTC) is used.
 
 ```bash
 # Fires at 09:00 Taipei time every day
-agent-chat-gateway schedule create general-watcher "Morning briefing" --at "09:00" --tz "Asia/Taipei"
+agent-chat-gateway schedule create general-watcher "Morning briefing" --every 1d --starting "09:00" --tz "Asia/Taipei"
 
 # Fires at 09:00 UTC every day (same as no --tz)
-agent-chat-gateway schedule create general-watcher "Morning briefing" --at "09:00"
+agent-chat-gateway schedule create general-watcher "Morning briefing" --every 1d --starting "09:00"
 ```
 
 `NEXT RUN` in `schedule list` is always displayed in UTC regardless of the job's configured timezone.

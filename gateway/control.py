@@ -328,10 +328,14 @@ class ControlServer:
             return {"ok": False, "error": f"Failed to validate cron expression: {e}"}
 
         now = datetime.now(UTC)
-        try:
-            next_run = compute_next_run(cron, timezone, after=now)
-        except Exception as e:
-            return {"ok": False, "error": f"Failed to compute next run time: {e}"}
+        next_run_override = request.get("next_run")
+        if next_run_override:
+            next_run = next_run_override
+        else:
+            try:
+                next_run = compute_next_run(cron, timezone, after=now)
+            except Exception as e:
+                return {"ok": False, "error": f"Failed to compute next run time: {e}"}
 
         # Auto-detect connector from watcher if not supplied
         if not connector:

@@ -585,5 +585,166 @@ class TestParseOneShotInterval(unittest.TestCase):
         self.assertEqual(self._parse("  5m  "), 5)
 
 
+# ── Tests: _parse_starting ────────────────────────────────────────────────────
+
+
+class TestParseStarting(unittest.TestCase):
+    """Tests for _parse_starting: smart date parsing for the --starting flag."""
+
+    def _parse(self, s: str, tz_name: str | None = None, now_utc: datetime | None = None):
+        from gateway.cli import _parse_starting
+        if now_utc is None:
+            now_utc = datetime(2026, 4, 9, 10, 0, 0, tzinfo=UTC)  # 2026-04-09 10:00 UTC (Thursday)
+        return _parse_starting(s, tz_name, now_utc)
+
+    # ── HH:MM format ──────────────────────────────────────────────────────────
+
+    def test_hhmm_future_today(self):
+        """'15:00' when it's 10:00 UTC → today at 15:00, was_past=False."""
+        now = datetime(2026, 4, 9, 10, 0, 0, tzinfo=UTC)
+        result = self._parse("15:00", now_utc=now)
+        self.assertEqual(result.hour, 15)
+        self.assertEqual(result.minute, 0)
+        self.assertFalse(result.was_past)
+        self.assertIsNone(result.dow)
+        # first_run should be on the same day
+        self.assertEqual(result.first_run.date(), now.date())
+
+    def test_hhmm_past_advances_to_tomorrow(self):
+        """'09:00' when it's 10:00 UTC → tomorrow at 09:00, was_past=True."""
+        now = datetime(2026, 4, 9, 10, 0, 0, tzinfo=UTC)
+        result = self._parse("09:00", now_utc=now)
+        self.assertEqual(result.hour, 9)
+        self.assertEqual(result.minute, 0)
+        self.assertTrue(result.was_past)
+        # first_run should be the next day
+        from datetime import timedelta
+        expected_date = (now + timedelta(days=1)).date()
+        self.assertEqual(result.first_run.astimezone(UTC).date(), expected_date)
+
+    def test_hhmm_first_run_is_utc_and_future(self):
+        """first_run is always UTC and in the future."""
+        now = datetime(2026, 4, 9, 10, 0, 0, tzinfo=UTC)
+        result = self._parse("09:00", now_utc=now)
+        self.assertGreater(result.first_run, now)
+        self.assertIsNotNone(result.first_run.tzinfo)
+
+    # ── Mon HH:MM format ──────────────────────────────────────────────────────
+
+    def test_dow_next_monday(self):
+        """'Mon 09:00' on a Thursday → next Monday."""
+        # 2026-04-09 is a Thursday
+        now = datetime(2026, 4, 9, 10, 0, 0, tzinfo=UTC)
+        result = self._parse("Mon 09:00", now_utc=now)
+        self.assertEqual(result.dow, "1")  # cron DOW for Monday
+        self.assertEqual(result.hour, 9)
+        self.assertEqual(result.minute, 0)
+        self.assertFalse(result.was_past)
+        # Next Monday from Thursday Apr 9 is Apr 13
+        self.assertEqual(result.first_run.astimezone(UTC).date().isoformat(), "2026-04-13")
+
+    def test_dow_case_insensitive(self):
+        """'fri 17:00' works (lowercase)."""
+        now = datetime(2026, 4, 9, 10, 0, 0, tzinfo=UTC)
+        result = self._parse("fri 17:00", now_utc=now)
+        self.assertEqual(result.dow, "5")  # Friday
+
+    def test_dow_unknown_raises(self):
+        """Unknown DOW raises ValueError."""
+        with self.assertRaises(ValueError):
+            self._parse("Xyz 09:00")
+
+    # ── Apr 15 09:00 format ───────────────────────────────────────────────────
+
+    def test_month_name_future_this_year(self):
+        """'Apr 15 09:00' when today is Apr 9 → this year Apr 15."""
+        now = datetime(2026, 4, 9, 10, 0, 0, tzinfo=UTC)
+        result = self._parse("Apr 15 09:00", now_utc=now)
+        self.assertFalse(result.was_past)
+        self.assertEqual(result.first_run.astimezone(UTC).month, 4)
+        self.assertEqual(result.first_run.astimezone(UTC).day, 15)
+
+    def test_month_name_past_advances_one_year(self):
+        """'Jan 01 09:00' in April → next year."""
+        now = datetime(2026, 4, 9, 10, 0, 0, tzinfo=UTC)
+        result = self._parse("Jan 01 09:00", now_utc=now)
+        self.assertTrue(result.was_past)
+        self.assertEqual(result.first_run.astimezone(UTC).year, 2027)
+
+    def test_month_name_case_insensitive(self):
+        """'apr 15 09:00' works (lowercase)."""
+        now = datetime(2026, 4, 9, 10, 0, 0, tzinfo=UTC)
+        result = self._parse("apr 15 09:00", now_utc=now)
+        self.assertEqual(result.first_run.astimezone(UTC).month, 4)
+
+    # ── 04-15 09:00 format ────────────────────────────────────────────────────
+
+    def test_mmdd_future_this_year(self):
+        """'04-15 09:00' → this year Apr 15."""
+        now = datetime(2026, 4, 9, 10, 0, 0, tzinfo=UTC)
+        result = self._parse("04-15 09:00", now_utc=now)
+        self.assertFalse(result.was_past)
+        self.assertEqual(result.first_run.astimezone(UTC).month, 4)
+        self.assertEqual(result.first_run.astimezone(UTC).day, 15)
+
+    def test_mmdd_past_advances_one_year(self):
+        """'01-01 09:00' in April → next year."""
+        now = datetime(2026, 4, 9, 10, 0, 0, tzinfo=UTC)
+        result = self._parse("01-01 09:00", now_utc=now)
+        self.assertTrue(result.was_past)
+        self.assertEqual(result.first_run.astimezone(UTC).year, 2027)
+
+    # ── Full datetime format ──────────────────────────────────────────────────
+
+    def test_full_datetime_future(self):
+        """'2026-05-01 09:00' → explicit UTC datetime."""
+        now = datetime(2026, 4, 9, 10, 0, 0, tzinfo=UTC)
+        result = self._parse("2026-05-01 09:00", now_utc=now)
+        self.assertFalse(result.was_past)
+        self.assertEqual(result.first_run.astimezone(UTC).year, 2026)
+        self.assertEqual(result.first_run.astimezone(UTC).month, 5)
+        self.assertEqual(result.first_run.astimezone(UTC).day, 1)
+        self.assertEqual(result.hour, 9)
+        self.assertEqual(result.minute, 0)
+
+    def test_full_datetime_past_was_past_true(self):
+        """'2000-01-01 09:00' (past) → was_past=True, first_run still that datetime."""
+        now = datetime(2026, 4, 9, 10, 0, 0, tzinfo=UTC)
+        result = self._parse("2000-01-01 09:00", now_utc=now)
+        self.assertTrue(result.was_past)
+        # first_run is the literal datetime (no auto-advance for full explicit datetimes)
+        self.assertEqual(result.first_run.astimezone(UTC).year, 2000)
+
+    # ── Timezone handling ─────────────────────────────────────────────────────
+
+    def test_tz_shifts_first_run_to_utc(self):
+        """'09:00' with tz='America/New_York' → UTC = 09:00 + offset."""
+        from zoneinfo import ZoneInfo
+        now = datetime(2026, 4, 9, 10, 0, 0, tzinfo=UTC)
+        result = self._parse("09:00", tz_name="America/New_York", now_utc=now)
+        # America/New_York is UTC-4 in April (EDT)
+        # 09:00 EDT = 13:00 UTC
+        utc_hour = result.first_run.astimezone(UTC).hour
+        self.assertIn(utc_hour, (13, 14))  # EDT is -4, so 09+4=13; DST edge: 14 is possible
+
+    def test_invalid_tz_falls_back_to_utc(self):
+        """Unknown timezone silently falls back to UTC."""
+        now = datetime(2026, 4, 9, 10, 0, 0, tzinfo=UTC)
+        result = self._parse("15:00", tz_name="Invalid/Zone", now_utc=now)
+        self.assertIsNotNone(result.first_run)  # should not raise
+
+    # ── Invalid input ─────────────────────────────────────────────────────────
+
+    def test_invalid_format_raises(self):
+        """Completely unrecognized format raises ValueError."""
+        with self.assertRaises(ValueError):
+            self._parse("not-a-date")
+
+    def test_empty_string_raises(self):
+        """Empty string raises ValueError."""
+        with self.assertRaises(ValueError):
+            self._parse("")
+
+
 if __name__ == "__main__":
     unittest.main()

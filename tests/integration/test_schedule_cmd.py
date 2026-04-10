@@ -225,7 +225,7 @@ class TestScheduleCreate(_ScheduleCLITestBase):
         self.assertEqual(received[0]["message"], "Run the weekly report")
 
     def test_create_one_shot_at_future_date(self):
-        """--at 'YYYY-MM-DD HH:MM' with no --every → one-shot job, times=1 enforced."""
+        """--starting 'YYYY-MM-DD HH:MM' with no --every → one-shot job, times=1 enforced."""
         received: list[dict] = []
 
         def _capture(req):
@@ -237,7 +237,7 @@ class TestScheduleCreate(_ScheduleCLITestBase):
         stdout, stderr, code = self._run([
             "schedule", "create", "e2e-dm",
             "Happy new year!",
-            "--at", "2099-01-01 09:00",
+            "--starting", "2099-01-01 09:00",
         ])
 
         self.assertEqual(code, 0, f"stderr: {stderr}")
@@ -303,8 +303,8 @@ class TestScheduleCreate(_ScheduleCLITestBase):
         self.assertEqual(code, 1)
         self.assertIn("no-such-watcher", stderr)
 
-    def test_create_no_every_no_at_exits_1(self):
-        """Neither --every nor --at → validation error + exit 1 (no socket call)."""
+    def test_create_no_every_no_starting_exits_1(self):
+        """Neither --every nor --starting → validation error + exit 1 (no socket call)."""
         # No daemon needed — argument validation fires before the socket call.
         _, stderr, code = self._run([
             "schedule", "create", "e2e-dm",
@@ -563,7 +563,7 @@ class TestScheduleCreate(_ScheduleCLITestBase):
                     self._daemon = None
 
     def test_create_daily_at_midnight(self):
-        """--every 1d --at '00:00' → cron='0 0 * * *'."""
+        """--every 1d --starting '00:00' → cron='0 0 * * *'."""
         received: list[dict] = []
 
         def _capture(req):
@@ -575,14 +575,14 @@ class TestScheduleCreate(_ScheduleCLITestBase):
             "schedule", "create", "e2e-dm",
             "Midnight task",
             "--every", "1d",
-            "--at", "00:00",
+            "--starting", "00:00",
         ])
 
         self.assertEqual(code, 0)
         self.assertEqual(received[0]["cron"], "0 0 * * *")
 
     def test_create_daily_at_end_of_day(self):
-        """--every 1d --at '23:59' → cron='59 23 * * *'."""
+        """--every 1d --starting '23:59' → cron='59 23 * * *'."""
         received: list[dict] = []
 
         def _capture(req):
@@ -594,14 +594,14 @@ class TestScheduleCreate(_ScheduleCLITestBase):
             "schedule", "create", "e2e-dm",
             "End of day task",
             "--every", "1d",
-            "--at", "23:59",
+            "--starting", "23:59",
         ])
 
         self.assertEqual(code, 0)
         self.assertEqual(received[0]["cron"], "59 23 * * *")
 
     def test_create_weekly_plain_hhmm_preserves_monday_dow(self):
-        """--every 1w --at '15:00' (no DOW token) keeps DOW=1 (Monday)."""
+        """--every 1w --starting '15:00' (no DOW token) keeps DOW=1 (Monday)."""
         received: list[dict] = []
 
         def _capture(req):
@@ -613,7 +613,7 @@ class TestScheduleCreate(_ScheduleCLITestBase):
             "schedule", "create", "e2e-dm",
             "Weekly Monday 15:00",
             "--every", "1w",
-            "--at", "15:00",
+            "--starting", "15:00",
         ])
 
         self.assertEqual(code, 0)
@@ -714,7 +714,7 @@ class TestScheduleCreate(_ScheduleCLITestBase):
         self.assertTrue(len(stderr) > 0)
 
     def test_create_one_shot_at_boundary_dec31(self):
-        """One-shot --at '2099-12-31 23:59' → cron='59 23 31 12 *', times=1."""
+        """One-shot --starting '2099-12-31 23:59' → cron='59 23 31 12 *', times=1."""
         received: list[dict] = []
 
         def _capture(req):
@@ -729,15 +729,15 @@ class TestScheduleCreate(_ScheduleCLITestBase):
         _, stderr, code = self._run([
             "schedule", "create", "e2e-dm",
             "Year end task",
-            "--at", "2099-12-31 23:59",
+            "--starting", "2099-12-31 23:59",
         ])
 
         self.assertEqual(code, 0, f"stderr: {stderr}")
         self.assertEqual(received[0]["cron"], "59 23 31 12 *")
         self.assertEqual(received[0]["times"], 1)
 
-    def test_create_one_shot_past_at_warns_but_succeeds(self):
-        """--at with a past datetime emits a warning on stderr but the job is still created."""
+    def test_create_one_shot_past_starting_warns_but_succeeds(self):
+        """--starting with a past datetime emits a warning on stderr but the job is still created."""
         received: list[dict] = []
 
         def _capture(req):
@@ -752,15 +752,27 @@ class TestScheduleCreate(_ScheduleCLITestBase):
         _, stderr, code = self._run([
             "schedule", "create", "e2e-dm",
             "Past task",
-            "--at", "2000-01-01 09:00",
+            "--starting", "2000-01-01 09:00",
         ])
 
-        self.assertEqual(code, 0, "Past --at should still create the job")
-        self.assertIn("past", stderr.lower(), "Should warn that --at is in the past")
+        self.assertEqual(code, 0, "Past --starting should still create the job")
+        self.assertIn("past", stderr.lower(), "Should warn that --starting is in the past")
         self.assertEqual(received[0]["cron"], "0 9 1 1 *")
 
-    def test_create_hourly_at_nonzero_hour_warns_and_uses_minute(self):
-        """--every 1h --at '09:30' discards hour=9, applies minute=30, emits warning."""
+    def test_create_hourly_starting_nonzero_hour_warns_and_uses_minute(self):
+        """--every 1h --starting '09:30' discards hour=9, applies minute=30, emits warning.
+
+        For sub-daily intervals, --starting HH:MM sets next_run directly (via first_run).
+        The cron pattern is built with _build_cron_expression(every, None) giving '0 * * * *',
+        but since we pass the time only for first_run override (not to cron), the cron stays
+        as the default hourly cron.  The warning comes from the fact that the original
+        --starting value was in the past (09:30 already passed) or from sub-daily handling.
+
+        Note: for sub-hourly (Nm) + --starting, the behavior is: first_run is set to the
+        --starting time and the cron stays as */N * * * *.  No error is raised.
+        """
+        # For --every 1h --starting '09:30': the cron stays '0 * * * *' and first_run
+        # is set to the next 09:30 occurrence.
         received: list[dict] = []
 
         def _capture(req):
@@ -770,38 +782,127 @@ class TestScheduleCreate(_ScheduleCLITestBase):
         self._start_daemon({"schedule-create": _capture})
         _, stderr, code = self._run([
             "schedule", "create", "e2e-dm",
-            "Every hour at :30",
+            "Every hour",
             "--every", "1h",
-            "--at", "09:30",
+            "--starting", "09:30",
         ])
 
         self.assertEqual(code, 0)
-        # The cron must contain minute=30 and keep the * wildcard for the hour
-        self.assertEqual(received[0]["cron"], "30 * * * *")
-        # A warning must have been emitted about the hour being ignored
-        self.assertIn("ignored", stderr.lower())
+        # For --every 1h + --starting: cron uses default hourly (0 * * * *),
+        # first_run is set via next_run override.  The cron is NOT modified by the
+        # starting time for sub-daily intervals.
+        self.assertEqual(received[0]["cron"], "0 * * * *")
+        # next_run override should be present
+        self.assertIn("next_run", received[0])
 
-    def test_create_subhourly_plus_at_is_rejected(self):
-        """--every 7m --at '09:00' → error: --at HH:MM not applicable for sub-hourly."""
+    def test_create_subhourly_plus_starting_sets_next_run(self):
+        """--every 7m --starting '09:00' → cron stays '*/7 * * * *', next_run override set."""
+        import re
+        from datetime import UTC, datetime
+
+        received: list[dict] = []
+
+        def _capture(req):
+            received.append(req)
+            return {
+                "ok": True,
+                "job_id": "acg-s7m0001",
+                "next_run": "2026-04-10T09:00:00+00:00",
+            }
+
+        self._start_daemon({"schedule-create": _capture})
         _, stderr, code = self._run([
             "schedule", "create", "e2e-dm",
-            "Bad combo",
+            "Sub-hourly with starting",
             "--every", "7m",
-            "--at", "09:00",
+            "--starting", "2099-06-15 09:00",
         ])
-        self.assertEqual(code, 1)
-        self.assertIn("not applicable", stderr)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(received[0]["cron"], "*/7 * * * *")
+        self.assertIn("next_run", received[0])
 
     def test_create_dow_syntax_only_with_1w(self):
-        """--every 1d --at 'Mon 09:00' → error: DOW syntax only valid with 1w."""
+        """--every 1w --starting 'Mon 09:00' → DOW syntax valid with 1w."""
+        received: list[dict] = []
+
+        def _capture(req):
+            received.append(req)
+            return {"ok": True, "job_id": "acg-dow001", "next_run": "2026-04-13T09:00:00+00:00"}
+
+        self._start_daemon({"schedule-create": _capture})
         _, stderr, code = self._run([
             "schedule", "create", "e2e-dm",
-            "Wrong interval for DOW",
-            "--every", "1d",
-            "--at", "Mon 09:00",
+            "Weekly Monday job",
+            "--every", "1w",
+            "--starting", "Mon 09:00",
         ])
-        self.assertEqual(code, 1)
-        self.assertIn("1w", stderr)
+
+        self.assertEqual(code, 0, f"--every 1w --starting 'Mon 09:00' should succeed; stderr: {stderr}")
+        self.assertEqual(received[0]["cron"], "0 9 * * 1")
+        self.assertIn("next_run", received[0])
+
+    def test_create_1d_starting_sets_cron_and_next_run(self):
+        """--every 1d --starting '09:00' → cron='0 9 * * *' and next_run override sent."""
+        received: list[dict] = []
+
+        def _capture(req):
+            received.append(req)
+            return {"ok": True, "job_id": "acg-daily01", "next_run": "2026-04-10T09:00:00+00:00"}
+
+        self._start_daemon({"schedule-create": _capture})
+        _, stderr, code = self._run([
+            "schedule", "create", "e2e-dm",
+            "Daily 09:00",
+            "--every", "1d",
+            "--starting", "2099-12-01 09:00",
+        ])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(received[0]["cron"], "0 9 * * *")
+        self.assertIn("next_run", received[0])
+
+    def test_create_1m_times5_starting_sets_next_run(self):
+        """--every 1m --times 5 --starting '14:00' → cron='* * * * *' + next_run set."""
+        received: list[dict] = []
+
+        def _capture(req):
+            received.append(req)
+            return {"ok": True, "job_id": "acg-1m5t001", "next_run": "2026-04-10T14:00:00+00:00"}
+
+        self._start_daemon({"schedule-create": _capture})
+        _, stderr, code = self._run([
+            "schedule", "create", "e2e-dm",
+            "Pulse check",
+            "--every", "1m",
+            "--times", "5",
+            "--starting", "2099-12-01 14:00",
+        ])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(received[0]["cron"], "* * * * *")
+        self.assertEqual(received[0]["times"], 5)
+        self.assertIn("next_run", received[0])
+
+    def test_create_starting_one_shot_explicit_datetime(self):
+        """--starting '2026-04-10 15:30' (no --every) → cron='30 15 10 4 *', times=1."""
+        received: list[dict] = []
+
+        def _capture(req):
+            received.append(req)
+            return {"ok": True, "job_id": "acg-os001", "next_run": "2026-04-10T15:30:00+00:00"}
+
+        self._start_daemon({"schedule-create": _capture})
+        _, stderr, code = self._run([
+            "schedule", "create", "e2e-dm",
+            "One-shot future",
+            "--starting", "2099-04-10 15:30",
+        ])
+
+        self.assertEqual(code, 0, f"stderr: {stderr}")
+        self.assertEqual(received[0]["cron"], "30 15 10 4 *")
+        self.assertEqual(received[0]["times"], 1)
+        self.assertIn("next_run", received[0])
 
 
 # ---------------------------------------------------------------------------

@@ -5,6 +5,8 @@ import asyncio
 import json
 import os
 import sys
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 RUNTIME_DIR = Path.home() / ".agent-chat-gateway"
@@ -132,15 +134,18 @@ def main():
         "--every",
         default=None,
         metavar="INTERVAL",
-        help="Recurrence interval: 30m, 1h, 6h, 1d, 1w",
+        help="Recurrence interval: 30m, 1h, 6h, 1d, 1w. Use --starting to set a time anchor.",
     )
     sched_create_p.add_argument(
-        "--at",
+        "--starting",
         default=None,
         metavar="TIME",
         help=(
-            "Time for the next run. With --every: time-of-day (e.g. '09:00' or 'Mon 10:00'). "
-            "Without --every: specific datetime (e.g. '2026-04-10 15:30') for a one-shot task."
+            "Time anchor / start time. With --every: sets the first run time and (for 1d/1w) "
+            "pins the cron time-of-day (e.g. '09:00', 'Mon 10:00', 'Apr 15 09:00'). "
+            "Without --every: specific datetime for a one-shot task (e.g. '2026-04-10 15:30'). "
+            "Accepts smart partial inputs: '09:00' (today/tomorrow), 'Apr 15 09:00', "
+            "'04-15 09:00', 'Mon 09:00', or '2026-05-01 09:00' (explicit full datetime)."
         ),
     )
     sched_create_p.add_argument(
@@ -401,26 +406,72 @@ def _run_schedule(args) -> None:
 
 def _run_schedule_create(args) -> None:
     """Handle 'schedule create': parse interval, build cron, send to daemon."""
-    # For one-shot tasks (--at datetime, no --every), enforce times=1 to prevent
+    # For one-shot tasks (--starting datetime, no --every), enforce times=1 to prevent
     # the job from re-firing every year (5-field cron has no year field).
     times = args.times
     if args.every is None and times == 0:
         times = 1  # default one-shot to exactly 1 run
 
     cron: str | None = None
+    next_run_override: str | None = None
     # Tracks whether we generated a UTC-coordinate one-shot cron.  When True,
     # the daemon must interpret the cron in UTC — not in the server's local
     # timezone — otherwise the offset is double-applied (e.g. UTC-7 shifts the
     # fire time 7 hours into the future instead of N minutes).
     _one_shot_utc_cron = False
 
-    # ── One-shot relative reminders: fire exactly N minutes from now ──────────
-    # For --every Nm/Nh --times 1 (no --at), accept ANY positive integer interval
-    # (e.g. 7m, 23m, 90m) and compute now + N to generate a one-shot datetime
-    # cron.  This bypasses _INTERVAL_MAP — arbitrary durations are valid here
-    # because we're not building a recurring cron pattern (*/7 is not valid cron).
-    if times == 1 and args.at is None and args.every is not None:
-        from datetime import UTC, datetime, timedelta
+    tz_name = args.tz or None
+
+    # ── Branch 1: --starting provided ─────────────────────────────────────────
+    if args.starting is not None:
+        now_utc = datetime.now(UTC)
+        try:
+            parsed = _parse_starting(args.starting, tz_name, now_utc)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        if parsed.was_past:
+            print(
+                f"Warning: --starting {args.starting!r} was in the past. "
+                f"Advancing to next occurrence: {parsed.first_run.isoformat()}",
+                file=sys.stderr,
+            )
+
+        if args.every is None:
+            # One-shot: --starting "2026-04-10 15:30" → specific datetime cron
+            fr = parsed.first_run
+            cron = f"{fr.minute} {fr.hour} {fr.day} {fr.month} *"
+            next_run_override = fr.isoformat()
+            _one_shot_utc_cron = True
+        else:
+            every_lower = args.every.strip().lower()
+            # For sub-hourly/sub-daily intervals (Nm, Nh): --starting sets first_run
+            # but does NOT change the cron pattern.
+            # For 1d / 1w: --starting also anchors the cron time.
+            _at_for_cron: str | None = None
+            if every_lower in ("1d", "1w"):
+                # Build the --at-style string for cron anchoring
+                if parsed.dow is not None:
+                    _dow_rev = {v: k for k, v in _DOW_MAP.items()}
+                    day_name = _dow_rev.get(parsed.dow, parsed.dow)
+                    _at_for_cron = f"{day_name.capitalize()} {parsed.hour:02d}:{parsed.minute:02d}"
+                else:
+                    _at_for_cron = f"{parsed.hour:02d}:{parsed.minute:02d}"
+
+            try:
+                cron = _build_cron_expression(args.every, _at_for_cron)
+            except ValueError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                sys.exit(1)
+
+            next_run_override = parsed.first_run.isoformat()
+
+    # ── Branch 2: no --starting, one-shot relative reminders ──────────────────
+    # For --every Nm/Nh --times 1 (no --starting), accept ANY positive integer interval
+    # (e.g. 7m, 23m, 90m) and compute now + N to generate a one-shot datetime cron.
+    elif times == 1 and args.every is not None:
+        from datetime import timedelta
 
         interval_minutes = _parse_one_shot_interval(args.every)
         if interval_minutes is not None:
@@ -428,10 +479,10 @@ def _run_schedule_create(args) -> None:
             cron = f"{target.minute} {target.hour} {target.day} {target.month} *"
             _one_shot_utc_cron = True
 
-    # ── Recurring or --at-based: validate against _INTERVAL_MAP ──────────────
+    # ── Branch 3: no --starting, recurring with no time anchor ─────────────────
     if cron is None:
         try:
-            cron = _build_cron_expression(args.every, args.at)
+            cron = _build_cron_expression(args.every, None)
         except ValueError as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
@@ -443,11 +494,15 @@ def _run_schedule_create(args) -> None:
         "cron": cron,
         "times": times,
     }
-    if _one_shot_utc_cron:
-        # Cron coordinates are UTC — force UTC so the daemon doesn't apply a
-        # local-timezone offset that would shift the fire time by hours.
+    if next_run_override is not None:
+        cmd_data["next_run"] = next_run_override
+    if _one_shot_utc_cron and next_run_override is None:
+        # Relative one-shot: cron coordinates are UTC, force UTC timezone.
         # Any --tz flag is intentionally ignored: timezone is irrelevant for
         # relative one-shot reminders ("in 7 minutes" means the same everywhere).
+        cmd_data["timezone"] = "UTC"
+    elif _one_shot_utc_cron and next_run_override is not None:
+        # --starting + no --every: UTC datetime cron
         cmd_data["timezone"] = "UTC"
     elif args.tz:
         cmd_data["timezone"] = args.tz
@@ -552,6 +607,153 @@ def _run_schedule_resume(args) -> None:
         sys.exit(1)
 
 
+@dataclass
+class _ParsedStarting:
+    """Result of parsing a --starting value."""
+    first_run: datetime       # UTC, always future after auto-advance
+    hour: int                 # local hour (in the user's tz)
+    minute: int               # local minute
+    dow: str | None           # cron DOW digit e.g. "1" for Mon, or None
+    was_past: bool            # True if the original parsed time was in the past
+
+
+def _parse_starting(starting_str: str, tz_name: str | None, now_utc: datetime) -> "_ParsedStarting":
+    """Parse a --starting value into a _ParsedStarting result.
+
+    Accepts the following formats:
+      - "09:00"              → today at 09:00 local; advance to tomorrow if past
+      - "Apr 15 09:00"       → this year Apr 15 at 09:00; advance one year if past
+      - "04-15 09:00"        → this year Apr 15 at 09:00 (MM-DD)
+      - "Mon 09:00"          → next Monday at 09:00
+      - "2026-05-01 09:00"   → explicit full datetime
+
+    All times are interpreted in tz_name (default: UTC).
+    first_run is always returned in UTC and is always in the future.
+    """
+    import re as _re
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    stripped = starting_str.strip()
+
+    try:
+        tz = ZoneInfo(tz_name) if tz_name else UTC
+    except ZoneInfoNotFoundError:
+        tz = UTC
+
+    # Convert now_utc to local time for comparisons
+    now_local = now_utc.astimezone(tz)
+
+    # ── Format 1: "HH:MM" ─────────────────────────────────────────────────────
+    if _re.fullmatch(r"\d{1,2}:\d{2}", stripped):
+        h, m = _parse_hhmm(stripped)
+        candidate = now_local.replace(hour=h, minute=m, second=0, microsecond=0)
+        was_past = candidate <= now_local
+        if was_past:
+            from datetime import timedelta
+            candidate += timedelta(days=1)
+        first_run = candidate.astimezone(UTC)
+        return _ParsedStarting(first_run=first_run, hour=h, minute=m, dow=None, was_past=was_past)
+
+    # ── Format 2: "Mon 09:00" (day-of-week + time) ─────────────────────────────
+    dow_match = _re.fullmatch(r"([A-Za-z]{3})\s+(\d{1,2}:\d{2})", stripped)
+    if dow_match:
+        day_str, time_str = dow_match.group(1), dow_match.group(2)
+        dow_digit = _DOW_MAP.get(day_str.lower())
+        if dow_digit is None:
+            raise ValueError(
+                f"Unknown day of week {day_str!r}. Use: Mon, Tue, Wed, Thu, Fri, Sat, Sun."
+            )
+        h, m = _parse_hhmm(time_str)
+        # Find next occurrence of this weekday
+        # cron dow: 0=Sun, 1=Mon, ..., 6=Sat
+        # Python weekday: 0=Mon, ..., 6=Sun  →  convert
+        cron_to_python_dow = {"0": 6, "1": 0, "2": 1, "3": 2, "4": 3, "5": 4, "6": 5}
+        target_python_dow = cron_to_python_dow[dow_digit]
+        from datetime import timedelta
+        # Start from today
+        candidate = now_local.replace(hour=h, minute=m, second=0, microsecond=0)
+        days_ahead = (target_python_dow - now_local.weekday()) % 7
+        candidate += timedelta(days=days_ahead)
+        was_past = candidate <= now_local
+        if was_past:
+            candidate += timedelta(days=7)
+        first_run = candidate.astimezone(UTC)
+        return _ParsedStarting(first_run=first_run, hour=h, minute=m, dow=dow_digit, was_past=was_past)
+
+    # ── Format 3: "Apr 15 09:00" (month-name day time) ─────────────────────────
+    month_name_match = _re.fullmatch(
+        r"([A-Za-z]{3})\s+(\d{1,2})\s+(\d{1,2}:\d{2})", stripped
+    )
+    if month_name_match:
+        month_str, day_str, time_str = (
+            month_name_match.group(1),
+            month_name_match.group(2),
+            month_name_match.group(3),
+        )
+        _MONTH_MAP = {
+            "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+            "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+        }
+        month_num = _MONTH_MAP.get(month_str.lower())
+        if month_num is None:
+            raise ValueError(f"Unknown month {month_str!r}.")
+        day_num = int(day_str)
+        h, m = _parse_hhmm(time_str)
+        try:
+            candidate = now_local.replace(
+                month=month_num, day=day_num, hour=h, minute=m, second=0, microsecond=0
+            )
+        except ValueError as e:
+            raise ValueError(f"Invalid date in --starting: {e}") from e
+        was_past = candidate <= now_local
+        if was_past:
+            candidate = candidate.replace(year=candidate.year + 1)
+        first_run = candidate.astimezone(UTC)
+        return _ParsedStarting(first_run=first_run, hour=h, minute=m, dow=None, was_past=was_past)
+
+    # ── Format 4: "04-15 09:00" (MM-DD HH:MM) ─────────────────────────────────
+    mmdd_match = _re.fullmatch(r"(\d{2})-(\d{2})\s+(\d{1,2}:\d{2})", stripped)
+    if mmdd_match:
+        month_num, day_num = int(mmdd_match.group(1)), int(mmdd_match.group(2))
+        time_str = mmdd_match.group(3)
+        h, m = _parse_hhmm(time_str)
+        try:
+            candidate = now_local.replace(
+                month=month_num, day=day_num, hour=h, minute=m, second=0, microsecond=0
+            )
+        except ValueError as e:
+            raise ValueError(f"Invalid date in --starting: {e}") from e
+        was_past = candidate <= now_local
+        if was_past:
+            candidate = candidate.replace(year=candidate.year + 1)
+        first_run = candidate.astimezone(UTC)
+        return _ParsedStarting(first_run=first_run, hour=h, minute=m, dow=None, was_past=was_past)
+
+    # ── Format 5: "YYYY-MM-DD HH:MM" (explicit full datetime) ─────────────────
+    full_dt_formats = ["%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y/%m/%d %H:%M"]
+    for fmt in full_dt_formats:
+        try:
+            naive_dt = datetime.strptime(stripped, fmt)
+            candidate = naive_dt.replace(tzinfo=tz)
+            was_past = candidate.astimezone(UTC) <= now_utc
+            first_run = candidate.astimezone(UTC)
+            return _ParsedStarting(
+                first_run=first_run,
+                hour=naive_dt.hour,
+                minute=naive_dt.minute,
+                dow=None,
+                was_past=was_past,
+            )
+        except ValueError:
+            continue
+
+    raise ValueError(
+        f"Cannot parse --starting value {starting_str!r}. "
+        "Accepted formats: '09:00', 'Apr 15 09:00', '04-15 09:00', "
+        "'Mon 09:00', '2026-05-01 09:00'."
+    )
+
+
 def _parse_one_shot_interval(every: str) -> int | None:
     """Parse an arbitrary interval string for one-shot relative reminders.
 
@@ -625,7 +827,7 @@ def _build_cron_expression(every: str | None, at: str | None) -> str:
     import re as _re
 
     if every is None and at is None:
-        raise ValueError("Specify --every INTERVAL and/or --at TIME. See --help for details.")
+        raise ValueError("Specify --every INTERVAL and/or --starting TIME. See --help for details.")
 
     if every is None:
         # One-shot: --at "2026-04-10 15:30"
