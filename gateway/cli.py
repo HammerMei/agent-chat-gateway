@@ -419,6 +419,7 @@ def _run_schedule_create(args) -> None:
     # timezone — otherwise the offset is double-applied (e.g. UTC-7 shifts the
     # fire time 7 hours into the future instead of N minutes).
     _one_shot_utc_cron = False
+    parsed: "_ParsedStarting | None" = None
 
     tz_name = args.tz or None
 
@@ -506,6 +507,11 @@ def _run_schedule_create(args) -> None:
         cmd_data["timezone"] = "UTC"
     elif args.tz:
         cmd_data["timezone"] = args.tz
+    elif parsed is not None:
+        # --starting was used without explicit --tz: store the resolved timezone
+        # (server local) so that 1d/1w cron expressions are interpreted correctly
+        # on subsequent runs.
+        cmd_data["timezone"] = parsed.tz_str
     if args.connector:
         cmd_data["connector"] = args.connector
 
@@ -607,6 +613,24 @@ def _run_schedule_resume(args) -> None:
         sys.exit(1)
 
 
+def _get_local_tz_name() -> str:
+    """Return the server's local IANA timezone name (e.g. 'America/Los_Angeles').
+
+    Reads /etc/localtime symlink which works on macOS and most Linux distros.
+    Falls back to a UTC-offset abbreviation if the symlink cannot be resolved.
+    """
+    import os
+    try:
+        link = os.readlink("/etc/localtime")
+        for prefix in ("/var/db/timezone/zoneinfo/", "/usr/share/zoneinfo/"):
+            if link.startswith(prefix):
+                return link[len(prefix):]
+    except (OSError, AttributeError, ValueError):
+        pass
+    # Last resort: "%Z" gives "PST"/"PDT" — not a valid IANA name but better than UTC.
+    return datetime.now().astimezone().strftime("%Z")
+
+
 @dataclass
 class _ParsedStarting:
     """Result of parsing a --starting value."""
@@ -615,6 +639,7 @@ class _ParsedStarting:
     minute: int               # local minute
     dow: str | None           # cron DOW digit e.g. "1" for Mon, or None
     was_past: bool            # True if the original parsed time was in the past
+    tz_str: str               # IANA timezone name actually used (e.g. "America/Los_Angeles")
 
 
 def _parse_starting(starting_str: str, tz_name: str | None, now_utc: datetime) -> "_ParsedStarting":
@@ -636,9 +661,17 @@ def _parse_starting(starting_str: str, tz_name: str | None, now_utc: datetime) -
     stripped = starting_str.strip()
 
     try:
-        tz = ZoneInfo(tz_name) if tz_name else UTC
+        if tz_name:
+            tz = ZoneInfo(tz_name)
+            tz_str = tz_name
+        else:
+            # Fall back to the server's local timezone (not UTC) so that
+            # times like "22:38" are interpreted as local wall-clock time.
+            tz = datetime.now().astimezone().tzinfo  # type: ignore[assignment]
+            tz_str = _get_local_tz_name()
     except ZoneInfoNotFoundError:
-        tz = UTC
+        tz = datetime.now().astimezone().tzinfo  # type: ignore[assignment]
+        tz_str = _get_local_tz_name()
 
     # Convert now_utc to local time for comparisons
     now_local = now_utc.astimezone(tz)
@@ -652,7 +685,7 @@ def _parse_starting(starting_str: str, tz_name: str | None, now_utc: datetime) -
             from datetime import timedelta
             candidate += timedelta(days=1)
         first_run = candidate.astimezone(UTC)
-        return _ParsedStarting(first_run=first_run, hour=h, minute=m, dow=None, was_past=was_past)
+        return _ParsedStarting(first_run=first_run, hour=h, minute=m, dow=None, was_past=was_past, tz_str=tz_str)
 
     # ── Format 2: "Mon 09:00" (day-of-week + time) ─────────────────────────────
     dow_match = _re.fullmatch(r"([A-Za-z]{3})\s+(\d{1,2}:\d{2})", stripped)
@@ -678,7 +711,7 @@ def _parse_starting(starting_str: str, tz_name: str | None, now_utc: datetime) -
         if was_past:
             candidate += timedelta(days=7)
         first_run = candidate.astimezone(UTC)
-        return _ParsedStarting(first_run=first_run, hour=h, minute=m, dow=dow_digit, was_past=was_past)
+        return _ParsedStarting(first_run=first_run, hour=h, minute=m, dow=dow_digit, was_past=was_past, tz_str=tz_str)
 
     # ── Format 3: "Apr 15 09:00" (month-name day time) ─────────────────────────
     month_name_match = _re.fullmatch(
@@ -709,7 +742,7 @@ def _parse_starting(starting_str: str, tz_name: str | None, now_utc: datetime) -
         if was_past:
             candidate = candidate.replace(year=candidate.year + 1)
         first_run = candidate.astimezone(UTC)
-        return _ParsedStarting(first_run=first_run, hour=h, minute=m, dow=None, was_past=was_past)
+        return _ParsedStarting(first_run=first_run, hour=h, minute=m, dow=None, was_past=was_past, tz_str=tz_str)
 
     # ── Format 4: "04-15 09:00" (MM-DD HH:MM) ─────────────────────────────────
     mmdd_match = _re.fullmatch(r"(\d{2})-(\d{2})\s+(\d{1,2}:\d{2})", stripped)
@@ -727,7 +760,7 @@ def _parse_starting(starting_str: str, tz_name: str | None, now_utc: datetime) -
         if was_past:
             candidate = candidate.replace(year=candidate.year + 1)
         first_run = candidate.astimezone(UTC)
-        return _ParsedStarting(first_run=first_run, hour=h, minute=m, dow=None, was_past=was_past)
+        return _ParsedStarting(first_run=first_run, hour=h, minute=m, dow=None, was_past=was_past, tz_str=tz_str)
 
     # ── Format 5: "YYYY-MM-DD HH:MM" (explicit full datetime) ─────────────────
     full_dt_formats = ["%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y/%m/%d %H:%M"]
@@ -743,6 +776,7 @@ def _parse_starting(starting_str: str, tz_name: str | None, now_utc: datetime) -
                 minute=naive_dt.minute,
                 dow=None,
                 was_past=was_past,
+                tz_str=tz_str,
             )
         except ValueError:
             continue

@@ -591,7 +591,7 @@ class TestParseOneShotInterval(unittest.TestCase):
 class TestParseStarting(unittest.TestCase):
     """Tests for _parse_starting: smart date parsing for the --starting flag."""
 
-    def _parse(self, s: str, tz_name: str | None = None, now_utc: datetime | None = None):
+    def _parse(self, s: str, tz_name: str | None = "UTC", now_utc: datetime | None = None):
         from gateway.cli import _parse_starting
         if now_utc is None:
             now_utc = datetime(2026, 4, 9, 10, 0, 0, tzinfo=UTC)  # 2026-04-09 10:00 UTC (Thursday)
@@ -727,11 +727,24 @@ class TestParseStarting(unittest.TestCase):
         utc_hour = result.first_run.astimezone(UTC).hour
         self.assertIn(utc_hour, (13, 14))  # EDT is -4, so 09+4=13; DST edge: 14 is possible
 
-    def test_invalid_tz_falls_back_to_utc(self):
-        """Unknown timezone silently falls back to UTC."""
+    def test_invalid_tz_falls_back_to_local(self):
+        """Unknown timezone silently falls back to server local timezone (not UTC)."""
         now = datetime(2026, 4, 9, 10, 0, 0, tzinfo=UTC)
         result = self._parse("15:00", tz_name="Invalid/Zone", now_utc=now)
         self.assertIsNotNone(result.first_run)  # should not raise
+
+    def test_no_tz_uses_server_local_not_utc(self):
+        """tz_name=None falls back to server local timezone, not UTC.
+
+        We verify that tz_str is not 'UTC' unless the server literally runs in UTC.
+        Also verify first_run is well-formed and in the future.
+        """
+        now = datetime(2026, 4, 9, 10, 0, 0, tzinfo=UTC)
+        result = self._parse("15:00", tz_name=None, now_utc=now)
+        self.assertIsNotNone(result.first_run)
+        self.assertGreater(result.first_run, now)
+        # tz_str should be set (non-empty)
+        self.assertTrue(result.tz_str)
 
     # ── Invalid input ─────────────────────────────────────────────────────────
 

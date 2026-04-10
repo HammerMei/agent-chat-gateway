@@ -238,6 +238,7 @@ class TestScheduleCreate(_ScheduleCLITestBase):
             "schedule", "create", "e2e-dm",
             "Happy new year!",
             "--starting", "2099-01-01 09:00",
+            "--tz", "UTC",   # explicit tz for deterministic cron assertion
         ])
 
         self.assertEqual(code, 0, f"stderr: {stderr}")
@@ -714,7 +715,10 @@ class TestScheduleCreate(_ScheduleCLITestBase):
         self.assertTrue(len(stderr) > 0)
 
     def test_create_one_shot_at_boundary_dec31(self):
-        """One-shot --starting '2099-12-31 23:59' → cron='59 23 31 12 *', times=1."""
+        """One-shot --starting '2099-12-31 23:59 --tz UTC' → cron='59 23 31 12 *', times=1.
+
+        Explicit --tz UTC ensures the test is deterministic regardless of server locale.
+        """
         received: list[dict] = []
 
         def _capture(req):
@@ -730,6 +734,7 @@ class TestScheduleCreate(_ScheduleCLITestBase):
             "schedule", "create", "e2e-dm",
             "Year end task",
             "--starting", "2099-12-31 23:59",
+            "--tz", "UTC",
         ])
 
         self.assertEqual(code, 0, f"stderr: {stderr}")
@@ -753,6 +758,7 @@ class TestScheduleCreate(_ScheduleCLITestBase):
             "schedule", "create", "e2e-dm",
             "Past task",
             "--starting", "2000-01-01 09:00",
+            "--tz", "UTC",   # explicit tz for deterministic cron assertion
         ])
 
         self.assertEqual(code, 0, "Past --starting should still create the job")
@@ -897,6 +903,7 @@ class TestScheduleCreate(_ScheduleCLITestBase):
             "schedule", "create", "e2e-dm",
             "One-shot future",
             "--starting", "2099-04-10 15:30",
+            "--tz", "UTC",   # explicit tz for deterministic cron assertion
         ])
 
         self.assertEqual(code, 0, f"stderr: {stderr}")
