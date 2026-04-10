@@ -321,6 +321,78 @@ class TestJobSchedulerCatchUp(unittest.IsolatedAsyncioTestCase):
         # inject_message must be called exactly once
         self.assertEqual(sm.inject_message.call_count, 1)
 
+    async def test_catch_up_remaining_one_uses_scheduled_fire_time(self):
+        """m-R3-1: remaining==1 catch-up records last_run from next_run, not wall-clock now.
+
+        The fast-path fires with fire_time = job.next_run (the canonical scheduled
+        time), not datetime.now(UTC).  This keeps last_run consistent with how
+        _fire_due_jobs records fire times (anchored to the scheduled time).
+        """
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = JobStore(jobs_file=Path(tmp.name) / "jobs.json")
+        store.load()
+        sm = MagicMock()
+        sm.inject_message = AsyncMock(return_value=True)
+
+        now = datetime.now(UTC)
+        scheduled_time = now - timedelta(hours=3)  # 3 hours in the past
+        job = store.add(_make_job(
+            times=2,
+            run_count=1,  # remaining == 1
+            next_run=scheduled_time.isoformat(),
+            last_run=(scheduled_time - timedelta(hours=1)).isoformat(),
+        ))
+
+        scheduler = JobScheduler(store=store, session_managers={"rc-home": sm}, completed_job_ttl_days=7)
+        await scheduler._catch_up_missed()
+
+        updated = store.get(job.id)
+        self.assertEqual(updated.run_count, 2)
+        self.assertEqual(updated.status, JobStatus.COMPLETED)
+        # last_run should reflect the nominal scheduled time, not the catch-up wall clock
+        last_run_dt = datetime.fromisoformat(updated.last_run)
+        # Tolerance: last_run should be within 1 second of the scheduled time,
+        # not near 'now' (which is 3 hours later).
+        self.assertLess(abs((last_run_dt - scheduled_time).total_seconds()), 1.0,
+            f"last_run {updated.last_run!r} should be close to scheduled_time "
+            f"{scheduled_time.isoformat()!r}, not near now")
+
+    async def test_catch_up_remaining_zero_marks_completed_without_firing(self):
+        """M-R3-1: _fire_catch_up with remaining==0 must NOT fire the job.
+
+        A job where run_count >= times but status is still ACTIVE (e.g. due to a
+        hand-edited jobs.json) should be marked COMPLETED without firing, rather
+        than delivering one extra message.
+        """
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = JobStore(jobs_file=Path(tmp.name) / "jobs.json")
+        store.load()
+        sm = MagicMock()
+        sm.inject_message = AsyncMock(return_value=True)
+
+        now = datetime.now(UTC)
+        # times=2, run_count=2 → remaining=0, but status left as ACTIVE
+        job = store.add(_make_job(
+            times=2,
+            run_count=2,
+            status=JobStatus.ACTIVE,
+            next_run=(now - timedelta(minutes=5)).isoformat(),
+            last_run=(now - timedelta(minutes=6)).isoformat(),
+        ))
+
+        scheduler = JobScheduler(store=store, session_managers={"rc-home": sm}, completed_job_ttl_days=7)
+        await scheduler._catch_up_missed()
+
+        updated = store.get(job.id)
+        # Must NOT fire — run_count stays at 2
+        self.assertEqual(updated.run_count, 2)
+        self.assertEqual(updated.status, JobStatus.COMPLETED)
+        self.assertIsNotNone(updated.completed_at)
+        self.assertEqual(sm.inject_message.call_count, 0,
+            "inject_message must not be called for an already-exhausted job")
+
 
 class TestJobSchedulerPurge(unittest.IsolatedAsyncioTestCase):
     async def test_tick_purges_expired_completed(self):

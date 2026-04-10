@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -46,6 +47,11 @@ class JobStore:
         self._file = jobs_file
         self._jobs: dict[str, ScheduledJob] = {}  # keyed by job.id
         self._loaded = False
+        # Protects _jobs dict against concurrent access from asyncio.to_thread()
+        # workers (scheduler tick/fire) and the event loop thread (control socket
+        # handlers).  The lock is held only during dict operations, never during
+        # disk I/O, to avoid blocking the event loop longer than necessary.
+        self._lock = threading.Lock()
 
     # ── Load / save ───────────────────────────────────────────────────────────
 
@@ -72,12 +78,19 @@ class JobStore:
         self._loaded = True
 
     def save(self) -> None:
-        """Atomically write current job list to disk."""
+        """Atomically write current job list to disk.
+
+        A snapshot of the in-memory dict is taken under ``_lock`` before any
+        I/O begins, so the lock is held only for the duration of the dict
+        iteration — not during the file write itself.  This prevents a
+        ``RuntimeError: dictionary changed size during iteration`` if a control-
+        socket handler mutates ``_jobs`` concurrently on the event loop thread
+        while the scheduler calls ``save()`` via ``asyncio.to_thread()``.
+        """
+        with self._lock:
+            snapshot = [j.to_dict() for j in self._jobs.values()]
         self._file.parent.mkdir(parents=True, exist_ok=True)
-        data = {
-            "version": _SCHEMA_VERSION,
-            "jobs": [j.to_dict() for j in self._jobs.values()],
-        }
+        data = {"version": _SCHEMA_VERSION, "jobs": snapshot}
         tmp = self._file.with_name(f"{self._file.name}.{os.getpid()}.tmp")
         try:
             tmp.write_text(json.dumps(data, indent=2))
@@ -85,7 +98,7 @@ class JobStore:
         except Exception:
             tmp.unlink(missing_ok=True)
             raise
-        logger.debug("Saved %d scheduled job(s) to %s", len(self._jobs), self._file)
+        logger.debug("Saved %d scheduled job(s) to %s", len(snapshot), self._file)
 
     # ── CRUD ──────────────────────────────────────────────────────────────────
 
@@ -100,7 +113,8 @@ class JobStore:
     def add(self, job: ScheduledJob) -> ScheduledJob:
         """Add a new job and persist. Returns the saved job."""
         self._assert_loaded()
-        self._jobs[job.id] = job
+        with self._lock:
+            self._jobs[job.id] = job
         self.save()
         logger.info("Scheduled job created: %s (watcher=%s, cron=%r)", job.id, job.watcher, job.cron)
         return job
@@ -108,17 +122,19 @@ class JobStore:
     def update(self, job: ScheduledJob) -> None:
         """Update an existing job in place and persist."""
         self._assert_loaded()
-        if job.id not in self._jobs:
-            raise KeyError(f"Job {job.id!r} not found")
-        self._jobs[job.id] = job
+        with self._lock:
+            if job.id not in self._jobs:
+                raise KeyError(f"Job {job.id!r} not found")
+            self._jobs[job.id] = job
         self.save()
 
     def remove(self, job_id: str) -> bool:
         """Remove a job by ID. Returns True if found and removed."""
         self._assert_loaded()
-        if job_id not in self._jobs:
-            return False
-        del self._jobs[job_id]
+        with self._lock:
+            if job_id not in self._jobs:
+                return False
+            del self._jobs[job_id]
         self.save()
         logger.info("Scheduled job deleted: %s", job_id)
         return True
@@ -134,21 +150,25 @@ class JobStore:
             return 0
         cutoff = datetime.now(UTC) - timedelta(days=ttl_days)
         to_remove = []
-        for job in self._jobs.values():
-            if job.status != JobStatus.COMPLETED:
-                continue
-            if ttl_days == 0:
-                to_remove.append(job.id)
-            elif job.completed_at:
-                try:
-                    completed = datetime.fromisoformat(job.completed_at)
-                    if completed < cutoff:
-                        to_remove.append(job.id)
-                except ValueError:
-                    # Malformed completed_at — remove it
+        # Hold the lock for both the iteration and deletion passes so that a
+        # concurrent add() / remove() from the event loop thread cannot change
+        # the dict size mid-iteration (which would raise RuntimeError in CPython).
+        with self._lock:
+            for job in self._jobs.values():
+                if job.status != JobStatus.COMPLETED:
+                    continue
+                if ttl_days == 0:
                     to_remove.append(job.id)
-        for jid in to_remove:
-            del self._jobs[jid]
+                elif job.completed_at:
+                    try:
+                        completed = datetime.fromisoformat(job.completed_at)
+                        if completed < cutoff:
+                            to_remove.append(job.id)
+                    except ValueError:
+                        # Malformed completed_at — remove it
+                        to_remove.append(job.id)
+            for jid in to_remove:
+                del self._jobs[jid]
         if to_remove:
             self.save()
             logger.info("Purged %d expired completed job(s)", len(to_remove))
@@ -159,7 +179,8 @@ class JobStore:
     def get(self, job_id: str) -> ScheduledJob | None:
         """Return a job by ID, or None if not found."""
         self._assert_loaded()
-        return self._jobs.get(job_id)
+        with self._lock:
+            return self._jobs.get(job_id)
 
     def list_jobs(
         self,
@@ -173,7 +194,8 @@ class JobStore:
         ``include_completed=True`` to also include COMPLETED jobs.
         """
         self._assert_loaded()
-        jobs = list(self._jobs.values())
+        with self._lock:
+            jobs = list(self._jobs.values())
         if not include_completed:
             jobs = [j for j in jobs if j.status != JobStatus.COMPLETED]
         if connector:
@@ -184,8 +206,10 @@ class JobStore:
         """Return ACTIVE jobs whose next_run is at or before now (UTC)."""
         self._assert_loaded()
         now = datetime.now(UTC)
+        with self._lock:
+            snapshot = list(self._jobs.values())
         due = []
-        for job in self._jobs.values():
+        for job in snapshot:
             if job.status != JobStatus.ACTIVE:
                 continue
             if job.next_run is None:

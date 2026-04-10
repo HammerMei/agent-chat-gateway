@@ -227,12 +227,39 @@ class JobScheduler:
                 await self._fire_once(job, now)
                 return
 
+        # Guard: job is exhausted (run_count >= times) but status is still ACTIVE.
+        # This can happen if jobs.json was hand-edited or if a persistence race left
+        # the status un-updated.  Do NOT fire — mark as COMPLETED and bail out.
+        remaining = job.times - job.run_count if job.times > 0 else None
+        if remaining is not None and remaining <= 0:
+            logger.warning(
+                "Job %s has run_count=%d >= times=%d but status=ACTIVE — "
+                "marking COMPLETED without firing",
+                job.id, job.run_count, job.times,
+            )
+            job.status = JobStatus.COMPLETED
+            job.next_run = None
+            if not job.completed_at:
+                job.completed_at = datetime.now(UTC).isoformat()
+            await asyncio.to_thread(self._store.update, job)
+            return
+
         # For jobs with exactly one remaining run, fire once regardless of how long
         # they were missed — calling compute_all_missed on a large downtime window
         # could return many entries, but only one more fire is allowed.
-        remaining = job.times - job.run_count if job.times > 0 else None
+        # Use the job's canonical scheduled time (next_run) as the fire timestamp
+        # so that last_run reflects the intended schedule, not the catch-up wall clock.
         if remaining == 1:
-            await self._fire_once(job, now)
+            fire_time = now
+            if job.next_run:
+                try:
+                    parsed = datetime.fromisoformat(job.next_run)
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=UTC)
+                    fire_time = parsed
+                except ValueError:
+                    pass
+            await self._fire_once(job, fire_time)
             return
 
         # For recurring jobs, enumerate all missed fire times

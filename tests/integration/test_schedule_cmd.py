@@ -1321,6 +1321,48 @@ class TestScheduleResume(_ScheduleCLITestBase):
         self.assertEqual(code, 1)
         self.assertIn("acg-nope", stderr)
 
+    def test_control_resume_idempotent_for_active_job(self):
+        """TC-4: resuming an already-ACTIVE job returns ok=True without mutating state."""
+        from gateway.control import ControlServer
+        from unittest.mock import MagicMock
+        from gateway.schedule_types import JobStatus
+
+        mock_store = MagicMock()
+        active_job = MagicMock()
+        active_job.status = JobStatus.ACTIVE
+        active_job.next_run = "2099-04-10T09:00:00+00:00"
+        mock_store.get = MagicMock(return_value=active_job)
+
+        server = ControlServer(entries=[], job_store=mock_store, default_timezone="UTC")
+        result = server._handle_schedule_resume({"cmd": "schedule-resume", "job_id": "acg-active01"})
+
+        self.assertTrue(result.get("ok"), f"Expected ok=True for idempotent resume, got: {result}")
+        self.assertEqual(result.get("next_run"), "2099-04-10T09:00:00+00:00")
+        # Must NOT call update — job state should not be mutated
+        mock_store.update.assert_not_called()
+
+    def test_control_resume_completed_job_returns_error(self):
+        """TC-4: resuming a COMPLETED job returns ok=False with a clear error message."""
+        from gateway.control import ControlServer
+        from unittest.mock import MagicMock
+        from gateway.schedule_types import JobStatus
+
+        mock_store = MagicMock()
+        completed_job = MagicMock()
+        completed_job.status = JobStatus.COMPLETED
+        mock_store.get = MagicMock(return_value=completed_job)
+
+        server = ControlServer(entries=[], job_store=mock_store, default_timezone="UTC")
+        result = server._handle_schedule_resume({"cmd": "schedule-resume", "job_id": "acg-done01"})
+
+        self.assertFalse(result.get("ok"), f"Expected ok=False for completed job, got: {result}")
+        error = result.get("error", "").lower()
+        self.assertTrue(
+            "completed" in error or "cannot be resumed" in error,
+            f"Error message should mention 'completed' or 'cannot be resumed', got: {result.get('error')!r}",
+        )
+        mock_store.update.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # Tests: schedule delete
