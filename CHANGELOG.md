@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.2.1] - 2026-04-11
+
+### Fixed
+- **Docker EBUSY error**: `JobStore.save()` now falls back to in-place write
+  when `rename()` returns `EBUSY` (caused by Docker single-file bind-mounts
+  pinning the file inode).
+- **`jobs.json` moved to `data/` subdirectory** (`~/.agent-chat-gateway/data/jobs.json`):
+  use a directory bind-mount (`./data:/root/.agent-chat-gateway/data`) instead
+  of a single-file mount to avoid the EBUSY issue entirely. The `data/`
+  directory is pre-created in `Dockerfile.acg` and in `docker-compose.example/`.
+  Future persistent runtime files can be added to `data/` without changing
+  the Docker volume configuration.
+
+### Migration (Docker users upgrading from 0.2.0)
+If you had `./jobs.json` mounted as a single-file volume:
+1. `mkdir data && mv jobs.json data/`
+2. Update `docker-compose.yml`: replace `- ./jobs.json:/root/.agent-chat-gateway/jobs.json`
+   with `- ./data:/root/.agent-chat-gateway/data`
+3. `docker compose up -d`
+
+---
+
 ## [0.2.0] - 2026-04-10
 
 ### Added
