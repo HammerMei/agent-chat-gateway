@@ -15,7 +15,8 @@ Storage format
 
 The ``data/`` subdirectory is designed to be bind-mounted as a Docker volume
 so that persistent runtime state (jobs, and any future files) survives
-container recreates without the EBUSY issue of single-file bind-mounts.
+container recreates. Directory mounts allow atomic rename(2) inside them,
+unlike single-file bind-mounts which pin the inode and cause EBUSY.
 
 Atomic writes use the same PID-unique temp-file + rename(2) pattern as
 ``gateway.core.state`` to guarantee no partial writes on crash.
@@ -23,7 +24,6 @@ Atomic writes use the same PID-unique temp-file + rename(2) pattern as
 
 from __future__ import annotations
 
-import errno
 import json
 import logging
 import os
@@ -93,37 +93,17 @@ class JobStore:
         ``RuntimeError: dictionary changed size during iteration`` if a control-
         socket handler mutates ``_jobs`` concurrently on the event loop thread
         while the scheduler calls ``save()`` via ``asyncio.to_thread()``.
-
-        Atomic strategy: write to a PID+thread-unique temp file, then rename
-        into place.  If the rename fails with EBUSY (Docker bind-mounted file
-        — the kernel pins the inode so rename(2) is rejected), fall back to an
-        in-place write.  The daemon is the sole writer so in-place write is
-        safe: no other process can produce a partial read.
         """
         with self._lock:
             snapshot = [j.to_dict() for j in self._jobs.values()]
         self._file.parent.mkdir(parents=True, exist_ok=True)
         data = {"version": _SCHEMA_VERSION, "jobs": snapshot}
-        payload = json.dumps(data, indent=2)
         # Include thread ident so concurrent save() calls from different
         # asyncio.to_thread() workers don't clobber each other's temp file.
         tmp = self._file.with_name(f"{self._file.name}.{os.getpid()}.{_thread_ident()}.tmp")
         try:
-            tmp.write_text(payload)
+            tmp.write_text(json.dumps(data, indent=2))
             tmp.replace(self._file)
-        except OSError as exc:
-            tmp.unlink(missing_ok=True)
-            if exc.errno == errno.EBUSY:
-                # Docker bind-mount: rename() over the pinned inode is rejected.
-                # Fall back to in-place write — safe because daemon is sole writer.
-                logger.debug(
-                    "Atomic rename blocked (EBUSY — Docker bind-mount?); "
-                    "falling back to in-place write for %s",
-                    self._file,
-                )
-                self._file.write_text(payload)
-            else:
-                raise
         except Exception:
             tmp.unlink(missing_ok=True)
             raise
