@@ -281,7 +281,6 @@ class ControlServer:
         from .schedule_types import JobStatus, ScheduledJob
 
         watcher = (request.get("watcher") or "").strip()
-        connector = request.get("connector", "")
         message = request.get("message", "")
         cron = request.get("cron", "")
         timezone = request.get("timezone") or self._default_timezone or _server_local_timezone()
@@ -362,26 +361,16 @@ class ControlServer:
             except Exception as e:
                 return {"ok": False, "error": f"Failed to compute next run time: {e}"}
 
-        # Auto-detect connector from watcher if not supplied
+        # Resolve connector from watcher name — the watcher name is the sole
+        # identifier; connectors need not be specified by the caller.
+        connector = self._find_connector_for_watcher(watcher)
         if not connector:
-            connector = self._find_connector_for_watcher(watcher)
-            if not connector:
-                available = self._list_all_watcher_names()
-                hint = f" Available watchers: {available}" if available else ""
-                return {
-                    "ok": False,
-                    "error": (
-                        f"Watcher {watcher!r} not found in any connector.{hint}"
-                    ),
-                }
-
-        # Always validate watcher exists in the resolved connector's config,
-        # even when --connector was explicitly supplied.  Without this check,
-        # a mis-typed watcher name is silently stored and only fails at fire
-        # time, making it impossible for the agent to self-correct.
-        watcher_err = self._validate_watcher_in_connector(watcher, connector)
-        if watcher_err is not None:
-            return {"ok": False, "error": watcher_err}
+            available = self._list_all_watcher_names()
+            hint = f" Available watchers: {available}" if available else ""
+            return {
+                "ok": False,
+                "error": f"Watcher {watcher!r} not found in any connector.{hint}",
+            }
 
         job = ScheduledJob(
             watcher=watcher,
@@ -478,21 +467,6 @@ class ControlServer:
             if entry.session_manager.get_watcher_config(watcher_name) is not None:
                 return entry.name
         return ""
-
-    def _validate_watcher_in_connector(self, watcher: str, connector: str) -> str | None:
-        """Validate that *watcher* is defined in *connector*'s config.
-
-        Returns an error string if invalid, or ``None`` if the watcher is found.
-        Extracted as a method so tests can mock it independently.
-        """
-        resolved_entry = self._resolve_entry(connector)
-        if isinstance(resolved_entry, dict):
-            return resolved_entry.get("error", f"Unknown connector: {connector!r}")
-        if resolved_entry.session_manager.get_watcher_config(watcher) is None:
-            available = self._list_all_watcher_names()
-            hint = f" Available watchers: {available}" if available else ""
-            return f"Watcher {watcher!r} not found in connector {connector!r}.{hint}"
-        return None
 
     def _list_all_watcher_names(self) -> str:
         """Return a comma-separated string of all configured watcher names."""

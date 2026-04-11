@@ -15,7 +15,6 @@ agent-chat-gateway schedule create <watcher> "<message>" [OPTIONS]
 - `--starting TIME` — Time anchor / start time. With `--every`: sets the first run time and (for `1d`/`1w`) pins the cron time-of-day. Without `--every`: specific datetime for a one-shot task. Accepts smart partial inputs (see below).
 - `--times N` — Number of runs. `0` = forever (default). `N` = stop after N runs.
 - `--tz TIMEZONE` — IANA timezone (e.g. `America/New_York`, `Europe/Berlin`, `UTC`). The `--starting` time is interpreted in this timezone. Only relevant for daily/weekly jobs anchored to a specific local time — **omit for sub-hourly intervals** (`1m`–`12h`), which fire on a fixed cadence regardless of timezone.
-- `--connector NAME` — Connector name (auto-detected if omitted)
 
 **`--starting` accepts smart partial inputs — the user does NOT need to type full dates:**
 - `"09:00"` → today at 09:00 (auto-advances to tomorrow if already past)
