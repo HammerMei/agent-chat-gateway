@@ -81,12 +81,6 @@ def main():
         help="Reset a watcher: clear runtime state and start a fresh session",
     )
     reset_p.add_argument("watcher_name", help="Watcher name as defined in config.yaml")
-    reset_p.add_argument(
-        "--connector",
-        default=None,
-        metavar="NAME",
-        help="Connector the watcher belongs to (default: first configured connector)",
-    )
 
     # onboard
     onboard_p = sub.add_parser(

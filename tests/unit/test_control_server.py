@@ -20,8 +20,13 @@ from gateway.control import ControlServer
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _make_entry(name: str, dispatch_result: dict | None = None,
-                send_raises: Exception | None = None) -> MagicMock:
-    """Build a minimal ConnectorEntry-like mock."""
+                send_raises: Exception | None = None,
+                watcher_names: list[str] | None = None) -> MagicMock:
+    """Build a minimal ConnectorEntry-like mock.
+
+    watcher_names: if provided, get_watcher_config() returns a truthy value
+    only for names in the list (simulating globally-unique watcher ownership).
+    """
     entry = MagicMock()
     entry.name = name
     entry.session_manager.dispatch_command = AsyncMock(
@@ -31,6 +36,10 @@ def _make_entry(name: str, dispatch_result: dict | None = None,
         entry.connector.send_to_room = AsyncMock(side_effect=send_raises)
     else:
         entry.connector.send_to_room = AsyncMock(return_value=None)
+    if watcher_names is not None:
+        def _get_watcher_config(wname: str):
+            return MagicMock() if wname in watcher_names else None
+        entry.session_manager.get_watcher_config = MagicMock(side_effect=_get_watcher_config)
     return entry
 
 
@@ -192,6 +201,74 @@ class TestHandleSend(unittest.IsolatedAsyncioTestCase):
         })
         self.assertFalse(result["ok"])
         self.assertIn("room not found", result["error"])
+
+
+# ── _find_entry_for_watcher ───────────────────────────────────────────────────
+
+class TestFindEntryForWatcher(unittest.IsolatedAsyncioTestCase):
+    """_find_entry_for_watcher resolves the correct entry by watcher name."""
+
+    def test_finds_entry_that_owns_watcher(self):
+        e_rc = _make_entry("rc", watcher_names=["support"])
+        e_slack = _make_entry("slack", watcher_names=["sales"])
+        server = _make_server(e_rc, e_slack)
+
+        result = server._find_entry_for_watcher("support")
+        self.assertIs(result, e_rc)
+
+        result = server._find_entry_for_watcher("sales")
+        self.assertIs(result, e_slack)
+
+    def test_unknown_watcher_returns_error(self):
+        e = _make_entry("rc", watcher_names=["support"])
+        server = _make_server(e)
+
+        result = server._find_entry_for_watcher("nonexistent")
+        self.assertIsInstance(result, dict)
+        self.assertFalse(result["ok"])
+        self.assertIn("nonexistent", result["error"])
+
+    def test_empty_watcher_name_returns_error(self):
+        server = _make_server(_make_entry("rc", watcher_names=[]))
+        result = server._find_entry_for_watcher("")
+        self.assertIsInstance(result, dict)
+        self.assertFalse(result["ok"])
+
+
+# ── reset command routing ─────────────────────────────────────────────────────
+
+class TestResetRouting(unittest.IsolatedAsyncioTestCase):
+    """reset command auto-resolves connector from watcher name (no --connector needed)."""
+
+    async def test_reset_routes_to_correct_entry_without_connector(self):
+        """reset watcher_name routes to the entry that owns the watcher."""
+        e_rc = _make_entry("rc", watcher_names=["support"])
+        e_slack = _make_entry("slack", watcher_names=["sales"])
+        server = _make_server(e_rc, e_slack)
+
+        result = await server.dispatch_command({"cmd": "reset", "watcher_name": "support"})
+        self.assertTrue(result["ok"])
+        e_rc.session_manager.dispatch_command.assert_called_once()
+        e_slack.session_manager.dispatch_command.assert_not_called()
+
+    async def test_reset_unknown_watcher_returns_error(self):
+        e = _make_entry("rc", watcher_names=["support"])
+        server = _make_server(e)
+
+        result = await server.dispatch_command({"cmd": "reset", "watcher_name": "unknown"})
+        self.assertFalse(result["ok"])
+        self.assertIn("unknown", result["error"])
+
+    async def test_reset_with_explicit_connector_still_works(self):
+        """Passing connector= explicitly in the request still routes via _resolve_entry."""
+        e_rc = _make_entry("rc")
+        server = _make_server(e_rc)
+
+        result = await server.dispatch_command({
+            "cmd": "reset", "watcher_name": "support", "connector": "rc"
+        })
+        self.assertTrue(result["ok"])
+        e_rc.session_manager.dispatch_command.assert_called_once()
 
     async def test_send_unknown_connector_returns_error(self):
         server = _make_server(_make_entry("rc"))
