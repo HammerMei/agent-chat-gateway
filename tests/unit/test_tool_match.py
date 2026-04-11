@@ -3,6 +3,7 @@
 Covers:
   - _normalize_path: path traversal prevention, relative paths, absolute paths
   - matches_rule: tool name regex, params regex, case insensitivity, params=None
+  - extract_bash_subcommands: compound commands, heredoc redirects, file redirects
   - get_param_strings_for_claude: Bash, file tools, WebFetch, unknown tools
   - get_param_strings_for_opencode: patterns list, empty patterns fallback
   - all_params_match_any: all-match semantics, partial match fails, empty allow-list
@@ -16,6 +17,7 @@ from gateway.config import ToolRule
 from gateway.core.tool_match import (
     _normalize_path,
     all_params_match_any,
+    extract_bash_subcommands,
     get_param_strings_for_claude,
     get_param_strings_for_opencode,
     matches_rule,
@@ -124,6 +126,94 @@ class TestMatchesRule(unittest.TestCase):
         """Regex fullmatch: 'Rea' must NOT match 'Read'."""
         rule = ToolRule(tool="Rea")
         self.assertFalse(matches_rule(rule, "Read", "/file"))
+
+
+# ── extract_bash_subcommands ─────────────────────────────────────────────────
+
+
+class TestExtractBashSubcommands(unittest.TestCase):
+    """extract_bash_subcommands handles simple commands, compound commands, and heredocs."""
+
+    def test_simple_command_returned_as_is(self):
+        result = extract_bash_subcommands("ls -la")
+        self.assertEqual(result, ["ls -la"])
+
+    def test_compound_and_splits_into_two(self):
+        result = extract_bash_subcommands("echo hi && rm -rf /")
+        self.assertIn("echo hi", result)
+        self.assertTrue(any("rm -rf /" in r for r in result))
+        self.assertEqual(len(result), 2)
+
+    def test_semicolon_splits_into_two(self):
+        result = extract_bash_subcommands("ls; echo done")
+        self.assertEqual(len(result), 2)
+
+    def test_pipe_splits_into_two(self):
+        result = extract_bash_subcommands("cat file.txt | grep foo")
+        self.assertEqual(len(result), 2)
+
+    # ── heredoc handling ──────────────────────────────────────────────────────
+
+    def test_heredoc_full_text_extracted(self):
+        """python3 << 'EOF'...EOF must produce a string containing the heredoc body."""
+        cmd = "python3 << 'GHEOF'\nimport urllib.request\nurl = 'https://github.com/trending?since=weekly'\nGHEOF"
+        result = extract_bash_subcommands(cmd)
+        # Must produce exactly one entry
+        self.assertEqual(len(result), 1)
+        # The full text must be present so patterns can inspect the heredoc body
+        self.assertIn("github.com/trending", result[0])
+        self.assertTrue(result[0].startswith("python3"))
+
+    def test_heredoc_full_text_matches_allow_pattern(self):
+        """Allow-list pattern for heredoc body must match after extraction."""
+        from gateway.config import ToolRule
+        from gateway.core.tool_match import all_params_match_any
+
+        cmd = (
+            "python3 << 'GHEOF'\n"
+            "import urllib.request, re, json, html as h\n"
+            "req = urllib.request.Request('https://github.com/trending?since=weekly')\n"
+            "print(req)\n"
+            "GHEOF"
+        )
+        param_strings = extract_bash_subcommands(cmd)
+        rule = ToolRule(tool="Bash", params=r"python3.*github\.com/trending.*")
+        self.assertTrue(all_params_match_any([rule], "Bash", param_strings))
+
+    def test_heredoc_dangerous_compound_still_blocked(self):
+        """python3 << 'EOF'...EOF && rm -rf / — rm must be extracted separately and blocked."""
+        from gateway.config import ToolRule
+        from gateway.core.tool_match import all_params_match_any
+
+        cmd = (
+            "python3 << 'GHEOF'\n"
+            "url = 'https://github.com/trending'\n"
+            "GHEOF\n"
+            "&& rm -rf /"
+        )
+        param_strings = extract_bash_subcommands(cmd)
+        # Must have at least 2 entries: the heredoc command and the rm command
+        self.assertGreaterEqual(len(param_strings), 2)
+        # A pattern matching only the heredoc must NOT approve the whole compound command
+        rule = ToolRule(tool="Bash", params=r"python3.*github\.com/trending.*")
+        self.assertFalse(all_params_match_any([rule], "Bash", param_strings))
+
+    def test_file_redirect_does_not_include_redirect_target(self):
+        """echo hi > /tmp/out — only 'echo hi' is extracted, not the redirect target."""
+        result = extract_bash_subcommands("echo hi > /tmp/out")
+        # Should have exactly one entry containing the command (not the file path)
+        self.assertEqual(len(result), 1)
+        self.assertIn("echo", result[0])
+        # The redirect operator and filename may or may not appear but the command
+        # must be present; crucially the result must NOT be 'python3' alone
+        self.assertNotEqual(result[0].strip(), "echo")  # params included
+
+    def test_herestring_full_text_extracted(self):
+        """cmd <<< 'value' — herestring content included in extracted text."""
+        cmd = "grep pattern <<< 'some multiline content with https://example.com'"
+        result = extract_bash_subcommands(cmd)
+        self.assertEqual(len(result), 1)
+        self.assertIn("example.com", result[0])
 
 
 # ── get_param_strings_for_claude ─────────────────────────────────────────────

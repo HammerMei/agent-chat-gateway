@@ -99,6 +99,13 @@ def extract_bash_subcommands(command: str) -> list[str]:
     of their parent command's text but are not recursed into.  This is the same
     behavior as OpenCode.
 
+    Heredoc redirections (``cmd << 'EOF' ... EOF``): the full
+    ``redirected_statement`` text is returned as a single string so that
+    allow-list patterns can inspect the heredoc body content (e.g. a Python
+    script piped to the interpreter).  For regular file redirections
+    (``> file``, ``< file``, etc.) only the ``command`` child is returned —
+    consistent with non-redirected commands.
+
     Falls back to ``[command]`` (treat whole string as one command) when:
       - tree-sitter is not installed
       - the parser produces an empty result (shouldn't happen for valid bash)
@@ -117,6 +124,23 @@ def extract_bash_subcommands(command: str) -> list[str]:
         if node.type == "command":
             commands.append(src[node.start_byte:node.end_byte].decode())
             return
+        if node.type == "redirected_statement":
+            # When a command uses a heredoc redirect (e.g. ``python3 << 'EOF'``),
+            # the heredoc body is logically the command's stdin input and may
+            # contain security-relevant content (e.g. a Python script).
+            # Extract the full ``redirected_statement`` text so allow-list patterns
+            # can inspect the heredoc body.
+            #
+            # For non-heredoc redirections (file I/O, e.g. ``echo hi > /tmp/f``),
+            # fall through to normal child traversal so only the ``command`` node
+            # text is extracted — consistent with prior behaviour.
+            has_heredoc = any(
+                child.type in ("heredoc_redirect", "herestring_redirect")
+                for child in node.children
+            )
+            if has_heredoc:
+                commands.append(src[node.start_byte:node.end_byte].decode())
+                return
         for child in node.children:
             walk(child)
 
