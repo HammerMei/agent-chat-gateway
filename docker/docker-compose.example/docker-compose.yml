@@ -18,7 +18,6 @@
 #   2. vim .env                                      # fill in CLAUDE_CODE_OAUTH_TOKEN
 #   3. vim config/.env                               # fill in RC_URL, RC_USERNAME, RC_PASSWORD
 #   4. vim config/config.yaml                        # set owners, rooms, agents
-#   5. echo '{"version":1,"jobs":[]}' > jobs.json    # must exist before first `docker compose up`
 #
 # Optional — customize agent personas/context per agent backend:
 #   vim agents/claude_agent/CLAUDE.md                # Claude Code agent persona & instructions
@@ -50,10 +49,8 @@ services:
 
       # ── Scheduled jobs ────────────────────────────────────────────────────
       # Persists jobs created via `acg schedule create` across container
-      # recreates (upgrades). IMPORTANT: the file must exist on the host
-      # before the first `docker compose up` — run the echo command in
-      # step 5 above during setup, otherwise Docker will create a
-      # directory instead of a file.
+      # recreates (upgrades). The file is pre-created in this example
+      # directory — copy it alongside docker-compose.yml.
       - ./jobs.json:/root/.agent-chat-gateway/jobs.json
 
       # ── OpenCode config (uncomment if using OpenCode backend) ─────────────
