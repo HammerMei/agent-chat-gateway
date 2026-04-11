@@ -234,7 +234,7 @@ This is intentional — no missed reminders, no silent skips. If you want to avo
 All job state is persisted in:
 
 ```
-~/.agent-chat-gateway/jobs.json
+~/.agent-chat-gateway/data/jobs.json
 ```
 
 Each job record contains:
@@ -249,7 +249,9 @@ Each job record contains:
 | `run_count` | How many times the job has fired so far |
 | `status` | `active`, `paused`, or `completed` |
 
-You can inspect or back up `jobs.json` directly. Do not edit it while ACG is running — restart ACG after any manual edits.
+You can inspect or back up `data/jobs.json` directly. Do not edit it while ACG is running — restart ACG after any manual edits.
+
+> **Docker users:** mount `./data:/root/.agent-chat-gateway/data` as a directory volume to persist jobs across container recreates (upgrades).
 
 ---
 
