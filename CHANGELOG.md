@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.2.3] - 2026-04-11
+
+### Fixed
+- **Watcher validation at schedule create time**: unknown watcher names are
+  now rejected immediately with an actionable error listing all available
+  watcher names — the agent can self-correct without waiting for fire time.
+
+### Changed
+- **`--connector` removed from `acg schedule create`**: the watcher name
+  uniquely identifies the connector; specifying `--connector` was redundant
+  and was the root cause of the watcher validation bypass bug.
+- **`scheduling-context.md`**: added explicit warning to always use the exact
+  watcher name from `acg list` — do not guess or invent names.
+
+---
+
 ## [0.2.2] - 2026-04-11
 
 ### Changed
