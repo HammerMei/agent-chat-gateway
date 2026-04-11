@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.2.4] - 2026-04-11
+
+### Fixed
+- **Heredoc command matching in allow-list**: bash commands using heredoc
+  redirects (`python3 << 'EOF' ... EOF`) were incorrectly reduced to just
+  the interpreter name (`python3`) by the tree-sitter AST walker. The full
+  `redirected_statement` text (including the heredoc body) is now extracted,
+  so allow-list patterns can inspect the heredoc content — e.g.
+  `python3.*github\.com/trending.*` now correctly matches a Python heredoc
+  that fetches GitHub trending. Compound commands with heredoc (e.g.
+  `python3 << 'EOF'...EOF && rm -rf /`) are still split correctly — the
+  dangerous sub-command is extracted separately and must also satisfy the
+  allow list.
+
+---
+
 ## [0.2.3] - 2026-04-11
 
 ### Fixed
