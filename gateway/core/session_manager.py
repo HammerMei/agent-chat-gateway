@@ -137,6 +137,10 @@ class SessionManager:
         """Return the WatcherConfig for a watcher name, or None if not found."""
         return self._lifecycle.get_watcher_config(name)
 
+    def get_all_watcher_names(self) -> list[str]:
+        """Return all configured watcher names for this connector."""
+        return [wc.name for wc in self._lifecycle._watcher_configs]
+
     async def pause_watcher(self, name: str) -> None:
         await self._lifecycle.pause_watcher(name)
 

@@ -366,13 +366,22 @@ class ControlServer:
         if not connector:
             connector = self._find_connector_for_watcher(watcher)
             if not connector:
+                available = self._list_all_watcher_names()
+                hint = f" Available watchers: {available}" if available else ""
                 return {
                     "ok": False,
                     "error": (
-                        f"Could not determine connector for watcher {watcher!r}. "
-                        f"Specify --connector NAME."
+                        f"Watcher {watcher!r} not found in any connector.{hint}"
                     ),
                 }
+
+        # Always validate watcher exists in the resolved connector's config,
+        # even when --connector was explicitly supplied.  Without this check,
+        # a mis-typed watcher name is silently stored and only fails at fire
+        # time, making it impossible for the agent to self-correct.
+        watcher_err = self._validate_watcher_in_connector(watcher, connector)
+        if watcher_err is not None:
+            return {"ok": False, "error": watcher_err}
 
         job = ScheduledJob(
             watcher=watcher,
@@ -469,6 +478,32 @@ class ControlServer:
             if entry.session_manager.get_watcher_config(watcher_name) is not None:
                 return entry.name
         return ""
+
+    def _validate_watcher_in_connector(self, watcher: str, connector: str) -> str | None:
+        """Validate that *watcher* is defined in *connector*'s config.
+
+        Returns an error string if invalid, or ``None`` if the watcher is found.
+        Extracted as a method so tests can mock it independently.
+        """
+        resolved_entry = self._resolve_entry(connector)
+        if isinstance(resolved_entry, dict):
+            return resolved_entry.get("error", f"Unknown connector: {connector!r}")
+        if resolved_entry.session_manager.get_watcher_config(watcher) is None:
+            available = self._list_all_watcher_names()
+            hint = f" Available watchers: {available}" if available else ""
+            return f"Watcher {watcher!r} not found in connector {connector!r}.{hint}"
+        return None
+
+    def _list_all_watcher_names(self) -> str:
+        """Return a comma-separated string of all configured watcher names."""
+        names: list[str] = []
+        seen: set[str] = set()
+        for entry in self._entries:
+            for name in entry.session_manager.get_all_watcher_names():
+                if name not in seen:
+                    names.append(name)
+                    seen.add(name)
+        return ", ".join(f"{n!r}" for n in sorted(names))
 
     async def _handle_send(self, request: dict, connector_name: str | None) -> dict:
         """Handle the 'send' command: route to a connector's send_to_room method."""
