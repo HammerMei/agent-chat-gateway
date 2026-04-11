@@ -822,7 +822,9 @@ class TestHandlerSendBusy(unittest.IsolatedAsyncioTestCase):
         call_kwargs = connector._rest.post_message.call_args
         self.assertEqual(call_kwargs[0][0], "room-1")
         self.assertIn("busy", call_kwargs[0][1].lower())
-        self.assertEqual(call_kwargs[1].get("thread_id"), "thread-123")
+        # post_message uses tmid= (not thread_id=)
+        self.assertEqual(call_kwargs[1].get("tmid"), "thread-123")
+        self.assertNotIn("thread_id", call_kwargs[1])
 
     async def test_posts_busy_message_without_thread_id(self):
         connector = _make_connector()
@@ -831,7 +833,7 @@ class TestHandlerSendBusy(unittest.IsolatedAsyncioTestCase):
         await connector._handler_send_busy("room-1", doc)
         connector._rest.post_message.assert_awaited_once()
         call_kwargs = connector._rest.post_message.call_args
-        self.assertIsNone(call_kwargs[1].get("thread_id"))
+        self.assertIsNone(call_kwargs[1].get("tmid"))
 
 
 # ── Tests: notify_agent_event + send_text placeholder lifecycle ──────────────

@@ -175,6 +175,9 @@ class ControlServer:
         Uses the 'connector' field in the request to select the target entry.
         Special case: 'list' without a connector name aggregates watchers
         across ALL connectors, annotating each entry with its connector name.
+        Special case: 'reset' without a connector name auto-resolves the entry
+        by searching all connectors for the named watcher (watcher names are
+        globally unique, enforced at config load time).
         """
         cmd = request.get("cmd")
         connector_name = request.get("connector")
@@ -219,6 +222,15 @@ class ControlServer:
         if cmd and cmd.startswith("schedule-"):
             return self._handle_schedule(cmd, request)
 
+        # reset: auto-resolve connector from watcher name (watcher names are
+        # globally unique across all connectors, so no --connector is needed).
+        if cmd == "reset" and not connector_name:
+            watcher_name = request.get("watcher_name", "")
+            entry = self._find_entry_for_watcher(watcher_name)
+            if isinstance(entry, dict):
+                return entry  # error response (unknown watcher)
+            return await entry.session_manager.dispatch_command(request)
+
         # All other commands: route to a specific entry
         entry = self._resolve_entry(connector_name)
         if isinstance(entry, dict):
@@ -249,6 +261,20 @@ class ControlServer:
                 ),
             }
         return self._entries[0]
+
+    def _find_entry_for_watcher(self, watcher_name: str) -> "ConnectorEntry | dict":
+        """Find the ConnectorEntry that owns the named watcher.
+
+        Watcher names are globally unique (enforced at config load time), so
+        searching all entries by name is unambiguous.  Returns an error dict
+        if no entry owns the watcher.
+        """
+        if not watcher_name:
+            return {"ok": False, "error": "Missing 'watcher_name'"}
+        for entry in self._entries:
+            if entry.session_manager.get_watcher_config(watcher_name) is not None:
+                return entry
+        return {"ok": False, "error": f"Unknown watcher: {watcher_name!r}"}
 
     def _handle_schedule(self, cmd: str, request: dict) -> dict:
         """Route schedule-* commands to the JobStore.
