@@ -210,13 +210,13 @@ watchers:
 #   agent-chat-gateway schedule pause JOB_ID
 #   agent-chat-gateway schedule resume JOB_ID
 #
-# Jobs are stored in ~/.agent-chat-gateway/jobs.json.
+# Jobs are stored in ~/.agent-chat-gateway/data/jobs.json.
 # The daemon must be running for schedule commands to work (they use the control socket).
 
 # scheduler:
 #   default_timezone: "Asia/Taipei"   # IANA timezone used when --tz is not specified.
 #                                     # Falls back to ACG server's local timezone if omitted.
 #                                     # Examples: "UTC", "America/New_York", "Europe/London"
-#   completed_job_ttl_days: 7         # How long completed jobs are kept in jobs.json before purge.
+#   completed_job_ttl_days: 7         # How long completed jobs are kept in data/jobs.json before purge.
 #                                     # 0 = delete immediately when a job completes.
 #                                     # Use "acg schedule list --all" to see completed jobs.
