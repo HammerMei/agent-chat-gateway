@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.2.2] - 2026-04-11
+
+### Changed
+- **`JobStore.save()` cleanup**: removed the EBUSY fallback added in 0.2.1 —
+  superseded by the `data/` directory mount which allows atomic `rename(2)`
+  natively. Drops the unused `errno` import.
+
+---
+
 ## [0.2.1] - 2026-04-11
 
 ### Fixed
