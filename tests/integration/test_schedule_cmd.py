@@ -1018,8 +1018,9 @@ class TestScheduleCreate(_ScheduleCLITestBase):
         mock_store = MagicMock()
         mock_store.add = MagicMock(return_value=MagicMock(id="acg-test001"))
         server = ControlServer(entries=[], job_store=mock_store, default_timezone="UTC")
-        # Patch _find_connector_for_watcher to avoid needing real entries
+        # Patch internals to avoid needing real connector entries
         server._find_connector_for_watcher = MagicMock(return_value="rc-home")
+        server._validate_watcher_in_connector = MagicMock(return_value=None)
 
         request = {
             "cmd": "schedule-create",
@@ -1031,6 +1032,33 @@ class TestScheduleCreate(_ScheduleCLITestBase):
         }
         result = server._handle_schedule_create(request)
         self.assertTrue(result.get("ok"), f"Expected success, got: {result}")
+
+    def test_control_handle_schedule_create_rejects_unknown_watcher(self):
+        """Watcher validation: rejects unknown watcher name and lists available ones."""
+        from unittest.mock import MagicMock
+
+        from gateway.control import ControlServer
+
+        mock_store = MagicMock()
+        server = ControlServer(entries=[], job_store=mock_store, default_timezone="UTC")
+        server._find_connector_for_watcher = MagicMock(return_value="rc-home")
+        # Simulate watcher not found in connector config
+        server._validate_watcher_in_connector = MagicMock(
+            return_value="Watcher 'bad-watcher' not found in connector 'rc-home'. Available watchers: 'real-watcher'"
+        )
+
+        request = {
+            "cmd": "schedule-create",
+            "watcher": "bad-watcher",
+            "message": "test",
+            "cron": "* * * * *",
+            "times": 0,
+        }
+        result = server._handle_schedule_create(request)
+        self.assertFalse(result.get("ok"))
+        error = result.get("error", "")
+        self.assertIn("bad-watcher", error)
+        self.assertIn("real-watcher", error)  # available watchers listed in error
 
     def test_control_handle_schedule_create_rejects_bool_times(self):
         """C2: _handle_schedule_create rejects True/False for 'times' (bool is a subclass of int)."""
