@@ -267,8 +267,8 @@ class TestScheduleCreate(_ScheduleCLITestBase):
 
         self.assertEqual(received[0].get("timezone"), "Asia/Taipei")
 
-    def test_create_with_connector_filter(self):
-        """--connector is forwarded in the command payload."""
+    def test_create_payload_contains_watcher_not_connector(self):
+        """schedule create sends watcher name; connector is resolved server-side."""
         received: list[dict] = []
 
         def _capture(req):
@@ -281,10 +281,10 @@ class TestScheduleCreate(_ScheduleCLITestBase):
             "schedule", "create", "e2e-dm",
             "Hello",
             "--every", "1h",
-            "--connector", "rc-e2e",
         ])
 
-        self.assertEqual(received[0].get("connector"), "rc-e2e")
+        self.assertEqual(received[0].get("watcher"), "e2e-dm")
+        self.assertNotIn("connector", received[0])  # connector resolved server-side, not sent by CLI
 
     def test_create_invalid_watcher_daemon_returns_error(self):
         """Daemon returning error (e.g. unknown watcher) → stderr error + exit 1."""
@@ -1018,9 +1018,8 @@ class TestScheduleCreate(_ScheduleCLITestBase):
         mock_store = MagicMock()
         mock_store.add = MagicMock(return_value=MagicMock(id="acg-test001"))
         server = ControlServer(entries=[], job_store=mock_store, default_timezone="UTC")
-        # Patch internals to avoid needing real connector entries
+        # Patch _find_connector_for_watcher to avoid needing real connector entries
         server._find_connector_for_watcher = MagicMock(return_value="rc-home")
-        server._validate_watcher_in_connector = MagicMock(return_value=None)
 
         request = {
             "cmd": "schedule-create",
@@ -1041,11 +1040,9 @@ class TestScheduleCreate(_ScheduleCLITestBase):
 
         mock_store = MagicMock()
         server = ControlServer(entries=[], job_store=mock_store, default_timezone="UTC")
-        server._find_connector_for_watcher = MagicMock(return_value="rc-home")
-        # Simulate watcher not found in connector config
-        server._validate_watcher_in_connector = MagicMock(
-            return_value="Watcher 'bad-watcher' not found in connector 'rc-home'. Available watchers: 'real-watcher'"
-        )
+        # Simulate watcher not found in any connector
+        server._find_connector_for_watcher = MagicMock(return_value="")
+        server._list_all_watcher_names = MagicMock(return_value="'real-watcher'")
 
         request = {
             "cmd": "schedule-create",

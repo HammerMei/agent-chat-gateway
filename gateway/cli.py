@@ -162,12 +162,6 @@ def main():
         help="IANA timezone (e.g. 'Asia/Taipei', 'America/New_York', 'UTC'). "
              "Fallback: scheduler.default_timezone in config, then server local.",
     )
-    sched_create_p.add_argument(
-        "--connector",
-        default=None,
-        metavar="NAME",
-        help="Connector the watcher belongs to (default: auto-detect)",
-    )
 
     # schedule list
     sched_list_p = schedule_sub.add_parser("list", help="List scheduled tasks")
@@ -524,8 +518,6 @@ def _run_schedule_create(args) -> None:
         # (server local) so that 1d/1w cron expressions are interpreted correctly
         # on subsequent runs.
         cmd_data["timezone"] = parsed.tz_str
-    if args.connector:
-        cmd_data["connector"] = args.connector
 
     result = _send_command(cmd_data)
     if result["ok"]:
