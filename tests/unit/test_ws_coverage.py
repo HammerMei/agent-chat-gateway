@@ -534,3 +534,51 @@ class TestStopNoneGuard(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ── RocketChatConnector._handler_send_busy ────────────────────────────────────
+
+
+class TestHandlerSendBusy(unittest.IsolatedAsyncioTestCase):
+    """_handler_send_busy must call post_message with tmid= (not thread_id=)."""
+
+    def _make_connector(self):
+        """Build a minimal RocketChatConnector with _rest mocked."""
+        from gateway.connectors.rocketchat.connector import RocketChatConnector
+
+        connector = RocketChatConnector.__new__(RocketChatConnector)
+        connector._rest = MagicMock()
+        connector._rest.post_message = AsyncMock()
+        return connector
+
+    async def test_busy_notification_uses_tmid_kwarg(self):
+        """post_message must be called with tmid= so the correct parameter name is used."""
+        connector = self._make_connector()
+        doc = {"tmid": "thread123"}
+        await connector._handler_send_busy("room_1", doc)
+
+        connector._rest.post_message.assert_awaited_once()
+        _, kwargs = connector._rest.post_message.call_args
+        self.assertIn("tmid", kwargs, "post_message must be called with tmid= kwarg")
+        self.assertNotIn("thread_id", kwargs, "thread_id= is not a valid post_message kwarg")
+        self.assertEqual(kwargs["tmid"], "thread123")
+
+    async def test_busy_notification_without_thread_passes_none(self):
+        """When doc has no tmid the notification is sent without a thread."""
+        connector = self._make_connector()
+        await connector._handler_send_busy("room_1", {})
+
+        _, kwargs = connector._rest.post_message.call_args
+        self.assertIsNone(kwargs.get("tmid"))
+
+    async def test_busy_notification_text_content(self):
+        """Busy notification text must mention 'busy' or 'dropped'."""
+        connector = self._make_connector()
+        await connector._handler_send_busy("room_1", {})
+
+        args, _ = connector._rest.post_message.call_args
+        text = args[1]
+        self.assertTrue(
+            "busy" in text.lower() or "dropped" in text.lower(),
+            f"Unexpected notification text: {text!r}",
+        )

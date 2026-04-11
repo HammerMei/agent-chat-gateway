@@ -569,5 +569,5 @@ class RocketChatConnector(Connector):
         await self._rest.post_message(
             room_id,
             "⚠️ Server busy — your message was dropped. Please retry.",
-            thread_id=thread_id,
+            tmid=thread_id,
         )
