@@ -81,11 +81,30 @@ class PermissionRegistry:
     def register(self, req: PermissionRequest) -> None:
         self._requests[req.request_id] = req
 
-    def resolve(self, request_id: str, approved: bool) -> bool:
-        """Resolve a pending request. Returns False if not found or already resolved."""
-        req = self._requests.pop(request_id, None)
+    def resolve(
+        self,
+        request_id: str,
+        approved: bool,
+        *,
+        from_room_id: str | None = None,
+    ) -> bool:
+        """Resolve a pending request. Returns False if not found, already resolved,
+        or the approving message came from a different room than the request.
+
+        Args:
+            request_id: The 4-character ID of the pending request.
+            approved: True to approve, False to deny.
+            from_room_id: When provided, the request is only resolved if its
+                ``room_id`` matches.  A mismatch (cross-room attempt) leaves the
+                request pending and returns False — same as "not found" so as not
+                to leak that a request with this ID exists in another room.
+        """
+        req = self._requests.get(request_id)
         if req is None or req.future.done():
             return False
+        if from_room_id is not None and req.room_id != from_room_id:
+            return False  # Cross-room approval rejected; leave request pending
+        self._requests.pop(request_id)
         req.future.set_result(approved)
         return True
 

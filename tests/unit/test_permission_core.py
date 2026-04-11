@@ -158,6 +158,53 @@ class TestPermissionRegistry(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(r_other.future.done())
 
+    async def test_resolve_with_matching_room_id_succeeds(self):
+        """resolve() with from_room_id matching request.room_id resolves normally."""
+        registry = PermissionRegistry()
+        req = PermissionRequest(
+            request_id="rm01",
+            tool_name="Bash",
+            tool_input={},
+            room_id="room_A",
+            session_id="ses_1",
+        )
+        registry.register(req)
+        result = registry.resolve("rm01", True, from_room_id="room_A")
+        self.assertTrue(result)
+        self.assertTrue(req.future.result())
+        self.assertIsNone(registry.get("rm01"))  # removed after resolve
+
+    async def test_resolve_with_mismatched_room_id_rejected(self):
+        """resolve() with from_room_id != request.room_id leaves request pending."""
+        registry = PermissionRegistry()
+        req = PermissionRequest(
+            request_id="rm02",
+            tool_name="Bash",
+            tool_input={},
+            room_id="room_A",
+            session_id="ses_1",
+        )
+        registry.register(req)
+        result = registry.resolve("rm02", True, from_room_id="room_B")
+        self.assertFalse(result)
+        self.assertFalse(req.future.done(), "Request must remain pending after cross-room rejection")
+        self.assertIs(registry.get("rm02"), req, "Request must stay in registry")
+
+    async def test_resolve_without_from_room_id_skips_room_check(self):
+        """resolve() without from_room_id (legacy callers) still works."""
+        registry = PermissionRegistry()
+        req = PermissionRequest(
+            request_id="rm03",
+            tool_name="Bash",
+            tool_input={},
+            room_id="room_A",
+            session_id="ses_1",
+        )
+        registry.register(req)
+        result = registry.resolve("rm03", False)
+        self.assertTrue(result)
+        self.assertFalse(req.future.result())
+
 
 # ── Message formatting ─────────────────────────────────────────────────────────
 

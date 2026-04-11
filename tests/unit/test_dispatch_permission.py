@@ -176,6 +176,53 @@ class TestPermissionCommandInterception(unittest.IsolatedAsyncioTestCase):
         self.assertIn("No pending", reply_text)
         self.assertIn("zzzz", reply_text)
 
+    async def test_cross_room_approval_rejected(self):
+        """An owner in room_B cannot approve a request that originated in room_A."""
+        registry = PermissionRegistry()
+        dispatcher, connector = _make_dispatcher(registry)
+
+        req = PermissionRequest(
+            request_id="cr01",
+            tool_name="Bash",
+            tool_input={},
+            room_id="room_A",   # request came from room_A
+            session_id="ses_1",
+        )
+        registry.register(req)
+
+        # Owner sends approve from room_B
+        msg = _make_msg("approve cr01", room_id="room_B")
+        await dispatcher.dispatch(msg)
+
+        # Request must NOT be resolved
+        self.assertFalse(req.future.done(), "Cross-room approval must not resolve the request")
+        # Reply should look like "No pending" (no information leakage)
+        reply_text = connector.send_text.call_args[0][1].text
+        self.assertIn("No pending", reply_text)
+
+    async def test_cross_room_approval_leaves_request_pending_for_correct_room(self):
+        """After a cross-room rejection the request is still resolvable from its own room."""
+        registry = PermissionRegistry()
+        dispatcher, connector = _make_dispatcher(registry)
+
+        req = PermissionRequest(
+            request_id="cr02",
+            tool_name="Bash",
+            tool_input={},
+            room_id="room_A",
+            session_id="ses_1",
+        )
+        registry.register(req)
+
+        # Wrong room — rejected
+        await dispatcher.dispatch(_make_msg("approve cr02", room_id="room_B"))
+        self.assertFalse(req.future.done())
+
+        # Correct room — should succeed
+        await dispatcher.dispatch(_make_msg("approve cr02", room_id="room_A"))
+        self.assertTrue(req.future.done())
+        self.assertTrue(req.future.result())
+
     async def test_non_owner_message_not_intercepted(self):
         """Permission commands from non-owner (GUEST) users are NOT intercepted."""
         registry = PermissionRegistry()
