@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.2.5] - 2026-04-11
+
+### Added
+- **`Skill` tool allow-list support**: added `"skill"` field mapping to
+  `_CLAUDE_PARAM_FIELD` so the `Skill` tool extracts the skill name directly
+  (e.g. `"daily-briefing"`) instead of falling back to the full JSON blob.
+  Config rule `params: "daily-briefing"` now correctly auto-approves Skill
+  tool calls without triggering a permission prompt.
+- **Daily-briefing runner script** (`gateway/agents/opencode/skills/daily-briefing/runner.py`):
+  stdlib-only Python script that fetches all briefing data sources in parallel
+  (stocks via Yahoo Finance/stooq, TechCrunch RSS, Hacker News, GitHub
+  Trending, world news RSS, entertainment RSS) and prints a single JSON object
+  to stdout. Reduces daily briefing run time from ~4–5 min to ~1–1.5 min by
+  collapsing multiple LLM/HTTP round-trips into one parallel fetch + one LLM
+  pass for summary and HTML generation.
+
+---
+
 ## [0.2.4] - 2026-04-11
 
 ### Fixed
