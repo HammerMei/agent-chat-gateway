@@ -11,7 +11,9 @@
 #   ├── agents/                   (agent working directories, auto-created)
 #   │   ├── claude_agent/
 #   │   └── opencode_agent/
-#   └── contexts/                 (context files, defaults restored if empty)
+#   ├── contexts/                 (context files, defaults restored if empty)
+#   └── data/                     (persistent runtime state, survives upgrades)
+#       └── jobs.json             (scheduled jobs)
 #
 # Setup (one-time):
 #   1. Copy this directory to your deployment location
@@ -47,11 +49,11 @@ services:
       # Injected into every agent session. Defaults restored if empty.
       - ./contexts:/root/.agent-chat-gateway/contexts
 
-      # ── Scheduled jobs ────────────────────────────────────────────────────
-      # Persists jobs created via `acg schedule create` across container
-      # recreates (upgrades). The file is pre-created in this example
-      # directory — copy it alongside docker-compose.yml.
-      - ./jobs.json:/root/.agent-chat-gateway/jobs.json
+      # ── Persistent runtime data ───────────────────────────────────────────
+      # Survives container recreates (upgrades). Currently holds jobs.json
+      # for scheduled jobs; add future persistent files here too.
+      # Directory mount avoids the EBUSY issue of single-file bind-mounts.
+      - ./data:/root/.agent-chat-gateway/data
 
       # ── OpenCode config (uncomment if using OpenCode backend) ─────────────
       # - ${HOME}/.config/opencode:/root/.config/opencode
