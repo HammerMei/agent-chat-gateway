@@ -47,6 +47,7 @@ _CLAUDE_PARAM_FIELD: dict[str, str] = {
     "write": "file_path",
     "multiedit": "file_path",
     "notebookedit": "notebook_path",
+    "skill": "skill",  # Claude Code Skill tool — primary field is the skill name
 }
 
 # File tools whose primary field is a path that needs normalization.

@@ -268,6 +268,29 @@ class TestGetParamStringsForClaude(unittest.TestCase):
         params = get_param_strings_for_claude("Write", {"file_path": "/out/result.txt"})
         self.assertEqual(params, ["/out/result.txt"])
 
+    def test_skill_returns_skill_name(self):
+        """Skill tool extracts the 'skill' field, not the full JSON blob."""
+        params = get_param_strings_for_claude("Skill", {"skill": "daily-briefing"})
+        self.assertEqual(params, ["daily-briefing"])
+
+    def test_skill_case_insensitive(self):
+        params = get_param_strings_for_claude("skill", {"skill": "daily-briefing"})
+        self.assertEqual(params, ["daily-briefing"])
+
+    def test_skill_allow_rule_matches(self):
+        """The config rule params='daily-briefing' correctly auto-approves the Skill tool."""
+        from gateway.core.tool_match import all_params_match_any
+        rule = ToolRule(tool="Skill", params="daily-briefing")
+        params = get_param_strings_for_claude("Skill", {"skill": "daily-briefing"})
+        self.assertTrue(all_params_match_any([rule], "Skill", params))
+
+    def test_skill_wrong_name_denied(self):
+        """A different skill name must NOT match the daily-briefing rule."""
+        from gateway.core.tool_match import all_params_match_any
+        rule = ToolRule(tool="Skill", params="daily-briefing")
+        params = get_param_strings_for_claude("Skill", {"skill": "some-other-skill"})
+        self.assertFalse(all_params_match_any([rule], "Skill", params))
+
 
 # ── get_param_strings_for_opencode ───────────────────────────────────────────
 
