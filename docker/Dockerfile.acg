@@ -87,6 +87,7 @@ RUN mkdir -p \
     /root/.agent-chat-gateway/config \
     /root/.agent-chat-gateway/work \
     /root/.agent-chat-gateway/logs \
+    /root/.agent-chat-gateway/data \
     /root/.claude \
     /root/.config/opencode
 

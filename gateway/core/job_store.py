@@ -6,12 +6,16 @@ via the control socket rather than writing directly.
 
 Storage format
 --------------
-  ~/.agent-chat-gateway/jobs.json
+  ~/.agent-chat-gateway/data/jobs.json
 
   {
     "version": 1,
     "jobs": [ { ...ScheduledJob fields... }, ... ]
   }
+
+The ``data/`` subdirectory is designed to be bind-mounted as a Docker volume
+so that persistent runtime state (jobs, and any future files) survives
+container recreates without the EBUSY issue of single-file bind-mounts.
 
 Atomic writes use the same PID-unique temp-file + rename(2) pattern as
 ``gateway.core.state`` to guarantee no partial writes on crash.
@@ -33,7 +37,8 @@ from ..schedule_types import JobStatus, ScheduledJob
 logger = logging.getLogger("agent-chat-gateway.core.job_store")
 
 RUNTIME_DIR = Path.home() / ".agent-chat-gateway"
-JOBS_FILE = RUNTIME_DIR / "jobs.json"
+DATA_DIR = RUNTIME_DIR / "data"
+JOBS_FILE = DATA_DIR / "jobs.json"
 _SCHEMA_VERSION = 1
 
 
