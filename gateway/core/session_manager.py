@@ -205,6 +205,35 @@ class SessionManager:
             )
         return accepted
 
+    async def notify_watcher_room(self, watcher_name: str, text: str) -> bool:
+        """Send a notification directly to the watcher's room via the connector.
+
+        Bypasses the watcher queue entirely — used for system notifications
+        (e.g. scheduler injection failures) that should reach the room even when
+        the watcher is paused or its queue is full.
+
+        Returns True if sent successfully, False on error or missing state.
+        """
+        from ..agents.response import AgentResponse  # local import avoids circular dependency
+
+        state = self._lifecycle.get_watcher_state(watcher_name)
+        if state is None or not state.room_id:
+            logger.warning(
+                "notify_watcher_room: no room_id for watcher %r — cannot send notification",
+                watcher_name,
+            )
+            return False
+        try:
+            await self._connector.send_text(state.room_id, AgentResponse(text=text))
+            return True
+        except Exception as e:
+            logger.warning(
+                "notify_watcher_room: failed to send notification to watcher %r room: %s",
+                watcher_name,
+                e,
+            )
+            return False
+
     # ── Control command dispatch (called by GatewayService) ───────────────────
 
     async def dispatch_command(self, request: dict) -> dict:

@@ -117,15 +117,28 @@ class TestComputeAllMissed(unittest.TestCase):
         self.assertLessEqual(len(missed), _MAX_MISSED_CATCHUP)
 
 
+def _make_sm_mock(inject_result: bool = True, paused: bool = False, room_id: str = "room-1") -> MagicMock:
+    """Build a SessionManager mock with all scheduler-facing methods pre-wired."""
+    sm = MagicMock()
+    sm.inject_message = AsyncMock(return_value=inject_result)
+    sm.notify_watcher_room = AsyncMock(return_value=True)
+    sm.get_watcher_config = MagicMock(return_value=MagicMock())
+    watcher_state = MagicMock()
+    watcher_state.paused = paused
+    watcher_state.room_id = room_id
+    sm.get_watcher_state = MagicMock(return_value=watcher_state)
+    return sm
+
+
 class TestJobSchedulerFiring(unittest.IsolatedAsyncioTestCase):
-    def _make_store_and_scheduler(self, **job_kwargs) -> tuple[JobStore, JobScheduler, ScheduledJob]:
+    def _make_store_and_scheduler(self, sm=None, **job_kwargs) -> tuple[JobStore, JobScheduler, ScheduledJob]:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         store = JobStore(jobs_file=Path(tmp.name) / "jobs.json")
         store.load()
 
-        sm = MagicMock()
-        sm.inject_message = AsyncMock(return_value=True)
+        if sm is None:
+            sm = _make_sm_mock(inject_result=True)
 
         scheduler = JobScheduler(
             store=store,
@@ -201,21 +214,75 @@ class TestJobSchedulerFiring(unittest.IsolatedAsyncioTestCase):
         updated = store.get(job.id)
         self.assertEqual(updated.run_count, 0)
 
-    async def test_inject_failure_advances_next_run_anyway(self):
-        """When inject fails, next_run should still advance (avoid retry flood)."""
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        store = JobStore(jobs_file=Path(tmp.name) / "jobs.json")
-        store.load()
-        sm = MagicMock()
-        sm.inject_message = AsyncMock(return_value=False)  # injection fails
-        scheduler = JobScheduler(store=store, session_managers={"rc-home": sm}, completed_job_ttl_days=7)
-        job = store.add(_make_job(
-            next_run=(datetime.now(UTC) - timedelta(minutes=1)).isoformat()
-        ))
+    async def test_inject_failure_infinite_job_advances_next_run(self):
+        """times=0 job: next_run advances and run_count increments even on injection failure."""
+        sm = _make_sm_mock(inject_result=False, paused=False)
+        store, scheduler, job = self._make_store_and_scheduler(
+            sm=sm,
+            times=0,
+            next_run=(datetime.now(UTC) - timedelta(minutes=1)).isoformat(),
+        )
         await scheduler._fire_due_jobs()
         updated = store.get(job.id)
-        self.assertEqual(updated.run_count, 1)  # count incremented despite failure
+        self.assertEqual(updated.run_count, 1)    # count still incremented (non-binding for times=0)
+        self.assertIsNotNone(updated.last_run)
+        self.assertIsNotNone(updated.next_run)    # next_run advances (avoid retry flood)
+
+    async def test_inject_failure_finite_job_preserves_run_count(self):
+        """times=1 job: run_count must NOT be consumed when injection fails."""
+        sm = _make_sm_mock(inject_result=False, paused=False)
+        store, scheduler, job = self._make_store_and_scheduler(
+            sm=sm,
+            times=1,
+            run_count=0,
+            next_run=(datetime.now(UTC) - timedelta(minutes=1)).isoformat(),
+        )
+        await scheduler._fire_due_jobs()
+        updated = store.get(job.id)
+        self.assertEqual(updated.run_count, 0)    # run NOT consumed
+        self.assertNotEqual(updated.status, JobStatus.COMPLETED)   # NOT marked done
+
+    async def test_inject_failure_finite_job_still_advances_next_run(self):
+        """times=N job: next_run advances after failed injection so it retries next tick."""
+        sm = _make_sm_mock(inject_result=False, paused=False)
+        original_next_run = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
+        store, scheduler, job = self._make_store_and_scheduler(
+            sm=sm,
+            times=3,
+            run_count=1,
+            next_run=original_next_run,
+        )
+        await scheduler._fire_due_jobs()
+        updated = store.get(job.id)
+        self.assertEqual(updated.run_count, 1)   # unchanged
+        original_dt = datetime.fromisoformat(original_next_run)
+        next_dt = datetime.fromisoformat(updated.next_run)
+        self.assertGreater(next_dt, original_dt)  # next_run advanced
+
+    async def test_inject_failure_paused_watcher_no_notification(self):
+        """When the watcher is intentionally paused, no notification is sent."""
+        sm = _make_sm_mock(inject_result=False, paused=True)
+        store, scheduler, job = self._make_store_and_scheduler(
+            sm=sm,
+            next_run=(datetime.now(UTC) - timedelta(minutes=1)).isoformat(),
+        )
+        await scheduler._fire_due_jobs()
+        sm.notify_watcher_room.assert_not_awaited()
+
+    async def test_inject_failure_active_watcher_sends_notification(self):
+        """When the watcher is not paused, a best-effort notification is sent."""
+        sm = _make_sm_mock(inject_result=False, paused=False)
+        store, scheduler, job = self._make_store_and_scheduler(
+            sm=sm,
+            next_run=(datetime.now(UTC) - timedelta(minutes=1)).isoformat(),
+        )
+        await scheduler._fire_due_jobs()
+        sm.notify_watcher_room.assert_awaited_once()
+        call_args = sm.notify_watcher_room.call_args
+        notified_watcher = call_args[0][0]
+        notified_text = call_args[0][1]
+        self.assertEqual(notified_watcher, job.watcher)
+        self.assertIn("⚠️", notified_text)
 
     async def test_broken_job_does_not_block_other_jobs(self):
         """Per-job isolation: an exception in one job must not prevent others from firing."""
@@ -223,8 +290,7 @@ class TestJobSchedulerFiring(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(tmp.cleanup)
         store = JobStore(jobs_file=Path(tmp.name) / "jobs.json")
         store.load()
-        sm = MagicMock()
-        sm.inject_message = AsyncMock(return_value=True)
+        sm = _make_sm_mock(inject_result=True)
         scheduler = JobScheduler(store=store, session_managers={"rc-home": sm}, completed_job_ttl_days=7)
 
         due_time = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
@@ -250,8 +316,7 @@ class TestJobSchedulerCatchUp(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(tmp.cleanup)
         store = JobStore(jobs_file=Path(tmp.name) / "jobs.json")
         store.load()
-        sm = MagicMock()
-        sm.inject_message = AsyncMock(return_value=True)
+        sm = _make_sm_mock(inject_result=True)
 
         # Hourly job created 4 h ago, last fired 3 h ago, next fire was 2 h ago
         now = datetime.now(UTC)
@@ -275,8 +340,7 @@ class TestJobSchedulerCatchUp(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(tmp.cleanup)
         store = JobStore(jobs_file=Path(tmp.name) / "jobs.json")
         store.load()
-        sm = MagicMock()
-        sm.inject_message = AsyncMock(return_value=True)
+        sm = _make_sm_mock(inject_result=True)
 
         # One-shot job that never ran
         job = store.add(_make_job(
