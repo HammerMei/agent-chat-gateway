@@ -517,6 +517,7 @@ class ClaudeBackend(AgentBackend):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=process_env,
+            limit=16 * 1024 * 1024,  # 16MB — handles large tool results (e.g. base64 images)
         )
 
         async def _write_stdin(writer: asyncio.StreamWriter, data: bytes) -> None:
@@ -715,6 +716,7 @@ class ClaudeBackend(AgentBackend):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=process_env,
+            limit=16 * 1024 * 1024,  # 16MB — handles large tool results (e.g. base64 images)
         )
 
         # Write stdin in a background task so it does not block stdout reading.
