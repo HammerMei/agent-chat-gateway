@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.2.7] - 2026-04-12
+
+### Fixed
+- **`acg reset` AttributeError**: removing `--connector` from the reset subparser
+  left a stale `args.connector` reference in the reset handler, causing
+  `AttributeError: 'Namespace' object has no attribute 'connector'` on every
+  `acg reset` invocation. The dead code has been removed.
+
+---
+
 ## [0.2.6] - 2026-04-11
 
 ### Fixed
