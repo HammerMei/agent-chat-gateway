@@ -344,12 +344,47 @@ class JobScheduler:
 
         success = await self._inject(job)
         if not success:
-            logger.warning(
-                "Job %s: injection failed (watcher=%s may not be active). "
-                "Advancing next_run anyway to avoid repeated retry flood.",
-                job.id,
-                job.watcher,
-            )
+            sm = self._get_sm_for_watcher(job)
+            watcher_state = sm.get_watcher_state(job.watcher) if sm is not None else None
+            is_paused = watcher_state is not None and bool(watcher_state.paused)
+
+            if is_paused:
+                logger.info(
+                    "Job %s: watcher %r is paused — skipping fire (expected). "
+                    "Job will retry at next scheduled time.",
+                    job.id,
+                    job.watcher,
+                )
+            else:
+                logger.warning(
+                    "Job %s: injection failed (watcher=%s may not be active). "
+                    "Advancing next_run to avoid repeated retry flood.",
+                    job.id,
+                    job.watcher,
+                )
+                await self._notify_injection_failure(job, sm, watcher_state)
+
+            if job.times > 0:
+                # Finite job: delivery failed — do NOT consume run_count so the
+                # remaining budget is preserved and the job can retry next fire.
+                try:
+                    job.next_run = compute_next_run(job.cron, job.timezone, after=fire_time)
+                except Exception as e:
+                    logger.error(
+                        "Job %s: failed to compute next_run (cron=%r): %s — pausing job",
+                        job.id,
+                        job.cron,
+                        e,
+                    )
+                    job.status = JobStatus.PAUSED
+                    job.next_run = None
+                try:
+                    await asyncio.to_thread(self._store.update, job)
+                except Exception as e:
+                    logger.error("Failed to persist job %s after failed fire: %s", job.id, e)
+                return job
+            # Infinite job (times == 0): run_count is non-binding for completion
+            # so we fall through to the normal accounting below.
 
         now_str = fire_time.isoformat()
         job.run_count += 1
@@ -386,6 +421,50 @@ class JobScheduler:
             logger.error("Failed to persist job %s after fire: %s", job.id, e)
 
         return job
+
+    def _get_sm_for_watcher(self, job: ScheduledJob) -> "SessionManager | None":
+        """Return the SessionManager that owns the job's watcher.
+
+        Prefers the connector named in job.connector; falls back to a linear
+        search when the connector field is absent or stale.
+        """
+        sm = self._session_managers.get(job.connector)
+        if sm is not None:
+            return sm
+        for manager in self._session_managers.values():
+            if manager.get_watcher_config(job.watcher) is not None:
+                return manager
+        return None
+
+    async def _notify_injection_failure(
+        self,
+        job: ScheduledJob,
+        sm: "SessionManager | None",
+        watcher_state: object | None,
+    ) -> None:
+        """Best-effort notification to the watcher's room when injection fails.
+
+        The message is sent directly via the connector (not through the watcher
+        queue) so it reaches the room even while the watcher is stopped or
+        draining.  Failures are logged but never re-raised.
+        """
+        if sm is None:
+            return
+        retry_note = (
+            "The run count was **not** consumed — it will retry at the next scheduled time."
+            if job.times > 0
+            else "It will fire again at the next scheduled time."
+        )
+        text = (
+            f"⚠️ Scheduled task `{job.id}` could not be delivered "
+            f"(watcher `{job.watcher}` is not accepting messages). {retry_note}"
+        )
+        try:
+            await sm.notify_watcher_room(job.watcher, text)
+        except Exception as e:
+            logger.warning(
+                "Job %s: failed to send injection-failure notification: %s", job.id, e
+            )
 
     async def _inject(self, job: ScheduledJob) -> bool:
         """Inject the job message into the target watcher via SessionManager.
