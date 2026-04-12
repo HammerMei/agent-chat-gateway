@@ -132,7 +132,7 @@ class MessageDispatcher:
         else:
             approved = action == "approve"
             resolved = self._permission_registry.resolve(  # type: ignore[union-attr]
-                req_id, approved, from_room_id=msg.room.id
+                req_id, approved, from_room_id=msg.room.id, from_thread_id=msg.thread_id
             )
             if resolved:
                 icon = "✅" if approved else "❌"

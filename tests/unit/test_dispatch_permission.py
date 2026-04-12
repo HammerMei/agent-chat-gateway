@@ -30,6 +30,7 @@ def _make_msg(
     text: str,
     room_id: str = "room_1",
     role: UserRole = UserRole.OWNER,
+    thread_id: str | None = None,
 ) -> IncomingMessage:
     room = Room(id=room_id, name="general", type="dm")
     sender = User(id="u1", username="owner", display_name="Owner")
@@ -40,6 +41,7 @@ def _make_msg(
         sender=sender,
         role=role,
         text=text,
+        thread_id=thread_id,
     )
 
 
@@ -220,6 +222,80 @@ class TestPermissionCommandInterception(unittest.IsolatedAsyncioTestCase):
 
         # Correct room — should succeed
         await dispatcher.dispatch(_make_msg("approve cr02", room_id="room_A"))
+        self.assertTrue(req.future.done())
+        self.assertTrue(req.future.result())
+
+    async def test_cross_thread_approval_rejected(self):
+        """An owner in thread_2 cannot approve a request that originated in thread_1."""
+        registry = PermissionRegistry()
+        dispatcher, connector = _make_dispatcher(registry)
+
+        req = PermissionRequest(
+            request_id="ct01",
+            tool_name="Bash",
+            tool_input={},
+            room_id="room_A",
+            session_id="ses_1",
+            thread_id="thread_1",
+        )
+        registry.register(req)
+
+        # Owner sends approve from a different thread in the same room
+        msg = _make_msg("approve ct01", room_id="room_A", thread_id="thread_2")
+        await dispatcher.dispatch(msg)
+
+        # Request must NOT be resolved
+        self.assertFalse(req.future.done(), "Cross-thread approval must not resolve the request")
+        # Reply should look like "No pending" (no information leakage)
+        reply_text = connector.send_text.call_args[0][1].text
+        self.assertIn("No pending", reply_text)
+
+    async def test_cross_thread_leaves_request_pending_for_correct_thread(self):
+        """After a cross-thread rejection the request is still resolvable from its own thread."""
+        registry = PermissionRegistry()
+        dispatcher, connector = _make_dispatcher(registry)
+
+        req = PermissionRequest(
+            request_id="ct02",
+            tool_name="Bash",
+            tool_input={},
+            room_id="room_A",
+            session_id="ses_1",
+            thread_id="thread_1",
+        )
+        registry.register(req)
+
+        # Wrong thread — rejected
+        await dispatcher.dispatch(_make_msg("approve ct02", room_id="room_A", thread_id="thread_2"))
+        self.assertFalse(req.future.done())
+
+        # Correct thread — should succeed
+        await dispatcher.dispatch(_make_msg("approve ct02", room_id="room_A", thread_id="thread_1"))
+        self.assertTrue(req.future.done())
+        self.assertTrue(req.future.result())
+
+    async def test_room_level_approve_allowed_for_threaded_request(self):
+        """A non-threaded approve (no thread_id in msg) can resolve a threaded request.
+
+        Owners may use the room-level input box even when the request originated in a thread.
+        """
+        registry = PermissionRegistry()
+        dispatcher, connector = _make_dispatcher(registry)
+
+        req = PermissionRequest(
+            request_id="ct03",
+            tool_name="Bash",
+            tool_input={},
+            room_id="room_A",
+            session_id="ses_1",
+            thread_id="thread_1",
+        )
+        registry.register(req)
+
+        # Approve from room-level (no thread_id) — must succeed
+        msg = _make_msg("approve ct03", room_id="room_A", thread_id=None)
+        await dispatcher.dispatch(msg)
+
         self.assertTrue(req.future.done())
         self.assertTrue(req.future.result())
 
