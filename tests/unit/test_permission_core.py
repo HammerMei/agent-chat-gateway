@@ -205,6 +205,61 @@ class TestPermissionRegistry(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result)
         self.assertFalse(req.future.result())
 
+    async def test_resolve_matching_thread_id_succeeds(self):
+        """resolve() with matching from_thread_id resolves normally."""
+        registry = PermissionRegistry()
+        req = PermissionRequest(
+            request_id="td01",
+            tool_name="Bash",
+            tool_input={},
+            room_id="room_A",
+            session_id="ses_1",
+            thread_id="thread_1",
+        )
+        registry.register(req)
+        result = registry.resolve("td01", True, from_room_id="room_A", from_thread_id="thread_1")
+        self.assertTrue(result)
+        self.assertTrue(req.future.result())
+        self.assertIsNone(registry.get("td01"))
+
+    async def test_resolve_mismatched_thread_id_rejected(self):
+        """resolve() with from_thread_id != request.thread_id leaves request pending."""
+        registry = PermissionRegistry()
+        req = PermissionRequest(
+            request_id="td02",
+            tool_name="Bash",
+            tool_input={},
+            room_id="room_A",
+            session_id="ses_1",
+            thread_id="thread_1",
+        )
+        registry.register(req)
+        result = registry.resolve("td02", True, from_room_id="room_A", from_thread_id="thread_2")
+        self.assertFalse(result)
+        self.assertFalse(req.future.done(), "Request must remain pending after cross-thread rejection")
+        self.assertIs(registry.get("td02"), req, "Request must stay in registry")
+
+    async def test_resolve_room_level_approve_allowed_for_threaded_request(self):
+        """A non-threaded approve (from_thread_id=None) can resolve a threaded request.
+
+        Owners may use the room-level input box even for requests that originated
+        in a thread — blocking this would make approvals unnecessarily hard.
+        """
+        registry = PermissionRegistry()
+        req = PermissionRequest(
+            request_id="td03",
+            tool_name="Bash",
+            tool_input={},
+            room_id="room_A",
+            session_id="ses_1",
+            thread_id="thread_1",
+        )
+        registry.register(req)
+        # from_thread_id=None → room-level approve, must succeed
+        result = registry.resolve("td03", True, from_room_id="room_A", from_thread_id=None)
+        self.assertTrue(result)
+        self.assertTrue(req.future.result())
+
 
 # ── Message formatting ─────────────────────────────────────────────────────────
 

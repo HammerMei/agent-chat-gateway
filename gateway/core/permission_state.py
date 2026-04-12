@@ -87,9 +87,10 @@ class PermissionRegistry:
         approved: bool,
         *,
         from_room_id: str | None = None,
+        from_thread_id: str | None = None,
     ) -> bool:
         """Resolve a pending request. Returns False if not found, already resolved,
-        or the approving message came from a different room than the request.
+        or the approving message came from a different room/thread than the request.
 
         Args:
             request_id: The 4-character ID of the pending request.
@@ -98,12 +99,23 @@ class PermissionRegistry:
                 ``room_id`` matches.  A mismatch (cross-room attempt) leaves the
                 request pending and returns False — same as "not found" so as not
                 to leak that a request with this ID exists in another room.
+            from_thread_id: When provided AND the request also has a ``thread_id``,
+                both must match.  A mismatch (cross-thread attempt within the same
+                room) leaves the request pending and returns False.
+                Non-threaded approval commands (``from_thread_id=None``) are always
+                allowed through this check — owners may approve from the room-level
+                input box even when the request originated in a thread.
         """
         req = self._requests.get(request_id)
         if req is None or req.future.done():
             return False
         if from_room_id is not None and req.room_id != from_room_id:
             return False  # Cross-room approval rejected; leave request pending
+        # Thread-level check: only enforce when BOTH sides have a thread_id.
+        # A room-level approve (from_thread_id=None) always passes — the owner
+        # may be using the main-channel input even for a threaded request.
+        if from_thread_id is not None and req.thread_id is not None and req.thread_id != from_thread_id:
+            return False  # Cross-thread approval rejected; leave request pending
         self._requests.pop(request_id)
         req.future.set_result(approved)
         return True
