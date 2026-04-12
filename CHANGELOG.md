@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.2.8] - 2026-04-12
+
+### Fixed
+- **`LimitOverrunError` on large tool results**: the two streaming
+  `create_subprocess_exec` calls in `ClaudeBackend` now set
+  `limit=16 * 1024 * 1024` (16 MB) on the underlying `asyncio.StreamReader`,
+  raising it from the 64 KB default. Large single-line outputs — base64-encoded
+  images or audio attachments — previously caused
+  `asyncio.exceptions.LimitOverrunError: Separator is not found, and chunk
+  exceed the limit`, crashing the turn. The non-streaming path that uses
+  `communicate()` is unaffected and unchanged.
+
+---
+
 ## [0.2.7] - 2026-04-12
 
 ### Fixed
