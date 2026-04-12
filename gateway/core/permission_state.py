@@ -111,9 +111,23 @@ class PermissionRegistry:
             return False
         if from_room_id is not None and req.room_id != from_room_id:
             return False  # Cross-room approval rejected; leave request pending
-        # Thread-level check: only enforce when BOTH sides have a thread_id.
-        # A room-level approve (from_thread_id=None) always passes — the owner
-        # may be using the main-channel input even for a threaded request.
+        # Thread-level check: only enforce when BOTH sides carry a thread_id.
+        #
+        # Design intent — room-level approvals (from_thread_id=None) are intentionally
+        # allowed to resolve threaded requests.  This is NOT a security gap:
+        #
+        #   • Rocket.Chat (and every major platform: Slack, Discord, Teams, Telegram)
+        #     does NOT enforce thread-level permissions distinct from the parent room.
+        #     Any owner who can see the room can already read every thread in it.
+        #   • The real trust boundary is the room, guarded by the from_room_id check
+        #     above.  Threads are just reply chains, not isolated namespaces.
+        #   • Requiring owners to be inside the exact thread to approve would hurt UX
+        #     with no security benefit on platforms that share room-level roles across
+        #     all threads.
+        #
+        # The guard below still rejects approvals sent from a *different* thread
+        # (from_thread_id != req.thread_id), which prevents casual cross-thread
+        # confusion when both the approver and the request are inside threads.
         if from_thread_id is not None and req.thread_id is not None and req.thread_id != from_thread_id:
             return False  # Cross-thread approval rejected; leave request pending
         self._requests.pop(request_id)
