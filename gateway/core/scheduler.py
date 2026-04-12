@@ -201,13 +201,21 @@ class JobScheduler:
             except ValueError:
                 return None
 
-        # Determine how many times this job should have fired since last_run
+        # Determine how many times this job should have fired since the last attempt.
+        # Use last_attempted_at as the primary anchor: it is set on every _fire_once
+        # call (success or failure) so it reflects "what time we last tried", not
+        # just "what time we last succeeded".  This prevents replaying fire slots
+        # where injection already failed — e.g. if the watcher was down during a
+        # catch-up, last_attempted_at already marks that slot as "tried".
+        # Fall back to last_run (last successful fire) for jobs upgraded from
+        # older gateway versions that predate last_attempted_at.
         last_run_dt: datetime | None = None
-        if job.last_run:
-            last_run_dt = _parse_utc(job.last_run)
+        anchor_ts = job.last_attempted_at or job.last_run
+        if anchor_ts:
+            last_run_dt = _parse_utc(anchor_ts)
 
         if last_run_dt is None:
-            # Never ran before — try creation time as the start anchor
+            # Never ran or attempted before — try creation time as the start anchor
             if job.created_at:
                 last_run_dt = _parse_utc(job.created_at)
             # If created_at is also missing/malformed, fall back to next_run itself
@@ -333,6 +341,11 @@ class JobScheduler:
         # Shallow copy is sufficient: all ScheduledJob fields are immutable
         # scalar types (str, int, enum) so there are no nested mutable objects.
         job = copy.copy(job)
+
+        # Record the attempt time unconditionally — before any early return —
+        # so that catch-up on restart uses this as the anchor and does not
+        # replay fire slots where injection already failed.
+        job.last_attempted_at = fire_time.isoformat()
 
         logger.info(
             "Firing scheduled job %s (watcher=%s, run=%d/%s)",

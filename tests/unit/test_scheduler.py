@@ -309,6 +309,53 @@ class TestJobSchedulerFiring(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(bad_updated.next_run)
         self.assertEqual(bad_updated.status, JobStatus.PAUSED)
 
+    async def test_successful_fire_sets_last_attempted_at(self):
+        """last_attempted_at is set to fire_time on a successful fire."""
+        store, scheduler, job = self._make_store_and_scheduler(
+            next_run=(datetime.now(UTC) - timedelta(minutes=1)).isoformat()
+        )
+        await scheduler._fire_due_jobs()
+        updated = store.get(job.id)
+        self.assertIsNotNone(updated.last_attempted_at, "last_attempted_at must be set after fire")
+        # last_attempted_at should equal last_run on success (both anchored to fire_time)
+        self.assertEqual(updated.last_attempted_at, updated.last_run)
+
+    async def test_inject_failure_sets_last_attempted_at(self):
+        """last_attempted_at is set even when injection fails (times > 0 path)."""
+        sm = _make_sm_mock(inject_result=False, paused=False)
+        fire_time = datetime.now(UTC) - timedelta(minutes=1)
+        store, scheduler, job = self._make_store_and_scheduler(
+            sm=sm,
+            times=2,
+            run_count=0,
+            next_run=fire_time.isoformat(),
+        )
+        await scheduler._fire_due_jobs()
+        updated = store.get(job.id)
+        self.assertIsNotNone(
+            updated.last_attempted_at,
+            "last_attempted_at must be set even when injection fails",
+        )
+        # run_count must NOT be consumed
+        self.assertEqual(updated.run_count, 0)
+        # last_run must NOT be set (only set on success)
+        self.assertIsNone(updated.last_run)
+
+    async def test_inject_failure_infinite_sets_last_attempted_at(self):
+        """last_attempted_at is set on failed injection for times=0 (infinite) jobs too."""
+        sm = _make_sm_mock(inject_result=False, paused=False)
+        store, scheduler, job = self._make_store_and_scheduler(
+            sm=sm,
+            times=0,
+            next_run=(datetime.now(UTC) - timedelta(minutes=1)).isoformat(),
+        )
+        await scheduler._fire_due_jobs()
+        updated = store.get(job.id)
+        self.assertIsNotNone(
+            updated.last_attempted_at,
+            "last_attempted_at must be set on infinite jobs even when injection fails",
+        )
+
 
 class TestJobSchedulerCatchUp(unittest.IsolatedAsyncioTestCase):
     async def test_catch_up_fires_missed_jobs(self):
@@ -498,6 +545,75 @@ class TestJobSchedulerCatchUp(unittest.IsolatedAsyncioTestCase):
             f"completed_at should be ~now, not the hand-edited future value {far_future!r}",
         )
         self.assertEqual(sm.inject_message.call_count, 0)
+
+    async def test_catch_up_uses_last_attempted_at_to_avoid_replay(self):
+        """Catch-up must not replay fire slots that already failed injection.
+
+        Scenario:
+          - Daily job at 09:00, last successful run = Mon 09:00 (last_run).
+          - On Tue 09:00, the scheduler fired but injection failed (watcher down).
+            last_attempted_at = Tue 09:00; last_run stays at Mon 09:00; next_run → Wed 09:00.
+          - Daemon is down all of Wednesday; restarts Thu morning.
+          - next_run = Wed 09:00 < now → job appears in list_due() catch-up list.
+          - Catch-up must use last_attempted_at (Tue 09:00) as anchor, NOT last_run (Mon 09:00).
+          - compute_all_missed(after=Tue 09:00, before=Thu) = [Wed 09:00] → fires ONCE.
+          - If it used last_run (Mon 09:00), it would find [Tue 09:00, Wed 09:00] → fires TWICE,
+            replaying the Tue slot that already failed.
+        """
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = JobStore(jobs_file=Path(tmp.name) / "jobs.json")
+        store.load()
+        sm = _make_sm_mock(inject_result=True)
+
+        now = datetime.now(UTC)
+        # Simulate: last_run = 3 hours ago (Mon), last_attempted_at = 2 hours ago (Tue, failed),
+        # next_run = 1 hour ago (Wed, not yet tried because daemon was down)
+        job = store.add(_make_job(
+            cron="0 * * * *",       # hourly to keep times manageable
+            times=0,
+            last_run=(now - timedelta(hours=3)).isoformat(),
+            last_attempted_at=(now - timedelta(hours=2)).isoformat(),   # 1 failed attempt
+            next_run=(now - timedelta(hours=1)).isoformat(),            # the wed slot
+        ))
+
+        scheduler = JobScheduler(store=store, session_managers={"rc-home": sm}, completed_job_ttl_days=7)
+        await scheduler._catch_up_missed()
+
+        updated = store.get(job.id)
+        # last_attempted_at = 2h ago; missed = [1h ago, now] → 2 fires (not 3)
+        # Without the fix: anchor = last_run (3h ago) → missed = [2h ago, 1h ago, now] → 3 fires
+        self.assertLessEqual(
+            updated.run_count, 2,
+            "Catch-up must not replay the slot already attempted (last_attempted_at anchor).",
+        )
+
+    async def test_catch_up_falls_back_to_last_run_when_no_last_attempted_at(self):
+        """Backward-compat: jobs without last_attempted_at still use last_run as anchor."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = JobStore(jobs_file=Path(tmp.name) / "jobs.json")
+        store.load()
+        sm = _make_sm_mock(inject_result=True)
+
+        now = datetime.now(UTC)
+        # Old-format job: last_run set, last_attempted_at = None (pre-upgrade job)
+        job = store.add(_make_job(
+            cron="0 * * * *",   # hourly
+            times=0,
+            last_run=(now - timedelta(hours=3)).isoformat(),
+            next_run=(now - timedelta(hours=2)).isoformat(),
+        ))
+        # Ensure last_attempted_at is None (it is by default, but be explicit)
+        self.assertIsNone(job.last_attempted_at)
+
+        scheduler = JobScheduler(store=store, session_managers={"rc-home": sm}, completed_job_ttl_days=7)
+        await scheduler._catch_up_missed()
+
+        updated = store.get(job.id)
+        # anchor = last_run (3h ago); hourly fires at -2h, -1h, now → 3 catches
+        self.assertEqual(updated.run_count, 3,
+            "Without last_attempted_at, catch-up must fall back to last_run as anchor")
 
 
 class TestJobSchedulerPurge(unittest.IsolatedAsyncioTestCase):
