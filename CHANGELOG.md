@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.2.6] - 2026-04-11
+
+### Fixed
+- **Permission cross-room bypass**: `approve`/`deny` commands are now scoped to
+  the originating room — an owner in room B can no longer resolve a permission
+  request that was raised in room A. The registry entry is left pending (not
+  removed) on a mismatch so the correct room can still resolve it, and the
+  response is identical to "no pending request" to avoid leaking request
+  existence across rooms.
+- **Permission cross-thread confusion**: when both the pending request and the
+  incoming command carry a `thread_id`, they must match. Approvals sent from a
+  different thread within the same room are rejected. Room-level approvals
+  (`from_thread_id=None`) are intentionally still allowed — no major chat
+  platform (RC, Slack, Discord, Teams) enforces thread-level permissions
+  separate from the room, so blocking room-level approval would hurt UX with
+  no security benefit.
+- **RC connector `_handle_send_busy` TypeError**: the `thread_id` kwarg was
+  incorrectly named `thread_id=` instead of `tmid=` when calling
+  `post_message()`, causing a `TypeError` on every busy-notification attempt.
+  The error was silently swallowed by the caller, so busy users never received
+  the retry message. Fixed to use the correct `tmid=` kwarg.
+- **Scheduler `run_count` consumed on injection failure**: finite jobs
+  (`times > 0`) no longer lose a run when the target watcher is unavailable.
+  On failure, `next_run` is advanced (to avoid a retry flood) but `run_count`
+  and `last_run` are left unchanged so the remaining budget is preserved.
+  Infinite jobs (`times = 0`) still advance `run_count` on failure, consistent
+  with prior behaviour (the count is non-binding for completion).
+- **Scheduler catch-up replay of previously-failed fires**: added
+  `last_attempted_at` field to `ScheduledJob` (set on every `_fire_once` call,
+  including failures). On daemon restart, the catch-up anchor now uses
+  `last_attempted_at` instead of `last_run`, preventing replay of fire slots
+  where injection already failed. Backward-compatible: old `jobs.json` files
+  without the field fall back to `last_run` as before.
+
+### Changed
+- **`acg reset` no longer requires `--connector`**: watcher names are globally
+  unique across all connectors, so the control server now resolves the owning
+  connector automatically by searching all entries. The `--connector` flag has
+  been removed from the CLI to eliminate a redundant and confusing argument.
+- **Scheduler injection failure notifications**: when a scheduled job cannot be
+  delivered (watcher not running), a best-effort notification is sent directly
+  to the watcher's room via the connector — bypassing the watcher queue so it
+  arrives even when the watcher is paused or its queue is full. Paused watchers
+  log at INFO level (expected state) rather than WARNING and receive no
+  notification; only unexpected failures (non-paused watcher unavailable) get
+  notified.
+
+---
+
 ## [0.2.5] - 2026-04-11
 
 ### Added
