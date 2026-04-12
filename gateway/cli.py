@@ -286,8 +286,6 @@ def main():
 
     elif args.command == "reset":
         cmd_data = {"cmd": "reset", "watcher_name": args.watcher_name}
-        if args.connector is not None:
-            cmd_data["connector"] = args.connector
         result = _send_command(cmd_data)
         if result["ok"]:
             print(f"Watcher '{args.watcher_name}' reset")
