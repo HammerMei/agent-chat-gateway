@@ -472,7 +472,7 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except Exception as exc:
+    except Exception:
         # Absolute last resort — emit a minimal valid JSON so the caller never gets nothing
         import traceback
         error_payload = {
