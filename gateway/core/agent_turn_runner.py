@@ -12,6 +12,7 @@ orchestration and session-map bookkeeping, while the turn runner owns:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 
 from ..agents import AgentBackend
@@ -127,9 +128,22 @@ class AgentTurnRunner:
 
             # Agent chain termination check — case-insensitive substring match so
             # LLM output variations like <END-OF-AGENT-CHAIN> or the token embedded
-            # in surrounding text (e.g. "Nothing to add.\n\n<end-of-agent-chain>")
-            # are still caught.
-            if is_agent_chain and AGENT_CHAIN_TERMINATION_TOKEN in response.text.lower():
+            # in surrounding text are still caught.
+            #
+            # If the LLM prefixes the token with meaningful content, e.g.:
+            #   "Summary: XYZ\n\n<end-of-agent-chain>"
+            # we deliver the content BEFORE the token so nothing is lost, then
+            # terminate.  Suppressing the entire response would silently discard
+            # the agent's last message — the same failure mode as the timeout bug.
+            token_idx = response.text.lower().find(AGENT_CHAIN_TERMINATION_TOKEN)
+            if is_agent_chain and token_idx != -1:
+                pre_token_text = response.text[:token_idx].rstrip()
+                if pre_token_text:
+                    await self._deliver_response(
+                        room_id,
+                        dataclasses.replace(response, text=pre_token_text),
+                        thread_id,
+                    )
                 logger.info(
                     "Agent chain self-terminated (session=%s room=%s sender turn suppressed)",
                     session_id[:8],

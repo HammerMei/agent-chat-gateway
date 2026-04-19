@@ -581,17 +581,43 @@ class TestAgentTurnRunner(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(terminated)
         connector.send_text.assert_not_called()
 
-    async def test_termination_token_embedded_in_text_still_terminates(self):
-        """Token embedded in surrounding text is still caught (substring match).
+    async def test_termination_token_embedded_in_text_delivers_preamble(self):
+        """Token embedded after meaningful content: preamble is delivered, token is suppressed.
 
         LLMs sometimes prefix the token with a closing sentence, e.g.:
-            "I have nothing more to add.\n\n<end-of-agent-chain>"
-        The previous == (exact match) would miss this; the current `in` check catches it.
+            "Summary: XYZ\n\n<end-of-agent-chain>"
+        The preamble must be delivered so the user sees it; the raw token must not appear.
         """
         from gateway.core.agent_chain import AGENT_CHAIN_TERMINATION_TOKEN
 
-        text_with_preamble = f"I have nothing more to add.\n\n{AGENT_CHAIN_TERMINATION_TOKEN}"
+        preamble = "Summary: the task is complete."
+        text_with_preamble = f"{preamble}\n\n{AGENT_CHAIN_TERMINATION_TOKEN}"
         agent = _MockAgent(AgentResponse(text=text_with_preamble))
+        runner, connector = _make_runner(agent)
+
+        terminated = await runner.run_turn(
+            session_id="ses_001",
+            prompt="hello",
+            working_directory="/tmp",
+            room_id="room_1",
+            thread_id=None,
+            is_agent_chain=True,
+            agent_chain_context="\n---\n[Agent chain: turn 1/5]",
+        )
+
+        self.assertTrue(terminated)
+        # Preamble delivered, token never appears in chat
+        connector.send_text.assert_called_once()
+        delivered_response = connector.send_text.call_args[0][1]
+        delivered_text = delivered_response.text
+        self.assertIn(preamble, delivered_text)
+        self.assertNotIn(AGENT_CHAIN_TERMINATION_TOKEN, delivered_text)
+
+    async def test_termination_token_only_no_delivery(self):
+        """Token with no preamble: nothing delivered, just silent termination."""
+        from gateway.core.agent_chain import AGENT_CHAIN_TERMINATION_TOKEN
+
+        agent = _MockAgent(AgentResponse(text=AGENT_CHAIN_TERMINATION_TOKEN))
         runner, connector = _make_runner(agent)
 
         terminated = await runner.run_turn(
