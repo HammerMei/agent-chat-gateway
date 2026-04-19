@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 
 from ..agents import AgentBackend
 from ..agents.response import AgentResponse
+from .agent_chain import build_agent_chain_context
 from .agent_turn_runner import AgentTurnRunner, _user_facing_agent_error_message
 from .attachment_workspace import localize_attachment_paths
 from .config import CoreConfig, WatcherConfig
@@ -388,7 +389,15 @@ class MessageProcessor:
         if self._agent.supports_per_message_env:
             role_env = self._config.env_for_role(msg.role, self._agent_name)
 
-        await self._turn_runner.run_turn(
+        # Agent chain: inject toll-call context if this is an agent-to-agent message
+        is_agent_chain = msg.extra_context.get("is_agent_chain", False)
+        agent_chain_context = ""
+        if is_agent_chain:
+            agent_chain_turn = msg.extra_context.get("agent_chain_turn", 1)
+            agent_chain_max_turns = msg.extra_context.get("agent_chain_max_turns", 5)
+            agent_chain_context = build_agent_chain_context(agent_chain_turn, agent_chain_max_turns)
+
+        terminated = await self._turn_runner.run_turn(
             session_id=self._session_id,
             prompt=prompt,
             working_directory=self._working_directory,
@@ -396,7 +405,15 @@ class MessageProcessor:
             thread_id=msg.thread_id,
             file_paths=file_paths or None,
             role_env=role_env,
+            is_agent_chain=is_agent_chain,
+            agent_chain_context=agent_chain_context,
         )
+        if terminated:
+            self._connector.on_agent_chain_drop(
+                msg.room.id,
+                msg.thread_id,
+                msg.sender.username,
+            )
 
     async def _ensure_context_injected(self) -> None:
         """Retry context injection safely on message processing when appropriate."""

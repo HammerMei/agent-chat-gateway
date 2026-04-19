@@ -391,6 +391,178 @@ class TestAgentTurnRunner(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(connector.send_text.call_args[0][1].text, "only final")
         connector.notify_agent_event.assert_not_called()
 
+    # ── Agent chain tests ─────────────────────────────────────────────────────
+
+    async def test_agent_chain_termination_token_suppresses_delivery(self):
+        """When agent responds with the termination token, response is not delivered."""
+        from gateway.core.agent_chain import AGENT_CHAIN_TERMINATION_TOKEN
+
+        agent = _MockAgent(AgentResponse(text=AGENT_CHAIN_TERMINATION_TOKEN))
+        runner, connector = _make_runner(agent)
+
+        terminated = await runner.run_turn(
+            session_id="ses_001",
+            prompt="hello",
+            working_directory="/tmp",
+            room_id="room_1",
+            thread_id=None,
+            is_agent_chain=True,
+            agent_chain_context="\n---\n[Agent chain: turn 1/5]",
+        )
+
+        self.assertTrue(terminated)
+        connector.send_text.assert_not_called()
+
+    async def test_agent_chain_normal_response_delivered_returns_false(self):
+        """Normal agent chain response is delivered and run_turn returns False."""
+        agent = _MockAgent(AgentResponse(text="Here is my analysis."))
+        runner, connector = _make_runner(agent)
+
+        terminated = await runner.run_turn(
+            session_id="ses_001",
+            prompt="hello",
+            working_directory="/tmp",
+            room_id="room_1",
+            thread_id=None,
+            is_agent_chain=True,
+            agent_chain_context="\n---\n[Agent chain: turn 2/5]",
+        )
+
+        self.assertFalse(terminated)
+        connector.send_text.assert_called_once()
+        self.assertEqual(connector.send_text.call_args[0][1].text, "Here is my analysis.")
+
+    async def test_termination_token_in_non_agent_chain_still_delivered(self):
+        """Termination token in a non-agent-chain turn is delivered normally."""
+        from gateway.core.agent_chain import AGENT_CHAIN_TERMINATION_TOKEN
+
+        agent = _MockAgent(AgentResponse(text=AGENT_CHAIN_TERMINATION_TOKEN))
+        runner, connector = _make_runner(agent)
+
+        # is_agent_chain=False (default) — no special handling
+        terminated = await runner.run_turn(
+            session_id="ses_001",
+            prompt="hello",
+            working_directory="/tmp",
+            room_id="room_1",
+            thread_id=None,
+        )
+
+        self.assertFalse(terminated)
+        connector.send_text.assert_called_once()
+
+    async def test_agent_chain_context_appended_to_prompt(self):
+        """Agent chain context suffix is appended to the prompt before invoking agent."""
+        captured: dict = {}
+
+        class _CapturingAgent(AgentBackend):
+            async def create_session(self, *a, **kw):
+                return "ses_001"
+
+            async def send(self, **kw):
+                raise NotImplementedError
+
+            async def stream(self, **kw):
+                captured.update(kw)
+                yield AgentEvent(kind="final", response=AgentResponse(text="ok"))
+
+        agent = _CapturingAgent()
+        connector = MagicMock()
+        connector.send_text = AsyncMock()
+        connector.notify_typing = AsyncMock()
+        connector.notify_agent_event = AsyncMock()
+        config = CoreConfig(
+            agents={"default": AgentConfig(timeout=10)},
+            default_agent="default",
+        )
+        runner = AgentTurnRunner(agent, connector, config, "default", "room")
+
+        await runner.run_turn(
+            session_id="ses_001",
+            prompt="base prompt",
+            working_directory="/tmp",
+            room_id="room_1",
+            thread_id=None,
+            is_agent_chain=True,
+            agent_chain_context="\n---\n[Agent chain: turn 1/5]",
+        )
+
+        self.assertIn("base prompt", captured.get("prompt", ""))
+        self.assertIn("[Agent chain: turn 1/5]", captured.get("prompt", ""))
+
+    async def test_agent_chain_no_context_prompt_unchanged(self):
+        """When agent_chain_context is empty, the prompt is not modified."""
+        captured: dict = {}
+
+        class _CapturingAgent(AgentBackend):
+            async def create_session(self, *a, **kw):
+                return "ses_001"
+
+            async def send(self, **kw):
+                raise NotImplementedError
+
+            async def stream(self, **kw):
+                captured.update(kw)
+                yield AgentEvent(kind="final", response=AgentResponse(text="ok"))
+
+        agent = _CapturingAgent()
+        connector = MagicMock()
+        connector.send_text = AsyncMock()
+        connector.notify_typing = AsyncMock()
+        connector.notify_agent_event = AsyncMock()
+        config = CoreConfig(
+            agents={"default": AgentConfig(timeout=10)},
+            default_agent="default",
+        )
+        runner = AgentTurnRunner(agent, connector, config, "default", "room")
+
+        await runner.run_turn(
+            session_id="ses_001",
+            prompt="base prompt",
+            working_directory="/tmp",
+            room_id="room_1",
+            thread_id=None,
+            is_agent_chain=True,
+            agent_chain_context="",  # empty — no append
+        )
+
+        self.assertEqual(captured.get("prompt"), "base prompt")
+
+    async def test_run_turn_returns_false_for_normal_non_agent_chain_turn(self):
+        """Non-agent-chain turns always return False."""
+        agent = _MockAgent(AgentResponse(text="Hello"))
+        runner, connector = _make_runner(agent)
+
+        result = await runner.run_turn(
+            session_id="ses_001",
+            prompt="hello",
+            working_directory="/tmp",
+            room_id="room_1",
+            thread_id=None,
+        )
+
+        self.assertFalse(result)
+
+    async def test_termination_token_with_whitespace_stripped(self):
+        """Termination token detection trims surrounding whitespace."""
+        from gateway.core.agent_chain import AGENT_CHAIN_TERMINATION_TOKEN
+
+        agent = _MockAgent(AgentResponse(text=f"  {AGENT_CHAIN_TERMINATION_TOKEN}  \n"))
+        runner, connector = _make_runner(agent)
+
+        terminated = await runner.run_turn(
+            session_id="ses_001",
+            prompt="hello",
+            working_directory="/tmp",
+            room_id="room_1",
+            thread_id=None,
+            is_agent_chain=True,
+            agent_chain_context="\n---\n[Agent chain: turn 1/5]",
+        )
+
+        self.assertTrue(terminated)
+        connector.send_text.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

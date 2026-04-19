@@ -21,6 +21,7 @@ from ..agents.errors import (
     AgentUnavailableError,
 )
 from ..agents.response import AgentResponse
+from .agent_chain import AGENT_CHAIN_TERMINATION_TOKEN
 from .config import CoreConfig
 from .connector import Connector
 
@@ -81,7 +82,9 @@ class AgentTurnRunner:
         thread_id: str | None,
         file_paths: list[str] | None = None,
         role_env: dict[str, str] | None = None,
-    ) -> None:
+        is_agent_chain: bool = False,
+        agent_chain_context: str = "",
+    ) -> bool:
         """Execute one turn: send prompt to agent, post response (or error) to room.
 
         Two separate error boundaries:
@@ -95,13 +98,26 @@ class AgentTurnRunner:
         Intermediate events from agent.stream() are forwarded to
         connector.notify_agent_event() on a best-effort basis — errors there
         are silently swallowed and never abort the turn.
+
+        When ``is_agent_chain=True`` and ``agent_chain_context`` is set, the
+        context suffix is appended to the prompt before invoking the agent.
+        If the agent responds with the termination token, the response is NOT
+        delivered to the room and ``True`` is returned (terminated).
+
+        Returns:
+            True  — agent chain self-terminated (response was suppressed).
+            False — normal delivery (or error delivery) occurred.
         """
+        full_prompt = prompt
+        if is_agent_chain and agent_chain_context:
+            full_prompt = prompt + agent_chain_context
+
         await self._notify_typing(room_id, True)
         try:
             # Stage 1: execute agent turn (may emit intermediate events)
             response = await self._execute_agent(
                 session_id,
-                prompt,
+                full_prompt,
                 working_directory,
                 room_id,
                 thread_id,
@@ -109,8 +125,18 @@ class AgentTurnRunner:
                 role_env,
             )
 
+            # Agent chain termination check
+            if is_agent_chain and response.text.strip() == AGENT_CHAIN_TERMINATION_TOKEN:
+                logger.info(
+                    "Agent chain self-terminated (session=%s room=%s sender turn suppressed)",
+                    session_id[:8],
+                    room_id,
+                )
+                return True
+
             # Stage 2: deliver response to chat room
             await self._deliver_response(room_id, response, thread_id)
+            return False
         finally:
             await self._notify_typing(room_id, False)
 

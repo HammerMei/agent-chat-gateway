@@ -22,6 +22,7 @@ from ...core.adapter_utils import ts_to_float as _ts_to_float
 from ...core.connector import Attachment, IncomingMessage, Room, User, UserRole
 
 if TYPE_CHECKING:
+    from .agent_chain import TurnStore
     from .config import RocketChatConfig
     from .rest import RocketChatREST
 
@@ -59,6 +60,9 @@ class FilterResult:
     sender: str = ""
     msg_ts: str = ""
     reason: str = ""  # debug only
+    is_agent_chain: bool = False   # True when sender is a known ACG agent
+    agent_chain_turn: int = 0      # current turn (1-based, after increment)
+    agent_chain_max_turns: int = 5  # from config
 
 
 def filter_rc_message(
@@ -66,15 +70,17 @@ def filter_rc_message(
     config: "RocketChatConfig",
     room_type: str,
     last_processed_ts: str | None,
+    turn_store: "TurnStore | None" = None,
 ) -> FilterResult:
     """Decide whether a raw RC DDP message document should be processed.
 
     Applies (in order):
       1. Skip messages from the bot itself.
-      2. Skip senders not in the allow-list.
+      2. Sender filter (allow-list or open mode, agents always pass).
       3. For non-DM rooms: require explicit @mention of the bot
-         (in mentions[], message text, or attachment descriptions).
-      4. Timestamp deduplication: skip messages already processed.
+         (skipped for agent senders and when require_mention=False).
+      4. Agent chain turn budget check (agents only).
+      5. Timestamp deduplication: skip messages already processed.
 
     Returns a FilterResult describing the outcome.
     """
@@ -84,14 +90,18 @@ def filter_rc_message(
     if sender == config.username:
         return FilterResult(accepted=False, reason="own message")
 
-    # 2. Allow-list check
-    if sender not in config.allow_senders:
-        return FilterResult(
-            accepted=False, sender=sender, reason="sender not in allow-list"
-        )
+    # Determine if sender is a known agent
+    is_agent = sender in config.agent_chain.agent_usernames
 
-    # 3. For channels / groups: require @mention
-    if room_type != "dm":
+    # 2. Sender filter
+    if config.filter_sender:
+        # allow-list mode: only owners+guests+agents are accepted
+        if sender not in config.allow_senders and not is_agent:
+            return FilterResult(accepted=False, sender=sender, reason="sender not in allow-list")
+    # else: open mode — everyone passes; role resolved later in normalize
+
+    # 3. For channels/groups: require @mention (unless listen-all mode or agent sender)
+    if config.require_mention and not is_agent and room_type != "dm":
         mentions = doc.get("mentions", [])
         bot_mentioned = any(m.get("username") == config.username for m in mentions)
         if not bot_mentioned:
@@ -104,8 +114,39 @@ def filter_rc_message(
                 return FilterResult(
                     accepted=False, sender=sender, reason="bot not mentioned"
                 )
+    # Note: agent senders bypass @mention requirement (listen-all for agents)
+    # Note: listen-all mode (require_mention=False) skips this for all senders
 
-    # 4. Timestamp deduplication — numeric comparison to avoid false
+    # 4. Agent chain turn budget (only for agent senders)
+    agent_chain_turn = 0
+    if is_agent and turn_store is not None:
+        allowed, agent_chain_turn = turn_store.check_and_increment(
+            room_id=doc.get("rid", ""),
+            thread_id=doc.get("tmid") or None,
+            sender=sender,
+            max_turns=config.agent_chain.max_turns,
+        )
+        if not allowed:
+            # Reset immediately — the drop itself breaks the loop
+            turn_store.reset_sender(
+                room_id=doc.get("rid", ""),
+                thread_id=doc.get("tmid") or None,
+                sender=sender,
+            )
+            logger.info(
+                "Agent chain turn limit reached for sender=%s (max=%d) — dropping and resetting",
+                sender,
+                config.agent_chain.max_turns,
+            )
+            return FilterResult(accepted=False, sender=sender, reason="agent chain turn limit reached")
+    elif not is_agent and turn_store is not None:
+        # Human message: reset all agent chain counters for this context
+        turn_store.reset_all(
+            room_id=doc.get("rid", ""),
+            thread_id=doc.get("tmid") or None,
+        )
+
+    # 5. Timestamp deduplication — numeric comparison to avoid false
     #    positives/negatives from lexicographic ordering of mixed-precision
     #    or mixed-format timestamp strings.
     msg_ts = _extract_ts(doc)
@@ -119,7 +160,14 @@ def filter_rc_message(
             reason=f"already processed (ts={msg_ts})",
         )
 
-    return FilterResult(accepted=True, sender=sender, msg_ts=msg_ts)
+    return FilterResult(
+        accepted=True,
+        sender=sender,
+        msg_ts=msg_ts,
+        is_agent_chain=is_agent,
+        agent_chain_turn=agent_chain_turn,
+        agent_chain_max_turns=config.agent_chain.max_turns,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +183,9 @@ async def normalize_rc_message(
     config: "RocketChatConfig",
     rest: "RocketChatREST",
     cache_dir: Path,
+    is_agent_chain: bool = False,
+    agent_chain_turn: int = 0,
+    agent_chain_max_turns: int = 5,
 ) -> IncomingMessage:
     """Convert an accepted RC DDP message document into a normalized IncomingMessage.
 
@@ -142,14 +193,17 @@ async def normalize_rc_message(
     assumes the message has already passed all filters.
 
     Args:
-        doc             : Raw RC DDP message document.
-        room            : Resolved Room (id, name, type already known).
-        sender_username : Extracted from doc["u"]["username"] by filter step.
-        msg_ts          : Extracted timestamp string (from filter step).
-        config          : RocketChatConfig (for role resolution, attachment settings).
-        rest            : RocketChatREST (for authenticated attachment downloads).
-        cache_dir       : Absolute directory path for downloaded attachments.
-                          Caller ensures this is unique per watcher.
+        doc                  : Raw RC DDP message document.
+        room                 : Resolved Room (id, name, type already known).
+        sender_username      : Extracted from doc["u"]["username"] by filter step.
+        msg_ts               : Extracted timestamp string (from filter step).
+        config               : RocketChatConfig (for role resolution, attachment settings).
+        rest                 : RocketChatREST (for authenticated attachment downloads).
+        cache_dir            : Absolute directory path for downloaded attachments.
+                               Caller ensures this is unique per watcher.
+        is_agent_chain       : True when the sender is a known ACG agent.
+        agent_chain_turn     : 1-based current turn number (after increment).
+        agent_chain_max_turns: Configured turn budget ceiling.
     """
     role = UserRole(config.role_of(sender_username))
     sender = User(
@@ -162,7 +216,7 @@ async def normalize_rc_message(
     attachments, warnings = await _download_attachments(doc, config, rest, cache_dir)
     thread_id: str | None = doc.get("tmid") or None
 
-    return IncomingMessage(
+    msg = IncomingMessage(
         id=doc.get("_id", msg_ts),
         timestamp=msg_ts,
         room=room,
@@ -174,6 +228,13 @@ async def normalize_rc_message(
         thread_id=thread_id,
         raw=doc,
     )
+
+    # Store agent chain context for the core layer to use
+    msg.extra_context["is_agent_chain"] = is_agent_chain
+    msg.extra_context["agent_chain_turn"] = agent_chain_turn
+    msg.extra_context["agent_chain_max_turns"] = agent_chain_max_turns
+
+    return msg
 
 
 # ---------------------------------------------------------------------------
