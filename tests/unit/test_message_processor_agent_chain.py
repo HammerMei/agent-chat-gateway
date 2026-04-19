@@ -17,7 +17,6 @@ from gateway.core.config import CoreConfig
 from gateway.core.connector import IncomingMessage, Room, User, UserRole
 from gateway.core.message_processor import MessageProcessor
 
-
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 

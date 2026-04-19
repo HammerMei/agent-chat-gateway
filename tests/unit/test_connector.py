@@ -244,14 +244,12 @@ class TestWatermarkAdvancement(unittest.IsolatedAsyncioTestCase):
     """Issue #8: dedup watermark must advance only after handler success."""
 
     def _make_connector_and_sub(self):
-        from gateway.connectors.rocketchat.config import RocketChatConfig
+        from gateway.connectors.rocketchat.config import AgentChainConfig, RocketChatConfig
         from gateway.connectors.rocketchat.connector import (
             RocketChatConnector,
             _RoomSubscription,
         )
         from gateway.core.connector import Room
-
-        from gateway.connectors.rocketchat.config import AgentChainConfig
 
         config = MagicMock(spec=RocketChatConfig)
         config.server_url = "http://localhost:3000"
