@@ -636,6 +636,7 @@ class TestRCRefcount(unittest.IsolatedAsyncioTestCase):
         connector._watcher_contexts = {}
         connector._room_refcount = {}
         connector._attachments_cache_base = Path("/tmp/acg-test-attachments/rc-test")
+        connector._turn_store = None
         return connector
 
     async def test_refcount_increments_on_duplicate_subscribe(self):
@@ -710,6 +711,7 @@ class TestMultiWatcherDispatch(unittest.IsolatedAsyncioTestCase):
         connector._watcher_contexts = {}
         connector._room_refcount = {}
         connector._attachments_cache_base = Path("/tmp/acg-test-attachments/rc-test")
+        connector._turn_store = None
         return connector
 
     async def test_handler_called_once_for_two_watcher_contexts(self):
@@ -1328,6 +1330,7 @@ class TestAttachmentCachePath(unittest.IsolatedAsyncioTestCase):
         connector._watcher_contexts = {}
         connector._room_refcount = {}
         connector._attachments_cache_base = Path("/tmp/acg-test/rc-home")
+        connector._turn_store = None
         return connector
 
     async def test_normalize_receives_global_cache_dir_with_room_id(self):
