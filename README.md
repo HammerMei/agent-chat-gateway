@@ -27,6 +27,7 @@ Inspired by [OpenClaw](https://github.com/openclaw/openclaw)'s vision of making 
 - 🧠 **[Context injection](docs/user-guide.md#context-files)** — pre-load domain knowledge, system prompts, or project context into the agent at startup
 - ⚡ **[Multiple chat systems at once](docs/user-guide.md#multi-connector-setup)** — connect to several chat platforms simultaneously
 - ⏰ **[Built-in task scheduler](docs/scheduling.md)** — let the agent schedule recurring or one-shot tasks directly from chat ("remind me in 5 minutes", "run daily standup at 09:00") without any infrastructure setup
+- 🤝 **[Agent-to-agent collaboration](docs/agent-chain.md)** — let multiple AI agents collaborate in a shared room; built-in loop protection keeps conversations bounded and human-observable
 
 ---
 
@@ -106,3 +107,4 @@ See [docs/user-guide.md](docs/user-guide.md) for the full CLI reference, configu
 | [docs/supported-features.md](docs/supported-features.md) | Supported features, known limitations, and roadmap |
 | [docs/requirements.md](docs/requirements.md) | Functional specification and behavioral requirements |
 | [docs/scheduling.md](docs/scheduling.md) | Built-in task scheduler — recurring and one-shot jobs from chat |
+| [docs/agent-chain.md](docs/agent-chain.md) | Agent-to-agent collaboration — enabling multiple heterogeneous AI agents to coordinate via chat |
