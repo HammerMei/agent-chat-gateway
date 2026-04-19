@@ -11,6 +11,14 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class AgentChainConfig:
+    """Configuration for controlled agent-to-agent communication."""
+    agent_usernames: list[str] = field(default_factory=list)
+    max_turns: int = 5
+    ttl_seconds: float = 3600.0
+
+
+@dataclass
 class RocketChatConfig:
     """All Rocket.Chat platform configuration in one place.
 
@@ -34,6 +42,15 @@ class RocketChatConfig:
     permission_reply_in_thread: bool = True
     # When True, 🔐 permission notifications are posted in a thread anchored to the
     # triggering message (keeps the main channel clean). Independent of reply_in_thread.
+    require_mention: bool = True
+    # When False, the bot responds to all messages in channels/groups without needing
+    # an explicit @mention. Agents bypass this check regardless.
+    filter_sender: bool = True
+    # When False, messages from senders not in the allow-list are still accepted
+    # (open mode). Agents bypass this check and are always accepted if listed in
+    # agent_chain.agent_usernames.
+    agent_chain: AgentChainConfig = field(default_factory=AgentChainConfig)
+    # Configuration for controlled agent-to-agent communication with loop protection.
 
     @property
     def allow_senders(self) -> list[str]:
@@ -78,6 +95,13 @@ class RocketChatConfig:
             ),
         )
 
+        agent_chain_raw = raw.get("agent_chain", {})
+        agent_chain_cfg = AgentChainConfig(
+            agent_usernames=agent_chain_raw.get("agent_usernames", []),
+            max_turns=agent_chain_raw.get("max_turns", 5),
+            ttl_seconds=agent_chain_raw.get("ttl_seconds", 3600.0),
+        )
+
         return cls(
             server_url=server.get("url", "").rstrip("/"),
             username=server.get("username", ""),
@@ -88,4 +112,7 @@ class RocketChatConfig:
             attachments=attach_cfg,
             reply_in_thread=raw.get("reply_in_thread", False),
             permission_reply_in_thread=raw.get("permission_reply_in_thread", True),
+            require_mention=raw.get("require_mention", True),
+            filter_sender=raw.get("filter_sender", True),
+            agent_chain=agent_chain_cfg,
         )

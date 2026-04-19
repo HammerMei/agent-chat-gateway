@@ -520,6 +520,15 @@ class Connector(ABC):
             thread_id: Thread ID to post into, if applicable.
         """
 
+    def on_agent_chain_drop(self, room_id: str, thread_id: str | None, sender: str) -> None:
+        """Called when an agent chain LLM response is dropped (termination token detected).
+
+        Connectors that support agent-to-agent communication override this to
+        reset the sender's turn counter so future messages are not penalised.
+        Default: no-op.
+        """
+        pass
+
     async def notify_typing(self, room_id: str, is_typing: bool) -> None:
         """Signal that the agent is (or has stopped) typing in a room.
 

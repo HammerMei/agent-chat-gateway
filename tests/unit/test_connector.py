@@ -57,6 +57,7 @@ def _make_connector():
     room = Room(id="room-1", name="general", type="channel")
     connector._rooms["room-1"] = _RoomSubscription(room=room, last_processed_ts=None)
     connector._watcher_contexts["room-1"] = []
+    connector._turn_store = None  # no agent chain configured
 
     return connector
 
@@ -250,6 +251,8 @@ class TestWatermarkAdvancement(unittest.IsolatedAsyncioTestCase):
         )
         from gateway.core.connector import Room
 
+        from gateway.connectors.rocketchat.config import AgentChainConfig
+
         config = MagicMock(spec=RocketChatConfig)
         config.server_url = "http://localhost:3000"
         config.username = "bot"
@@ -260,6 +263,9 @@ class TestWatermarkAdvancement(unittest.IsolatedAsyncioTestCase):
         config.role_of = MagicMock(return_value="owner")
         config.reply_in_thread = False
         config.permission_reply_in_thread = False
+        config.require_mention = True
+        config.filter_sender = True
+        config.agent_chain = AgentChainConfig()
         config.attachments = MagicMock()
         config.attachments.max_file_size_mb = 10.0
         config.attachments.download_timeout = 30
@@ -275,6 +281,7 @@ class TestWatermarkAdvancement(unittest.IsolatedAsyncioTestCase):
         connector._watcher_contexts = {}
         connector._room_refcount = {}
         connector._attachments_cache_base = Path("/tmp/acg-test-attachments/test")
+        connector._turn_store = None  # no agent chain configured
 
         room = Room(id="room-1", name="general", type="channel")
         sub = _RoomSubscription(room=room, last_processed_ts="100")

@@ -25,6 +25,45 @@ connectors:
       # cache_dir_global: ~/.agent-chat-gateway/attachments  # optional: override download cache location
     reply_in_thread: false           # true = start a new thread for every top-level reply
     permission_reply_in_thread: true # false = post permission notifications at room level
+
+    # ── Message filtering ─────────────────────────────────────────────────────
+    # require_mention: true (default) — in channels/groups, bot only responds when
+    #   explicitly @mentioned.  Set to false to listen to all messages without mention.
+    #   DMs always pass regardless of this setting.
+    # require_mention: true
+
+    # filter_sender: true (default) — only users listed in allowed_users.owners +
+    #   allowed_users.guests may interact.  Set to false to allow anyone to send messages
+    #   (role defaults to 'guest' for unlisted users).
+    # filter_sender: true
+
+    # ── Agent-to-agent loop protection ───────────────────────────────────────
+    # Enables controlled agent-to-agent communication when two ACG bots share a room.
+    # Without this, bots responding to each other create infinite loops.
+    #
+    # How it works (three layers):
+    #   1. LLM self-termination — the agent responds with a special token to stop
+    #      the chain early when it detects a loop or has nothing to add.
+    #   2. Per-sender turn budget — hard ceiling on how many turns each agent can take
+    #      before messages are force-dropped.
+    #   3. TTL expiry — stale counters are garbage-collected automatically.
+    #
+    # The turn budget is tracked independently per sender, so two different bot pairs
+    # in the same room don't share quotas.
+    #
+    # Counter resets:
+    #   - When the LLM self-terminates (token detected)
+    #   - When the turn limit is hit (force-drop)
+    #   - When a human message arrives (resets all agent counters for that room/thread)
+    #   - After ttl_seconds of inactivity (TTL GC)
+    #
+    # agent_chain:
+    #   agent_usernames:               # RC usernames of other ACG bots this bot may receive messages from
+    #     - laomei-bot                 # messages from these senders bypass the allow-list check
+    #     - xiaomei-bot                # and are tracked against their own per-sender turn budget
+    #   max_turns: 5                   # max turns per agent per room/thread before force-drop (default: 5)
+    #   ttl_seconds: 3600              # seconds before idle turn counters are GC'd (default: 3600)
+
     # Built-in context files are injected automatically — no config needed:
     #   contexts/rc-gateway-context.md  — RC message format, RBAC rules, injection protection
     #   contexts/scheduling-context.md  — teaches agent the acg schedule CLI commands
