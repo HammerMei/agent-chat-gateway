@@ -27,6 +27,7 @@ from ...core.connector import (
     MessageHandler,
     Room,
 )
+from .agent_chain import TurnStore
 from .config import RocketChatConfig
 from .normalize import FilterResult, filter_rc_message, normalize_rc_message
 from .outbound import send_media as _send_media
@@ -119,6 +120,12 @@ class RocketChatConnector(Connector):
         # Namespaced by connector name to avoid collisions across multi-connector deployments.
         self._attachments_cache_base = (
             Path(config.attachments.cache_dir_global).expanduser() / config.name
+        )
+        # TurnStore for agent-to-agent loop protection; only allocated when agents are configured.
+        self._turn_store: TurnStore | None = (
+            TurnStore(ttl_seconds=config.agent_chain.ttl_seconds)
+            if config.agent_chain.agent_usernames
+            else None
         )
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
@@ -420,6 +427,15 @@ class RocketChatConnector(Connector):
         except Exception as e:
             logger.warning("Failed to post offline notification: %s", e)
 
+    def on_agent_chain_drop(self, room_id: str, thread_id: str | None, sender: str) -> None:
+        """Called when an agent chain LLM response was dropped (termination token detected).
+
+        Resets the sender's turn counter so future messages from the same agent
+        are not penalised by an artificially inflated count.
+        """
+        if self._turn_store is not None:
+            self._turn_store.reset_sender(room_id, thread_id, sender)
+
     # ── Internal: DDP callback factory ───────────────────────────────────────
 
     def _make_ddp_callback(self, room_id: str):
@@ -465,6 +481,7 @@ class RocketChatConnector(Connector):
             config=self._config,
             room_type=sub.room.type,
             last_processed_ts=sub.last_processed_ts,
+            turn_store=self._turn_store,
         )
         if not result.accepted:
             logger.debug(
@@ -526,6 +543,9 @@ class RocketChatConnector(Connector):
                 config=self._config,
                 rest=self._rest,
                 cache_dir=cache_dir,
+                is_agent_chain=result.is_agent_chain,
+                agent_chain_turn=result.agent_chain_turn,
+                agent_chain_max_turns=result.agent_chain_max_turns,
             )
         except Exception as e:
             logger.error("Failed to normalize message: %s", e)
