@@ -125,9 +125,11 @@ class AgentTurnRunner:
                 role_env,
             )
 
-            # Agent chain termination check — case-insensitive so LLM output
-            # variations like <END-OF-AGENT-CHAIN> are still caught.
-            if is_agent_chain and response.text.strip().lower() == AGENT_CHAIN_TERMINATION_TOKEN:
+            # Agent chain termination check — case-insensitive substring match so
+            # LLM output variations like <END-OF-AGENT-CHAIN> or the token embedded
+            # in surrounding text (e.g. "Nothing to add.\n\n<end-of-agent-chain>")
+            # are still caught.
+            if is_agent_chain and AGENT_CHAIN_TERMINATION_TOKEN in response.text.lower():
                 logger.info(
                     "Agent chain self-terminated (session=%s room=%s sender turn suppressed)",
                     session_id[:8],
