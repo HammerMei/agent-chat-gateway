@@ -33,9 +33,22 @@ class TurnStore:
 
     Key: (room_id, thread_id, sender_username)
     - Each sender has an independent counter against the current bot.
-    - On any drop (force or LLM termination): immediately reset that sender's counter.
-    - On human message: reset all counters for (room_id, thread_id).
-    - TTL GC: entries older than ttl_seconds are purged on each check.
+    - On force-drop (budget exhausted): counter stays at max, sender locked until
+      human message or TTL expiry.
+    - On self-termination (LLM gracefully exits): counter stays, chain dies
+      naturally (no reply posted → no trigger for the other agent to reply).
+    - On human message: reset_all clears all counters for the room/thread.
+    - TTL GC: entries older than ttl_seconds are purged lazily on each check,
+      giving any sender a fresh full budget after a long idle period.
+
+    Future consideration — two-TTL design:
+        Force-drop and self-termination may warrant different TTLs.  A force-drop
+        is like a dropped call: the other agent likely wants to keep talking and
+        will retry quickly, so a shorter TTL is appropriate.  Self-termination is a
+        natural hang-up: the room should stay quiet, so a longer TTL gives more
+        cooldown before fresh budget is granted.  For now a single ttl_seconds is
+        used for simplicity; split into force_drop_ttl / self_terminate_ttl if
+        real-world tuning shows the single value is too coarse.
     """
 
     def __init__(self, ttl_seconds: float = 3600.0) -> None:
