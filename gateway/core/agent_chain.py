@@ -34,7 +34,8 @@ def build_agent_chain_context(turn: int, max_turns: int) -> str:
         )
     if turn < max_turns:
         lines.append(
-            f"If you have nothing meaningful to add, respond with ONLY: "
+            f"If this conversation is repeating without making progress (a loop), "
+            f"or if you have nothing meaningful to add, respond with ONLY: "
             f"{AGENT_CHAIN_TERMINATION_TOKEN}"
         )
     return "\n".join(lines)

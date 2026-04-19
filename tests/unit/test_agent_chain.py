@@ -183,6 +183,17 @@ class TestBuildAgentChainContext(unittest.TestCase):
         self.assertNotIn("final turn", ctx)
         self.assertNotIn("next response will be your last", ctx)
 
+    def test_loop_detection_hint_present_on_non_final_turns(self):
+        """Non-final turns include the loop-detection instruction."""
+        for turn in (1, 2, 4):  # all turns before max
+            ctx = build_agent_chain_context(turn=turn, max_turns=5)
+            self.assertIn("repeating without making progress", ctx)
+
+    def test_loop_detection_hint_absent_on_final_turn(self):
+        """Final turn uses graceful-closing wording instead of loop hint."""
+        ctx = build_agent_chain_context(turn=5, max_turns=5)
+        self.assertNotIn("repeating without making progress", ctx)
+
     def test_penultimate_turn_has_warning(self):
         ctx = build_agent_chain_context(turn=4, max_turns=5)
         self.assertIn("[Agent chain: turn 4/5]", ctx)
