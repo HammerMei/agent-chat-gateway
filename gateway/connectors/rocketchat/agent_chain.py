@@ -10,8 +10,8 @@ infinite loops.  This module provides:
 
 from __future__ import annotations
 
-import time
 import logging
+import time
 from dataclasses import dataclass, field
 
 from ...core.agent_chain import (  # noqa: F401 — re-export for connector consumers

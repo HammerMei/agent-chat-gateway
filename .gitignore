@@ -20,3 +20,4 @@ example-agents/**/node_modules/
 .opencode
 docker_env/
 *.tar.gz
+.tamago

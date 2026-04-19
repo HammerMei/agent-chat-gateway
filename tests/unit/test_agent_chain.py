@@ -22,11 +22,11 @@ import time
 import unittest
 from unittest.mock import patch
 
-from gateway.connectors.rocketchat.agent_chain import TurnStore, AGENT_CHAIN_TERMINATION_TOKEN
+from gateway.connectors.rocketchat.agent_chain import AGENT_CHAIN_TERMINATION_TOKEN, TurnStore
 from gateway.connectors.rocketchat.config import AgentChainConfig, RocketChatConfig
-from gateway.connectors.rocketchat.normalize import FilterResult, filter_rc_message
-from gateway.core.agent_chain import build_agent_chain_context, AGENT_CHAIN_TERMINATION_TOKEN as CORE_TOKEN
-
+from gateway.connectors.rocketchat.normalize import filter_rc_message
+from gateway.core.agent_chain import AGENT_CHAIN_TERMINATION_TOKEN as CORE_TOKEN
+from gateway.core.agent_chain import build_agent_chain_context
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
