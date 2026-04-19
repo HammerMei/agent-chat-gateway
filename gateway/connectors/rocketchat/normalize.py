@@ -143,14 +143,13 @@ def filter_rc_message(
             max_turns=config.agent_chain.max_turns,
         )
         if not allowed:
-            # Reset immediately — the drop itself breaks the loop
-            turn_store.reset_sender(
-                room_id=doc.get("rid", ""),
-                thread_id=doc.get("tmid") or None,
-                sender=sender,
-            )
+            # Do NOT reset the counter here — resetting on drop would allow the
+            # loop to restart immediately on the next message.  Instead, the
+            # counter stays at max_turns and every subsequent message from this
+            # sender is force-dropped until a human message (reset_all) or TTL
+            # expiry clears the budget.
             logger.info(
-                "Agent chain turn limit reached for sender=%s (max=%d) — dropping and resetting",
+                "Agent chain turn limit reached for sender=%s (max=%d) — dropping",
                 sender,
                 config.agent_chain.max_turns,
             )

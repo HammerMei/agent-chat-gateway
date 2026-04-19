@@ -235,22 +235,38 @@ class TestFilterRcMessageAgentChain(unittest.TestCase):
         self.assertEqual(result.agent_chain_turn, 1)
         self.assertEqual(result.agent_chain_max_turns, 5)
 
-    def test_agent_sender_at_turn_limit_dropped_and_counter_reset(self):
+    def test_agent_sender_at_turn_limit_dropped_counter_stays_at_max(self):
+        """Counter is NOT reset on force-drop — stays at max to prevent loop restart."""
         config = _make_config(owners=["human1"], agent_usernames=["agentA"], max_turns=3)
         store = TurnStore()
         # Exhaust budget
-        for _ in range(3):
-            doc = _make_doc(sender="agentA", rid="room1", msg="msg", ts=_ + 1)
+        for i in range(3):
+            doc = _make_doc(sender="agentA", rid="room1", msg="msg", ts=i + 1)
             filter_rc_message(doc, config, "channel", None, turn_store=store)
 
-        # 4th message should be dropped
+        # 4th message: force-drop, counter stays at max
         doc = _make_doc(sender="agentA", rid="room1", msg="over limit", ts=100)
         result = filter_rc_message(doc, config, "channel", None, turn_store=store)
 
         self.assertFalse(result.accepted)
         self.assertEqual(result.reason, "agent chain turn limit reached")
-        # Counter was reset on drop
-        self.assertEqual(store.current_turns("room1", None, "agentA"), 0)
+        # Counter stays at max (NOT reset) so subsequent messages stay blocked
+        self.assertEqual(store.current_turns("room1", None, "agentA"), 3)
+
+    def test_agent_sender_stays_blocked_after_turn_limit(self):
+        """Once force-dropped, ALL subsequent messages are also dropped until reset."""
+        config = _make_config(owners=["human1"], agent_usernames=["agentA"], max_turns=3)
+        store = TurnStore()
+        for i in range(3):
+            doc = _make_doc(sender="agentA", rid="room1", msg="msg", ts=i + 1)
+            filter_rc_message(doc, config, "channel", None, turn_store=store)
+
+        # Every subsequent message is immediately force-dropped
+        for ts in range(100, 105):
+            doc = _make_doc(sender="agentA", rid="room1", msg="still trying", ts=ts)
+            result = filter_rc_message(doc, config, "channel", None, turn_store=store)
+            self.assertFalse(result.accepted)
+            self.assertEqual(result.reason, "agent chain turn limit reached")
 
     def test_agent_bypasses_mention_requirement_in_channel(self):
         config = _make_config(owners=["human1"], agent_usernames=["agentA"], require_mention=True)

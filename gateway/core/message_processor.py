@@ -397,7 +397,7 @@ class MessageProcessor:
             agent_chain_max_turns = msg.extra_context.get("agent_chain_max_turns", 5)
             agent_chain_context = build_agent_chain_context(agent_chain_turn, agent_chain_max_turns)
 
-        terminated = await self._turn_runner.run_turn(
+        await self._turn_runner.run_turn(
             session_id=self._session_id,
             prompt=prompt,
             working_directory=self._working_directory,
@@ -408,12 +408,6 @@ class MessageProcessor:
             is_agent_chain=is_agent_chain,
             agent_chain_context=agent_chain_context,
         )
-        if terminated:
-            self._connector.on_agent_chain_drop(
-                msg.room.id,
-                msg.thread_id,
-                msg.sender.username,
-            )
 
     async def _ensure_context_injected(self) -> None:
         """Retry context injection safely on message processing when appropriate."""

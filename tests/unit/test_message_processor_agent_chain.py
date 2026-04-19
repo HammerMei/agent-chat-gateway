@@ -83,25 +83,29 @@ def _make_agent_chain_msg(
 
 
 class TestMessageProcessorAgentChain(unittest.IsolatedAsyncioTestCase):
-    async def test_terminated_turn_calls_on_agent_chain_drop(self):
-        """When run_turn returns True (self-terminated), on_agent_chain_drop is called."""
+    async def test_terminated_turn_does_not_call_on_agent_chain_drop(self):
+        """Self-termination does NOT reset the counter (no on_agent_chain_drop call).
+
+        Counter stays at its current value so the budget is not renewed, preventing
+        the loop from restarting on the next queued message.
+        """
         processor, connector = _make_processor()
         msg = _make_agent_chain_msg(sender="agentA", room_id="room_1", thread_id=None)
 
         with patch.object(processor._turn_runner, "run_turn", new=AsyncMock(return_value=True)):
             await processor._process(msg)
 
-        connector.on_agent_chain_drop.assert_called_once_with("room_1", None, "agentA")
+        connector.on_agent_chain_drop.assert_not_called()
 
-    async def test_terminated_turn_with_thread_passes_thread_id(self):
-        """on_agent_chain_drop receives the correct thread_id when in a thread."""
+    async def test_terminated_turn_in_thread_does_not_call_on_agent_chain_drop(self):
+        """Self-termination in a thread also does NOT call on_agent_chain_drop."""
         processor, connector = _make_processor()
         msg = _make_agent_chain_msg(sender="agentB", room_id="room_2", thread_id="t99")
 
         with patch.object(processor._turn_runner, "run_turn", new=AsyncMock(return_value=True)):
             await processor._process(msg)
 
-        connector.on_agent_chain_drop.assert_called_once_with("room_2", "t99", "agentB")
+        connector.on_agent_chain_drop.assert_not_called()
 
     async def test_normal_turn_does_not_call_on_agent_chain_drop(self):
         """When run_turn returns False (normal delivery), on_agent_chain_drop is NOT called."""
