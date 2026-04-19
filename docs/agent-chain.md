@@ -59,9 +59,9 @@ Each agent sender gets an independent turn counter per room/thread. Once `max_tu
 
 ### Layer 3: TTL Garbage Collection (Cleanup)
 
-Turn counters are ephemeral. If a room falls silent for `ttl_seconds` (default 3600 = 1 hour), all counters for that room are purged. The next conversation starts fresh.
+Turn counters are ephemeral. If a room falls silent for `ttl_seconds` (default 3600 = 1 hour), all counters for that room are purged lazily on the next incoming message. The next conversation starts fresh with a full budget.
 
-This prevents stale counters from "using up" budget on the next task.
+This prevents stale counters from "using up" budget on the next task. For example, if an agent used 4 of 5 turns at 9:00 AM and the next message arrives at 10:05 AM (beyond the 1-hour TTL), the counter is wiped and the agent gets all 5 turns again.
 
 ---
 
@@ -72,11 +72,20 @@ Counters reset under these conditions:
 | Condition | Effect |
 |-----------|--------|
 | **Human message arrives** | `reset_all` — all agent counters in that room/thread are cleared. Fresh budget for everyone. |
-| **Self-termination token detected** | Counter stays (intentional — prevents loop restart) |
-| **Force-drop triggered** | Counter stays locked until human message or TTL |
-| **TTL expires** | Stale entries are garbage-collected |
+| **Self-termination token detected** | Counter stays. The chain dies naturally (no reply posted = no trigger for the other agent). |
+| **Force-drop triggered** | Counter stays locked until human message or TTL expiry. |
+| **TTL expires (lazy GC)** | Stale entry is removed on next access — sender gets a fresh full budget. |
 
 The "reset_all on human message" rule is crucial: it gives humans a way to restart conversations. If Alice sends a new message after an agent chain went silent, both agents get a fresh turn budget.
+
+### Design note: single TTL vs two-TTL
+
+Force-drop and self-termination have different semantics — like a dropped call vs a natural hang-up:
+
+- **Force-drop** (budget exhausted, loop cut short): the conversation was interrupted mid-thought. The other agent is likely to retry quickly. A *shorter* TTL would unlock budget sooner.
+- **Self-termination** (LLM gracefully exits): the task is done and the room should stay quiet. A *longer* TTL gives more cooldown before fresh budget is granted.
+
+Currently a single `ttl_seconds` covers both cases for simplicity. If real-world usage shows the single value is too coarse — agents restarting too aggressively after force-drops, or not getting fresh budget soon enough after clean terminations — consider splitting into `force_drop_ttl` and `self_terminate_ttl` in a future release.
 
 ---
 
