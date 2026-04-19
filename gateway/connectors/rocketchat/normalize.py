@@ -79,8 +79,10 @@ def filter_rc_message(
       2. Sender filter (allow-list or open mode, agents always pass).
       3. For non-DM rooms: require explicit @mention of the bot
          (skipped for agent senders and when require_mention=False).
-      4. Agent chain turn budget check (agents only).
-      5. Timestamp deduplication: skip messages already processed.
+      4. Timestamp deduplication: skip messages already processed.
+      5. Agent chain turn budget check (agents only) / counter reset (humans).
+         State mutation runs after dedup so replayed messages never corrupt
+         turn counters.
 
     Returns a FilterResult describing the outcome.
     """
@@ -117,7 +119,21 @@ def filter_rc_message(
     # Note: agent senders bypass @mention requirement (listen-all for agents)
     # Note: listen-all mode (require_mention=False) skips this for all senders
 
-    # 4. Agent chain turn budget (only for agent senders)
+    # 4. Timestamp deduplication — run BEFORE any state mutation so replayed
+    #    or reconnect-duplicated messages never corrupt turn counters.
+    msg_ts = _extract_ts(doc)
+    msg_ts_f = _ts_to_float(msg_ts)
+    last_ts_f = _ts_to_float(last_processed_ts)
+    if msg_ts_f is not None and last_ts_f is not None and msg_ts_f <= last_ts_f:
+        return FilterResult(
+            accepted=False,
+            sender=sender,
+            msg_ts=msg_ts,
+            reason=f"already processed (ts={msg_ts})",
+        )
+
+    # 5. Agent chain turn budget (only for agent senders) — state mutation only
+    #    after dedup confirms this is a fresh, previously-unseen message.
     agent_chain_turn = 0
     if is_agent and turn_store is not None:
         allowed, agent_chain_turn = turn_store.check_and_increment(
@@ -144,20 +160,6 @@ def filter_rc_message(
         turn_store.reset_all(
             room_id=doc.get("rid", ""),
             thread_id=doc.get("tmid") or None,
-        )
-
-    # 5. Timestamp deduplication — numeric comparison to avoid false
-    #    positives/negatives from lexicographic ordering of mixed-precision
-    #    or mixed-format timestamp strings.
-    msg_ts = _extract_ts(doc)
-    msg_ts_f = _ts_to_float(msg_ts)
-    last_ts_f = _ts_to_float(last_processed_ts)
-    if msg_ts_f is not None and last_ts_f is not None and msg_ts_f <= last_ts_f:
-        return FilterResult(
-            accepted=False,
-            sender=sender,
-            msg_ts=msg_ts,
-            reason=f"already processed (ts={msg_ts})",
         )
 
     return FilterResult(

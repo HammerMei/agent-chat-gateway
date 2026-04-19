@@ -563,6 +563,24 @@ class TestAgentTurnRunner(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(terminated)
         connector.send_text.assert_not_called()
 
+    async def test_termination_token_uppercase_variant_still_terminates(self):
+        """Case-insensitive match catches uppercase/mixed-case LLM output variants."""
+        agent = _MockAgent(AgentResponse(text="<END-OF-AGENT-CHAIN>"))
+        runner, connector = _make_runner(agent)
+
+        terminated = await runner.run_turn(
+            session_id="ses_001",
+            prompt="hello",
+            working_directory="/tmp",
+            room_id="room_1",
+            thread_id=None,
+            is_agent_chain=True,
+            agent_chain_context="\n---\n[Agent chain: turn 1/5]",
+        )
+
+        self.assertTrue(terminated)
+        connector.send_text.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
