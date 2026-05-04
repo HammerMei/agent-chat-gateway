@@ -13,6 +13,12 @@
 #              acg:latest
 # =============================================================================
 
+# Agent version build args — pass at build time to pin specific versions.
+# Defaults to "latest" for both agents (used by e2e-canary).
+# e2e-pinned passes explicit versions to ensure reproducible test runs.
+ARG CLAUDE_CODE_VERSION=latest
+ARG OPENCODE_VERSION=latest
+
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -49,12 +55,23 @@ ENV PATH="/root/.local/bin:/root/.cargo/bin:/root/.opencode/bin:$PATH"
 # -----------------------------------------------------------------------------
 # Claude Code CLI
 # -----------------------------------------------------------------------------
-RUN npm install -g @anthropic-ai/claude-code
+# Re-declare ARG after FROM so it is visible in this build stage.
+ARG CLAUDE_CODE_VERSION=latest
+RUN if [ "$CLAUDE_CODE_VERSION" = "latest" ]; then \
+      npm install -g @anthropic-ai/claude-code; \
+    else \
+      npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}; \
+    fi
 
 # -----------------------------------------------------------------------------
 # OpenCode CLI
 # -----------------------------------------------------------------------------
-RUN curl -fsSL https://opencode.ai/install | bash
+ARG OPENCODE_VERSION=latest
+RUN if [ "$OPENCODE_VERSION" = "latest" ]; then \
+      curl -fsSL https://opencode.ai/install | bash; \
+    else \
+      curl -fsSL https://opencode.ai/install | bash -s -- --version ${OPENCODE_VERSION}; \
+    fi
 
 # -----------------------------------------------------------------------------
 # Install ACG — mirrors the real curl | bash install flow exactly:
