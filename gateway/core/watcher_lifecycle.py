@@ -376,7 +376,8 @@ class WatcherLifecycle:
         # 4. Inject context (rollback maps on failure)
         try:
             await self._injector.inject(
-                ws, session_id, agent, agent_name, wc.connector, wc
+                ws, session_id, agent, agent_name, wc.connector, wc,
+                agent_username=self._connector.agent_username,
             )
         except Exception:
             self._states.pop(wc.name, None)

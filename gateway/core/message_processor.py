@@ -431,6 +431,7 @@ class MessageProcessor:
             agent_name=self._agent_name,
             connector_name=self._connector_name,
             wc=self._watcher_config,
+            agent_username=self._connector.agent_username,
         )
 
     # ── Notifications ─────────────────────────────────────────────────────────

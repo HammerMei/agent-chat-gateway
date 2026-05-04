@@ -383,9 +383,55 @@ class RocketChatConnector(Connector):
     _PREFIX_UNSAFE_RE = re.compile(r"[\|\[\]\r\n]")
 
     @property
+    def agent_username(self) -> str:
+        """The bot's own RC username (from connector config)."""
+        return self._config.username
+
+    @property
     def timezone(self) -> str:
         """IANA timezone from connector config, falling back to server local."""
         return self._config.timezone or _server_local_timezone()
+
+    def _compute_to_field(self, msg: IncomingMessage) -> str:
+        """Compute the compact ``to:`` routing field for the agent prompt prefix.
+
+        Summarises who the message is addressed to among agents:
+
+        - ``to: me``          — only this bot is @mentioned
+        - ``to: @wavebro``    — one or more other agents mentioned, not this bot
+        - ``to: me+@wavebro`` — this bot and other agents mentioned
+        - ``to: *``           — no explicit agent mention (broadcast or DM)
+
+        DMs are treated as ``to: me`` because the user is speaking to the bot
+        directly without needing an @mention.  All other broadcast messages
+        (no agent mention in a channel) are ``to: *``.
+
+        Usernames from ``msg.mentions`` are sanitized with ``_PREFIX_UNSAFE_RE``
+        before use in the trusted header — the same treatment as room and sender.
+        """
+        # DMs are always addressed to this bot, regardless of mentions metadata.
+        if msg.room.type == "dm":
+            return "to: me"
+
+        own = self._config.username
+        agent_names = set(self._config.agent_chain.agent_usernames)
+        mentioned = set(msg.mentions)
+
+        own_mentioned = own in mentioned
+        other_agents = [
+            self._PREFIX_UNSAFE_RE.sub("_", u)
+            for u in msg.mentions
+            if u != own and u in agent_names
+        ]
+
+        if not own_mentioned and not other_agents:
+            return "to: *"
+
+        parts = []
+        if own_mentioned:
+            parts.append("me")
+        parts.extend(f"@{u}" for u in other_agents)
+        return "to: " + "+".join(parts)
 
     def format_prompt_prefix(self, msg: IncomingMessage) -> str:
         """Return the trusted RC identity header for the agent prompt.
@@ -401,15 +447,19 @@ class RocketChatConnector(Connector):
         The ``ts`` field is the original RC message timestamp formatted in the
         connector's configured timezone (ISO 8601 with UTC offset) so agents
         can reason about local time without needing to know the offset.
+
+        The ``to:`` field summarises addressing among agents: ``me``, ``@other``,
+        ``me+@other``, or ``*`` (broadcast).  See ``_compute_to_field``.
         """
         safe_room = self._PREFIX_UNSAFE_RE.sub("_", msg.room.name)
         safe_user = self._PREFIX_UNSAFE_RE.sub("_", msg.sender.username)
         ts = ts_ms_to_iso_local(msg.timestamp, self.timezone)
         ts_part = f" | ts: {ts}" if ts else ""
+        to_part = f" | {self._compute_to_field(msg)}"
         return (
             f"[Rocket.Chat #{safe_room} | "
             f"from: {safe_user} | "
-            f"role: {msg.role.value}{ts_part}]"
+            f"role: {msg.role.value}{ts_part}{to_part}]"
         )
 
     # ── Status notifications ──────────────────────────────────────────────────

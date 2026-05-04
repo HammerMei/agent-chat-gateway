@@ -83,6 +83,7 @@ class ContextInjector:
         agent_name: str,
         connector_name: str,
         wc: WatcherConfig,
+        agent_username: str = "",
     ) -> None:
         """Inject context into the agent session if not already done."""
         if ws.context_injected:
@@ -178,6 +179,17 @@ class ContextInjector:
                 f"- **Watcher name:** `{wc.name}`\n"
                 f"- **Connector:** `{connector_name}`\n"
             )
+            if agent_username:
+                dynamic_header += (
+                    f"- **Your username:** `@{agent_username}`\n"
+                    f"\n"
+                    f"## Multi-Agent Addressing\n"
+                    f"Each message header includes a `to:` field. Use it to decide your response:\n"
+                    f"- `to: me` — message explicitly addressed to you → respond normally\n"
+                    f"- `to: @<agent>` — addressed to another agent → stay silent unless you have something essential to add\n"
+                    f"- `to: me+@<agent>` — addressed to you and others → respond normally\n"
+                    f"- `to: *` — no explicit agent mention → use judgment; respond only if you have something meaningful to contribute\n"
+                )
             combined_context.insert(0, dynamic_header)
 
             full_context = "\n\n".join(combined_context)
