@@ -371,6 +371,7 @@ def _make_rc_connector():
     from gateway.connectors.rocketchat.connector import RocketChatConnector
 
     connector = RocketChatConnector.__new__(RocketChatConnector)
+    connector._config = _make_config()
     return connector
 
 

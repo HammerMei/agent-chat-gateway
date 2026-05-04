@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.0] - 2026-05-03
+
+### Added
+- **Message timestamp in agent prompt header**: the trusted RC identity header
+  now includes a `ts` field with the original message timestamp formatted in
+  the connector's local timezone (ISO 8601 with UTC offset), e.g.
+  `[Rocket.Chat #general | from: alice | role: owner | ts: 2026-05-03T09:30:00-07:00]`.
+  Agents can now reason about message timing, detect stale messages after
+  reconnect, and enforce time-based rules (game timeouts, SLA reminders).
+  Closes #18.
+- **Per-connector `timezone` setting**: each connector now accepts an optional
+  `timezone` field (IANA name, e.g. `"America/Los_Angeles"`) that controls
+  both message timestamp formatting and the default timezone for scheduled
+  tasks created against that connector's watchers. Falls back to the ACG
+  server's local timezone when omitted.
+
+### Fixed
+- **Config env var false-positive**: passwords or tokens whose resolved value
+  contains a `$WORD` pattern (e.g. `myPass$HM`) were incorrectly flagged as
+  unresolved environment variables at startup. The scanner now checks the
+  original placeholder string rather than the expanded value, so only genuinely
+  unresolved variables raise an error. Closes #11.
+
+### Changed
+- **Scheduler timezone now per-connector** ⚠️ _migration required_: the
+  `scheduler.default_timezone` config field has been removed. Set `timezone`
+  on each connector instead — the scheduler automatically uses the watcher's
+  connector timezone as its fallback when `--tz` is not supplied to
+  `acg schedule create`. Users who had `scheduler.default_timezone` set should
+  move that value to the relevant connector's `timezone` field.
+
+---
+
 ## [0.2.8] - 2026-04-12
 
 ### Fixed

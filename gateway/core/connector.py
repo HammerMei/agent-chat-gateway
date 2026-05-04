@@ -436,6 +436,16 @@ class Connector(ABC):
         return "direct"
 
     @property
+    def timezone(self) -> str:
+        """IANA timezone name for this connector, or ``""`` to use server local.
+
+        Used to format per-message timestamps in the agent prompt prefix so
+        agents see local time rather than UTC.  Override in connectors that
+        expose a user-configurable ``timezone`` setting.
+        """
+        return ""
+
+    @property
     def text_chunk_limit(self) -> int | None:
         """Maximum characters per outbound message, or None for no limit.
 

@@ -302,7 +302,6 @@ class GatewayService:
         self._control = ControlServer(
             self._entries,
             job_store=self._job_store,
-            default_timezone=config.scheduler.default_timezone,
         )
 
     async def run(self, startup_fd: int = -1) -> None:

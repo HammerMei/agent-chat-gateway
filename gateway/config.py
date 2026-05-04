@@ -37,17 +37,11 @@ class AttachmentConfig:
 class SchedulerConfig:
     """Configuration for the built-in job scheduler.
 
-    default_timezone:
-        IANA timezone used when ``--tz`` is not specified on ``acg schedule create``.
-        Example: ``"Asia/Taipei"``, ``"America/New_York"``, ``"UTC"``.
-        When empty, the ACG server's local timezone is used (and a warning is logged).
-
     completed_job_ttl_days:
         How long to retain COMPLETED jobs in jobs.json before purging them.
         0 = remove immediately when completed.
         Default: 7 days.
     """
-    default_timezone: str = ""          # IANA timezone; empty = server local (with warning)
     completed_job_ttl_days: int = 7     # days to keep completed jobs (0 = delete immediately)
 
 
@@ -359,7 +353,6 @@ class GatewayConfig:
                 "config.yaml 'scheduler.completed_job_ttl_days' must be a non-negative integer."
             )
         scheduler_cfg = SchedulerConfig(
-            default_timezone=scheduler_raw.get("default_timezone", ""),
             completed_job_ttl_days=scheduler_ttl,
         )
 
@@ -409,7 +402,17 @@ def _expand_env_vars(obj, _path: str = ""):
     """
     if isinstance(obj, str):
         expanded = os.path.expandvars(obj)
-        if re.search(r"\$\{?\w+", expanded):
+        # Check for unresolved placeholders on the *original* string, not the
+        # expanded result.  Scanning the expanded value causes false positives
+        # when a resolved secret itself contains a $WORD pattern (e.g. a
+        # password like "myPass$HM").  A placeholder is truly unresolved only
+        # when it still appears verbatim in the expanded output.
+        unresolved = [
+            m.group()
+            for m in re.finditer(r"\$\{?\w+", obj)
+            if m.group() in expanded
+        ]
+        if unresolved:
             raise ValueError(
                 f"Unresolved environment variable in config key '{_path}': {expanded!r}. "
                 f"Set the environment variable or remove the placeholder from config.yaml."

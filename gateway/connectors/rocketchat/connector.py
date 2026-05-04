@@ -21,12 +21,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ...agents.response import AgentEvent, AgentResponse
+from ...core.adapter_utils import ts_ms_to_iso_local
 from ...core.connector import (
     Connector,
     IncomingMessage,
     MessageHandler,
     Room,
 )
+from ...core.tz_utils import local_iana_timezone as _server_local_timezone
 from .agent_chain import TurnStore
 from .config import RocketChatConfig
 from .normalize import FilterResult, filter_rc_message, normalize_rc_message
@@ -380,6 +382,11 @@ class RocketChatConnector(Connector):
     # bypass RBAC enforcement in CLAUDE.md.  Stripping them here closes the gap.
     _PREFIX_UNSAFE_RE = re.compile(r"[\|\[\]\r\n]")
 
+    @property
+    def timezone(self) -> str:
+        """IANA timezone from connector config, falling back to server local."""
+        return self._config.timezone or _server_local_timezone()
+
     def format_prompt_prefix(self, msg: IncomingMessage) -> str:
         """Return the trusted RC identity header for the agent prompt.
 
@@ -390,13 +397,19 @@ class RocketChatConnector(Connector):
         room.name and sender.username are sanitized to remove characters that
         could be used to inject fake delimiter fields (``|``, ``[``, ``]``,
         newlines).  role.value is an enum — not user-controlled.
+
+        The ``ts`` field is the original RC message timestamp formatted in the
+        connector's configured timezone (ISO 8601 with UTC offset) so agents
+        can reason about local time without needing to know the offset.
         """
         safe_room = self._PREFIX_UNSAFE_RE.sub("_", msg.room.name)
         safe_user = self._PREFIX_UNSAFE_RE.sub("_", msg.sender.username)
+        ts = ts_ms_to_iso_local(msg.timestamp, self.timezone)
+        ts_part = f" | ts: {ts}" if ts else ""
         return (
             f"[Rocket.Chat #{safe_room} | "
             f"from: {safe_user} | "
-            f"role: {msg.role.value}]"
+            f"role: {msg.role.value}{ts_part}]"
         )
 
     # ── Status notifications ──────────────────────────────────────────────────
