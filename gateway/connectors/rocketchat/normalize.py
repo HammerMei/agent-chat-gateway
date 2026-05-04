@@ -217,6 +217,16 @@ async def normalize_rc_message(
     attachments, warnings = await _download_attachments(doc, config, rest, cache_dir)
     thread_id: str | None = doc.get("tmid") or None
 
+    # Extract mentioned usernames from RC's mentions[] metadata.
+    # This is server-controlled (injected by RC before delivery), not user-input.
+    # Username sanitization happens in format_prompt_prefix before any use in
+    # the trusted header; here we store the raw value for flexibility.
+    mentions = [
+        m.get("username", "")
+        for m in doc.get("mentions", [])
+        if m.get("username")
+    ]
+
     msg = IncomingMessage(
         id=doc.get("_id", msg_ts),
         timestamp=msg_ts,
@@ -227,6 +237,7 @@ async def normalize_rc_message(
         attachments=attachments,
         warnings=warnings,
         thread_id=thread_id,
+        mentions=mentions,
         raw=doc,
     )
 

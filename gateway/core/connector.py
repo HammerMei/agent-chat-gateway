@@ -102,6 +102,11 @@ class IncomingMessage:
     # Human-readable warnings from the Connector (e.g. attachment download failures).
     # The core injects these into the agent prompt so the agent can inform the user.
     thread_id: str | None = None                   # Platform thread ID (RC tmid, etc.); None = top-level
+    mentions: list[str] = field(default_factory=list)
+    # Usernames explicitly @-mentioned in this message (sanitized, server-controlled).
+    # Connectors populate this from the platform's mention metadata (e.g. RC's
+    # ``mentions[]`` array).  Used by ``format_prompt_prefix`` to build the ``to:``
+    # routing field so agents know whether a message is addressed to them or others.
     extra_context: dict[str, Any] = field(default_factory=dict)
     # Connector-computed behavioral hints (e.g. RC's "permission_thread_id").
     # Distinct from raw: raw holds the unmodified platform payload for debugging;
@@ -434,6 +439,16 @@ class Connector(ABC):
         Used by SessionManager to select timeout and retry strategies.
         """
         return "direct"
+
+    @property
+    def agent_username(self) -> str:
+        """The bot's own username on this platform, or ``""`` if not applicable.
+
+        Used to inject the agent's own identity into the session context so it
+        can reason about messages addressed to it vs. other agents.  Override
+        in connectors that authenticate with a platform username (e.g. RC, Slack).
+        """
+        return ""
 
     @property
     def timezone(self) -> str:

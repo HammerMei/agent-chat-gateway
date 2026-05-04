@@ -450,7 +450,143 @@ class TestFormatPromptPrefixSanitization(unittest.TestCase):
         self.assertTrue(prefix.startswith("[Rocket.Chat #"))
         self.assertIn("from:", prefix)
         self.assertIn("role:", prefix)
+        self.assertIn("to:", prefix)
         self.assertTrue(prefix.endswith("]"))
+
+
+# ── Tests: format_prompt_prefix to: field (S6) ──────────────────────────────
+
+
+def _make_msg_with_mentions(
+    room_name: str,
+    username: str,
+    room_type: str = "channel",
+    mentions: list[str] | None = None,
+    role: str = "owner",
+):
+    """Build an IncomingMessage with explicit mentions and room type."""
+    from gateway.core.connector import IncomingMessage, Room, User, UserRole
+
+    role_map = {
+        "owner": UserRole.OWNER,
+        "guest": UserRole.GUEST,
+        "anonymous": UserRole.ANONYMOUS,
+    }
+    return IncomingMessage(
+        id="m1",
+        timestamp="100",
+        room=Room(id="r1", name=room_name, type=room_type),
+        sender=User(id="u1", username=username),
+        role=role_map[role],
+        text="hello",
+        mentions=mentions or [],
+    )
+
+
+def _make_rc_connector_with_agents(agent_usernames: list[str]):
+    """Build a RocketChatConnector with agent_chain configured."""
+    from gateway.connectors.rocketchat.connector import RocketChatConnector
+    from gateway.connectors.rocketchat.config import AgentChainConfig
+
+    connector = RocketChatConnector.__new__(RocketChatConnector)
+    cfg = _make_config()
+    cfg.agent_chain = AgentChainConfig(agent_usernames=agent_usernames)
+    connector._config = cfg
+    return connector
+
+
+class TestFormatPromptPrefixToField(unittest.TestCase):
+    """S6: to: field correctly reflects message addressing among agents."""
+
+    def test_channel_no_mentions_is_broadcast(self):
+        """Channel message with no agent mentions → to: *"""
+        connector = _make_rc_connector_with_agents(["wavebro"])
+        msg = _make_msg_with_mentions("general", "alice", room_type="channel", mentions=[])
+        prefix = connector.format_prompt_prefix(msg)
+        self.assertIn("to: *", prefix)
+
+    def test_channel_only_bot_mentioned(self):
+        """Channel message @-mentioning only the bot → to: me"""
+        connector = _make_rc_connector_with_agents(["wavebro"])
+        msg = _make_msg_with_mentions(
+            "general", "alice", room_type="channel", mentions=["bot"]
+        )
+        prefix = connector.format_prompt_prefix(msg)
+        self.assertIn("to: me", prefix)
+        self.assertNotIn("@", prefix.split("to: ")[1].split("]")[0])
+
+    def test_channel_other_agent_mentioned(self):
+        """Channel message @-mentioning another agent → to: @wavebro"""
+        connector = _make_rc_connector_with_agents(["wavebro"])
+        msg = _make_msg_with_mentions(
+            "general", "alice", room_type="channel", mentions=["wavebro"]
+        )
+        prefix = connector.format_prompt_prefix(msg)
+        self.assertIn("to: @wavebro", prefix)
+        self.assertNotIn("me", prefix.split("to: ")[1].split("]")[0])
+
+    def test_channel_bot_and_other_agent_mentioned(self):
+        """Channel message @-mentioning bot + another agent → to: me+@wavebro"""
+        connector = _make_rc_connector_with_agents(["wavebro"])
+        msg = _make_msg_with_mentions(
+            "general", "alice", room_type="channel", mentions=["bot", "wavebro"]
+        )
+        prefix = connector.format_prompt_prefix(msg)
+        self.assertIn("to: me+@wavebro", prefix)
+
+    def test_dm_always_to_me_even_without_mentions(self):
+        """DM messages are always addressed to the bot → to: me (no @mention needed)"""
+        connector = _make_rc_connector_with_agents(["wavebro"])
+        msg = _make_msg_with_mentions("alice", "alice", room_type="dm", mentions=[])
+        prefix = connector.format_prompt_prefix(msg)
+        self.assertIn("to: me", prefix)
+
+    def test_dm_always_to_me_ignores_mentions(self):
+        """DM: even if mentions[] lists another agent, DM means to: me"""
+        connector = _make_rc_connector_with_agents(["wavebro"])
+        msg = _make_msg_with_mentions(
+            "alice", "alice", room_type="dm", mentions=["wavebro"]
+        )
+        prefix = connector.format_prompt_prefix(msg)
+        self.assertIn("to: me", prefix)
+        self.assertNotIn("@wavebro", prefix)
+
+    def test_regular_user_mention_not_in_to_field(self):
+        """@alice mention (non-agent user) must not appear in to: — stays in body"""
+        connector = _make_rc_connector_with_agents(["wavebro"])
+        msg = _make_msg_with_mentions(
+            "general", "alice", room_type="channel", mentions=["alice", "bot"]
+        )
+        prefix = connector.format_prompt_prefix(msg)
+        # bot is mentioned → to: me; alice is a non-agent user, ignored
+        self.assertIn("to: me", prefix)
+        self.assertNotIn("@alice", prefix)
+
+    def test_no_agent_chain_configured(self):
+        """When agent_chain has no agents, any channel mention → to: me or to: *"""
+        connector = _make_rc_connector()  # no agent_usernames
+        msg_mentioned = _make_msg_with_mentions(
+            "general", "alice", room_type="channel", mentions=["bot"]
+        )
+        prefix = connector.format_prompt_prefix(msg_mentioned)
+        self.assertIn("to: me", prefix)
+
+        msg_not_mentioned = _make_msg_with_mentions(
+            "general", "alice", room_type="channel", mentions=[]
+        )
+        prefix2 = connector.format_prompt_prefix(msg_not_mentioned)
+        self.assertIn("to: *", prefix2)
+
+    def test_pipe_in_agent_username_sanitized_in_to_field(self):
+        """A crafted agent username with | must be sanitized in the to: field."""
+        connector = _make_rc_connector_with_agents(["bad|agent"])
+        msg = _make_msg_with_mentions(
+            "general", "alice", room_type="channel", mentions=["bad|agent"]
+        )
+        prefix = connector.format_prompt_prefix(msg)
+        # Sanitized to bad_agent, raw pipe must not appear in to: part
+        self.assertNotIn("|", prefix.split("to: ")[1].split("]")[0])
+        self.assertIn("bad_agent", prefix)
 
 
 # ── Tests: connect / disconnect lifecycle (T3) ───────────────────────────────
