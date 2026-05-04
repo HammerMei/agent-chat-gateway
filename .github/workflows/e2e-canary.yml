@@ -1,21 +1,24 @@
-name: E2E Tests (Pinned)
+name: E2E Canary (Latest Agents)
 
-# Pinned agent versions — reproducible, stable gate.
-# Update CLAUDE_CODE_VERSION / OPENCODE_VERSION when intentionally upgrading agents.
-env:
-  CLAUDE_CODE_VERSION: "2.1.126"
-  OPENCODE_VERSION: "1.14.33"
+# Runs daily with the latest claude-code and opencode to detect upstream
+# breaking changes before they affect production deployments.
+#
+# Failures here do NOT block merges — they indicate an upstream agent
+# change that may require ACG code or context updates.
+# Check the run log to identify which agent changed and what broke.
 
 on:
-  # Run manually from GitHub Actions UI only
-  # (E2E tests are slow and consume API credits — trigger deliberately)
-  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * *'   # daily at 06:00 UTC
+  workflow_dispatch:       # also triggerable manually
 
 jobs:
-  e2e:
-    name: E2E — RC + ACG + Claude/OpenCode (pinned)
+  e2e-canary:
+    name: E2E Canary — RC + ACG + Claude/OpenCode (latest)
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # Never block PRs or releases — canary failures are informational
+    continue-on-error: true
 
     steps:
       - uses: actions/checkout@v4
@@ -39,12 +42,9 @@ jobs:
       - name: Create RC accounts (waits for RC health)
         run: uv run python tests/e2e/setup.py --rc-url http://localhost:3100
 
-      - name: Build ACG image from source (pinned agent versions)
+      - name: Build ACG image from source (latest agent versions)
         run: |
-          docker compose -f tests/e2e/docker-compose.yml build \
-            --build-arg CLAUDE_CODE_VERSION=${{ env.CLAUDE_CODE_VERSION }} \
-            --build-arg OPENCODE_VERSION=${{ env.OPENCODE_VERSION }} \
-            acg
+          docker compose -f tests/e2e/docker-compose.yml build acg
 
       - name: Start ACG (phase 2)
         env:
@@ -52,6 +52,13 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           docker compose -f tests/e2e/docker-compose.yml up -d acg
+
+      - name: Print agent versions (for debugging canary failures)
+        run: |
+          echo "=== claude-code version ==="
+          docker exec acg-e2e claude --version 2>/dev/null || echo "unavailable"
+          echo "=== opencode version ==="
+          docker exec acg-e2e opencode --version 2>/dev/null || echo "unavailable"
 
       - name: Run E2E tests
         env:
