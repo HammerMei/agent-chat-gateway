@@ -26,6 +26,14 @@ connectors:
     reply_in_thread: false           # true = start a new thread for every top-level reply
     permission_reply_in_thread: true # false = post permission notifications at room level
 
+    # ── Timezone ─────────────────────────────────────────────────────────────
+    # IANA timezone for this connector.  Used to format message timestamps in
+    # the agent prompt header and as the default timezone for scheduled tasks
+    # created against this connector's watchers.
+    # Falls back to the ACG server's local timezone when omitted.
+    # Examples: "America/Los_Angeles", "Asia/Taipei", "Europe/London", "UTC"
+    # timezone: "America/Los_Angeles"
+
     # ── Message filtering ─────────────────────────────────────────────────────
     # require_mention: true (default) — in channels/groups, bot only responds when
     #   explicitly @mentioned.  Set to false to listen to all messages without mention.
@@ -253,9 +261,10 @@ watchers:
 # The daemon must be running for schedule commands to work (they use the control socket).
 
 # scheduler:
-#   default_timezone: "Asia/Taipei"   # IANA timezone used when --tz is not specified.
-#                                     # Falls back to ACG server's local timezone if omitted.
-#                                     # Examples: "UTC", "America/New_York", "Europe/London"
 #   completed_job_ttl_days: 7         # How long completed jobs are kept in data/jobs.json before purge.
 #                                     # 0 = delete immediately when a job completes.
 #                                     # Use "acg schedule list --all" to see completed jobs.
+#
+# Note: timezone is now configured per-connector (see "timezone:" under each connector above).
+# When --tz is not supplied to "schedule create", the watcher's connector timezone is used,
+# falling back to the ACG server's local timezone.

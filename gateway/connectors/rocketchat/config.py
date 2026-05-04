@@ -51,6 +51,9 @@ class RocketChatConfig:
     # agent_chain.agent_usernames.
     agent_chain: AgentChainConfig = field(default_factory=AgentChainConfig)
     # Configuration for controlled agent-to-agent communication with loop protection.
+    timezone: str = ""
+    # IANA timezone for formatting message timestamps in the agent prompt prefix
+    # (e.g. "America/Los_Angeles", "Asia/Taipei").  Empty = server local timezone.
 
     @property
     def allow_senders(self) -> list[str]:
@@ -115,4 +118,5 @@ class RocketChatConfig:
             require_mention=raw.get("require_mention", True),
             filter_sender=raw.get("filter_sender", True),
             agent_chain=agent_chain_cfg,
+            timezone=raw.get("timezone", ""),
         )

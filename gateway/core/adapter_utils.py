@@ -43,6 +43,34 @@ def ts_to_float(ts: str | None) -> float | None:
         return None
 
 
+def ts_ms_to_iso_local(ts_ms_str: str | None, tz_name: str) -> str | None:
+    """Convert a Unix-epoch-millisecond timestamp string to ISO 8601 with local offset.
+
+    Args:
+        ts_ms_str: Timestamp string in Unix epoch milliseconds (e.g. ``"1711234567890"``).
+                   Returns ``None`` when the string is absent or unparseable.
+        tz_name:   IANA timezone name (e.g. ``"America/Los_Angeles"``).
+                   The result carries the UTC offset for that zone so agents can
+                   read the local time directly without knowing the offset themselves.
+
+    Returns:
+        ISO 8601 string with offset, e.g. ``"2026-04-24T10:30:00-07:00"``,
+        or ``None`` when ``ts_ms_str`` cannot be parsed.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    f = ts_to_float(ts_ms_str)
+    if f is None:
+        return None
+    try:
+        tz = ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, KeyError):
+        return None
+    dt = datetime.fromtimestamp(f / 1000.0, tz=tz)
+    return dt.isoformat(timespec="seconds")
+
+
 def ts_gt(a: str, b: str) -> bool:
     """Return True if timestamp string ``a`` is strictly greater than ``b``.
 

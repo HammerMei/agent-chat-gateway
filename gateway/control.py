@@ -46,11 +46,9 @@ class ControlServer:
         self,
         entries: "list[ConnectorEntry]",
         job_store: "JobStore | None" = None,
-        default_timezone: str = "",
     ) -> None:
         self._entries = entries
         self._job_store = job_store
-        self._default_timezone = default_timezone
         self._server: asyncio.Server | None = None
 
     async def start(self) -> None:
@@ -309,11 +307,22 @@ class ControlServer:
         watcher = (request.get("watcher") or "").strip()
         message = request.get("message", "")
         cron = request.get("cron", "")
-        timezone = request.get("timezone") or self._default_timezone or _server_local_timezone()
         times = request.get("times", 0)
 
         if not watcher:
             return {"ok": False, "error": "Missing 'watcher' field"}
+
+        # Resolve the connector early — we need its timezone as the default
+        # fallback when --tz is not supplied by the caller.
+        entry = self._find_entry_for_watcher(watcher)
+        if isinstance(entry, dict):
+            available = self._list_all_watcher_names()
+            hint = f" Available watchers: {available}" if available else ""
+            return {"ok": False, "error": f"Watcher {watcher!r} not found in any connector.{hint}"}
+
+        connector_tz = entry.connector.timezone  # "" → _server_local_timezone() inside connector
+        timezone = request.get("timezone") or connector_tz or _server_local_timezone()
+
         if not isinstance(message, str):
             return {"ok": False, "error": "'message' must be a string"}
         if not message:
@@ -387,20 +396,9 @@ class ControlServer:
             except Exception as e:
                 return {"ok": False, "error": f"Failed to compute next run time: {e}"}
 
-        # Resolve connector from watcher name — the watcher name is the sole
-        # identifier; connectors need not be specified by the caller.
-        connector = self._find_connector_for_watcher(watcher)
-        if not connector:
-            available = self._list_all_watcher_names()
-            hint = f" Available watchers: {available}" if available else ""
-            return {
-                "ok": False,
-                "error": f"Watcher {watcher!r} not found in any connector.{hint}",
-            }
-
         job = ScheduledJob(
             watcher=watcher,
-            connector=connector,
+            connector=entry.name,
             message=message,
             cron=cron,
             timezone=timezone,

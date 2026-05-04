@@ -537,9 +537,10 @@ def run_onboard(repo_path: Path | None = None) -> None:
             "You can ask the agent to schedule tasks, or use the CLI:\n"
             "  [bold]agent-chat-gateway schedule create WATCHER MSG --every 1d --at 09:00[/bold]\n"
             "  [bold]agent-chat-gateway schedule list[/bold]\n\n"
-            "To set a default timezone, add to your config.yaml:\n"
-            "  [dim]scheduler:\n"
-            "    default_timezone: \"Asia/Taipei\"[/dim]",
+            "To set a timezone for scheduled tasks, add to your connector in config.yaml:\n"
+            "  [dim]connectors:\n"
+            "    - name: rc-main\n"
+            "      timezone: \"Asia/Taipei\"[/dim]",
             border_style="green",
         )
     )

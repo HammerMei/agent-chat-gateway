@@ -156,6 +156,18 @@ class _ScheduleCLITestBase(unittest.TestCase):
 # Tests: schedule create
 # ---------------------------------------------------------------------------
 
+
+def _make_mock_watcher_entry(name: str = "rc-home", timezone: str = "UTC"):
+    """Return a mock ConnectorEntry whose connector exposes *timezone* and whose
+    session manager recognises 'test-watcher'.  Used by unit-level ControlServer
+    tests that don't need a real connector."""
+    from unittest.mock import MagicMock
+    entry = MagicMock()
+    entry.name = name
+    entry.connector.timezone = timezone
+    return entry
+
+
 class TestScheduleCreate(_ScheduleCLITestBase):
     """schedule create: argument parsing, cron computation, daemon round-trip."""
 
@@ -969,7 +981,8 @@ class TestScheduleCreate(_ScheduleCLITestBase):
         from gateway.control import ControlServer
 
         mock_job_store = MagicMock()
-        server = ControlServer(entries=[], job_store=mock_job_store, default_timezone="UTC")
+        server = ControlServer(entries=[], job_store=mock_job_store)
+        server._find_entry_for_watcher = MagicMock(return_value=_make_mock_watcher_entry())
 
         bad_values = [
             "not-a-date",
@@ -996,7 +1009,8 @@ class TestScheduleCreate(_ScheduleCLITestBase):
 
         from gateway.control import ControlServer
 
-        server = ControlServer(entries=[], job_store=MagicMock(), default_timezone="UTC")
+        server = ControlServer(entries=[], job_store=MagicMock())
+        server._find_entry_for_watcher = MagicMock(return_value=_make_mock_watcher_entry())
         request = {
             "cmd": "schedule-create",
             "watcher": "test-watcher",
@@ -1017,9 +1031,8 @@ class TestScheduleCreate(_ScheduleCLITestBase):
 
         mock_store = MagicMock()
         mock_store.add = MagicMock(return_value=MagicMock(id="acg-test001"))
-        server = ControlServer(entries=[], job_store=mock_store, default_timezone="UTC")
-        # Patch _find_connector_for_watcher to avoid needing real connector entries
-        server._find_connector_for_watcher = MagicMock(return_value="rc-home")
+        server = ControlServer(entries=[], job_store=mock_store)
+        server._find_entry_for_watcher = MagicMock(return_value=_make_mock_watcher_entry())
 
         request = {
             "cmd": "schedule-create",
@@ -1039,9 +1052,9 @@ class TestScheduleCreate(_ScheduleCLITestBase):
         from gateway.control import ControlServer
 
         mock_store = MagicMock()
-        server = ControlServer(entries=[], job_store=mock_store, default_timezone="UTC")
+        server = ControlServer(entries=[], job_store=mock_store)
         # Simulate watcher not found in any connector
-        server._find_connector_for_watcher = MagicMock(return_value="")
+        server._find_entry_for_watcher = MagicMock(return_value={"ok": False, "error": "Unknown watcher: 'bad-watcher'"})
         server._list_all_watcher_names = MagicMock(return_value="'real-watcher'")
 
         request = {
@@ -1064,8 +1077,8 @@ class TestScheduleCreate(_ScheduleCLITestBase):
         from gateway.control import ControlServer
 
         mock_store = MagicMock()
-        server = ControlServer(entries=[], job_store=mock_store, default_timezone="UTC")
-        server._find_connector_for_watcher = MagicMock(return_value="rc-home")
+        server = ControlServer(entries=[], job_store=mock_store)
+        server._find_entry_for_watcher = MagicMock(return_value=_make_mock_watcher_entry())
 
         for bad_times in (True, False):
             with self.subTest(times=bad_times):
@@ -1087,8 +1100,8 @@ class TestScheduleCreate(_ScheduleCLITestBase):
         from gateway.control import ControlServer
 
         mock_store = MagicMock()
-        server = ControlServer(entries=[], job_store=mock_store, default_timezone="UTC")
-        server._find_connector_for_watcher = MagicMock(return_value="rc-home")
+        server = ControlServer(entries=[], job_store=mock_store)
+        server._find_entry_for_watcher = MagicMock(return_value=_make_mock_watcher_entry())
 
         request = {
             "cmd": "schedule-create",
@@ -1113,8 +1126,8 @@ class TestScheduleCreate(_ScheduleCLITestBase):
         from gateway.control import ControlServer
 
         mock_store = MagicMock()
-        server = ControlServer(entries=[], job_store=mock_store, default_timezone="UTC")
-        server._find_connector_for_watcher = MagicMock(return_value="rc-home")
+        server = ControlServer(entries=[], job_store=mock_store)
+        server._find_entry_for_watcher = MagicMock(return_value=_make_mock_watcher_entry())
 
         for bad_tz in ("Mars/Olympus", "NotATimezone", "Bogus/Zone", "GMT+8"):
             with self.subTest(timezone=bad_tz):
@@ -1362,7 +1375,7 @@ class TestScheduleResume(_ScheduleCLITestBase):
         active_job.next_run = "2099-04-10T09:00:00+00:00"
         mock_store.get = MagicMock(return_value=active_job)
 
-        server = ControlServer(entries=[], job_store=mock_store, default_timezone="UTC")
+        server = ControlServer(entries=[], job_store=mock_store)
         result = server._handle_schedule_resume({"cmd": "schedule-resume", "job_id": "acg-active01"})
 
         self.assertTrue(result.get("ok"), f"Expected ok=True for idempotent resume, got: {result}")
@@ -1382,7 +1395,7 @@ class TestScheduleResume(_ScheduleCLITestBase):
         completed_job.status = JobStatus.COMPLETED
         mock_store.get = MagicMock(return_value=completed_job)
 
-        server = ControlServer(entries=[], job_store=mock_store, default_timezone="UTC")
+        server = ControlServer(entries=[], job_store=mock_store)
         result = server._handle_schedule_resume({"cmd": "schedule-resume", "job_id": "acg-done01"})
 
         self.assertFalse(result.get("ok"), f"Expected ok=False for completed job, got: {result}")

@@ -154,7 +154,7 @@ def main():
         default=None,
         metavar="TIMEZONE",
         help="IANA timezone (e.g. 'Asia/Taipei', 'America/New_York', 'UTC'). "
-             "Fallback: scheduler.default_timezone in config, then server local.",
+             "Fallback: the watcher's connector timezone setting, then server local.",
     )
 
     # schedule list
