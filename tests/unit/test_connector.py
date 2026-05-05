@@ -485,8 +485,8 @@ def _make_msg_with_mentions(
 
 def _make_rc_connector_with_agents(agent_usernames: list[str]):
     """Build a RocketChatConnector with agent_chain configured."""
-    from gateway.connectors.rocketchat.connector import RocketChatConnector
     from gateway.connectors.rocketchat.config import AgentChainConfig
+    from gateway.connectors.rocketchat.connector import RocketChatConnector
 
     connector = RocketChatConnector.__new__(RocketChatConnector)
     cfg = _make_config()
