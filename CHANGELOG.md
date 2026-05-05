@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.1] - 2026-05-04
+
+### Added
+- **Multi-agent `to:` field in RC prompt prefix**: each message header now
+  includes a compact `to:` routing field so agents know whether they are being
+  addressed directly or as bystanders:
+  - `to: me` — explicitly @-mentioned or DM → respond normally
+  - `to: @wavebro` — another agent @-mentioned, not this bot → stay silent unless essential
+  - `to: me+@wavebro` — both this bot and another agent → respond normally
+  - `to: *` — no explicit agent @-mention (broadcast) → use judgment
+  Only usernames listed in `agent_chain.agent_usernames` appear in `to:`; regular
+  user @-mentions remain in the message body unchanged. Closes #17.
+- **Agent identity in session context**: the gateway context header injected at
+  session start now includes the bot's own `@username` and multi-agent behavior
+  guidelines when `agent_chain` is configured, so agents can reason about their
+  own identity from the first message.
+- **`mentions` field on `IncomingMessage`**: the normalized message dataclass
+  now carries the list of @-mentioned usernames from the platform's metadata
+  (e.g. RC's `mentions[]` array), available for connector-level routing logic.
+
+---
+
 ## [0.3.0] - 2026-05-03
 
 ### Added
