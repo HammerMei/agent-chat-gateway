@@ -239,14 +239,13 @@ def stop_daemon() -> None:
         os.kill(pid, signal.SIGTERM)
         # Wait for the gateway to complete its graceful shutdown before resorting
         # to SIGKILL.  The shutdown sequence includes:
-        #   - stopping session managers (processor drain: up to 30s per watcher)
+        #   - stopping session managers (processor drain: up to 30s, now parallel)
         #   - stopping agent backends (opencode: SIGTERM wait 5s + SIGKILL wait 5s)
-        # Together these can take up to ~12s in a simple idle case and longer
-        # when messages are in-flight.  The original 6s window (30 × 0.2s) was
-        # far too short and caused SIGKILL to fire before the gateway could kill
-        # its opencode child process, leaving it as an orphan — which is why
-        # "acg restart" produced two running opencode processes.
-        for _ in range(150):  # 150 × 0.2s = 30s grace period
+        # With parallel processor drain the worst case is ~50s (30s drain + 20s
+        # backend stop).  90s gives a comfortable margin.
+        # History: the original 6s window caused opencode serve to be left as an
+        # orphan on restart; extended to 30s then 90s as drain time grew.
+        for _ in range(450):  # 450 × 0.2s = 90s grace period
             try:
                 os.kill(pid, 0)
                 time.sleep(0.2)
