@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.2] - 2026-05-04
+
+### Fixed
+- **`opencode serve` orphan process on `acg stop`**: sequential processor drain
+  could take up to 30 s × N watchers before backends were even signalled, causing
+  the daemon's SIGKILL grace window to expire before `opencode serve` had a chance
+  to exit cleanly. Two changes combined to fix this:
+  - `stop_all()` now drains all processors **concurrently** via `asyncio.gather`
+    instead of a sequential `for` loop (worst-case drain drops from 30 s × N to
+    ~30 s regardless of watcher count).
+  - `stop_daemon()` grace window extended from **30 s → 90 s** to absorb the
+    worst-case 30 s drain + 20 s backend stop (SIGTERM→SIGKILL ladder).
+- **`acg reset` CLI timeout**: reset command now waits up to **300 s** (previously
+  60 s) for the socket response, preventing spurious `asyncio.TimeoutError` while
+  OpenCode reinitialises its serve process and the context injector replays the
+  full session history.
+
+---
+
 ## [0.3.1] - 2026-05-04
 
 ### Added

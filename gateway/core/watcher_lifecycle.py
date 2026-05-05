@@ -316,12 +316,26 @@ class WatcherLifecycle:
     # ── Shutdown ──────────────────────────────────────────────────────────────
 
     async def stop_all(self) -> None:
-        """Stop all processors (called during shutdown)."""
-        for name in list(self._processors):
-            try:
-                await self._stop_processor(name, save=False)
-            except Exception as e:
-                logger.error("Error stopping watcher '%s' during shutdown: %s", name, e)
+        """Stop all processors concurrently (called during shutdown).
+
+        Running stops in parallel is safe because:
+          - Each processor's drain (the slow part, up to 30 s) is independent.
+          - Shared connector state (room refcount, DDP unsubscribe) is updated
+            before the first ``await`` inside each call, so asyncio cooperative
+            scheduling guarantees no interleaving during those dict mutations.
+
+        Without parallelism a two-watcher setup could take 60 s to drain before
+        the backends are even stopped — exceeding the ``stop_daemon()`` grace
+        window and leaving ``opencode serve`` as an orphan process.
+        """
+        names = list(self._processors)
+        results = await asyncio.gather(
+            *[self._stop_processor(name, save=False) for name in names],
+            return_exceptions=True,
+        )
+        for name, result in zip(names, results):
+            if isinstance(result, Exception):
+                logger.error("Error stopping watcher '%s' during shutdown: %s", name, result)
 
     def save_state(self) -> None:
         """Persist current state (called before shutdown)."""
