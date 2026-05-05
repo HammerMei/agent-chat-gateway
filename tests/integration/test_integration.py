@@ -165,6 +165,23 @@ def _watcher_info(manager: SessionManager, name: str) -> dict | None:
     return None
 
 
+async def _wait_until_active(
+    manager: SessionManager, name: str, timeout: float = 5.0
+) -> None:
+    """Poll until the named watcher is active (processor running).
+
+    Used after reset_watcher() when the restart is deferred to a background
+    task — the caller must await this before sending messages to the watcher.
+    """
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        info = _watcher_info(manager, name)
+        if info and info.get("active"):
+            return
+        await asyncio.sleep(0.01)
+    raise TimeoutError(f"Watcher {name!r} did not become active within {timeout}s")
+
+
 async def run_and_reply(
     connector: ScriptConnector,
     text: str,
@@ -485,6 +502,8 @@ class TestWatcherLifecycle(IsolatedTestCase):
         first_session_id = agent.created_sessions[0]["session_id"]
 
         await manager.reset_watcher("script")
+        # reset fires the restart as a background task — wait for it.
+        await _wait_until_active(manager, "script")
         self.assertEqual(len(agent.created_sessions), 2)
         second_session_id = agent.created_sessions[1]["session_id"]
         self.assertNotEqual(first_session_id, second_session_id)
@@ -508,6 +527,8 @@ class TestWatcherLifecycle(IsolatedTestCase):
         self.assertEqual(agent.created_sessions, [])  # sticky: no create_session call
 
         await manager.reset_watcher("script")
+        # reset fires the restart as a background task — wait for it.
+        await _wait_until_active(manager, "script")
         self.assertEqual(agent.created_sessions, [])  # still no new session after reset
 
         await connector.inject("hi")
