@@ -228,7 +228,15 @@ class WatcherLifecycle:
             logger.info("Watcher '%s' resumed", name)
 
     async def reset_watcher(self, name: str) -> None:
-        """Reset a watcher: clear session and restart with fresh state."""
+        """Reset a watcher: clear session and restart with fresh state.
+
+        The stop + clear phase runs under the watcher lock and completes
+        before this coroutine returns, so the caller (and the CLI) gets a
+        fast acknowledgement.  The restart (subscribe + context injection,
+        which requires an agent round-trip) is fired as a background task
+        to avoid timing out the CLI socket while waiting for a slow agent
+        (e.g. OpenCode startup + context injection can take > 60 s).
+        """
         wc = self._find_watcher_config(name)
         self._ensure_agent_available(wc)
         async with self._get_watcher_lock(name):
@@ -263,13 +271,26 @@ class WatcherLifecycle:
                 state.context_injected = False
                 state.paused = False
 
-            try:
-                await self._start_watcher(wc, state)
-            except Exception as e:
-                logger.error("Failed to restart watcher '%s' after reset: %s", name, e)
-                raise
+            # Persist cleared state now so the CLI can safely return before
+            # the background restart finishes.
             self._state_store.save(self._states)
-            logger.info("Watcher '%s' reset", name)
+            logger.info("Watcher '%s' cleared — restart deferred to background", name)
+
+        # Fire the restart as a background task — this decouples the slow
+        # context-injection agent round-trip from the CLI socket timeout.
+        asyncio.create_task(self._restart_watcher_background(name))
+
+    async def _restart_watcher_background(self, name: str) -> None:
+        """Background restart after reset — runs outside the CLI request cycle."""
+        try:
+            wc = self._find_watcher_config(name)
+            state = self._states.get(name)
+            async with self._get_watcher_lock(name):
+                await self._start_watcher(wc, state)
+                self._state_store.save(self._states)
+            logger.info("Watcher '%s' reset complete", name)
+        except Exception as e:
+            logger.error("Failed to restart watcher '%s' after reset: %s", name, e)
 
     def list_watchers(self) -> list[dict]:
         """Return info for all configured watchers, including runtime status."""
