@@ -286,7 +286,11 @@ def main():
 
     elif args.command == "reset":
         cmd_data = {"cmd": "reset", "watcher_name": args.watcher_name}
-        result = _send_command(cmd_data)
+        # Reset involves stopping + restarting the agent process and injecting
+        # context (an agent round-trip). This can take several minutes for slow
+        # agents (e.g. OpenCode startup + context injection). Use a 5-minute
+        # timeout so the CLI does not bail out before the restart completes.
+        result = _send_command(cmd_data, timeout=300)
         if result["ok"]:
             print(f"Watcher '{args.watcher_name}' reset")
         else:
@@ -1033,8 +1037,14 @@ def _parse_hhmm(time_str: str) -> tuple[int, int]:
     return h, m
 
 
-def _send_command(request: dict) -> dict:
-    """Send a command to the running daemon via Unix domain socket."""
+def _send_command(request: dict, timeout: float = 60.0) -> dict:
+    """Send a command to the running daemon via Unix domain socket.
+
+    Args:
+        request: Command payload to send.
+        timeout: Seconds to wait for a response (default 60 s).
+                 Use a larger value for slow commands (e.g. reset: 300 s).
+    """
     from .daemon import is_running
 
     running, pid = is_running()
@@ -1046,17 +1056,17 @@ def _send_command(request: dict) -> dict:
         print("Error: Control socket not found. The daemon may still be starting.", file=sys.stderr)
         sys.exit(1)
 
-    return asyncio.run(_send_command_async(request))
+    return asyncio.run(_send_command_async(request, timeout=timeout))
 
 
-async def _send_command_async(request: dict) -> dict:
+async def _send_command_async(request: dict, timeout: float = 60.0) -> dict:
     """Async helper to send command over Unix socket."""
     reader, writer = await asyncio.open_unix_connection(str(CONTROL_SOCK))
     try:
         writer.write(json.dumps(request).encode() + b"\n")
         await writer.drain()
 
-        data = await asyncio.wait_for(reader.readline(), timeout=60.0)
+        data = await asyncio.wait_for(reader.readline(), timeout=timeout)
         return json.loads(data.decode())
     finally:
         writer.close()
