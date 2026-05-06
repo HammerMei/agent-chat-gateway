@@ -18,6 +18,8 @@ config.yaml
 example-agents/**/node_modules/
 .claude
 .opencode
+.openclaude
+.openclaude-profile.json
 docker_env/
 *.tar.gz
 .tamago

@@ -432,14 +432,33 @@ class TestAgentTurnRunner(unittest.IsolatedAsyncioTestCase):
         connector.send_text.assert_called_once()
         self.assertEqual(connector.send_text.call_args[0][1].text, "Here is my analysis.")
 
-    async def test_termination_token_in_non_agent_chain_still_delivered(self):
-        """Termination token in a non-agent-chain turn is delivered normally."""
+    async def test_termination_token_in_non_agent_chain_stripped_not_delivered(self):
+        """Termination token alone in a non-chain turn is stripped; nothing delivered."""
         from gateway.core.agent_chain import AGENT_CHAIN_TERMINATION_TOKEN
 
         agent = _MockAgent(AgentResponse(text=AGENT_CHAIN_TERMINATION_TOKEN))
         runner, connector = _make_runner(agent)
 
-        # is_agent_chain=False (default) — no special handling
+        # is_agent_chain=False (default) — token is stripped, no content to deliver
+        terminated = await runner.run_turn(
+            session_id="ses_001",
+            prompt="hello",
+            working_directory="/tmp",
+            room_id="room_1",
+            thread_id=None,
+        )
+
+        self.assertFalse(terminated)
+        connector.send_text.assert_not_called()
+
+    async def test_termination_token_with_preamble_in_non_agent_chain_strips_token(self):
+        """Token with preamble in a non-chain turn: preamble delivered, token stripped."""
+        from gateway.core.agent_chain import AGENT_CHAIN_TERMINATION_TOKEN
+
+        preamble = "Here is my answer."
+        agent = _MockAgent(AgentResponse(text=f"{preamble}\n\n{AGENT_CHAIN_TERMINATION_TOKEN}"))
+        runner, connector = _make_runner(agent)
+
         terminated = await runner.run_turn(
             session_id="ses_001",
             prompt="hello",
@@ -450,6 +469,81 @@ class TestAgentTurnRunner(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(terminated)
         connector.send_text.assert_called_once()
+        delivered_text = connector.send_text.call_args[0][1].text
+        self.assertEqual(delivered_text, preamble)
+        self.assertNotIn(AGENT_CHAIN_TERMINATION_TOKEN, delivered_text)
+
+    async def test_termination_token_at_start_post_text_delivered(self):
+        """Token at start of response: text after token is delivered, token stripped."""
+        from gateway.core.agent_chain import AGENT_CHAIN_TERMINATION_TOKEN
+
+        epilogue = "Bye now"
+        agent = _MockAgent(AgentResponse(text=f"{AGENT_CHAIN_TERMINATION_TOKEN}\n{epilogue}"))
+        runner, connector = _make_runner(agent)
+
+        terminated = await runner.run_turn(
+            session_id="ses_001",
+            prompt="hello",
+            working_directory="/tmp",
+            room_id="room_1",
+            thread_id=None,
+            is_agent_chain=True,
+            agent_chain_context="\n---\n[Agent chain: turn 1/5]",
+        )
+
+        self.assertTrue(terminated)
+        connector.send_text.assert_called_once()
+        delivered_text = connector.send_text.call_args[0][1].text
+        self.assertEqual(delivered_text, epilogue)
+        self.assertNotIn(AGENT_CHAIN_TERMINATION_TOKEN, delivered_text)
+
+    async def test_termination_token_at_start_non_chain_post_text_delivered(self):
+        """Token at start in non-chain turn: post-token text is delivered, token stripped."""
+        from gateway.core.agent_chain import AGENT_CHAIN_TERMINATION_TOKEN
+
+        epilogue = "Bye now"
+        agent = _MockAgent(AgentResponse(text=f"{AGENT_CHAIN_TERMINATION_TOKEN}\n{epilogue}"))
+        runner, connector = _make_runner(agent)
+
+        terminated = await runner.run_turn(
+            session_id="ses_001",
+            prompt="hello",
+            working_directory="/tmp",
+            room_id="room_1",
+            thread_id=None,
+        )
+
+        self.assertFalse(terminated)
+        connector.send_text.assert_called_once()
+        delivered_text = connector.send_text.call_args[0][1].text
+        self.assertEqual(delivered_text, epilogue)
+        self.assertNotIn(AGENT_CHAIN_TERMINATION_TOKEN, delivered_text)
+
+    async def test_termination_token_in_middle_both_sides_delivered(self):
+        """Token in the middle: both pre- and post-token text are delivered."""
+        from gateway.core.agent_chain import AGENT_CHAIN_TERMINATION_TOKEN
+
+        pre = "Hello"
+        post = "Goodbye"
+        agent = _MockAgent(AgentResponse(text=f"{pre}\n{AGENT_CHAIN_TERMINATION_TOKEN}\n{post}"))
+        runner, connector = _make_runner(agent)
+
+        terminated = await runner.run_turn(
+            session_id="ses_001",
+            prompt="hello",
+            working_directory="/tmp",
+            room_id="room_1",
+            thread_id=None,
+            is_agent_chain=True,
+            agent_chain_context="\n---\n[Agent chain: turn 1/5]",
+        )
+
+        self.assertTrue(terminated)
+        connector.send_text.assert_called_once()
+        delivered_text = connector.send_text.call_args[0][1].text
+        self.assertIn(pre, delivered_text)
+        self.assertIn(post, delivered_text)
+        self.assertNotIn(AGENT_CHAIN_TERMINATION_TOKEN, delivered_text)
 
     async def test_agent_chain_context_appended_to_prompt(self):
         """Agent chain context suffix is appended to the prompt before invoking agent."""
