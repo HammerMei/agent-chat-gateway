@@ -220,9 +220,9 @@ class ControlServer:
         if cmd and cmd.startswith("schedule-"):
             return self._handle_schedule(cmd, request)
 
-        # reset: auto-resolve connector from watcher name (watcher names are
+        # pause/resume/reset: auto-resolve connector from watcher name (watcher names are
         # globally unique across all connectors, so no --connector is needed).
-        if cmd == "reset" and not connector_name:
+        if cmd in ("pause", "resume", "reset") and not connector_name:
             watcher_name = request.get("watcher_name", "")
             entry = self._find_entry_for_watcher(watcher_name)
             if isinstance(entry, dict):

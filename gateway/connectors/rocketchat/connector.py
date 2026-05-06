@@ -400,7 +400,7 @@ class RocketChatConnector(Connector):
         - ``to: me``          — only this bot is @mentioned
         - ``to: @wavebro``    — one or more other agents mentioned, not this bot
         - ``to: me+@wavebro`` — this bot and other agents mentioned
-        - ``to: *``           — no explicit agent mention (broadcast or DM)
+        - ``to: *``           — no explicit agent mention in a channel (broadcast)
 
         DMs are treated as ``to: me`` because the user is speaking to the bot
         directly without needing an @mention.  All other broadcast messages

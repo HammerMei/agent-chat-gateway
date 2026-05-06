@@ -336,17 +336,6 @@ class TestCLIPauseResumeReset(_CLITestBase):
         self._run(["pause", "my-watcher"])
         self.assertEqual(received[0]["watcher_name"], "my-watcher")
 
-    def test_pause_with_connector_filter(self):
-        """--connector flag forwarded in pause payload."""
-        received: list[dict] = []
-
-        def _capture(req):
-            received.append(req)
-            return {"ok": True}
-
-        self._start_daemon({"pause": _capture})
-        self._run(["pause", "my-watcher", "--connector", "rc-prod"])
-        self.assertEqual(received[0].get("connector"), "rc-prod")
 
 
 # ---------------------------------------------------------------------------

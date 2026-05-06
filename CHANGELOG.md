@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.3] - 2026-05-06
+
+### Fixed
+- **`pause` / `resume` CLI no longer require `--connector`**: watcher names are
+  globally unique across all connectors, so the server now auto-resolves the
+  target connector from the watcher name (same behaviour as `reset`). The
+  `--connector` option has been removed from both commands.
+- **`<end-of-agent-chain>` token always stripped from agent responses**: previously
+  the token was only intercepted during agent-chain turns; a user-to-agent turn
+  could still leak the raw token into the chat room. The token is now stripped
+  unconditionally. Content on **either side** of the token is preserved and
+  delivered — fixing a silent data-loss bug where text placed *after* the token
+  (e.g. `<end-of-agent-chain>\nBye now`) was discarded entirely.
+
+---
+
 ## [0.3.2] - 2026-05-04
 
 ### Fixed

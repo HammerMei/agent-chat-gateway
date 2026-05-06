@@ -58,22 +58,10 @@ def main():
     # pause
     pause_p = sub.add_parser("pause", help="Pause a watcher (stops processing messages)")
     pause_p.add_argument("watcher_name", help="Watcher name as defined in config.yaml")
-    pause_p.add_argument(
-        "--connector",
-        default=None,
-        metavar="NAME",
-        help="Connector the watcher belongs to (default: first configured connector)",
-    )
 
     # resume
     resume_p = sub.add_parser("resume", help="Resume a paused watcher")
     resume_p.add_argument("watcher_name", help="Watcher name as defined in config.yaml")
-    resume_p.add_argument(
-        "--connector",
-        default=None,
-        metavar="NAME",
-        help="Connector the watcher belongs to (default: first configured connector)",
-    )
 
     # reset
     reset_p = sub.add_parser(
@@ -264,8 +252,6 @@ def main():
 
     elif args.command == "pause":
         cmd_data = {"cmd": "pause", "watcher_name": args.watcher_name}
-        if args.connector is not None:
-            cmd_data["connector"] = args.connector
         result = _send_command(cmd_data)
         if result["ok"]:
             print(f"Watcher '{args.watcher_name}' paused")
@@ -275,8 +261,6 @@ def main():
 
     elif args.command == "resume":
         cmd_data = {"cmd": "resume", "watcher_name": args.watcher_name}
-        if args.connector is not None:
-            cmd_data["connector"] = args.connector
         result = _send_command(cmd_data)
         if result["ok"]:
             print(f"Watcher '{args.watcher_name}' resumed")

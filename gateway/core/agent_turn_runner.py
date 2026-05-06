@@ -126,30 +126,54 @@ class AgentTurnRunner:
                 role_env,
             )
 
-            # Agent chain termination check — case-insensitive substring match so
-            # LLM output variations like <END-OF-AGENT-CHAIN> or the token embedded
-            # in surrounding text are still caught.
+            # Strip the termination token from agent responses — case-insensitive
+            # substring match so LLM output variations like <END-OF-AGENT-CHAIN>
+            # or the token embedded in surrounding text are still caught.
             #
-            # If the LLM prefixes the token with meaningful content, e.g.:
-            #   "Summary: XYZ\n\n<end-of-agent-chain>"
-            # we deliver the content BEFORE the token so nothing is lost, then
-            # terminate.  Suppressing the entire response would silently discard
-            # the agent's last message — the same failure mode as the timeout bug.
+            # The token may appear in both agent-chain and user-to-agent turns
+            # (the LLM can output it regardless of context), so always strip it.
+            #
+            # Content on EITHER side of the token is preserved, e.g.:
+            #   "Summary: XYZ\n\n<end-of-agent-chain>"  → deliver "Summary: XYZ"
+            #   "<end-of-agent-chain>\nBye now"          → deliver "Bye now"
+            #   "Pre\n<end-of-agent-chain>\nPost"        → deliver "Pre\n\nPost"
+            # Suppressing the entire response would silently discard the agent's
+            # last message — the same failure mode as the timeout bug.
             token_idx = response.text.lower().find(AGENT_CHAIN_TERMINATION_TOKEN)
-            if is_agent_chain and token_idx != -1:
+            if token_idx != -1:
                 pre_token_text = response.text[:token_idx].rstrip()
-                if pre_token_text:
-                    await self._deliver_response(
+                token_end_idx = token_idx + len(AGENT_CHAIN_TERMINATION_TOKEN)
+                post_token_text = response.text[token_end_idx:].strip()
+                content_parts = [p for p in (pre_token_text, post_token_text) if p]
+                stripped_text = "\n\n".join(content_parts)
+                if is_agent_chain:
+                    if stripped_text:
+                        await self._deliver_response(
+                            room_id,
+                            dataclasses.replace(response, text=stripped_text),
+                            thread_id,
+                        )
+                    logger.info(
+                        "Agent chain self-terminated (session=%s room=%s sender turn suppressed)",
+                        session_id[:8],
                         room_id,
-                        dataclasses.replace(response, text=pre_token_text),
-                        thread_id,
                     )
-                logger.info(
-                    "Agent chain self-terminated (session=%s room=%s sender turn suppressed)",
-                    session_id[:8],
-                    room_id,
-                )
-                return True
+                    return True
+                else:
+                    # Not an agent chain — strip the token and deliver remaining content
+                    logger.info(
+                        "Stripped <end-of-agent-chain> token from non-chain response "
+                        "(session=%s room=%s)",
+                        session_id[:8],
+                        room_id,
+                    )
+                    if stripped_text:
+                        await self._deliver_response(
+                            room_id,
+                            dataclasses.replace(response, text=stripped_text),
+                            thread_id,
+                        )
+                    return False
 
             # Stage 2: deliver response to chat room
             await self._deliver_response(room_id, response, thread_id)
