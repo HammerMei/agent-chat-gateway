@@ -22,7 +22,6 @@ from gateway.core.config import AgentConfig, CoreConfig
 from gateway.core.connector import Attachment, IncomingMessage, Room, User, UserRole
 from gateway.core.message_processor import MessageProcessor
 
-
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 
