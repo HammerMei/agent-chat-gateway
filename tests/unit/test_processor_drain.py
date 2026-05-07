@@ -127,11 +127,14 @@ class TestGracefulDrain(unittest.IsolatedAsyncioTestCase):
         # Give the consumer a moment to start processing the first
         await asyncio.sleep(0.02)
 
-        # Stop should drain both messages
+        # Stop should drain both messages.
+        # Both may arrive as a single catch-up batch prompt, so check that
+        # all content appears somewhere across the processed prompts.
         await proc.stop()
 
-        self.assertIn("msg1", agent.processed)
-        self.assertIn("msg2", agent.processed)
+        all_text = " ".join(agent.processed)
+        self.assertIn("msg1", all_text)
+        self.assertIn("msg2", all_text)
 
     async def test_enqueue_rejected_during_drain(self):
         """New messages are rejected once drain starts."""
@@ -203,10 +206,12 @@ class TestGracefulDrain(unittest.IsolatedAsyncioTestCase):
 
         await proc.stop()
 
-        # All 5 should have been processed
-        self.assertEqual(len(agent.processed), 5)
+        # All 5 message texts should appear across the processed prompts.
+        # Messages may be combined into one or more catch-up batch prompts,
+        # so check content presence rather than exact prompt count.
+        all_text = " ".join(agent.processed)
         for i in range(5):
-            self.assertIn(f"batch-{i}", agent.processed)
+            self.assertIn(f"batch-{i}", all_text)
 
     async def test_drain_works_when_queue_full_sentinel_cannot_be_placed(self):
         """When the queue is full, stop() can't place the sentinel but drain still works."""
@@ -241,9 +246,10 @@ class TestGracefulDrain(unittest.IsolatedAsyncioTestCase):
         # Stop — sentinel can't be placed because queue is full
         await proc.stop()
 
-        # Both messages should still have been processed
-        self.assertIn("fill1", agent.processed)
-        self.assertIn("fill2", agent.processed)
+        # Both messages should still have been processed (possibly as one batch).
+        all_text = " ".join(agent.processed)
+        self.assertIn("fill1", all_text)
+        self.assertIn("fill2", all_text)
         self.assertEqual(proc._state, "stopped")
 
     async def test_double_stop_is_safe(self):

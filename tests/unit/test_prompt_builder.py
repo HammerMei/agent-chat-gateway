@@ -5,7 +5,7 @@ Extracted from MessageProcessor to make prompt logic independently testable.
 
 import unittest
 
-from gateway.core.prompt_builder import build_prompt
+from gateway.core.prompt_builder import build_catchup_prompt, build_prompt
 
 
 class TestBuildPrompt(unittest.TestCase):
@@ -45,6 +45,60 @@ class TestBuildPrompt(unittest.TestCase):
         """Edge case: empty text body with a prefix."""
         result = build_prompt("", "from: alice")
         self.assertEqual(result, "from: alice")
+
+
+class TestBuildCatchupPrompt(unittest.TestCase):
+
+    def test_structure_contains_header_and_footer(self):
+        result = build_catchup_prompt(["line1"], "anchor text")
+        self.assertIn("[CATCH-UP:", result)
+        self.assertIn("[END CATCH-UP]", result)
+        self.assertIn("Latest message (respond to this):", result)
+
+    def test_history_lines_indented(self):
+        result = build_catchup_prompt(["msg A", "msg B"], "anchor")
+        self.assertIn("  msg A", result)
+        self.assertIn("  msg B", result)
+
+    def test_anchor_appears_after_end_catchup(self):
+        result = build_catchup_prompt(["history"], "the anchor")
+        end_idx = result.index("[END CATCH-UP]")
+        anchor_idx = result.index("the anchor")
+        self.assertGreater(anchor_idx, end_idx)
+
+    def test_anchor_prompt_preserved_verbatim(self):
+        anchor = "[RC #room | from: alice] do the thing\nwarn: file too large"
+        result = build_catchup_prompt(["hist"], anchor)
+        self.assertIn(anchor, result)
+
+    def test_warnings_in_anchor_not_history(self):
+        """Warnings should be included in anchor_prompt, not in history lines."""
+        history = ["[RC #room | from: bob] msg without warnings"]
+        anchor = "[RC #room | from: alice] do it\nwarn: too large"
+        result = build_catchup_prompt(history, anchor)
+        # Warning appears
+        self.assertIn("warn: too large", result)
+        # History line appears without warning
+        self.assertIn("msg without warnings", result)
+
+    def test_single_history_entry(self):
+        result = build_catchup_prompt(["only one"], "anchor")
+        self.assertIn("  only one", result)
+        self.assertIn("anchor", result)
+
+    def test_multiple_history_entries_order_preserved(self):
+        result = build_catchup_prompt(["first", "second", "third"], "anchor")
+        self.assertLess(result.index("first"), result.index("second"))
+        self.assertLess(result.index("second"), result.index("third"))
+        self.assertLess(result.index("third"), result.index("anchor"))
+
+    def test_empty_history_list(self):
+        """Edge case: empty history (should not normally happen in _process_batch,
+        but the function itself should handle it gracefully."""
+        result = build_catchup_prompt([], "anchor only")
+        self.assertIn("[CATCH-UP:", result)
+        self.assertIn("[END CATCH-UP]", result)
+        self.assertIn("anchor only", result)
 
 
 if __name__ == "__main__":
