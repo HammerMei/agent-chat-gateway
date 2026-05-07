@@ -196,6 +196,26 @@ class TestProcessorBatch(unittest.IsolatedAsyncioTestCase):
         all_text = " ".join(agent.prompts)
         self.assertIn("[CATCH-UP:", all_text)
 
+    async def test_anonymous_anchor_demotes_to_prior_non_anonymous(self):
+        """When the last enqueued message is anonymous, the anchor falls back
+        to the last non-anonymous message in the batch."""
+        agent = _RecordingAgent()
+        proc = _make_processor(agent)
+        proc.start()
+
+        await proc.enqueue(_msg("real anchor", "m1", role=UserRole.OWNER))
+        await proc.enqueue(_msg("anon last", "m2", role=UserRole.ANONYMOUS))
+        await proc.stop()
+
+        all_text = " ".join(agent.prompts)
+        self.assertIn("real anchor", all_text)
+        self.assertNotIn("anon last", all_text)
+        # "real anchor" appears after "Latest message" (it is the anchor)
+        self.assertIn("Latest message (respond to this):", all_text)
+        latest_idx = all_text.index("Latest message (respond to this):")
+        anchor_idx = all_text.index("real anchor")
+        self.assertGreater(anchor_idx, latest_idx)
+
     async def test_history_lines_appear_in_catchup_block(self):
         """Non-anchor messages appear inside the [CATCH-UP] block."""
         agent = _RecordingAgent()

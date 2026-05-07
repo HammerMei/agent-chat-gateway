@@ -542,6 +542,10 @@ class MessageProcessor:
             agent_chain_max_turns = anchor.extra_context.get("agent_chain_max_turns", 5)
             agent_chain_context = build_agent_chain_context(agent_chain_turn, agent_chain_max_turns)
 
+        # If messages in the batch span multiple threads, the response is sent
+        # to the anchor's thread_id (the last non-anonymous message's thread).
+        # This is intentional: the agent's reply goes to the most-recent context,
+        # not scattered across every thread in the batch.
         await self._turn_runner.run_turn(
             session_id=self._session_id,
             prompt=prompt,
