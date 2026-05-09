@@ -27,9 +27,9 @@ from .agent_chain import build_agent_chain_context
 from .agent_turn_runner import AgentTurnRunner, _user_facing_agent_error_message
 from .attachment_workspace import localize_attachment_paths
 from .config import CoreConfig, WatcherConfig
-from .connector import Connector, IncomingMessage, Room, UserRole
+from .connector import Attachment, Connector, IncomingMessage, Room, UserRole
 from .context_injector import ContextInjector
-from .prompt_builder import build_prompt
+from .prompt_builder import build_catchup_prompt, build_prompt
 from .session_maps import SessionMaps
 from .state import WatcherState
 
@@ -305,13 +305,32 @@ class MessageProcessor:
                             except Exception:
                                 logger.exception("Unhandled error in processor loop")
                     break  # drain complete
+                # Atomically drain any additional pending messages to build a
+                # catch-up batch.  No await between get_nowait() calls so no
+                # new messages can be interleaved during collection.
+                batch: list[IncomingMessage] = [msg]
+                while True:
+                    try:
+                        extra = self._queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if extra is _DRAIN_SENTINEL:
+                        # Sentinel consumed — process whatever batch we have,
+                        # then exit.  The state==draining check below will
+                        # catch the empty-queue condition.
+                        break
+                    batch.append(extra)
+
                 try:
-                    await self._process(msg)
+                    if len(batch) == 1:
+                        await self._process(batch[0])
+                    else:
+                        await self._process_batch(batch)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
                     logger.exception("Unhandled error in processor loop")
-                # After each message, check if we should exit (drain mode + empty).
+                # After each turn, check if we should exit (drain mode + empty).
                 if self._state == "draining" and self._queue.empty():
                     break
         finally:
@@ -403,6 +422,136 @@ class MessageProcessor:
             working_directory=self._working_directory,
             room_id=msg.room.id,
             thread_id=msg.thread_id,
+            file_paths=file_paths or None,
+            role_env=role_env,
+            is_agent_chain=is_agent_chain,
+            agent_chain_context=agent_chain_context,
+        )
+
+    async def _process_batch(self, batch: list[IncomingMessage]) -> None:
+        """Process a batch of IncomingMessages as a single catch-up turn.
+
+        Called when the queue had >1 messages pending after the previous turn.
+        The last non-anonymous message is the anchor (the agent responds to it);
+        all preceding non-anonymous messages form the [CATCH-UP] history header.
+
+        Design decisions:
+          - ANONYMOUS messages are dropped (same gate as _process()).
+          - Session maps, role_env, thread_id: taken from anchor.
+          - Attachments: aggregated from all messages, dedup by local path.
+          - Warnings: aggregated from all messages, surfaced on the anchor prompt.
+          - History lines carry no warnings (context only).
+          - Turn budget over-counting: agent-chain counters are incremented once
+            per enqueued message (in filter_rc_message), so a batch of N agent
+            messages charges N turns. This is a known limitation; will be
+            addressed in a follow-up if observed to cause premature budget
+            exhaustion in practice.
+        """
+        # Security gate: drop anonymous messages (same as _process).
+        allowed = [m for m in batch if m.role != UserRole.ANONYMOUS]
+        if not allowed:
+            logger.warning(
+                "Entire batch of %d messages contained only ANONYMOUS users "
+                "— dropping (session=%s room=%s)",
+                len(batch),
+                self._session_id[:8],
+                self._room.name,
+            )
+            return
+
+        anchor = allowed[-1]
+        history_msgs = allowed[:-1]
+
+        # Aggregate attachments from all messages; dedup by local path.
+        all_attachments: list[Attachment] = []
+        seen_paths: set[str] = set()
+        for m in allowed:
+            for att in m.attachments:
+                if att.local_path not in seen_paths:
+                    all_attachments.append(att)
+                    seen_paths.add(att.local_path)
+
+        file_paths = localize_attachment_paths(all_attachments, self._attachment_local_base)
+
+        # Aggregate warnings from all messages; surfaced on the anchor prompt.
+        all_warnings = [w for m in allowed for w in m.warnings] or None
+
+        try:
+            await self._ensure_context_injected()
+        except Exception as e:
+            logger.exception(
+                "Context injection failed during batch processing "
+                "(session=%s room=%s): %s",
+                self._session_id[:8],
+                self._room.name,
+                e,
+            )
+            await self._connector.send_text(
+                anchor.room.id,
+                AgentResponse(
+                    text=_user_facing_agent_error_message(e, session_id=self._session_id),
+                    is_error=True,
+                ),
+                thread_id=anchor.thread_id,
+            )
+            return
+
+        # Build history lines using the same format_prompt_prefix as normal
+        # messages — timestamps and addressing are already embedded.
+        # No warnings on history lines (context only).
+        history_lines = [
+            build_prompt(m.text, self._connector.format_prompt_prefix(m))
+            for m in history_msgs
+        ]
+
+        anchor_prefix = self._connector.format_prompt_prefix(anchor)
+        anchor_prompt = build_prompt(anchor.text, anchor_prefix, all_warnings)
+        prompt = build_catchup_prompt(history_lines, anchor_prompt)
+
+        logger.info(
+            "Processing batch [%s] %d messages (history=%d), anchor: %s",
+            self._room.name,
+            len(batch),
+            len(history_msgs),
+            anchor.text[:120],
+        )
+
+        # Update session maps from anchor (same logic as _process).
+        if self._session_role_map is not None:
+            if self._session_maps is not None:
+                self._session_maps.update_role(self._session_id, anchor.role.value)
+            else:
+                self._session_role_map[self._session_id] = anchor.role.value
+        if self._session_permission_thread_map is not None:
+            permission_thread_id = anchor.extra_context.get("permission_thread_id")
+            if self._session_maps is not None:
+                self._session_maps.update_permission_thread(
+                    self._session_id, permission_thread_id,
+                )
+            else:
+                self._session_permission_thread_map[self._session_id] = permission_thread_id
+
+        role_env: dict[str, str] | None = None
+        if self._agent.supports_per_message_env:
+            role_env = self._config.env_for_role(anchor.role, self._agent_name)
+
+        is_agent_chain = anchor.extra_context.get("is_agent_chain", False)
+        agent_chain_context = ""
+        if is_agent_chain:
+            agent_chain_turn = anchor.extra_context.get("agent_chain_turn", 1)
+            agent_chain_max_turns = anchor.extra_context.get("agent_chain_max_turns", 5)
+            agent_chain_context = build_agent_chain_context(agent_chain_turn, agent_chain_max_turns)
+
+        # If messages in the batch span multiple threads, the response is sent
+        # to the anchor's thread_id (the last non-anonymous message's thread).
+        # This is intentional: the agent's reply goes to the most-recent context,
+        # not scattered across every thread in the batch.
+        await self._turn_runner.run_turn(
+            session_id=self._session_id,
+            prompt=prompt,
+            working_directory=self._working_directory,
+            room_id=anchor.room.id,
+            thread_id=anchor.thread_id,
             file_paths=file_paths or None,
             role_env=role_env,
             is_agent_chain=is_agent_chain,
