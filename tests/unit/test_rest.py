@@ -954,3 +954,109 @@ class TestDownloadFileUniqueTmpPath(unittest.IsolatedAsyncioTestCase):
             len(generated_tokens),
             f"tmp_path tokens must be unique across concurrent downloads; got {generated_tokens}",
         )
+
+
+# ---------------------------------------------------------------------------
+# get_room_history
+# ---------------------------------------------------------------------------
+
+
+class TestGetRoomHistory(unittest.IsolatedAsyncioTestCase):
+    """Tests for RocketChatREST.get_room_history()."""
+
+    def _make_rc_msg(self, username: str, text: str, ts_date: int, msg_type: str = "") -> dict:
+        """Build a minimal RC REST message dict."""
+        m: dict = {
+            "_id": f"msg-{ts_date}",
+            "msg": text,
+            "ts": {"$date": ts_date},
+            "u": {"_id": "uid", "username": username},
+        }
+        if msg_type:
+            m["t"] = msg_type
+        return m
+
+    async def test_channel_uses_channels_history_endpoint(self):
+        rest = _make_rest()
+        rest._request = AsyncMock(return_value={"messages": [], "success": True})
+        await rest.get_room_history("ROOM_ID", "channel", count=10)
+        rest._request.assert_called_once_with(
+            "GET", "channels.history",
+            params={"roomId": "ROOM_ID", "count": 10, "unreads": "false"},
+        )
+
+    async def test_group_uses_groups_history_endpoint(self):
+        rest = _make_rest()
+        rest._request = AsyncMock(return_value={"messages": [], "success": True})
+        await rest.get_room_history("ROOM_ID", "group", count=5)
+        rest._request.assert_called_once_with(
+            "GET", "groups.history",
+            params={"roomId": "ROOM_ID", "count": 5, "unreads": "false"},
+        )
+
+    async def test_dm_uses_im_history_endpoint(self):
+        rest = _make_rest()
+        rest._request = AsyncMock(return_value={"messages": [], "success": True})
+        await rest.get_room_history("ROOM_ID", "dm", count=20)
+        rest._request.assert_called_once_with(
+            "GET", "im.history",
+            params={"roomId": "ROOM_ID", "count": 20, "unreads": "false"},
+        )
+
+    async def test_unknown_room_type_defaults_to_channels_history(self):
+        rest = _make_rest()
+        rest._request = AsyncMock(return_value={"messages": [], "success": True})
+        await rest.get_room_history("ROOM_ID", "unknown_type", count=10)
+        call_args = rest._request.call_args
+        self.assertEqual(call_args[0][1], "channels.history")
+
+    async def test_messages_returned_chronological_oldest_first(self):
+        """API returns newest-first; method must reverse to oldest-first."""
+        rest = _make_rest()
+        rest._request = AsyncMock(return_value={
+            "messages": [
+                self._make_rc_msg("alice", "third", 1000003),
+                self._make_rc_msg("alice", "second", 1000002),
+                self._make_rc_msg("alice", "first", 1000001),
+            ],
+            "success": True,
+        })
+        msgs = await rest.get_room_history("ROOM_ID", "channel", count=3)
+        self.assertEqual([m["msg"] for m in msgs], ["first", "second", "third"])
+
+    async def test_system_messages_excluded(self):
+        """Messages with 't' field (system events) must be filtered out."""
+        rest = _make_rest()
+        rest._request = AsyncMock(return_value={
+            "messages": [
+                self._make_rc_msg("alice", "normal", 1000001),
+                self._make_rc_msg("system", "", 1000002, msg_type="uj"),  # user joined
+                self._make_rc_msg("bob", "another", 1000003),
+            ],
+            "success": True,
+        })
+        msgs = await rest.get_room_history("ROOM_ID", "channel", count=10)
+        texts = [m["msg"] for m in msgs]
+        self.assertIn("normal", texts)
+        self.assertIn("another", texts)
+        self.assertEqual(len(msgs), 2)
+
+    async def test_empty_body_messages_excluded(self):
+        """Messages with empty 'msg' field must be filtered out."""
+        rest = _make_rest()
+        rest._request = AsyncMock(return_value={
+            "messages": [
+                self._make_rc_msg("alice", "has text", 1000001),
+                self._make_rc_msg("alice", "", 1000002),  # empty body (file upload)
+            ],
+            "success": True,
+        })
+        msgs = await rest.get_room_history("ROOM_ID", "channel", count=10)
+        self.assertEqual(len(msgs), 1)
+        self.assertEqual(msgs[0]["msg"], "has text")
+
+    async def test_empty_channel_returns_empty_list(self):
+        rest = _make_rest()
+        rest._request = AsyncMock(return_value={"messages": [], "success": True})
+        msgs = await rest.get_room_history("ROOM_ID", "channel", count=50)
+        self.assertEqual(msgs, [])

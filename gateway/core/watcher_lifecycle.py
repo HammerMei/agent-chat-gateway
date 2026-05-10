@@ -17,6 +17,7 @@ from .config import CoreConfig, WatcherConfig
 from .connector import Connector
 from .context_injector import ContextInjector
 from .dispatch import MessageDispatcher
+from .history_context import format_history_context
 from .message_processor import MessageProcessor
 from .permission import PermissionRegistry
 from .session_maps import SessionMaps
@@ -387,11 +388,39 @@ class WatcherLifecycle:
         self._states[wc.name] = ws
         self._maps.bind_session(session_id, room.id, self._connector)
 
+        # 3.5 Fetch channel history for context handoff (new sessions only).
+        # Only fires when created_new_session=True (reset, upgrade, first join)
+        # so that resumed sessions (same session ID) are not re-injected.
+        # Failure is non-fatal: a failed fetch logs a warning and the watcher
+        # starts without history rather than blocking the entire startup.
+        history_context: str | None = None
+        hh = wc.history_handoff
+        if created_new_session and hh.enabled:
+            try:
+                raw_msgs = await self._connector.fetch_room_history(room, hh.fetch_count)
+                history_context = format_history_context(
+                    raw_msgs, verbatim_tail=hh.verbatim_tail
+                )
+                if history_context:
+                    logger.info(
+                        "Watcher '%s': injecting history handoff (%d messages, %d chars)",
+                        wc.name,
+                        len(raw_msgs),
+                        len(history_context),
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Watcher '%s': history handoff fetch failed — starting without history: %s",
+                    wc.name,
+                    e,
+                )
+
         # 4. Inject context (rollback maps on failure)
         try:
             await self._injector.inject(
                 ws, session_id, agent, agent_name, wc.connector, wc,
                 agent_username=self._connector.agent_username,
+                history_context=history_context,
             )
         except Exception:
             self._states.pop(wc.name, None)

@@ -150,6 +150,25 @@ class ConnectorConfig:
 
 
 @dataclass
+class HistoryHandoffConfig:
+    """Configuration for on-startup channel history injection.
+
+    When enabled, ACG fetches recent channel history and injects it as Layer 0
+    context whenever a new agent session is created (reset, upgrade, or first
+    join).  This restores conversational continuity without requiring the
+    previous agent session to be alive.
+
+    fetch_count : Total number of messages to fetch from the channel.
+    verbatim_tail : Last N messages are injected verbatim; older messages are
+        condensed to a single line each to reduce context window usage.
+    """
+
+    enabled: bool = False
+    fetch_count: int = 50
+    verbatim_tail: int = 15
+
+
+@dataclass
 class WatcherConfig:
     """Static definition of a watcher (connector + room + agent binding).
 
@@ -171,6 +190,7 @@ class WatcherConfig:
     context_inject_files: list[str] = field(default_factory=list)  # watcher-level context (layer 3)
     online_notification: str | None = "✅ _Agent online_"   # message text on startup; None = suppress
     offline_notification: str | None = "❌ _Agent offline_" # message text on shutdown; None = suppress
+    history_handoff: HistoryHandoffConfig = field(default_factory=HistoryHandoffConfig)  # session context recovery
 
 
 # ── CoreConfig ───────────────────────────────────────────────────────────────

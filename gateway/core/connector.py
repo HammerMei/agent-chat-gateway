@@ -357,6 +357,35 @@ class Connector(ABC):
 
     # ── Attachment support ────────────────────────────────────────────────────
 
+    async def fetch_room_history(
+        self,
+        room: "Room",
+        count: int,
+    ) -> list[dict[str, Any]]:
+        """Fetch recent channel history as normalized message dicts.
+
+        Returns messages in chronological order (oldest first), already
+        filtered to exclude anonymous/unlisted senders (same security
+        boundary as live message processing).
+
+        Each returned dict has the following keys:
+            ts        : str | None  — ISO 8601 timestamp with UTC offset,
+                        or ``None`` when the timestamp cannot be parsed.
+            username  : str         — sanitized sender username.
+            role      : str         — ``"owner"`` | ``"guest"`` | ``"agent"``
+                        (``"agent"`` marks the bot's own prior responses).
+            room_name : str         — sanitized room name.
+            text      : str         — message body.
+
+        Default: returns ``[]`` — connectors that do not support history
+        (e.g. ScriptConnector) need not override this method.
+
+        Args:
+            room : Resolved ``Room`` object (provides ``id`` and ``type``).
+            count: Maximum number of messages to retrieve.
+        """
+        return []
+
     def supports_attachments(self) -> bool:
         """Return True if this connector can download platform file attachments.
 
