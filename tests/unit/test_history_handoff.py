@@ -21,9 +21,10 @@ def _make_config(
     guests: list[str] | None = None,
     bot_username: str = "hammer-mei",
     timezone: str = "Asia/Taipei",
+    peer_agents: list[str] | None = None,
 ):
     from gateway.config import AttachmentConfig
-    from gateway.connectors.rocketchat.config import RocketChatConfig
+    from gateway.connectors.rocketchat.config import AgentChainConfig, RocketChatConfig
 
     return RocketChatConfig(
         server_url="http://chat.example.com",
@@ -34,6 +35,7 @@ def _make_config(
         guests=guests or ["bob"],
         attachments=AttachmentConfig(cache_dir_global="/tmp/rc-cache"),
         timezone=timezone,
+        agent_chain=AgentChainConfig(agent_usernames=peer_agents or []),
     )
 
 
@@ -42,11 +44,12 @@ def _make_connector(
     guests: list[str] | None = None,
     bot_username: str = "hammer-mei",
     timezone: str = "Asia/Taipei",
+    peer_agents: list[str] | None = None,
 ):
     from gateway.connectors.rocketchat.connector import RocketChatConnector
 
     connector = RocketChatConnector.__new__(RocketChatConnector)
-    connector._config = _make_config(owners, guests, bot_username, timezone)
+    connector._config = _make_config(owners, guests, bot_username, timezone, peer_agents)
     return connector
 
 
@@ -233,6 +236,41 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
         connector._rest.get_room_history = AsyncMock(return_value=[])
         msgs = await connector.fetch_room_history(_make_room(), count=50)
         self.assertEqual(msgs, [])
+
+    async def test_peer_agent_message_included_with_own_username(self):
+        """Peer agents (agent_chain.agent_usernames) are included as role='agent'
+        with their actual username — distinct from the bot's 'me' self-reference."""
+        connector = _make_connector(
+            owners=["alice"],
+            peer_agents=["wavebro"],
+        )
+        connector._rest = AsyncMock()
+        connector._rest.get_room_history = AsyncMock(return_value=[
+            _rc_msg("alice", "owner msg"),
+            _rc_msg("wavebro", "peer agent msg"),
+        ])
+        msgs = await connector.fetch_room_history(_make_room(), count=10)
+        self.assertEqual(len(msgs), 2)
+        peer_msg = next(m for m in msgs if m["username"] == "wavebro")
+        self.assertEqual(peer_msg["role"], "agent")
+        self.assertEqual(peer_msg["username"], "wavebro")
+        self.assertEqual(peer_msg["text"], "peer agent msg")
+
+    async def test_peer_agent_not_included_when_not_in_agent_chain(self):
+        """A user not in owners, guests, or agent_chain must be excluded."""
+        connector = _make_connector(
+            owners=["alice"],
+            guests=[],
+            peer_agents=[],  # no peer agents configured
+        )
+        connector._rest = AsyncMock()
+        connector._rest.get_room_history = AsyncMock(return_value=[
+            _rc_msg("alice", "ok"),
+            _rc_msg("wavebro", "not in any list"),
+        ])
+        msgs = await connector.fetch_room_history(_make_room(), count=10)
+        self.assertEqual(len(msgs), 1)
+        self.assertEqual(msgs[0]["username"], "alice")
 
 
 # ---------------------------------------------------------------------------

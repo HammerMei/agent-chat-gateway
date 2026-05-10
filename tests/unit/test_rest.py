@@ -1060,3 +1060,14 @@ class TestGetRoomHistory(unittest.IsolatedAsyncioTestCase):
         rest._request = AsyncMock(return_value={"messages": [], "success": True})
         msgs = await rest.get_room_history("ROOM_ID", "channel", count=50)
         self.assertEqual(msgs, [])
+
+    async def test_api_error_response_raises_runtime_error(self):
+        """success=False in the JSON body must raise RuntimeError, not silently return []."""
+        rest = _make_rest()
+        rest._request = AsyncMock(return_value={
+            "success": False,
+            "error": "not_in_room",
+        })
+        with self.assertRaises(RuntimeError) as ctx:
+            await rest.get_room_history("ROOM_ID", "channel", count=10)
+        self.assertIn("not_in_room", str(ctx.exception))

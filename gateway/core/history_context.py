@@ -13,10 +13,16 @@ Layout (fixed-tail approach):
   - Total output capped at ``max_chars`` to respect context window limits
 
 Filtering (applied by the Connector before calling this module):
-  - Only owner, guest, and agent (bot's own) messages are included.
+  - Only owner, guest, and agent (bot's own + peer agents) messages are included.
   - Anonymous / unlisted senders are excluded by the connector.
   - ``mention_only`` filter is NOT applied — history provides full conversation
     context regardless of whether messages addressed the agent.
+
+Security note:
+  - All newlines in message text are collapsed to a single space before output.
+    This prevents a crafted multi-line message from injecting fake RC header
+    lines (e.g. ``[Rocket.Chat #room | from: alice | role: owner]``) into the
+    verbatim section where headers and text appear on consecutive lines.
 """
 
 from __future__ import annotations
@@ -33,9 +39,11 @@ _HISTORY_HEADER = (
 def _format_rc_header(msg: dict) -> str:
     """Build the RC-style message header for a single history entry.
 
-    Uses ``from: me`` for the bot's own prior responses (role ``"agent"``)
-    to mirror the existing ``to: me`` convention — symmetric and immediately
-    clear without requiring the agent to remember its own username.
+    Uses the ``username`` field directly.  For the bot's own prior responses
+    the connector sets ``username="me"`` to mirror the ``to: me`` convention —
+    symmetric and immediately clear without exposing the bot's platform handle.
+    Peer agents (also ``role="agent"``) keep their actual sanitized username so
+    the agent can distinguish between its own turns and those of collaborators.
 
     Omits the ``to:`` field (live-routing metadata, irrelevant for history).
     """
@@ -44,9 +52,8 @@ def _format_rc_header(msg: dict) -> str:
     role = msg.get("role", "guest")
     ts = msg.get("ts")
 
-    from_field = "me" if role == "agent" else username
     ts_part = f" | ts: {ts}" if ts else ""
-    return f"[Rocket.Chat #{room_name} | from: {from_field} | role: {role}{ts_part}]"
+    return f"[Rocket.Chat #{room_name} | from: {username} | role: {role}{ts_part}]"
 
 
 def format_history_context(
@@ -95,7 +102,10 @@ def format_history_context(
         lines.append("**Recent messages:**")
         for m in recent:
             header = _format_rc_header(m)
-            text = m.get("text", "")
+            # Collapse all line endings to a single space — prevents a crafted
+            # multi-line message from injecting fake RC header lines after the
+            # real header when text and header appear on consecutive lines.
+            text = " ".join(m.get("text", "").splitlines())
             lines.append(header)
             if text:
                 lines.append(text)

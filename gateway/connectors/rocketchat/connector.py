@@ -435,19 +435,21 @@ class RocketChatConnector(Connector):
 
     async def fetch_room_history(
         self,
-        room: "Room",
+        room: Room,
         count: int,
     ) -> list[dict]:
         """Fetch recent channel history as normalized, filtered message dicts.
 
         Calls the RC REST history endpoint, filters out messages from users
-        not in the owner/guest allowlist (same security boundary as live
-        processing — anonymous users are excluded to prevent prompt injection),
-        and returns a chronological list of normalized dicts.
+        not in the owner/guest allowlist or agent chain (same security boundary
+        as live processing — anonymous users are excluded to prevent prompt
+        injection), and returns a chronological list of normalized dicts.
 
-        The bot's own prior messages are included with ``role: "agent"``
-        and ``username: "me"`` so the agent knows what it said before the
-        session was reset.
+        The bot's own prior messages are included with ``role: "agent"`` and
+        ``username: "me"`` so the agent knows what it said before the session
+        was reset.  Peer agents (``agent_chain.agent_usernames``) are also
+        included as ``role: "agent"`` with their sanitized username, giving the
+        agent full conversation context in multi-agent rooms.
 
         Args:
             room : Resolved Room (provides id and type for the API call).
@@ -459,6 +461,7 @@ class RocketChatConnector(Connector):
         bot_username = self._config.username
         owners = set(self._config.owners)
         guests = set(self._config.guests)
+        peer_agents = set(self._config.agent_chain.agent_usernames)
         safe_room = self._PREFIX_UNSAFE_RE.sub("_", room.name)
         tz = self.timezone
 
@@ -476,6 +479,12 @@ class RocketChatConnector(Connector):
                 display_username = self._PREFIX_UNSAFE_RE.sub("_", sender)
             elif sender in guests:
                 role = "guest"
+                display_username = self._PREFIX_UNSAFE_RE.sub("_", sender)
+            elif sender in peer_agents:
+                # Peer agents in the agent chain — include as role="agent" with
+                # their actual username so the bot can distinguish peer turns
+                # from its own prior turns (which use username="me").
+                role = "agent"
                 display_username = self._PREFIX_UNSAFE_RE.sub("_", sender)
             else:
                 # Anonymous / unlisted sender — exclude for prompt injection safety.

@@ -327,6 +327,11 @@ class RocketChatREST:
             "GET", endpoint,
             params={"roomId": room_id, "count": count, "unreads": "false"},
         )
+        if not result.get("success"):
+            raise RuntimeError(
+                f"get_room_history API error for room {room_id!r}: "
+                f"{result.get('error', result)}"
+            )
         msgs = result.get("messages", [])
         # Exclude system events (type field ``t`` present) and empty messages.
         text_msgs = [m for m in msgs if not m.get("t") and m.get("msg")]
