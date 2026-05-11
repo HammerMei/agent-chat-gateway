@@ -3,7 +3,6 @@
 Pure function tests — no I/O, no network, no agent calls.
 """
 
-import pytest
 
 from gateway.core.history_context import (
     CONDENSE_CHARS,
@@ -12,7 +11,6 @@ from gateway.core.history_context import (
     _format_rc_header,
     format_history_context,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures

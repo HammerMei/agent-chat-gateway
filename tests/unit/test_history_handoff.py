@@ -362,7 +362,6 @@ class TestWatcherLifecycleHistoryHandoff(unittest.IsolatedAsyncioTestCase):
         """Build a WatcherLifecycle with history handoff configured."""
         from gateway.core.config import CoreConfig, HistoryHandoffConfig, WatcherConfig
         from gateway.core.context_injector import ContextInjector
-        from gateway.core.dispatch import MessageDispatcher
         from gateway.core.session_maps import SessionMaps
         from gateway.core.watcher_lifecycle import WatcherLifecycle
 
