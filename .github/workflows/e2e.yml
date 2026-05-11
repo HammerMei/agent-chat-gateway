@@ -4,7 +4,7 @@ name: E2E Tests (Pinned)
 # Update CLAUDE_CODE_VERSION / OPENCODE_VERSION when intentionally upgrading agents.
 env:
   CLAUDE_CODE_VERSION: "2.1.138"
-  OPENCODE_VERSION: "1.14.48"
+  OPENCODE_VERSION: "1.14.46"
 
 on:
   # Run manually from GitHub Actions UI only
