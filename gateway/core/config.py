@@ -163,7 +163,7 @@ class HistoryHandoffConfig:
         condensed to a single line each to reduce context window usage.
     """
 
-    enabled: bool = False
+    enabled: bool = True
     fetch_count: int = 50
     verbatim_tail: int = 15
 

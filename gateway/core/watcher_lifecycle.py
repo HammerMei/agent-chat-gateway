@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime
 
 from ..agents import AgentBackend
 from .adapter_utils import ts_gt as _ts_gt
@@ -398,8 +399,9 @@ class WatcherLifecycle:
         if created_new_session and hh.enabled:
             try:
                 raw_msgs = await self._connector.fetch_room_history(room, hh.fetch_count)
+                fetched_at = datetime.now().astimezone().isoformat(timespec="seconds")
                 history_context = format_history_context(
-                    raw_msgs, verbatim_tail=hh.verbatim_tail
+                    raw_msgs, verbatim_tail=hh.verbatim_tail, fetched_at=fetched_at
                 )
                 if history_context:
                     logger.info(

@@ -32,8 +32,8 @@ VERBATIM_TAIL: int = 15      # keep last N messages in full
 CONDENSE_CHARS: int = 120    # max text chars per condensed line
 MAX_HISTORY_CHARS: int = 12_000  # total cap for the entire block
 
-_HISTORY_HEADER = (
-    "[SESSION HISTORY — fetched at startup, from before this session]"
+_HISTORY_HEADER_TEMPLATE = (
+    "[SESSION HISTORY — fetched at startup{ts_part}, from before this session]"
 )
 
 
@@ -62,6 +62,7 @@ def format_history_context(
     verbatim_tail: int = VERBATIM_TAIL,
     condense_chars: int = CONDENSE_CHARS,
     max_chars: int = MAX_HISTORY_CHARS,
+    fetched_at: str | None = None,
 ) -> str | None:
     """Format normalized history message dicts into an injectable context block.
 
@@ -75,6 +76,11 @@ def format_history_context(
                        with ``…`` when exceeded).
         max_chars    : Hard cap on the total output length.  Content is
                        truncated with a notice when exceeded.
+        fetched_at   : ISO 8601 timestamp of when the history was fetched
+                       (i.e. session start time).  Included in the block header
+                       so the agent knows how old the snapshot is and can use
+                       this timestamp as the ``--before`` anchor for Phase 2
+                       on-demand pagination.  Omitted when ``None``.
 
     Returns:
         Formatted context block string, or ``None`` when ``messages`` is empty.
@@ -82,11 +88,14 @@ def format_history_context(
     if not messages:
         return None
 
+    ts_part = f" {fetched_at}" if fetched_at else ""
+    header = _HISTORY_HEADER_TEMPLATE.format(ts_part=ts_part)
+
     split_at = max(0, len(messages) - verbatim_tail)
     older = messages[:split_at]
     recent = messages[split_at:]
 
-    lines: list[str] = [_HISTORY_HEADER, ""]
+    lines: list[str] = [header, ""]
 
     if older:
         lines.append("**Earlier messages (condensed):**")
