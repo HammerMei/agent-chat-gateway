@@ -455,8 +455,6 @@ class RocketChatConnector(Connector):
             room : Resolved Room (provides id and type for the API call).
             count: Maximum number of messages to retrieve.
         """
-        from ...core.adapter_utils import ts_ms_to_iso_local
-
         raw_msgs = await self._rest.get_room_history(room.id, room.type, count)
         bot_username = self._config.username
         owners = set(self._config.owners)

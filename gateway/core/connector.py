@@ -359,7 +359,7 @@ class Connector(ABC):
 
     async def fetch_room_history(
         self,
-        room: "Room",
+        room: Room,
         count: int,
     ) -> list[dict[str, Any]]:
         """Fetch recent channel history as normalized message dicts.

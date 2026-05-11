@@ -307,10 +307,12 @@ class TestContextInjectorWithHistory(unittest.IsolatedAsyncioTestCase):
             history_context=history_block,
         )
 
-        call_args = agent.send.call_args
-        prompt = call_args.kwargs.get("prompt") or call_args[1].get("prompt") or call_args[0][1]
+        prompt = agent.send.call_args.kwargs["prompt"]
         self.assertIn("SESSION HISTORY", prompt)
         self.assertIn("hello", prompt)
+        # Injection order: identity header first, then history, then context files.
+        # combined_context.insert(0, history); insert(0, header) → header is first.
+        self.assertLess(prompt.index("ACG Session Identity"), prompt.index("SESSION HISTORY"))
 
     async def test_history_context_none_skips_injection_when_no_files(self):
         """When history_context=None and no context files are configured,
@@ -362,7 +364,6 @@ class TestWatcherLifecycleHistoryHandoff(unittest.IsolatedAsyncioTestCase):
         from gateway.core.context_injector import ContextInjector
         from gateway.core.dispatch import MessageDispatcher
         from gateway.core.session_maps import SessionMaps
-        from gateway.core.state_store import StateStore
         from gateway.core.watcher_lifecycle import WatcherLifecycle
 
         wc = WatcherConfig(

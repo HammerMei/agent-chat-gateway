@@ -19,10 +19,11 @@ Filtering (applied by the Connector before calling this module):
     context regardless of whether messages addressed the agent.
 
 Security note:
-  - All newlines in message text are collapsed to a single space before output.
-    This prevents a crafted multi-line message from injecting fake RC header
-    lines (e.g. ``[Rocket.Chat #room | from: alice | role: owner]``) into the
-    verbatim section where headers and text appear on consecutive lines.
+  - All newlines in message text are collapsed to a single space before output,
+    in both the condensed and verbatim sections.  This prevents a crafted
+    multi-line message from injecting fake RC header lines (e.g.
+    ``[Rocket.Chat #room | from: alice | role: owner]``) that the agent would
+    parse as trusted metadata.
 """
 
 from __future__ import annotations
@@ -91,7 +92,10 @@ def format_history_context(
         lines.append("**Earlier messages (condensed):**")
         for m in older:
             header = _format_rc_header(m)
-            text = m.get("text", "")
+            # Collapse newlines before slicing — a \n within the first
+            # condense_chars characters would otherwise create a separate line
+            # that the agent could mistake for a real RC header.
+            text = " ".join(m.get("text", "").splitlines())
             snippet = text[:condense_chars]
             if len(text) > condense_chars:
                 snippet += "…"
