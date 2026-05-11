@@ -130,6 +130,20 @@ class TestFormatHistoryContext:
         result = format_history_context([_msg()])
         assert "SESSION HISTORY" in result
 
+    def test_header_includes_fetched_at_when_provided(self):
+        """fetched_at timestamp must appear in the block header."""
+        ts = "2026-05-10T14:32:00+08:00"
+        result = format_history_context([_msg()], fetched_at=ts)
+        assert ts in result
+        assert "SESSION HISTORY" in result
+
+    def test_header_omits_timestamp_when_fetched_at_is_none(self):
+        """When fetched_at=None, the block header line must not contain a timestamp."""
+        result = format_history_context([_msg()], fetched_at=None)
+        assert result is not None
+        header_line = result.splitlines()[0]
+        assert header_line == "[SESSION HISTORY — fetched at startup, from before this session]"
+
     def test_max_chars_truncation(self):
         msgs = [_msg(text="y" * 200) for _ in range(100)]
         result = format_history_context(msgs, max_chars=500)
