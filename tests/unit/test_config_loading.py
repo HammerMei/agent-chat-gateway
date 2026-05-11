@@ -735,5 +735,51 @@ class TestEffectiveGuestAllowedTools(unittest.TestCase):
         )
 
 
+class TestBuildAgentBackendUsesEffectiveMethods(unittest.TestCase):
+    """Regression test for service.py Fix #1 (HIGH): _build_agent_backend must call
+    effective_guest_allowed_tools() so built-in guest rules are not silently dropped."""
+
+    def test_broker_config_includes_builtin_guest_rules(self):
+        """broker_config.guest_allowed_tools must include the built-in fetch-history rule
+        even when AgentConfig.guest_allowed_tools is empty.
+
+        If service.py regresses to the raw guest_allowed_tools field, this list will be
+        empty and the assertion will fail — surfacing the exact HIGH issue fixed in #35.
+        """
+        from unittest.mock import patch, MagicMock
+
+        from gateway.core.config import AgentConfig, PermissionConfig
+        from gateway.service import _build_agent_backend
+
+        agent_cfg = AgentConfig(
+            name="test",
+            type="claude",
+            command="claude",
+            guest_allowed_tools=[],     # no user-defined rules
+            permissions=PermissionConfig(enabled=True),
+        )
+
+        # Capture the GatewayBrokerConfig that _build_agent_backend constructs.
+        captured = {}
+
+        def _capture_broker(
+            owner_allowed_tools, guest_allowed_tools, timeout, skip_owner_approval
+        ):
+            captured["guest"] = list(guest_allowed_tools)
+            m = MagicMock()
+            return m
+
+        with patch("gateway.service.GatewayBrokerConfig", side_effect=_capture_broker):
+            with patch("gateway.service.ClaudeBackend", return_value=MagicMock()):
+                _build_agent_backend(agent_cfg)
+
+        # The broker must have received the built-in fetch-history rule.
+        guest_params = [r.params for r in captured.get("guest", [])]
+        self.assertTrue(
+            any("fetch-history" in (p or "") for p in guest_params),
+            f"Built-in fetch-history rule missing from broker guest_allowed_tools: {guest_params}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

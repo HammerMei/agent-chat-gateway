@@ -521,9 +521,8 @@ class TestHandleFetchHistory(unittest.IsolatedAsyncioTestCase):
             "cmd": "fetch-history", "watcher": "my-watcher", "count": 999
         })
         self.assertTrue(result["ok"])
-        self.assertIn("clamped", result["history"])
-        self.assertIn("999", result["history"])
-        self.assertIn("10", result["history"])
+        # Use the exact phrase so we don't false-positive on timestamps like "10:00"
+        self.assertIn("clamped from 999 to 10", result["history"])
 
     async def test_empty_channel_returns_ok_with_empty_history(self):
         """A channel with no messages returns ok=True and an empty history string."""
@@ -584,6 +583,28 @@ class TestHandleFetchHistory(unittest.IsolatedAsyncioTestCase):
         })
         self.assertFalse(result["ok"])
         self.assertIn("before_ts", result["error"])
+
+    async def test_on_demand_header_in_output(self):
+        """History text from fetch-history must use the on-demand header, not the startup header."""
+        from gateway.core.history_context import format_history_context
+        entry = _make_history_entry(
+            "my-watcher",
+            history_messages=[{
+                "username": "alice", "role": "owner",
+                "text": "hello", "ts": "2026-05-10T10:00:00+08:00", "room_name": "test-room",
+            }],
+        )
+        server = _make_server(entry)
+        result = await server.dispatch_command({
+            "cmd": "fetch-history", "watcher": "my-watcher"
+        })
+        self.assertTrue(result["ok"])
+        # on_demand=True must be wired: header starts with on-demand marker, not startup marker
+        self.assertTrue(
+            result["history"].startswith("[HISTORY FETCH — on-demand"),
+            f"Expected on-demand header, got: {result['history'][:80]!r}",
+        )
+        self.assertNotIn("SESSION HISTORY", result["history"])
 
 
 if __name__ == "__main__":
