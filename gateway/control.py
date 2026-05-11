@@ -541,6 +541,7 @@ class ControlServer:
         boundary as live message processing.
         """
         from datetime import datetime as _datetime
+
         from .core.history_context import format_history_context
 
         watcher_name = request.get("watcher", "")
