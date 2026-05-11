@@ -746,7 +746,7 @@ class TestBuildAgentBackendUsesEffectiveMethods(unittest.TestCase):
         If service.py regresses to the raw guest_allowed_tools field, this list will be
         empty and the assertion will fail — surfacing the exact HIGH issue fixed in #35.
         """
-        from unittest.mock import patch, MagicMock
+        from unittest.mock import MagicMock, patch
 
         from gateway.core.config import AgentConfig, PermissionConfig
         from gateway.service import _build_agent_backend

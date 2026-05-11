@@ -462,7 +462,8 @@ def _make_history_entry(
     max_fetch_count: int = 200,
 ) -> MagicMock:
     """Build a ConnectorEntry mock suited for fetch-history tests."""
-    from unittest.mock import MagicMock, AsyncMock
+    from unittest.mock import AsyncMock, MagicMock
+
     from gateway.core.config import HistoryHandoffConfig, WatcherConfig
 
     hh_cfg = HistoryHandoffConfig(max_fetch_count=max_fetch_count)
@@ -640,7 +641,6 @@ class TestHandleFetchHistory(unittest.IsolatedAsyncioTestCase):
 
     async def test_on_demand_header_in_output(self):
         """History text from fetch-history must use the on-demand header, not the startup header."""
-        from gateway.core.history_context import format_history_context
         entry = _make_history_entry(
             "my-watcher",
             history_messages=[{
