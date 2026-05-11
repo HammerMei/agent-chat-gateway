@@ -589,11 +589,12 @@ class ControlServer:
         if clamped:
             count = max_count
 
-        # Validate before_ts format if provided.
+        # Validate before_ts and after_ts format if provided.
+        from datetime import datetime as _dt_parse
+
         before_ts = request.get("before_ts") or None
         if before_ts:
             try:
-                from datetime import datetime as _dt_parse
                 _dt_parse.fromisoformat(before_ts)
             except ValueError:
                 return {
@@ -604,9 +605,24 @@ class ControlServer:
                     ),
                 }
 
+        after_ts = request.get("after_ts") or None
+        if after_ts:
+            try:
+                _dt_parse.fromisoformat(after_ts)
+            except ValueError:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"Invalid 'after_ts' value {after_ts!r}: "
+                        "must be an ISO 8601 timestamp (e.g. '2026-05-10T10:00:00+08:00')"
+                    ),
+                }
+
         try:
             room = await entry.connector.resolve_room(wc.room)
-            msgs = await entry.connector.fetch_room_history(room, count, before_ts=before_ts)
+            msgs = await entry.connector.fetch_room_history(
+                room, count, before_ts=before_ts, after_ts=after_ts
+            )
         except Exception as e:
             logger.error("fetch_room_history failed for watcher '%s': %s", watcher_name, e)
             return {"ok": False, "error": str(e)}

@@ -114,7 +114,9 @@ def main():
     fh_p.add_argument("--count", type=int, default=50, metavar="N",
                       help="Max messages to fetch (default: 50; server cap: max_fetch_count)")
     fh_p.add_argument("--before", default=None, metavar="TS",
-                      help="ISO 8601 exclusive upper-bound timestamp for pagination")
+                      help="ISO 8601 exclusive upper-bound timestamp — fetch messages older than this")
+    fh_p.add_argument("--after", default=None, metavar="TS",
+                      help="ISO 8601 inclusive lower-bound timestamp — fetch messages from this point forward")
     fh_p.add_argument("--verbatim", type=int, default=15, metavar="N",
                       help="Last N messages kept verbatim; older messages condensed (default: 15)")
 
@@ -330,6 +332,8 @@ def _run_fetch_history(args) -> None:
     }
     if args.before:
         cmd_data["before_ts"] = args.before
+    if args.after:
+        cmd_data["after_ts"] = args.after
 
     result = _send_command(cmd_data)
     if result["ok"]:

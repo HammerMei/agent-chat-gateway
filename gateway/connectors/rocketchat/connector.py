@@ -441,6 +441,7 @@ class RocketChatConnector(Connector):
         room: Room,
         count: int,
         before_ts: str | None = None,
+        after_ts: str | None = None,
     ) -> list[dict]:
         """Fetch recent channel history as normalized, filtered message dicts.
 
@@ -458,12 +459,17 @@ class RocketChatConnector(Connector):
         Args:
             room     : Resolved Room (provides id and type for the API call).
             count    : Maximum number of messages to retrieve.
-            before_ts: ISO 8601 timestamp used as an exclusive upper bound for
-                       pagination (maps to RC ``latest`` parameter).  When set,
-                       only messages older than this timestamp are returned,
-                       enabling a caller to page backwards through history.
+            before_ts: ISO 8601 exclusive upper-bound timestamp for backward
+                       pagination (maps to RC ``latest`` parameter).  Only
+                       messages older than this timestamp are returned.
+            after_ts : ISO 8601 inclusive lower-bound timestamp for forward
+                       navigation (maps to RC ``oldest`` parameter).  Only
+                       messages newer than or equal to this timestamp are
+                       returned.
         """
-        raw_msgs = await self._rest.get_room_history(room.id, room.type, count, before_ts=before_ts)
+        raw_msgs = await self._rest.get_room_history(
+            room.id, room.type, count, before_ts=before_ts, after_ts=after_ts
+        )
         bot_username = self._config.username
         owners = set(self._config.owners)
         guests = set(self._config.guests)

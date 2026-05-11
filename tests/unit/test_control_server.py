@@ -584,6 +584,28 @@ class TestHandleFetchHistory(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["ok"])
         self.assertIn("before_ts", result["error"])
 
+    async def test_invalid_after_ts_returns_error(self):
+        """A malformed after_ts must return an ISO 8601 validation error."""
+        entry = _make_history_entry("my-watcher")
+        server = _make_server(entry)
+        result = await server.dispatch_command({
+            "cmd": "fetch-history", "watcher": "my-watcher", "after_ts": "not-a-date"
+        })
+        self.assertFalse(result["ok"])
+        self.assertIn("after_ts", result["error"])
+
+    async def test_after_ts_passed_to_connector(self):
+        """after_ts must be forwarded to fetch_room_history."""
+        entry = _make_history_entry("my-watcher")
+        server = _make_server(entry)
+        ts = "2026-05-10T19:25:00+08:00"
+        await server.dispatch_command({
+            "cmd": "fetch-history", "watcher": "my-watcher", "after_ts": ts
+        })
+        entry.connector.fetch_room_history.assert_called_once()
+        _, kwargs = entry.connector.fetch_room_history.call_args
+        self.assertEqual(kwargs.get("after_ts"), ts)
+
     async def test_on_demand_header_in_output(self):
         """History text from fetch-history must use the on-demand header, not the startup header."""
         from gateway.core.history_context import format_history_context

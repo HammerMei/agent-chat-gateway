@@ -17,9 +17,14 @@ by letting you reach further back or refresh your view mid-session.
 # Fetch recent history for your own watcher (most common)
 agent-chat-gateway fetch-history --watcher <your-watcher-name> --count 50
 
-# Fetch older messages — paginate using --before with the oldest timestamp
-# from your previous result
+# Fetch messages from a specific point forward (most intuitive)
+agent-chat-gateway fetch-history --watcher <your-watcher-name> --count 50 --after "2026-05-10T19:25:00+08:00"
+
+# Page backwards — fetch messages older than a given timestamp
 agent-chat-gateway fetch-history --watcher <your-watcher-name> --count 50 --before "2026-05-10T10:00:00+08:00"
+
+# Fetch a specific time window (combine --after and --before)
+agent-chat-gateway fetch-history --watcher <your-watcher-name> --count 100 --after "2026-05-10T08:00:00+08:00" --before "2026-05-10T20:00:00+08:00"
 
 # Control how many messages are shown verbatim vs condensed
 agent-chat-gateway fetch-history --watcher <your-watcher-name> --count 100 --verbatim 30
@@ -33,13 +38,24 @@ Your watcher name is in your `ACG Session Identity` context block (e.g. `hammer-
 |---|---|---|
 | `--watcher NAME` | *(required)* | Your watcher name from ACG Session Identity |
 | `--count N` | `50` | Max messages to retrieve |
+| `--after TS` | *(not set)* | ISO 8601 timestamp — fetch messages from this point forward (inclusive) |
 | `--before TS` | *(not set)* | ISO 8601 timestamp — fetch messages older than this (exclusive) |
 | `--verbatim N` | `15` | Last N messages shown in full; older messages condensed to one line each |
 
-## Pagination
+`--after` and `--before` can be combined to fetch a specific time window.
 
-To page further back, take the oldest timestamp from the current result
-and pass it as `--before` in your next call:
+## Navigation
+
+**Forward (most common):** use `--after` with the timestamp of the oldest message
+in your current context to get everything after that point:
+
+```bash
+# "Show me everything from 7:25 PM onwards"
+agent-chat-gateway fetch-history --watcher hammer-mei --count 50 --after "2026-05-10T19:25:00+08:00"
+```
+
+**Backward pagination:** use `--before` with the oldest timestamp in your current
+result to page further back:
 
 ```bash
 # Step 1: get recent history
