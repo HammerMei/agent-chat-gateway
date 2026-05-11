@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 from .core.config import (  # noqa: F401 — re-exports
     AgentConfig,
     ConnectorConfig,
+    HistoryHandoffConfig,
     PermissionConfig,
     ToolRule,
     WatcherConfig,
@@ -302,6 +303,13 @@ class GatewayConfig:
             raw_ctx = wc.get("context_inject_files", [])
             ctx_files = _resolve_paths(raw_ctx, config_dir)
 
+            hh_raw = wc.get("history_handoff", {}) or {}
+            history_handoff = HistoryHandoffConfig(
+                enabled=hh_raw.get("enabled", False),
+                fetch_count=hh_raw.get("fetch_count", 50),
+                verbatim_tail=hh_raw.get("verbatim_tail", 15),
+            )
+
             watchers.append(
                 WatcherConfig(
                     name=watcher_name,
@@ -316,6 +324,7 @@ class GatewayConfig:
                     offline_notification=wc.get(
                         "offline_notification", "❌ _Agent offline_"
                     ),
+                    history_handoff=history_handoff,
                 )
             )
 

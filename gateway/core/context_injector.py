@@ -84,8 +84,17 @@ class ContextInjector:
         connector_name: str,
         wc: WatcherConfig,
         agent_username: str = "",
+        history_context: str | None = None,
     ) -> None:
-        """Inject context into the agent session if not already done."""
+        """Inject context into the agent session if not already done.
+
+        Args:
+            history_context: Optional pre-formatted channel history block
+                (from ``format_history_context()``).  When provided, it is
+                injected immediately after the dynamic identity header and
+                before any user-configured context files, giving the agent
+                conversation continuity across resets and upgrades.
+        """
         if ws.context_injected:
             self._inject_status[session_id] = InjectionStatus(state="injected")
             return
@@ -107,8 +116,8 @@ class ContextInjector:
         files = self._config.context_inject_files_for(
             connector_name, agent_name, wc.context_inject_files
         )
-        if not files:
-            # No context files configured for this watcher — nothing to inject.
+        if not files and not history_context:
+            # No context files or history to inject — nothing to send.
             # Mark as injected immediately to prevent re-entry on every subsequent
             # message (otherwise _ensure_context_injected() would call inject()
             # on every message, finding no files each time and looping forever).
@@ -152,11 +161,12 @@ class ContextInjector:
                     continue
                 combined_context.append(content)
 
-            if not combined_context:
-                # All files were present but exceeded the per-file size limit and were
-                # skipped.  There is nothing meaningful to inject — treat this as an
-                # immediate success to avoid sending an empty prompt to the agent and
-                # potentially burning retry attempts on a content-less round-trip.
+            if not combined_context and not history_context:
+                # All files were present but exceeded the per-file size limit and
+                # there is no history context either — nothing meaningful to inject.
+                # Treat as an immediate success to avoid sending an empty prompt to
+                # the agent and potentially burning retry attempts on a content-less
+                # round-trip.
                 logger.warning(
                     "Context injection for watcher '%s' (session %s): "
                     "all %d configured file(s) exceeded the %d KB size limit — "
@@ -190,6 +200,10 @@ class ContextInjector:
                     f"- `to: me+@<agent>` — addressed to you and others → respond normally\n"
                     f"- `to: *` — no explicit agent mention → use judgment; respond only if you have something meaningful to contribute\n"
                 )
+            # Inject order (innermost = inserted last at position 0):
+            #   [dynamic_header] → [history_context] → [context files...]
+            if history_context:
+                combined_context.insert(0, history_context)
             combined_context.insert(0, dynamic_header)
 
             full_context = "\n\n".join(combined_context)
