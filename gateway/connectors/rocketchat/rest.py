@@ -295,6 +295,49 @@ class RocketChatREST:
             raise RuntimeError(f"upload_file failed: {result.get('error', result)}")
         logger.info("Uploaded file %s to room %s", path.name, room_id)
 
+    async def get_room_history(
+        self,
+        room_id: str,
+        room_type: str,
+        count: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Fetch the last ``count`` messages from a room via the REST API.
+
+        Selects the correct history endpoint based on room type:
+          - ``channel`` → ``channels.history``
+          - ``group``   → ``groups.history``
+          - ``dm``      → ``im.history``
+
+        Returns messages in **chronological order** (oldest first).
+        System messages (RC ``t`` field present) and messages with empty
+        body are excluded — only plain user/bot text messages are returned.
+
+        Args:
+            room_id  : Opaque RC room ID (``_id`` field).
+            room_type: ``"channel"`` | ``"group"`` | ``"dm"``.
+            count    : Maximum number of messages to retrieve.
+        """
+        endpoint_map = {
+            "channel": "channels.history",
+            "group":   "groups.history",
+            "dm":      "im.history",
+        }
+        endpoint = endpoint_map.get(room_type, "channels.history")
+        result = await self._request(
+            "GET", endpoint,
+            params={"roomId": room_id, "count": count, "unreads": "false"},
+        )
+        if not result.get("success"):
+            raise RuntimeError(
+                f"get_room_history API error for room {room_id!r}: "
+                f"{result.get('error', result)}"
+            )
+        msgs = result.get("messages", [])
+        # Exclude system events (type field ``t`` present) and empty messages.
+        text_msgs = [m for m in msgs if not m.get("t") and m.get("msg")]
+        # RC REST API returns newest-first; reverse to chronological order.
+        return list(reversed(text_msgs))
+
     async def resolve_room(self, room_name: str) -> dict[str, Any]:
         """Resolve a room name to its info dict.
 
