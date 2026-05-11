@@ -216,6 +216,10 @@ class ControlServer:
         if cmd == "send":
             return await self._handle_send(request, connector_name)
 
+        # fetch-history: on-demand channel history fetch for agent mid-session use
+        if cmd == "fetch-history":
+            return await self._handle_fetch_history(request)
+
         # schedule-*: managed by JobStore (no connector routing needed)
         if cmd and cmd.startswith("schedule-"):
             return self._handle_schedule(cmd, request)
@@ -524,3 +528,74 @@ class ControlServer:
         except Exception as e:
             logger.error("send_to_room failed for connector '%s': %s", entry.name, e)
             return {"ok": False, "error": str(e)}
+
+    async def _handle_fetch_history(self, request: dict) -> dict:
+        """Handle the 'fetch-history' command: on-demand channel history for agents.
+
+        Resolves the watcher name to its connector + room, applies the
+        max_fetch_count cap, fetches filtered history, and returns a formatted
+        block string the agent can read directly from Bash stdout.
+
+        Security: --watcher is honor-system in v1 (see issue #34 for token auth).
+        Content security is enforced by the connector's allowlist filter — same
+        boundary as live message processing.
+        """
+        from datetime import datetime as _datetime
+        from .core.history_context import format_history_context
+
+        watcher_name = request.get("watcher", "")
+        if not watcher_name:
+            return {"ok": False, "error": "Missing 'watcher' field in fetch-history command"}
+
+        entry = self._find_entry_for_watcher(watcher_name)
+        if isinstance(entry, dict):
+            return entry  # error: unknown watcher
+
+        if not entry.connector.supports_history():
+            return {
+                "ok": False,
+                "error": (
+                    f"Connector '{entry.name}' does not support history fetch. "
+                    f"fetch-history is only available for connectors that implement "
+                    f"fetch_room_history() (e.g. Rocket.Chat)."
+                ),
+            }
+
+        wc = entry.session_manager.get_watcher_config(watcher_name)
+        if wc is None:
+            return {"ok": False, "error": f"Watcher config not found for '{watcher_name}'"}
+
+        # Apply server-side cap to protect against context window overload.
+        count = int(request.get("count", 50))
+        max_count = wc.history_handoff.max_fetch_count
+        clamped = count > max_count
+        if clamped:
+            count = max_count
+
+        verbatim = int(request.get("verbatim", 15))
+        before_ts = request.get("before_ts") or None
+
+        try:
+            room = await entry.connector.resolve_room(wc.room)
+            msgs = await entry.connector.fetch_room_history(room, count, before_ts=before_ts)
+        except Exception as e:
+            logger.error("fetch_room_history failed for watcher '%s': %s", watcher_name, e)
+            return {"ok": False, "error": str(e)}
+
+        fetched_at = _datetime.now().astimezone().isoformat(timespec="seconds")
+        text = format_history_context(
+            msgs,
+            verbatim_tail=verbatim,
+            fetched_at=fetched_at,
+            on_demand=True,
+        ) or ""
+
+        if clamped:
+            warning = (
+                f"\n\n[fetch-history] Note: --count was clamped from {request.get('count')} "
+                f"to {max_count} (max_fetch_count limit). Use a smaller --count or adjust "
+                f"history_handoff.max_fetch_count in config."
+            )
+            text = text + warning if text else warning.strip()
+
+        return {"ok": True, "history": text}

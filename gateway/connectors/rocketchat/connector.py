@@ -433,10 +433,14 @@ class RocketChatConnector(Connector):
         parts.extend(f"@{u}" for u in other_agents)
         return "to: " + "+".join(parts)
 
+    def supports_history(self) -> bool:
+        return True
+
     async def fetch_room_history(
         self,
         room: Room,
         count: int,
+        before_ts: str | None = None,
     ) -> list[dict]:
         """Fetch recent channel history as normalized, filtered message dicts.
 
@@ -455,7 +459,7 @@ class RocketChatConnector(Connector):
             room : Resolved Room (provides id and type for the API call).
             count: Maximum number of messages to retrieve.
         """
-        raw_msgs = await self._rest.get_room_history(room.id, room.type, count)
+        raw_msgs = await self._rest.get_room_history(room.id, room.type, count, before_ts=before_ts)
         bot_username = self._config.username
         owners = set(self._config.owners)
         guests = set(self._config.guests)

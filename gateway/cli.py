@@ -104,6 +104,20 @@ def main():
         help="Connector to send through (default: first configured connector)",
     )
 
+    # fetch-history
+    fh_p = sub.add_parser(
+        "fetch-history",
+        help="Fetch channel history on-demand (for agent mid-session use)",
+    )
+    fh_p.add_argument("--watcher", required=True, metavar="NAME",
+                      help="Watcher name (from ACG Session Identity context)")
+    fh_p.add_argument("--count", type=int, default=50, metavar="N",
+                      help="Max messages to fetch (default: 50; server cap: max_fetch_count)")
+    fh_p.add_argument("--before", default=None, metavar="TS",
+                      help="ISO 8601 exclusive upper-bound timestamp for pagination")
+    fh_p.add_argument("--verbatim", type=int, default=15, metavar="N",
+                      help="Last N messages kept verbatim; older messages condensed (default: 15)")
+
     # schedule (sub-subcommands)
     schedule_p = sub.add_parser("schedule", help="Manage scheduled agent tasks")
     schedule_sub = schedule_p.add_subparsers(dest="schedule_cmd", help="Schedule subcommands")
@@ -292,8 +306,41 @@ def main():
     elif args.command == "send":
         _run_send(args)
 
+    elif args.command == "fetch-history":
+        _run_fetch_history(args)
+
     elif args.command == "schedule":
         _run_schedule(args)
+
+
+def _run_fetch_history(args) -> None:
+    """Handle the 'fetch-history' subcommand: pull channel history on-demand.
+
+    Intended for agent use mid-session.  Routes through the control socket
+    so the daemon applies its connector's allowlist filter (same security
+    boundary as live message processing).
+
+    Output is printed to stdout so the agent reads it as Bash tool output.
+    """
+    cmd_data: dict = {
+        "cmd": "fetch-history",
+        "watcher": args.watcher,
+        "count": args.count,
+        "verbatim": args.verbatim,
+    }
+    if args.before:
+        cmd_data["before_ts"] = args.before
+
+    result = _send_command(cmd_data)
+    if result["ok"]:
+        history = result.get("history", "")
+        if history:
+            print(history)
+        else:
+            print("[fetch-history] No messages found.")
+    else:
+        print(f"Error: {result.get('error')}", file=sys.stderr)
+        sys.exit(1)
 
 
 def _run_send(args) -> None:
