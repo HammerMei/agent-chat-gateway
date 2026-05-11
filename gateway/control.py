@@ -565,15 +565,44 @@ class ControlServer:
         if wc is None:
             return {"ok": False, "error": f"Watcher config not found for '{watcher_name}'"}
 
+        # Validate and parse count.
+        raw_count = request.get("count", 50)
+        try:
+            count = int(raw_count)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": f"'count' must be a positive integer, got {raw_count!r}"}
+        if count <= 0:
+            return {"ok": False, "error": f"'count' must be > 0, got {count}"}
+
+        # Validate and parse verbatim.
+        raw_verbatim = request.get("verbatim", 15)
+        try:
+            verbatim = int(raw_verbatim)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": f"'verbatim' must be a non-negative integer, got {raw_verbatim!r}"}
+        if verbatim < 0:
+            return {"ok": False, "error": f"'verbatim' must be >= 0, got {verbatim}"}
+
         # Apply server-side cap to protect against context window overload.
-        count = int(request.get("count", 50))
         max_count = wc.history_handoff.max_fetch_count
         clamped = count > max_count
         if clamped:
             count = max_count
 
-        verbatim = int(request.get("verbatim", 15))
+        # Validate before_ts format if provided.
         before_ts = request.get("before_ts") or None
+        if before_ts:
+            try:
+                from datetime import datetime as _dt_parse
+                _dt_parse.fromisoformat(before_ts)
+            except ValueError:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"Invalid 'before_ts' value {before_ts!r}: "
+                        "must be an ISO 8601 timestamp (e.g. '2026-05-10T10:00:00+08:00')"
+                    ),
+                }
 
         try:
             room = await entry.connector.resolve_room(wc.room)
@@ -592,7 +621,7 @@ class ControlServer:
 
         if clamped:
             warning = (
-                f"\n\n[fetch-history] Note: --count was clamped from {request.get('count')} "
+                f"\n\n[fetch-history] Note: --count was clamped from {raw_count} "
                 f"to {max_count} (max_fetch_count limit). Use a smaller --count or adjust "
                 f"history_handoff.max_fetch_count in config."
             )

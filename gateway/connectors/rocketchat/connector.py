@@ -456,8 +456,12 @@ class RocketChatConnector(Connector):
         agent full conversation context in multi-agent rooms.
 
         Args:
-            room : Resolved Room (provides id and type for the API call).
-            count: Maximum number of messages to retrieve.
+            room     : Resolved Room (provides id and type for the API call).
+            count    : Maximum number of messages to retrieve.
+            before_ts: ISO 8601 timestamp used as an exclusive upper bound for
+                       pagination (maps to RC ``latest`` parameter).  When set,
+                       only messages older than this timestamp are returned,
+                       enabling a caller to page backwards through history.
         """
         raw_msgs = await self._rest.get_room_history(room.id, room.type, count, before_ts=before_ts)
         bot_username = self._config.username

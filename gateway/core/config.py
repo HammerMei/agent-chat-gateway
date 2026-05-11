@@ -24,9 +24,9 @@ _BUILTIN_CONTEXTS_DIR = Path(__file__).parent.parent / "contexts"
 # without triggering a 🔐 human-approval prompt — they are the gateway's own management
 # interface, not arbitrary shell commands.
 #
-# Owner rules: send, schedule (write/mutation operations — owner-only)
-# Guest rules:  fetch-history (read-only — guests can query context too)
-# Both:         fetch-history is safe for guests; send/schedule are owner-only
+# Owner rules: send, schedule, fetch-history, date
+#   (owners get all commands — write, mutation, and read-only)
+# Guest rules:  fetch-history only (read-only; send/schedule are owner-only)
 _BUILTIN_OWNER_TOOL_RULES: "list[ToolRule]" = []  # populated after ToolRule is defined
 _BUILTIN_GUEST_TOOL_RULES: "list[ToolRule]" = []  # populated after ToolRule is defined
 

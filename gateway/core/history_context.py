@@ -108,7 +108,7 @@ def format_history_context(
     if older:
         lines.append("**Earlier messages (condensed):**")
         for m in older:
-            header = _format_rc_header(m)
+            msg_header = _format_rc_header(m)
             # Collapse newlines before slicing — a \n within the first
             # condense_chars characters would otherwise create a separate line
             # that the agent could mistake for a real RC header.
@@ -116,18 +116,18 @@ def format_history_context(
             snippet = text[:condense_chars]
             if len(text) > condense_chars:
                 snippet += "…"
-            lines.append(f"{header} {snippet}" if snippet else header)
+            lines.append(f"{msg_header} {snippet}" if snippet else msg_header)
         lines.append("")
 
     if recent:
         lines.append("**Recent messages:**")
         for m in recent:
-            header = _format_rc_header(m)
+            msg_header = _format_rc_header(m)
             # Collapse all line endings to a single space — prevents a crafted
             # multi-line message from injecting fake RC header lines after the
             # real header when text and header appear on consecutive lines.
             text = " ".join(m.get("text", "").splitlines())
-            lines.append(header)
+            lines.append(msg_header)
             if text:
                 lines.append(text)
             lines.append("")
