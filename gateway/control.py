@@ -591,12 +591,12 @@ class ControlServer:
             count = max_count
 
         # Validate before_ts and after_ts format if provided.
-        from datetime import datetime as _dt_parse
-
+        # Reuse _datetime (already imported above) — no second alias needed.
         before_ts = request.get("before_ts") or None
+        before_dt = None
         if before_ts:
             try:
-                _dt_parse.fromisoformat(before_ts)
+                before_dt = _datetime.fromisoformat(before_ts)
             except ValueError:
                 return {
                     "ok": False,
@@ -607,9 +607,10 @@ class ControlServer:
                 }
 
         after_ts = request.get("after_ts") or None
+        after_dt = None
         if after_ts:
             try:
-                _dt_parse.fromisoformat(after_ts)
+                after_dt = _datetime.fromisoformat(after_ts)
             except ValueError:
                 return {
                     "ok": False,
@@ -618,6 +619,21 @@ class ControlServer:
                         "must be an ISO 8601 timestamp (e.g. '2026-05-10T10:00:00+08:00')"
                     ),
                 }
+
+        # Cross-validate: after_ts must be strictly earlier than before_ts.
+        # Wrap in try/except to handle mixed tz-aware/naive comparison gracefully.
+        if after_dt and before_dt:
+            try:
+                if after_dt >= before_dt:
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"'after_ts' ({after_ts!r}) must be earlier than "
+                            f"'before_ts' ({before_ts!r})"
+                        ),
+                    }
+            except TypeError:
+                pass  # mixed tz-aware/naive: skip comparison, connector will handle
 
         try:
             room = await entry.connector.resolve_room(wc.room)

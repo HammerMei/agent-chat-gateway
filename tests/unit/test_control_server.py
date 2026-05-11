@@ -606,6 +606,38 @@ class TestHandleFetchHistory(unittest.IsolatedAsyncioTestCase):
         _, kwargs = entry.connector.fetch_room_history.call_args
         self.assertEqual(kwargs.get("after_ts"), ts)
 
+    async def test_combined_after_and_before_passed_to_connector(self):
+        """Both after_ts and before_ts must be forwarded when a time window is specified."""
+        entry = _make_history_entry("my-watcher")
+        server = _make_server(entry)
+        after = "2026-05-10T08:00:00+08:00"
+        before = "2026-05-10T20:00:00+08:00"
+        result = await server.dispatch_command({
+            "cmd": "fetch-history",
+            "watcher": "my-watcher",
+            "after_ts": after,
+            "before_ts": before,
+        })
+        self.assertTrue(result["ok"])
+        entry.connector.fetch_room_history.assert_called_once()
+        _, kwargs = entry.connector.fetch_room_history.call_args
+        self.assertEqual(kwargs.get("after_ts"), after)
+        self.assertEqual(kwargs.get("before_ts"), before)
+
+    async def test_inverted_range_returns_error(self):
+        """after_ts >= before_ts must return a clear error, not silently return empty results."""
+        entry = _make_history_entry("my-watcher")
+        server = _make_server(entry)
+        result = await server.dispatch_command({
+            "cmd": "fetch-history",
+            "watcher": "my-watcher",
+            "after_ts": "2026-05-10T20:00:00+08:00",   # later
+            "before_ts": "2026-05-10T08:00:00+08:00",  # earlier
+        })
+        self.assertFalse(result["ok"])
+        self.assertIn("after_ts", result["error"])
+        self.assertIn("before_ts", result["error"])
+
     async def test_on_demand_header_in_output(self):
         """History text from fetch-history must use the on-demand header, not the startup header."""
         from gateway.core.history_context import format_history_context

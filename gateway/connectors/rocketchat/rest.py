@@ -322,8 +322,9 @@ class RocketChatREST:
                        RC's ``latest`` parameter — only messages with
                        ``ts < before_ts`` are returned.  Omitted when None.
             after_ts : ISO 8601 inclusive lower-bound timestamp.  Maps to
-                       RC's ``oldest`` parameter — only messages with
-                       ``ts >= after_ts`` are returned.  Omitted when None.
+                       RC's ``oldest`` parameter with ``inclusive=true`` —
+                       only messages with ``ts >= after_ts`` are returned.
+                       Omitted when None.
         """
         endpoint_map = {
             "channel": "channels.history",
@@ -336,6 +337,10 @@ class RocketChatREST:
             params["latest"] = before_ts
         if after_ts:
             params["oldest"] = after_ts
+            # RC treats 'oldest' as exclusive by default (ts > oldest).
+            # Set inclusive=true to get ts >= oldest — matching the documented
+            # contract that --after is an inclusive lower bound.
+            params["inclusive"] = "true"
         result = await self._request(
             "GET", endpoint,
             params=params,
