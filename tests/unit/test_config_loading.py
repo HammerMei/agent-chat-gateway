@@ -651,5 +651,135 @@ class TestBuiltinOwnerToolRuleAutoInjection(unittest.TestCase):
         )
 
 
+class TestEffectiveGuestAllowedTools(unittest.TestCase):
+    """Tests for AgentConfig.effective_guest_allowed_tools() — symmetric to owner tests."""
+
+    def _make_agent(self, extra_rules=None):
+        from gateway.core.config import AgentConfig, ToolRule
+        rules = []
+        if extra_rules:
+            rules = [ToolRule(tool="Bash", params=p) for p in extra_rules]
+        return AgentConfig(name="test", guest_allowed_tools=rules)
+
+    def test_effective_includes_fetch_history_rule(self):
+        """effective_guest_allowed_tools() must include 'agent-chat-gateway fetch-history .*'."""
+        agent = self._make_agent()
+        effective = agent.effective_guest_allowed_tools()
+        params = [r.params for r in effective if r.tool == "Bash"]
+        self.assertTrue(
+            any("agent-chat-gateway" in (p or "") and "fetch-history" in (p or "") for p in params),
+            "Built-in fetch-history rule must be in effective_guest_allowed_tools",
+        )
+
+    def test_builtin_guest_rules_precede_user_rules(self):
+        """Built-in guest rules must come before user-defined rules."""
+        from gateway.core.config import _BUILTIN_GUEST_TOOL_RULES
+        agent = self._make_agent(extra_rules=["git log.*"])
+        effective = agent.effective_guest_allowed_tools()
+        builtin_count = len(_BUILTIN_GUEST_TOOL_RULES)
+        # First N entries must match the built-in rules
+        for i, builtin_rule in enumerate(_BUILTIN_GUEST_TOOL_RULES):
+            self.assertEqual(effective[i].tool, builtin_rule.tool)
+            self.assertEqual(effective[i].params, builtin_rule.params)
+        # The user rule follows after
+        self.assertEqual(effective[builtin_count].params, "git log.*")
+
+    def test_guest_allowed_tools_field_unchanged(self):
+        """effective_guest_allowed_tools() must NOT mutate guest_allowed_tools in place."""
+        from gateway.core.config import ToolRule
+        user_rule = ToolRule(tool="Bash", params="ls.*")
+        agent = self._make_agent()
+        agent.guest_allowed_tools = [user_rule]
+        original_len = len(agent.guest_allowed_tools)
+        agent.effective_guest_allowed_tools()
+        self.assertEqual(len(agent.guest_allowed_tools), original_len)
+
+    def test_empty_guest_list_still_gets_builtins(self):
+        """An agent with empty guest_allowed_tools still gets built-in guest rules."""
+        from gateway.core.config import _BUILTIN_GUEST_TOOL_RULES
+        agent = self._make_agent()
+        effective = agent.effective_guest_allowed_tools()
+        self.assertGreaterEqual(len(effective), len(_BUILTIN_GUEST_TOOL_RULES))
+
+    def test_guest_does_not_include_send_rule(self):
+        """Guests must NOT get the send rule — that is owner-only."""
+        agent = self._make_agent()
+        effective = agent.effective_guest_allowed_tools()
+        params = [r.params for r in effective if r.tool == "Bash"]
+        self.assertFalse(
+            any("agent-chat-gateway" in (p or "") and "send" in (p or "") for p in params),
+            "send rule must NOT be in effective_guest_allowed_tools",
+        )
+
+    def test_guest_does_not_include_schedule_rule(self):
+        """Guests must NOT get the schedule rule — that is owner-only."""
+        agent = self._make_agent()
+        effective = agent.effective_guest_allowed_tools()
+        params = [r.params for r in effective if r.tool == "Bash"]
+        self.assertFalse(
+            any("agent-chat-gateway" in (p or "") and "schedule" in (p or "") for p in params),
+            "schedule rule must NOT be in effective_guest_allowed_tools",
+        )
+
+    def test_fetch_history_rule_matches_actual_command(self):
+        """The fetch-history guest rule must match a realistic command invocation."""
+        import re
+
+        from gateway.core.config import _BUILTIN_GUEST_TOOL_RULES
+        fh_rule = next(r for r in _BUILTIN_GUEST_TOOL_RULES
+                       if r.params and "fetch-history" in r.params)
+        cmd = "agent-chat-gateway fetch-history --watcher hammer-mei --count 50"
+        self.assertIsNotNone(
+            re.fullmatch(fh_rule.params, cmd, re.IGNORECASE | re.DOTALL),
+            f"fetch-history rule {fh_rule.params!r} must match command {cmd!r}",
+        )
+
+
+class TestBuildAgentBackendUsesEffectiveMethods(unittest.TestCase):
+    """Regression test for service.py Fix #1 (HIGH): _build_agent_backend must call
+    effective_guest_allowed_tools() so built-in guest rules are not silently dropped."""
+
+    def test_broker_config_includes_builtin_guest_rules(self):
+        """broker_config.guest_allowed_tools must include the built-in fetch-history rule
+        even when AgentConfig.guest_allowed_tools is empty.
+
+        If service.py regresses to the raw guest_allowed_tools field, this list will be
+        empty and the assertion will fail — surfacing the exact HIGH issue fixed in #35.
+        """
+        from unittest.mock import MagicMock, patch
+
+        from gateway.core.config import AgentConfig, PermissionConfig
+        from gateway.service import _build_agent_backend
+
+        agent_cfg = AgentConfig(
+            name="test",
+            type="claude",
+            command="claude",
+            guest_allowed_tools=[],     # no user-defined rules
+            permissions=PermissionConfig(enabled=True),
+        )
+
+        # Capture the GatewayBrokerConfig that _build_agent_backend constructs.
+        captured = {}
+
+        def _capture_broker(
+            owner_allowed_tools, guest_allowed_tools, timeout, skip_owner_approval
+        ):
+            captured["guest"] = list(guest_allowed_tools)
+            m = MagicMock()
+            return m
+
+        with patch("gateway.service.GatewayBrokerConfig", side_effect=_capture_broker):
+            with patch("gateway.service.ClaudeBackend", return_value=MagicMock()):
+                _build_agent_backend(agent_cfg)
+
+        # The broker must have received the built-in fetch-history rule.
+        guest_params = [r.params for r in captured.get("guest", [])]
+        self.assertTrue(
+            any("fetch-history" in (p or "") for p in guest_params),
+            f"Built-in fetch-history rule missing from broker guest_allowed_tools: {guest_params}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

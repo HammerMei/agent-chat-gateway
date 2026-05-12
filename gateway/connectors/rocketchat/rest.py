@@ -300,6 +300,8 @@ class RocketChatREST:
         room_id: str,
         room_type: str,
         count: int = 50,
+        before_ts: str | None = None,
+        after_ts: str | None = None,
     ) -> list[dict[str, Any]]:
         """Fetch the last ``count`` messages from a room via the REST API.
 
@@ -316,6 +318,13 @@ class RocketChatREST:
             room_id  : Opaque RC room ID (``_id`` field).
             room_type: ``"channel"`` | ``"group"`` | ``"dm"``.
             count    : Maximum number of messages to retrieve.
+            before_ts: ISO 8601 exclusive upper-bound timestamp.  Maps to
+                       RC's ``latest`` parameter — only messages with
+                       ``ts < before_ts`` are returned.  Omitted when None.
+            after_ts : ISO 8601 inclusive lower-bound timestamp.  Maps to
+                       RC's ``oldest`` parameter with ``inclusive=true`` —
+                       only messages with ``ts >= after_ts`` are returned.
+                       Omitted when None.
         """
         endpoint_map = {
             "channel": "channels.history",
@@ -323,9 +332,18 @@ class RocketChatREST:
             "dm":      "im.history",
         }
         endpoint = endpoint_map.get(room_type, "channels.history")
+        params: dict = {"roomId": room_id, "count": count, "unreads": "false"}
+        if before_ts:
+            params["latest"] = before_ts
+        if after_ts:
+            params["oldest"] = after_ts
+            # RC treats 'oldest' as exclusive by default (ts > oldest).
+            # Set inclusive=true to get ts >= oldest — matching the documented
+            # contract that --after is an inclusive lower bound.
+            params["inclusive"] = "true"
         result = await self._request(
             "GET", endpoint,
-            params={"roomId": room_id, "count": count, "unreads": "false"},
+            params=params,
         )
         if not result.get("success"):
             raise RuntimeError(

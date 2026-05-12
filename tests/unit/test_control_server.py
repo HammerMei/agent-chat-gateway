@@ -451,6 +451,216 @@ class TestStartStop(unittest.IsolatedAsyncioTestCase):
                 await server.stop()
 
 
+# ── _handle_fetch_history ─────────────────────────────────────────────────────
+
+
+def _make_history_entry(
+    watcher_name: str,
+    supports_history: bool = True,
+    history_messages: list | None = None,
+    resolve_room_raises: Exception | None = None,
+    max_fetch_count: int = 200,
+) -> MagicMock:
+    """Build a ConnectorEntry mock suited for fetch-history tests."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from gateway.core.config import HistoryHandoffConfig, WatcherConfig
+
+    hh_cfg = HistoryHandoffConfig(max_fetch_count=max_fetch_count)
+    wc = MagicMock(spec=WatcherConfig)
+    wc.room = "#test-room"
+    wc.history_handoff = hh_cfg
+
+    entry = MagicMock()
+    entry.name = "rc"
+    entry.connector.supports_history.return_value = supports_history
+
+    if resolve_room_raises:
+        entry.connector.resolve_room = AsyncMock(side_effect=resolve_room_raises)
+    else:
+        from gateway.core.connector import Room
+        room = Room(id="ROOM_ID", name="test-room", type="c")
+        entry.connector.resolve_room = AsyncMock(return_value=room)
+
+    entry.connector.fetch_room_history = AsyncMock(return_value=history_messages or [])
+
+    def _get_watcher_config(name):
+        return wc if name == watcher_name else None
+
+    entry.session_manager.get_watcher_config = MagicMock(side_effect=_get_watcher_config)
+    return entry
+
+
+class TestHandleFetchHistory(unittest.IsolatedAsyncioTestCase):
+    """Tests for ControlServer._handle_fetch_history."""
+
+    async def test_unknown_watcher_returns_error(self):
+        """A watcher name that belongs to no entry must return an error."""
+        entry = _make_history_entry("known-watcher")
+        server = _make_server(entry)
+        result = await server.dispatch_command({
+            "cmd": "fetch-history", "watcher": "unknown-watcher"
+        })
+        self.assertFalse(result["ok"])
+        self.assertIn("unknown-watcher", result["error"])
+
+    async def test_connector_no_history_support_returns_error(self):
+        """fetch-history against a connector that doesn't support it must return an error."""
+        entry = _make_history_entry("my-watcher", supports_history=False)
+        server = _make_server(entry)
+        result = await server.dispatch_command({
+            "cmd": "fetch-history", "watcher": "my-watcher"
+        })
+        self.assertFalse(result["ok"])
+        self.assertIn("does not support history", result["error"])
+
+    async def test_count_clamped_adds_warning(self):
+        """When --count exceeds max_fetch_count, response includes a clamping warning."""
+        entry = _make_history_entry("my-watcher", max_fetch_count=10)
+        server = _make_server(entry)
+        result = await server.dispatch_command({
+            "cmd": "fetch-history", "watcher": "my-watcher", "count": 999
+        })
+        self.assertTrue(result["ok"])
+        # Use the exact phrase so we don't false-positive on timestamps like "10:00"
+        self.assertIn("clamped from 999 to 10", result["history"])
+
+    async def test_empty_channel_returns_ok_with_empty_history(self):
+        """A channel with no messages returns ok=True and an empty history string."""
+        entry = _make_history_entry("my-watcher", history_messages=[])
+        server = _make_server(entry)
+        result = await server.dispatch_command({
+            "cmd": "fetch-history", "watcher": "my-watcher"
+        })
+        self.assertTrue(result["ok"])
+        self.assertIsInstance(result["history"], str)
+
+    async def test_resolve_room_failure_returns_error(self):
+        """An exception from resolve_room must propagate as an error response."""
+        entry = _make_history_entry(
+            "my-watcher",
+            resolve_room_raises=RuntimeError("room not found"),
+        )
+        server = _make_server(entry)
+        result = await server.dispatch_command({
+            "cmd": "fetch-history", "watcher": "my-watcher"
+        })
+        self.assertFalse(result["ok"])
+        self.assertIn("room not found", result["error"])
+
+    async def test_missing_watcher_field_returns_error(self):
+        """Omitting the 'watcher' field must return a descriptive error."""
+        server = _make_server(_make_history_entry("any"))
+        result = await server.dispatch_command({"cmd": "fetch-history"})
+        self.assertFalse(result["ok"])
+        self.assertIn("watcher", result["error"].lower())
+
+    async def test_invalid_count_returns_error(self):
+        """A non-integer count must return a validation error."""
+        entry = _make_history_entry("my-watcher")
+        server = _make_server(entry)
+        result = await server.dispatch_command({
+            "cmd": "fetch-history", "watcher": "my-watcher", "count": "abc"
+        })
+        self.assertFalse(result["ok"])
+        self.assertIn("count", result["error"])
+
+    async def test_zero_count_returns_error(self):
+        """count=0 must be rejected with a validation error."""
+        entry = _make_history_entry("my-watcher")
+        server = _make_server(entry)
+        result = await server.dispatch_command({
+            "cmd": "fetch-history", "watcher": "my-watcher", "count": 0
+        })
+        self.assertFalse(result["ok"])
+        self.assertIn("count", result["error"])
+
+    async def test_invalid_before_ts_returns_error(self):
+        """A malformed before_ts must return an ISO 8601 validation error."""
+        entry = _make_history_entry("my-watcher")
+        server = _make_server(entry)
+        result = await server.dispatch_command({
+            "cmd": "fetch-history", "watcher": "my-watcher", "before_ts": "not-a-date"
+        })
+        self.assertFalse(result["ok"])
+        self.assertIn("before_ts", result["error"])
+
+    async def test_invalid_after_ts_returns_error(self):
+        """A malformed after_ts must return an ISO 8601 validation error."""
+        entry = _make_history_entry("my-watcher")
+        server = _make_server(entry)
+        result = await server.dispatch_command({
+            "cmd": "fetch-history", "watcher": "my-watcher", "after_ts": "not-a-date"
+        })
+        self.assertFalse(result["ok"])
+        self.assertIn("after_ts", result["error"])
+
+    async def test_after_ts_passed_to_connector(self):
+        """after_ts must be forwarded to fetch_room_history."""
+        entry = _make_history_entry("my-watcher")
+        server = _make_server(entry)
+        ts = "2026-05-10T19:25:00+08:00"
+        await server.dispatch_command({
+            "cmd": "fetch-history", "watcher": "my-watcher", "after_ts": ts
+        })
+        entry.connector.fetch_room_history.assert_called_once()
+        _, kwargs = entry.connector.fetch_room_history.call_args
+        self.assertEqual(kwargs.get("after_ts"), ts)
+
+    async def test_combined_after_and_before_passed_to_connector(self):
+        """Both after_ts and before_ts must be forwarded when a time window is specified."""
+        entry = _make_history_entry("my-watcher")
+        server = _make_server(entry)
+        after = "2026-05-10T08:00:00+08:00"
+        before = "2026-05-10T20:00:00+08:00"
+        result = await server.dispatch_command({
+            "cmd": "fetch-history",
+            "watcher": "my-watcher",
+            "after_ts": after,
+            "before_ts": before,
+        })
+        self.assertTrue(result["ok"])
+        entry.connector.fetch_room_history.assert_called_once()
+        _, kwargs = entry.connector.fetch_room_history.call_args
+        self.assertEqual(kwargs.get("after_ts"), after)
+        self.assertEqual(kwargs.get("before_ts"), before)
+
+    async def test_inverted_range_returns_error(self):
+        """after_ts >= before_ts must return a clear error, not silently return empty results."""
+        entry = _make_history_entry("my-watcher")
+        server = _make_server(entry)
+        result = await server.dispatch_command({
+            "cmd": "fetch-history",
+            "watcher": "my-watcher",
+            "after_ts": "2026-05-10T20:00:00+08:00",   # later
+            "before_ts": "2026-05-10T08:00:00+08:00",  # earlier
+        })
+        self.assertFalse(result["ok"])
+        self.assertIn("after_ts", result["error"])
+        self.assertIn("before_ts", result["error"])
+
+    async def test_on_demand_header_in_output(self):
+        """History text from fetch-history must use the on-demand header, not the startup header."""
+        entry = _make_history_entry(
+            "my-watcher",
+            history_messages=[{
+                "username": "alice", "role": "owner",
+                "text": "hello", "ts": "2026-05-10T10:00:00+08:00", "room_name": "test-room",
+            }],
+        )
+        server = _make_server(entry)
+        result = await server.dispatch_command({
+            "cmd": "fetch-history", "watcher": "my-watcher"
+        })
+        self.assertTrue(result["ok"])
+        # on_demand=True must be wired: header starts with on-demand marker, not startup marker
+        self.assertTrue(
+            result["history"].startswith("[HISTORY FETCH — on-demand"),
+            f"Expected on-demand header, got: {result['history'][:80]!r}",
+        )
+        self.assertNotIn("SESSION HISTORY", result["history"])
+
+
 if __name__ == "__main__":
     unittest.main()
 

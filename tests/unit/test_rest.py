@@ -1071,3 +1071,41 @@ class TestGetRoomHistory(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError) as ctx:
             await rest.get_room_history("ROOM_ID", "channel", count=10)
         self.assertIn("not_in_room", str(ctx.exception))
+
+    async def test_before_ts_maps_to_latest_param(self):
+        """before_ts must be sent as the RC 'latest' query parameter."""
+        rest = _make_rest()
+        rest._request = AsyncMock(return_value={"messages": [], "success": True})
+        ts = "2026-05-10T10:00:00+08:00"
+        await rest.get_room_history("ROOM_ID", "channel", count=10, before_ts=ts)
+        _, kwargs = rest._request.call_args
+        self.assertEqual(kwargs["params"].get("latest"), ts)
+        self.assertNotIn("inclusive", kwargs["params"])
+
+    async def test_after_ts_maps_to_oldest_with_inclusive(self):
+        """after_ts must be sent as the RC 'oldest' parameter with inclusive=true.
+
+        RC treats 'oldest' as exclusive by default (ts > oldest). The inclusive=true
+        flag makes it inclusive (ts >= oldest) — matching the --after contract.
+        """
+        rest = _make_rest()
+        rest._request = AsyncMock(return_value={"messages": [], "success": True})
+        ts = "2026-05-10T19:25:00+08:00"
+        await rest.get_room_history("ROOM_ID", "channel", count=10, after_ts=ts)
+        _, kwargs = rest._request.call_args
+        self.assertEqual(kwargs["params"].get("oldest"), ts)
+        self.assertEqual(kwargs["params"].get("inclusive"), "true",
+                         "inclusive must be 'true' (string) so RC returns ts >= after_ts")
+
+    async def test_combined_before_and_after_ts(self):
+        """Both before_ts and after_ts can be set simultaneously for a time window."""
+        rest = _make_rest()
+        rest._request = AsyncMock(return_value={"messages": [], "success": True})
+        after = "2026-05-10T08:00:00+08:00"
+        before = "2026-05-10T20:00:00+08:00"
+        await rest.get_room_history("ROOM_ID", "channel", count=50,
+                                    before_ts=before, after_ts=after)
+        _, kwargs = rest._request.call_args
+        self.assertEqual(kwargs["params"].get("latest"), before)
+        self.assertEqual(kwargs["params"].get("oldest"), after)
+        self.assertEqual(kwargs["params"].get("inclusive"), "true")

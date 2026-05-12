@@ -204,7 +204,33 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
         connector._rest.get_room_history = AsyncMock(return_value=[])
         room = _make_room(room_id="CUSTOM_ID", room_type="group")
         await connector.fetch_room_history(room, count=42)
-        connector._rest.get_room_history.assert_called_once_with("CUSTOM_ID", "group", 42)
+        connector._rest.get_room_history.assert_called_once_with(
+            "CUSTOM_ID", "group", 42, before_ts=None, after_ts=None
+        )
+
+    async def test_before_ts_passed_through_to_rest(self):
+        """before_ts is forwarded to get_room_history for backward pagination."""
+        connector = _make_connector()
+        connector._rest = AsyncMock()
+        connector._rest.get_room_history = AsyncMock(return_value=[])
+        room = _make_room(room_id="ROOM", room_type="channel")
+        ts = "2026-05-10T10:00:00+08:00"
+        await connector.fetch_room_history(room, count=50, before_ts=ts)
+        connector._rest.get_room_history.assert_called_once_with(
+            "ROOM", "channel", 50, before_ts=ts, after_ts=None
+        )
+
+    async def test_after_ts_passed_through_to_rest(self):
+        """after_ts is forwarded to get_room_history for forward navigation."""
+        connector = _make_connector()
+        connector._rest = AsyncMock()
+        connector._rest.get_room_history = AsyncMock(return_value=[])
+        room = _make_room(room_id="ROOM", room_type="channel")
+        ts = "2026-05-10T19:25:00+08:00"
+        await connector.fetch_room_history(room, count=50, after_ts=ts)
+        connector._rest.get_room_history.assert_called_once_with(
+            "ROOM", "channel", 50, before_ts=None, after_ts=ts
+        )
 
     async def test_timestamp_formatted_as_iso(self):
         """ts field must be a formatted ISO 8601 string, not raw epoch ms."""

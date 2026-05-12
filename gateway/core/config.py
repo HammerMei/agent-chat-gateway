@@ -19,14 +19,16 @@ from .connector import UserRole
 # Resolved relative to this file: gateway/core/config.py → gateway/core/ → gateway/ → gateway/contexts/
 _BUILTIN_CONTEXTS_DIR = Path(__file__).parent.parent / "contexts"
 
-# Built-in tool rules automatically prepended to every agent's owner_allowed_tools.
-# These are gateway-specific Bash commands that the agent should always be able to
-# call without triggering a 🔐 human-approval prompt — they are the gateway's own
-# management interface, not arbitrary shell commands.
+# Built-in tool rules automatically prepended to every agent's owner/guest allowed tools.
+# These are gateway-specific Bash commands that agents should always be able to call
+# without triggering a 🔐 human-approval prompt — they are the gateway's own management
+# interface, not arbitrary shell commands.
 #
-# Rule: `agent-chat-gateway send ...` — send messages / attach files to RC rooms.
-# Rule: `agent-chat-gateway schedule ...` — create/list/delete/pause/resume jobs.
+# Owner rules: send, schedule, fetch-history, date
+#   (owners get all commands — write, mutation, and read-only)
+# Guest rules:  fetch-history only (read-only; send/schedule are owner-only)
 _BUILTIN_OWNER_TOOL_RULES: "list[ToolRule]" = []  # populated after ToolRule is defined
+_BUILTIN_GUEST_TOOL_RULES: "list[ToolRule]" = []  # populated after ToolRule is defined
 
 # ── Shared config types ──────────────────────────────────────────────────────
 
@@ -99,10 +101,17 @@ class ToolRule:
 _BUILTIN_OWNER_TOOL_RULES = [
     ToolRule(tool="Bash", params="agent-chat-gateway\\s+send\\s+.*"),
     ToolRule(tool="Bash", params="agent-chat-gateway\\s+schedule\\s+.*"),
+    ToolRule(tool="Bash", params="agent-chat-gateway\\s+fetch-history\\s+.*"),
     # date is a read-only command used by agents to compute timestamps.
     # It is safe to auto-approve for owners so that compound bash commands
     # containing $(date ...) sub-expressions do not trigger approval prompts.
     ToolRule(tool="Bash", params="date(\\s+.*)?"),
+]
+
+_BUILTIN_GUEST_TOOL_RULES = [
+    # fetch-history is read-only — guests can safely query channel history
+    # for context without being able to send messages or create schedules.
+    ToolRule(tool="Bash", params="agent-chat-gateway\\s+fetch-history\\s+.*"),
 ]
 
 
@@ -123,13 +132,22 @@ class AgentConfig:
     def effective_owner_allowed_tools(self) -> "list[ToolRule]":
         """Return owner_allowed_tools with built-in gateway rules prepended.
 
-        The built-in rules (``agent-chat-gateway send`` and
-        ``agent-chat-gateway schedule``) are always included so that agents can
-        call gateway management commands without triggering a 🔐 human-approval
-        prompt — no user config required.  User-defined rules follow the
-        built-in ones so that custom patterns can further extend the allow list.
+        The built-in rules (``agent-chat-gateway send``, ``schedule``, and
+        ``fetch-history``) are always included so that agents can call gateway
+        management commands without triggering a 🔐 human-approval prompt —
+        no user config required.  User-defined rules follow the built-in ones
+        so that custom patterns can further extend the allow list.
         """
         return list(_BUILTIN_OWNER_TOOL_RULES) + list(self.owner_allowed_tools)
+
+    def effective_guest_allowed_tools(self) -> "list[ToolRule]":
+        """Return guest_allowed_tools with built-in read-only gateway rules prepended.
+
+        The built-in guest rule allows ``agent-chat-gateway fetch-history`` —
+        a read-only operation safe for guest-role agents.  Write operations
+        (``send``, ``schedule``) remain owner-only.
+        """
+        return list(_BUILTIN_GUEST_TOOL_RULES) + list(self.guest_allowed_tools)
 
 
 @dataclass
@@ -166,6 +184,7 @@ class HistoryHandoffConfig:
     enabled: bool = True
     fetch_count: int = 50
     verbatim_tail: int = 15
+    max_fetch_count: int = 200   # hard cap for on-demand fetch-history; prevents context window overload
 
 
 @dataclass
@@ -263,6 +282,7 @@ class CoreConfig:
             if connector_cfg.type == "rocketchat":
                 result.append(str(_BUILTIN_CONTEXTS_DIR / "rc-gateway-context.md"))
             result.append(str(_BUILTIN_CONTEXTS_DIR / "scheduling-context.md"))
+            result.append(str(_BUILTIN_CONTEXTS_DIR / "fetch-history-context.md"))
             # Layer 1: connector-level user files
             result.extend(connector_cfg.context_inject_files)
 

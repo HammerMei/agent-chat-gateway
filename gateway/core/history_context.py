@@ -35,6 +35,9 @@ MAX_HISTORY_CHARS: int = 12_000  # total cap for the entire block
 _HISTORY_HEADER_TEMPLATE = (
     "[SESSION HISTORY — fetched at startup{ts_part}, from before this session]"
 )
+_ONDEMAND_HEADER_TEMPLATE = (
+    "[HISTORY FETCH — on-demand{ts_part}]"
+)
 
 
 def _format_rc_header(msg: dict) -> str:
@@ -63,6 +66,7 @@ def format_history_context(
     condense_chars: int = CONDENSE_CHARS,
     max_chars: int = MAX_HISTORY_CHARS,
     fetched_at: str | None = None,
+    on_demand: bool = False,
 ) -> str | None:
     """Format normalized history message dicts into an injectable context block.
 
@@ -76,11 +80,14 @@ def format_history_context(
                        with ``…`` when exceeded).
         max_chars    : Hard cap on the total output length.  Content is
                        truncated with a notice when exceeded.
-        fetched_at   : ISO 8601 timestamp of when the history was fetched
-                       (i.e. session start time).  Included in the block header
-                       so the agent knows how old the snapshot is and can use
-                       this timestamp as the ``--before`` anchor for Phase 2
-                       on-demand pagination.  Omitted when ``None``.
+        fetched_at   : ISO 8601 timestamp of when the history was fetched.
+                       Included in the block header so the agent knows how old
+                       the snapshot is and can use it as a ``--before`` anchor
+                       for on-demand pagination.  Omitted when ``None``.
+        on_demand    : When True, uses the on-demand header format
+                       (``[HISTORY FETCH — on-demand ...]``) instead of the
+                       startup-injection format.  Signals to the agent that this
+                       block came through a Bash tool call, not system context.
 
     Returns:
         Formatted context block string, or ``None`` when ``messages`` is empty.
@@ -89,7 +96,8 @@ def format_history_context(
         return None
 
     ts_part = f" {fetched_at}" if fetched_at else ""
-    header = _HISTORY_HEADER_TEMPLATE.format(ts_part=ts_part)
+    template = _ONDEMAND_HEADER_TEMPLATE if on_demand else _HISTORY_HEADER_TEMPLATE
+    header = template.format(ts_part=ts_part)
 
     split_at = max(0, len(messages) - verbatim_tail)
     older = messages[:split_at]
@@ -100,7 +108,7 @@ def format_history_context(
     if older:
         lines.append("**Earlier messages (condensed):**")
         for m in older:
-            header = _format_rc_header(m)
+            msg_header = _format_rc_header(m)
             # Collapse newlines before slicing — a \n within the first
             # condense_chars characters would otherwise create a separate line
             # that the agent could mistake for a real RC header.
@@ -108,18 +116,18 @@ def format_history_context(
             snippet = text[:condense_chars]
             if len(text) > condense_chars:
                 snippet += "…"
-            lines.append(f"{header} {snippet}" if snippet else header)
+            lines.append(f"{msg_header} {snippet}" if snippet else msg_header)
         lines.append("")
 
     if recent:
         lines.append("**Recent messages:**")
         for m in recent:
-            header = _format_rc_header(m)
+            msg_header = _format_rc_header(m)
             # Collapse all line endings to a single space — prevents a crafted
             # multi-line message from injecting fake RC header lines after the
             # real header when text and header appear on consecutive lines.
             text = " ".join(m.get("text", "").splitlines())
-            lines.append(header)
+            lines.append(msg_header)
             if text:
                 lines.append(text)
             lines.append("")
