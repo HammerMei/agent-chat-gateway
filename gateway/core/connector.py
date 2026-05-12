@@ -357,10 +357,24 @@ class Connector(ABC):
 
     # ── Attachment support ────────────────────────────────────────────────────
 
+    def supports_history(self) -> bool:
+        """Return True if this connector can fetch channel message history.
+
+        Used by ``_handle_fetch_history`` in the control socket to distinguish
+        "connector doesn't support history" (hard error) from "empty channel"
+        (both return ``[]`` from ``fetch_room_history``).
+
+        Default: False.  Override in connectors that implement history fetch
+        (e.g. RocketChatConnector).
+        """
+        return False
+
     async def fetch_room_history(
         self,
         room: Room,
         count: int,
+        before_ts: str | None = None,
+        after_ts: str | None = None,
     ) -> list[dict[str, Any]]:
         """Fetch recent channel history as normalized message dicts.
 
@@ -381,8 +395,16 @@ class Connector(ABC):
         (e.g. ScriptConnector) need not override this method.
 
         Args:
-            room : Resolved ``Room`` object (provides ``id`` and ``type``).
-            count: Maximum number of messages to retrieve.
+            room     : Resolved ``Room`` object (provides ``id`` and ``type``).
+            count    : Maximum number of messages to retrieve.
+            before_ts: ISO 8601 exclusive upper-bound timestamp.  When provided,
+                       only messages older than this timestamp are returned.
+                       Maps to the platform ``latest`` parameter.
+            after_ts : ISO 8601 inclusive lower-bound timestamp.  When provided,
+                       only messages newer than or equal to this timestamp are
+                       returned.  Maps to the platform ``oldest`` parameter.
+                       Connectors that do not support this parameter may silently
+                       ignore it.
         """
         return []
 

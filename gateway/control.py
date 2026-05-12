@@ -216,6 +216,10 @@ class ControlServer:
         if cmd == "send":
             return await self._handle_send(request, connector_name)
 
+        # fetch-history: on-demand channel history fetch for agent mid-session use
+        if cmd == "fetch-history":
+            return await self._handle_fetch_history(request)
+
         # schedule-*: managed by JobStore (no connector routing needed)
         if cmd and cmd.startswith("schedule-"):
             return self._handle_schedule(cmd, request)
@@ -524,3 +528,136 @@ class ControlServer:
         except Exception as e:
             logger.error("send_to_room failed for connector '%s': %s", entry.name, e)
             return {"ok": False, "error": str(e)}
+
+    async def _handle_fetch_history(self, request: dict) -> dict:
+        """Handle the 'fetch-history' command: on-demand channel history for agents.
+
+        Resolves the watcher name to its connector + room, applies the
+        max_fetch_count cap, fetches filtered history, and returns a formatted
+        block string the agent can read directly from Bash stdout.
+
+        Security: --watcher is honor-system in v1 (see issue #34 for token auth).
+        Content security is enforced by the connector's allowlist filter — same
+        boundary as live message processing.
+        """
+        from datetime import datetime as _datetime
+
+        from .core.history_context import format_history_context
+
+        watcher_name = request.get("watcher", "")
+        if not watcher_name:
+            return {"ok": False, "error": "Missing 'watcher' field in fetch-history command"}
+
+        entry = self._find_entry_for_watcher(watcher_name)
+        if isinstance(entry, dict):
+            return entry  # error: unknown watcher
+
+        if not entry.connector.supports_history():
+            return {
+                "ok": False,
+                "error": (
+                    f"Connector '{entry.name}' does not support history fetch. "
+                    f"fetch-history is only available for connectors that implement "
+                    f"fetch_room_history() (e.g. Rocket.Chat)."
+                ),
+            }
+
+        wc = entry.session_manager.get_watcher_config(watcher_name)
+        if wc is None:
+            return {"ok": False, "error": f"Watcher config not found for '{watcher_name}'"}
+
+        # Validate and parse count.
+        raw_count = request.get("count", 50)
+        try:
+            count = int(raw_count)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": f"'count' must be a positive integer, got {raw_count!r}"}
+        if count <= 0:
+            return {"ok": False, "error": f"'count' must be > 0, got {count}"}
+
+        # Validate and parse verbatim.
+        raw_verbatim = request.get("verbatim", 15)
+        try:
+            verbatim = int(raw_verbatim)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": f"'verbatim' must be a non-negative integer, got {raw_verbatim!r}"}
+        if verbatim < 0:
+            return {"ok": False, "error": f"'verbatim' must be >= 0, got {verbatim}"}
+
+        # Apply server-side cap to protect against context window overload.
+        max_count = wc.history_handoff.max_fetch_count
+        clamped = count > max_count
+        if clamped:
+            count = max_count
+
+        # Validate before_ts and after_ts format if provided.
+        # Reuse _datetime (already imported above) — no second alias needed.
+        before_ts = request.get("before_ts") or None
+        before_dt = None
+        if before_ts:
+            try:
+                before_dt = _datetime.fromisoformat(before_ts)
+            except ValueError:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"Invalid 'before_ts' value {before_ts!r}: "
+                        "must be an ISO 8601 timestamp (e.g. '2026-05-10T10:00:00+08:00')"
+                    ),
+                }
+
+        after_ts = request.get("after_ts") or None
+        after_dt = None
+        if after_ts:
+            try:
+                after_dt = _datetime.fromisoformat(after_ts)
+            except ValueError:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"Invalid 'after_ts' value {after_ts!r}: "
+                        "must be an ISO 8601 timestamp (e.g. '2026-05-10T10:00:00+08:00')"
+                    ),
+                }
+
+        # Cross-validate: after_ts must be strictly earlier than before_ts.
+        # Wrap in try/except to handle mixed tz-aware/naive comparison gracefully.
+        if after_dt and before_dt:
+            try:
+                if after_dt >= before_dt:
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"'after_ts' ({after_ts!r}) must be earlier than "
+                            f"'before_ts' ({before_ts!r})"
+                        ),
+                    }
+            except TypeError:
+                pass  # mixed tz-aware/naive: skip comparison, connector will handle
+
+        try:
+            room = await entry.connector.resolve_room(wc.room)
+            msgs = await entry.connector.fetch_room_history(
+                room, count, before_ts=before_ts, after_ts=after_ts
+            )
+        except Exception as e:
+            logger.error("fetch_room_history failed for watcher '%s': %s", watcher_name, e)
+            return {"ok": False, "error": str(e)}
+
+        fetched_at = _datetime.now().astimezone().isoformat(timespec="seconds")
+        text = format_history_context(
+            msgs,
+            verbatim_tail=verbatim,
+            fetched_at=fetched_at,
+            on_demand=True,
+        ) or ""
+
+        if clamped:
+            warning = (
+                f"\n\n[fetch-history] Note: --count was clamped from {raw_count} "
+                f"to {max_count} (max_fetch_count limit). Use a smaller --count or adjust "
+                f"history_handoff.max_fetch_count in config."
+            )
+            text = text + warning if text else warning.strip()
+
+        return {"ok": True, "history": text}

@@ -236,6 +236,24 @@ class TestFormatHistoryContext:
         assert "Earlier messages (condensed)" in result
         assert "Recent messages" in result
 
+    def test_on_demand_header_format(self):
+        """on_demand=True must produce the on-demand header, not the startup header."""
+        ts = "2026-05-10T14:32:00+08:00"
+        result = format_history_context([_msg()], fetched_at=ts, on_demand=True)
+        assert result is not None
+        header_line = result.splitlines()[0]
+        assert header_line == f"[HISTORY FETCH — on-demand {ts}]"
+        # Must NOT contain the startup header string
+        assert "SESSION HISTORY" not in header_line
+
+    def test_on_demand_without_timestamp(self):
+        """on_demand=True with no fetched_at omits the timestamp from the header."""
+        result = format_history_context([_msg()], fetched_at=None, on_demand=True)
+        assert result is not None
+        header_line = result.splitlines()[0]
+        assert header_line == "[HISTORY FETCH — on-demand]"
+        assert "SESSION HISTORY" not in header_line
+
 
 # ---------------------------------------------------------------------------
 # Default constant sanity checks

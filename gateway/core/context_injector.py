@@ -187,6 +187,7 @@ class ContextInjector:
             dynamic_header = (
                 f"## ACG Session Identity\n"
                 f"- **Watcher name:** `{wc.name}`\n"
+                f"- **Room:** `{wc.room}`\n"
                 f"- **Connector:** `{connector_name}`\n"
             )
             if agent_username:

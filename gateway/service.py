@@ -55,7 +55,7 @@ def _build_agent_backend(agent_cfg: AgentConfig) -> AgentBackend:
     broker_config = (
         GatewayBrokerConfig(
             owner_allowed_tools=agent_cfg.effective_owner_allowed_tools(),
-            guest_allowed_tools=agent_cfg.guest_allowed_tools,
+            guest_allowed_tools=agent_cfg.effective_guest_allowed_tools(),
             timeout=agent_cfg.permissions.timeout,
             skip_owner_approval=agent_cfg.permissions.skip_owner_approval,
         )
