@@ -13,5 +13,7 @@ def test_rc_context_contains_directed_reply_etiquette():
     assert "directed at someone else as not addressed to you" in text
     assert "Do not choose the reply target from `from:` alone" in text
     assert "scheduler" in text
+    assert "usually the original sender" in text
+    assert "ONLY `<end-of-agent-chain>`" in text
     assert "Do not reply just to summarize another agent" in text
     assert "Scheduled A2A tasks must also be addressed" in text
