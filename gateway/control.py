@@ -220,6 +220,10 @@ class ControlServer:
         if cmd == "fetch-history":
             return await self._handle_fetch_history(request)
 
+        # instructions: static bundled docs for lazy instruction loading
+        if cmd == "instructions":
+            return self._handle_instructions(request)
+
         # schedule-*: managed by JobStore (no connector routing needed)
         if cmd and cmd.startswith("schedule-"):
             return self._handle_schedule(cmd, request)
@@ -239,6 +243,18 @@ class ControlServer:
             return entry  # error response
 
         return await entry.session_manager.dispatch_command(request)
+
+    def _handle_instructions(self, request: dict) -> dict:
+        """Return a bundled instruction document by name."""
+        from .instructions import read_instruction
+
+        name = request.get("name")
+        if not isinstance(name, str) or not name:
+            return {"ok": False, "error": "Missing 'name' field in instructions command"}
+        try:
+            return {"ok": True, "name": name, "text": read_instruction(name)}
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
 
     def _resolve_entry(
         self, connector_name: str | None

@@ -121,6 +121,25 @@ class TestDispatchCommand(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["data"], [])
         self.assertEqual(len(result["errors"]), 2)
 
+    async def test_instructions_returns_bundled_doc(self):
+        """instructions is handled by the control server without connector routing."""
+        server = _make_server(_make_entry("rc"))
+
+        result = await server.dispatch_command({"cmd": "instructions", "name": "scheduling"})
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["name"], "scheduling")
+        self.assertIn("# ACG Scheduling Commands", result["text"])
+
+    async def test_instructions_unknown_name_returns_error(self):
+        """Unknown instruction names return a structured error."""
+        server = _make_server(_make_entry("rc"))
+
+        result = await server.dispatch_command({"cmd": "instructions", "name": "nope"})
+
+        self.assertFalse(result["ok"])
+        self.assertIn("Unknown instruction", result["error"])
+
     async def test_list_all_success_has_no_errors_key(self):
         """All connectors healthy → ok=True with no 'errors' key in response."""
         e1 = _make_entry("rc", dispatch_result={"ok": True, "data": [{"name": "w1"}]})

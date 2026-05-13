@@ -207,6 +207,12 @@ class GatewayConfig:
                     f"or is not a directory: '{working_directory}'"
                 )
 
+            lazy_instruction_loading = agent_raw.get("lazy_instruction_loading", True)
+            if not isinstance(lazy_instruction_loading, bool):
+                raise ValueError(
+                    f"Agent '{agent_name}': lazy_instruction_loading must be a boolean"
+                )
+
             agents[agent_name] = AgentConfig(
                 name=agent_name,
                 type=agent_raw.get("type", "claude"),
@@ -214,6 +220,7 @@ class GatewayConfig:
                 new_session_args=agent_raw.get("new_session_args", []),
                 working_directory=working_directory,
                 session_prefix=agent_raw.get("session_prefix", "agent-chat"),
+                lazy_instruction_loading=lazy_instruction_loading,
                 context_inject_files=ctx_files,
                 owner_allowed_tools=_parse_tool_rules(
                     agent_raw.get("owner_allowed_tools", []), agent_name
