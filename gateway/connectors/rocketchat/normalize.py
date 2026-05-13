@@ -227,6 +227,19 @@ async def normalize_rc_message(
         if m.get("username")
     ]
 
+    raw_msg = doc.get("msg", "")
+    if isinstance(raw_msg, str) and "@all" in raw_msg:
+        logger.warning(
+            "DEBUG @all payload: sender=%s room=%s thread_id=%s msg=%r mentions=%r raw_keys=%r raw=%r",
+            sender_username,
+            room.name,
+            thread_id,
+            raw_msg,
+            mentions,
+            sorted(doc.keys()),
+            doc,
+        )
+
     msg = IncomingMessage(
         id=doc.get("_id", msg_ts),
         timestamp=msg_ts,
