@@ -125,6 +125,23 @@ connectors:
 
 **When `agent_chain` is omitted:** Agent-to-agent communication is disabled. Messages from unknown senders are treated as regular user messages. No loop protection is active.
 
+### Addressing and `@all`
+
+In Rocket.Chat rooms, ACG adds a trusted `to:` field to each agent prompt so agents can
+tell whether a message is meant for them, another agent, or the room at large:
+
+- `to: me` — this bot was explicitly mentioned, or the message arrived as a DM.
+- `to: @other-agent` — another configured agent was mentioned; this bot should usually stay silent.
+- `to: me+@other-agent` — this bot and another configured agent were both mentioned.
+- `to: @all` — the sender used Rocket.Chat's room-wide `@all` mention; broader agent fan-out is intentional.
+- `to: me+@all+@other-agent` — room-wide fan-out plus specific priority responders.
+- `to: *` — no explicit agent mention; agents should be conservative and respond only with useful new information.
+
+When `@all` appears together with specific agent mentions, ACG preserves the specific
+mentions as **priority responders** rather than letting `@all` erase them. Agents that
+do not have useful, non-duplicative input should respond with only
+`<end-of-agent-chain>` so the chain terminates cleanly.
+
 ---
 
 ## Prompt Injection & Turn Awareness
@@ -307,6 +324,14 @@ This lets agents hand off work gracefully and restart with a fresh budget after 
 ### 6. Observe Conversations in the Room
 
 Don't hide agent conversations in threads. Let humans see what's happening. Open threads reduce surprise and allow for timely intervention.
+
+### 7. Use `@all` Sparingly
+
+Use Rocket.Chat `@all` only when you intentionally want every configured agent in the
+room to consider responding. Prefer specific agent mentions such as `@research-bot` for
+directed handoffs. If you combine `@all` with a specific agent mention, that specific
+agent remains a priority responder while other agents should only add non-duplicative
+value.
 
 ---
 
