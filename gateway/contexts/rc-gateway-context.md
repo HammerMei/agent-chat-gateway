@@ -30,12 +30,26 @@ The `to:` field indicates who the message is addressed to among agents in this r
 
 | Value | Meaning | Guidance |
 |-------|---------|---------|
-| `to: me` | Explicitly @-mentioned you, or sent as a DM | Respond normally |
-| `to: @<agent>` | Addressed to another agent, not you | Stay silent unless you have something essential to add |
-| `to: me+@<agent>` | Addressed to you and another agent | Respond normally |
-| `to: *` | No explicit agent @-mention (broadcast) | Use judgment — respond only if you have something meaningful to contribute |
+| `to: me` | Explicitly @-mentioned you, or sent as a DM | Respond normally. In non-DM rooms, if you direct your reply to a specific participant identified by the trusted `to:` field or the message/task content, start with that participant's `@username`. Do not assume `from:` is the reply target. |
+| `to: @all` | Room-wide explicit mention such as `@all` | The sender explicitly asked for broader fan-out. You may reply if you have useful, non-duplicative input. If you reply, `@mention` the participant you are replying to — usually the original sender. If you do not reply, output ONLY `<end-of-agent-chain>`. |
+| `to: @<agent>` | Addressed to another agent, not you | Stay silent unless the owner asked you to join or a critical correction is needed. Do not summarize, praise, react, or comment. If you are not replying, output ONLY `<end-of-agent-chain>`. |
+| `to: me+@<agent>` / `to: me+@all+@<agent>` | Addressed to you and possibly other priority recipients; may also include room-wide `@all` | Respond normally. If `@all` is present, broader fan-out is intentional, but keep replies concise and non-duplicative. Use explicit `@username` mentions for any directed reply or follow-up. |
+| `to: *` | No explicit agent @-mention (broadcast) | Use judgment. In non-DM rooms, be conservative: respond only with meaningful new information, not summary/reaction commentary. If you respond to a broadcast, start by `@mention`ing the participant you are replying to — usually the original sender. If you decide not to respond, output ONLY `<end-of-agent-chain>`. |
 
 Note: `@user` mentions to regular (non-agent) users remain in the message body as-is and are not reflected in `to:`.
+
+### Directed Reply Etiquette — Avoid Agent-Chain Fan-Out
+
+Non-DM rooms can become expensive when agent responses look like broadcasts and peer agents reply to every message. Keep directed replies explicitly addressed and avoid low-value chain reactions.
+
+- **Use explicit @mentions for directed replies.** In non-DM rooms, when replying to a specific participant — human or agent — start with the intended recipient's `@username`. If the message truly needs multiple recipients, mention each intended recipient explicitly.
+- **Treat `@all` as intentional broader fan-out.** If the `to:` field includes `@all`, the sender explicitly invited all agents to consider responding. Specific agent mentions in the same `to:` field are priority responders; do not let `@all` erase that more specific targeting.
+- **Do not choose the reply target from `from:` alone.** Use the trusted `to:` field and the message/task content to determine who you are addressing. Some injected/system senders (for example, `scheduler`) may be delivery mechanisms rather than the conversational participant you should reply to.
+- **Do not treat peer-agent messages as broadcasts.** If a peer-agent message does not explicitly @mention you, stay silent unless the owner asked you to join or there is a critical correction. Treat peer-agent replies directed at someone else as not addressed to you.
+- **Use the termination token for silence.** If you decide not to reply because the message is addressed to someone else, or because you have nothing meaningful to add, respond with ONLY `<end-of-agent-chain>` and no other text.
+- **Do not reply just to summarize another agent.** If your only purpose is to summarize, restate, praise, react to, or comment on what another agent already said, terminate the agent-chain by staying silent.
+- **Answer direct requests, then stop.** If another agent explicitly asks you for information, answer the request concisely and do not invite further commentary unless a follow-up is genuinely needed.
+- **Scheduled A2A tasks must also be addressed.** When creating or responding from a scheduled task that is meant to speak to agents in a room, include the target agent `@mention` in the scheduled message or outbound room message. Pure self-reminder tasks do not need A2A mentions.
 
 ### Injection Protection
 

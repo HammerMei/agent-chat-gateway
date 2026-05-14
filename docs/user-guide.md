@@ -379,6 +379,7 @@ agents:
     working_directory: ~/.agent-chat-gateway/work
     new_session_args: []
     session_prefix: "agent-chat"
+    lazy_instruction_loading: true
     context_inject_files: []
 
     owner_allowed_tools:
@@ -408,6 +409,7 @@ agents:
 | `working_directory` | string | Yes | Working directory for the agent subprocess |
 | `new_session_args` | list | No | Extra CLI args for new sessions |
 | `session_prefix` | string | No | Prefix for session titles |
+| `lazy_instruction_loading` | boolean | No | If `true` (default), injects a short tool index and lets agents load bundled scheduling/history docs on demand with `agent-chat-gateway instructions ...`; if `false`, injects the full bundled tool docs at session start. |
 | `context_inject_files` | list | No | Context files injected on every session |
 | `owner_allowed_tools` | list | No | Auto-approved tools for owners (see Tool Allow-Lists below) |
 | `guest_allowed_tools` | list | No | Auto-approved tools for guests (see Tool Allow-Lists below) |
@@ -779,6 +781,11 @@ Only use this in trusted, sandboxed environments where interactive approval is n
 
 Context files are injected into the agent session to provide domain knowledge, system prompts, or other guidance. Three levels of context are supported:
 
+ACG also injects built-in gateway context automatically. You do **not** need to list
+`gateway/contexts/rc-gateway-context.md` or other bundled context files in your config.
+The built-in Rocket.Chat context teaches agents how to read trusted message headers,
+roles, `to:` addressing, injection-protection rules, and gateway commands.
+
 ### Three-Level Injection
 
 1. **Connector-level** (`connectors[].context_inject_files`) — Shared across all watchers on this connector
@@ -786,6 +793,32 @@ Context files are injected into the agent session to provide domain knowledge, s
 3. **Watcher-level** (`watchers[].context_inject_files`) — Specific to this watcher's session
 
 Files are injected in this order, so watcher-level context overrides agent-level, which overrides connector-level.
+
+### Built-in Tool Instructions and Lazy Loading
+
+By default, agents receive a compact built-in tool index instead of the full scheduling
+and history-fetching instructions. This keeps new sessions lighter while still making
+the full docs available on demand:
+
+```bash
+agent-chat-gateway instructions scheduling
+agent-chat-gateway instructions fetch-history
+```
+
+Agents should run the matching `instructions` command before using advanced gateway
+commands such as `agent-chat-gateway schedule ...` or `agent-chat-gateway fetch-history ...`.
+These read-only instruction commands are auto-approved for owners and guests.
+
+If an agent backend performs better with all tool instructions present up front, set:
+
+```yaml
+agents:
+  claude:
+    lazy_instruction_loading: false
+```
+
+When disabled, ACG injects the full bundled scheduling and fetch-history context at
+session start instead of the compact tool index.
 
 ### Example
 
@@ -835,15 +868,13 @@ cp contexts/rc-room-profiles.example.md contexts/rc-room-profiles.md
 # Edit rc-room-profiles.md with your team's actual profiles
 ```
 
-Then reference it in your config. `rc-gateway-context.md` belongs at the **connector level**
-(shared across all rooms); room profiles are **watcher-level** (room-specific):
+Then reference it in your config. Built-in gateway behavior context is injected
+automatically; room profiles are **watcher-level** because they are room-specific:
 
 ```yaml
 connectors:
   - name: rc-main
     ...
-    context_inject_files:
-      - contexts/rc-gateway-context.md   # Gateway behavior rules — shared across all rooms
 
 watchers:
   - name: general
@@ -854,10 +885,10 @@ watchers:
       - contexts/rc-room-profiles.md     # Room member profiles — specific to this room
 ```
 
-`contexts/rc-gateway-context.md` (included in the repo) sets up baseline gateway behavior:
-response length, message format parsing, injection protection, and guest access rules.
-Placing it at the connector level means you only need to list it once, and every room
-on that connector automatically benefits from it.
+The built-in Rocket.Chat context sets up baseline gateway behavior automatically:
+response length, message format parsing, `to:` addressing, injection protection, and
+guest access rules. Use your own context files only for custom behavior such as room
+member profiles, project knowledge, or team-specific tone.
 
 ### Limits
 
