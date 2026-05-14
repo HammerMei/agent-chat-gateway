@@ -31,6 +31,7 @@ from ...core.connector import (
 from ...core.tz_utils import local_iana_timezone as _server_local_timezone
 from .agent_chain import TurnStore
 from .config import RocketChatConfig
+from .mentions import is_room_wide_mention
 from .normalize import FilterResult, filter_rc_message, normalize_rc_message
 from .outbound import send_media as _send_media
 from .outbound import send_text as _send_text
@@ -400,6 +401,8 @@ class RocketChatConnector(Connector):
         - ``to: me``          — only this bot is @mentioned
         - ``to: @wavebro``    — one or more other agents mentioned, not this bot
         - ``to: me+@wavebro`` — this bot and other agents mentioned
+        - ``to: @all``        — room-wide explicit mention such as ``@all``
+        - ``to: me+@all+@wavebro`` — room-wide mention plus priority agents
         - ``to: *``           — no explicit agent mention in a channel (broadcast)
 
         DMs are treated as ``to: me`` because the user is speaking to the bot
@@ -418,18 +421,21 @@ class RocketChatConnector(Connector):
         mentioned = set(msg.mentions)
 
         own_mentioned = own in mentioned
+        all_mentioned = any(is_room_wide_mention(u) for u in mentioned)
         other_agents = [
             self._PREFIX_UNSAFE_RE.sub("_", u)
             for u in msg.mentions
-            if u != own and u in agent_names
+            if u != own and not is_room_wide_mention(u) and u in agent_names
         ]
 
-        if not own_mentioned and not other_agents:
+        if not own_mentioned and not all_mentioned and not other_agents:
             return "to: *"
 
         parts = []
         if own_mentioned:
             parts.append("me")
+        if all_mentioned:
+            parts.append("@all")
         parts.extend(f"@{u}" for u in other_agents)
         return "to: " + "+".join(parts)
 

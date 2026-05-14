@@ -19,6 +19,7 @@ This document clearly communicates what agent-chat-gateway supports today, what 
 - ✅ **Message triggering**
   - Direct message (DM) activation — all DMs to bot are forwarded to agent
   - Channel/group activation — requires `@mention` of bot username
+  - Room-wide `@all` activation — treated as explicit permission for broader multi-agent fan-out
 
 - ✅ **Attachments**
   - Inbound attachment download (files, images, documents)
@@ -147,6 +148,8 @@ This document clearly communicates what agent-chat-gateway supports today, what 
 
 #### Behavior
 - ✅ Injected on session start (one-time, not per-message)
+- ✅ Built-in Rocket.Chat gateway context injected automatically
+- ✅ Lazy instruction loading for bundled scheduling/history docs via `agent-chat-gateway instructions ...`
 - ✅ 256 KB per file limit
 - ✅ 512 KB total context limit
 - ✅ Multiple context files supported (concatenated)
@@ -351,4 +354,3 @@ If you'd like to see a feature implemented:
 4. **Submit an issue** — File a feature request with your use case and motivation
 
 For security-related features or constraints, please contact the maintainers privately via the security reporting process.
-

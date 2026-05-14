@@ -24,6 +24,7 @@ from unittest.mock import patch
 
 from gateway.connectors.rocketchat.agent_chain import AGENT_CHAIN_TERMINATION_TOKEN, TurnStore
 from gateway.connectors.rocketchat.config import AgentChainConfig, RocketChatConfig
+from gateway.connectors.rocketchat.mentions import is_room_wide_mention
 from gateway.connectors.rocketchat.normalize import filter_rc_message
 from gateway.core.agent_chain import AGENT_CHAIN_TERMINATION_TOKEN as CORE_TOKEN
 from gateway.core.agent_chain import build_agent_chain_context
@@ -302,6 +303,36 @@ class TestFilterRcMessageAgentChain(unittest.TestCase):
 
         self.assertTrue(result.accepted)
         self.assertFalse(result.is_agent_chain)
+
+    def test_require_mention_true_accepts_room_wide_all_mention(self):
+        config = _make_config(owners=["human1"], require_mention=True)
+        room_wide_username = "all"
+        self.assertTrue(is_room_wide_mention(room_wide_username))
+        doc = _make_doc(
+            sender="human1",
+            rid="room1",
+            msg="@all everyone please check in",
+            mentions=[{"username": room_wide_username}],
+        )
+
+        result = filter_rc_message(doc, config, "channel", None)
+
+        self.assertTrue(result.accepted)
+        self.assertFalse(result.is_agent_chain)
+
+    def test_room_wide_all_mention_does_not_bypass_sender_filter(self):
+        config = _make_config(owners=["human1"], require_mention=True, filter_sender=True)
+        doc = _make_doc(
+            sender="stranger",
+            rid="room1",
+            msg="@all everyone please check in",
+            mentions=[{"username": "all"}],
+        )
+
+        result = filter_rc_message(doc, config, "channel", None)
+
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "sender not in allow-list")
 
     def test_filter_sender_false_allows_unknown_senders(self):
         config = _make_config(owners=["human1"], filter_sender=False)

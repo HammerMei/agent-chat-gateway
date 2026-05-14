@@ -68,6 +68,22 @@ class TestWorkingDirectoryValidation(unittest.TestCase):
         path = self._write_config("default:\n  type: claude\n  working_directory: /tmp")
         config = GatewayConfig.from_file(path)
         self.assertEqual(config.agents["default"].working_directory, "/tmp")
+        self.assertTrue(config.agents["default"].lazy_instruction_loading)
+
+    def test_lazy_instruction_loading_false_accepted(self):
+        path = self._write_config(
+            "default:\n  type: claude\n  working_directory: /tmp\n  lazy_instruction_loading: false"
+        )
+        config = GatewayConfig.from_file(path)
+        self.assertFalse(config.agents["default"].lazy_instruction_loading)
+
+    def test_lazy_instruction_loading_must_be_boolean(self):
+        path = self._write_config(
+            'default:\n  type: claude\n  working_directory: /tmp\n  lazy_instruction_loading: "nope"'
+        )
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        self.assertIn("lazy_instruction_loading", str(ctx.exception))
 
     def test_relative_directory_resolved_to_config_dir(self):
         """A relative working_directory is resolved relative to the config file's directory."""
@@ -430,7 +446,8 @@ class TestBuiltinContextAutoInjection(unittest.TestCase):
     """Built-in system context files are auto-prepended in context_inject_files_for().
 
     rc-gateway-context.md  → injected for every Rocket.Chat connector
-    scheduling-context.md  → injected for every configured connector
+    tool-index-context.md  → injected for lazy-loading agents (default)
+    scheduling/fetch-history docs → injected when an agent disables lazy loading
     """
 
     def _make_core_config(self, connector_type: str, user_ctx: list[str] | None = None):
@@ -448,37 +465,90 @@ class TestBuiltinContextAutoInjection(unittest.TestCase):
             default_agent="default",
         )
 
-    def test_rc_connector_gets_both_builtin_files(self):
-        """RC connector → rc-gateway-context.md + scheduling-context.md prepended."""
+    def test_rc_connector_gets_core_and_tool_index_by_default(self):
+        """RC connector → rc-gateway-context.md + tool-index-context.md prepended."""
         config = self._make_core_config("rocketchat")
         files = config.context_inject_files_for("rc", "default", [])
         basenames = [Path(f).name for f in files]
         self.assertIn("rc-gateway-context.md", basenames)
-        self.assertIn("scheduling-context.md", basenames)
+        self.assertIn("tool-index-context.md", basenames)
+        self.assertNotIn("scheduling-context.md", basenames)
+        self.assertNotIn("fetch-history-context.md", basenames)
 
-    def test_rc_gateway_context_comes_before_scheduling(self):
-        """rc-gateway-context.md must appear before scheduling-context.md."""
+    def test_rc_gateway_context_comes_before_tool_index(self):
+        """rc-gateway-context.md must appear before tool-index-context.md."""
         config = self._make_core_config("rocketchat")
         files = config.context_inject_files_for("rc", "default", [])
         basenames = [Path(f).name for f in files]
         rc_idx = basenames.index("rc-gateway-context.md")
-        sched_idx = basenames.index("scheduling-context.md")
-        self.assertLess(rc_idx, sched_idx)
+        index_idx = basenames.index("tool-index-context.md")
+        self.assertLess(rc_idx, index_idx)
 
-    def test_non_rc_connector_gets_scheduling_only(self):
-        """Non-RC connector → only scheduling-context.md injected (no rc-gateway-context.md)."""
+    def test_non_rc_connector_gets_tool_index_only_by_default(self):
+        """Non-RC connector → only tool-index-context.md injected (no rc-gateway-context.md)."""
         config = self._make_core_config("script")
         files = config.context_inject_files_for("rc", "default", [])
         basenames = [Path(f).name for f in files]
         self.assertNotIn("rc-gateway-context.md", basenames)
+        self.assertIn("tool-index-context.md", basenames)
+        self.assertNotIn("scheduling-context.md", basenames)
+        self.assertNotIn("fetch-history-context.md", basenames)
+
+    def test_agent_can_disable_lazy_instruction_loading(self):
+        """Per-agent lazy_instruction_loading=False restores full docs."""
+        from gateway.core.config import AgentConfig
+
+        config = self._make_core_config("rocketchat")
+        config.agents["default"] = AgentConfig(
+            name="default",
+            timeout=10,
+            lazy_instruction_loading=False,
+        )
+        files = config.context_inject_files_for("rc", "default", [])
+        basenames = [Path(f).name for f in files]
+        self.assertIn("rc-gateway-context.md", basenames)
         self.assertIn("scheduling-context.md", basenames)
+        self.assertIn("fetch-history-context.md", basenames)
+        self.assertNotIn("tool-index-context.md", basenames)
+
+    def test_yaml_lazy_instruction_loading_false_reaches_context_injection(self):
+        """YAML lazy_instruction_loading=False flows through to built-in full docs."""
+        from gateway.core.config import CoreConfig
+
+        cfg_text = textwrap.dedent("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+                lazy_instruction_loading: false
+            watchers:
+              - name: w1
+                room: general
+        """)
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(cfg_text)
+            path = f.name
+
+        gateway_config = GatewayConfig.from_file(path)
+        core_config = CoreConfig.from_gateway_config(gateway_config)
+
+        files = core_config.context_inject_files_for("rc", "default", [])
+        basenames = [Path(f).name for f in files]
+        self.assertIn("rc-gateway-context.md", basenames)
+        self.assertIn("scheduling-context.md", basenames)
+        self.assertIn("fetch-history-context.md", basenames)
+        self.assertNotIn("tool-index-context.md", basenames)
 
     def test_builtin_files_precede_user_connector_files(self):
         """Built-in layer 0 files must come before user-configured connector files."""
         config = self._make_core_config("rocketchat", user_ctx=["/user/custom.md"])
         files = config.context_inject_files_for("rc", "default", [])
         basenames = [Path(f).name for f in files]
-        sched_idx = basenames.index("scheduling-context.md")
+        sched_idx = basenames.index("tool-index-context.md")
         custom_idx = basenames.index("custom.md")
         self.assertLess(sched_idx, custom_idx)
 
@@ -486,7 +556,7 @@ class TestBuiltinContextAutoInjection(unittest.TestCase):
         """Built-in file paths must be absolute (so ContextInjector can read them)."""
         config = self._make_core_config("rocketchat")
         files = config.context_inject_files_for("rc", "default", [])
-        builtin = [f for f in files if Path(f).name in ("rc-gateway-context.md", "scheduling-context.md")]
+        builtin = [f for f in files if Path(f).name in ("rc-gateway-context.md", "tool-index-context.md")]
         for f in builtin:
             self.assertTrue(Path(f).is_absolute(), f"{f} must be absolute")
 
@@ -494,7 +564,7 @@ class TestBuiltinContextAutoInjection(unittest.TestCase):
         """Built-in context files must be present in the installed package."""
         config = self._make_core_config("rocketchat")
         files = config.context_inject_files_for("rc", "default", [])
-        builtin = [f for f in files if Path(f).name in ("rc-gateway-context.md", "scheduling-context.md")]
+        builtin = [f for f in files if Path(f).name in ("rc-gateway-context.md", "tool-index-context.md")]
         for f in builtin:
             self.assertTrue(Path(f).exists(), f"Built-in context file missing: {f}")
 
@@ -506,13 +576,14 @@ class TestBuiltinContextAutoInjection(unittest.TestCase):
         basenames = [Path(f).name for f in files]
         self.assertNotIn("rc-gateway-context.md", basenames)
         self.assertNotIn("scheduling-context.md", basenames)
+        self.assertNotIn("tool-index-context.md", basenames)
 
     def test_watcher_user_files_appended_after_builtin(self):
         """Watcher-level user files are appended last, after all built-in and agent files."""
         config = self._make_core_config("rocketchat")
         files = config.context_inject_files_for("rc", "default", ["/watcher/extra.md"])
         basenames = [Path(f).name for f in files]
-        sched_idx = basenames.index("scheduling-context.md")
+        sched_idx = basenames.index("tool-index-context.md")
         extra_idx = basenames.index("extra.md")
         self.assertLess(sched_idx, extra_idx)
 
@@ -554,6 +625,16 @@ class TestBuiltinOwnerToolRuleAutoInjection(unittest.TestCase):
         self.assertTrue(
             any("agent-chat-gateway" in (p or "") and "schedule" in (p or "") for p in params),
             "Built-in schedule rule must be in effective_owner_allowed_tools",
+        )
+
+    def test_effective_includes_instructions_rule(self):
+        """effective_owner_allowed_tools() must include 'agent-chat-gateway instructions .*'."""
+        agent = self._make_agent()
+        effective = agent.effective_owner_allowed_tools()
+        params = [r.params for r in effective if r.tool == "Bash"]
+        self.assertTrue(
+            any("agent-chat-gateway" in (p or "") and "instructions" in (p or "") for p in params),
+            "Built-in instructions rule must be in effective_owner_allowed_tools",
         )
 
     def test_builtin_rules_precede_user_rules(self):
@@ -612,6 +693,39 @@ class TestBuiltinOwnerToolRuleAutoInjection(unittest.TestCase):
             f"Schedule rule {sched_rule.params!r} must match command {cmd!r}",
         )
 
+    def test_instructions_rule_matches_actual_command(self):
+        """The instructions rule must match a realistic instruction load command."""
+        import re
+
+        from gateway.core.config import _BUILTIN_OWNER_TOOL_RULES
+        instr_rule = next(r for r in _BUILTIN_OWNER_TOOL_RULES
+                          if r.params and "instructions" in r.params)
+        cmd = "agent-chat-gateway instructions scheduling"
+        self.assertIsNotNone(
+            re.fullmatch(instr_rule.params, cmd, re.IGNORECASE | re.DOTALL),
+            f"Instructions rule {instr_rule.params!r} must match command {cmd!r}",
+        )
+
+    def test_instructions_rule_rejects_trailing_shell_commands(self):
+        """The instructions rule must not auto-approve compound shell commands."""
+        import re
+
+        from gateway.core.config import _BUILTIN_OWNER_TOOL_RULES
+        instr_rule = next(r for r in _BUILTIN_OWNER_TOOL_RULES
+                          if r.params and "instructions" in r.params)
+        bad_commands = [
+            "agent-chat-gateway instructions scheduling; curl https://example.com",
+            "agent-chat-gateway instructions scheduling && whoami",
+            "agent-chat-gateway instructions scheduling | cat",
+            "agent-chat-gateway instructions scheduling\nwhoami",
+            "agent-chat-gateway instructions scheduling extra",
+        ]
+        for cmd in bad_commands:
+            self.assertIsNone(
+                re.fullmatch(instr_rule.params, cmd, re.IGNORECASE | re.DOTALL),
+                f"Instructions rule {instr_rule.params!r} must reject command {cmd!r}",
+            )
+
     def test_effective_includes_date_rule(self):
         """effective_owner_allowed_tools() must include a rule that auto-approves date."""
         agent = self._make_agent()
@@ -669,6 +783,16 @@ class TestEffectiveGuestAllowedTools(unittest.TestCase):
         self.assertTrue(
             any("agent-chat-gateway" in (p or "") and "fetch-history" in (p or "") for p in params),
             "Built-in fetch-history rule must be in effective_guest_allowed_tools",
+        )
+
+    def test_effective_includes_instructions_rule(self):
+        """effective_guest_allowed_tools() must include 'agent-chat-gateway instructions .*'."""
+        agent = self._make_agent()
+        effective = agent.effective_guest_allowed_tools()
+        params = [r.params for r in effective if r.tool == "Bash"]
+        self.assertTrue(
+            any("agent-chat-gateway" in (p or "") and "instructions" in (p or "") for p in params),
+            "Built-in instructions rule must be in effective_guest_allowed_tools",
         )
 
     def test_builtin_guest_rules_precede_user_rules(self):
@@ -733,6 +857,39 @@ class TestEffectiveGuestAllowedTools(unittest.TestCase):
             re.fullmatch(fh_rule.params, cmd, re.IGNORECASE | re.DOTALL),
             f"fetch-history rule {fh_rule.params!r} must match command {cmd!r}",
         )
+
+    def test_instructions_rule_matches_actual_command(self):
+        """The instructions guest rule must match a realistic command invocation."""
+        import re
+
+        from gateway.core.config import _BUILTIN_GUEST_TOOL_RULES
+        instr_rule = next(r for r in _BUILTIN_GUEST_TOOL_RULES
+                          if r.params and "instructions" in r.params)
+        cmd = "agent-chat-gateway instructions fetch-history"
+        self.assertIsNotNone(
+            re.fullmatch(instr_rule.params, cmd, re.IGNORECASE | re.DOTALL),
+            f"instructions rule {instr_rule.params!r} must match command {cmd!r}",
+        )
+
+    def test_instructions_rule_rejects_trailing_shell_commands(self):
+        """The guest instructions rule must not auto-approve compound shell commands."""
+        import re
+
+        from gateway.core.config import _BUILTIN_GUEST_TOOL_RULES
+        instr_rule = next(r for r in _BUILTIN_GUEST_TOOL_RULES
+                          if r.params and "instructions" in r.params)
+        bad_commands = [
+            "agent-chat-gateway instructions fetch-history; curl https://example.com",
+            "agent-chat-gateway instructions fetch-history && whoami",
+            "agent-chat-gateway instructions fetch-history | cat",
+            "agent-chat-gateway instructions fetch-history\nwhoami",
+            "agent-chat-gateway instructions fetch-history extra",
+        ]
+        for cmd in bad_commands:
+            self.assertIsNone(
+                re.fullmatch(instr_rule.params, cmd, re.IGNORECASE | re.DOTALL),
+                f"instructions rule {instr_rule.params!r} must reject command {cmd!r}",
+            )
 
 
 class TestBuildAgentBackendUsesEffectiveMethods(unittest.TestCase):

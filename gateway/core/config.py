@@ -24,9 +24,9 @@ _BUILTIN_CONTEXTS_DIR = Path(__file__).parent.parent / "contexts"
 # without triggering a 🔐 human-approval prompt — they are the gateway's own management
 # interface, not arbitrary shell commands.
 #
-# Owner rules: send, schedule, fetch-history, date
+# Owner rules: send, schedule, fetch-history, instructions, date
 #   (owners get all commands — write, mutation, and read-only)
-# Guest rules:  fetch-history only (read-only; send/schedule are owner-only)
+# Guest rules:  fetch-history and instructions only (read-only; send/schedule are owner-only)
 _BUILTIN_OWNER_TOOL_RULES: "list[ToolRule]" = []  # populated after ToolRule is defined
 _BUILTIN_GUEST_TOOL_RULES: "list[ToolRule]" = []  # populated after ToolRule is defined
 
@@ -102,6 +102,7 @@ _BUILTIN_OWNER_TOOL_RULES = [
     ToolRule(tool="Bash", params="agent-chat-gateway\\s+send\\s+.*"),
     ToolRule(tool="Bash", params="agent-chat-gateway\\s+schedule\\s+.*"),
     ToolRule(tool="Bash", params="agent-chat-gateway\\s+fetch-history\\s+.*"),
+    ToolRule(tool="Bash", params="agent-chat-gateway\\s+instructions\\s+(scheduling|fetch-history)\\s*"),
     # date is a read-only command used by agents to compute timestamps.
     # It is safe to auto-approve for owners so that compound bash commands
     # containing $(date ...) sub-expressions do not trigger approval prompts.
@@ -112,6 +113,7 @@ _BUILTIN_GUEST_TOOL_RULES = [
     # fetch-history is read-only — guests can safely query channel history
     # for context without being able to send messages or create schedules.
     ToolRule(tool="Bash", params="agent-chat-gateway\\s+fetch-history\\s+.*"),
+    ToolRule(tool="Bash", params="agent-chat-gateway\\s+instructions\\s+(scheduling|fetch-history)\\s*"),
 ]
 
 
@@ -123,6 +125,7 @@ class AgentConfig:
     new_session_args: list[str] = field(default_factory=list)
     working_directory: str = ""  # cwd for sidecar process (opencode agents); "" = inherit gateway cwd
     session_prefix: str = "agent-chat"  # prefix for session names/titles
+    lazy_instruction_loading: bool = True  # inject short tool index; load full docs on demand
     context_inject_files: list[str] = field(default_factory=list)  # paths injected once per session
     owner_allowed_tools: list[ToolRule] = field(default_factory=list)  # auto-approved for owners
     guest_allowed_tools: list[ToolRule] = field(default_factory=list)  # auto-approved for guests
@@ -132,20 +135,22 @@ class AgentConfig:
     def effective_owner_allowed_tools(self) -> "list[ToolRule]":
         """Return owner_allowed_tools with built-in gateway rules prepended.
 
-        The built-in rules (``agent-chat-gateway send``, ``schedule``, and
-        ``fetch-history``) are always included so that agents can call gateway
-        management commands without triggering a 🔐 human-approval prompt —
-        no user config required.  User-defined rules follow the built-in ones
-        so that custom patterns can further extend the allow list.
+        The built-in rules (``agent-chat-gateway send``, ``schedule``,
+        ``fetch-history``, and ``instructions``) are always included so that
+        agents can call gateway management commands without triggering a 🔐
+        human-approval prompt — no user config required.  User-defined rules
+        follow the built-in ones so that custom patterns can further extend
+        the allow list.
         """
         return list(_BUILTIN_OWNER_TOOL_RULES) + list(self.owner_allowed_tools)
 
     def effective_guest_allowed_tools(self) -> "list[ToolRule]":
         """Return guest_allowed_tools with built-in read-only gateway rules prepended.
 
-        The built-in guest rule allows ``agent-chat-gateway fetch-history`` —
-        a read-only operation safe for guest-role agents.  Write operations
-        (``send``, ``schedule``) remain owner-only.
+        The built-in guest rules allow ``agent-chat-gateway fetch-history``
+        and ``agent-chat-gateway instructions`` — read-only operations safe
+        for guest-role agents.  Write operations (``send``, ``schedule``)
+        remain owner-only.
         """
         return list(_BUILTIN_GUEST_TOOL_RULES) + list(self.guest_allowed_tools)
 
@@ -263,7 +268,8 @@ class CoreConfig:
         Concatenates four layers in order:
           0. Built-in system files (auto-injected; no user config needed):
                - rc-gateway-context.md  — injected for every Rocket.Chat connector
-               - scheduling-context.md  — injected for every configured connector
+               - tool-index-context.md  — injected when the agent uses lazy instruction loading
+               - scheduling/fetch-history docs — injected when lazy loading is disabled
           1. Connector-level files (from ConnectorConfig.context_inject_files)
           2. Agent-level files    (from AgentConfig.context_inject_files)
           3. Watcher-level files  (passed in directly as watcher_ctx)
@@ -276,18 +282,21 @@ class CoreConfig:
         """
         result: list[str] = []
         connector_cfg = self.connector_configs.get(connector_name)
+        agent_cfg = self.agent_config(agent_name)
 
         # Layer 0: built-in system context files (shipped inside the package)
         if connector_cfg is not None:
             if connector_cfg.type == "rocketchat":
                 result.append(str(_BUILTIN_CONTEXTS_DIR / "rc-gateway-context.md"))
-            result.append(str(_BUILTIN_CONTEXTS_DIR / "scheduling-context.md"))
-            result.append(str(_BUILTIN_CONTEXTS_DIR / "fetch-history-context.md"))
+            if agent_cfg.lazy_instruction_loading:
+                result.append(str(_BUILTIN_CONTEXTS_DIR / "tool-index-context.md"))
+            else:
+                result.append(str(_BUILTIN_CONTEXTS_DIR / "scheduling-context.md"))
+                result.append(str(_BUILTIN_CONTEXTS_DIR / "fetch-history-context.md"))
             # Layer 1: connector-level user files
             result.extend(connector_cfg.context_inject_files)
 
         # Layer 2: agent-level user files
-        agent_cfg = self.agent_config(agent_name)
         result.extend(agent_cfg.context_inject_files)
 
         # Layer 3: watcher-level user files

@@ -841,7 +841,15 @@ class TestContextInjectorDynamicHeader(unittest.IsolatedAsyncioTestCase):
             return None
 
         with patch("gateway.core.context_injector.asyncio.to_thread", side_effect=fake_to_thread):
-            await injector.inject(ws, "ses_header_test", agent, "default", "rc-home", wc)
+            await injector.inject(
+                ws,
+                "ses_header_test",
+                agent,
+                "default",
+                "rc-home",
+                wc,
+                agent_username="bot",
+            )
 
         self.assertIsNotNone(sent_prompt, "agent.send must have been called")
         # Dynamic header must appear before the static file content
@@ -853,6 +861,10 @@ class TestContextInjectorDynamicHeader(unittest.IsolatedAsyncioTestCase):
         # Watcher name and connector must appear in the header
         self.assertIn("my-watcher", sent_prompt)
         self.assertIn("rc-home", sent_prompt)
+        self.assertIn("to: @all", sent_prompt)
+        self.assertIn("broader fan-out is intentional", sent_prompt)
+        self.assertIn("priority responders", sent_prompt)
+        self.assertIn("ONLY `<end-of-agent-chain>`", sent_prompt)
 
     async def test_dynamic_header_not_sent_when_all_files_oversized(self):
         """When all context files are oversized, agent.send must NOT be called."""

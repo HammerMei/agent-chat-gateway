@@ -159,6 +159,26 @@ class TestCLIArgParsing(unittest.TestCase):
         self.assertEqual(cm.exception.code, 1)
 
 
+class TestCLIInstructions(_CLITestBase):
+    """instructions: print bundled docs without contacting the daemon."""
+
+    def test_instructions_scheduling_prints_scheduling_doc(self):
+        stdout, stderr, code = self._run(["instructions", "scheduling"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("# ACG Scheduling Commands", stdout)
+        self.assertIn("agent-chat-gateway schedule create", stdout)
+
+    def test_instructions_fetch_history_prints_fetch_history_doc(self):
+        stdout, stderr, code = self._run(["instructions", "fetch-history"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("# fetch-history", stdout)
+        self.assertIn("agent-chat-gateway fetch-history", stdout)
+
+
 # ---------------------------------------------------------------------------
 # Tests: status command
 # ---------------------------------------------------------------------------

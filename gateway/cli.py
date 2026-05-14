@@ -120,6 +120,17 @@ def main():
     fh_p.add_argument("--verbatim", type=int, default=15, metavar="N",
                       help="Last N messages kept verbatim; older messages condensed (default: 15)")
 
+    # instructions
+    instructions_p = sub.add_parser(
+        "instructions",
+        help="Print bundled ACG instruction docs by name",
+    )
+    instructions_p.add_argument(
+        "name",
+        choices=_instruction_names(),
+        help="Instruction document to print",
+    )
+
     # schedule (sub-subcommands)
     schedule_p = sub.add_parser("schedule", help="Manage scheduled agent tasks")
     schedule_sub = schedule_p.add_subparsers(dest="schedule_cmd", help="Schedule subcommands")
@@ -311,8 +322,28 @@ def main():
     elif args.command == "fetch-history":
         _run_fetch_history(args)
 
+    elif args.command == "instructions":
+        _run_instructions(args)
+
     elif args.command == "schedule":
         _run_schedule(args)
+
+
+def _run_instructions(args) -> None:
+    """Print a bundled instruction document without requiring the daemon."""
+    from .instructions import read_instruction
+
+    try:
+        print(read_instruction(args.name), end="")
+    except (OSError, ValueError) as exc:
+        print(f"Error: could not read instruction {args.name!r}: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _instruction_names() -> list[str]:
+    from .instructions import instruction_names
+
+    return instruction_names()
 
 
 def _run_fetch_history(args) -> None:
