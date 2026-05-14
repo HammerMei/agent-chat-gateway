@@ -534,6 +534,45 @@ class TestFormatPromptPrefixToField(unittest.TestCase):
         prefix = connector.format_prompt_prefix(msg)
         self.assertIn("to: me+@wavebro", prefix)
 
+    def test_channel_all_mentioned(self):
+        """Channel message @all → to: @all"""
+        from gateway.connectors.rocketchat.mentions import is_room_wide_mention
+
+        self.assertTrue(is_room_wide_mention("all"))
+        connector = _make_rc_connector_with_agents(["wavebro"])
+        msg = _make_msg_with_mentions(
+            "general", "alice", room_type="channel", mentions=["all"]
+        )
+        prefix = connector.format_prompt_prefix(msg)
+        self.assertIn("to: @all", prefix)
+
+    def test_channel_all_and_specific_mentions_preserves_priority_agent(self):
+        """@all preserves specific agent mentions as priority recipients."""
+        connector = _make_rc_connector_with_agents(["wavebro"])
+        msg = _make_msg_with_mentions(
+            "general", "alice", room_type="channel", mentions=["all", "wavebro"]
+        )
+        prefix = connector.format_prompt_prefix(msg)
+        self.assertIn("to: @all+@wavebro", prefix)
+
+    def test_channel_all_and_bot_mentions_preserves_me(self):
+        """@all preserves explicit mentions of this bot as a priority recipient."""
+        connector = _make_rc_connector_with_agents(["wavebro"])
+        msg = _make_msg_with_mentions(
+            "general", "alice", room_type="channel", mentions=["all", "bot"]
+        )
+        prefix = connector.format_prompt_prefix(msg)
+        self.assertIn("to: me+@all", prefix)
+
+    def test_channel_all_bot_and_specific_mentions_preserves_all_targets(self):
+        """@all combines with this bot and other priority agent recipients."""
+        connector = _make_rc_connector_with_agents(["wavebro"])
+        msg = _make_msg_with_mentions(
+            "general", "alice", room_type="channel", mentions=["bot", "all", "wavebro"]
+        )
+        prefix = connector.format_prompt_prefix(msg)
+        self.assertIn("to: me+@all+@wavebro", prefix)
+
     def test_dm_always_to_me_even_without_mentions(self):
         """DM messages are always addressed to the bot → to: me (no @mention needed)"""
         connector = _make_rc_connector_with_agents(["wavebro"])

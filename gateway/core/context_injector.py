@@ -197,8 +197,9 @@ class ContextInjector:
                     f"## Multi-Agent Addressing\n"
                     f"Each message header includes a `to:` field. Use it to decide your response:\n"
                     f"- `to: me` — message explicitly addressed to you → respond normally\n"
+                    f"- `to: @all` — room-wide explicit mention → broader fan-out is intentional; reply only with useful, non-duplicative input, otherwise output ONLY `<end-of-agent-chain>`\n"
                     f"- `to: @<agent>` — addressed to another agent → stay silent unless you have something essential to add\n"
-                    f"- `to: me+@<agent>` — addressed to you and others → respond normally\n"
+                    f"- `to: me+@<agent>` / `to: me+@all+@<agent>` — addressed to you and other priority responders; if `@all` is present, broader fan-out is intentional but keep replies concise and non-duplicative\n"
                     f"- `to: *` — no explicit agent mention → use judgment; respond only if you have something meaningful to contribute\n"
                 )
             # Inject order (innermost = inserted last at position 0):

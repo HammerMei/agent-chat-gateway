@@ -7,6 +7,9 @@ def test_rc_context_contains_directed_reply_etiquette():
     context_path = Path(__file__).parents[2] / "gateway" / "contexts" / "rc-gateway-context.md"
     text = context_path.read_text(encoding="utf-8")
 
+    assert "`to: @all`" in text
+    assert "intentional broader fan-out" in text
+    assert "priority responders" in text
     assert "Directed Reply Etiquette" in text
     assert "Use explicit @mentions for directed replies" in text
     assert "human or agent" in text

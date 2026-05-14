@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 
 from ...core.adapter_utils import ts_to_float as _ts_to_float
 from ...core.connector import Attachment, IncomingMessage, Room, User, UserRole
+from .mentions import is_room_wide_mention
 
 if TYPE_CHECKING:
     from .agent_chain import TurnStore
@@ -106,7 +107,10 @@ def filter_rc_message(
     if config.require_mention and not is_agent and room_type != "dm":
         mentions = doc.get("mentions", [])
         bot_mentioned = any(m.get("username") == config.username for m in mentions)
-        if not bot_mentioned:
+        room_wide_mentioned = any(
+            is_room_wide_mention(m.get("username", "")) for m in mentions
+        )
+        if not bot_mentioned and not room_wide_mentioned:
             msg_text = doc.get("msg", "")
             attach_descs = " ".join(
                 a.get("description", "") for a in doc.get("attachments", [])
@@ -226,19 +230,6 @@ async def normalize_rc_message(
         for m in doc.get("mentions", [])
         if m.get("username")
     ]
-
-    raw_msg = doc.get("msg", "")
-    if isinstance(raw_msg, str) and "@all" in raw_msg:
-        logger.warning(
-            "DEBUG @all payload: sender=%s room=%s thread_id=%s msg=%r mentions=%r raw_keys=%r raw=%r",
-            sender_username,
-            room.name,
-            thread_id,
-            raw_msg,
-            mentions,
-            sorted(doc.keys()),
-            doc,
-        )
 
     msg = IncomingMessage(
         id=doc.get("_id", msg_ts),
