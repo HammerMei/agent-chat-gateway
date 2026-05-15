@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.4.0] - 2026-05-14
+
+### Added
+- **Lazy instruction loading for bundled gateway docs**: agents now receive a
+  compact tool index by default and can load full scheduling/history guidance on
+  demand with `agent-chat-gateway instructions scheduling` or
+  `agent-chat-gateway instructions fetch-history`. Agents can opt out with
+  `lazy_instruction_loading: false` to inject the full docs at session start.
+- **Rocket.Chat `@all` fan-out routing**: room-wide `@all` mentions are treated
+  as explicit permission for broader multi-agent fan-out, while specific agent
+  mentions in the same message remain priority responders.
+
+### Changed
+- **Multi-agent reply guidance** now emphasizes directed `@mention` replies,
+  conservative broadcast behavior, priority responders, and clean silence via
+  `<end-of-agent-chain>`.
+- **Documentation** now covers built-in context auto-injection, lazy instruction
+  loading, and `@all` routing semantics.
+
+---
+
 ## [0.3.3] - 2026-05-06
 
 ### Fixed
