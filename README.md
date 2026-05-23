@@ -4,6 +4,7 @@
 [![Docker](https://ghcr-badge.egpl.dev/hammermei/agent-chat-gateway/latest_tag?trim=major&label=docker&color=blue)](https://github.com/HammerMei/agent-chat-gateway/pkgs/container/agent-chat-gateway)
 ![Python](https://img.shields.io/badge/python-%3E%3D3.12-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
+[![Stars](https://img.shields.io/github/stars/HammerMei/agent-chat-gateway?style=flat&color=yellow)](https://github.com/HammerMei/agent-chat-gateway/stargazers)
 
 **Turn your AI agent into a team-shared chatbot — in minutes.**
 
