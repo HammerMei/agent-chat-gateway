@@ -1174,7 +1174,7 @@ class TestOnWsReconnect(unittest.IsolatedAsyncioTestCase):
 
         dispatched: list[dict] = []
 
-        async def capture_dispatch(room_id, doc):
+        async def capture_dispatch(room_id, doc, **kwargs):
             dispatched.append(doc)
 
         connector._on_raw_ddp_message = capture_dispatch  # type: ignore[method-assign]
@@ -1191,7 +1191,7 @@ class TestOnWsReconnect(unittest.IsolatedAsyncioTestCase):
 
         dispatched: list = []
 
-        async def capture_dispatch(room_id, doc):
+        async def capture_dispatch(room_id, doc, **kwargs):
             dispatched.append(doc)
 
         connector._on_raw_ddp_message = capture_dispatch  # type: ignore[method-assign]
@@ -1221,7 +1221,7 @@ class TestOnWsReconnect(unittest.IsolatedAsyncioTestCase):
 
         dispatched: list = []
 
-        async def capture_dispatch(room_id, doc):
+        async def capture_dispatch(room_id, doc, **kwargs):
             dispatched.append(doc)
 
         connector._on_raw_ddp_message = capture_dispatch  # type: ignore[method-assign]
@@ -1431,7 +1431,7 @@ class TestReviewFixes(unittest.IsolatedAsyncioTestCase):
 
         dispatched: list = []
 
-        async def capture(room_id, doc):
+        async def capture(room_id, doc, **kwargs):
             dispatched.append(doc)
 
         connector._on_raw_ddp_message = capture  # type: ignore[method-assign]
@@ -1466,7 +1466,7 @@ class TestReviewFixes(unittest.IsolatedAsyncioTestCase):
 
         dispatched: list = []
 
-        async def remove_then_dispatch(room_id, doc):
+        async def remove_then_dispatch(room_id, doc, **kwargs):
             # Simulate concurrent unsubscribe after the first message.
             connector._rooms.pop(room_id, None)
             dispatched.append(doc)
@@ -1477,6 +1477,152 @@ class TestReviewFixes(unittest.IsolatedAsyncioTestCase):
         # Only the first message was dispatched before the room vanished.
         self.assertEqual(len(dispatched), 1)
         self.assertEqual(dispatched[0]["_id"], "m1")
+
+
+# ── Tests: round-3 review fixes ─────────────────────────────────────────────
+
+
+class TestRound3Fixes(unittest.IsolatedAsyncioTestCase):
+    """Regression tests for findings addressed in round-3 code-review pass."""
+
+    # --- Fix 1: no busy-notification spam during replay ---
+
+    async def test_no_busy_notification_during_replay(self):
+        """capacity-rejected messages during replay must NOT fire post_message."""
+        from unittest.mock import patch as _patch
+
+        connector = _make_connector()
+        connector._rooms["room-1"].last_processed_ts = "100"
+        connector._ws.subscription_statuses = {}
+        connector._capacity_check = lambda room_id: False  # always reject
+        connector._rest.post_message = AsyncMock()
+        connector._rest.get_room_history = AsyncMock(return_value=[
+            {"_id": "r1", "msg": "hi", "u": {"username": "alice"}, "ts": {"$date": 200}},
+        ])
+
+        with _patch("gateway.connectors.rocketchat.connector.filter_rc_message") as mock_filter:
+            from gateway.connectors.rocketchat.normalize import FilterResult
+            mock_filter.return_value = FilterResult(
+                accepted=True, sender="alice", msg_ts="200", reason=""
+            )
+            await connector._on_ws_reconnect()
+
+        # Busy notification must NOT fire during replay
+        connector._rest.post_message.assert_not_awaited()
+
+    async def test_busy_notification_fires_for_live_delivery(self):
+        """capacity-rejected messages on the live path still send busy notification."""
+        from unittest.mock import patch as _patch
+
+        connector = _make_connector()
+        connector._handler = AsyncMock(return_value=True)
+        connector._capacity_check = lambda room_id: False
+        connector._rest.post_message = AsyncMock()
+
+        doc = {"_id": "live1", "msg": "hi", "u": {"username": "alice"}, "ts": {"$date": 100}}
+        with _patch("gateway.connectors.rocketchat.connector.filter_rc_message") as mock_filter:
+            from gateway.connectors.rocketchat.normalize import FilterResult
+            mock_filter.return_value = FilterResult(
+                accepted=True, sender="alice", msg_ts="100", reason=""
+            )
+            # is_replay defaults to False → live path
+            await connector._on_raw_ddp_message("room-1", doc)
+
+        connector._rest.post_message.assert_awaited_once()
+
+    # --- Fix 2: handler-returns-False must be re-deliverable by replay ---
+
+    async def test_handler_false_removes_msg_id_from_seen_ids(self):
+        """When the handler returns False, msg_id must be removed from seen_ids_set
+        so the reconnect replay path can re-deliver the message."""
+        from unittest.mock import patch as _patch
+
+        connector = _make_connector()
+        connector._handler = AsyncMock(return_value=False)  # queue full
+
+        doc = {"_id": "qfull", "msg": "hi", "u": {"username": "alice"}, "ts": {"$date": 100}}
+        with (
+            _patch("gateway.connectors.rocketchat.connector.filter_rc_message") as mock_filter,
+            _patch("gateway.connectors.rocketchat.connector.normalize_rc_message") as mock_norm,
+            _patch("gateway.connectors.rocketchat.connector.apply_thread_policy"),
+        ):
+            from gateway.connectors.rocketchat.normalize import FilterResult
+            from gateway.core.connector import IncomingMessage, Room, User, UserRole
+            mock_filter.return_value = FilterResult(
+                accepted=True, sender="alice", msg_ts="100", reason=""
+            )
+            mock_norm.return_value = IncomingMessage(
+                id="qfull", timestamp="100",
+                room=Room(id="room-1", name="general", type="channel"),
+                sender=User(id="u1", username="alice"),
+                role=UserRole.OWNER,
+                text="hi",
+            )
+            await connector._on_raw_ddp_message("room-1", doc)
+
+        sub = connector._rooms["room-1"]
+        # Must NOT be in seen_ids so replay can re-deliver it
+        self.assertNotIn("qfull", sub.seen_ids_set)
+        # Watermark must NOT have advanced
+        self.assertIsNone(sub.last_processed_ts)
+
+    # --- Fix 3: watermark snapshot prevents stale after_ts in multi-room loop ---
+
+    async def test_watermark_snapshotted_before_await(self):
+        """Advancing last_processed_ts after the replay loop starts must not
+        affect the after_ts used for the in-flight get_room_history call."""
+        connector = _make_connector()
+        connector._rooms["room-1"].last_processed_ts = "100"
+        connector._ws.subscription_statuses = {}
+
+        captured_after_ts: list[str] = []
+
+        async def fake_history(room_id, room_type, count, after_ts):
+            # Simulate a live message advancing the watermark while we await
+            connector._rooms["room-1"].last_processed_ts = "999"
+            captured_after_ts.append(after_ts)
+            return []
+
+        connector._rest.get_room_history = fake_history
+        await connector._on_ws_reconnect()
+
+        # Must use the watermark that was snapshotted BEFORE the await (100),
+        # not the one updated mid-call (999)
+        self.assertEqual(captured_after_ts, ["100"])
+
+    # --- Fix 4: preflight-reject seen_ids add before await prevents deque duplicate ---
+
+    async def test_preflight_reject_seen_ids_add_is_synchronous(self):
+        """After a capacity-rejected message, msg_id must be in seen_ids_set
+        immediately (before any await) so a concurrent second delivery is blocked."""
+        from unittest.mock import patch as _patch
+
+        connector = _make_connector()
+        connector._handler = AsyncMock(return_value=True)
+        connector._capacity_check = lambda room_id: False
+        connector._rest.post_message = AsyncMock()
+
+        # Track whether seen_ids_set was populated before or after post_message
+        seen_before_post: list[bool] = []
+
+        original_post = connector._rest.post_message
+
+        async def spy_post(channel, text, **kwargs):
+            seen_before_post.append("cap-sync" in connector._rooms["room-1"].seen_ids_set)
+            return await original_post(channel, text, **kwargs)
+
+        connector._rest.post_message = spy_post
+
+        doc = {"_id": "cap-sync", "msg": "hi", "u": {"username": "alice"}, "ts": {"$date": 100}}
+        with _patch("gateway.connectors.rocketchat.connector.filter_rc_message") as mock_filter:
+            from gateway.connectors.rocketchat.normalize import FilterResult
+            mock_filter.return_value = FilterResult(
+                accepted=True, sender="alice", msg_ts="100", reason=""
+            )
+            await connector._on_raw_ddp_message("room-1", doc)
+
+        # seen_ids_set must have been populated BEFORE post_message was called
+        self.assertEqual(seen_before_post, [True])
 
 
 if __name__ == "__main__":
