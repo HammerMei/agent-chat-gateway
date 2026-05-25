@@ -1590,6 +1590,67 @@ class TestRound3Fixes(unittest.IsolatedAsyncioTestCase):
         # not the one updated mid-call (999)
         self.assertEqual(captured_after_ts, ["100"])
 
+    # --- Fix 5 (Round 4): replay filter must use snapshotted watermark, not live ts ---
+
+    async def test_replay_filter_uses_snapshotted_watermark_not_live_ts(self):
+        """replay_after_ts prevents live-watermark advances from dropping replay messages.
+
+        Scenario: outage at T=100; reconnect; live message at T=200 advances
+        sub.last_processed_ts to "200" while replay is in progress.  Without the
+        fix, filter_rc_message sees last_ts=200 and rejects the T=150 replay
+        message as "already processed".  With the fix it sees replay_after_ts=100
+        and accepts T=150 (it falls inside the outage window).
+        """
+        connector = _make_connector()
+        connector._handler = AsyncMock(return_value=True)
+        # Simulate a concurrent live message that has advanced the watermark to t=200
+        # (past the outage window and past our replay message at t=150).
+        connector._rooms["room-1"].last_processed_ts = "200"
+
+        # Replay message sent at t=150 — inside the outage window [100, 200)
+        doc = {
+            "_id": "outage-msg-150",
+            "msg": "@bot hello during outage",
+            "u": {"username": "alice"},
+            "ts": {"$date": 150},
+            "mentions": [{"username": "bot"}],
+            "rid": "room-1",
+        }
+        # replay_after_ts=100 is the watermark snapshotted before the replay loop.
+        # The filter must accept t=150 because 150 > 100, even though live ts=200.
+        await connector._on_raw_ddp_message(
+            "room-1", doc, is_replay=True, replay_after_ts="100"
+        )
+
+        # Handler must have been called — message was NOT dropped as "already processed"
+        connector._handler.assert_awaited_once()
+
+    async def test_replay_without_snapshotted_watermark_would_drop_message(self):
+        """Negative control: without replay_after_ts the same message is filtered.
+
+        Demonstrates that simply passing is_replay=True without the snapshotted
+        watermark is NOT enough — the fix in replay_after_ts is essential.
+        """
+        connector = _make_connector()
+        connector._handler = AsyncMock(return_value=True)
+        # Live watermark has advanced past the outage window (same as above)
+        connector._rooms["room-1"].last_processed_ts = "200"
+
+        doc = {
+            "_id": "outage-msg-150-nofix",
+            "msg": "@bot hello during outage",
+            "u": {"username": "alice"},
+            "ts": {"$date": 150},
+            "mentions": [{"username": "bot"}],
+            "rid": "room-1",
+        }
+        # Without replay_after_ts, the filter uses live last_processed_ts=200.
+        # t=150 ≤ 200 → filtered as "already processed" → handler never called.
+        await connector._on_raw_ddp_message("room-1", doc, is_replay=True)
+
+        # Handler must NOT have been called (message dropped by timestamp filter)
+        connector._handler.assert_not_awaited()
+
     # --- Fix 4: preflight-reject seen_ids add before await prevents deque duplicate ---
 
     async def test_preflight_reject_seen_ids_add_is_synchronous(self):

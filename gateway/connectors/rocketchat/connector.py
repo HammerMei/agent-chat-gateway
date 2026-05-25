@@ -261,7 +261,9 @@ class RocketChatConnector(Connector):
                         len(raw_msgs) - idx,
                     )
                     break
-                await self._on_raw_ddp_message(room_id, doc, is_replay=True)
+                await self._on_raw_ddp_message(
+                    room_id, doc, is_replay=True, replay_after_ts=watermark
+                )
 
     # ── Inbound ──────────────────────────────────────────────────────────────
 
@@ -721,7 +723,14 @@ class RocketChatConnector(Connector):
         """
         await self._on_raw_ddp_message(room_id, doc)
 
-    async def _on_raw_ddp_message(self, room_id: str, doc: dict, *, is_replay: bool = False) -> None:
+    async def _on_raw_ddp_message(
+        self,
+        room_id: str,
+        doc: dict,
+        *,
+        is_replay: bool = False,
+        replay_after_ts: str | None = None,
+    ) -> None:
         """Parse a raw RC DDP message doc, filter it, normalize it, fire handler.
 
         Filtering and deduplication are room-level (done once).
@@ -730,6 +739,20 @@ class RocketChatConnector(Connector):
 
         This is the boundary where all RC-specific field names disappear.
         After this method, only IncomingMessage objects exist in the codebase.
+
+        Args:
+            room_id        : Platform room ID.
+            doc            : Raw RC DDP message document.
+            is_replay      : True when called from the reconnect history replay
+                             path.  Suppresses busy-notification REST posts to
+                             avoid spamming the user with one per missed message.
+            replay_after_ts: Snapshotted watermark passed by ``_on_ws_reconnect``
+                             at the start of a replay loop.  When set, the
+                             timestamp dedup filter uses this value instead of
+                             the live ``sub.last_processed_ts``, preventing a
+                             concurrent live message from advancing the watermark
+                             past the replay window and silently dropping every
+                             remaining replay message as "already processed".
         """
         if not self._handler:
             return
@@ -752,11 +775,23 @@ class RocketChatConnector(Connector):
             return
 
         # --- Filter (room-level, evaluated once) ---
+        # During replay, use the watermark that was snapshotted at the START of
+        # _on_ws_reconnect (passed as replay_after_ts) rather than the live
+        # sub.last_processed_ts.  Without this, a concurrent live message that
+        # arrives and advances sub.last_processed_ts mid-replay would cause every
+        # remaining replay message (whose ts falls inside the outage window but
+        # below the new live watermark) to be rejected as "already processed",
+        # silently dropping messages the user sent during the outage.
+        filter_ts = (
+            replay_after_ts
+            if (is_replay and replay_after_ts is not None)
+            else sub.last_processed_ts
+        )
         result: FilterResult = filter_rc_message(
             doc=doc,
             config=self._config,
             room_type=sub.room.type,
-            last_processed_ts=sub.last_processed_ts,
+            last_processed_ts=filter_ts,
             turn_store=self._turn_store,
         )
         if not result.accepted:
