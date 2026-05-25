@@ -14,10 +14,11 @@ connector only through the Connector ABC defined in gateway.core.connector.
 
 from __future__ import annotations
 
+import collections
 import logging
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from ...agents.response import AgentEvent, AgentResponse
@@ -47,6 +48,9 @@ logger = logging.getLogger("agent-chat-gateway.connectors.rocketchat")
 # ---------------------------------------------------------------------------
 
 
+_SEEN_IDS_MAXLEN = 200  # bounded FIFO dedup window per room
+
+
 @dataclass
 class _RoomSubscription:
     """Connector-level room state: platform subscription + shared dedup watermark.
@@ -56,6 +60,13 @@ class _RoomSubscription:
 
     room: Room
     last_processed_ts: str | None = None
+    # Bounded FIFO set of recently-seen message _id values.  Used to deduplicate
+    # messages that arrive on both the live DDP stream and the reconnect history
+    # replay path.  deque provides O(1) append and fast len() checks while the
+    # set provides O(1) membership tests.  Both are updated together so they
+    # stay in sync; the deque is used only for eviction ordering.
+    seen_ids: collections.deque = field(default_factory=lambda: collections.deque())
+    seen_ids_set: set = field(default_factory=set)
 
 
 @dataclass
@@ -133,10 +144,17 @@ class RocketChatConnector(Connector):
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
+    # Maximum messages fetched per room during a reconnect history replay.
+    # Chosen to cover most realistic outage windows (e.g. 200 messages at
+    # ~1 msg/s ≈ 3 minutes of traffic).  A warning is emitted when the
+    # response fills the limit so operators know replay may be incomplete.
+    _REPLAY_HISTORY_COUNT = 200
+
     async def connect(self) -> None:
         """Login via REST and establish the DDP WebSocket connection."""
         await self._rest.login(self._config.username, self._config.password)
         await self._ws.connect()
+        self._ws.register_reconnect_callback(self._on_ws_reconnect)
         await self._ws.start()
         logger.info(
             "RocketChatConnector connected to %s as %s",
@@ -149,6 +167,64 @@ class RocketChatConnector(Connector):
         await self._ws.stop()
         await self._rest.close()
         logger.info("RocketChatConnector disconnected")
+
+    async def _on_ws_reconnect(self) -> None:
+        """Replay messages missed during a WebSocket outage.
+
+        Called by ``RCWebSocketClient`` after every successful reconnect + room
+        resubscription.  For each subscribed room that has a known watermark,
+        we fetch up to ``_REPLAY_HISTORY_COUNT`` messages via the REST history
+        API and re-inject them through the normal filter/normalize/dispatch
+        pipeline.
+
+        The ``_id``-based dedup window on ``_RoomSubscription`` ensures that any
+        messages delivered on both the live DDP stream and this replay path are
+        processed exactly once.  The ts-watermark handles older messages that
+        fall below the last-processed timestamp.
+        """
+        logger.info("WebSocket reconnected — replaying missed messages for %d room(s)", len(self._rooms))
+        for room_id, sub in list(self._rooms.items()):
+            if not sub.last_processed_ts:
+                logger.debug(
+                    "Room '%s': no watermark yet — skipping replay", sub.room.name
+                )
+                continue
+            try:
+                raw_msgs = await self._rest.get_room_history(
+                    sub.room.id,
+                    sub.room.type,
+                    count=self._REPLAY_HISTORY_COUNT,
+                    after_ts=sub.last_processed_ts,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Room '%s': failed to fetch history for replay: %s",
+                    sub.room.name, e,
+                )
+                continue
+
+            if not raw_msgs:
+                logger.debug(
+                    "Room '%s': no missed messages since %s",
+                    sub.room.name, sub.last_processed_ts,
+                )
+                continue
+
+            if len(raw_msgs) == self._REPLAY_HISTORY_COUNT:
+                logger.warning(
+                    "Room '%s': replay fetched the maximum %d message(s) — "
+                    "the outage window may have produced more; some messages "
+                    "could be permanently lost",
+                    sub.room.name, self._REPLAY_HISTORY_COUNT,
+                )
+            else:
+                logger.info(
+                    "Room '%s': replaying %d missed message(s) since %s",
+                    sub.room.name, len(raw_msgs), sub.last_processed_ts,
+                )
+
+            for doc in raw_msgs:
+                await self._on_raw_ddp_message(room_id, doc)
 
     # ── Inbound ──────────────────────────────────────────────────────────────
 
@@ -626,6 +702,18 @@ class RocketChatConnector(Connector):
             logger.warning("Received message for unknown room_id=%s", room_id)
             return
 
+        # --- _id dedup (live + replay race guard) ---
+        # A message can arrive on both the live DDP stream and the reconnect
+        # history replay path within the same short window.  The ts-based
+        # watermark alone cannot catch this because the watermark is advanced
+        # *after* the handler returns, leaving a gap.  The seen_ids set provides
+        # a fast O(1) check that eliminates exact duplicates regardless of
+        # ordering.  The deque bounds memory to _SEEN_IDS_MAXLEN entries.
+        msg_id = doc.get("_id", "")
+        if msg_id and msg_id in sub.seen_ids_set:
+            logger.debug("Skipping already-seen message _id=%s in room %s", msg_id, room_id)
+            return
+
         # --- Filter (room-level, evaluated once) ---
         result: FilterResult = filter_rc_message(
             doc=doc,
@@ -733,6 +821,14 @@ class RocketChatConnector(Connector):
         # duration, so the previous "advance before handler" behaviour did not
         # meaningfully reduce reconnect duplication in practice.
         sub.last_processed_ts = result.msg_ts
+        # Track this message's _id so the reconnect replay path can skip it
+        # if the same message arrives again on the history API response.
+        if msg_id:
+            sub.seen_ids_set.add(msg_id)
+            sub.seen_ids.append(msg_id)
+            if len(sub.seen_ids) > _SEEN_IDS_MAXLEN:
+                evicted = sub.seen_ids.popleft()
+                sub.seen_ids_set.discard(evicted)
 
     async def _handler_send_busy(self, room_id: str, doc: dict) -> None:
         """Best-effort 'server busy' notification to the user when preflight rejects."""

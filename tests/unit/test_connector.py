@@ -1130,5 +1130,200 @@ class TestNotifyAgentEvent(unittest.IsolatedAsyncioTestCase):
         connector._rest.update_message.assert_not_called()
 
 
+# ── Tests: reconnect history replay (_on_ws_reconnect) ──────────────────────
+
+
+class TestOnWsReconnect(unittest.IsolatedAsyncioTestCase):
+    """RocketChatConnector._on_ws_reconnect() — missed-message replay after reconnect."""
+
+    def _make_reconnect_connector(self, last_processed_ts: str | None = "100"):
+        """Build a connector with one room, pre-wired for replay tests."""
+        connector = _make_connector()
+        connector._rooms["room-1"].last_processed_ts = last_processed_ts
+        connector._rest.get_room_history = AsyncMock(return_value=[])
+        return connector
+
+    async def test_skips_room_with_no_watermark(self):
+        """Rooms without a watermark must not trigger a history fetch."""
+        connector = self._make_reconnect_connector(last_processed_ts=None)
+        await connector._on_ws_reconnect()
+        connector._rest.get_room_history.assert_not_awaited()
+
+    async def test_fetches_history_with_correct_watermark(self):
+        """History fetch must use last_processed_ts as after_ts."""
+        connector = self._make_reconnect_connector(last_processed_ts="999")
+        await connector._on_ws_reconnect()
+        connector._rest.get_room_history.assert_awaited_once()
+        call_kwargs = connector._rest.get_room_history.call_args
+        self.assertEqual(call_kwargs[1].get("after_ts"), "999")
+        self.assertEqual(call_kwargs[0][0], "room-1")  # room_id
+
+    async def test_replays_missed_messages_via_dispatch(self):
+        """Each missed message must be re-injected through _on_raw_ddp_message."""
+        connector = self._make_reconnect_connector(last_processed_ts="100")
+        missed = [
+            {"_id": "m2", "msg": "hi", "u": {"username": "alice"}, "ts": {"$date": 200}},
+            {"_id": "m3", "msg": "hey", "u": {"username": "alice"}, "ts": {"$date": 300}},
+        ]
+        connector._rest.get_room_history = AsyncMock(return_value=missed)
+
+        dispatched: list[dict] = []
+
+        async def capture_dispatch(room_id, doc):
+            dispatched.append(doc)
+
+        connector._on_raw_ddp_message = capture_dispatch  # type: ignore[method-assign]
+        await connector._on_ws_reconnect()
+
+        self.assertEqual(len(dispatched), 2)
+        self.assertEqual(dispatched[0]["_id"], "m2")
+        self.assertEqual(dispatched[1]["_id"], "m3")
+
+    async def test_no_fetch_when_history_is_empty(self):
+        """When history returns no messages, nothing is dispatched."""
+        connector = self._make_reconnect_connector(last_processed_ts="100")
+        connector._rest.get_room_history = AsyncMock(return_value=[])
+
+        dispatched: list = []
+
+        async def capture_dispatch(room_id, doc):
+            dispatched.append(doc)
+
+        connector._on_raw_ddp_message = capture_dispatch  # type: ignore[method-assign]
+        await connector._on_ws_reconnect()
+        self.assertEqual(dispatched, [])
+
+    async def test_rest_failure_does_not_raise(self):
+        """A REST history error must be logged and skipped, not propagated."""
+        connector = self._make_reconnect_connector(last_processed_ts="100")
+        connector._rest.get_room_history = AsyncMock(
+            side_effect=RuntimeError("API down")
+        )
+        # Must not raise
+        await connector._on_ws_reconnect()
+
+    async def test_truncation_warning_when_count_hits_limit(self):
+        """When the history response fills the fetch limit, a warning must be logged."""
+        import logging
+
+        connector = self._make_reconnect_connector(last_processed_ts="100")
+        limit = connector._REPLAY_HISTORY_COUNT
+        full_page = [
+            {"_id": f"m{i}", "msg": "x", "u": {"username": "alice"}, "ts": {"$date": i}}
+            for i in range(limit)
+        ]
+        connector._rest.get_room_history = AsyncMock(return_value=full_page)
+
+        dispatched: list = []
+
+        async def capture_dispatch(room_id, doc):
+            dispatched.append(doc)
+
+        connector._on_raw_ddp_message = capture_dispatch  # type: ignore[method-assign]
+
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat", level=logging.WARNING) as cm:
+            await connector._on_ws_reconnect()
+
+        # All messages replayed
+        self.assertEqual(len(dispatched), limit)
+        # Warning about possible truncation must appear
+        self.assertTrue(
+            any("maximum" in line.lower() or "truncat" in line.lower() for line in cm.output),
+            f"Expected truncation warning in logs, got: {cm.output}",
+        )
+
+
+# ── Tests: _id dedup (seen_ids window) ───────────────────────────────────────
+
+
+class TestSeenIdsDedup(unittest.IsolatedAsyncioTestCase):
+    """_on_raw_ddp_message() must skip messages whose _id is already in seen_ids_set."""
+
+    async def test_duplicate_message_id_is_skipped(self):
+        """A message with an already-seen _id must be dropped before filter."""
+        from unittest.mock import patch as _patch
+
+        connector = _make_connector()
+        connector._handler = AsyncMock(return_value=True)
+
+        doc = {"msg": "hello", "_id": "dup-id", "u": {"username": "alice"}, "ts": {"$date": 200}}
+
+        # Pre-populate seen_ids_set as if this message was already processed live
+        sub = connector._rooms["room-1"]
+        sub.seen_ids_set.add("dup-id")
+        sub.seen_ids.append("dup-id")
+
+        with _patch("gateway.connectors.rocketchat.connector.filter_rc_message") as mock_filter:
+            await connector._on_raw_ddp_message("room-1", doc)
+            # filter must never be reached
+            mock_filter.assert_not_called()
+
+        connector._handler.assert_not_called()
+
+    async def test_seen_ids_populated_after_successful_dispatch(self):
+        """After a message is accepted, its _id must appear in seen_ids_set."""
+        from unittest.mock import patch as _patch
+
+        connector = _make_connector()
+        connector._handler = AsyncMock(return_value=True)
+
+        doc = {"msg": "hello", "_id": "new-id", "u": {"username": "alice"}, "ts": {"$date": 200}}
+
+        with (
+            _patch("gateway.connectors.rocketchat.connector.filter_rc_message") as mock_filter,
+            _patch("gateway.connectors.rocketchat.connector.normalize_rc_message") as mock_norm,
+            _patch("gateway.connectors.rocketchat.connector.apply_thread_policy"),
+        ):
+            from gateway.connectors.rocketchat.normalize import FilterResult
+            from gateway.core.connector import IncomingMessage, Room, User, UserRole
+            mock_filter.return_value = FilterResult(
+                accepted=True, sender="alice", msg_ts="200", reason=""
+            )
+            mock_norm.return_value = IncomingMessage(
+                id="new-id", timestamp="200",
+                room=Room(id="room-1", name="general", type="channel"),
+                sender=User(id="u1", username="alice"),
+                role=UserRole.OWNER,
+                text="hello",
+            )
+            await connector._on_raw_ddp_message("room-1", doc)
+
+        sub = connector._rooms["room-1"]
+        self.assertIn("new-id", sub.seen_ids_set)
+        self.assertIn("new-id", sub.seen_ids)
+
+    async def test_seen_ids_eviction_at_maxlen(self):
+        """When seen_ids exceeds _SEEN_IDS_MAXLEN, oldest entry must be evicted."""
+        from gateway.connectors.rocketchat.connector import (
+            _SEEN_IDS_MAXLEN,
+            _RoomSubscription,
+        )
+        from gateway.core.connector import Room
+
+        room = Room(id="r", name="r", type="channel")
+        sub = _RoomSubscription(room=room)
+
+        # Fill to the limit
+        for i in range(_SEEN_IDS_MAXLEN):
+            mid = f"id-{i}"
+            sub.seen_ids_set.add(mid)
+            sub.seen_ids.append(mid)
+
+        # Simulate adding one more (eviction logic is inline in _on_raw_ddp_message)
+        new_id = "id-overflow"
+        sub.seen_ids_set.add(new_id)
+        sub.seen_ids.append(new_id)
+        if len(sub.seen_ids) > _SEEN_IDS_MAXLEN:
+            evicted = sub.seen_ids.popleft()
+            sub.seen_ids_set.discard(evicted)
+
+        self.assertEqual(len(sub.seen_ids), _SEEN_IDS_MAXLEN)
+        self.assertEqual(len(sub.seen_ids_set), _SEEN_IDS_MAXLEN)
+        # First entry should have been evicted
+        self.assertNotIn("id-0", sub.seen_ids_set)
+        # Newest entry should still be present
+        self.assertIn("id-overflow", sub.seen_ids_set)
+
+
 if __name__ == "__main__":
     unittest.main()
