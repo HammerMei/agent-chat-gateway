@@ -465,8 +465,11 @@ class RCWebSocketClient:
                 else:
                     logger.debug("Unhandled WS message: %s", msg_type)
 
-            except websockets.ConnectionClosed:
-                logger.warning("WebSocket connection closed")
+            except websockets.ConnectionClosed as e:
+                logger.warning(
+                    "WebSocket connection closed: code=%s reason=%r",
+                    e.code, e.reason,
+                )
                 self._ws = None
                 await self._reconnect()
             except json.JSONDecodeError as e:
