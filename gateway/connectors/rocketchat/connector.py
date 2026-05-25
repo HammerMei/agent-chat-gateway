@@ -241,7 +241,7 @@ class RocketChatConnector(Connector):
                     sub.room.name, ws_status.get("status"),
                 )
 
-            for doc in raw_msgs:
+            for idx, doc in enumerate(raw_msgs):
                 # Guard against concurrent unsubscribe_room: if the room was
                 # removed while we were awaiting get_room_history, skip the
                 # remaining docs rather than logging spurious "unknown room_id"
@@ -251,7 +251,7 @@ class RocketChatConnector(Connector):
                         "Room '%s' was unsubscribed during replay — "
                         "skipping %d remaining message(s)",
                         sub.room.name,
-                        len(raw_msgs) - raw_msgs.index(doc),
+                        len(raw_msgs) - idx,
                     )
                     break
                 await self._on_raw_ddp_message(room_id, doc)
@@ -801,6 +801,27 @@ class RocketChatConnector(Connector):
                     sub.seen_ids_set.discard(evicted)
             return  # watermark NOT advanced — message can be re-delivered by user resend
 
+        # --- Optimistic seen_ids registration (TOCTOU guard) ---
+        # Mark this message as "in-flight" before the first await so that any
+        # concurrent delivery of the same _id (live DDP racing a replay, or two
+        # replay calls overlapping) will hit the dedup check at the top and
+        # return immediately.  We do this AFTER the filter / preflight checks so
+        # that messages rejected by those paths are NOT permanently suppressed
+        # from future deliveries (a filtered message may become eligible once
+        # room state changes; a preflight-rejected message was already recorded
+        # above so the duplicate add here is a no-op for that branch).
+        #
+        # Consequence: if normalize or handler raises, msg_id stays in seen_ids
+        # and the message will NOT be replayed.  This is intentional — a message
+        # that fails normalization is almost certainly malformed and would fail
+        # again on replay, causing a poison-pill replay storm on every reconnect.
+        if msg_id:
+            sub.seen_ids_set.add(msg_id)
+            sub.seen_ids.append(msg_id)
+            if len(sub.seen_ids) > _SEEN_IDS_MAXLEN:
+                evicted = sub.seen_ids.popleft()
+                sub.seen_ids_set.discard(evicted)
+
         # --- Normalize (once per message) ---
         # Attachment files are downloaded to a connector-global cache directory
         # namespaced by connector name and room ID.  All processors that subscribe
@@ -861,14 +882,8 @@ class RocketChatConnector(Connector):
         # duration, so the previous "advance before handler" behaviour did not
         # meaningfully reduce reconnect duplication in practice.
         sub.last_processed_ts = result.msg_ts
-        # Track this message's _id so the reconnect replay path can skip it
-        # if the same message arrives again on the history API response.
-        if msg_id:
-            sub.seen_ids_set.add(msg_id)
-            sub.seen_ids.append(msg_id)
-            if len(sub.seen_ids) > _SEEN_IDS_MAXLEN:
-                evicted = sub.seen_ids.popleft()
-                sub.seen_ids_set.discard(evicted)
+        # msg_id was already added to seen_ids_set by the optimistic registration
+        # block above (before the first await).  No second add needed here.
 
     async def _handler_send_busy(self, room_id: str, doc: dict) -> None:
         """Best-effort 'server busy' notification to the user when preflight rejects."""

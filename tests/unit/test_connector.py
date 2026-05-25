@@ -1141,6 +1141,11 @@ class TestOnWsReconnect(unittest.IsolatedAsyncioTestCase):
         connector = _make_connector()
         connector._rooms["room-1"].last_processed_ts = last_processed_ts
         connector._rest.get_room_history = AsyncMock(return_value=[])
+        # Prevent spurious DDP-sub-not-active warnings: the ws mock's
+        # subscription_statuses would otherwise return a truthy MagicMock,
+        # triggering the warning branch in _on_ws_reconnect for every test
+        # that returns non-empty history.
+        connector._ws.subscription_statuses = {}
         return connector
 
     async def test_skips_room_with_no_watermark(self):
