@@ -1293,36 +1293,185 @@ class TestSeenIdsDedup(unittest.IsolatedAsyncioTestCase):
         self.assertIn("new-id", sub.seen_ids)
 
     async def test_seen_ids_eviction_at_maxlen(self):
-        """When seen_ids exceeds _SEEN_IDS_MAXLEN, oldest entry must be evicted."""
-        from gateway.connectors.rocketchat.connector import (
-            _SEEN_IDS_MAXLEN,
-            _RoomSubscription,
-        )
-        from gateway.core.connector import Room
+        """When seen_ids reaches _SEEN_IDS_MAXLEN, oldest entry must be evicted on the next accept.
 
-        room = Room(id="r", name="r", type="channel")
-        sub = _RoomSubscription(room=room)
+        Drives _SEEN_IDS_MAXLEN + 1 messages through _on_raw_ddp_message so the
+        eviction logic in the real code path (not a hand-rolled copy) is exercised.
+        """
+        from unittest.mock import patch as _patch
 
-        # Fill to the limit
-        for i in range(_SEEN_IDS_MAXLEN):
-            mid = f"id-{i}"
-            sub.seen_ids_set.add(mid)
-            sub.seen_ids.append(mid)
+        from gateway.connectors.rocketchat.connector import _SEEN_IDS_MAXLEN
+        from gateway.connectors.rocketchat.normalize import FilterResult
+        from gateway.core.connector import IncomingMessage, Room, User, UserRole
 
-        # Simulate adding one more (eviction logic is inline in _on_raw_ddp_message)
-        new_id = "id-overflow"
-        sub.seen_ids_set.add(new_id)
-        sub.seen_ids.append(new_id)
-        if len(sub.seen_ids) > _SEEN_IDS_MAXLEN:
-            evicted = sub.seen_ids.popleft()
-            sub.seen_ids_set.discard(evicted)
+        connector = _make_connector()
+        connector._handler = AsyncMock(return_value=True)
 
+        def make_doc(i: int) -> dict:
+            return {
+                "msg": f"msg-{i}",
+                "_id": f"id-{i}",
+                "u": {"username": "alice"},
+                "ts": {"$date": i + 1},
+            }
+
+        def make_result(i: int) -> FilterResult:
+            return FilterResult(accepted=True, sender="alice", msg_ts=str(i + 1), reason="")
+
+        def make_incoming(i: int) -> IncomingMessage:
+            return IncomingMessage(
+                id=f"id-{i}", timestamp=str(i + 1),
+                room=Room(id="room-1", name="general", type="channel"),
+                sender=User(id="u1", username="alice"),
+                role=UserRole.OWNER,
+                text=f"msg-{i}",
+            )
+
+        # Drive exactly _SEEN_IDS_MAXLEN + 1 messages through the real dispatch path.
+        with (
+            _patch("gateway.connectors.rocketchat.connector.filter_rc_message") as mock_filter,
+            _patch("gateway.connectors.rocketchat.connector.normalize_rc_message") as mock_norm,
+            _patch("gateway.connectors.rocketchat.connector.apply_thread_policy"),
+        ):
+            for i in range(_SEEN_IDS_MAXLEN + 1):
+                mock_filter.return_value = make_result(i)
+                mock_norm.return_value = make_incoming(i)
+                await connector._on_raw_ddp_message("room-1", make_doc(i))
+
+        sub = connector._rooms["room-1"]
+        # Window is exactly _SEEN_IDS_MAXLEN after the extra message triggered eviction.
         self.assertEqual(len(sub.seen_ids), _SEEN_IDS_MAXLEN)
         self.assertEqual(len(sub.seen_ids_set), _SEEN_IDS_MAXLEN)
-        # First entry should have been evicted
+        # Oldest entry (id-0) must have been evicted
         self.assertNotIn("id-0", sub.seen_ids_set)
-        # Newest entry should still be present
-        self.assertIn("id-overflow", sub.seen_ids_set)
+        # Newest entry must still be present
+        self.assertIn(f"id-{_SEEN_IDS_MAXLEN}", sub.seen_ids_set)
+
+
+# ── Tests: review-round fixes ────────────────────────────────────────────────
+
+
+class TestReviewFixes(unittest.IsolatedAsyncioTestCase):
+    """Regression tests for findings addressed in the code-review pass."""
+
+    # --- Fix #1: capacity-rejected messages must not be replayed ---
+
+    async def test_capacity_rejected_msg_added_to_seen_ids(self):
+        """When preflight rejects a message, its _id must be added to seen_ids_set
+        so the reconnect replay path does not re-deliver it and fire another busy
+        notification."""
+        from unittest.mock import patch as _patch
+
+        connector = _make_connector()
+        connector._handler = AsyncMock(return_value=True)
+        connector._capacity_check = lambda room_id: False  # always reject
+        connector._rest.post_message = AsyncMock()
+
+        doc = {"msg": "hi", "_id": "cap-id", "u": {"username": "alice"}, "ts": {"$date": 100}}
+        with _patch("gateway.connectors.rocketchat.connector.filter_rc_message") as mock_filter:
+            from gateway.connectors.rocketchat.normalize import FilterResult
+            mock_filter.return_value = FilterResult(
+                accepted=True, sender="alice", msg_ts="100", reason=""
+            )
+            await connector._on_raw_ddp_message("room-1", doc)
+
+        sub = connector._rooms["room-1"]
+        # _id must be in seen_ids so replay won't re-deliver it.
+        self.assertIn("cap-id", sub.seen_ids_set)
+        # Watermark must NOT have advanced (message is user-retryable by resend).
+        self.assertIsNone(sub.last_processed_ts)
+
+    async def test_capacity_rejected_msg_not_replayed_on_reconnect(self):
+        """A capacity-rejected message that entered seen_ids_set must be skipped
+        by the replay path, preventing a second busy notification."""
+        from unittest.mock import patch as _patch
+
+        connector = _make_connector()
+        connector._rooms["room-1"].last_processed_ts = "50"
+        connector._handler = AsyncMock(return_value=True)
+
+        # Pre-populate the seen_ids as if the message was capacity-rejected live.
+        sub = connector._rooms["room-1"]
+        sub.seen_ids_set.add("cap-id")
+        sub.seen_ids.append("cap-id")
+
+        # Replay returns the same message.
+        connector._rest.get_room_history = AsyncMock(return_value=[
+            {"msg": "hi", "_id": "cap-id", "u": {"username": "alice"}, "ts": {"$date": 100}},
+        ])
+        connector._rest.post_message = AsyncMock()
+
+        with _patch("gateway.connectors.rocketchat.connector.filter_rc_message") as mock_filter:
+            await connector._on_ws_reconnect()
+            mock_filter.assert_not_called()  # skipped by seen_ids dedup
+
+        connector._rest.post_message.assert_not_awaited()
+
+    # --- Fix #2: warn when DDP sub is failed during replay ---
+
+    async def test_failed_ddp_sub_logged_during_replay(self):
+        """When a room's DDP subscription is in 'failed' state, a warning must be
+        logged during replay so operators are not left in the dark."""
+        import logging
+
+        connector = _make_connector()
+        connector._rooms["room-1"].last_processed_ts = "100"
+        connector._rest.get_room_history = AsyncMock(return_value=[
+            {"_id": "m1", "msg": "hi", "u": {"username": "alice"}, "ts": {"$date": 200}},
+        ])
+        # Simulate failed DDP subscription status from the WS layer.
+        connector._ws.subscription_statuses = {
+            "room-1": {"status": "failed", "sub_id": None, "last_error": "rejected"}
+        }
+
+        dispatched: list = []
+
+        async def capture(room_id, doc):
+            dispatched.append(doc)
+
+        connector._on_raw_ddp_message = capture  # type: ignore[method-assign]
+
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat", level=logging.WARNING) as cm:
+            await connector._on_ws_reconnect()
+
+        # Replay must still proceed (user gets missed messages).
+        self.assertEqual(len(dispatched), 1)
+        # Warning about broken live stream must appear.
+        self.assertTrue(
+            any("failed" in line.lower() or "lost" in line.lower() for line in cm.output),
+            f"Expected DDP-sub warning in logs, got: {cm.output}",
+        )
+
+    # --- Fix #3: concurrent unsubscribe during replay ---
+
+    async def test_unsubscribed_room_skipped_during_replay(self):
+        """If a room is removed from self._rooms while replay is in progress,
+        remaining messages for that room must be skipped without spurious warnings."""
+        import logging
+
+        connector = _make_connector()
+        connector._rooms["room-1"].last_processed_ts = "100"
+        connector._ws.subscription_statuses = {}
+
+        msgs = [
+            {"_id": "m1", "msg": "first", "u": {"username": "alice"}, "ts": {"$date": 200}},
+            {"_id": "m2", "msg": "second", "u": {"username": "alice"}, "ts": {"$date": 300}},
+        ]
+        connector._rest.get_room_history = AsyncMock(return_value=msgs)
+
+        dispatched: list = []
+
+        async def remove_then_dispatch(room_id, doc):
+            # Simulate concurrent unsubscribe after the first message.
+            connector._rooms.pop(room_id, None)
+            dispatched.append(doc)
+
+        connector._on_raw_ddp_message = remove_then_dispatch  # type: ignore[method-assign]
+        await connector._on_ws_reconnect()
+
+        # Only the first message was dispatched before the room vanished.
+        self.assertEqual(len(dispatched), 1)
+        self.assertEqual(dispatched[0]["_id"], "m1")
 
 
 if __name__ == "__main__":

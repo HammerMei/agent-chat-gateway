@@ -48,7 +48,13 @@ logger = logging.getLogger("agent-chat-gateway.connectors.rocketchat")
 # ---------------------------------------------------------------------------
 
 
-_SEEN_IDS_MAXLEN = 200  # bounded FIFO dedup window per room
+# Sustained size of the per-room seen-id dedup window.  The eviction check
+# uses strict-greater-than (len > MAXLEN) so the deque reaches MAXLEN + 1
+# momentarily (one synchronous Python statement) before popleft brings it
+# back to exactly MAXLEN.  The post-eviction cap is MAXLEN; the peak is
+# MAXLEN + 1 but is never visible to other coroutines because no await
+# occurs between append and popleft.
+_SEEN_IDS_MAXLEN = 200
 
 
 @dataclass
@@ -223,7 +229,31 @@ class RocketChatConnector(Connector):
                     sub.room.name, len(raw_msgs), sub.last_processed_ts,
                 )
 
+            # Warn when the live DDP subscription for this room is not healthy.
+            # History replay still proceeds — the user gets missed messages —
+            # but future live messages will be lost until the sub recovers.
+            ws_status = self._ws.subscription_statuses.get(room_id, {})
+            if ws_status.get("status") not in ("active", None, ""):
+                logger.warning(
+                    "Room '%s': DDP subscription is in '%s' state — "
+                    "replaying history but future live messages will be lost "
+                    "until the subscription recovers",
+                    sub.room.name, ws_status.get("status"),
+                )
+
             for doc in raw_msgs:
+                # Guard against concurrent unsubscribe_room: if the room was
+                # removed while we were awaiting get_room_history, skip the
+                # remaining docs rather than logging spurious "unknown room_id"
+                # warnings for each one.
+                if room_id not in self._rooms:
+                    logger.debug(
+                        "Room '%s' was unsubscribed during replay — "
+                        "skipping %d remaining message(s)",
+                        sub.room.name,
+                        len(raw_msgs) - raw_msgs.index(doc),
+                    )
+                    break
                 await self._on_raw_ddp_message(room_id, doc)
 
     # ── Inbound ──────────────────────────────────────────────────────────────
@@ -759,7 +789,17 @@ class RocketChatConnector(Connector):
                     "Best-effort busy notification failed for room '%s': %s",
                     room_id, exc
                 )
-            return  # watermark NOT advanced — message can be re-delivered
+            # Record the _id so the reconnect replay path does not re-deliver
+            # this message and fire a second "server busy" notification.  The
+            # watermark is intentionally left unchanged so the user can retry
+            # by resending — we only suppress the automated replay re-delivery.
+            if msg_id:
+                sub.seen_ids_set.add(msg_id)
+                sub.seen_ids.append(msg_id)
+                if len(sub.seen_ids) > _SEEN_IDS_MAXLEN:
+                    evicted = sub.seen_ids.popleft()
+                    sub.seen_ids_set.discard(evicted)
+            return  # watermark NOT advanced — message can be re-delivered by user resend
 
         # --- Normalize (once per message) ---
         # Attachment files are downloaded to a connector-global cache directory
