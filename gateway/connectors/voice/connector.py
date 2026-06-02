@@ -222,7 +222,24 @@ class VoiceConnector(Connector):
             _write_response(writer, 400, "Bad Request", b"incomplete body")
             return
 
-        text = raw_body.decode("utf-8", errors="replace").strip()
+        # ── Body parsing — plain text or JSON {"text": "..."} ────────────────
+        # iOS Shortcuts "Get Contents of URL" only offers JSON/Form/File body
+        # types (no plain-text option), so we accept both:
+        #   Content-Type: application/json  →  extract the "text" key
+        #   anything else                   →  treat raw body as plain text
+        raw_str = raw_body.decode("utf-8", errors="replace").strip()
+        content_type = headers.get("content-type", "")
+        if "application/json" in content_type:
+            import json as _json
+            try:
+                payload = _json.loads(raw_str)
+                text = str(payload.get("text", "")).strip()
+            except (_json.JSONDecodeError, AttributeError):
+                _write_response(writer, 400, "Bad Request", b"invalid JSON")
+                return
+        else:
+            text = raw_str
+
         if not text:
             _write_response(writer, 400, "Bad Request", b"empty message")
             return

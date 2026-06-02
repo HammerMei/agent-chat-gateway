@@ -263,6 +263,33 @@ class TestHandleHttp(unittest.IsolatedAsyncioTestCase):
         await conn._handle_http(reader, writer)
         self.assertIn(b"401", _written(writer))
 
+    async def test_json_body_extracted(self):
+        conn = self._connector_with_reply("json works")
+        body = b'{"text": "hello from Siri"}'
+        raw = (
+            b"POST /ask HTTP/1.1\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+            b"\r\n" + body
+        )
+        reader, writer = _make_stream(raw)
+        await conn._handle_http(reader, writer)
+        self.assertIn(b"200 OK", _written(writer))
+        self.assertIn(b"json works", _written(writer))
+
+    async def test_invalid_json_returns_400(self):
+        conn = self._connector_with_reply("never")
+        body = b"not json at all"
+        raw = (
+            b"POST /ask HTTP/1.1\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+            b"\r\n" + body
+        )
+        reader, writer = _make_stream(raw)
+        await conn._handle_http(reader, writer)
+        self.assertIn(b"400", _written(writer))
+
     async def test_oversized_body_returns_413(self):
         conn = self._connector_with_reply("never")
         raw = b"POST /ask HTTP/1.1\r\nContent-Length: 99999\r\n\r\n"
