@@ -14,10 +14,11 @@ connector only through the Connector ABC defined in gateway.core.connector.
 
 from __future__ import annotations
 
+import collections
 import logging
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from ...agents.response import AgentEvent, AgentResponse
@@ -47,6 +48,15 @@ logger = logging.getLogger("agent-chat-gateway.connectors.rocketchat")
 # ---------------------------------------------------------------------------
 
 
+# Sustained size of the per-room seen-id dedup window.  The eviction check
+# uses strict-greater-than (len > MAXLEN) so the deque reaches MAXLEN + 1
+# momentarily (one synchronous Python statement) before popleft brings it
+# back to exactly MAXLEN.  The post-eviction cap is MAXLEN; the peak is
+# MAXLEN + 1 but is never visible to other coroutines because no await
+# occurs between append and popleft.
+_SEEN_IDS_MAXLEN = 200
+
+
 @dataclass
 class _RoomSubscription:
     """Connector-level room state: platform subscription + shared dedup watermark.
@@ -56,6 +66,13 @@ class _RoomSubscription:
 
     room: Room
     last_processed_ts: str | None = None
+    # Bounded FIFO set of recently-seen message _id values.  Used to deduplicate
+    # messages that arrive on both the live DDP stream and the reconnect history
+    # replay path.  deque provides O(1) append and fast len() checks while the
+    # set provides O(1) membership tests.  Both are updated together so they
+    # stay in sync; the deque is used only for eviction ordering.
+    seen_ids: collections.deque = field(default_factory=lambda: collections.deque())
+    seen_ids_set: set = field(default_factory=set)
 
 
 @dataclass
@@ -133,10 +150,17 @@ class RocketChatConnector(Connector):
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
+    # Maximum messages fetched per room during a reconnect history replay.
+    # Chosen to cover most realistic outage windows (e.g. 200 messages at
+    # ~1 msg/s ≈ 3 minutes of traffic).  A warning is emitted when the
+    # response fills the limit so operators know replay may be incomplete.
+    _REPLAY_HISTORY_COUNT = 200
+
     async def connect(self) -> None:
         """Login via REST and establish the DDP WebSocket connection."""
         await self._rest.login(self._config.username, self._config.password)
         await self._ws.connect()
+        self._ws.register_reconnect_callback(self._on_ws_reconnect)
         await self._ws.start()
         logger.info(
             "RocketChatConnector connected to %s as %s",
@@ -149,6 +173,97 @@ class RocketChatConnector(Connector):
         await self._ws.stop()
         await self._rest.close()
         logger.info("RocketChatConnector disconnected")
+
+    async def _on_ws_reconnect(self) -> None:
+        """Replay messages missed during a WebSocket outage.
+
+        Called by ``RCWebSocketClient`` after every successful reconnect + room
+        resubscription.  For each subscribed room that has a known watermark,
+        we fetch up to ``_REPLAY_HISTORY_COUNT`` messages via the REST history
+        API and re-inject them through the normal filter/normalize/dispatch
+        pipeline.
+
+        The ``_id``-based dedup window on ``_RoomSubscription`` ensures that any
+        messages delivered on both the live DDP stream and this replay path are
+        processed exactly once.  The ts-watermark handles older messages that
+        fall below the last-processed timestamp.
+        """
+        logger.info("WebSocket reconnected — replaying missed messages for %d room(s)", len(self._rooms))
+        for room_id, sub in list(self._rooms.items()):
+            # Snapshot the watermark NOW, before any await in this iteration.
+            # The live DDP listen loop runs concurrently: awaiting get_room_history
+            # for an earlier room yields the event loop and allows live messages for
+            # subsequent rooms to advance their last_processed_ts.  If we read the
+            # watermark inside the await we would use a newer ts that skips the
+            # entire outage window for those rooms.
+            watermark = sub.last_processed_ts
+            if not watermark:
+                logger.debug(
+                    "Room '%s': no watermark yet — skipping replay", sub.room.name
+                )
+                continue
+            try:
+                raw_msgs = await self._rest.get_room_history(
+                    sub.room.id,
+                    sub.room.type,
+                    count=self._REPLAY_HISTORY_COUNT,
+                    after_ts=watermark,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Room '%s': failed to fetch history for replay: %s",
+                    sub.room.name, e,
+                )
+                continue
+
+            if not raw_msgs:
+                logger.debug(
+                    "Room '%s': no missed messages since %s",
+                    sub.room.name, watermark,
+                )
+                continue
+
+            if len(raw_msgs) == self._REPLAY_HISTORY_COUNT:
+                logger.warning(
+                    "Room '%s': replay fetched the maximum %d message(s) — "
+                    "the outage window may have produced more; some messages "
+                    "could be permanently lost",
+                    sub.room.name, self._REPLAY_HISTORY_COUNT,
+                )
+            else:
+                logger.info(
+                    "Room '%s': replaying %d missed message(s) since %s",
+                    sub.room.name, len(raw_msgs), watermark,
+                )
+
+            # Warn when the live DDP subscription for this room is not healthy.
+            # History replay still proceeds — the user gets missed messages —
+            # but future live messages will be lost until the sub recovers.
+            ws_status = self._ws.subscription_statuses.get(room_id, {})
+            if ws_status.get("status") not in ("active", None, ""):
+                logger.warning(
+                    "Room '%s': DDP subscription is in '%s' state — "
+                    "replaying history but future live messages will be lost "
+                    "until the subscription recovers",
+                    sub.room.name, ws_status.get("status"),
+                )
+
+            for idx, doc in enumerate(raw_msgs):
+                # Guard against concurrent unsubscribe_room: if the room was
+                # removed while we were awaiting get_room_history, skip the
+                # remaining docs rather than logging spurious "unknown room_id"
+                # warnings for each one.
+                if room_id not in self._rooms:
+                    logger.debug(
+                        "Room '%s' was unsubscribed during replay — "
+                        "skipping %d remaining message(s)",
+                        sub.room.name,
+                        len(raw_msgs) - idx,
+                    )
+                    break
+                await self._on_raw_ddp_message(
+                    room_id, doc, is_replay=True, replay_after_ts=watermark
+                )
 
     # ── Inbound ──────────────────────────────────────────────────────────────
 
@@ -608,7 +723,14 @@ class RocketChatConnector(Connector):
         """
         await self._on_raw_ddp_message(room_id, doc)
 
-    async def _on_raw_ddp_message(self, room_id: str, doc: dict) -> None:
+    async def _on_raw_ddp_message(
+        self,
+        room_id: str,
+        doc: dict,
+        *,
+        is_replay: bool = False,
+        replay_after_ts: str | None = None,
+    ) -> None:
         """Parse a raw RC DDP message doc, filter it, normalize it, fire handler.
 
         Filtering and deduplication are room-level (done once).
@@ -617,6 +739,20 @@ class RocketChatConnector(Connector):
 
         This is the boundary where all RC-specific field names disappear.
         After this method, only IncomingMessage objects exist in the codebase.
+
+        Args:
+            room_id        : Platform room ID.
+            doc            : Raw RC DDP message document.
+            is_replay      : True when called from the reconnect history replay
+                             path.  Suppresses busy-notification REST posts to
+                             avoid spamming the user with one per missed message.
+            replay_after_ts: Snapshotted watermark passed by ``_on_ws_reconnect``
+                             at the start of a replay loop.  When set, the
+                             timestamp dedup filter uses this value instead of
+                             the live ``sub.last_processed_ts``, preventing a
+                             concurrent live message from advancing the watermark
+                             past the replay window and silently dropping every
+                             remaining replay message as "already processed".
         """
         if not self._handler:
             return
@@ -626,12 +762,36 @@ class RocketChatConnector(Connector):
             logger.warning("Received message for unknown room_id=%s", room_id)
             return
 
+        # --- _id dedup (live + replay race guard) ---
+        # A message can arrive on both the live DDP stream and the reconnect
+        # history replay path within the same short window.  The ts-based
+        # watermark alone cannot catch this because the watermark is advanced
+        # *after* the handler returns, leaving a gap.  The seen_ids set provides
+        # a fast O(1) check that eliminates exact duplicates regardless of
+        # ordering.  The deque bounds memory to _SEEN_IDS_MAXLEN entries.
+        msg_id = doc.get("_id", "")
+        if msg_id and msg_id in sub.seen_ids_set:
+            logger.debug("Skipping already-seen message _id=%s in room %s", msg_id, room_id)
+            return
+
         # --- Filter (room-level, evaluated once) ---
+        # During replay, use the watermark that was snapshotted at the START of
+        # _on_ws_reconnect (passed as replay_after_ts) rather than the live
+        # sub.last_processed_ts.  Without this, a concurrent live message that
+        # arrives and advances sub.last_processed_ts mid-replay would cause every
+        # remaining replay message (whose ts falls inside the outage window but
+        # below the new live watermark) to be rejected as "already processed",
+        # silently dropping messages the user sent during the outage.
+        filter_ts = (
+            replay_after_ts
+            if (is_replay and replay_after_ts is not None)
+            else sub.last_processed_ts
+        )
         result: FilterResult = filter_rc_message(
             doc=doc,
             config=self._config,
             room_type=sub.room.type,
-            last_processed_ts=sub.last_processed_ts,
+            last_processed_ts=filter_ts,
             turn_store=self._turn_store,
         )
         if not result.accepted:
@@ -663,15 +823,51 @@ class RocketChatConnector(Connector):
                 result.sender,
                 sub.room.name,
             )
+            # Record _id BEFORE the first await so a concurrent delivery of the
+            # same msg_id (e.g. live DDP racing a replay) hits the dedup check
+            # at the top of this function rather than both calls appending to the
+            # deque and creating a phantom duplicate entry.
+            # Watermark is intentionally left unchanged so the user can retry by
+            # resending — we only suppress automated replay re-delivery.
+            if msg_id:
+                sub.seen_ids_set.add(msg_id)
+                sub.seen_ids.append(msg_id)
+                if len(sub.seen_ids) > _SEEN_IDS_MAXLEN:
+                    evicted = sub.seen_ids.popleft()
+                    sub.seen_ids_set.discard(evicted)
             # Best-effort notification so the user knows their message was dropped.
-            try:
-                await self._handler_send_busy(room_id, doc)
-            except Exception as exc:
-                logger.debug(
-                    "Best-effort busy notification failed for room '%s': %s",
-                    room_id, exc
-                )
-            return  # watermark NOT advanced — message can be re-delivered
+            # Suppressed during replay: replaying 200 missed messages while queues
+            # are full would otherwise fire up to 200 "server busy" REST posts.
+            if not is_replay:
+                try:
+                    await self._handler_send_busy(room_id, doc)
+                except Exception as exc:
+                    logger.debug(
+                        "Best-effort busy notification failed for room '%s': %s",
+                        room_id, exc
+                    )
+            return  # watermark NOT advanced — message can be re-delivered by user resend
+
+        # --- Optimistic seen_ids registration (TOCTOU guard) ---
+        # Mark this message as "in-flight" before the first await so that any
+        # concurrent delivery of the same _id (live DDP racing a replay, or two
+        # replay calls overlapping) will hit the dedup check at the top and
+        # return immediately.  We do this AFTER the filter / preflight checks so
+        # that messages rejected by those paths are NOT permanently suppressed
+        # from future deliveries (a filtered message may become eligible once
+        # room state changes; a preflight-rejected message was already recorded
+        # above so the duplicate add here is a no-op for that branch).
+        #
+        # Consequence: if normalize or handler raises, msg_id stays in seen_ids
+        # and the message will NOT be replayed.  This is intentional — a message
+        # that fails normalization is almost certainly malformed and would fail
+        # again on replay, causing a poison-pill replay storm on every reconnect.
+        if msg_id:
+            sub.seen_ids_set.add(msg_id)
+            sub.seen_ids.append(msg_id)
+            if len(sub.seen_ids) > _SEEN_IDS_MAXLEN:
+                evicted = sub.seen_ids.popleft()
+                sub.seen_ids_set.discard(evicted)
 
         # --- Normalize (once per message) ---
         # Attachment files are downloaded to a connector-global cache directory
@@ -717,6 +913,19 @@ class RocketChatConnector(Connector):
                 "Message from %s was dropped (queue full)",
                 result.sender,
             )
+            # Remove msg_id from seen_ids so the reconnect replay path can
+            # re-deliver this message.  The optimistic registration above added
+            # it before the handler call to guard against concurrent live+replay
+            # races, but a queue-full drop should be retryable: the queue may
+            # have drained by the time the next reconnect fires.
+            # We discard from the set and remove the single deque entry to keep
+            # them in sync; the O(N) deque.remove is acceptable at N ≤ 200.
+            if msg_id:
+                sub.seen_ids_set.discard(msg_id)
+                try:
+                    sub.seen_ids.remove(msg_id)
+                except ValueError:
+                    pass
             return
 
         # --- Advance dedup watermark AFTER confirmed acceptance ---
@@ -733,6 +942,8 @@ class RocketChatConnector(Connector):
         # duration, so the previous "advance before handler" behaviour did not
         # meaningfully reduce reconnect duplication in practice.
         sub.last_processed_ts = result.msg_ts
+        # msg_id was already added to seen_ids_set by the optimistic registration
+        # block above (before the first await).  No second add needed here.
 
     async def _handler_send_busy(self, room_id: str, doc: dict) -> None:
         """Best-effort 'server busy' notification to the user when preflight rejects."""

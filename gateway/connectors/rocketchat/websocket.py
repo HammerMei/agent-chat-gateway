@@ -7,6 +7,7 @@ import logging
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 import websockets
 
@@ -55,6 +56,9 @@ class RCWebSocketClient:
         ] = {}  # per-room bounded inbound queues
         self._room_workers: dict[str, asyncio.Task] = {}  # per-room worker tasks
         self._resubscribe_task: asyncio.Task | None = None
+        # Optional callback invoked after every successful reconnect + resubscribe.
+        # Registered by the connector to replay messages missed during the outage.
+        self._on_reconnect_cb: Callable[[], Any] | None = None
         # Set of room IDs currently being unsubscribed.  Checked inside
         # _subscribe_with_confirmation to detect a race where
         # _resubscribe_all_rooms re-registers a room that unsubscribe_room
@@ -312,6 +316,18 @@ class RCWebSocketClient:
                 logger.info("Unsubscribed from room %s", room_id)
         finally:
             self._rooms_unsubscribing.discard(room_id)
+
+    def register_reconnect_callback(self, cb: Callable[[], Any]) -> None:
+        """Register an async callback invoked after every successful reconnect.
+
+        Called once per reconnect cycle, after all room subscriptions have been
+        re-confirmed (or attempted).  The connector uses this hook to replay
+        messages missed during the outage via the REST history API.
+
+        Only one callback is supported; calling this method again replaces the
+        previous registration.
+        """
+        self._on_reconnect_cb = cb
 
     @property
     def is_connected(self) -> bool:
@@ -749,6 +765,21 @@ class RCWebSocketClient:
                 )
             elif self._callbacks:
                 logger.info("Reconnect re-confirmed %d room subscription(s)", success)
+
+            # Fire the connector's history-replay callback now that the live
+            # stream is active again.  Any messages that arrived during the
+            # outage are fetched via REST and re-injected through the normal
+            # filter/normalize path.  Errors here must not crash the reconnect
+            # loop, so we swallow them after logging.
+            if self._on_reconnect_cb:
+                try:
+                    await self._on_reconnect_cb()
+                except Exception as cb_err:
+                    logger.warning(
+                        "Reconnect callback raised an unexpected error "
+                        "(history replay may be incomplete): %s",
+                        cb_err,
+                    )
         finally:
             self._resubscribe_task = None
 
