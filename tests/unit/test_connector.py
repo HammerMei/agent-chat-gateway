@@ -1452,8 +1452,6 @@ class TestReviewFixes(unittest.IsolatedAsyncioTestCase):
     async def test_unsubscribed_room_skipped_during_replay(self):
         """If a room is removed from self._rooms while replay is in progress,
         remaining messages for that room must be skipped without spurious warnings."""
-        import logging
-
         connector = _make_connector()
         connector._rooms["room-1"].last_processed_ts = "100"
         connector._ws.subscription_statuses = {}
