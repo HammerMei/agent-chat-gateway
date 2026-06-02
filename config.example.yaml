@@ -7,6 +7,31 @@
 # Any $VAR or ${VAR} reference in this file is automatically expanded at startup.
 
 connectors:
+  # ── Voice Gateway (Siri / iOS Shortcuts) ─────────────────────────────────
+  # Exposes a plain-text HTTP endpoint so any ACG-connected agent can be
+  # reached via Siri. iOS Shortcut: Dictate → POST /ask → Speak Text.
+  #
+  # Security: set 'secret' to a strong random token and configure your router
+  # to only allow your iPhone's IP to reach this port, or put it behind a VPN.
+  #
+  # - name: siri-voice
+  #   type: voice
+  #   port: 8765                     # HTTP port the gateway listens on
+  #   host: "0.0.0.0"               # bind address (default: all interfaces)
+  #   secret: "$VOICE_SECRET"        # Bearer token required in Authorization header
+  #   timeout: 45                    # seconds to wait for agent reply
+  #
+  # ⚠️  IMPORTANT — permissions for voice agents:
+  # With permissions.enabled: true and skip_owner_approval: false, any tool not in
+  # owner_allowed_tools triggers a human-in-the-loop approval request — but there
+  # is no human on the other end of a voice call to approve it.  The request hangs
+  # until timeout, and the caller hears "request timed out."
+  # For voice agents, use ONE of:
+  #   a) permissions.enabled: false         — disables the broker entirely (simplest)
+  #   b) skip_owner_approval: true          — auto-approves all owner tool calls
+  #      (requires permissions.enabled: true; guests are still subject to allow-lists)
+  # Gate access at the network level (VPN / firewall) to compensate.
+
   - name: rc-home                    # unique name for this connector (used in CLI commands)
     type: rocketchat
     server:
@@ -232,6 +257,17 @@ watchers:
   #   this watcher starts or stops. Supports any text, emoji, or RC markdown.
   #   Set to null (~) to suppress the message entirely for this watcher.
   #   Defaults: "✅ _Agent online_" / "❌ _Agent offline_"
+
+  # ── Voice watcher (pairs with the siri-voice connector above) ───────────
+  # - name: siri-watcher
+  #   connector: siri-voice
+  #   room: voice-room               # must be "voice-room" (fixed by VoiceConnector)
+  #   agent: my-agent
+  #   session_id: ~
+  #   context_inject_files:
+  #     - contexts/voice-context.md  # enforces plain-text, no markdown/emoji for Siri
+  #   online_notification: ~         # suppress — no RC room to notify
+  #   offline_notification: ~
 
   - name: general-room               # unique watcher name (used in CLI commands)
     connector: rc-home               # must match a connector name above
