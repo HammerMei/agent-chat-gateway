@@ -394,6 +394,41 @@ class TestHandleHttp(unittest.IsolatedAsyncioTestCase):
         await conn._handle_http(reader, writer)
         self.assertIn(b"400", _written(writer))
 
+    async def test_json_null_text_returns_400(self):
+        """{"text": null} must be rejected — not dispatched as literal 'None'."""
+        conn = self._connector_with_reply("never")
+        body = b'{"text": null}'
+        raw = (
+            b"POST /ask/laomei HTTP/1.1\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+            b"\r\n" + body
+        )
+        reader, writer = _make_stream(raw)
+        await conn._handle_http(reader, writer)
+        self.assertIn(b"400", _written(writer))
+
+    async def test_negative_content_length_returns_400(self):
+        conn = self._connector_with_reply("never")
+        raw = b"POST /ask/laomei HTTP/1.1\r\nContent-Length: -1\r\n\r\n"
+        reader, writer = _make_stream(raw)
+        await conn._handle_http(reader, writer)
+        self.assertIn(b"400", _written(writer))
+
+    async def test_wrong_bearer_token_returns_401_constant_time(self):
+        """Wrong token is rejected (also covers hmac.compare_digest path)."""
+        conn = self._connector_with_reply("never", secret="s3cr3t")
+        body = b"ping"
+        raw = (
+            b"POST /ask/laomei HTTP/1.1\r\n"
+            b"Authorization: Bearer almostright\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+            b"\r\n" + body
+        )
+        reader, writer = _make_stream(raw)
+        await conn._handle_http(reader, writer)
+        self.assertIn(b"401", _written(writer))
+
 
 # ── connector_factory ─────────────────────────────────────────────────────────
 

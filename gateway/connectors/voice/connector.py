@@ -36,6 +36,7 @@ watcher config to enforce this automatically.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -267,7 +268,9 @@ class VoiceConnector(Connector):
         # ── Auth ──────────────────────────────────────────────────────────────
         if self._config.secret:
             auth = headers.get("authorization", "")
-            if auth != f"Bearer {self._config.secret}":
+            expected = f"Bearer {self._config.secret}"
+            # Use constant-time comparison to prevent timing-based token brute-force.
+            if not hmac.compare_digest(auth.encode(), expected.encode()):
                 logger.warning("VoiceConnector: unauthorized request rejected")
                 _write_response(
                     writer, 401, "Unauthorized", b"invalid or missing Bearer token"
@@ -302,6 +305,9 @@ class VoiceConnector(Connector):
         except ValueError:
             _write_response(writer, 400, "Bad Request", b"invalid Content-Length")
             return
+        if content_length < 0:
+            _write_response(writer, 400, "Bad Request", b"invalid Content-Length")
+            return
         if content_length > _MAX_BODY_BYTES:
             _write_response(writer, 413, "Payload Too Large", b"")
             return
@@ -325,7 +331,13 @@ class VoiceConnector(Connector):
             import json as _json
             try:
                 payload = _json.loads(raw_str)
-                text = str(payload.get("text", "")).strip()
+                raw_text = payload.get("text")
+                if not isinstance(raw_text, str):
+                    # Reject null, numbers, booleans — e.g. {"text": null} from
+                    # an iOS Shortcut that failed to populate the variable.
+                    _write_response(writer, 400, "Bad Request", b"'text' must be a string")
+                    return
+                text = raw_text.strip()
             except (_json.JSONDecodeError, AttributeError):
                 _write_response(writer, 400, "Bad Request", b"invalid JSON")
                 return
@@ -357,7 +369,22 @@ class VoiceConnector(Connector):
 
         The reply queue is drained before each dispatch (inside the lock) to
         discard any stale reply left by a prior timed-out request.
-        """
+
+        Known limitation — cross-request reply mixup after timeout:
+            If Request A times out and its agent turn is still running in the
+            background, Request B can acquire the lock, drain an empty queue
+            (A's reply hasn't arrived yet), set dispatch_active=True, and then
+            receive A's late reply as if it were B's.  B's own reply arrives
+            after dispatch_active resets to False and is dropped with a warning.
+
+            Root cause: a per-room boolean cannot associate a reply with the
+            specific dispatch that requested it.  The robust fix requires a
+            per-dispatch correlation token — each dispatch creates its own
+            Queue and discards it after use; send_text() routes by token.
+            Deferred: Siri is sequential and the window (timeout < agent turn
+            duration) is narrow in practice.  If this becomes a problem,
+            track it as a follow-up and implement per-dispatch queues.
+"""
         state = self._get_room(room_name)
         async with state.lock:
             # Drain stale replies from any prior timed-out request.
