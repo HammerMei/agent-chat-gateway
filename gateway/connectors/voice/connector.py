@@ -69,10 +69,17 @@ class _RoomState:
 
     Each room gets its own lock and reply queue so requests to different rooms
     run concurrently while same-room requests are serialized.
+
+    ``dispatch_active`` gates send_text() so that only the agent reply for the
+    current in-flight dispatch is enqueued.  Non-reply send_text() calls
+    (permission notifications, queue-full error messages, scheduler notices)
+    are silently dropped when no dispatch is waiting — preventing them from
+    being returned to the caller as a spurious voice reply.
     """
 
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     queue: asyncio.Queue[str] = field(default_factory=asyncio.Queue)
+    dispatch_active: bool = False
 
 
 class VoiceConnector(Connector):
@@ -141,8 +148,31 @@ class VoiceConnector(Connector):
         response: AgentResponse,
         thread_id: str | None = None,  # noqa: ARG002
     ) -> None:
-        """Bridge the agent reply back to the waiting HTTP handler for this room."""
+        """Bridge the agent reply back to the waiting HTTP handler for this room.
+
+        Only enqueues when a dispatch is actively waiting for a reply
+        (``dispatch_active == True``).  Calls that arrive outside a dispatch
+        window — permission notifications, queue-full error messages, scheduler
+        notices — are dropped so they cannot be returned to the caller as a
+        spurious voice reply.
+        """
         state = self._get_room(room_id)
+        if not state.dispatch_active:
+            # Receiving a send_text with no dispatch waiting is unexpected on a
+            # voice connector. Likely causes: permission notifications fired
+            # because permissions.enabled=true without skip_owner_approval=true,
+            # or a system/scheduler message routed to this room. Either way it
+            # would have been returned as a spurious voice reply — log a warning
+            # so the operator can fix the config.
+            logger.warning(
+                "VoiceConnector [%s]: send_text received outside active dispatch "
+                "— dropped (%d chars). If this recurs, check that "
+                "skip_owner_approval=true (or permissions.enabled=false) is set "
+                "for the voice agent.",
+                room_id,
+                len(response.text),
+            )
+            return
         await state.queue.put(response.text)
         logger.debug(
             "VoiceConnector [%s]: reply queued (%d chars)", room_id, len(response.text)
@@ -190,6 +220,14 @@ class VoiceConnector(Connector):
                 "VoiceConnector: error handling connection from %s: %s", peer, exc
             )
         finally:
+            # Drain before close so buffered error responses (4xx, 504) are
+            # flushed to the client.  Without this, error paths that write a
+            # response and return without awaiting drain() produce a connection
+            # reset instead of a well-formed HTTP response.
+            try:
+                await writer.drain()
+            except Exception:
+                pass
             writer.close()
 
     async def _handle_http(
@@ -242,7 +280,9 @@ class VoiceConnector(Connector):
             return
 
         # Distinguish wrong prefix (404) from missing room name (400).
-        if not path.split("?", 1)[0].startswith("/ask"):
+        # Use "/ask/" (with trailing slash) to avoid false-matching "/askfoo/...".
+        bare_path = path.split("?", 1)[0]
+        if not (bare_path.startswith("/ask/") or bare_path == "/ask"):
             _write_response(writer, 404, "Not Found", b"POST /ask/<room> only")
             return
 
@@ -257,7 +297,11 @@ class VoiceConnector(Connector):
             return
 
         # ── Body ──────────────────────────────────────────────────────────────
-        content_length = int(headers.get("content-length", "0"))
+        try:
+            content_length = int(headers.get("content-length", "0"))
+        except ValueError:
+            _write_response(writer, 400, "Bad Request", b"invalid Content-Length")
+            return
         if content_length > _MAX_BODY_BYTES:
             _write_response(writer, 413, "Payload Too Large", b"")
             return
@@ -347,6 +391,11 @@ class VoiceConnector(Connector):
                 )
                 return _BUSY_REPLY
 
+            # Gate send_text() so only the real agent reply is enqueued —
+            # permission notifications and other system send_text() calls
+            # arrive while this flag is True and would otherwise be dequeued
+            # as the voice reply.
+            state.dispatch_active = True
             try:
                 return await asyncio.wait_for(
                     state.queue.get(), timeout=float(self._config.timeout)
@@ -358,6 +407,8 @@ class VoiceConnector(Connector):
                     self._config.timeout,
                 )
                 return _TIMEOUT_REPLY
+            finally:
+                state.dispatch_active = False
 
 
 # ── URL helpers ───────────────────────────────────────────────────────────────

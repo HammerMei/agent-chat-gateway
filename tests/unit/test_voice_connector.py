@@ -109,19 +109,34 @@ class TestParseRoom(unittest.TestCase):
 # ── send_text routes to correct room ─────────────────────────────────────────
 
 class TestSendText(unittest.IsolatedAsyncioTestCase):
-    async def test_queues_reply_to_correct_room(self):
+    async def test_queues_reply_when_dispatch_active(self):
         conn = VoiceConnector(_make_config())
+        conn._get_room("laomei").dispatch_active = True
         response = MagicMock()
         response.text = "Hello from agent"
 
         await conn.send_text("laomei", response)
 
-        # Only laomei's queue has the reply
         self.assertEqual(conn._rooms["laomei"].queue.qsize(), 1)
         self.assertEqual(conn._rooms["laomei"].queue.get_nowait(), "Hello from agent")
 
+    async def test_drops_reply_when_no_dispatch_active(self):
+        """send_text outside a dispatch is dropped — prevents permission notifications
+        from being returned as a spurious voice reply."""
+        conn = VoiceConnector(_make_config())
+        # dispatch_active defaults to False
+        response = MagicMock()
+        response.text = "🔐 Permission request: approve tool call?"
+
+        await conn.send_text("laomei", response)
+
+        # Nothing enqueued
+        self.assertEqual(conn._get_room("laomei").queue.qsize(), 0)
+
     async def test_replies_go_to_separate_queues(self):
         conn = VoiceConnector(_make_config())
+        conn._get_room("laomei").dispatch_active = True
+        conn._get_room("xiaomei").dispatch_active = True
         r1, r2 = MagicMock(), MagicMock()
         r1.text, r2.text = "reply A", "reply B"
 
@@ -228,6 +243,9 @@ class TestHandleHttp(unittest.IsolatedAsyncioTestCase):
         conn = VoiceConnector(_make_config(secret=secret, timeout=5))
 
         async def handler(msg: IncomingMessage) -> bool:
+            # Simulate agent reply arriving while dispatch_active is True.
+            # In production the agent calls send_text(); here we put directly
+            # so the test doesn't depend on send_text() gating logic.
             await conn._rooms[msg.room.id].queue.put(reply)
             return True
 
