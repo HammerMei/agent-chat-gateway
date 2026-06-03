@@ -3,14 +3,21 @@
 Exposes a minimal HTTP server that accepts plain-text POST requests and returns
 plain-text agent replies.  Designed to slot directly into an iOS Shortcut:
 
-    Dictate Text  →  POST /ask  →  Agent  →  Speak Text
+    Dictate Text  →  POST /ask/<room>  →  Agent  →  Speak Text
+
+The ``<room>`` path segment maps directly to the watcher's ``room:`` field in
+config.yaml, consistent with how all other ACG connectors use the room concept.
+
+    POST /ask/laomei   →  room "laomei"  →  watcher → laomei agent
+    POST /ask/xiaomei  →  room "xiaomei" →  watcher → xiaomei agent
 
 Architecture
 ------------
-- Single fixed room (``voice-room``) to match the configured watcher.
-- Requests are serialized with an asyncio.Lock — Siri is sequential.
+- Path-derived rooms: URL segment ``/ask/<room>`` is the room name.
+- Per-room Lock + Queue — requests to different rooms run concurrently;
+  same-room requests are serialized (Siri is sequential within one agent).
+- Stale-reply drain on each dispatch — prevents queue desync after timeouts.
 - No extra dependencies: uses asyncio.start_server (stdlib only).
-- Replies are bridged from send_text() → asyncio.Queue → HTTP response.
 
 Security
 --------
@@ -31,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from dataclasses import dataclass, field
 from typing import Literal
 
 from ...agents.response import AgentResponse
@@ -46,18 +54,25 @@ from .config import VoiceConfig
 
 logger = logging.getLogger("agent-chat-gateway.connectors.voice")
 
-_VOICE_ROOM = Room(id="voice-room", name="voice-room", type="channel")
 _VOICE_USER = User(id="siri-user", username="siri", display_name="Siri")
 
 # Hard cap on request body to avoid memory issues.
 _MAX_BODY_BYTES = 4096
 
-_TIMEOUT_REPLY = (
-    "Sorry, the request timed out. Please try again in a moment."
-)
-_BUSY_REPLY = (
-    "The gateway is busy right now. Please try again in a moment."
-)
+_TIMEOUT_REPLY = "Sorry, the request timed out. Please try again in a moment."
+_BUSY_REPLY = "The gateway is busy right now. Please try again in a moment."
+
+
+@dataclass
+class _RoomState:
+    """Per-room synchronization state.
+
+    Each room gets its own lock and reply queue so requests to different rooms
+    run concurrently while same-room requests are serialized.
+    """
+
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    queue: asyncio.Queue[str] = field(default_factory=asyncio.Queue)
 
 
 class VoiceConnector(Connector):
@@ -65,6 +80,10 @@ class VoiceConnector(Connector):
 
     One instance per ``type: voice`` connector entry in config.yaml.
     Starts an asyncio HTTP server on ``connect()`` and stops it on ``disconnect()``.
+
+    Endpoint: ``POST /ask/<room>``
+        The ``<room>`` segment is the ACG room name — matches the ``room:``
+        field in the watcher config exactly.
     """
 
     delivery_mode: Literal["direct"] = "direct"
@@ -72,9 +91,9 @@ class VoiceConnector(Connector):
     def __init__(self, config: VoiceConfig) -> None:
         self._config = config
         self._handler: MessageHandler | None = None
-        self._reply_queue: asyncio.Queue[str] = asyncio.Queue()
-        self._request_lock = asyncio.Lock()
         self._server: asyncio.Server | None = None
+        # Lazily created per room — populated on first request to each room.
+        self._rooms: dict[str, _RoomState] = {}
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -122,9 +141,12 @@ class VoiceConnector(Connector):
         response: AgentResponse,
         thread_id: str | None = None,  # noqa: ARG002
     ) -> None:
-        """Bridge the agent reply back to the waiting HTTP handler."""
-        await self._reply_queue.put(response.text)
-        logger.debug("VoiceConnector reply queued (%d chars)", len(response.text))
+        """Bridge the agent reply back to the waiting HTTP handler for this room."""
+        state = self._get_room(room_id)
+        await state.queue.put(response.text)
+        logger.debug(
+            "VoiceConnector [%s]: reply queued (%d chars)", room_id, len(response.text)
+        )
 
     # ── Room resolution ───────────────────────────────────────────────────────
 
@@ -136,6 +158,14 @@ class VoiceConnector(Connector):
     def format_prompt_prefix(self, msg: IncomingMessage) -> str:
         return f"[Voice | from: {msg.sender.username} | role: {msg.role.value}]"
 
+    # ── Per-room state ────────────────────────────────────────────────────────
+
+    def _get_room(self, room_name: str) -> _RoomState:
+        """Return (creating if needed) the per-room Lock+Queue state."""
+        if room_name not in self._rooms:
+            self._rooms[room_name] = _RoomState()
+        return self._rooms[room_name]
+
     # ── Internal HTTP server ──────────────────────────────────────────────────
 
     async def _handle_connection(
@@ -143,7 +173,7 @@ class VoiceConnector(Connector):
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
-        """Top-level connection handler — enforces an outer read timeout."""
+        """Top-level connection handler — enforces an outer timeout."""
         peer = writer.get_extra_info("peername", "<unknown>")
         logger.debug("VoiceConnector: connection from %s", peer)
         try:
@@ -156,7 +186,9 @@ class VoiceConnector(Connector):
             _write_response(writer, 504, "Gateway Timeout", b"")
             await writer.drain()
         except Exception as exc:
-            logger.error("VoiceConnector: error handling connection from %s: %s", peer, exc)
+            logger.error(
+                "VoiceConnector: error handling connection from %s: %s", peer, exc
+            )
         finally:
             writer.close()
 
@@ -165,7 +197,7 @@ class VoiceConnector(Connector):
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
-        """Minimal HTTP/1.1 handler for POST /ask."""
+        """Minimal HTTP/1.1 handler for POST /ask/<room>."""
         # ── Request line ──────────────────────────────────────────────────────
         try:
             raw_line = await asyncio.wait_for(reader.readline(), timeout=5.0)
@@ -197,15 +229,31 @@ class VoiceConnector(Connector):
         # ── Auth ──────────────────────────────────────────────────────────────
         if self._config.secret:
             auth = headers.get("authorization", "")
-            expected = f"Bearer {self._config.secret}"
-            if auth != expected:
+            if auth != f"Bearer {self._config.secret}":
                 logger.warning("VoiceConnector: unauthorized request rejected")
-                _write_response(writer, 401, "Unauthorized", b"invalid or missing Bearer token")
+                _write_response(
+                    writer, 401, "Unauthorized", b"invalid or missing Bearer token"
+                )
                 return
 
-        # ── Route ─────────────────────────────────────────────────────────────
-        if method != "POST" or path not in ("/ask", "/"):
-            _write_response(writer, 404, "Not Found", b"POST /ask only")
+        # ── Route: POST /ask/<room> ────────────────────────────────────────────
+        if method != "POST":
+            _write_response(writer, 404, "Not Found", b"POST /ask/<room> only")
+            return
+
+        # Distinguish wrong prefix (404) from missing room name (400).
+        if not path.split("?", 1)[0].startswith("/ask"):
+            _write_response(writer, 404, "Not Found", b"POST /ask/<room> only")
+            return
+
+        room_name = _parse_room(path)
+        if room_name is None:
+            _write_response(
+                writer,
+                400,
+                "Bad Request",
+                b"room name required: POST /ask/<room>",
+            )
             return
 
         # ── Body ──────────────────────────────────────────────────────────────
@@ -222,7 +270,7 @@ class VoiceConnector(Connector):
             _write_response(writer, 400, "Bad Request", b"incomplete body")
             return
 
-        # ── Body parsing — plain text or JSON {"text": "..."} ────────────────
+        # ── Body parsing — plain text or JSON {"text": "..."} ─────────────────
         # iOS Shortcuts "Get Contents of URL" only offers JSON/Form/File body
         # types (no plain-text option), so we accept both:
         #   Content-Type: application/json  →  extract the "text" key
@@ -244,45 +292,49 @@ class VoiceConnector(Connector):
             _write_response(writer, 400, "Bad Request", b"empty message")
             return
 
-        logger.info("VoiceConnector: query (%d chars)", len(text))
+        logger.info("VoiceConnector [%s]: query (%d chars)", room_name, len(text))
 
-        # ── Dispatch (serialized) ─────────────────────────────────────────────
-        reply = await self._dispatch(text)
+        # ── Dispatch ──────────────────────────────────────────────────────────
+        reply = await self._dispatch(text, room_name)
 
         # ── Response ──────────────────────────────────────────────────────────
         encoded = reply.encode("utf-8")
-        _write_response(writer, 200, "OK", encoded, content_type="text/plain; charset=utf-8")
+        _write_response(
+            writer, 200, "OK", encoded, content_type="text/plain; charset=utf-8"
+        )
         await writer.drain()
-        logger.info("VoiceConnector: reply sent (%d chars)", len(reply))
+        logger.info("VoiceConnector [%s]: reply sent (%d chars)", room_name, len(reply))
 
-    async def _dispatch(self, text: str) -> str:
-        """Inject a voice message, wait for the agent reply, return it.
+    async def _dispatch(self, text: str, room_name: str) -> str:
+        """Inject a voice message into room_name, wait for reply, return it.
 
-        The reply queue is drained at the start of each dispatch (inside the lock)
-        to discard any stale reply left by a previous request that timed out while
-        the agent was still running.  The lock serializes requests, so a stale item
-        can only arrive here if the previous turn timed out — draining clears it.
+        Serialized per room — concurrent requests to different rooms proceed
+        independently; same-room requests queue behind the lock.
 
-        Residual race: if a stale reply arrives *during* the current wait (i.e. the
-        previous agent finishes after we drain but before we get our own reply) we
-        would consume it.  This is acceptable for the sequential Siri use-case.
-        The robust fix is per-request correlation (unique room IDs); deferred as a
-        follow-up for multi-user / concurrent-request support.
+        The reply queue is drained before each dispatch (inside the lock) to
+        discard any stale reply left by a prior timed-out request.
         """
-        async with self._request_lock:
-            # Drain any stale reply from a prior timed-out request.
-            while not self._reply_queue.empty():
-                stale = self._reply_queue.get_nowait()
-                logger.debug("VoiceConnector: discarding stale reply (%d chars)", len(stale))
+        state = self._get_room(room_name)
+        async with state.lock:
+            # Drain stale replies from any prior timed-out request.
+            while not state.queue.empty():
+                stale = state.queue.get_nowait()
+                logger.debug(
+                    "VoiceConnector [%s]: discarding stale reply (%d chars)",
+                    room_name,
+                    len(stale),
+                )
 
             if not self._handler:
-                logger.warning("VoiceConnector: handler not registered yet")
+                logger.warning(
+                    "VoiceConnector [%s]: handler not registered yet", room_name
+                )
                 return _BUSY_REPLY
 
             msg = IncomingMessage(
                 id=f"voice-{uuid.uuid4().hex[:8]}",
                 timestamp="",
-                room=_VOICE_ROOM,
+                room=Room(id=room_name, name=room_name, type="channel"),
                 sender=_VOICE_USER,
                 role=UserRole.OWNER,
                 text=text,
@@ -290,16 +342,47 @@ class VoiceConnector(Connector):
 
             accepted = await self._handler(msg)
             if not accepted:
-                logger.warning("VoiceConnector: message dropped (queue full)")
+                logger.warning(
+                    "VoiceConnector [%s]: message dropped (queue full)", room_name
+                )
                 return _BUSY_REPLY
 
             try:
                 return await asyncio.wait_for(
-                    self._reply_queue.get(), timeout=float(self._config.timeout)
+                    state.queue.get(), timeout=float(self._config.timeout)
                 )
             except asyncio.TimeoutError:
-                logger.warning("VoiceConnector: agent reply timed out after %ds", self._config.timeout)
+                logger.warning(
+                    "VoiceConnector [%s]: agent reply timed out after %ds",
+                    room_name,
+                    self._config.timeout,
+                )
                 return _TIMEOUT_REPLY
+
+
+# ── URL helpers ───────────────────────────────────────────────────────────────
+
+
+def _parse_room(path: str) -> str | None:
+    """Extract the room name from a ``/ask/<room>`` path.
+
+    Returns the room name string, or None if the path is invalid / missing a room.
+
+    Valid:
+        /ask/laomei       → "laomei"
+        /ask/voice-room   → "voice-room"
+    Invalid (returns None):
+        /ask              → None  (no room)
+        /ask/             → None  (empty room)
+        /other/laomei     → None  (wrong prefix)
+    """
+    # Strip query string
+    path = path.split("?", 1)[0]
+    # Must start with /ask/
+    if not path.startswith("/ask/"):
+        return None
+    room = path[len("/ask/"):].strip("/")
+    return room if room else None
 
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────

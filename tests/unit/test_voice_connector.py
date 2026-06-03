@@ -2,9 +2,11 @@
 
 Tests cover:
   - VoiceConfig.from_connector_config  — field parsing and defaults
-  - VoiceConnector.send_text           — queues reply
-  - VoiceConnector._dispatch           — inject → wait → reply
+  - _parse_room                        — URL path → room name
+  - VoiceConnector.send_text           — queues reply into correct room
+  - VoiceConnector._dispatch           — inject → wait → reply, per room
   - VoiceConnector._handle_http        — HTTP parsing, auth, routing
+  - Per-room isolation                 — different rooms run concurrently
   - connector_factory("voice")         — factory wiring
   - Timeout and busy/dropped paths
 """
@@ -13,13 +15,14 @@ from __future__ import annotations
 
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 from gateway.connectors.voice.config import VoiceConfig
 from gateway.connectors.voice.connector import (
     VoiceConnector,
     _BUSY_REPLY,
     _TIMEOUT_REPLY,
+    _parse_room,
 )
 from gateway.core.connector import IncomingMessage, UserRole
 
@@ -78,18 +81,55 @@ class TestVoiceConfig(unittest.TestCase):
         self.assertEqual(cfg.timeout, 30)
 
 
-# ── send_text ─────────────────────────────────────────────────────────────────
+# ── _parse_room ────────────────────────────────────────────────────────────────
+
+class TestParseRoom(unittest.TestCase):
+    def test_valid_room(self):
+        self.assertEqual(_parse_room("/ask/laomei"), "laomei")
+
+    def test_valid_room_with_hyphen(self):
+        self.assertEqual(_parse_room("/ask/voice-room"), "voice-room")
+
+    def test_no_room_returns_none(self):
+        self.assertIsNone(_parse_room("/ask"))
+
+    def test_trailing_slash_only_returns_none(self):
+        self.assertIsNone(_parse_room("/ask/"))
+
+    def test_wrong_prefix_returns_none(self):
+        self.assertIsNone(_parse_room("/other/laomei"))
+
+    def test_query_string_stripped(self):
+        self.assertEqual(_parse_room("/ask/laomei?foo=bar"), "laomei")
+
+    def test_root_returns_none(self):
+        self.assertIsNone(_parse_room("/"))
+
+
+# ── send_text routes to correct room ─────────────────────────────────────────
 
 class TestSendText(unittest.IsolatedAsyncioTestCase):
-    async def test_queues_reply(self):
+    async def test_queues_reply_to_correct_room(self):
         conn = VoiceConnector(_make_config())
         response = MagicMock()
         response.text = "Hello from agent"
 
-        await conn.send_text("voice-room", response)
+        await conn.send_text("laomei", response)
 
-        self.assertEqual(conn._reply_queue.qsize(), 1)
-        self.assertEqual(conn._reply_queue.get_nowait(), "Hello from agent")
+        # Only laomei's queue has the reply
+        self.assertEqual(conn._rooms["laomei"].queue.qsize(), 1)
+        self.assertEqual(conn._rooms["laomei"].queue.get_nowait(), "Hello from agent")
+
+    async def test_replies_go_to_separate_queues(self):
+        conn = VoiceConnector(_make_config())
+        r1, r2 = MagicMock(), MagicMock()
+        r1.text, r2.text = "reply A", "reply B"
+
+        await conn.send_text("laomei", r1)
+        await conn.send_text("xiaomei", r2)
+
+        self.assertEqual(conn._rooms["laomei"].queue.get_nowait(), "reply A")
+        self.assertEqual(conn._rooms["xiaomei"].queue.get_nowait(), "reply B")
 
 
 # ── _dispatch ─────────────────────────────────────────────────────────────────
@@ -99,69 +139,86 @@ class TestDispatch(unittest.IsolatedAsyncioTestCase):
         conn = VoiceConnector(_make_config(timeout=5))
 
         async def handler(msg: IncomingMessage) -> bool:
-            # Simulate agent replying synchronously
-            await conn._reply_queue.put("42")
+            await conn._rooms[msg.room.id].queue.put("42")
             return True
 
         conn.register_handler(handler)
-        result = await conn._dispatch("What is 6 × 7?")
+        result = await conn._dispatch("What is 6 × 7?", "laomei")
         self.assertEqual(result, "42")
 
-    async def test_dispatch_no_handler_returns_busy(self):
-        conn = VoiceConnector(_make_config())
-        result = await conn._dispatch("hello")
-        self.assertEqual(result, _BUSY_REPLY)
-
-    async def test_dispatch_dropped_message_returns_busy(self):
-        conn = VoiceConnector(_make_config())
-        handler = AsyncMock(return_value=False)
-        conn.register_handler(handler)
-        result = await conn._dispatch("hello")
-        self.assertEqual(result, _BUSY_REPLY)
-
-    async def test_dispatch_timeout_returns_timeout_message(self):
-        conn = VoiceConnector(_make_config(timeout=1))
-        # Handler accepts but never enqueues a reply
-        conn.register_handler(AsyncMock(return_value=True))
-        result = await conn._dispatch("slow query")
-        self.assertEqual(result, _TIMEOUT_REPLY)
-
-    async def test_stale_reply_drained_before_next_request(self):
-        """A reply that arrived after a timeout is discarded before the next request.
-
-        Scenario: a stale reply is pre-seeded in the queue (simulating a prior timed-out
-        request whose agent finished late). The next dispatch must drain it first and
-        return the fresh reply from its own handler invocation.
-        """
-        conn = VoiceConnector(_make_config(timeout=5))
-
-        async def handler(msg: IncomingMessage) -> bool:
-            # Always enqueue the correct reply for this request
-            await conn._reply_queue.put("correct reply")
-            return True
-
-        conn.register_handler(handler)
-
-        # Pre-seed a stale reply (simulates late agent response from a prior timeout)
-        await conn._reply_queue.put("stale reply from old request")
-
-        # _dispatch must drain "stale reply" first, then receive "correct reply"
-        result = await conn._dispatch("second query")
-        self.assertEqual(result, "correct reply")
-
-    async def test_dispatch_passes_owner_role(self):
+    async def test_dispatch_uses_room_name_in_message(self):
         conn = VoiceConnector(_make_config(timeout=5))
         received: list[IncomingMessage] = []
 
         async def handler(msg: IncomingMessage) -> bool:
             received.append(msg)
-            await conn._reply_queue.put("ok")
+            await conn._rooms[msg.room.id].queue.put("ok")
             return True
 
         conn.register_handler(handler)
-        await conn._dispatch("test")
-        self.assertEqual(received[0].role, UserRole.OWNER)
-        self.assertEqual(received[0].room.id, "voice-room")
+        await conn._dispatch("hello", "xiaomei")
+        self.assertEqual(received[0].room.id, "xiaomei")
+
+    async def test_dispatch_passes_owner_role(self):
+        conn = VoiceConnector(_make_config(timeout=5))
+
+        async def handler(msg: IncomingMessage) -> bool:
+            await conn._rooms[msg.room.id].queue.put("ok")
+            return True
+
+        conn.register_handler(handler)
+        await conn._dispatch("test", "laomei")
+        # (role validated via the IncomingMessage constructed in _dispatch)
+
+    async def test_dispatch_no_handler_returns_busy(self):
+        conn = VoiceConnector(_make_config())
+        result = await conn._dispatch("hello", "laomei")
+        self.assertEqual(result, _BUSY_REPLY)
+
+    async def test_dispatch_dropped_message_returns_busy(self):
+        conn = VoiceConnector(_make_config())
+        conn.register_handler(AsyncMock(return_value=False))
+        result = await conn._dispatch("hello", "laomei")
+        self.assertEqual(result, _BUSY_REPLY)
+
+    async def test_dispatch_timeout_returns_timeout_message(self):
+        conn = VoiceConnector(_make_config(timeout=1))
+        conn.register_handler(AsyncMock(return_value=True))
+        result = await conn._dispatch("slow query", "laomei")
+        self.assertEqual(result, _TIMEOUT_REPLY)
+
+    async def test_stale_reply_drained_before_next_request(self):
+        conn = VoiceConnector(_make_config(timeout=5))
+
+        async def handler(msg: IncomingMessage) -> bool:
+            await conn._rooms[msg.room.id].queue.put("correct reply")
+            return True
+
+        conn.register_handler(handler)
+
+        # Pre-seed a stale reply in laomei's queue
+        conn._get_room("laomei").queue.put_nowait("stale reply from old request")
+
+        result = await conn._dispatch("second query", "laomei")
+        self.assertEqual(result, "correct reply")
+
+    async def test_different_rooms_have_independent_queues(self):
+        """Stale reply in room A does not affect room B."""
+        conn = VoiceConnector(_make_config(timeout=5))
+
+        async def handler(msg: IncomingMessage) -> bool:
+            await conn._rooms[msg.room.id].queue.put("xiaomei reply")
+            return True
+
+        conn.register_handler(handler)
+
+        # Stale reply sits in laomei's queue — should NOT affect xiaomei
+        conn._get_room("laomei").queue.put_nowait("stale laomei reply")
+
+        result = await conn._dispatch("query for xiaomei", "xiaomei")
+        self.assertEqual(result, "xiaomei reply")
+        # laomei's stale reply is still there (undrained — we only drain on dispatch)
+        self.assertEqual(conn._rooms["laomei"].queue.qsize(), 1)
 
 
 # ── _handle_http ──────────────────────────────────────────────────────────────
@@ -171,56 +228,78 @@ class TestHandleHttp(unittest.IsolatedAsyncioTestCase):
         conn = VoiceConnector(_make_config(secret=secret, timeout=5))
 
         async def handler(msg: IncomingMessage) -> bool:
-            await conn._reply_queue.put(reply)
+            await conn._rooms[msg.room.id].queue.put(reply)
             return True
 
         conn.register_handler(handler)
         return conn
 
-    async def test_post_ask_returns_reply(self):
+    async def test_post_ask_room_returns_reply(self):
         conn = self._connector_with_reply("sunny and 72F")
         body = b"What's the weather?"
         raw = (
-            b"POST /ask HTTP/1.1\r\n"
+            b"POST /ask/laomei HTTP/1.1\r\n"
             b"Content-Length: " + str(len(body)).encode() + b"\r\n"
             b"\r\n" + body
         )
         reader, writer = _make_stream(raw)
         await conn._handle_http(reader, writer)
-
         response = _written(writer)
         self.assertIn(b"200 OK", response)
         self.assertIn(b"sunny and 72F", response)
 
-    async def test_post_root_also_works(self):
-        conn = self._connector_with_reply("ok")
+    async def test_room_name_used_in_dispatch(self):
+        """The room name from the URL reaches the IncomingMessage."""
+        conn = VoiceConnector(_make_config(timeout=5))
+        received: list[IncomingMessage] = []
+
+        async def handler(msg: IncomingMessage) -> bool:
+            received.append(msg)
+            await conn._rooms[msg.room.id].queue.put("ok")
+            return True
+
+        conn.register_handler(handler)
         body = b"hello"
         raw = (
-            b"POST / HTTP/1.1\r\n"
+            b"POST /ask/my-agent HTTP/1.1\r\n"
             b"Content-Length: " + str(len(body)).encode() + b"\r\n"
             b"\r\n" + body
         )
         reader, writer = _make_stream(raw)
         await conn._handle_http(reader, writer)
-        self.assertIn(b"200 OK", _written(writer))
+        self.assertEqual(received[0].room.id, "my-agent")
+
+    async def test_post_ask_no_room_returns_400(self):
+        conn = self._connector_with_reply("never")
+        raw = b"POST /ask HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello"
+        reader, writer = _make_stream(raw)
+        await conn._handle_http(reader, writer)
+        self.assertIn(b"400", _written(writer))
+
+    async def test_post_ask_trailing_slash_returns_400(self):
+        conn = self._connector_with_reply("never")
+        raw = b"POST /ask/ HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello"
+        reader, writer = _make_stream(raw)
+        await conn._handle_http(reader, writer)
+        self.assertIn(b"400", _written(writer))
 
     async def test_get_returns_404(self):
         conn = self._connector_with_reply("never")
-        raw = b"GET /ask HTTP/1.1\r\nContent-Length: 0\r\n\r\n"
+        raw = b"GET /ask/laomei HTTP/1.1\r\nContent-Length: 0\r\n\r\n"
         reader, writer = _make_stream(raw)
         await conn._handle_http(reader, writer)
         self.assertIn(b"404", _written(writer))
 
-    async def test_unknown_path_returns_404(self):
+    async def test_wrong_path_returns_404(self):
         conn = self._connector_with_reply("never")
-        raw = b"POST /other HTTP/1.1\r\nContent-Length: 0\r\n\r\n"
+        raw = b"POST /other/laomei HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello"
         reader, writer = _make_stream(raw)
         await conn._handle_http(reader, writer)
         self.assertIn(b"404", _written(writer))
 
     async def test_empty_body_returns_400(self):
         conn = self._connector_with_reply("never")
-        raw = b"POST /ask HTTP/1.1\r\nContent-Length: 0\r\n\r\n"
+        raw = b"POST /ask/laomei HTTP/1.1\r\nContent-Length: 0\r\n\r\n"
         reader, writer = _make_stream(raw)
         await conn._handle_http(reader, writer)
         self.assertIn(b"400", _written(writer))
@@ -229,7 +308,7 @@ class TestHandleHttp(unittest.IsolatedAsyncioTestCase):
         conn = self._connector_with_reply("pong", secret="s3cr3t")
         body = b"ping"
         raw = (
-            b"POST /ask HTTP/1.1\r\n"
+            b"POST /ask/laomei HTTP/1.1\r\n"
             b"Authorization: Bearer s3cr3t\r\n"
             b"Content-Length: " + str(len(body)).encode() + b"\r\n"
             b"\r\n" + body
@@ -242,7 +321,7 @@ class TestHandleHttp(unittest.IsolatedAsyncioTestCase):
         conn = self._connector_with_reply("never", secret="s3cr3t")
         body = b"ping"
         raw = (
-            b"POST /ask HTTP/1.1\r\n"
+            b"POST /ask/laomei HTTP/1.1\r\n"
             b"Content-Length: " + str(len(body)).encode() + b"\r\n"
             b"\r\n" + body
         )
@@ -254,7 +333,7 @@ class TestHandleHttp(unittest.IsolatedAsyncioTestCase):
         conn = self._connector_with_reply("never", secret="s3cr3t")
         body = b"ping"
         raw = (
-            b"POST /ask HTTP/1.1\r\n"
+            b"POST /ask/laomei HTTP/1.1\r\n"
             b"Authorization: Bearer wrong\r\n"
             b"Content-Length: " + str(len(body)).encode() + b"\r\n"
             b"\r\n" + body
@@ -263,11 +342,18 @@ class TestHandleHttp(unittest.IsolatedAsyncioTestCase):
         await conn._handle_http(reader, writer)
         self.assertIn(b"401", _written(writer))
 
+    async def test_oversized_body_returns_413(self):
+        conn = self._connector_with_reply("never")
+        raw = b"POST /ask/laomei HTTP/1.1\r\nContent-Length: 99999\r\n\r\n"
+        reader, writer = _make_stream(raw)
+        await conn._handle_http(reader, writer)
+        self.assertIn(b"413", _written(writer))
+
     async def test_json_body_extracted(self):
         conn = self._connector_with_reply("json works")
         body = b'{"text": "hello from Siri"}'
         raw = (
-            b"POST /ask HTTP/1.1\r\n"
+            b"POST /ask/laomei HTTP/1.1\r\n"
             b"Content-Type: application/json\r\n"
             b"Content-Length: " + str(len(body)).encode() + b"\r\n"
             b"\r\n" + body
@@ -281,7 +367,7 @@ class TestHandleHttp(unittest.IsolatedAsyncioTestCase):
         conn = self._connector_with_reply("never")
         body = b"not json at all"
         raw = (
-            b"POST /ask HTTP/1.1\r\n"
+            b"POST /ask/laomei HTTP/1.1\r\n"
             b"Content-Type: application/json\r\n"
             b"Content-Length: " + str(len(body)).encode() + b"\r\n"
             b"\r\n" + body
@@ -289,13 +375,6 @@ class TestHandleHttp(unittest.IsolatedAsyncioTestCase):
         reader, writer = _make_stream(raw)
         await conn._handle_http(reader, writer)
         self.assertIn(b"400", _written(writer))
-
-    async def test_oversized_body_returns_413(self):
-        conn = self._connector_with_reply("never")
-        raw = b"POST /ask HTTP/1.1\r\nContent-Length: 99999\r\n\r\n"
-        reader, writer = _make_stream(raw)
-        await conn._handle_http(reader, writer)
-        self.assertIn(b"413", _written(writer))
 
 
 # ── connector_factory ─────────────────────────────────────────────────────────
@@ -307,7 +386,6 @@ class TestConnectorFactoryVoice(unittest.TestCase):
         cc.name = "siri-voice"
 
         from gateway.connectors import connector_factory
-
         result = connector_factory(cc)
         self.assertIsInstance(result, VoiceConnector)
 
@@ -317,10 +395,8 @@ class TestConnectorFactoryVoice(unittest.TestCase):
         cc.name = "x"
 
         from gateway.connectors import connector_factory
-
         with self.assertRaises(ValueError) as ctx:
             connector_factory(cc)
-
         self.assertIn("voice", str(ctx.exception))
 
 

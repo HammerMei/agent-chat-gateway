@@ -265,7 +265,7 @@ watchers:
   #   agent: my-agent
   #   session_id: ~
   #   context_inject_files:
-  #     - contexts/voice-context.md  # enforces plain-text, no markdown/emoji for Siri
+  #     - gateway/contexts/voice-context.md  # enforces plain-text, no markdown/emoji for Siri
   #   online_notification: ~         # suppress — no RC room to notify
   #   offline_notification: ~
 
