@@ -29,6 +29,7 @@ Inspired by [OpenClaw](https://github.com/openclaw/openclaw)'s vision of making 
 - ⚡ **[Multiple chat systems at once](docs/user-guide.md#multi-connector-setup)** — connect to several chat platforms simultaneously
 - ⏰ **[Built-in task scheduler](docs/scheduling.md)** — let the agent schedule recurring or one-shot tasks directly from chat ("remind me in 5 minutes", "run daily standup at 09:00") without any infrastructure setup
 - 🤝 **[Agent-to-agent collaboration](docs/agent-chain.md)** — let multiple AI agents collaborate in a shared room; built-in loop protection keeps conversations bounded and human-observable
+- 🧪 **[Voice gateway (experimental)](docs/supported-features.md#voice-gateway-experimental-)** — connect your agent to Siri via iOS Shortcuts; any phone becomes a zero-hardware voice interface with no custom wake word infrastructure
 
 ---
 
@@ -38,6 +39,7 @@ Inspired by [OpenClaw](https://github.com/openclaw/openclaw)'s vision of making 
 |--|--|--|
 | **Chat platforms** | Rocket.Chat | Slack, Discord, and others |
 | **Agent backends** | Claude Code, OpenCode | Any agent with a CLI interface |
+| **Voice** | iOS Shortcuts *(experimental)* | Android via Tasker, dedicated hardware |
 
 ---
 

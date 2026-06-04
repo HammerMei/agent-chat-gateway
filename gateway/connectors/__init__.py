@@ -10,6 +10,7 @@ def connector_factory(cc: ConnectorConfig) -> Connector:
     Supported types:
       - "rocketchat": Full Rocket.Chat DDP/REST connector
       - "script":     In-memory connector for testing and scripting
+      - "voice":      HTTP voice gateway for Siri / iOS Shortcuts
     """
     if cc.type == "rocketchat":
         from .rocketchat import RocketChatConnector
@@ -18,6 +19,10 @@ def connector_factory(cc: ConnectorConfig) -> Connector:
     if cc.type == "script":
         from .script import ScriptConnector
         return ScriptConnector(name=cc.name)
+    if cc.type == "voice":
+        from .voice import VoiceConnector
+        from .voice.config import VoiceConfig
+        return VoiceConnector(VoiceConfig.from_connector_config(cc))
     raise ValueError(
-        f"Unknown connector type: {cc.type!r} (supported: 'rocketchat', 'script')"
+        f"Unknown connector type: {cc.type!r} (supported: 'rocketchat', 'script', 'voice')"
     )
