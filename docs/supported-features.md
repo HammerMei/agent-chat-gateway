@@ -38,6 +38,65 @@ This document clearly communicates what agent-chat-gateway supports today, what 
 
 ---
 
+### Voice Gateway (Experimental) 🧪
+
+A lightweight HTTP endpoint that turns any ACG-connected agent into a voice assistant
+accessible from Siri via iOS Shortcuts — no custom hardware, no wake word infrastructure.
+
+```
+"Hey Siri, run Ask 老妹"
+    ↓
+iOS Shortcut: Dictate Text
+    ↓
+POST /ask/<room>   ←  VoiceConnector
+    ↓
+Agent processes
+    ↓
+Plain-text reply returned
+    ↓
+Speak Text (iOS TTS)
+```
+
+**Config:**
+```yaml
+connectors:
+  - name: siri-voice
+    type: voice
+    port: 8765
+    secret: "$VOICE_SECRET"
+
+watchers:
+  - name: siri-watcher
+    connector: siri-voice
+    room: voice-room           # → POST /ask/voice-room
+    agent: my-agent
+    context_inject_files:
+      - gateway/contexts/voice-context.md
+```
+
+#### Supported
+
+- ✅ **Plain-text HTTP endpoint** — `POST /ask/<room>` returns plain-text; room maps directly to watcher `room:` config
+- ✅ **Path-based room routing** — one port, N agents: `/ask/laomei`, `/ask/xiaomei`, etc.
+- ✅ **JSON and plain-text body** — accepts both (iOS Shortcuts has no plain-text body option; use JSON `{"text": "..."}`)
+- ✅ **Bearer token auth** — constant-time `hmac.compare_digest` comparison
+- ✅ **Per-room serialization** — same-room requests serialized; different rooms run concurrently
+- ✅ **Voice-safe replies** — `gateway/contexts/voice-context.md` enforces plain text, no markdown, no emoji
+- ✅ **Zero new dependencies** — stdlib `asyncio.start_server` only
+
+#### Configuration notes
+
+- ⚠️ **Requires `skip_owner_approval: true`** (or `permissions.enabled: false`) — there is no human in the loop to approve tool requests over a voice channel. Document this in your config; the gateway logs a warning if a permission notification is received on a voice room.
+- ⚠️ **Network security** — binds to `0.0.0.0` by default; gate at the network level (VPN / firewall) in addition to the bearer token.
+
+#### Known limitations
+
+- 🔶 **Subprocess latency** — each query spawns a new `claude -p` process (~0.5–2 s overhead); a persistent-session backend (e.g. `poor-claude`) would eliminate this
+- 🔶 **Cross-request reply mixup on timeout** — if a request times out and the agent turn finishes late, the late reply may be delivered to the next request; root cause requires per-dispatch queue correlation (deferred; narrow window for sequential Siri use)
+- 🔶 **Unbounded room map** — `_rooms` dict grows one entry per distinct room name ever POSTed; no eviction (negligible in practice, more relevant when `secret` is unset)
+
+---
+
 ### Agent Backends
 
 #### Claude CLI Backend (`claude`)
@@ -222,10 +281,11 @@ This document clearly communicates what agent-chat-gateway supports today, what 
 
 ### Platform Support
 
-- ❌ **Single connector type**: Only Rocket.Chat supported currently
+- ❌ **Single production connector type**: Only Rocket.Chat is production-ready
   - No Slack, Discord, Microsoft Teams, or WhatsApp connectors
   - Webhook-based (push) connectors not yet implemented
   - Rocket.Chat connector is pull-based (DDP subscription polling)
+  - Voice gateway connector is experimental — see [Voice Gateway](#voice-gateway-experimental-) section
 
 ### Agent Backends
 
@@ -341,6 +401,7 @@ This document clearly communicates what agent-chat-gateway supports today, what 
 | CLI operations | Stable | Production-ready |
 | Persistence & recovery | Stable | Production-ready |
 | Scripting API | Stable | Stable for scripting |
+| Voice gateway connector | **Experimental** | POC-quality; sequential Siri use; known timeout race |
 
 ---
 
