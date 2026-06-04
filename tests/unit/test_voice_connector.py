@@ -19,13 +19,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 from gateway.connectors.voice.config import VoiceConfig
 from gateway.connectors.voice.connector import (
-    VoiceConnector,
     _BUSY_REPLY,
     _TIMEOUT_REPLY,
+    VoiceConnector,
     _parse_room,
 )
-from gateway.core.connector import IncomingMessage, UserRole
-
+from gateway.core.connector import IncomingMessage
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
