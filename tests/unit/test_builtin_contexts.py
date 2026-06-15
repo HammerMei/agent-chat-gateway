@@ -10,7 +10,7 @@ def test_rc_context_contains_directed_reply_etiquette():
     assert "`to: @all`" in text
     assert "intentional broader fan-out" in text
     assert "priority responders" in text
-    assert "Directed Reply Etiquette" in text
+    assert "PROHIBITED: Unsolicited Agent-Chain Replies" in text
     assert "Use explicit @mentions for directed replies" in text
     assert "human or agent" in text
     assert "directed at someone else as not addressed to you" in text
