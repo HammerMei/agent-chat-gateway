@@ -1197,5 +1197,61 @@ class TestInjectMessageStateNone(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(warning_msgs, "Expected a warning about missing watcher state")
 
 
+class TestInjectMessageTimestampFormat(unittest.IsolatedAsyncioTestCase):
+    """agent-chat-gateway#53: scheduler-injected messages must carry a
+    timestamp RocketChatConnector.format_prompt_prefix() can actually parse
+    into ts:/day: — otherwise scheduled tasks (e.g. stock reports) never see
+    a day-of-week hint and can misjudge weekday vs. weekend."""
+
+    async def test_injected_timestamp_produces_day_and_ts_fields(self):
+        from unittest.mock import MagicMock
+
+        from gateway.config import AttachmentConfig
+        from gateway.connectors.rocketchat.config import RocketChatConfig
+        from gateway.connectors.rocketchat.connector import RocketChatConnector
+        from gateway.core.session_manager import SessionManager
+
+        captured: list = []
+
+        mock_processor = MagicMock()
+
+        async def _capture_enqueue(msg):
+            captured.append(msg)
+            return True
+
+        mock_processor.enqueue = _capture_enqueue
+
+        mock_lifecycle = MagicMock()
+        mock_lifecycle.get_processor = MagicMock(return_value=mock_processor)
+        mock_lifecycle.get_watcher_state = MagicMock(return_value=None)
+        mock_lifecycle.get_watcher_config = MagicMock(return_value=None)
+
+        sm = SessionManager.__new__(SessionManager)
+        sm._lifecycle = mock_lifecycle
+
+        result = await sm.inject_message("test-watcher", "check stock prices")
+        self.assertTrue(result)
+        self.assertEqual(len(captured), 1)
+        injected_msg = captured[0]
+
+        # Feed the exact message SessionManager built into the real RC
+        # connector's header formatter — this is the code path a scheduled
+        # job's message actually goes through.
+        connector = RocketChatConnector.__new__(RocketChatConnector)
+        connector._config = RocketChatConfig(
+            server_url="http://chat.example.com",
+            username="bot",
+            password="pw",
+            name="rc",
+            owners=["alice"],
+            timezone="UTC",
+            attachments=AttachmentConfig(cache_dir_global="/tmp/rc-cache"),
+        )
+        prefix = connector.format_prompt_prefix(injected_msg)
+
+        self.assertIn("day:", prefix)
+        self.assertIn("ts:", prefix)
+
+
 if __name__ == "__main__":
     unittest.main()
