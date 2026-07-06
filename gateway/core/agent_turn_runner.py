@@ -85,6 +85,7 @@ class AgentTurnRunner:
         role_env: dict[str, str] | None = None,
         is_agent_chain: bool = False,
         agent_chain_context: str = "",
+        append_system_prompt_file: str | None = None,
     ) -> bool:
         """Execute one turn: send prompt to agent, post response (or error) to room.
 
@@ -124,6 +125,7 @@ class AgentTurnRunner:
                 thread_id,
                 file_paths,
                 role_env,
+                append_system_prompt_file,
             )
 
             # Strip the termination token from agent responses — case-insensitive
@@ -190,6 +192,7 @@ class AgentTurnRunner:
         thread_id: str | None,
         file_paths: list[str] | None,
         role_env: dict[str, str] | None,
+        append_system_prompt_file: str | None = None,
     ) -> AgentResponse:
         """Iterate agent.stream() and return the final AgentResponse.
 
@@ -206,6 +209,7 @@ class AgentTurnRunner:
                 timeout=self._config.timeout_for(self._agent_name),
                 attachments=file_paths,
                 env=role_env,
+                append_system_prompt_file=append_system_prompt_file,
             ):
                 if event.kind == "final":
                     response = event.response or AgentResponse(

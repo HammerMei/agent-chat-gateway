@@ -415,10 +415,15 @@ class _MockAgentBackend(_AgentBackend):
         self._session_counter += 1
         return f"mock-session-{self._session_counter:04d}"
 
-    async def send(self, session_id, prompt, working_directory, timeout, attachments=None, env=None):
+    async def send(self, session_id, prompt, working_directory, timeout, attachments=None, env=None, append_system_prompt_file=None):
         self.sent_messages.append({"prompt": prompt, "session_id": session_id, "attachments": attachments})
         text = self._responses.pop(0) if self._responses else self._default_response
         return _AgentResponse(text=text)
+
+    async def ensure_durable_instructions(self, *a, **kw):
+        """Skip the default send()-based fallback so watcher startup doesn't
+        consume a canned response from self._responses."""
+        return None
 
 
 def _make_watcher_cr(room="script", name=None):

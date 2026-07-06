@@ -386,9 +386,16 @@ class TestAttachmentWarningPromptInjection(IsolatedTestCase):
                 return f"mock-session-{self._session_counter:04d}"
 
             async def send(self, session_id, prompt, working_directory, timeout,
-                           attachments=None, env=None):
+                           attachments=None, env=None, append_system_prompt_file=None):
                 self.sent_messages.append({"prompt": prompt, "session_id": session_id})
                 return AgentResponse(text="mock reply")
+
+            async def ensure_durable_instructions(self, session_id, working_directory,
+                                                    timeout, content, *, watcher_name,
+                                                    already_delivered):
+                return await self._send_once_as_durable_fallback(
+                    session_id, working_directory, timeout, content, already_delivered,
+                )
 
         connector = ScriptConnector()
         agent = MockAgent()
@@ -441,9 +448,16 @@ class TestAttachmentWarningPromptInjection(IsolatedTestCase):
                 return f"mock-session-{self._session_counter:04d}"
 
             async def send(self, session_id, prompt, working_directory, timeout,
-                           attachments=None, env=None):
+                           attachments=None, env=None, append_system_prompt_file=None):
                 self.sent_messages.append({"prompt": prompt, "session_id": session_id})
                 return AgentResponse(text="mock reply")
+
+            async def ensure_durable_instructions(self, session_id, working_directory,
+                                                    timeout, content, *, watcher_name,
+                                                    already_delivered):
+                return await self._send_once_as_durable_fallback(
+                    session_id, working_directory, timeout, content, already_delivered,
+                )
 
         connector = ScriptConnector()
         agent = MockAgent()
@@ -487,8 +501,15 @@ class TestAttachmentSymlink(IsolatedTestCase):
                 return f"mock-session-{self._session_counter:04d}"
 
             async def send(self, session_id, prompt, working_directory, timeout,
-                           attachments=None, env=None):
+                           attachments=None, env=None, append_system_prompt_file=None):
                 return AgentResponse(text="ok")
+
+            async def ensure_durable_instructions(self, session_id, working_directory,
+                                                    timeout, content, *, watcher_name,
+                                                    already_delivered):
+                return await self._send_once_as_durable_fallback(
+                    session_id, working_directory, timeout, content, already_delivered,
+                )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             connector = ScriptConnector()
@@ -530,8 +551,15 @@ class TestAttachmentSymlink(IsolatedTestCase):
                 return f"mock-session-{self._session_counter:04d}"
 
             async def send(self, session_id, prompt, working_directory, timeout,
-                           attachments=None, env=None):
+                           attachments=None, env=None, append_system_prompt_file=None):
                 return AgentResponse(text="ok")
+
+            async def ensure_durable_instructions(self, session_id, working_directory,
+                                                    timeout, content, *, watcher_name,
+                                                    already_delivered):
+                return await self._send_once_as_durable_fallback(
+                    session_id, working_directory, timeout, content, already_delivered,
+                )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             connector = ScriptConnector()
@@ -593,9 +621,16 @@ class TestAttachmentSymlink(IsolatedTestCase):
                 return f"mock-session-{self._session_counter:04d}"
 
             async def send(self, session_id, prompt, working_directory, timeout,
-                           attachments=None, env=None):
+                           attachments=None, env=None, append_system_prompt_file=None):
                 self.sent_messages.append({"prompt": prompt, "attachments": attachments})
                 return AgentResponse(text="ok")
+
+            async def ensure_durable_instructions(self, session_id, working_directory,
+                                                    timeout, content, *, watcher_name,
+                                                    already_delivered):
+                return await self._send_once_as_durable_fallback(
+                    session_id, working_directory, timeout, content, already_delivered,
+                )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             connector = ScriptConnector()
@@ -679,8 +714,15 @@ class TestAttachmentSymlink(IsolatedTestCase):
                 return f"mock-session-{self._session_counter:04d}"
 
             async def send(self, session_id, prompt, working_directory, timeout,
-                           attachments=None, env=None):
+                           attachments=None, env=None, append_system_prompt_file=None):
                 return AgentResponse(text="ok")
+
+            async def ensure_durable_instructions(self, session_id, working_directory,
+                                                    timeout, content, *, watcher_name,
+                                                    already_delivered):
+                return await self._send_once_as_durable_fallback(
+                    session_id, working_directory, timeout, content, already_delivered,
+                )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             connector = ScriptConnector()

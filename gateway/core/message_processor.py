@@ -28,7 +28,7 @@ from .agent_turn_runner import AgentTurnRunner, _user_facing_agent_error_message
 from .attachment_workspace import localize_attachment_paths
 from .config import CoreConfig, WatcherConfig
 from .connector import Attachment, Connector, IncomingMessage, Room, UserRole
-from .context_injector import ContextInjector
+from .injected_context_builder import InjectedContextBuilder
 from .prompt_builder import build_catchup_prompt, build_prompt
 from .session_maps import SessionMaps
 from .state import WatcherState
@@ -71,13 +71,14 @@ class MessageProcessor:
         session_role_map: dict[str, str] | None = None,
         session_permission_thread_map: "dict[str, str | None] | None" = None,
         session_maps: SessionMaps | None = None,
-        context_injector: ContextInjector | None = None,
+        context_injector: InjectedContextBuilder | None = None,
         watcher_state: WatcherState | None = None,
         watcher_config: WatcherConfig | None = None,
         connector_name: str = "",
         online_notification: str | None = "✅ _Agent online_",
         offline_notification: str | None = "❌ _Agent offline_",
         attachment_local_base: str | None = None,
+        append_system_prompt_file: str | None = None,
     ) -> None:
         self._session_id = session_id
         self._room = room
@@ -98,6 +99,11 @@ class MessageProcessor:
         self._online_notification = online_notification
         self._offline_notification = offline_notification
         self._attachment_local_base = attachment_local_base
+        # Path to re-supply on every turn via AgentBackend.send()/.stream()'s
+        # append_system_prompt_file kwarg (e.g. Claude's
+        # --append-system-prompt-file). None for backends with no such
+        # mechanism (see AgentBackend.ensure_durable_instructions()).
+        self._append_system_prompt_file = append_system_prompt_file
 
         self._turn_runner = AgentTurnRunner(
             agent=agent,
@@ -362,7 +368,7 @@ class MessageProcessor:
             await self._ensure_context_injected()
         except Exception as e:
             logger.exception(
-                "Context injection failed during message processing "
+                "Durable context retry failed during message processing "
                 "(session=%s room=%s): %s",
                 self._session_id[:8],
                 self._room.name,
@@ -426,6 +432,7 @@ class MessageProcessor:
             role_env=role_env,
             is_agent_chain=is_agent_chain,
             agent_chain_context=agent_chain_context,
+            append_system_prompt_file=self._append_system_prompt_file,
         )
 
     async def _process_batch(self, batch: list[IncomingMessage]) -> None:
@@ -462,25 +469,11 @@ class MessageProcessor:
         anchor = allowed[-1]
         history_msgs = allowed[:-1]
 
-        # Aggregate attachments from all messages; dedup by local path.
-        all_attachments: list[Attachment] = []
-        seen_paths: set[str] = set()
-        for m in allowed:
-            for att in m.attachments:
-                if att.local_path not in seen_paths:
-                    all_attachments.append(att)
-                    seen_paths.add(att.local_path)
-
-        file_paths = localize_attachment_paths(all_attachments, self._attachment_local_base)
-
-        # Aggregate warnings from all messages; surfaced on the anchor prompt.
-        all_warnings = [w for m in allowed for w in m.warnings] or None
-
         try:
             await self._ensure_context_injected()
         except Exception as e:
             logger.exception(
-                "Context injection failed during batch processing "
+                "Durable context retry failed during batch processing "
                 "(session=%s room=%s): %s",
                 self._session_id[:8],
                 self._room.name,
@@ -495,6 +488,20 @@ class MessageProcessor:
                 thread_id=anchor.thread_id,
             )
             return
+
+        # Aggregate attachments from all messages; dedup by local path.
+        all_attachments: list[Attachment] = []
+        seen_paths: set[str] = set()
+        for m in allowed:
+            for att in m.attachments:
+                if att.local_path not in seen_paths:
+                    all_attachments.append(att)
+                    seen_paths.add(att.local_path)
+
+        file_paths = localize_attachment_paths(all_attachments, self._attachment_local_base)
+
+        # Aggregate warnings from all messages; surfaced on the anchor prompt.
+        all_warnings = [w for m in allowed for w in m.warnings] or None
 
         # Build history lines using the same format_prompt_prefix as normal
         # messages — timestamps and addressing are already embedded.
@@ -556,10 +563,36 @@ class MessageProcessor:
             role_env=role_env,
             is_agent_chain=is_agent_chain,
             agent_chain_context=agent_chain_context,
+            append_system_prompt_file=self._append_system_prompt_file,
         )
 
     async def _ensure_context_injected(self) -> None:
-        """Retry context injection safely on message processing when appropriate."""
+        """Retry durable-context delivery on message processing when appropriate.
+
+        ``InjectedContextBuilder.ensure()`` is called unconditionally once at
+        watcher startup (``WatcherLifecycle._start_watcher()``). For backends
+        using the default ``ensure_durable_instructions()`` fallback (a
+        one-time ``send()`` — OpenCode today), a transient failure there has
+        no other recovery path: without this retry, the watcher would stay
+        in ``failed_retryable``/``failed_degraded`` for its entire uptime,
+        recoverable only via a manual watcher reset or gateway restart. This
+        restores the retry-on-message cadence the old ``ContextInjector`` had
+        (throttled naturally by actual traffic, same as before), now pointed
+        at the ``build()``/``ensure()`` pipeline.
+
+        For backends that return a value to re-supply every turn (Claude),
+        ``ensure_durable_instructions()`` has no side effect and essentially
+        cannot fail this way in practice — but if a retry here does succeed
+        with a fresh non-``None`` value, ``self._append_system_prompt_file``
+        is updated so subsequent turns pick it up instead of staying stuck
+        with whatever (possibly ``None``) value the failed startup attempt left.
+
+        Raises whatever ``build()``/``ensure()`` raise on a hard failure
+        (e.g. a missing context file, or a non-``AgentExecutionError``
+        exception from the backend) — callers (``_process()``/
+        ``_process_batch()``) catch this and surface a user-facing error,
+        aborting that turn rather than silently proceeding without context.
+        """
         if (
             self._context_injector is None
             or self._watcher_state is None
@@ -573,15 +606,23 @@ class MessageProcessor:
         if status.state not in {"not_started", "failed_retryable", "pending"}:
             return
 
-        await self._context_injector.inject(
-            ws=self._watcher_state,
-            session_id=self._session_id,
-            agent=self._agent,
-            agent_name=self._agent_name,
-            connector_name=self._connector_name,
-            wc=self._watcher_config,
+        content = await self._context_injector.build(
+            self._agent_name,
+            self._connector_name,
+            self._watcher_config,
             agent_username=self._connector.agent_username,
         )
+        to_repeat = await self._context_injector.ensure(
+            self._watcher_state,
+            self._session_id,
+            self._agent,
+            self._working_directory,
+            self._config.timeout_for(self._agent_name),
+            watcher_name=self._watcher_id,
+            content=content,
+        )
+        if to_repeat is not None:
+            self._append_system_prompt_file = to_repeat
 
     # ── Notifications ─────────────────────────────────────────────────────────
 

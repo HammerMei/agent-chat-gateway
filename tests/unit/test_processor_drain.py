@@ -14,14 +14,10 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock
 
 from gateway.agents import AgentBackend
-from gateway.agents.errors import AgentUnavailableError
-from gateway.agents.response import AgentResponse
-from gateway.config import WatcherConfig
+from gateway.agents.response import AgentEvent, AgentResponse
 from gateway.core.config import AgentConfig, CoreConfig
 from gateway.core.connector import IncomingMessage, Room, User, UserRole
-from gateway.core.context_injector import ContextInjector, InjectionStatus
 from gateway.core.message_processor import MessageProcessor
-from gateway.core.state import WatcherState
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -37,7 +33,14 @@ class _SlowAgent(AgentBackend):
         return "ses_001"
 
     async def send(
-        self, session_id, prompt, working_directory, timeout, attachments=None, env=None
+        self,
+        session_id,
+        prompt,
+        working_directory,
+        timeout,
+        attachments=None,
+        env=None,
+        append_system_prompt_file=None,
     ):
         await asyncio.sleep(self._delay)
         self.processed.append(prompt)
@@ -67,11 +70,8 @@ def _make_processor(agent: AgentBackend) -> MessageProcessor:
     )
 
 
-def _make_processor_with_context(
-    agent: AgentBackend,
-    injector: ContextInjector,
-    watcher_state: WatcherState,
-    watcher_config: WatcherConfig,
+def _make_processor_with_prompt_file(
+    agent: AgentBackend, append_system_prompt_file: str | None
 ) -> MessageProcessor:
     config = CoreConfig(
         agents={"default": AgentConfig(timeout=10)},
@@ -83,6 +83,7 @@ def _make_processor_with_context(
     connector.notify_typing = AsyncMock()
     connector.notify_online = AsyncMock()
     connector.notify_offline = AsyncMock()
+    connector.notify_agent_event = AsyncMock()
     return MessageProcessor(
         session_id="ses_001",
         room=Room(id="room_1", name="test-room"),
@@ -92,10 +93,7 @@ def _make_processor_with_context(
         agent=agent,
         config=config,
         agent_name="default",
-        context_injector=injector,
-        watcher_state=watcher_state,
-        watcher_config=watcher_config,
-        connector_name="script",
+        append_system_prompt_file=append_system_prompt_file,
     )
 
 
@@ -262,100 +260,213 @@ class TestGracefulDrain(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(proc._state, "stopped")
 
 
-class TestContextInjectionRetry(unittest.IsolatedAsyncioTestCase):
-    async def test_retryable_context_failure_retries_on_next_message(self):
-        agent = _SlowAgent(delay=0.0)
-        injector = MagicMock(spec=ContextInjector)
-        injector.status_for = MagicMock(
-            return_value=InjectionStatus(state="failed_retryable", failure_count=1)
+class TestAppendSystemPromptFileDurability(unittest.IsolatedAsyncioTestCase):
+    """Regression coverage for issue #52: the durable system prompt file path
+    must be re-supplied by MessageProcessor on EVERY turn, not just the first.
+
+    Claude's --append-system-prompt-file only works if the gateway passes it
+    on every single invocation (each turn is a fresh subprocess) — the whole
+    point of the fix is that this content must survive context compaction by
+    being re-supplied every time, never sent once as a compactable message.
+    """
+
+    async def test_same_append_system_prompt_file_passed_on_every_turn(self):
+        captured: list[dict] = []
+
+        class _CapturingAgent(AgentBackend):
+            async def create_session(self, *a, **kw):
+                return "ses_001"
+
+            async def send(self, *a, **kw):
+                raise NotImplementedError
+
+            async def stream(self, **kw):
+                captured.append(kw)
+                yield AgentEvent(kind="final", response=AgentResponse(text="ok"))
+
+        agent = _CapturingAgent()
+        prompt_file = "/tmp/.acg-system-prompt/test-watcher.md"
+        proc = _make_processor_with_prompt_file(agent, prompt_file)
+
+        await proc._process(_make_msg("hello", "m1"))
+        await proc._process(_make_msg("world", "m2"))
+        await proc._process(_make_msg("again", "m3"))
+
+        self.assertEqual(len(captured), 3)
+        for kw in captured:
+            self.assertEqual(kw.get("append_system_prompt_file"), prompt_file)
+
+    async def test_none_append_system_prompt_file_passed_through_as_none(self):
+        """Backends without the mechanism (e.g. OpenCode) see None, not omitted."""
+        captured: list[dict] = []
+
+        class _CapturingAgent(AgentBackend):
+            async def create_session(self, *a, **kw):
+                return "ses_001"
+
+            async def send(self, *a, **kw):
+                raise NotImplementedError
+
+            async def stream(self, **kw):
+                captured.append(kw)
+                yield AgentEvent(kind="final", response=AgentResponse(text="ok"))
+
+        agent = _CapturingAgent()
+        proc = _make_processor_with_prompt_file(agent, None)
+
+        await proc._process(_make_msg("hello", "m1"))
+
+        self.assertEqual(len(captured), 1)
+        self.assertIsNone(captured[0].get("append_system_prompt_file"))
+
+
+class TestEnsureContextInjectedRetryOnMessage(unittest.IsolatedAsyncioTestCase):
+    """Regression coverage: a transient AgentExecutionError during the
+    default ensure_durable_instructions() fallback (e.g. OpenCode's one-time
+    send()) at watcher startup must self-heal on a later incoming message,
+    not stay stuck in failed_retryable/failed_degraded for the watcher's
+    entire uptime. This restores the retry-on-message cadence the old
+    ContextInjector/_ensure_context_injected() had — found missing in code
+    review after it was deleted along with the old inject() call path."""
+
+    def _make_processor_with_injector(self, agent, injector, ws, wc):
+        config = CoreConfig(
+            agents={"default": AgentConfig(timeout=10)},
+            default_agent="default",
         )
-        injector.inject = AsyncMock()
-        watcher_state = WatcherState(
-            watcher_name="test-watcher",
-            session_id="ses_001",
-            room_id="room_1",
+        connector = MagicMock()
+        connector.send_text = AsyncMock()
+        connector.format_prompt_prefix = MagicMock(return_value="")
+        connector.notify_typing = AsyncMock()
+        connector.notify_online = AsyncMock()
+        connector.notify_offline = AsyncMock()
+        connector.agent_username = "bot"
+        return MessageProcessor(
+            session_id="ses_retry",
+            room=Room(id="room_1", name="test-room"),
+            working_directory="/tmp",
+            watcher_id="w1",
+            connector=connector,
+            agent=agent,
+            config=config,
+            agent_name="default",
+            context_injector=injector,
+            watcher_state=ws,
+            watcher_config=wc,
+            connector_name="rc",
+        )
+
+    async def test_failed_delivery_recovers_on_next_message(self):
+        from gateway.core.config import WatcherConfig
+        from gateway.core.injected_context_builder import InjectedContextBuilder
+        from gateway.core.state import WatcherState
+
+        injector = InjectedContextBuilder(
+            CoreConfig(agents={"default": AgentConfig(timeout=10)}, default_agent="default")
+        )
+        ws = WatcherState(
+            watcher_name="w1", session_id="ses_retry", room_id="room_1",
             context_injected=False,
         )
-        watcher_config = WatcherConfig(
-            name="test-watcher",
-            connector="script",
-            room="test-room",
-            agent="default",
-            context_inject_files=["ctx.md"],
-        )
-        proc = _make_processor_with_context(
-            agent, injector, watcher_state, watcher_config
-        )
+        wc = WatcherConfig(name="w1", connector="rc", room="general", agent="default")
 
-        await proc._process(_make_msg("hello"))
+        attempts = 0
 
-        injector.inject.assert_awaited_once()
+        class _FlakyAgent(AgentBackend):
+            async def create_session(self, *a, **kw):
+                return "ses_retry"
 
-    async def test_degraded_context_state_does_not_retry_every_message(self):
-        agent = _SlowAgent(delay=0.0)
-        injector = MagicMock(spec=ContextInjector)
-        injector.status_for = MagicMock(
-            return_value=InjectionStatus(state="failed_degraded", failure_count=3)
+            async def send(self, *a, **kw):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    return AgentResponse(text="rate limited", is_error=True)
+                return AgentResponse(text="ok")
+
+            async def stream(self, **kw):
+                yield AgentEvent(kind="final", response=AgentResponse(text="reply"))
+
+            async def ensure_durable_instructions(
+                self, session_id, working_directory, timeout, content,
+                *, watcher_name, already_delivered,
+            ):
+                return await self._send_once_as_durable_fallback(
+                    session_id, working_directory, timeout, content, already_delivered,
+                )
+
+        agent = _FlakyAgent()
+        proc = self._make_processor_with_injector(agent, injector, ws, wc)
+
+        # Simulate the failed startup attempt directly via ensure(), exactly
+        # as WatcherLifecycle._start_watcher() would have on gateway boot.
+        await injector.ensure(
+            ws, ws.session_id, agent, "/tmp", 10, watcher_name="w1", content="ctx",
         )
-        injector.inject = AsyncMock()
-        watcher_state = WatcherState(
-            watcher_name="test-watcher",
-            session_id="ses_001",
-            room_id="room_1",
+        self.assertEqual(injector.status_for(ws.session_id).state, "failed_retryable")
+        self.assertFalse(ws.context_injected)
+
+        # A later incoming message must retry and succeed this time.
+        await proc._process(_make_msg("hello", "m1"))
+
+        self.assertEqual(attempts, 2, "must have retried the failed delivery")
+        self.assertTrue(ws.context_injected)
+        self.assertEqual(injector.status_for(ws.session_id).state, "injected")
+
+    async def test_degraded_after_max_attempts_stops_retrying(self):
+        from gateway.core.config import WatcherConfig
+        from gateway.core.injected_context_builder import (
+            InjectedContextBuilder,
+            _MAX_INJECT_ATTEMPTS,
+        )
+        from gateway.core.state import WatcherState
+
+        injector = InjectedContextBuilder(
+            CoreConfig(agents={"default": AgentConfig(timeout=10)}, default_agent="default")
+        )
+        ws = WatcherState(
+            watcher_name="w1", session_id="ses_degraded", room_id="room_1",
             context_injected=False,
         )
-        watcher_config = WatcherConfig(
-            name="test-watcher",
-            connector="script",
-            room="test-room",
-            agent="default",
-            context_inject_files=["ctx.md"],
-        )
-        proc = _make_processor_with_context(
-            agent, injector, watcher_state, watcher_config
-        )
+        wc = WatcherConfig(name="w1", connector="rc", room="general", agent="default")
 
-        await proc._process(_make_msg("hello"))
+        call_count = 0
 
-        injector.inject.assert_not_awaited()
+        class _AlwaysFailingAgent(AgentBackend):
+            async def create_session(self, *a, **kw):
+                return "ses_degraded"
 
-        # Second stop should not raise or hang
-        await proc.stop()
-        self.assertEqual(proc._state, "stopped")
+            async def send(self, *a, **kw):
+                nonlocal call_count
+                call_count += 1
+                return AgentResponse(text="down", is_error=True)
 
-    async def test_hard_context_injection_failure_replies_with_error_message(self):
-        agent = _SlowAgent(delay=0.0)
-        injector = MagicMock(spec=ContextInjector)
-        injector.status_for = MagicMock(
-            return_value=InjectionStatus(state="failed_retryable")
-        )
-        injector.inject = AsyncMock(
-            side_effect=AgentUnavailableError("backend unavailable")
-        )
-        watcher_state = WatcherState(
-            watcher_name="test-watcher",
-            session_id="ses_001",
-            room_id="room_1",
-            context_injected=False,
-        )
-        watcher_config = WatcherConfig(
-            name="test-watcher",
-            connector="script",
-            room="test-room",
-            agent="default",
-            context_inject_files=["ctx.md"],
-        )
-        proc = _make_processor_with_context(
-            agent, injector, watcher_state, watcher_config
-        )
+            async def stream(self, **kw):
+                yield AgentEvent(kind="final", response=AgentResponse(text="reply"))
 
-        await proc._process(_make_msg("hello"))
+            async def ensure_durable_instructions(
+                self, session_id, working_directory, timeout, content,
+                *, watcher_name, already_delivered,
+            ):
+                return await self._send_once_as_durable_fallback(
+                    session_id, working_directory, timeout, content, already_delivered,
+                )
 
-        proc._connector.send_text.assert_awaited_once()
-        response = proc._connector.send_text.await_args.args[1]
-        self.assertTrue(response.is_error)
-        self.assertIn("temporarily unavailable", response.text)
-        self.assertEqual(agent.processed, [])
+        agent = _AlwaysFailingAgent()
+        proc = self._make_processor_with_injector(agent, injector, ws, wc)
+
+        for _ in range(_MAX_INJECT_ATTEMPTS):
+            await injector.ensure(
+                ws, ws.session_id, agent, "/tmp", 10, watcher_name="w1", content="ctx",
+            )
+        self.assertEqual(injector.status_for(ws.session_id).state, "failed_degraded")
+        self.assertTrue(ws.context_injected)
+        calls_before = call_count
+
+        # Once degraded, ws.context_injected is True — no further retries
+        # should be attempted on subsequent messages.
+        await proc._process(_make_msg("hello", "m1"))
+
+        self.assertEqual(call_count, calls_before, "must not retry once degraded")
 
 
 if __name__ == "__main__":
@@ -393,7 +504,7 @@ class TestProcessorStoppingFlag(_IsolatedTestCase3):
             async def create_session(self, working_directory, extra_args=None, session_title=None):
                 return "test-session"
 
-            async def send(self, session_id, prompt, working_directory, timeout, attachments=None, env=None):
+            async def send(self, session_id, prompt, working_directory, timeout, attachments=None, env=None, append_system_prompt_file=None):
                 return AgentResponse(text="ok")
 
         connector = ScriptConnector()
@@ -421,7 +532,7 @@ class TestProcessorStoppingFlag(_IsolatedTestCase3):
             async def create_session(self, working_directory, extra_args=None, session_title=None):
                 return "test-session"
 
-            async def send(self, session_id, prompt, working_directory, timeout, attachments=None, env=None):
+            async def send(self, session_id, prompt, working_directory, timeout, attachments=None, env=None, append_system_prompt_file=None):
                 return AgentResponse(text="ok")
 
         connector = ScriptConnector()
@@ -452,7 +563,7 @@ class TestProcessorStoppingFlag(_IsolatedTestCase3):
             async def create_session(self, working_directory, extra_args=None, session_title=None):
                 return "test-session"
 
-            async def send(self, session_id, prompt, working_directory, timeout, attachments=None, env=None):
+            async def send(self, session_id, prompt, working_directory, timeout, attachments=None, env=None, append_system_prompt_file=None):
                 return AgentResponse(text="ok")
 
         connector = ScriptConnector()

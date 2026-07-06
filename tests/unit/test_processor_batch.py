@@ -35,7 +35,14 @@ class _RecordingAgent(AgentBackend):
         return "ses_001"
 
     async def send(
-        self, session_id, prompt, working_directory, timeout, attachments=None, env=None
+        self,
+        session_id,
+        prompt,
+        working_directory,
+        timeout,
+        attachments=None,
+        env=None,
+        append_system_prompt_file=None,
     ) -> AgentResponse:
         self.prompts.append(prompt)
         return AgentResponse(text="ok")

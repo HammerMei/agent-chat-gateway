@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Awaitable, Callable
 
+from .errors import AgentExecutionError
 from .response import AgentEvent, AgentResponse
 
 if TYPE_CHECKING:
@@ -103,6 +104,93 @@ class AgentBackend(ABC):
         support explicit session deletion need not override it.
         """
         return False
+
+    # ── Durable instruction delivery ─────────────────────────────────────────
+
+    async def ensure_durable_instructions(
+        self,
+        session_id: str,
+        working_directory: str,
+        timeout: int,
+        content: str,
+        *,
+        watcher_name: str,
+        already_delivered: bool,
+    ) -> str | None:
+        """Make `content` durably visible to the model, by whatever mechanism this
+        backend actually has. Called on EVERY watcher start — unconditionally, never
+        gated on prior history by the caller (see InjectedContextBuilder.ensure()).
+
+        Returns:
+            None — this backend fully handled it via a one-time side-effecting
+            action (e.g. sent a message into conversation history); caller does
+            nothing further.
+            A non-None value — this backend cannot make content durable on its
+            own; caller must keep re-supplying the returned value on every turn
+            via send()/stream()'s `append_system_prompt_file` parameter.
+
+        `already_delivered`: True if a PRIOR watcher start already got a
+        successful result for this session (persisted across gateway restarts).
+        Backends whose mechanism has a real side effect should honor it to
+        avoid duplicating content into conversation history. Backends with no
+        such side effect (returning a value for the caller to re-supply)
+        should ignore it and always return fresh content.
+
+        There is deliberately NO usable default here — every backend must
+        make an explicit choice, visible in its own source, about how it
+        makes content durable. A one-time send into conversation history
+        (see :meth:`_send_once_as_durable_fallback`) is NOT compaction-
+        resistant and is not a behavior any backend should end up with by
+        silently inheriting it; a backend that wants exactly that fallback
+        (OpenCode, today — see :class:`~gateway.agents.opencode.adapter.OpenCodeBackend`)
+        must opt in explicitly by calling ``self._send_once_as_durable_fallback(...)``
+        from its own override. This is intentionally NOT ``@abstractmethod``:
+        many ``AgentBackend`` subclasses across the test suite never exercise
+        this path at all and should not be forced to implement it just to be
+        instantiable — the cost of a missing implementation is paid only by
+        backends that actually get asked to deliver durable content.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement ensure_durable_instructions(). "
+            "Backends must explicitly decide how to make durable content reach "
+            "the model — either implement a real mechanism (see ClaudeBackend, "
+            "which writes a file for --append-system-prompt-file), or opt into "
+            "the one-time-send fallback via self._send_once_as_durable_fallback() "
+            "(see OpenCodeBackend)."
+        )
+
+    async def _send_once_as_durable_fallback(
+        self,
+        session_id: str,
+        working_directory: str,
+        timeout: int,
+        content: str,
+        already_delivered: bool,
+    ) -> str | None:
+        """Shared fallback: deliver `content` via one-time self.send().
+
+        Exactly matches the pre-#52 ContextInjector behavior — sends once,
+        skips re-sending when `already_delivered` is True, and raises
+        AgentExecutionError (retryable by the caller) on an error response.
+        Always returns None: this fully handles delivery itself, so the
+        caller has nothing further to re-supply on subsequent turns.
+
+        Not called automatically — a backend must call this explicitly from
+        its own ensure_durable_instructions() override to opt in (see
+        OpenCodeBackend). This is what makes that choice a visible, deliberate
+        one rather than a silently-inherited default.
+        """
+        if already_delivered:
+            return None
+        response = await self.send(
+            session_id=session_id,
+            prompt=content,
+            working_directory=working_directory,
+            timeout=timeout,
+        )
+        if response.is_error:
+            raise AgentExecutionError(response.text[:200])
+        return None
 
     # ── Permission broker factory ──────────────────────────────────────────────
 
@@ -210,6 +298,7 @@ class AgentBackend(ABC):
         timeout: int,
         attachments: list[str] | None = None,
         env: dict[str, str] | None = None,
+        append_system_prompt_file: str | None = None,
     ) -> AgentResponse:
         """Send a message to an existing session and return a normalized AgentResponse.
 
@@ -222,6 +311,10 @@ class AgentBackend(ABC):
             env: Optional extra environment variables to inject into the agent subprocess.
                  Merged on top of the inherited process environment. Used to pass role context
                  (e.g. ACG_ROLE) for hook/plugin enforcement.
+            append_system_prompt_file: Optional path to a file whose content should be
+                 appended to the system prompt on this turn (backend support varies —
+                 e.g. Claude's ``--append-system-prompt-file``). Backends without an
+                 equivalent mechanism should ignore it.
 
         Returns:
             AgentResponse with the agent's reply in ``.text`` and best-effort
@@ -238,6 +331,7 @@ class AgentBackend(ABC):
         timeout: int,
         attachments: list[str] | None = None,
         env: dict[str, str] | None = None,
+        append_system_prompt_file: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Stream agent events for a turn, yielding intermediate events then a final one.
 
@@ -260,6 +354,8 @@ class AgentBackend(ABC):
             timeout          : Seconds before the call times out.
             attachments      : Optional local file paths to attach.
             env              : Optional extra environment variables.
+            append_system_prompt_file: Optional path whose content should be appended
+                                 to the system prompt (backend support varies).
 
         Yields:
             :class:`AgentEvent` — zero or more intermediate events followed by
@@ -272,5 +368,6 @@ class AgentBackend(ABC):
             timeout=timeout,
             attachments=attachments,
             env=env,
+            append_system_prompt_file=append_system_prompt_file,
         )
         yield AgentEvent(kind="final", response=response)

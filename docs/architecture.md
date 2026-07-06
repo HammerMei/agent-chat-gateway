@@ -37,7 +37,7 @@ graph TD
     C["SessionManager<br/>(per-connector orchestrator)"]
     D["MessageDispatcher<br/>(routes → per-room processor)"]
     E["MessageProcessor<br/>(per-room async queue)"]
-    F["ContextInjector<br/>(prepend context files)"]
+    F["InjectedContextBuilder<br/>(build header+files; ensure durable delivery)"]
     G["PromptBuilder<br/>(role prefix + text)"]
     H["AgentTurnRunner<br/>(typing → send → deliver)"]
     I["AgentBackend<br/>(Claude/OpenCode)"]
@@ -85,7 +85,7 @@ graph TD
 | **core/dispatch.py** | Routes inbound messages to per-room processor; intercepts approve/deny | `MessageDispatcher` |
 | **core/message_processor.py** | Per-room async queue + orchestration of one turn | `MessageProcessor`, `enqueue()`, `_process()` |
 | **core/agent_turn_runner.py** | Execute one agent turn (typing → send → deliver) | `AgentTurnRunner`, `run_turn()` |
-| **core/context_injector.py** | Read context files and inject into agent sessions | `ContextInjector` |
+| **core/injected_context_builder.py** | Build identity header + context files; ensure durable delivery via AgentBackend.ensure_durable_instructions() | `InjectedContextBuilder` |
 | **core/prompt_builder.py** | Pure prompt assembly (no I/O); role-aware prefix | `build_prompt()` |
 | **core/attachment_workspace.py** | Per-watcher attachment symlink workspaces | `AttachmentWorkspace`, `localize_attachment_paths()` |
 | **core/state_store.py** | Persist WatcherState to JSON; watermark management | `StateStore` |
@@ -148,9 +148,10 @@ graph TD
                 └─→ asyncio.Queue.put(message)               │
                                                               │
     └─→ MessageProcessor._process()  [queue consumer loop]   │
-        ├─→ ContextInjector.inject()  [if first message]     │
+        ├─→ InjectedContextBuilder.build()+.ensure()  [every watcher start] │
         │   └─ Read ~/.agent-chat-gateway/contexts/*.md      │
-        │   └─ Inject into agent session                     │
+        │   └─ Deliver via agent.ensure_durable_instructions() │
+        │      (Claude: --append-system-prompt-file; else: one-time send) │
         │                                                     │
         ├─→ PromptBuilder.build_prompt()                     │
         │   ├─ Trusted header:                               │
@@ -648,7 +649,7 @@ Each module has a single responsibility:
 - **MessageDispatcher** — routes to per-room processor; intercepts commands
 - **MessageProcessor** — queue orchestration and session bookkeeping
 - **AgentTurnRunner** — single turn execution (prompt → agent → reply)
-- **ContextInjector** — context file I/O
+- **InjectedContextBuilder** — context file I/O (build) + durable delivery (ensure)
 - **PromptBuilder** — prompt assembly (no I/O, pure function)
 - **StateStore** — persistence (no business logic)
 
