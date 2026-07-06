@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ...agents.response import AgentEvent, AgentResponse
-from ...core.adapter_utils import ts_ms_to_iso_local
+from ...core.adapter_utils import ts_ms_to_iso_local, weekday_abbrev
 from ...core.connector import (
     Connector,
     IncomingMessage,
@@ -649,7 +649,10 @@ class RocketChatConnector(Connector):
 
         The ``ts`` field is the original RC message timestamp formatted in the
         connector's configured timezone (ISO 8601 with UTC offset) so agents
-        can reason about local time without needing to know the offset.
+        can reason about local time without needing to know the offset.  It
+        is kept machine-parseable — agents echo it back into
+        ``fetch-history --before/--after`` — so the day of week is surfaced
+        separately as a ``day:`` field instead of being embedded in ``ts``.
 
         The ``to:`` field summarises addressing among agents: ``me``, ``@other``,
         ``me+@other``, or ``*`` (broadcast).  See ``_compute_to_field``.
@@ -657,12 +660,14 @@ class RocketChatConnector(Connector):
         safe_room = self._PREFIX_UNSAFE_RE.sub("_", msg.room.name)
         safe_user = self._PREFIX_UNSAFE_RE.sub("_", msg.sender.username)
         ts = ts_ms_to_iso_local(msg.timestamp, self.timezone)
+        day = weekday_abbrev(ts)
+        day_part = f" | day: {day}" if day else ""
         ts_part = f" | ts: {ts}" if ts else ""
         to_part = f" | {self._compute_to_field(msg)}"
         return (
             f"[Rocket.Chat #{safe_room} | "
             f"from: {safe_user} | "
-            f"role: {msg.role.value}{ts_part}{to_part}]"
+            f"role: {msg.role.value}{day_part}{ts_part}{to_part}]"
         )
 
     # ── Status notifications ──────────────────────────────────────────────────

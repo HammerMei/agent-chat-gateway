@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Added
+- **`day:` field in the Rocket.Chat message header** — the gateway now
+  precomputes the weekday (e.g. `day: Sun`) alongside `ts:` so agents don't
+  have to infer it from a bare date, which was unreliable and could cause
+  scheduled weekday tasks to be silently skipped (#53).
+
+### Fixed
+- **Scheduled-task messages now carry a usable `ts:`/`day:` timestamp.**
+  Previously, messages injected by the scheduler used an ISO-formatted
+  timestamp that the Rocket.Chat header formatter couldn't parse, so
+  `ts:`/`day:` were silently omitted from every scheduled-task prompt —
+  exactly the case (e.g. scheduled stock reports) that motivated #53.
+
+---
+
 ## [0.4.0] - 2026-05-14
 
 ### Added

@@ -56,6 +56,13 @@ def ts_ms_to_iso_local(ts_ms_str: str | None, tz_name: str) -> str | None:
     Returns:
         ISO 8601 string with offset, e.g. ``"2026-04-24T10:30:00-07:00"``,
         or ``None`` when ``ts_ms_str`` cannot be parsed.
+
+    Note:
+        This value is deliberately kept machine-parseable and round-trippable —
+        it is echoed back verbatim by agents into ``fetch-history --before/--after``
+        and forwarded to Rocket.Chat's REST API. Do not embed the weekday here;
+        see :func:`weekday_abbrev` for a display-only weekday label derived from
+        this same value.
     """
     from datetime import datetime
     from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -69,6 +76,42 @@ def ts_ms_to_iso_local(ts_ms_str: str | None, tz_name: str) -> str | None:
         return None
     dt = datetime.fromtimestamp(f / 1000.0, tz=tz)
     return dt.isoformat(timespec="seconds")
+
+
+_WEEKDAY_ABBREV = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+
+def weekday_abbrev(ts_iso: str | None) -> str | None:
+    """Return the 3-letter English weekday abbreviation for an ISO 8601 timestamp.
+
+    Used to add a ``day:`` field alongside the ``ts:`` field in RC message
+    headers so agents don't have to infer the day of week from a bare date
+    themselves — LLMs calculate day-of-week from a date string unreliably
+    (it's pattern-matching over training data, not true calendar arithmetic),
+    which has caused agents to mistake a weekday for a weekend and silently
+    skip scheduled tasks. See: agent-chat-gateway#53.
+
+    Looks up a fixed table indexed by ``datetime.weekday()`` rather than
+    ``strftime("%a")`` so the abbreviation is always English, regardless of
+    the host process locale.
+
+    Args:
+        ts_iso: An ISO 8601 timestamp string (as produced by
+                :func:`ts_ms_to_iso_local`), or ``None``.
+
+    Returns:
+        A 3-letter English weekday abbreviation (e.g. ``"Fri"``), or ``None``
+        when ``ts_iso`` is ``None`` or cannot be parsed.
+    """
+    if not ts_iso:
+        return None
+    from datetime import datetime
+
+    try:
+        dt = datetime.fromisoformat(ts_iso)
+    except ValueError:
+        return None
+    return _WEEKDAY_ABBREV[dt.weekday()]
 
 
 def ts_gt(a: str, b: str) -> bool:

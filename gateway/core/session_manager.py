@@ -187,7 +187,12 @@ class SessionManager:
 
         msg = IncomingMessage(
             id=f"sched-{secrets.token_hex(8)}",
-            timestamp=datetime.now(UTC).isoformat(),
+            # Epoch milliseconds (as a string), matching the format RC's own
+            # messages carry — RocketChatConnector.format_prompt_prefix() feeds
+            # this straight into ts_ms_to_iso_local(), which only parses epoch-ms.
+            # A plain ISO string here silently drops ts:/day: from the header,
+            # which is exactly the "scheduled stock report" scenario in #53.
+            timestamp=str(int(datetime.now(UTC).timestamp() * 1000)),
             room=Room(id=room_id, name=room_name, type=room_type),
             sender=User(id="scheduler", username="scheduler", display_name="Scheduler"),
             role=UserRole.OWNER,

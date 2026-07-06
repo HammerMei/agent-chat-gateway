@@ -454,6 +454,38 @@ class TestFormatPromptPrefixSanitization(unittest.TestCase):
         self.assertTrue(prefix.endswith("]"))
 
 
+# ── Tests: format_prompt_prefix day: field (agent-chat-gateway#53) ──────────
+
+
+class TestFormatPromptPrefixDayField(unittest.TestCase):
+    """The day: field surfaces the precomputed weekday so agents don't have
+    to infer it themselves from a bare date (agent-chat-gateway#53)."""
+
+    def _prefix_for(self, timestamp_ms: str, tz: str = "UTC"):
+        connector = _make_rc_connector()
+        connector._config.timezone = tz
+        msg = _make_msg("general", "alice")
+        msg.timestamp = timestamp_ms
+        return connector.format_prompt_prefix(msg)
+
+    def test_day_field_present_and_precedes_ts(self):
+        # 1777026600000 ms == 2026-04-24T10:30:00 UTC, a Friday.
+        prefix = self._prefix_for("1777026600000")
+        self.assertIn("| day: Fri | ts: 2026-04-24T10:30:00+00:00 |", prefix)
+
+    def test_day_field_absent_when_timestamp_unparseable(self):
+        prefix = self._prefix_for("not-a-timestamp")
+        self.assertNotIn("day:", prefix)
+        self.assertNotIn("ts:", prefix)
+
+    def test_day_field_matches_ts_across_timezones(self):
+        # Same instant (Fri 10:30 UTC), viewed from UTC+14 where the local
+        # date rolls over to the next day — day: must track the *local* ts,
+        # not UTC.
+        prefix = self._prefix_for("1777026600000", tz="Pacific/Kiritimati")
+        self.assertIn("day: Sat", prefix)  # local: 2026-04-25T00:30:00+14:00
+
+
 # ── Tests: format_prompt_prefix to: field (S6) ──────────────────────────────
 
 

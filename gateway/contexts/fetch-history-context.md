@@ -75,10 +75,10 @@ so you can parse it with the same rules you already know:
 [HISTORY FETCH — on-demand 2026-05-10T14:32:00+08:00]
 
 **Earlier messages (condensed):**
-[Rocket.Chat #nest | from: alice | role: owner | ts: 2026-05-10T08:00:00+08:00] Can you look into the auth issue?
+[Rocket.Chat #nest | from: alice | role: owner | day: Sun | ts: 2026-05-10T08:00:00+08:00] Can you look into the auth issue?
 
 **Recent messages:**
-[Rocket.Chat #nest | from: alice | role: owner | ts: 2026-05-10T14:30:00+08:00]
+[Rocket.Chat #nest | from: alice | role: owner | day: Sun | ts: 2026-05-10T14:30:00+08:00]
 What did you find?
 ```
 

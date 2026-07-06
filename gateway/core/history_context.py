@@ -28,6 +28,8 @@ Security note:
 
 from __future__ import annotations
 
+from .adapter_utils import weekday_abbrev
+
 VERBATIM_TAIL: int = 15      # keep last N messages in full
 CONDENSE_CHARS: int = 120    # max text chars per condensed line
 MAX_HISTORY_CHARS: int = 12_000  # total cap for the entire block
@@ -56,8 +58,10 @@ def _format_rc_header(msg: dict) -> str:
     role = msg.get("role", "guest")
     ts = msg.get("ts")
 
+    day = weekday_abbrev(ts)
+    day_part = f" | day: {day}" if day else ""
     ts_part = f" | ts: {ts}" if ts else ""
-    return f"[Rocket.Chat #{room_name} | from: {username} | role: {role}{ts_part}]"
+    return f"[Rocket.Chat #{room_name} | from: {username} | role: {role}{day_part}{ts_part}]"
 
 
 def format_history_context(

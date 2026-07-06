@@ -209,5 +209,94 @@ class TestTsGt(unittest.TestCase):
         self.assertTrue(self._gt("1711234567.9", "1711234567.1"))
 
 
+# ── Tests: ts_ms_to_iso_local ─────────────────────────────────────────────────
+
+
+class TestTsMsToIsoLocal(unittest.TestCase):
+    """ts_ms_to_iso_local — epoch-ms to local ISO 8601, kept round-trippable."""
+
+    def _iso(self, ts_ms, tz="UTC"):
+        from gateway.core.adapter_utils import ts_ms_to_iso_local
+        return ts_ms_to_iso_local(ts_ms, tz)
+
+    def test_epoch_ms_converted_to_iso_with_offset(self):
+        # 2026-04-24T10:30:00 UTC in epoch ms
+        result = self._iso("1777026600000", tz="UTC")
+        self.assertEqual(result, "2026-04-24T10:30:00+00:00")
+
+    def test_timezone_offset_applied(self):
+        result = self._iso("1777026600000", tz="America/Los_Angeles")
+        self.assertEqual(result, "2026-04-24T03:30:00-07:00")
+
+    def test_none_ts_returns_none(self):
+        self.assertIsNone(self._iso(None))
+
+    def test_unparseable_ts_returns_none(self):
+        self.assertIsNone(self._iso("not-a-ts"))
+
+    def test_unknown_timezone_returns_none(self):
+        self.assertIsNone(self._iso("1777026600000", tz="Not/A_Zone"))
+
+    def test_result_is_fromisoformat_round_trippable(self):
+        """The output must stay parseable by datetime.fromisoformat() — it is
+        echoed back by agents into fetch-history --before/--after and must
+        never carry non-ISO decoration (e.g. an embedded weekday)."""
+        from datetime import datetime
+        result = self._iso("1777026600000", tz="UTC")
+        parsed = datetime.fromisoformat(result)  # raises if not round-trippable
+        self.assertEqual(parsed.isoformat(timespec="seconds"), result)
+
+
+# ── Tests: weekday_abbrev ─────────────────────────────────────────────────────
+
+
+class TestWeekdayAbbrev(unittest.TestCase):
+    """weekday_abbrev — display-only day-of-week label for the ``day:`` header field.
+
+    See agent-chat-gateway#53: agents infer weekday from a bare date
+    unreliably, so the gateway precomputes it instead.
+    """
+
+    def _day(self, ts_iso):
+        from gateway.core.adapter_utils import weekday_abbrev
+        return weekday_abbrev(ts_iso)
+
+    def test_known_dates_map_to_correct_weekday(self):
+        # 2026-04-24 is a Friday; 2026-04-27 (the following Monday) confirms
+        # the week rolls over correctly.
+        self.assertEqual(self._day("2026-04-24T10:30:00+00:00"), "Fri")
+        self.assertEqual(self._day("2026-04-25T00:00:00+00:00"), "Sat")
+        self.assertEqual(self._day("2026-04-26T23:59:59+00:00"), "Sun")
+        self.assertEqual(self._day("2026-04-27T00:00:00+00:00"), "Mon")
+
+    def test_timezone_offset_does_not_affect_lookup(self):
+        # Same instant, different offsets — weekday is read from the local
+        # wall-clock date already baked into the ISO string, not recomputed.
+        self.assertEqual(self._day("2026-04-24T23:00:00-07:00"), "Fri")
+
+    def test_none_returns_none(self):
+        self.assertIsNone(self._day(None))
+
+    def test_empty_string_returns_none(self):
+        self.assertIsNone(self._day(""))
+
+    def test_unparseable_returns_none(self):
+        self.assertIsNone(self._day("not-a-timestamp"))
+
+    def test_result_is_always_english_abbreviation(self):
+        """Uses a fixed table (not strftime) so the locale of the host process
+        can never change the label agents are told to expect."""
+        for ts, expected in [
+            ("2026-04-20T00:00:00+00:00", "Mon"),
+            ("2026-04-21T00:00:00+00:00", "Tue"),
+            ("2026-04-22T00:00:00+00:00", "Wed"),
+            ("2026-04-23T00:00:00+00:00", "Thu"),
+            ("2026-04-24T00:00:00+00:00", "Fri"),
+            ("2026-04-25T00:00:00+00:00", "Sat"),
+            ("2026-04-26T00:00:00+00:00", "Sun"),
+        ]:
+            self.assertEqual(self._day(ts), expected)
+
+
 if __name__ == "__main__":
     unittest.main()

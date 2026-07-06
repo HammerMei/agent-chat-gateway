@@ -51,12 +51,12 @@ def build_catchup_prompt(
     Example output::
 
         [CATCH-UP: The following messages arrived while you were processing your last response]
-          [Rocket.Chat #general | from: agent2_bot | role: owner | ts: 2026-05-06T10:02:15+08:00 | to: *] Hi from Agent 2
-          [Rocket.Chat #general | from: glin | role: owner | ts: 2026-05-06T10:04:22+08:00 | to: *] do xyz
+          [Rocket.Chat #general | from: agent2_bot | role: owner | day: Wed | ts: 2026-05-06T10:02:15+08:00 | to: *] Hi from Agent 2
+          [Rocket.Chat #general | from: glin | role: owner | day: Wed | ts: 2026-05-06T10:04:22+08:00 | to: *] do xyz
         [END CATCH-UP]
 
         Latest message (respond to this):
-        [Rocket.Chat #general | from: agent2_bot | role: owner | ts: 2026-05-06T10:05:30+08:00 | to: *] I already handled do xyz
+        [Rocket.Chat #general | from: agent2_bot | role: owner | day: Wed | ts: 2026-05-06T10:05:30+08:00 | to: *] I already handled do xyz
     """
     header = (
         "[CATCH-UP: The following messages arrived while you were "

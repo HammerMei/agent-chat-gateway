@@ -40,7 +40,17 @@ class TestFormatRcHeader:
     def test_owner_message(self):
         m = _msg(username="alice", role="owner", ts="2026-05-10T14:32:00+08:00")
         header = _format_rc_header(m)
-        assert header == "[Rocket.Chat #nest | from: alice | role: owner | ts: 2026-05-10T14:32:00+08:00]"
+        # 2026-05-10 is a Sunday.
+        assert header == (
+            "[Rocket.Chat #nest | from: alice | role: owner | day: Sun | "
+            "ts: 2026-05-10T14:32:00+08:00]"
+        )
+
+    def test_day_field_derived_from_ts(self):
+        """day: is computed from ts, not stored/passed separately."""
+        m = _msg(ts="2026-04-27T09:00:00+08:00")  # a Monday
+        header = _format_rc_header(m)
+        assert "| day: Mon |" in header
 
     def test_guest_message(self):
         m = _msg(username="bob", role="guest", ts="2026-05-10T14:33:00+08:00")
@@ -64,10 +74,11 @@ class TestFormatRcHeader:
         assert "role: agent" in header
 
     def test_no_timestamp(self):
-        """ts=None should omit the ts field entirely."""
+        """ts=None should omit both the ts and day fields entirely."""
         m = _msg(ts=None)
         header = _format_rc_header(m)
         assert "ts:" not in header
+        assert "day:" not in header
         assert "from: alice" in header
 
     def test_no_to_field(self):
