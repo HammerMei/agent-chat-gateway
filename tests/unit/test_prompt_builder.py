@@ -5,7 +5,65 @@ Extracted from MessageProcessor to make prompt logic independently testable.
 
 import unittest
 
-from gateway.core.prompt_builder import build_catchup_prompt, build_prompt
+from gateway.config import WatcherConfig
+from gateway.core.prompt_builder import (
+    build_catchup_prompt,
+    build_prompt,
+    build_system_header,
+)
+
+
+class TestBuildSystemHeader(unittest.TestCase):
+    """build_system_header() — pure, no I/O. Extracted from context_injector.py
+    for issue #52 (durable system prompt via --append-system-prompt-file)."""
+
+    def _wc(self) -> WatcherConfig:
+        return WatcherConfig(
+            name="my-watcher",
+            connector="rc-home",
+            room="general",
+            agent="default",
+        )
+
+    def test_identity_fields_present(self):
+        header = build_system_header(self._wc(), "")
+        self.assertIn("## ACG Session Identity", header)
+        self.assertIn("my-watcher", header)
+        self.assertIn("general", header)
+        self.assertIn("rc-home", header)
+
+    def test_never_empty_even_without_username(self):
+        """The identity block is unconditional — never empty, even with no username."""
+        header = build_system_header(self._wc(), "")
+        self.assertTrue(header)
+        self.assertIn("## ACG Session Identity", header)
+
+    def test_addressing_rules_absent_when_username_falsy(self):
+        header = build_system_header(self._wc(), "")
+        self.assertNotIn("## Multi-Agent Addressing", header)
+        self.assertNotIn("Your username", header)
+
+    def test_addressing_rules_present_when_username_truthy(self):
+        header = build_system_header(self._wc(), "acg_bot")
+        self.assertIn("## Multi-Agent Addressing", header)
+        self.assertIn("@acg_bot", header)
+        self.assertIn("to: me", header)
+        self.assertIn("to: @all", header)
+        self.assertIn("broader fan-out is intentional", header)
+        self.assertIn("ONLY `<end-of-agent-chain>`", header)
+        self.assertIn("priority responders", header)
+
+    def test_identity_precedes_addressing(self):
+        header = build_system_header(self._wc(), "bot")
+        self.assertLess(
+            header.index("## ACG Session Identity"),
+            header.index("## Multi-Agent Addressing"),
+        )
+
+    def test_pure_no_side_effects_deterministic(self):
+        """Same inputs always produce the same output (no I/O, no randomness)."""
+        wc = self._wc()
+        self.assertEqual(build_system_header(wc, "bot"), build_system_header(wc, "bot"))
 
 
 class TestBuildPrompt(unittest.TestCase):

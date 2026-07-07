@@ -6,6 +6,46 @@ testable and to keep the processor focused on queue orchestration.
 
 from __future__ import annotations
 
+from .config import WatcherConfig
+
+
+def build_system_header(wc: WatcherConfig, agent_username: str) -> str:
+    """Build the ACG identity + multi-agent addressing header.
+
+    Pure — no I/O, no agent calls. This is protocol-invariant content that
+    must survive Claude Code's context compaction, so it is delivered via
+    --append-system-prompt-file, not as a compactable user message.
+
+    Args:
+        wc: The watcher's config (provides name/room).
+        agent_username: The agent's own RC username. When truthy, the
+            ``## Multi-Agent Addressing`` block is appended so the agent
+            knows how to interpret the ``to:`` field on message headers.
+
+    Returns:
+        The combined header string. Never empty — the identity block is
+        always present.
+    """
+    header = (
+        f"## ACG Session Identity\n"
+        f"- **Watcher name:** `{wc.name}`\n"
+        f"- **Room:** `{wc.room}`\n"
+        f"- **Connector:** `{wc.connector}`\n"
+    )
+    if agent_username:
+        header += (
+            f"- **Your username:** `@{agent_username}`\n"
+            f"\n"
+            f"## Multi-Agent Addressing\n"
+            f"Each message header includes a `to:` field. Use it to decide your response:\n"
+            f"- `to: me` — message explicitly addressed to you → respond normally\n"
+            f"- `to: @all` — room-wide explicit mention → broader fan-out is intentional; reply only with useful, non-duplicative input, otherwise output ONLY `<end-of-agent-chain>`\n"
+            f"- `to: @<agent>` — addressed to another agent → stay silent unless you have something essential to add\n"
+            f"- `to: me+@<agent>` / `to: me+@all+@<agent>` — addressed to you and other priority responders; if `@all` is present, broader fan-out is intentional but keep replies concise and non-duplicative\n"
+            f"- `to: *` — no explicit agent mention → use judgment; respond only if you have something meaningful to contribute\n"
+        )
+    return header
+
 
 def build_prompt(text: str, prefix: str | None, warnings: list[str] | None = None) -> str:
     """Build the final agent prompt from cleaned text, platform prefix, and warnings.

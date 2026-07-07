@@ -1,7 +1,7 @@
 """Watcher runtime state: data model and persistence.
 
 Moved from ``gateway.state`` into the core layer so that core modules
-(``WatcherLifecycle``, ``ContextInjector``, ``StateStore``) can import it
+(``WatcherLifecycle``, ``InjectedContextBuilder``, ``StateStore``) can import it
 without reaching up to the gateway application layer.
 
 ``gateway.state`` re-exports everything here for backward compatibility.

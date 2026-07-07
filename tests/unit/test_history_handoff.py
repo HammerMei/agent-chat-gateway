@@ -3,7 +3,8 @@
 Covers:
   - RocketChatConnector.fetch_room_history(): filtering, normalization, format
   - WatcherLifecycle: history inject on new session, skip on resume
-  - ContextInjector: history_context appears before context files in prompt
+  - History handoff delivery: sent via a plain one-time agent.send(), fully
+    decoupled from InjectedContextBuilder.build()/ensure() (issue #52)
 """
 
 from __future__ import annotations
@@ -300,76 +301,105 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
 
 
 # ---------------------------------------------------------------------------
-# ContextInjector — history_context injection order
+# History handoff delivery — decoupled from InjectedContextBuilder (issue #52)
 # ---------------------------------------------------------------------------
+#
+# history_context used to be woven into ContextInjector.inject()'s combined
+# prompt, ordered after the identity header and before context files. Under
+# the durable-system-prompt fix, history_context is genuinely one-time/
+# volatile content (not protocol-critical like the identity/addressing
+# header), so it is now sent directly by WatcherLifecycle._start_watcher() as
+# a simple, separate, best-effort agent.send() call — fully decoupled from
+# InjectedContextBuilder.build()/ensure(). There is no longer a combined
+# "identity header before history" ordering to assert on a single prompt.
 
 
-class TestContextInjectorWithHistory(unittest.IsolatedAsyncioTestCase):
-    """Verify that history_context is injected after the dynamic header
-    and before any user-configured context files."""
+class TestHistoryHandoffSentSeparatelyFromHeader(unittest.IsolatedAsyncioTestCase):
+    """Verify history_context is delivered via a plain one-time agent.send(),
+    independent of the header/context-file delivery path."""
 
-    async def test_history_context_included_in_prompt(self):
-        from gateway.core.config import CoreConfig, WatcherConfig
-        from gateway.core.context_injector import ContextInjector
-        from gateway.core.state import WatcherState
+    def _build_lifecycle_with_history(self, raw_history_msgs):
+        from gateway.core.config import CoreConfig, HistoryHandoffConfig, WatcherConfig
+        from gateway.core.injected_context_builder import InjectedContextBuilder
+        from gateway.core.session_maps import SessionMaps
+        from gateway.core.watcher_lifecycle import WatcherLifecycle
 
-        config = CoreConfig()
-        injector = ContextInjector(config)
-
-        ws = WatcherState(
-            watcher_name="w1",
-            session_id="sess1",
-            room_id="r1",
-            context_injected=False,
+        wc = WatcherConfig(
+            name="w1",
+            connector="rc",
+            room="#nest",
+            agent="claude",
+            history_handoff=HistoryHandoffConfig(enabled=True, fetch_count=10, verbatim_tail=5),
         )
-        wc = WatcherConfig(name="w1", connector="rc", room="#nest", agent="claude")
+        config = CoreConfig()
+        connector = AsyncMock()
+        connector.agent_username = "hammer-mei"
+        connector.resolve_room = AsyncMock(return_value=MagicMock(id="r1", name="nest", type="channel"))
+        connector.subscribe_room = AsyncMock()
+        connector.fetch_room_history = AsyncMock(return_value=raw_history_msgs)
+        connector.get_last_processed_ts = MagicMock(return_value=None)
+        connector.update_last_processed_ts = MagicMock()
+        connector.attachment_cache_dir = MagicMock(return_value=None)
 
         agent = AsyncMock()
+        agent.create_session = AsyncMock(return_value="new-sess-id")
         agent.send = AsyncMock(return_value=MagicMock(is_error=False, text="ok"))
+        agent.ensure_durable_instructions = AsyncMock(return_value=None)
+        agent.delete_session = AsyncMock(return_value=True)
 
-        history_block = "[SESSION HISTORY]\nfrom: alice | role: owner\nhello"
-        await injector.inject(
-            ws, "sess1", agent, "claude", "rc", wc,
-            history_context=history_block,
+        state_store = MagicMock()
+        state_store.load = MagicMock(return_value={})
+        state_store.save = MagicMock()
+        dispatcher = MagicMock()
+        dispatcher.add_processor = MagicMock()
+        injector = InjectedContextBuilder(config)
+        maps = SessionMaps()
+
+        lifecycle = WatcherLifecycle(
+            connector=connector,
+            agents={"claude": agent},
+            default_agent="claude",
+            config=config,
+            watcher_configs=[wc],
+            state_store=state_store,
+            dispatcher=dispatcher,
+            injector=injector,
+            permission_registry=None,
+            maps=maps,
+        )
+        lifecycle._attachment_workspace = MagicMock()
+        lifecycle._attachment_workspace.setup = MagicMock(return_value="/tmp/fake")
+        return lifecycle, connector, agent, wc
+
+    async def test_history_context_sent_via_plain_agent_send(self):
+        lifecycle, connector, agent, wc = self._build_lifecycle_with_history(
+            [{"username": "alice", "role": "owner", "text": "hello", "ts": "2026-01-01T00:00:00+08:00"}]
         )
 
-        prompt = agent.send.call_args.kwargs["prompt"]
-        self.assertIn("SESSION HISTORY", prompt)
-        self.assertIn("hello", prompt)
-        # Injection order: identity header first, then history, then context files.
-        # combined_context.insert(0, history); insert(0, header) → header is first.
-        self.assertLess(prompt.index("ACG Session Identity"), prompt.index("SESSION HISTORY"))
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            await lifecycle._start_watcher(wc, state=None)
 
-    async def test_history_context_none_skips_injection_when_no_files(self):
-        """When history_context=None and no context files are configured,
-        agent.send must NOT be called (no empty round-trip to the agent)."""
-        from gateway.core.config import CoreConfig, WatcherConfig
-        from gateway.core.context_injector import ContextInjector
-        from gateway.core.state import WatcherState
+        # The header/context path goes through agent.ensure_durable_instructions(),
+        # not agent.send() — so agent.send() must have been called exactly once,
+        # and only for the history handoff.
+        agent.send.assert_awaited_once()
+        agent.ensure_durable_instructions.assert_awaited_once()
+        sent_kwargs = agent.send.call_args.kwargs
+        self.assertIn("hello", sent_kwargs["prompt"])
+        self.assertNotIn("ACG Session Identity", sent_kwargs["prompt"])
 
-        config = CoreConfig()
-        injector = ContextInjector(config)
+    async def test_no_history_means_agent_send_not_called(self):
+        """When fetch_room_history returns no usable messages, agent.send()
+        must not be called at all (header delivery uses ensure_durable_instructions)."""
+        lifecycle, connector, agent, wc = self._build_lifecycle_with_history([])
 
-        ws = WatcherState(
-            watcher_name="w1",
-            session_id="sess2",
-            room_id="r1",
-            context_injected=False,
-        )
-        wc = WatcherConfig(name="w1", connector="rc", room="#nest", agent="claude")
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            await lifecycle._start_watcher(wc, state=None)
 
-        agent = AsyncMock()
-        agent.send = AsyncMock(return_value=MagicMock(is_error=False, text="ok"))
-
-        await injector.inject(
-            ws, "sess2", agent, "claude", "rc", wc,
-            history_context=None,
-        )
-
-        # No files + no history → nothing to inject → agent.send never called
         agent.send.assert_not_called()
-        # But the session must be marked injected to avoid re-entry on every message
-        self.assertTrue(ws.context_injected)
+        agent.ensure_durable_instructions.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -387,7 +417,7 @@ class TestWatcherLifecycleHistoryHandoff(unittest.IsolatedAsyncioTestCase):
     def _make_lifecycle(self, history_enabled: bool = True, fetch_count: int = 10, verbatim_tail: int = 5):
         """Build a WatcherLifecycle with history handoff configured."""
         from gateway.core.config import CoreConfig, HistoryHandoffConfig, WatcherConfig
-        from gateway.core.context_injector import ContextInjector
+        from gateway.core.injected_context_builder import InjectedContextBuilder
         from gateway.core.session_maps import SessionMaps
         from gateway.core.watcher_lifecycle import WatcherLifecycle
 
@@ -425,7 +455,7 @@ class TestWatcherLifecycleHistoryHandoff(unittest.IsolatedAsyncioTestCase):
         dispatcher = MagicMock()
         dispatcher.add_processor = MagicMock()
 
-        injector = ContextInjector(config)
+        injector = InjectedContextBuilder(config)
 
         maps = SessionMaps()
 
