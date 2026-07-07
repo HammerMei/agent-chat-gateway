@@ -106,6 +106,7 @@ class MockAgentBackend(AgentBackend):
         timeout: int,
         attachments: list[str] | None = None,
         env: dict[str, str] | None = None,
+        append_system_prompt_file: str | None = None,
     ) -> AgentResponse:
         self.sent_messages.append(
             {
@@ -123,6 +124,13 @@ class MockAgentBackend(AgentBackend):
 
         text = self._responses.pop(0) if self._responses else self._default_response
         return AgentResponse(text=text)
+
+    async def ensure_durable_instructions(self, *a, **kw):
+        """Skip the default send()-based fallback so watcher startup doesn't
+        consume a canned response from self._responses — this test double is
+        for generic message-routing tests, not context-injection interactions
+        (see tests/integration/test_injected_context_builder.py for those)."""
+        return None
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────

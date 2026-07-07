@@ -281,6 +281,14 @@ class GatewayConfig:
             watcher_name = wc.get("name", "")
             if not watcher_name:
                 raise ValueError("Each watcher entry must have a 'name' field")
+            if "/" in watcher_name:
+                raise ValueError(
+                    f"Watcher name '{watcher_name}' must not contain '/' — "
+                    "watcher names are used as filesystem path components "
+                    "(e.g. <working_directory>/.acg-attachments/<name>, "
+                    "<RUNTIME_DIR>/system-prompts/<name>.md) "
+                    "and a '/' could escape the intended directory."
+                )
             if watcher_name in seen_watcher_names:
                 raise ValueError(
                     f"Duplicate watcher name '{watcher_name}' found. "

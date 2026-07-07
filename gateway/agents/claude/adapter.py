@@ -13,14 +13,25 @@ Note: claude -p does not support native file attachments.  When attachments are
 provided, their paths are injected into the prompt text via
 :func:`~gateway.core.adapter_utils.build_attachment_prompt` so the agent can
 access them using the Read tool.
+
+Durable system-prompt files (see :meth:`ClaudeBackend.ensure_durable_instructions`)
+are written under ``RUNTIME_DIR`` (``~/.agent-chat-gateway``), NOT under a
+watcher's ``working_directory`` — that directory can be (and per
+``docs/user-guide.md`` examples, often is) a real user project under git
+version control, and a generated file living there risks being accidentally
+`git add`-ed. ``RUNTIME_DIR`` is ACG's own dedicated state directory (already
+used by ``state.json``, ``gateway.pid``, etc. — see ``gateway/runtime_lock.py``),
+never inside any user-controlled repo.
 """
 
 import asyncio
 import json
 import logging
 import os
+import tempfile
 from collections import deque
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ...core.adapter_utils import build_attachment_prompt
@@ -42,6 +53,13 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger("agent-chat-gateway.agents.claude")
+
+# Redeclared locally rather than imported from gateway.core.state / gateway.runtime_lock
+# to avoid a core-layer → application-layer import (same pattern already used in
+# gateway/cli.py, gateway/daemon.py, gateway/runtime_lock.py, gateway/core/state.py,
+# gateway/core/job_store.py, gateway/upgrade.py, gateway/onboard.py). Patch this
+# module-local constant in tests (see tests/unit/test_claude_adapter.py).
+RUNTIME_DIR = Path.home() / ".agent-chat-gateway"
 
 _RATE_LIMIT_PATTERNS = (
     "usage limit",
@@ -172,6 +190,29 @@ async def _terminate_gracefully(proc: asyncio.subprocess.Process) -> None:
         proc.kill()
     except Exception:
         pass  # already dead or unrecoverable
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Write ``content`` to ``path`` atomically (temp file + ``os.replace``).
+
+    Without this, a ``claude`` subprocess started concurrently with a write
+    (e.g. a message arriving mid-update) could read a partially-written
+    ``--append-system-prompt-file`` and get truncated/corrupt content instead
+    of either the old or the new version. The temp file is created in the
+    same directory so ``os.replace`` stays on one filesystem (required for
+    atomicity) and is cleaned up on any failure before the replace.
+    """
+    fd, tmp_path = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 class _StreamParser:
@@ -372,6 +413,46 @@ class ClaudeBackend(AgentBackend):
             self.settings_path = self._pre_broker_settings_path
             del self._pre_broker_settings_path
 
+    async def ensure_durable_instructions(
+        self,
+        session_id: str,
+        working_directory: str,
+        timeout: int,
+        content: str,
+        *,
+        watcher_name: str,
+        already_delivered: bool,
+    ) -> str | None:
+        """Write `content` to a stable per-watcher file for --append-system-prompt-file.
+
+        Writing is idempotent (overwrite with identical content) — no side
+        effect to avoid repeating, so already_delivered is irrelevant here;
+        always write fresh so a resumed session after a gateway restart still
+        gets a correct, current file.
+
+        The write itself is atomic (see ``_atomic_write_text``) — a ``claude``
+        subprocess reading this file concurrently with an update always sees
+        either the old or the new content in full, never a partial write.
+
+        Deliberately written under ``RUNTIME_DIR`` (ACG's own state directory),
+        NOT under ``working_directory`` — Claude reads this file via a plain
+        CLI flag at startup, before any tool-permission sandboxing applies, so
+        it is not restricted to the project directory (verified empirically:
+        --append-system-prompt-file works with an absolute path outside any
+        project). Putting it under working_directory would risk an
+        accidental `git add` if that directory is a real user project under
+        version control (a documented, real configuration — see
+        docs/user-guide.md's ``working_directory: ~/my-project`` examples).
+        ``watcher_name`` is globally unique (enforced at config-load time) and
+        forbidden from containing ``/`` (see gateway/config.py), so this path
+        cannot collide with another watcher's file or escape RUNTIME_DIR.
+        """
+        acg_dir = RUNTIME_DIR / "system-prompts"
+        await asyncio.to_thread(acg_dir.mkdir, parents=True, exist_ok=True)
+        path = acg_dir / f"{watcher_name}.md"
+        await asyncio.to_thread(_atomic_write_text, path, content)
+        return str(path)
+
     async def create_session(
         self,
         working_directory: str,
@@ -478,6 +559,7 @@ class ClaudeBackend(AgentBackend):
         timeout: int,
         attachments: list[str] | None = None,
         env: dict[str, str] | None = None,
+        append_system_prompt_file: str | None = None,
     ) -> AgentResponse:
         """Send a message to an existing Claude session and return a normalized AgentResponse."""
         if attachments:
@@ -499,6 +581,8 @@ class ClaudeBackend(AgentBackend):
         ]
         if self.settings_path:
             cmd += ["--dangerously-skip-permissions", "--settings", self.settings_path]
+        if append_system_prompt_file:
+            cmd += ["--append-system-prompt-file", append_system_prompt_file]
 
         # Strip CLAUDECODE so the subprocess does not inherit the parent session context,
         # then merge any role env vars (e.g. ACG_ROLE) for hook enforcement.
@@ -668,6 +752,7 @@ class ClaudeBackend(AgentBackend):
         timeout: int,
         attachments: list[str] | None = None,
         env: dict[str, str] | None = None,
+        append_system_prompt_file: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Stream Claude events, yielding intermediate tool/thinking events then a final one.
 
@@ -700,6 +785,8 @@ class ClaudeBackend(AgentBackend):
         ]
         if self.settings_path:
             cmd += ["--dangerously-skip-permissions", "--settings", self.settings_path]
+        if append_system_prompt_file:
+            cmd += ["--append-system-prompt-file", append_system_prompt_file]
 
         process_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
         if env:

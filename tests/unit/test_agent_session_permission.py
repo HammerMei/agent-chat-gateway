@@ -49,7 +49,7 @@ class MockBackend:
         self.create_session_called_with_settings = self.settings_path
         return "mock-session-id"
 
-    async def send(self, session_id, prompt, cwd, timeout, attachments=None, env=None):
+    async def send(self, session_id, prompt, cwd, timeout, attachments=None, env=None, append_system_prompt_file=None):
         from gateway.agents.response import AgentResponse
         return AgentResponse(text=self._response_text, session_id=session_id)
 

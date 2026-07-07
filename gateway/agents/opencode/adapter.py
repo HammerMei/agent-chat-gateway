@@ -745,6 +745,30 @@ class OpenCodeBackend(AgentBackend):
         logger.info("Created opencode session: %s", session_id[:16])
         return session_id
 
+    async def ensure_durable_instructions(
+        self,
+        session_id: str,
+        working_directory: str,
+        timeout: int,
+        content: str,
+        *,
+        watcher_name: str,
+        already_delivered: bool,
+    ) -> str | None:
+        """Explicitly opt into the one-time-send fallback (see
+        AgentBackend.ensure_durable_instructions()'s docstring for why this
+        must be an explicit choice, not an inherited default).
+
+        This deliberately preserves OpenCode's pre-issue-#52 behavior — a
+        one-time send into conversation history, NOT compaction-resistant.
+        A real, durable mechanism (writing to ``.opencode/opencode.json`` so
+        OpenCode's own instruction-file reload picks it up every turn) is
+        deferred to a follow-up PR.
+        """
+        return await self._send_once_as_durable_fallback(
+            session_id, working_directory, timeout, content, already_delivered,
+        )
+
     async def send(
         self,
         session_id: str,
@@ -753,6 +777,7 @@ class OpenCodeBackend(AgentBackend):
         timeout: int,
         attachments: list[str] | None = None,
         env: dict[str, str] | None = None,
+        append_system_prompt_file: str | None = None,
     ) -> AgentResponse:
         """Send a message to an existing opencode session and return a normalized AgentResponse.
 
@@ -761,6 +786,13 @@ class OpenCodeBackend(AgentBackend):
 
         The ``env`` kwarg is a no-op: ACG_ROLE and other role vars must be set on the
         opencode server process at startup, not per-message.
+
+        The ``append_system_prompt_file`` kwarg is also a no-op for this backend:
+        OpenCode has no CLI/HTTP equivalent to Claude's --append-system-prompt-file.
+        A future PR will give OpenCode a real file-based mechanism via
+        ``.opencode/opencode.json``; until then this backend relies on the
+        AgentBackend default ``ensure_durable_instructions()`` (one-time send()),
+        so this parameter is always None in practice for this backend.
         """
         if attachments:
             logger.info(
@@ -775,6 +807,12 @@ class OpenCodeBackend(AgentBackend):
                 "env kwarg ignored by HTTP adapter (set on server at startup): %s",
                 list(env.keys()),
             )
+        if append_system_prompt_file:
+            logger.debug(
+                "append_system_prompt_file kwarg ignored by HTTP adapter "
+                "(no equivalent mechanism): %s",
+                append_system_prompt_file,
+            )
 
         await self._ensure_live_runtime()
         raw = await self._post_message(session_id, prompt, timeout=timeout)
@@ -788,6 +826,7 @@ class OpenCodeBackend(AgentBackend):
         timeout: int,
         attachments: list[str] | None = None,
         env: dict[str, str] | None = None,
+        append_system_prompt_file: str | None = None,
     ) -> AsyncGenerator[AgentEvent, None]:
         """Stream intermediate agent events for an OpenCode session turn.
 
@@ -828,6 +867,12 @@ class OpenCodeBackend(AgentBackend):
             logger.debug(
                 "env kwarg ignored by HTTP adapter (set on server at startup): %s",
                 list(env.keys()),
+            )
+        if append_system_prompt_file:
+            logger.debug(
+                "append_system_prompt_file kwarg ignored by HTTP adapter "
+                "(no equivalent mechanism): %s",
+                append_system_prompt_file,
             )
 
         await self._ensure_live_runtime()
@@ -1221,7 +1266,7 @@ class OpenCodeBackend(AgentBackend):
 
         Raises ``AgentUnavailableError`` (not ``RuntimeError``) when the client
         is None so that callers — including ``AgentTurnRunner`` and
-        ``ContextInjector`` — can distinguish a shutdown-race condition from a
+        ``InjectedContextBuilder`` — can distinguish a shutdown-race condition from a
         permanent programming error.  The most common cause of a None client
         after ``_ensure_live_runtime()`` returns is a concurrent ``stop()``
         call that cleared ``_client`` between the live-runtime check and the
@@ -1350,7 +1395,7 @@ class OpenCodeBackend(AgentBackend):
         Notes:
           - ``step-finish`` uses a hyphen, not an underscore (unlike the old CLI stream).
           - ``is_error`` is set to True when no text parts are extracted from the
-            response (empty or tool-only turns).  This lets ContextInjector detect
+            response (empty or tool-only turns).  This lets InjectedContextBuilder detect
             failed injection attempts without relying on the HTTP status code.
           - ``duration_ms`` is read from ``info.duration`` and coerced to ``int``.
             opencode returns this as a numeric millisecond count; non-numeric or
@@ -1398,7 +1443,7 @@ class OpenCodeBackend(AgentBackend):
             # Distinguish tool-only turns (agent ran tools, no text output) from
             # genuine errors (no parts at all, or only unrecognised part types).
             # Tool-only turns are valid — they produce step-finish events but no
-            # text blocks.  Marking them as is_error=True would cause ContextInjector
+            # text blocks.  Marking them as is_error=True would cause InjectedContextBuilder
             # to incorrectly count them as failed injection attempts.
             has_tool_steps = any(
                 isinstance(p, dict) and p.get("type") == "step-finish" for p in parts

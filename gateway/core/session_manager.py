@@ -3,7 +3,7 @@
 Delegates all real work to focused collaborators:
   - WatcherLifecycle: start/stop/pause/resume/reset watchers
   - MessageDispatcher: inbound message routing + permission interception
-  - ContextInjector: context file reading + agent session injection
+  - InjectedContextBuilder: context file reading + durable agent session delivery
   - StateStore: WatcherState persistence + watermark management
   - SessionMaps: shared session→room/role/connector routing state
 """
@@ -18,8 +18,8 @@ from datetime import UTC, datetime
 from ..agents import AgentBackend
 from .config import CoreConfig, WatcherConfig
 from .connector import Connector, IncomingMessage, Room, User, UserRole
-from .context_injector import ContextInjector
 from .dispatch import MessageDispatcher
+from .injected_context_builder import InjectedContextBuilder
 from .permission import PermissionRegistry
 from .session_maps import SessionMaps
 from .state_store import StateStore
@@ -57,7 +57,7 @@ class SessionManager:
 
         # Collaborators
         self._dispatcher = MessageDispatcher(connector, permission_registry)
-        self._injector = ContextInjector(config)
+        self._injector = InjectedContextBuilder(config)
         self._state_store = StateStore(state_name, connector)
         self._lifecycle = WatcherLifecycle(
             connector=connector,

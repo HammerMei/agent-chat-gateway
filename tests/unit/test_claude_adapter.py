@@ -400,3 +400,227 @@ class TestClaudeAdapterCancelledError(unittest.IsolatedAsyncioTestCase):
 
         proc.terminate.assert_called_once()
         proc.kill.assert_called()
+
+
+# ── append_system_prompt_file: durable system prompt (issue #52) ────────────
+
+
+def _cmd_from_call(call) -> list[str]:
+    """Extract the argv list from a asyncio.create_subprocess_exec(...) call."""
+    return list(call.args)
+
+
+class TestClaudeBackendAppendSystemPromptFileFlag(unittest.IsolatedAsyncioTestCase):
+    """send()/stream() must add --append-system-prompt-file <path> to the CLI
+    command when the kwarg is set, and omit it entirely when it is None."""
+
+    async def test_send_includes_flag_when_set(self):
+        backend = _make_backend()
+        proc = _make_mock_process(stdout_bytes=_stream_json_output("ok"))
+
+        with patch("asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+            await backend.send(
+                session_id="sess-1",
+                prompt="hi",
+                working_directory="/tmp",
+                timeout=10,
+                append_system_prompt_file="/tmp/.acg-system-prompt/w.md",
+            )
+
+        cmd = _cmd_from_call(mock_exec.call_args)
+        self.assertIn("--append-system-prompt-file", cmd)
+        idx = cmd.index("--append-system-prompt-file")
+        self.assertEqual(cmd[idx + 1], "/tmp/.acg-system-prompt/w.md")
+
+    async def test_send_omits_flag_when_none(self):
+        backend = _make_backend()
+        proc = _make_mock_process(stdout_bytes=_stream_json_output("ok"))
+
+        with patch("asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+            await backend.send(
+                session_id="sess-1",
+                prompt="hi",
+                working_directory="/tmp",
+                timeout=10,
+            )
+
+        cmd = _cmd_from_call(mock_exec.call_args)
+        self.assertNotIn("--append-system-prompt-file", cmd)
+
+    async def test_stream_includes_flag_when_set(self):
+        backend = _make_backend()
+        proc = _make_mock_process(stdout_bytes=_stream_json_output("ok"))
+
+        with patch("asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+            events = []
+            async for event in backend.stream(
+                session_id="sess-1",
+                prompt="hi",
+                working_directory="/tmp",
+                timeout=10,
+                append_system_prompt_file="/tmp/.acg-system-prompt/w.md",
+            ):
+                events.append(event)
+
+        cmd = _cmd_from_call(mock_exec.call_args)
+        self.assertIn("--append-system-prompt-file", cmd)
+        idx = cmd.index("--append-system-prompt-file")
+        self.assertEqual(cmd[idx + 1], "/tmp/.acg-system-prompt/w.md")
+
+    async def test_stream_omits_flag_when_none(self):
+        backend = _make_backend()
+        proc = _make_mock_process(stdout_bytes=_stream_json_output("ok"))
+
+        with patch("asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+            events = []
+            async for event in backend.stream(
+                session_id="sess-1",
+                prompt="hi",
+                working_directory="/tmp",
+                timeout=10,
+            ):
+                events.append(event)
+
+        cmd = _cmd_from_call(mock_exec.call_args)
+        self.assertNotIn("--append-system-prompt-file", cmd)
+
+
+class TestClaudeBackendEnsureDurableInstructions(unittest.IsolatedAsyncioTestCase):
+    """ensure_durable_instructions() writes content to a stable per-watcher
+    file and always returns its path — regardless of already_delivered — since
+    writing has no side effect to avoid repeating (regression test for design
+    review blocker #1: a resumed session must still get a non-None path).
+
+    Written under RUNTIME_DIR (ACG's own state directory), NOT under
+    working_directory — a real user project directory could be under git
+    version control, and a generated file living there risks an accidental
+    `git add`. Tests patch the module-local RUNTIME_DIR constant (same
+    convention as tests/unit/test_daemon.py, test_control_server.py, etc.)
+    rather than relying on the real ~/.agent-chat-gateway. `working_directory`
+    is passed as an arbitrary unused placeholder since this method no longer
+    keys the path off it.
+    """
+
+    async def test_writes_file_and_returns_path(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        backend = _make_backend()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("gateway.agents.claude.adapter.RUNTIME_DIR", Path(tmp)):
+                path = await backend.ensure_durable_instructions(
+                    "sess-1", "/unused", 10, "## ACG Session Identity\nhello",
+                    watcher_name="my-watcher", already_delivered=False,
+                )
+
+            self.assertEqual(path, str(Path(tmp) / "system-prompts" / "my-watcher.md"))
+
+    async def test_writes_file_content_correctly(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        backend = _make_backend()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("gateway.agents.claude.adapter.RUNTIME_DIR", Path(tmp)):
+                content = "## ACG Session Identity\nhello world"
+                path = await backend.ensure_durable_instructions(
+                    "sess-1", "/unused", 10, content,
+                    watcher_name="my-watcher", already_delivered=False,
+                )
+                self.assertEqual(Path(path).read_text(), content)
+                self.assertEqual(Path(path), Path(tmp) / "system-prompts" / "my-watcher.md")
+
+    async def test_returns_non_none_path_when_already_delivered_true(self):
+        """Resumed session (already_delivered=True) must still get a fresh path."""
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        backend = _make_backend()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("gateway.agents.claude.adapter.RUNTIME_DIR", Path(tmp)):
+                path = await backend.ensure_durable_instructions(
+                    "sess-1", "/unused", 10, "content",
+                    watcher_name="my-watcher", already_delivered=True,
+                )
+
+            self.assertIsNotNone(path)
+
+    async def test_returns_non_none_path_when_already_delivered_false(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        backend = _make_backend()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("gateway.agents.claude.adapter.RUNTIME_DIR", Path(tmp)):
+                path = await backend.ensure_durable_instructions(
+                    "sess-1", "/unused", 10, "content",
+                    watcher_name="my-watcher", already_delivered=False,
+                )
+
+            self.assertIsNotNone(path)
+
+    async def test_overwrites_existing_file_with_fresh_content(self):
+        """Writing is idempotent — a second call with different content overwrites."""
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        backend = _make_backend()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("gateway.agents.claude.adapter.RUNTIME_DIR", Path(tmp)):
+                await backend.ensure_durable_instructions(
+                    "sess-1", "/unused", 10, "old content",
+                    watcher_name="my-watcher", already_delivered=False,
+                )
+                path = await backend.ensure_durable_instructions(
+                    "sess-1", "/unused", 10, "new content",
+                    watcher_name="my-watcher", already_delivered=True,
+                )
+                self.assertEqual(Path(path).read_text(), "new content")
+
+    async def test_write_is_atomic_no_leftover_temp_files(self):
+        """The write goes through a temp-file-then-rename so a concurrently
+        running `claude` subprocess never observes a partial write — verified
+        here by checking no .tmp artifact survives a successful write."""
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        backend = _make_backend()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("gateway.agents.claude.adapter.RUNTIME_DIR", Path(tmp)):
+                path = await backend.ensure_durable_instructions(
+                    "sess-1", "/unused", 10, "content",
+                    watcher_name="my-watcher", already_delivered=False,
+                )
+                acg_dir = Path(tmp) / "system-prompts"
+                entries = list(acg_dir.iterdir())
+
+            self.assertEqual(entries, [Path(path)], f"unexpected leftover files: {entries}")
+
+    async def test_written_outside_a_given_working_directory(self):
+        """The file must NOT live under working_directory at all — regression
+        test for the git-accidental-commit concern: working_directory can be
+        a real user project under version control (see docs/user-guide.md's
+        `working_directory: ~/my-project` examples), and RUNTIME_DIR must
+        never be a subpath of it."""
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        backend = _make_backend()
+        with tempfile.TemporaryDirectory() as fake_project, tempfile.TemporaryDirectory() as runtime_dir:
+            with patch("gateway.agents.claude.adapter.RUNTIME_DIR", Path(runtime_dir)):
+                path = await backend.ensure_durable_instructions(
+                    "sess-1", fake_project, 10, "content",
+                    watcher_name="my-watcher", already_delivered=False,
+                )
+
+            self.assertFalse(
+                Path(path).resolve().is_relative_to(Path(fake_project).resolve()),
+                f"durable system-prompt file must not live under working_directory, got {path}",
+            )

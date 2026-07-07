@@ -156,6 +156,27 @@ class TestConfigValidationHardening(unittest.TestCase):
             GatewayConfig.from_file(path)
         self.assertIn("Duplicate watcher name 'same'", str(ctx.exception))
 
+    def test_watcher_name_with_slash_raises(self):
+        """Watcher names become filesystem path components (.acg-attachments/<name>
+        under working_directory, system-prompts/<name>.md under RUNTIME_DIR) — a
+        '/' could escape the intended directory."""
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watchers:
+              - name: evil/../escape
+                room: general
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        self.assertIn("must not contain '/'", str(ctx.exception))
+
     def test_empty_watcher_room_raises(self):
         path = self._write_config("""\
             connectors:

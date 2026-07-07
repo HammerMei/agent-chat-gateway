@@ -257,7 +257,7 @@ class _MockAgentBackend2(_AgentBackend2):
         self._session_counter += 1
         return f"mock-session-{self._session_counter:04d}"
 
-    async def send(self, session_id, prompt, working_directory, timeout, attachments=None, env=None):
+    async def send(self, session_id, prompt, working_directory, timeout, attachments=None, env=None, append_system_prompt_file=None):
         self.sent_messages.append({"prompt": prompt, "session_id": session_id, "attachments": attachments})
         return _AgentResponse2(text="mock reply")
 

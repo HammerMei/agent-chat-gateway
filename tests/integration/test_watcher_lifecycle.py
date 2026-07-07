@@ -48,10 +48,17 @@ class MockAgentBackend(AgentBackend):
         self._session_counter += 1
         return f"mock-session-{self._session_counter:04d}"
 
-    async def send(self, session_id, prompt, working_directory, timeout, attachments=None, env=None):
+    async def send(self, session_id, prompt, working_directory, timeout, attachments=None, env=None, append_system_prompt_file=None):
         self.sent_messages.append({"prompt": prompt, "session_id": session_id, "attachments": attachments})
         text = self._responses.pop(0) if self._responses else self._default_response
         return AgentResponse(text=text)
+
+    async def ensure_durable_instructions(self, *a, **kw):
+        """Skip the default send()-based fallback so watcher startup doesn't
+        consume a canned response from self._responses — this test double is
+        for generic message-routing tests, not context-injection interactions
+        (see tests/integration/test_injected_context_builder.py for those)."""
+        return None
 
 
 class CleanupTrackingAgent(MockAgentBackend):
@@ -142,7 +149,8 @@ def _make_lifecycle_r14(watcher_names=None):
     dispatcher.remove_processor = MagicMock()
 
     injector = MagicMock()
-    injector.inject = AsyncMock()
+    injector.build = AsyncMock(return_value="built content")
+    injector.ensure = AsyncMock(return_value=None)
     injector.reset_session = MagicMock()
     injector.status_for = MagicMock(return_value=MagicMock(state="done"))
 
@@ -294,7 +302,8 @@ class TestAttachmentWorkspaceInThread(unittest.IsolatedAsyncioTestCase):
         lc._connector = connector
 
         injector = MagicMock()
-        injector.inject = AsyncMock()
+        injector.build = AsyncMock(return_value="built content")
+        injector.ensure = AsyncMock(return_value=None)
         injector.reset_session = MagicMock()
         lc._injector = injector
 
@@ -370,7 +379,8 @@ class TestAttachmentWorkspaceRollback(unittest.IsolatedAsyncioTestCase):
         lc._connector = connector
 
         injector = MagicMock()
-        injector.inject = AsyncMock()
+        injector.build = AsyncMock(return_value="built content")
+        injector.ensure = AsyncMock(return_value=None)
         injector.reset_session = MagicMock()
         lc._injector = injector
 
@@ -434,7 +444,8 @@ class TestContextInjectedResetOnSubscribeFailure(unittest.IsolatedAsyncioTestCas
         lc._connector = connector
 
         injector = MagicMock()
-        injector.inject = AsyncMock()
+        injector.build = AsyncMock(return_value="built content")
+        injector.ensure = AsyncMock(return_value=None)
         injector.reset_session = MagicMock()
         lc._injector = injector
 
@@ -494,7 +505,8 @@ class TestContextInjectedResetOnSubscribeFailure(unittest.IsolatedAsyncioTestCas
         lc._connector = connector
 
         injector = MagicMock()
-        injector.inject = AsyncMock()
+        injector.build = AsyncMock(return_value="built content")
+        injector.ensure = AsyncMock(return_value=None)
         injector.reset_session = MagicMock()
         lc._injector = injector
 
@@ -752,7 +764,7 @@ class TestWatcherLifecycleHardening(IsolatedTestCase):
 
         with patch.object(
             manager._lifecycle._injector,
-            "inject",
+            "ensure",
             AsyncMock(side_effect=RuntimeError("inject failed")),
         ):
             errors = await manager.run_once()

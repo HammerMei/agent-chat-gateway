@@ -1,33 +1,36 @@
-"""Tests for ContextInjector.reset_session() — failure-counter reset on watcher reset.
+"""Tests for InjectedContextBuilder.reset_session() — failure-counter reset on watcher reset.
 
 Without reset_session(), a watcher that reached ``failed_degraded`` would
 immediately re-enter that state after a reset because failure_count is still
 at _MAX_INJECT_ATTEMPTS and one more failure tips it over again.
 
 Run with:
-    uv run python -m pytest tests/test_reset_session_injector.py -v
+    uv run python -m pytest tests/unit/test_reset_session_injector.py -v
 """
 
 from __future__ import annotations
 
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 
-from gateway.agents.response import AgentResponse
+from gateway.agents.errors import AgentExecutionError
 from gateway.config import AgentConfig, WatcherConfig
 from gateway.core.config import CoreConfig
-from gateway.core.context_injector import _MAX_INJECT_ATTEMPTS, ContextInjector
+from gateway.core.injected_context_builder import (
+    _MAX_INJECT_ATTEMPTS,
+    InjectedContextBuilder,
+)
 from gateway.state import WatcherState
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 
-def _make_injector() -> ContextInjector:
+def _make_injector() -> InjectedContextBuilder:
     config = CoreConfig(
         agents={"default": AgentConfig(timeout=10)},
         default_agent="default",
     )
-    return ContextInjector(config)
+    return InjectedContextBuilder(config)
 
 
 def _make_ws(context_injected: bool = False) -> WatcherState:
@@ -47,48 +50,24 @@ def _make_wc(ctx_files: list[str] | None = None) -> WatcherConfig:
     )
 
 
-async def _run_inject_error(injector, ws, session_id="ses_1"):
-    """Simulate one inject() call where the agent returns an error."""
-    wc = _make_wc()
+async def _run_ensure_error(injector, ws, session_id="ses_1"):
+    """Simulate one ensure() call where the agent raises AgentExecutionError."""
     agent = AsyncMock()
-    agent.send = AsyncMock(return_value=AgentResponse(text="agent error", is_error=True))
-
-    async def fake_to_thread(fn, *args, **kwargs):
-        name = getattr(fn, "__name__", "")
-        if "exists" in name:
-            return True
-        if "stat" in name:
-            stat = MagicMock()
-            stat.st_size = 100
-            return stat
-        if "read_text" in name:
-            return "context"
-        return None
-
-    with patch("gateway.core.context_injector.asyncio.to_thread", side_effect=fake_to_thread):
-        await injector.inject(ws, session_id, agent, "default", "rc", wc)
+    agent.ensure_durable_instructions = AsyncMock(
+        side_effect=AgentExecutionError("agent error")
+    )
+    await injector.ensure(
+        ws, session_id, agent, "/tmp", 10, watcher_name="test", content="context",
+    )
 
 
-async def _run_inject_success(injector, ws, session_id="ses_1"):
-    """Simulate one inject() call where the agent succeeds."""
-    wc = _make_wc()
+async def _run_ensure_success(injector, ws, session_id="ses_1"):
+    """Simulate one ensure() call where the agent succeeds."""
     agent = AsyncMock()
-    agent.send = AsyncMock(return_value=AgentResponse(text="ok", is_error=False))
-
-    async def fake_to_thread(fn, *args, **kwargs):
-        name = getattr(fn, "__name__", "")
-        if "exists" in name:
-            return True
-        if "stat" in name:
-            stat = MagicMock()
-            stat.st_size = 100
-            return stat
-        if "read_text" in name:
-            return "context"
-        return None
-
-    with patch("gateway.core.context_injector.asyncio.to_thread", side_effect=fake_to_thread):
-        await injector.inject(ws, session_id, agent, "default", "rc", wc)
+    agent.ensure_durable_instructions = AsyncMock(return_value=None)
+    await injector.ensure(
+        ws, session_id, agent, "/tmp", 10, watcher_name="test", content="context",
+    )
 
 
 # ── Tests ──────────────────────────────────────────────────────────────────────
@@ -103,7 +82,7 @@ class TestResetSessionClearsFailureCounter(unittest.IsolatedAsyncioTestCase):
         ws = _make_ws()
         # Reach degraded
         for _ in range(_MAX_INJECT_ATTEMPTS):
-            await _run_inject_error(injector, ws, "ses_1")
+            await _run_ensure_error(injector, ws, "ses_1")
         self.assertEqual(injector.status_for("ses_1").state, "failed_degraded")
 
         # Reset
@@ -118,18 +97,18 @@ class TestResetSessionClearsFailureCounter(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status.failure_count, 0, "failure_count must be 0 after reset")
 
     async def test_reset_session_allows_fresh_injection(self):
-        """After reset_session(), a successful inject() marks the session as injected."""
+        """After reset_session(), a successful ensure() marks the session as injected."""
         injector = _make_injector()
         ws = _make_ws()
         for _ in range(_MAX_INJECT_ATTEMPTS):
-            await _run_inject_error(injector, ws, "ses_1")
+            await _run_ensure_error(injector, ws, "ses_1")
 
         # Reset clears the degraded state
         injector.reset_session("ses_1")
         # Simulate the watcher also resetting its context_injected flag
         ws.context_injected = False
 
-        await _run_inject_success(injector, ws, "ses_1")
+        await _run_ensure_success(injector, ws, "ses_1")
 
         self.assertTrue(ws.context_injected, "Injection after reset must succeed")
         self.assertEqual(injector.status_for("ses_1").state, "injected")
@@ -145,14 +124,14 @@ class TestResetSessionClearsFailureCounter(unittest.IsolatedAsyncioTestCase):
         injector = _make_injector()
         ws = _make_ws()
         for _ in range(_MAX_INJECT_ATTEMPTS):
-            await _run_inject_error(injector, ws, "ses_1")
+            await _run_ensure_error(injector, ws, "ses_1")
 
         # Simulate watcher reset WITHOUT calling reset_session():
         ws.context_injected = False
 
         # One more failure tip it back to degraded immediately because
         # failure_count is already at _MAX_INJECT_ATTEMPTS.
-        await _run_inject_error(injector, ws, "ses_1")
+        await _run_ensure_error(injector, ws, "ses_1")
         self.assertEqual(
             injector.status_for("ses_1").state,
             "failed_degraded",
@@ -164,7 +143,7 @@ class TestResetSessionClearsFailureCounter(unittest.IsolatedAsyncioTestCase):
         injector = _make_injector()
         ws = _make_ws()
         for _ in range(_MAX_INJECT_ATTEMPTS):
-            await _run_inject_error(injector, ws, "ses_1")
+            await _run_ensure_error(injector, ws, "ses_1")
 
         # Reset
         injector.reset_session("ses_1")
@@ -172,7 +151,7 @@ class TestResetSessionClearsFailureCounter(unittest.IsolatedAsyncioTestCase):
 
         # Should now be able to fail _MAX_INJECT_ATTEMPTS - 1 times before degrading
         for _ in range(_MAX_INJECT_ATTEMPTS - 1):
-            await _run_inject_error(injector, ws, "ses_1")
+            await _run_ensure_error(injector, ws, "ses_1")
         self.assertEqual(
             injector.status_for("ses_1").state,
             "failed_retryable",

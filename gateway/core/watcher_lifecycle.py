@@ -2,7 +2,7 @@
 
 Extracted from SessionManager to keep watcher management logic focused.
 Owns the _processors and _states dicts, delegates to MessageDispatcher,
-ContextInjector, and StateStore for their respective concerns.
+InjectedContextBuilder, and StateStore for their respective concerns.
 """
 
 from __future__ import annotations
@@ -16,9 +16,9 @@ from .adapter_utils import ts_gt as _ts_gt
 from .attachment_workspace import AttachmentWorkspace
 from .config import CoreConfig, WatcherConfig
 from .connector import Connector
-from .context_injector import ContextInjector
 from .dispatch import MessageDispatcher
 from .history_context import format_history_context
+from .injected_context_builder import InjectedContextBuilder
 from .message_processor import MessageProcessor
 from .permission import PermissionRegistry
 from .session_maps import SessionMaps
@@ -34,7 +34,7 @@ class WatcherLifecycle:
     Collaborators:
         - StateStore: persistence
         - MessageDispatcher: room→processor index
-        - ContextInjector: context file injection
+        - InjectedContextBuilder: context file build + durable delivery
         - SessionMaps: shared session routing state
     """
 
@@ -47,7 +47,7 @@ class WatcherLifecycle:
         watcher_configs: list[WatcherConfig],
         state_store: StateStore,
         dispatcher: MessageDispatcher,
-        injector: ContextInjector,
+        injector: InjectedContextBuilder,
         permission_registry: PermissionRegistry | None,
         maps: SessionMaps,
     ) -> None:
@@ -356,7 +356,9 @@ class WatcherLifecycle:
           1. Resolve agent and room.
           2. Provision session (reuse or create).
           3. Build state and register session maps.
-          4. Inject context files.
+          4. Build + ensure durable context delivery (identity header,
+             addressing rules, context files); best-effort one-time history
+             handoff send.
           5. Prepare attachment workspace.
           6. Create MessageProcessor (not yet started).
           7. Subscribe to connector (with rollback on failure).
@@ -417,12 +419,41 @@ class WatcherLifecycle:
                     e,
                 )
 
-        # 4. Inject context (rollback maps on failure)
+        # 3.6 Deliver history handoff as a simple, separate, best-effort one-time
+        # send. Deliberate design decision (not an oversight): history_context is
+        # genuinely one-time/volatile content — it gives the agent conversation
+        # continuity across resets/upgrades, but it is not protocol-critical like
+        # the identity/addressing header. It therefore does NOT get the shared
+        # retry tracking that InjectedContextBuilder.ensure() provides below; a
+        # failed send here just logs a warning and the watcher still starts.
+        if history_context:
+            try:
+                await agent.send(
+                    session_id=session_id,
+                    prompt=history_context,
+                    working_directory=agent_cfg.working_directory,
+                    timeout=agent_cfg.timeout,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Watcher '%s': history handoff send failed — continuing without it: %s",
+                    wc.name,
+                    e,
+                )
+
+        # 4. Build durable context (identity header + context files) and ensure
+        # it durably reaches the agent (rollback maps on hard failure). This runs
+        # UNCONDITIONALLY on every watcher start — including resumed sessions —
+        # because backends like Claude have no side effect to skip; they must
+        # return a fresh --append-system-prompt-file path every time.
         try:
-            await self._injector.inject(
-                ws, session_id, agent, agent_name, wc.connector, wc,
+            built_content = await self._injector.build(
+                agent_name, wc.connector, wc,
                 agent_username=self._connector.agent_username,
-                history_context=history_context,
+            )
+            to_repeat = await self._injector.ensure(
+                ws, session_id, agent, agent_cfg.working_directory, agent_cfg.timeout,
+                watcher_name=wc.name, content=built_content,
             )
         except Exception:
             self._states.pop(wc.name, None)
@@ -481,6 +512,7 @@ class WatcherLifecycle:
             online_notification=wc.online_notification,
             offline_notification=wc.offline_notification,
             attachment_local_base=attachment_local_base,
+            append_system_prompt_file=to_repeat,
         )
         self._processors[wc.name] = processor
 

@@ -36,7 +36,14 @@ class _MockAgent(AgentBackend):
         return "ses_001"
 
     async def send(
-        self, session_id, prompt, working_directory, timeout, attachments=None, env=None
+        self,
+        session_id,
+        prompt,
+        working_directory,
+        timeout,
+        attachments=None,
+        env=None,
+        append_system_prompt_file=None,
     ):
         if isinstance(self._response, Exception):
             raise self._response

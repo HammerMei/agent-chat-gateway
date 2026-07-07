@@ -37,7 +37,7 @@ class _EnvAwareBackend(AgentBackend):
         return "ses_001"
 
     async def send(self, session_id, prompt, working_directory, timeout,
-                   attachments=None, env=None):
+                   attachments=None, env=None, append_system_prompt_file=None):
         self.last_env = env
         return AgentResponse(text="ok")
 

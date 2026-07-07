@@ -232,6 +232,54 @@ class TestRequireBaseUrl(unittest.TestCase):
         b._require_base_url()  # should not raise
 
 
+# ── ensure_durable_instructions (issue #52) ──────────────────────────────────
+
+
+class TestEnsureDurableInstructions(unittest.IsolatedAsyncioTestCase):
+    """OpenCodeBackend explicitly opts into the shared one-time-send fallback
+    (see AgentBackend._send_once_as_durable_fallback()) — a deliberate choice
+    preserving pre-#52 behavior, not an accidentally-inherited default (the
+    base AgentBackend.ensure_durable_instructions() has no default at all;
+    calling it unoverridden raises NotImplementedError)."""
+
+    async def test_delegates_to_shared_fallback_send_once(self):
+        backend = _make_backend()
+        backend.send = AsyncMock(return_value=AgentResponse(text="ok"))
+
+        result = await backend.ensure_durable_instructions(
+            "ses_001", "/tmp", 10, "identity header content",
+            watcher_name="w1", already_delivered=False,
+        )
+
+        self.assertIsNone(result)
+        backend.send.assert_awaited_once()
+        call_kwargs = backend.send.await_args.kwargs
+        self.assertEqual(call_kwargs["prompt"], "identity header content")
+        self.assertEqual(call_kwargs["session_id"], "ses_001")
+
+    async def test_skips_send_when_already_delivered(self):
+        backend = _make_backend()
+        backend.send = AsyncMock(return_value=AgentResponse(text="ok"))
+
+        result = await backend.ensure_durable_instructions(
+            "ses_001", "/tmp", 10, "content",
+            watcher_name="w1", already_delivered=True,
+        )
+
+        self.assertIsNone(result)
+        backend.send.assert_not_awaited()
+
+    async def test_raises_agent_execution_error_on_send_error_response(self):
+        backend = _make_backend()
+        backend.send = AsyncMock(return_value=AgentResponse(text="boom", is_error=True))
+
+        with self.assertRaises(AgentExecutionError):
+            await backend.ensure_durable_instructions(
+                "ses_001", "/tmp", 10, "content",
+                watcher_name="w1", already_delivered=False,
+            )
+
+
 # ── create_session ────────────────────────────────────────────────────────────
 
 
@@ -364,6 +412,31 @@ class TestCreateSession(unittest.IsolatedAsyncioTestCase):
 class TestSend(unittest.IsolatedAsyncioTestCase):
     def _make_http_response(self, parts: list, duration_ms: int = 1500) -> dict:
         return {"parts": parts, "info": {"duration": duration_ms}}
+
+    async def test_append_system_prompt_file_is_noop(self):
+        """append_system_prompt_file has no HTTP equivalent for this backend —
+        it must be silently ignored (logged, not applied) rather than raise."""
+        b = _make_backend()
+        b._base_url = "http://127.0.0.1:57000"
+        b._ever_started = True
+
+        response_data = self._make_http_response(
+            [{"type": "text", "text": "Hello world"}]
+        )
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = response_data
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        b._client = mock_client
+        result = await b.send(
+            "ses_abc", "Hello", "/workspace", timeout=60,
+            append_system_prompt_file="/tmp/.acg-system-prompt/w.md",
+        )
+
+        self.assertIsInstance(result, AgentResponse)
+        self.assertEqual(result.text, "Hello world")
 
     async def test_basic_send_returns_text(self):
         b = _make_backend()
