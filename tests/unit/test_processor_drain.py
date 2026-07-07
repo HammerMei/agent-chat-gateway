@@ -415,8 +415,8 @@ class TestEnsureContextInjectedRetryOnMessage(unittest.IsolatedAsyncioTestCase):
     async def test_degraded_after_max_attempts_stops_retrying(self):
         from gateway.core.config import WatcherConfig
         from gateway.core.injected_context_builder import (
-            InjectedContextBuilder,
             _MAX_INJECT_ATTEMPTS,
+            InjectedContextBuilder,
         )
         from gateway.core.state import WatcherState
 

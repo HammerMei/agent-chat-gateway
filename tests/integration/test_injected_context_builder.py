@@ -329,6 +329,7 @@ class TestConcurrentEnsureGuard(unittest.IsolatedAsyncioTestCase):
         # the default fallback's one-time send().
         self.assertEqual(len(agent.send_calls), 1)
         self.assertTrue(ws.context_injected)
+        self.assertIsNone(result, "default fallback fully handles delivery — nothing to re-supply")
 
     async def test_concurrent_ensures_for_different_watchers_both_run(self):
         """Two concurrent ensure() calls for the SAME session_id but
