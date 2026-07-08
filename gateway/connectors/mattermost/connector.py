@@ -311,9 +311,8 @@ class MattermostConnector(Connector):
             room_id = room
 
         if attachment_path:
-            await self._rest.upload_file(room_id, attachment_path)
-            if text:
-                await self._rest.post_message(room_id, text)
+            file_ids = await self._rest.upload_file(room_id, attachment_path)
+            await self._rest.post_message(room_id, text, file_ids=file_ids)
         elif text:
             await self._rest.post_message(room_id, text)
 
