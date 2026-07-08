@@ -224,6 +224,59 @@ class TestSendTextAndMedia(unittest.IsolatedAsyncioTestCase):
         connector._rest.post_message.assert_called_once_with("chan1", "a file", file_ids=["f1", "f2"])
 
 
+class TestSendToRoom(unittest.IsolatedAsyncioTestCase):
+    """Regression tests for a bug found post-review: send_to_room() (the
+    CLI `agent-chat-gateway send <room> --attach ...` path, per
+    mm-gateway-context.md) discarded upload_file()'s returned file_ids and
+    called post_message() without them — the uploaded file never got linked
+    to any post and rendered as an invisible orphan in the channel."""
+
+    async def test_attachment_with_caption_links_file_ids_to_post(self):
+        connector = _make_connector()
+        connector._rest.resolve_room = AsyncMock(return_value={"id": "chan1", "name": "general", "type": "channel"})
+        connector._rest.upload_file = AsyncMock(return_value=["f1"])
+        connector._rest.post_message = AsyncMock()
+
+        await connector.send_to_room("general", "a caption", attachment_path="/tmp/f.txt")
+
+        connector._rest.upload_file.assert_called_once_with("chan1", "/tmp/f.txt")
+        connector._rest.post_message.assert_called_once_with("chan1", "a caption", file_ids=["f1"])
+
+    async def test_attachment_with_no_caption_still_posts_with_file_ids(self):
+        """Previously: an empty caption meant post_message() was never
+        called at all, so the uploaded file was never linked to any post."""
+        connector = _make_connector()
+        connector._rest.resolve_room = AsyncMock(return_value={"id": "chan1", "name": "general", "type": "channel"})
+        connector._rest.upload_file = AsyncMock(return_value=["f1"])
+        connector._rest.post_message = AsyncMock()
+
+        await connector.send_to_room("general", "", attachment_path="/tmp/f.txt")
+
+        connector._rest.post_message.assert_called_once_with("chan1", "", file_ids=["f1"])
+
+    async def test_text_only_posts_without_file_ids(self):
+        connector = _make_connector()
+        connector._rest.resolve_room = AsyncMock(return_value={"id": "chan1", "name": "general", "type": "channel"})
+        connector._rest.upload_file = AsyncMock()
+        connector._rest.post_message = AsyncMock()
+
+        await connector.send_to_room("general", "hello")
+
+        connector._rest.upload_file.assert_not_called()
+        connector._rest.post_message.assert_called_once_with("chan1", "hello")
+
+    async def test_room_not_found_falls_back_to_raw_id(self):
+        from gateway.connectors.mattermost.rest import RoomNotFoundError
+
+        connector = _make_connector()
+        connector._rest.resolve_room = AsyncMock(side_effect=RoomNotFoundError("nope"))
+        connector._rest.post_message = AsyncMock()
+
+        await connector.send_to_room("chan-raw-id", "hello")
+
+        connector._rest.post_message.assert_called_once_with("chan-raw-id", "hello")
+
+
 # ── agent_username fallback ───────────────────────────────────────────────────
 
 
