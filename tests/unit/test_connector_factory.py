@@ -1,8 +1,9 @@
 """Unit tests for gateway.connectors.connector_factory().
 
-Covers the three branches of the factory:
+Covers:
   - rocketchat  → RocketChatConnector
   - script      → ScriptConnector
+  - mattermost  → MattermostConnector
   - unknown     → ValueError
 """
 
@@ -64,6 +65,34 @@ class TestConnectorFactory(unittest.TestCase):
         mock_script_cls.assert_called_once_with(name="my-script")
         self.assertIs(result, mock_script_instance)
 
+    def test_mattermost_returns_mattermost_connector(self):
+        """connector_factory with type='mattermost' must return a MattermostConnector."""
+        cc = _make_cc("mattermost")
+
+        mock_mm_config = MagicMock()
+        mock_mm_connector_instance = MagicMock()
+        mock_mm_connector_cls = MagicMock(return_value=mock_mm_connector_instance)
+        mock_mm_config_cls = MagicMock()
+        mock_mm_config_cls.from_connector_config.return_value = mock_mm_config
+
+        with (
+            patch(
+                "gateway.connectors.mattermost.MattermostConnector",
+                mock_mm_connector_cls,
+            ),
+            patch(
+                "gateway.connectors.mattermost.config.MattermostConfig",
+                mock_mm_config_cls,
+            ),
+        ):
+            from gateway.connectors import connector_factory
+
+            result = connector_factory(cc)
+
+        mock_mm_config_cls.from_connector_config.assert_called_once_with(cc)
+        mock_mm_connector_cls.assert_called_once_with(mock_mm_config)
+        self.assertIs(result, mock_mm_connector_instance)
+
     def test_unknown_type_raises_value_error(self):
         """connector_factory with an unknown type must raise ValueError."""
         cc = _make_cc("telegram")
@@ -76,6 +105,7 @@ class TestConnectorFactory(unittest.TestCase):
         self.assertIn("telegram", str(ctx.exception))
         self.assertIn("rocketchat", str(ctx.exception))
         self.assertIn("script", str(ctx.exception))
+        self.assertIn("mattermost", str(ctx.exception))
 
 
 if __name__ == "__main__":
