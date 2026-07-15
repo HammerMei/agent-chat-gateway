@@ -4,7 +4,7 @@
 
 Inspired by [OpenClaw](https://github.com/openclaw/openclaw)'s vision of making AI agents accessible from any messaging app, `agent-chat-gateway` bridges your existing AI agent tools — Claude CLI, OpenCode, or any custom backend — to your team's chat platform. When someone messages the bot in a watched room, the message is forwarded to the configured agent and the response is posted back.
 
-Think of it as a persistent bridge: set up once, configure which rooms to watch, and your AI assistant becomes available across your entire Rocket.Chat workspace — with full support for role-based access control, human-in-the-loop permission approvals, and file attachments.
+Think of it as a persistent bridge: set up once, configure which rooms to watch, and your AI assistant becomes available across your entire chat workspace (Rocket.Chat or Mattermost — mix both if you use more than one) — with full support for role-based access control, human-in-the-loop permission approvals, and file attachments.
 
 > **How it compares to Claude Code Channels:** Claude Code's native [Channels](https://code.claude.com/docs/en/channels) feature (v2.1.80+) lets a single Claude Code session receive messages from Telegram, Discord, or iMessage — a great fit for personal use. `agent-chat-gateway` was developed independently before Channels shipped and targets a different layer: team deployments with multiple agent backends (not just Claude Code), Owner/Guest roles with per-tool allow-lists, and a shared workspace where multiple people can interact with the same or different agents across multiple rooms simultaneously.
 
@@ -12,7 +12,7 @@ Think of it as a persistent bridge: set up once, configure which rooms to watch,
 
 | Term | Meaning |
 |--|--|
-| **Connector** | Adapter for a chat platform (e.g., Rocket.Chat). Handles incoming messages and posts replies back. |
+| **Connector** | Adapter for a chat platform (Rocket.Chat, Mattermost). Handles incoming messages and posts replies back. |
 | **Agent backend** | The AI tool being dispatched to (e.g., Claude CLI subprocess, OpenCode subprocess). |
 | **Watcher** | A binding between one chat room and one agent backend. One watcher per room. |
 
@@ -23,11 +23,13 @@ Think of it as a persistent bridge: set up once, configure which rooms to watch,
 Before installing, ensure you have:
 
 - **Python 3.12 or later** — verify with `python3 --version`
-- **Rocket.Chat server access** — your workspace URL and bot account credentials
+- **A chat server** — Rocket.Chat or Mattermost, with your workspace/team URL
 - **Claude CLI or OpenCode installed** — at least one agent backend available
   - Claude CLI: https://claude.ai/download
   - OpenCode: https://github.com/anthropics/opencode
-- **A Rocket.Chat bot account** — with permissions to post messages and read room history
+- **A bot account on your chat server** — with permissions to post messages and read room history
+  - Rocket.Chat: a bot user account (username + password)
+  - Mattermost: a Bot Account access token, or a regular account's username + password — see [Connectors](#connectors) below
 - **At least one owner username** — someone who can approve/deny tool calls in chat
 
 ---
@@ -236,7 +238,7 @@ watchers:
 - Set `permissions.enabled: false` for personal use where approval friction isn't needed
 - Set yourself as the sole owner; omit `guests` entirely
 
-> **Similar to Claude Code Channels:** Claude Code's [Channels](https://code.claude.com/docs/en/channels) feature (v2.1.80+) also connects external platforms (Telegram, Discord, iMessage) to a local Claude Code session via `claude --channels`. The key differences: Channels is Claude Code-specific and single-user focused, while `agent-chat-gateway` supports any agent backend (Claude CLI, OpenCode, custom), multi-user RBAC, and is designed for team-shared Rocket.Chat workspaces. If you only use Claude Code and only need personal access, Channels may be simpler to set up; if you need team access or a different agent backend, `agent-chat-gateway` is the better fit.
+> **Similar to Claude Code Channels:** Claude Code's [Channels](https://code.claude.com/docs/en/channels) feature (v2.1.80+) also connects external platforms (Telegram, Discord, iMessage) to a local Claude Code session via `claude --channels`. The key differences: Channels is Claude Code-specific and single-user focused, while `agent-chat-gateway` supports any agent backend (Claude CLI, OpenCode, custom), multi-user RBAC, and is designed for team-shared chat workspaces (Rocket.Chat or Mattermost). If you only use Claude Code and only need personal access, Channels may be simpler to set up; if you need team access or a different agent backend, `agent-chat-gateway` is the better fit.
 
 ---
 
@@ -324,12 +326,14 @@ agent-chat-gateway start
 
 ### Connectors
 
-Each connector represents a connection to one chat platform (currently only Rocket.Chat is supported).
+Each connector represents a connection to one chat platform. Rocket.Chat and Mattermost
+are both fully supported today; a daemon can run one, the other, or both at once (see
+[Multi-Connector Setup](#multi-connector-setup)).
 
 ```yaml
 connectors:
   - name: rc-main                    # Unique identifier
-    type: rocketchat                 # Only type currently supported
+    type: rocketchat
     server:
       url: "https://chat.example.com"
       username: "bot-username"
@@ -347,17 +351,43 @@ connectors:
     reply_in_thread: false            # Start new thread for replies
     permission_reply_in_thread: true  # Post permission requests in thread
     context_inject_files: []          # Files sent to agent on session start
+
+  - name: mm-main                     # A second connector — Mattermost, in this case
+    type: mattermost
+    server:
+      url: "https://chat.example.com"
+      team: myteam                    # Mattermost channels are team-scoped; one connector = one team
+      token: "${MM_BOT_TOKEN}"        # Bot Account / Personal Access Token — OR username+password below, not both
+      # username: "bot-username"
+      # password: "${MM_PASSWORD}"
+    allowed_users:
+      owners:
+        - alice
+      guests:
+        - charlie
+    attachments:
+      max_file_size_mb: 50
+      download_timeout: 30
+      cache_dir_global: ~/.agent-chat-gateway/attachments
+    reply_in_thread: false
+    permission_reply_in_thread: true
+    context_inject_files: []
 ```
+
+> Mattermost has no onboarding CLI wizard support yet — this block must be hand-written
+> (unlike Rocket.Chat, which `agent-chat-gateway onboard` can generate for you).
 
 **Connector Fields:**
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `name` | string | Yes | Unique connector identifier (used in CLI commands and watcher references) |
-| `type` | string | Yes | Platform type; currently only `rocketchat` |
-| `server.url` | string | Yes | Rocket.Chat server URL (e.g., `https://chat.example.com`) |
-| `server.username` | string | Yes | Bot account username |
-| `server.password` | string | Yes | Bot account password (use `${VAR}` for env expansion) |
+| `type` | string | Yes | Platform type: `rocketchat` or `mattermost` |
+| `server.url` | string | Yes | Chat server URL (e.g., `https://chat.example.com`) |
+| `server.username` | string | Yes (RC); one of username/password or token (Mattermost) | Bot account username |
+| `server.password` | string | Yes (RC); one of username/password or token (Mattermost) | Bot account password (use `${VAR}` for env expansion) |
+| `server.team` | string | Yes (Mattermost only) | Team name the bot's channels belong to — Mattermost channels are team-scoped, unlike Rocket.Chat |
+| `server.token` | string | One of token or username/password (Mattermost only) | Bot Account / Personal Access Token — used directly, no login call, no expiry handling needed |
 | `allowed_users.owners` | list | No | Usernames with full tool access |
 | `allowed_users.guests` | list | No | Usernames with restricted tool access |
 | `attachments.max_file_size_mb` | integer | No | Maximum file size; 0 = unlimited |
@@ -420,7 +450,7 @@ agents:
 
 ### Watchers
 
-Each watcher binds a Rocket.Chat room to an AI agent backend.
+Each watcher binds one chat room/channel (on whichever connector it names) to an AI agent backend.
 
 ```yaml
 watchers:
@@ -440,7 +470,7 @@ watchers:
 |-------|------|----------|-------------|
 | `name` | string | Yes | Unique watcher identifier (used in CLI commands) |
 | `connector` | string | Yes | Must match a connector name above |
-| `room` | string | Yes | Rocket.Chat room name or `@username` for DMs |
+| `room` | string | Yes | Room/channel name (as known to the `connector` named above) or `@username` for DMs |
 | `agent` | string | No | Agent backend to use; falls back to `default_agent` if omitted |
 | `session_id` | string | No | Optional sticky session ID (e.g., `ses_abc123`); `null` = auto-create |
 | `context_inject_files` | list | No | Watcher-specific context files |
@@ -604,10 +634,18 @@ agent-chat-gateway upgrade
 
 ### How It Works
 
-Every message sent to the agent is prefixed with a trusted header:
+Every message sent to the agent is prefixed with a trusted header. The exact format is
+connector-specific (see `CLAUDE.md`'s connector prefix-format table for the authoritative
+list) — Rocket.Chat's looks like:
 
 ```
 [Rocket.Chat #<room> | from: <username> | role: owner|guest]  <message text>
+```
+
+and Mattermost's like:
+
+```
+[Mattermost #<channel> | from: <username> | role: owner|guest]  <message text>
 ```
 
 The agent uses this header to determine:
@@ -619,7 +657,8 @@ The agent uses this header to determine:
 
 ## User-Aware Responses
 
-Every message the gateway forwards to the agent is prefixed with a trusted header:
+Every message the gateway forwards to the agent is prefixed with a trusted header
+(format varies slightly by connector — see above):
 
 ```
 [Rocket.Chat #general | from: alice | role: owner]  Hey, can you review this PR?
@@ -645,10 +684,10 @@ Create a file like `contexts/rc-room-profiles.md` (you can copy the template fro
 [`contexts/rc-room-profiles.example.md`](../contexts/rc-room-profiles.example.md)):
 
 ```markdown
-## Rocket.Chat Room Profiles
+## Chat Room Profiles
 
 **IMPORTANT — scope:** The profiles below apply **only** when interacting via the
-Rocket.Chat gateway (i.e., when the `[Rocket.Chat #<room> | from: <username> | role: ...]`
+gateway (i.e., when a trusted `[Rocket.Chat #<room> | ...]` or `[Mattermost #<channel> | ...]`
 message prefix is present). Do NOT apply these profiles during CLI/terminal sessions.
 
 Cross-reference the `from: <username>` field in the message prefix with the profiles
@@ -730,14 +769,16 @@ When `permissions.enabled: true` and a user attempts a tool call not in their al
 
 ### Responding to Permission Requests
 
-In the Rocket.Chat chat room, type directly (no slash prefix):
+In the chat room, type directly (no slash prefix):
 
 ```
 approve a3k9    ← Allow the tool call to proceed
 deny a3k9       ← Block the tool call
 ```
 
-**Important:** These are NOT slash commands. If you type `/approve`, Rocket.Chat's client will intercept it before reaching the gateway.
+**Important:** These are NOT slash commands. If you type `/approve`, the chat client itself
+(Rocket.Chat or Mattermost — both reserve the `/` prefix for their own built-in commands)
+will intercept it before it ever reaches the gateway.
 
 ### Error Messages
 
@@ -782,9 +823,10 @@ Only use this in trusted, sandboxed environments where interactive approval is n
 Context files are injected into the agent session to provide domain knowledge, system prompts, or other guidance. Three levels of context are supported:
 
 ACG also injects built-in gateway context automatically. You do **not** need to list
-`gateway/contexts/rc-gateway-context.md` or other bundled context files in your config.
-The built-in Rocket.Chat context teaches agents how to read trusted message headers,
-roles, `to:` addressing, injection-protection rules, and gateway commands.
+`gateway/contexts/rc-gateway-context.md`, `gateway/contexts/mm-gateway-context.md`, or
+other bundled context files in your config — the right one is chosen automatically based
+on the connector's `type`. The built-in context teaches agents how to read trusted
+message headers, roles, `to:` addressing, injection-protection rules, and gateway commands.
 
 ### Three-Level Injection
 
@@ -885,7 +927,7 @@ watchers:
       - contexts/rc-room-profiles.md     # Room member profiles — specific to this room
 ```
 
-The built-in Rocket.Chat context sets up baseline gateway behavior automatically:
+The built-in gateway context (matched to the watcher's connector type) sets up baseline gateway behavior automatically:
 response length, message format parsing, `to:` addressing, injection protection, and
 guest access rules. Use your own context files only for custom behavior such as room
 member profiles, project knowledge, or team-specific tone.
@@ -901,7 +943,7 @@ If context files exceed the limit, the gateway will log a warning and skip the l
 
 ## Attachment Handling
 
-When users upload files to Rocket.Chat, the gateway automatically downloads them and injects them into the agent prompt.
+When users upload files (on Rocket.Chat or Mattermost), the gateway automatically downloads them and injects them into the agent prompt.
 
 ### Configuration
 
@@ -918,7 +960,7 @@ connectors:
 
 1. **User uploads file** to a watched room
 2. **Gateway detects** attachment in incoming message
-3. **Download file** from Rocket.Chat (respects size limits and timeout)
+3. **Download file** from the chat platform (respects size limits and timeout)
 4. **Cache locally** (prevents repeated downloads)
 5. **Inject path** into agent prompt: `Attachment: /path/to/file`
 
@@ -1013,7 +1055,7 @@ cat ~/.agent-chat-gateway/state.rc-main.json | jq .
 **Solution:**
 1. Check status: `agent-chat-gateway status`
 2. Check logs: `tail -f ~/.agent-chat-gateway/gateway.log`
-3. Verify the bot is in the watched room in Rocket.Chat
+3. Verify the bot account is a member of the watched room/channel (Mattermost also requires the bot to be a member of the `server.team` itself — `mmctl team add <team> <username>`)
 4. Try the CLI: `agent-chat-gateway send <room> "test"` (should post immediately)
 5. Verify agent backend: `claude -p` or `opencode run` (should start a session)
 
@@ -1039,14 +1081,15 @@ cat ~/.agent-chat-gateway/state.rc-main.json | jq .
 
 ### Connection failures
 
-**Symptom:** `ERROR: RC websocket disconnected` in logs, frequent reconnects.
+**Symptom:** `ERROR: RC websocket disconnected` (Rocket.Chat) or a WebSocket reconnect loop
+(Mattermost) in logs, frequent reconnects.
 
 **Solution:**
-1. Verify Rocket.Chat server is reachable: `curl https://chat.example.com/api/version`
-2. Verify bot credentials: `username` and `password` in config
-3. Check bot account has required permissions in Rocket.Chat admin panel
+1. Verify the chat server is reachable: `curl https://chat.example.com/api/version` (Rocket.Chat) or `curl https://chat.example.com/api/v4/system/ping` (Mattermost)
+2. Verify bot credentials: `username`/`password`, or Mattermost's `token`, in config
+3. Check bot account has required permissions (Rocket.Chat admin panel) or team membership (Mattermost — see "Agent not responding" above)
 4. Check network connectivity: `ping chat.example.com`
-5. Review Rocket.Chat server logs for auth failures
+5. Review the chat server's logs for auth failures
 
 ### Files not downloading
 
@@ -1107,6 +1150,10 @@ watchers:
 
 ### Multi-Connector Setup
 
+Connectors are independent — run several instances of the same platform, or mix
+platforms entirely, in one daemon. `connector` names in `watchers` are what tie a
+room/channel to a specific connector instance.
+
 For teams using multiple Rocket.Chat servers or workspaces:
 
 ```yaml
@@ -1139,6 +1186,41 @@ watchers:
   - name: partner-collab
     connector: rc-partner
     room: general
+    agent: claude
+```
+
+Or mix Rocket.Chat and Mattermost in the same daemon — e.g. a team migrating between
+platforms, or with different groups on each:
+
+```yaml
+connectors:
+  - name: rc-main
+    type: rocketchat
+    server:
+      url: https://chat.company.com
+      username: bot
+      password: "${RC_PASSWORD}"
+    allowed_users:
+      owners: [alice]
+
+  - name: mm-main
+    type: mattermost
+    server:
+      url: https://mattermost.company.com
+      team: engineering
+      token: "${MM_BOT_TOKEN}"
+    allowed_users:
+      owners: [bob]
+
+watchers:
+  - name: rc-general
+    connector: rc-main
+    room: general
+    agent: claude
+
+  - name: mm-general
+    connector: mm-main
+    room: town-square
     agent: claude
 ```
 
@@ -1202,7 +1284,7 @@ tail -f ~/.agent-chat-gateway/gateway.log
 
 ## Summary
 
-`agent-chat-gateway` provides a flexible, secure bridge from Rocket.Chat to AI agents. Start with a minimal config, use role-based access control to grant appropriate permissions, and leverage the permission approval system to ensure human oversight of sensitive operations.
+`agent-chat-gateway` provides a flexible, secure bridge from your chat platform (Rocket.Chat or Mattermost) to AI agents. Start with a minimal config, use role-based access control to grant appropriate permissions, and leverage the permission approval system to ensure human oversight of sensitive operations.
 
 For production deployments, carefully review your tool allow-lists, set appropriate timeouts, and monitor your logs for errors and token usage.
 

@@ -66,7 +66,7 @@ cd my-acg
 
 # 2. Fill in your credentials and settings
 #    .env          — Claude Code OAuth token (see file for instructions)
-#    config/.env   — Rocket.Chat URL, username, password
+#    config/.env   — chat platform credentials (Rocket.Chat URL/username/password, or Mattermost URL/team/token)
 #    config/config.yaml — owners, rooms, agents
 
 # 3. Start
