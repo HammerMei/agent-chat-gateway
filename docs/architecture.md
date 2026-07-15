@@ -116,6 +116,12 @@ graph TD
 | **connectors/rocketchat/normalize.py** | RC DDP doc → IncomingMessage (dedup, attachment download) | `normalize_rc_message()` |
 | **connectors/rocketchat/outbound.py** | RC outbound helpers (send_text, typing, online) | `send_message()`, `notify_typing()` |
 | **connectors/rocketchat/policy.py** | RC message filtering policy (bot, edits, threads) | `should_process_message()` |
+| **connectors/mattermost/connector.py** | MattermostConnector: all Mattermost-specific logic | `MattermostConnector` |
+| **connectors/mattermost/websocket.py** | Mattermost Realtime WebSocket client (no per-channel subscribe — one stream covers every channel the bot is in) | `MattermostWebSocketClient` |
+| **connectors/mattermost/rest.py** | Mattermost REST v4 client (dual auth, post, upload, history) | `MattermostREST` |
+| **connectors/mattermost/normalize.py** | Mattermost post → IncomingMessage (mention/dedup filtering, attachment download) | `filter_mm_message()`, `normalize_mm_message()` |
+| **connectors/mattermost/outbound.py** | Mattermost outbound helpers (chunked send, media upload) | `send_text()`, `send_media()` |
+| **connectors/mattermost/policy.py** | Re-export of the shared `apply_thread_policy()` (see `core/thread_policy.py`) | `apply_thread_policy` |
 | **connectors/script/connector.py** | ScriptConnector: in-memory connector for tests/scripting | `ScriptConnector` |
 
 ---
@@ -744,13 +750,23 @@ class DiscordConnector(Connector):
         return f"[Discord #{msg.room.name} | from: {msg.sender.username} | role: {msg.role.value}]"
 ```
 
-Register in `service.py`:
+Register in `gateway/connectors/__init__.py`'s `connector_factory()` (imported and called from `service.py`, but the factory itself lives here). It currently has four branches (`rocketchat`, `script`, `voice`, `mattermost`) — add a fifth:
 
 ```python
-def connector_factory(cfg: ConnectorConfig) -> Connector:
-    if cfg.type == "discord":
-        return DiscordConnector(config=cfg.discord)
-    ...
+def connector_factory(cc: ConnectorConfig) -> Connector:
+    if cc.type == "rocketchat":
+        ...
+    if cc.type == "script":
+        ...
+    if cc.type == "voice":
+        ...
+    if cc.type == "mattermost":
+        ...
+    if cc.type == "discord":
+        from .discord import DiscordConnector
+        from .discord.config import DiscordConfig
+        return DiscordConnector(DiscordConfig.from_connector_config(cc))
+    raise ValueError(f"Unknown connector type: {cc.type!r}")
 ```
 
 Add to `config.yaml`:

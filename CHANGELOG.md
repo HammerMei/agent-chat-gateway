@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Mattermost connector** — a second full chat platform connector (REST v4 +
+  WebSocket), alongside Rocket.Chat, with dual auth (Bot Token or
+  username/password), RBAC role/mention filtering, threaded replies,
+  attachments, reconnect history replay, and shared multi-agent agent-chain
+  loop protection (#59). Onboarding CLI wizard support and an E2E docker test
+  harness are deferred to a follow-up.
 - **`day:` field in the Rocket.Chat message header** — the gateway now
   precomputes the weekday (e.g. `day: Sun`) alongside `ts:` so agents don't
   have to infer it from a bare date, which was unreliable and could cause
