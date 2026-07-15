@@ -167,7 +167,7 @@ class ConnectorConfig:
     """
 
     name: str
-    type: str       # "rocketchat" | "script"
+    type: str       # "rocketchat" | "script" | "voice" | "mattermost"
     raw: dict       # type-specific config, passed to connector factory
     context_inject_files: list[str] = field(default_factory=list)
 
@@ -268,6 +268,7 @@ class CoreConfig:
         Concatenates four layers in order:
           0. Built-in system files (auto-injected; no user config needed):
                - rc-gateway-context.md  — injected for every Rocket.Chat connector
+               - mm-gateway-context.md  — injected for every Mattermost connector
                - tool-index-context.md  — injected when the agent uses lazy instruction loading
                - scheduling/fetch-history docs — injected when lazy loading is disabled
           1. Connector-level files (from ConnectorConfig.context_inject_files)
@@ -288,6 +289,8 @@ class CoreConfig:
         if connector_cfg is not None:
             if connector_cfg.type == "rocketchat":
                 result.append(str(_BUILTIN_CONTEXTS_DIR / "rc-gateway-context.md"))
+            elif connector_cfg.type == "mattermost":
+                result.append(str(_BUILTIN_CONTEXTS_DIR / "mm-gateway-context.md"))
             if agent_cfg.lazy_instruction_loading:
                 result.append(str(_BUILTIN_CONTEXTS_DIR / "tool-index-context.md"))
             else:

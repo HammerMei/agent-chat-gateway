@@ -8,7 +8,7 @@
 
 **Turn your AI agent into a team-shared chatbot — in minutes.**
 
-Already running Claude Code or OpenCode? `agent-chat-gateway` connects it to your team's chat system (Rocket.Chat, and more) so everyone can talk to it directly from chat — no terminal required, no code changes to your agent.
+Already running Claude Code or OpenCode? `agent-chat-gateway` connects it to your team's chat system (Rocket.Chat, Mattermost, and more) so everyone can talk to it directly from chat — no terminal required, no code changes to your agent.
 
 Inspired by [OpenClaw](https://github.com/openclaw/openclaw)'s vision of making AI agents accessible from any messaging app — built for the team layer.
 
@@ -18,7 +18,7 @@ Inspired by [OpenClaw](https://github.com/openclaw/openclaw)'s vision of making 
 
 ## Features
 
-- 💬 **[Works with Rocket.Chat](docs/supported-features.md#chat-platform-connectors)** — and extensible to Slack, Discord, or any other chat system you use
+- 💬 **[Works with Rocket.Chat and Mattermost](docs/supported-features.md#chat-platform-connectors)** — and extensible to Slack, Discord, or any other chat system you use
 - 🤖 **[Bring your own agent](docs/supported-features.md#agent-backends)** — Claude Code and OpenCode work out of the box; plug in any other agent too
 - 👥 **[User-aware in chat](docs/user-guide.md#user-aware-responses)** — the agent knows who sent each message and can personalize tone, language, and style per person using room profiles
 - 🔒 **[Owner & Guest roles](docs/permission-reference.md#roles)** — control who can do what, with different permissions per role
@@ -37,7 +37,7 @@ Inspired by [OpenClaw](https://github.com/openclaw/openclaw)'s vision of making 
 
 | | Supported today | Can be extended |
 |--|--|--|
-| **Chat platforms** | Rocket.Chat | Slack, Discord, and others |
+| **Chat platforms** | Rocket.Chat, Mattermost | Slack, Discord, and others |
 | **Agent backends** | Claude Code, OpenCode | Any agent with a CLI interface |
 | **Voice** | iOS Shortcuts *(experimental)* | Android via Tasker, dedicated hardware |
 

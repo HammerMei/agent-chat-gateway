@@ -144,7 +144,7 @@ class TestTurnStore(unittest.TestCase):
         self.assertEqual(store.current_turns("room1", None, "agentA"), 1)
 
         # Simulate time passing beyond TTL
-        with patch("gateway.connectors.rocketchat.agent_chain.time.monotonic",
+        with patch("gateway.core.agent_chain.time.monotonic",
                    return_value=time.monotonic() + 2.0):
             store._gc()
 
