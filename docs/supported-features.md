@@ -38,6 +38,48 @@ This document clearly communicates what agent-chat-gateway supports today, what 
 
 ---
 
+#### Mattermost
+- ✅ **Message routing** via the Mattermost Realtime API (WebSocket)
+  - One authenticated connection streams every channel the bot is a member of
+    (no per-channel subscribe/unsubscribe handshake, unlike Rocket.Chat's DDP)
+  - Automatic reconnect with exponential backoff, followed by REST history
+    replay of messages missed during the outage
+  - Per-channel message deduplication (watermark-based)
+  - Multiple concurrent channels per connector
+
+- ✅ **Authentication** — dual mode, configured per connector instance:
+  - Personal Access Token / Bot Account access token (no login call, no
+    expiry/re-login logic needed)
+  - Username + password session login, with automatic re-login on token expiry
+
+- ✅ **Message triggering**
+  - Direct message (DM) activation — all DMs to bot are forwarded to agent
+  - Channel activation — requires `@mention` of bot username, checked against
+    the server-computed mentions list on the live WebSocket event (not a text
+    regex — more robust than pattern-matching the message body)
+  - Channel-wide `@channel`/`@all`/`@here` activation — treated as explicit
+    permission for broader multi-agent fan-out
+
+- ✅ **Attachments**
+  - Inbound attachment download (files, images, documents)
+  - File size and timeout limits enforced
+  - Multiple attachments per message supported
+
+- ✅ **Typing & Status Indicators**
+  - Typing indicator while agent processes message (WebSocket `user_typing` action)
+  - Online/offline notifications per watcher (optional)
+
+- ✅ **Multi-agent / agent-chain support**
+  - Shared turn-budget loop protection with Rocket.Chat (same underlying
+    `TurnStore`), so two ACG agents in the same channel can converse without
+    looping forever
+
+- ⚠️ **Team-scoped**: one connector instance serves exactly one Mattermost
+  team (channels are team-scoped on Mattermost, unlike Rocket.Chat). A
+  multi-team deployment runs one connector instance per team.
+
+---
+
 ### Voice Gateway (Experimental) 🧪
 
 A lightweight HTTP endpoint that turns any ACG-connected agent into a voice assistant
@@ -281,11 +323,14 @@ watchers:
 
 ### Platform Support
 
-- ❌ **Single production connector type**: Only Rocket.Chat is production-ready
-  - No Slack, Discord, Microsoft Teams, or WhatsApp connectors
+- ❌ **No Slack, Discord, Microsoft Teams, or WhatsApp connectors**
+  - Rocket.Chat and Mattermost are the production-ready chat connectors
   - Webhook-based (push) connectors not yet implemented
-  - Rocket.Chat connector is pull-based (DDP subscription polling)
+  - Both chat connectors are pull-based (persistent WebSocket)
   - Voice gateway connector is experimental — see [Voice Gateway](#voice-gateway-experimental-) section
+  - Mattermost's onboarding CLI wizard (`agent-chat-gateway onboard`) and a
+    real E2E docker test harness are not yet implemented (config.yaml must be
+    hand-written for now) — planned as a follow-up
 
 ### Agent Backends
 
@@ -316,6 +361,44 @@ watchers:
 - ❌ **Slash command conflict**: Permission approve/deny cannot use `/` prefix
   - Rocket.Chat intercepts `/` commands
   - Workaround: use `approve` and `deny` without prefix
+
+---
+
+### Mattermost Specific
+
+- ⚠️ **History pagination is best-effort, not exact**: Mattermost's channel
+  history API pages by post ID, not timestamp — there is no direct equivalent
+  of Rocket.Chat's `latest`/`oldest` ISO-timestamp parameters. `before_ts`/
+  `after_ts` are applied as a client-side filter over the most recent page of
+  results rather than true server-side pagination; very deep history lookups
+  may not reach far enough back.
+
+- ⚠️ **Reconnect-replay mention detection is text-based only**: Mattermost's
+  REST history API returns bare Post objects with no mention data at all (the
+  `mentions` field only exists as a live WebSocket notification-time
+  computation, not part of the stored Post). Messages replayed after a
+  reconnect are matched against the bot's username via text regex instead —
+  this only detects a mention of the bot itself, not other agents mentioned
+  in the same message, so the `to:` field is less complete for replayed
+  messages than for live ones.
+
+- ⚠️ **`@channel`/`@all`/`@here` mention-gate bypass is possible for
+  already-allow-listed senders** (found in code review): Mattermost gives no
+  ID-based/trusted signal for these special mention keywords at all (unlike a
+  real `@botname` mention, which is checked against the server-computed
+  `mentions` ID array). Detection falls back to a text regex over the raw
+  message body, so any sender already in the owner/guest allow-list can type
+  the literal string `@channel` to satisfy the `require_mention` gate and
+  make peer agents see `to: @all`, regardless of whether Mattermost actually
+  delivered a real channel-wide notification. This does **not** allow a
+  sender outside the allow-list in, and does not break the trusted
+  `format_prompt_prefix` header — it only weakens the require_mention gate's
+  integrity for senders already trusted enough to talk to the bot. No better
+  technical fix exists without Mattermost exposing a trusted signal for these
+  keywords; see `gateway/connectors/mattermost/mentions.py`'s SECURITY NOTE.
+
+- ❌ **Slash command conflict**: same as Rocket.Chat — permission approve/deny
+  cannot use `/` prefix; use `approve`/`deny` without it.
 
 ---
 
