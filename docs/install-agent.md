@@ -13,9 +13,9 @@ Before starting, ensure you have:
 - **Claude CLI** or **OpenCode CLI** installed and authenticated
   - Claude CLI: https://claude.ai/download
   - OpenCode CLI: https://opencode.ai
-- **Rocket.Chat server** with a dedicated bot account
-  - You'll need bot username and password
-  - You'll need Rocket.Chat admin or room owner access to add the bot to rooms
+- **A chat server with a dedicated bot account** — either works, pick one:
+  - **Rocket.Chat**: bot username + password, and admin or room-owner access to add the bot to rooms
+  - **Mattermost**: a Bot Account access token (or a regular account's username + password), and the bot account must be a member of the team your channels live in
 - **Basic familiarity** with YAML and the command line
 
 ---
@@ -51,7 +51,12 @@ You should see the available commands: `start`, `stop`, `status`, `list`, `pause
 
 ---
 
-## Step 2: Create a Bot Account in Rocket.Chat
+## Step 2: Create a Bot Account
+
+**Ask the user which chat platform they're connecting** (Rocket.Chat or Mattermost) before
+proceeding — the rest of this step and Step 3 branch on that choice.
+
+### Option A: Rocket.Chat
 
 1. Log in to your Rocket.Chat server as an administrator
 2. Click the avatar menu → **Administration** → **Users**
@@ -66,6 +71,15 @@ You should see the available commands: `start`, `stop`, `status`, `list`, `pause
 7. Click **Save User**
 8. Add the bot to at least one room or DM (you can do this later)
 
+### Option B: Mattermost
+
+1. Create the bot account — either works:
+   - **Bot Account** (recommended): System Console → Integrations → Bot Accounts → **Add Bot Account**, or via CLI: `mmctl --local bot create --username agent-bot --display-name "Agent Bot"`. This issues an access token directly — **keep it handy; you'll need it**, it's shown only once.
+   - **Regular account + username/password**: create (or reuse) a normal Mattermost user account instead, if you'd rather authenticate with credentials than a token.
+2. **Add the bot to the team** your channels live in — this is required and easy to miss (Mattermost channels are team-scoped, unlike Rocket.Chat rooms): `mmctl --local team add <team-name> <bot-username>`, or via System Console.
+3. Add the bot to at least one channel (you can do this later)
+4. **Keep handy:** the bot's access token (or username/password), and the **team name** (the URL slug, not the display name) — you'll need both in Step 3.
+
 ---
 
 ## Step 3: Create the Configuration
@@ -77,7 +91,9 @@ mkdir -p ~/.agent-chat-gateway
 
 ### Create `.env` file
 
-Store sensitive credentials:
+Store sensitive credentials — use whichever block matches the platform chosen in Step 2.
+
+**Rocket.Chat:**
 ```bash
 cat > ~/.agent-chat-gateway/.env << 'EOF'
 RC_URL=https://your-rocket-chat-server.com
@@ -86,11 +102,23 @@ RC_PASSWORD=your-bot-password
 EOF
 chmod 600 ~/.agent-chat-gateway/.env
 ```
-
 Replace the values with your Rocket.Chat server URL and bot credentials.
+
+**Mattermost** (bot-token auth — the recommended path from Step 2's Option B; if using
+username/password instead, store `MM_USERNAME`/`MM_PASSWORD` in place of `MM_BOT_TOKEN`):
+```bash
+cat > ~/.agent-chat-gateway/.env << 'EOF'
+MM_URL=https://your-mattermost-server.com
+MM_TEAM=your-team-name
+MM_BOT_TOKEN=your-bot-access-token
+EOF
+chmod 600 ~/.agent-chat-gateway/.env
+```
+Replace the values with your Mattermost server URL, team name (the URL slug), and bot token.
 
 ### Create `config.yaml` file
 
+**Rocket.Chat:**
 ```bash
 cat > ~/.agent-chat-gateway/config.yaml << 'EOF'
 connectors:
@@ -109,8 +137,8 @@ connectors:
       download_timeout: 30
     reply_in_thread: false
     permission_reply_in_thread: true    # post approval requests inside a thread
-    context_inject_files:
-      - contexts/rc-gateway-context.md  # injected once per session: RC format, RBAC rules
+    # No context_inject_files needed here — the RC-specific gateway context
+    # (message format, RBAC rules, how to send files) is injected automatically.
 
 agents:
   my-agent:
@@ -167,18 +195,100 @@ watchers:
 EOF
 ```
 
+**Mattermost** (same `agents:`/`watchers:` shape — only the `connectors:` block and the
+watcher's `connector:`/`room:` values differ from the Rocket.Chat example above):
+```bash
+cat > ~/.agent-chat-gateway/config.yaml << 'EOF'
+connectors:
+  - name: mm-home
+    type: mattermost
+    server:
+      url: $MM_URL
+      team: $MM_TEAM
+      token: $MM_BOT_TOKEN
+      # username: $MM_USERNAME       # use this + password instead of token, not both
+      # password: $MM_PASSWORD
+    allowed_users:
+      owners:
+        - your-username
+      guests: []
+    attachments:
+      max_file_size_mb: 10
+      download_timeout: 30
+    reply_in_thread: false
+    permission_reply_in_thread: true    # post approval requests inside a thread
+    # No context_inject_files needed here — the Mattermost-specific gateway context
+    # (message format, RBAC rules, how to send files) is injected automatically.
+
+agents:
+  my-agent:
+    type: claude
+    command: claude
+    working_directory: ~/.agent-chat-gateway/work
+    new_session_args: []                # extra CLI flags passed when creating a new session
+    session_prefix: "agent-chat"
+    context_inject_files: []            # agent-level extra context (usually empty)
+
+    # ── Tool allow-lists ───────────────────────────────────────────────────
+    # Tools matched here are auto-approved for that role — no chat notification.
+    # Anything NOT matched triggers the human-in-the-loop approval flow.
+    # Each entry: tool (regex on tool name) + optional params (regex on primary param).
+    owner_allowed_tools:
+      - tool: "Read"
+      - tool: "Glob"
+      - tool: "Grep"
+      - tool: "WebSearch"
+      - tool: "WebFetch"
+        params: "https?://(www\\.)?github\\.com/.*"
+      - tool: "WebFetch"
+        params: "https?://[^/]*\\.wikipedia\\.org/.*"
+      - tool: "Bash"
+        params: "git (log|diff|status|show)( .*)?"   # read-only git
+      - tool: "Bash"
+        params: "ls( .*)?"
+      - tool: "Bash"
+        params: "agent-chat-gateway\\s+send\\s+.*"   # agent-initiated file send to chat
+
+    guest_allowed_tools:
+      - tool: "Read"
+      - tool: "Glob"
+      - tool: "Grep"
+      - tool: "WebFetch"
+        params: "https?://[^/]*\\.wikipedia\\.org/.*"
+      - tool: "Bash"
+        params: "agent-chat-gateway\\s+send\\s+.*"
+
+    timeout: 360
+    permissions:
+      enabled: true
+      timeout: 300
+
+watchers:
+  - name: dm-me
+    connector: mm-home
+    room: "@your-username"
+    agent: my-agent
+    session_id: null
+    context_inject_files: []            # watcher-level extra context (usually empty)
+    online_notification: "✅ _Agent online_"
+    offline_notification: "❌ _Agent offline_"
+EOF
+```
+
 **Replace:**
-- `your-username` — your Rocket.Chat username (the one who will own the bot)
-- `your-rocket-chat-server.com` — your Rocket.Chat server URL
+- `your-username` — your username on the chosen chat platform (the one who will own the bot)
+- `your-rocket-chat-server.com` / `your-mattermost-server.com` — your server URL
+- `your-team-name` (Mattermost only) — the team's URL slug (not its display name) that your channels live in
 - `~/.agent-chat-gateway/work` — **the project folder where Claude Code or OpenCode will run tasks and create files**. Default to the current project directory (`pwd`); ask the user to confirm or change it before proceeding.
 - If using OpenCode instead of Claude, change `type: claude` and `command: claude` to `type: opencode` and `command: opencode`
 
-> **About `context_inject_files`:** The file `contexts/rc-gateway-context.md` is copied to
-> `~/.agent-chat-gateway/contexts/` by the installer. It tells the agent about the RC message
-> format, RBAC rules, and how to send files. Paths are resolved relative to `~/.agent-chat-gateway/`.
+> **About context injection:** The built-in gateway context (message format, RBAC rules,
+> how to send files — `rc-gateway-context.md` or `mm-gateway-context.md`, matched
+> automatically to the connector's `type`) is injected on every session with no config
+> needed. `context_inject_files` is only for your own additional context, if any.
 
 > **About `owner_allowed_tools`:** Any tool call not matched by these rules triggers a
-> human-in-the-loop approval notification in RC. Adjust the list to match your security needs —
+> human-in-the-loop approval notification in chat. Adjust the list to match your security needs —
 > the example above allows common read-only tools and safe bash commands. See
 > `config.example.yaml` for more patterns and documentation.
 
@@ -232,7 +342,7 @@ dm-me: (rc-home) @your-username [my-agent] session=agent-chat-xxxx [active]
 
 ## Step 6: Send a Test Message
 
-1. Open Rocket.Chat and go to your direct message with the bot (or the configured room)
+1. Open your chat platform and go to your direct message with the bot (or the configured room/channel)
 2. Send a message (e.g., "Hello, what can you do?")
 3. The agent should respond in a few seconds
 4. If you don't see a response, check the logs: `tail -f ~/.agent-chat-gateway/gateway.log`
@@ -241,14 +351,16 @@ dm-me: (rc-home) @your-username [my-agent] session=agent-chat-xxxx [active]
 
 ## Step 7: Add More Watchers (Optional)
 
-To monitor additional rooms:
+To monitor additional rooms/channels:
 
-1. Add the bot to the room in Rocket.Chat
-2. Edit `~/.agent-chat-gateway/config.yaml` and add a new watcher entry:
+1. Add the bot to the room (Rocket.Chat) or channel (Mattermost — must also already be a
+   team member, see Step 2)
+2. Edit `~/.agent-chat-gateway/config.yaml` and add a new watcher entry, pointing `connector:`
+   at whichever connector name you created in Step 3 (`rc-home` or `mm-home`):
    ```yaml
    - name: dev-room
-     connector: rc-home
-     room: "#dev"
+     connector: rc-home   # or mm-home
+     room: "dev"           # bare channel name, no leading "#", on either platform
      agent: my-agent
      session_id: null
    ```

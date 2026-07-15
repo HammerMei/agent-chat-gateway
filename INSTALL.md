@@ -67,11 +67,19 @@ Run ACG as a container — no Python, Node.js, or Claude Code required on the ho
 
 2. **Fill in `.env`** — Claude Code OAuth token (see the file for instructions on how to obtain it)
 
-3. **Fill in `config/.env`** — Rocket.Chat credentials:
+3. **Fill in `config/.env`** — chat platform credentials. Rocket.Chat:
    ```
    RC_URL=https://your-rocketchat.example.com
    RC_USERNAME=bot
    RC_PASSWORD=yourpassword
+   ```
+   Mattermost (no `.env` convention is generated for you — the Docker example ships
+   with Rocket.Chat only; add your own vars here and reference them from
+   `config/config.yaml`'s `server:` block, e.g. `MM_URL`, `MM_TEAM`, `MM_BOT_TOKEN`):
+   ```
+   MM_URL=https://your-mattermost.example.com
+   MM_TEAM=yourteam
+   MM_BOT_TOKEN=yourbotaccesstoken
    ```
 
 4. **Edit `config/config.yaml`** — set your owners, watcher rooms, and agent config.
@@ -91,7 +99,7 @@ Run ACG as a container — no Python, Node.js, or Claude Code required on the ho
 
 | Host path | Container path | Purpose |
 |-----------|---------------|---------|
-| `./config/` | `~/.agent-chat-gateway/config/` | `config.yaml` + `.env` (RC credentials) |
+| `./config/` | `~/.agent-chat-gateway/config/` | `config.yaml` + `.env` (chat platform credentials) |
 | `./agents/` | `~/.agent-chat-gateway/work/` | Agent working directories |
 | `./contexts/` | `~/.agent-chat-gateway/contexts/` | Context files injected into agent sessions |
 
@@ -146,10 +154,18 @@ The `onboard` wizard creates three files in `~/.agent-chat-gateway/`:
 
 **Never put passwords directly in `config.yaml`.** Use the `$RC_PASSWORD` env var reference — it is expanded automatically from `.env` at startup.
 
+**Mattermost:** the `onboard` wizard only walks through Rocket.Chat setup today — it does not
+yet generate a Mattermost `connectors:` block. To add a Mattermost connector, run the wizard
+for your first (Rocket.Chat) connector as usual, then hand-edit `config.yaml` to add a second
+connector with `type: mattermost` — see the [Connectors](user-guide.md#connectors) section of
+the user guide for the full field reference and a worked example (including the
+`server.team`/`server.token` fields Mattermost needs that Rocket.Chat doesn't).
+
 ### Watcher room formats
 
-- `@username` — direct message room with that user
+- `@username` — direct message room with that user (both platforms)
 - `roomname` — a Rocket.Chat channel or private group
+- `channelname` — a Mattermost channel within the connector's configured `server.team`
 
 ---
 
@@ -198,7 +214,8 @@ tail -50 ~/.agent-chat-gateway/gateway.log
 Common causes:
 - Invalid config YAML — run `python3 -c "import yaml; yaml.safe_load(open('$HOME/.agent-chat-gateway/config.yaml'))"` to validate
 - Wrong Rocket.Chat credentials — verify RC_URL, RC_USERNAME, RC_PASSWORD in `~/.agent-chat-gateway/.env`
-- Bot account not added to the watched room in Rocket.Chat
+- Wrong Mattermost credentials — verify `server.url`/`server.team`/`server.token` (or `username`/`password`) in `config.yaml`
+- Bot account not added to the watched room in Rocket.Chat, or not a member of the configured `server.team` in Mattermost
 
 ### Permission denied errors
 

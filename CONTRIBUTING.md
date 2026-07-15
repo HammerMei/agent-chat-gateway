@@ -93,7 +93,8 @@ gateway/
 │
 ├── connectors/
 │   ├── __init__.py     # connector_factory() — register new connectors here
-│   └── rocketchat/     # reference connector implementation
+│   ├── rocketchat/     # reference connector implementation (DDP WebSocket + REST)
+│   └── mattermost/     # second reference implementation (REST v4 + WebSocket, no per-channel subscribe)
 │
 └── agents/
     ├── claude/         # ClaudeBackend
@@ -134,7 +135,11 @@ class MyPlatformConnector(Connector):
 ```
 
 See `gateway/core/connector.py` for the full interface and docstrings, and
-`gateway/connectors/rocketchat/` as a reference implementation.
+`gateway/connectors/rocketchat/` or `gateway/connectors/mattermost/` as reference
+implementations — the two differ structurally (RC uses DDP WebSocket subscriptions
+per room; Mattermost's WebSocket streams every channel the bot belongs to with no
+per-channel subscribe), which is useful to compare when deciding how your own
+platform's transport model should map onto the `Connector` ABC.
 
 ### 3. Register in the factory
 
