@@ -1,0 +1,244 @@
+"""EditableConfig — the pre-merge raw document the config TUI reads (and, in
+later phases, writes).
+
+This is the keystone decision recorded in docs/design/config-tool.md: the
+editor operates on the raw, as-authored YAML structure, never on the
+post-merge ``GatewayConfig``. That's the only place two things the TUI needs
+are still visible:
+
+  1. Provenance — whether a field on an entry is explicit, inherited from a
+     ``*_defaults`` block, or an explicit ``null`` suppressing a default.
+     ``GatewayConfig.from_file`` already applied the merge by the time it
+     returns; the distinction is gone.
+  2. Raw ``rooms:`` groupings — by the time ``GatewayConfig.from_file``
+     returns, one raw watcher entry with ``rooms: [a, b, c]`` has already
+     been expanded into three independent ``WatcherConfig`` objects; the
+     group itself no longer exists as data.
+
+Critically, ``EditableConfig`` loads via plain ``yaml.safe_load`` — never via
+``GatewayConfig.from_file``, which expands ``$VAR``/``${VAR}`` environment
+references (gateway/config.py's ``_expand_env_vars``). If the editor ever
+loaded (or, in a later phase, saved) through that path, a save would write
+resolved secrets — passwords, tokens — into config.yaml in plain text.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+
+import yaml
+
+from ..config import GatewayConfig, WatcherConfig, _deep_merge, _extract_defaults_block
+from ..config_validate import Finding
+
+# Mirrors the forbidden-key sets GatewayConfig.from_file enforces for each
+# *_defaults block (gateway/config.py's calls to _extract_defaults_block) —
+# kept in sync by the unit tests importing both from the same source, not by
+# hand.
+_DEFAULTS_FORBIDDEN_KEYS: dict[str, frozenset[str]] = {
+    "connector_defaults": frozenset({"name"}),
+    "agent_defaults": frozenset(),
+    "watcher_defaults": frozenset({"name", "room", "rooms", "session_id"}),
+}
+
+
+class Provenance(Enum):
+    """Where a top-level field's value on an entry actually comes from.
+
+    Computed at whole-field granularity (not per-nested-sub-key) — matches
+    how ``_deep_merge`` treats nested dicts as a single mergeable unit and
+    lists/scalars as replaced wholesale. A field that is itself a dict (e.g.
+    ``permissions``) is EXPLICIT or INHERITED as a whole; this does not
+    (yet) distinguish "this one sub-key of permissions is overridden while
+    the rest is inherited" — that finer grain isn't needed until a phase
+    that edits nested fields individually exists.
+    """
+
+    EXPLICIT = "explicit"
+    INHERITED = "inherited"
+    EXPLICIT_SUPPRESSING = "explicit_suppressing"
+
+
+@dataclass
+class EditableConfig:
+    """The raw config.yaml document, kept in its pre-merge, as-authored form.
+
+    ``document`` is the literal top-level mapping from ``yaml.safe_load`` —
+    keys like ``connectors``, ``agents``, ``watchers``, ``connector_defaults``,
+    ``tool_presets``, etc. Phase 1 only reads it; later phases mutate it and
+    call ``save()``.
+    """
+
+    document: dict
+    path: Path
+
+    @classmethod
+    def load(cls, path: str | Path) -> "EditableConfig":
+        """Load config.yaml as a plain dict — no env-var expansion, no merge.
+
+        Raises FileNotFoundError / ValueError the same way GatewayConfig.from_file
+        does for a missing file or a non-mapping top level, so callers can
+        handle both the same way they already handle from_file's errors.
+        """
+        path = Path(path)
+        if not path.exists():
+            raise FileNotFoundError(f"Config file not found: {path}")
+        with open(path) as f:
+            document = yaml.safe_load(f) or {}
+        if not isinstance(document, dict):
+            raise ValueError(
+                f"Config file '{path}' must contain a YAML mapping at the "
+                f"top level, got {type(document).__name__}."
+            )
+        return cls(document=document, path=path)
+
+    def reload(self) -> None:
+        """Re-read `document` from disk in place (e.g. after the $EDITOR
+        round-trip, or a manual 'refresh' action)."""
+        fresh = EditableConfig.load(self.path)
+        self.document = fresh.document
+
+    # ── Raw entry accessors (pre-merge, as-authored) ─────────────────────────
+
+    @property
+    def connectors_raw(self) -> list[dict]:
+        return [c for c in (self.document.get("connectors") or []) if isinstance(c, dict)]
+
+    @property
+    def agents_raw(self) -> dict[str, dict]:
+        agents = self.document.get("agents") or {}
+        return {k: v for k, v in agents.items() if isinstance(v, dict)}
+
+    @property
+    def watchers_raw(self) -> list[dict]:
+        return [w for w in (self.document.get("watchers") or []) if isinstance(w, dict)]
+
+    @property
+    def tool_presets_raw(self) -> dict[str, list]:
+        return dict(self.document.get("tool_presets") or {})
+
+    def defaults_block(self, kind: str) -> dict:
+        """Return the named `*_defaults:` block (description stripped, same
+        as the real loader) — 'connector_defaults' | 'agent_defaults' |
+        'watcher_defaults'."""
+        forbidden = _DEFAULTS_FORBIDDEN_KEYS[kind]
+        return _extract_defaults_block(self.document, kind, forbidden)
+
+    # ── Provenance / effective value (reuses the real merge, never reimplemented) ──
+
+    def merged_entry(self, kind: str, entry_raw: dict) -> dict:
+        """`entry_raw` deep-merged against its matching *_defaults block —
+        the exact value GatewayConfig.from_file would compute for this one
+        entry before its own further per-entry processing (path resolution,
+        tool-preset resolution, etc). Uses the real _deep_merge."""
+        return _deep_merge(self.defaults_block(kind), entry_raw)
+
+    def field_provenance(self, kind: str, entry_raw: dict, field: str) -> Provenance:
+        """Where `entry_raw[field]` (or its absence) actually comes from.
+
+        kind: 'connector_defaults' | 'agent_defaults' | 'watcher_defaults'
+        (selects which defaults block this entry inherits from).
+        """
+        if field in entry_raw:
+            if entry_raw[field] is None and field in self.defaults_block(kind):
+                return Provenance.EXPLICIT_SUPPRESSING
+            return Provenance.EXPLICIT
+        return Provenance.INHERITED
+
+    # ── Read-only validated view ─────────────────────────────────────────────
+
+    def validated_view(self) -> GatewayConfig:
+        """The fully-parsed, env-expanded, merged GatewayConfig — for display
+        and cross-reference only (e.g. "this watcher's agent is X"). Loads via
+        the real gateway loader; never mutate anything based on what this
+        returns — only `document` is ever written back to disk."""
+        return GatewayConfig.from_file(self.path)
+
+    def expanded_watchers(self) -> list["ExpandedWatcher"]:
+        """Pair each of validated_view()'s expanded WatcherConfig objects with
+        the raw `watchers:` entry (and sibling-room count) it came from.
+
+        Per docs/design/config-tool.md, the Watchers table shows EXPANDED
+        rows (what `agent-chat-gateway list/pause/resume/reset` operate on),
+        but a watcher's detail screen still needs to know whether it's part
+        of a shared `rooms:` group. This is computed by replaying the same
+        room/rooms-counting order gateway/config.py's loader uses (each raw
+        entry contributes exactly `len(rooms or [room])` consecutive expanded
+        watchers, in order) — without reimplementing name generation or
+        defaults-merging, both of which stay owned by the real loader via
+        validated_view().
+
+        Only call this when validated_view() would not raise (i.e. after
+        confirming the config loads) — a raw watcher entry's `room`/`rooms`
+        keys are never touched by any `*_defaults` merge (both are forbidden
+        there), so reading them directly off the raw entry is safe once the
+        document is known to be schema-valid.
+        """
+        expanded = self.validated_view().watchers
+        result: list[ExpandedWatcher] = []
+        idx = 0
+        for entry in self.watchers_raw:
+            rooms = entry.get("rooms")
+            if rooms is None:
+                rooms = [entry.get("room")]
+            count = len(rooms)
+            for _ in range(count):
+                result.append(
+                    ExpandedWatcher(watcher=expanded[idx], raw_entry=entry, group_size=count)
+                )
+                idx += 1
+        return result
+
+
+@dataclass
+class ExpandedWatcher:
+    """One expanded WatcherConfig plus the raw `watchers:` entry it came
+    from. `group_size > 1` means this watcher shares a `rooms:` list with
+    `group_size - 1` sibling watchers."""
+
+    watcher: WatcherConfig
+    raw_entry: dict
+    group_size: int
+
+    @property
+    def sibling_rooms(self) -> list[str]:
+        if self.group_size <= 1:
+            return []
+        rooms = list(self.raw_entry.get("rooms") or [])
+        return [r for r in rooms if r != self.watcher.room]
+
+
+class StatusIndex:
+    """Groups a ValidationResult's structured `findings` by (entity_kind,
+    entity_name) for cheap per-row lookup in the TUI's tables.
+
+    Known gap (documented, not silently papered over): `_lint_config`'s
+    per-watcher findings are attributed to the RAW entry's own `name` (or a
+    `watchers[i]` placeholder when unnamed) — for a multi-room `rooms:`
+    group with no explicit name, that placeholder matches none of the
+    group's expanded watcher names, so those specific lint findings won't
+    surface on any single row. They are never dropped from
+    `result.lint_findings`/`result.findings` overall — only from this
+    per-row index — so a global lint count elsewhere always accounts for
+    them.
+    """
+
+    _SEVERITY_RANK = {"error": 3, "warning": 2, "lint": 1}
+
+    def __init__(self, findings: list[Finding]):
+        self._by_entity: dict[tuple[str, str], list[Finding]] = {}
+        for f in findings:
+            if f.entity_name is not None:
+                self._by_entity.setdefault((f.entity_kind, f.entity_name), []).append(f)
+
+    def findings_for(self, kind: str, name: str) -> list[Finding]:
+        return self._by_entity.get((kind, name), [])
+
+    def status_for(self, kind: str, name: str) -> str:
+        """'error' | 'warning' | 'lint' | 'ok', highest severity present."""
+        items = self.findings_for(kind, name)
+        if not items:
+            return "ok"
+        return max(items, key=lambda f: self._SEVERITY_RANK.get(f.severity, 0)).severity

@@ -61,6 +61,21 @@ class TestExampleAndFixtureConfigsMatchSchema:
         errors = list(validator.iter_errors(doc))
         assert not errors, "\n".join(str(e) for e in errors)
 
+    def test_description_field_is_schema_valid_everywhere(self, validator):
+        """'description:' is accepted on connectors, agents, watchers, and all
+        three *_defaults blocks — additionalProperties: false on agent/watcher
+        means this must be explicit in the schema, not just implicitly allowed."""
+        doc = _load_yaml(REPO_ROOT / "config.example.yaml")
+        doc = copy.deepcopy(doc)
+        doc["connectors"][0]["description"] = "Primary bot"
+        doc["agents"]["my-agent"]["description"] = "The main agent"
+        doc["watchers"][0]["description"] = "General channel"
+        doc["connector_defaults"] = {"description": "Shared connector settings"}
+        doc["agent_defaults"] = {"description": "Shared agent settings"}
+        doc["watcher_defaults"] = {"description": "Shared watcher settings"}
+        errors = list(validator.iter_errors(doc))
+        assert not errors, "\n".join(str(e) for e in errors)
+
 
 class TestSchemaCatchesKnownMistakes:
     """Negative controls — if these stop failing, the schema became too

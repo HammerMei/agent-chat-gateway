@@ -132,7 +132,26 @@ def main():
     )
 
     # config (sub-subcommands)
-    config_p = sub.add_parser("config", help="Config file utilities")
+    config_p = sub.add_parser(
+        "config",
+        help="Interactive config TUI (or a subcommand — see below)",
+    )
+    # NOTE: dest is deliberately NOT "config" — config_validate_p below also
+    # defines its own --config (so 'config validate --config X' keeps working
+    # exactly as before). If both wrote to the same 'config' attribute,
+    # argparse would apply config_validate_p's own default over whatever this
+    # parent parser had already parsed whenever --config isn't repeated after
+    # 'validate' — silently discarding a --config the user gave before the
+    # subcommand. Separate dest names sidestep that collision entirely.
+    config_p.add_argument(
+        "--config", dest="config_path_for_tui", default=DEFAULT_CONFIG,
+        help="Path to config.yaml (default: $ACG_CONFIG or ~/.agent-chat-gateway/config.yaml)",
+    )
+    config_p.add_argument(
+        "--lint", action="store_true",
+        help="Also flag values that just restate a built-in default or duplicate "
+             "a *_defaults entry",
+    )
     config_sub = config_p.add_subparsers(dest="config_cmd", help="Config subcommands")
 
     config_validate_p = config_sub.add_parser(
@@ -351,10 +370,11 @@ def main():
 
 
 def _run_config(args) -> None:
-    """Handle 'config' subcommands."""
+    """Handle 'config' subcommands — or, with no subcommand, launch the
+    interactive config TUI (gateway/configtool/)."""
     if not getattr(args, "config_cmd", None):
-        print("Usage: agent-chat-gateway config {validate}")
-        sys.exit(1)
+        from .configtool import run_app
+        sys.exit(run_app(args.config_path_for_tui, lint=args.lint))
 
     if args.config_cmd == "validate":
         _run_config_validate(args)

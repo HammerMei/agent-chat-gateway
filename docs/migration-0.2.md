@@ -149,3 +149,20 @@ watchers:
 See `config.example.yaml` for a fully annotated reference using the new
 format, including a commented multi-connector example showing
 `connector_defaults` / `agent_defaults` / `watcher_defaults` together.
+
+## 6. New: `description:` fields
+
+Every connector, agent, and watcher entry, plus each `*_defaults` block, may
+carry an optional `description: <text>` — a free-text note that is purely
+informational: never validated, never read at runtime, safe to omit. It
+exists so tooling (starting with the config TUI, `agent-chat-gateway config`)
+has a structured place to show a human-readable note about an entry, instead
+of relying on a YAML comment that a tool can't reliably attribute to the
+right entry (or preserve across a rewrite).
+
+**If you're planning to use the config TUI once it can save changes:** a
+tool-driven save rewrites the whole file and does not preserve hand-written
+YAML comments (a timestamped backup is made before every such save, so
+nothing is unrecoverable). Moving any notes you care about from comments
+into `description:` fields ahead of time means they survive future TUI saves
+unchanged.
