@@ -34,6 +34,11 @@ class OverviewScreen(Screen):
     BINDINGS = [
         Binding("e", "edit_config", "Edit in $EDITOR"),
         Binding("r", "refresh", "Refresh"),
+        # Screen already binds tab/shift+tab to app.focus_next/focus_previous
+        # with show=False (textual/screen.py) — on mount, focus starts on the
+        # tab bar itself, not the list, so surfacing this in the footer (same
+        # action, just visible) is the fix for "how do I get into the list?"
+        Binding("tab", "app.focus_next", "Focus next / enter list", show=True),
     ]
 
     def compose(self) -> ComposeResult:
