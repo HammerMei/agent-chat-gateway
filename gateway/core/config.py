@@ -212,8 +212,8 @@ class WatcherConfig:
     agent: str                                       # must match an AgentConfig.name
     session_id: str | None = None                    # sticky session ID; None = auto-create
     context_inject_files: list[str] = field(default_factory=list)  # watcher-level context (layer 3)
-    online_notification: str | None = "✅ _Agent online_"   # message text on startup; None = suppress
-    offline_notification: str | None = "❌ _Agent offline_" # message text on shutdown; None = suppress
+    online_notification: str | None = None   # message text on startup; None = suppress (default: quiet)
+    offline_notification: str | None = None  # message text on shutdown; None = suppress (default: quiet)
     history_handoff: HistoryHandoffConfig = field(default_factory=HistoryHandoffConfig)  # session context recovery
 
 

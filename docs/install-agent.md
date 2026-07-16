@@ -188,10 +188,6 @@ watchers:
     connector: rc-home
     room: "@your-username"
     agent: my-agent
-    session_id: null
-    context_inject_files: []            # watcher-level extra context (usually empty)
-    online_notification: "✅ _Agent online_"
-    offline_notification: "❌ _Agent offline_"
 EOF
 ```
 
@@ -268,12 +264,14 @@ watchers:
     connector: mm-home
     room: "@your-username"
     agent: my-agent
-    session_id: null
-    context_inject_files: []            # watcher-level extra context (usually empty)
-    online_notification: "✅ _Agent online_"
-    offline_notification: "❌ _Agent offline_"
 EOF
 ```
+
+> By default a watcher doesn't announce online/offline in chat. Watching more than one
+> room with the same connector+agent? Use `rooms: [a, b, ...]` instead of `room:` and
+> one entry expands into a watcher per room automatically — see Step 7 below and
+> `config.example.yaml` for the full annotated format (including `tool_presets` and
+> `*_defaults` blocks for larger multi-bot setups).
 
 **Replace:**
 - `your-username` — your username on the chosen chat platform (the one who will own the bot)
@@ -355,16 +353,20 @@ To monitor additional rooms/channels:
 
 1. Add the bot to the room (Rocket.Chat) or channel (Mattermost — must also already be a
    team member, see Step 2)
-2. Edit `~/.agent-chat-gateway/config.yaml` and add a new watcher entry, pointing `connector:`
-   at whichever connector name you created in Step 3 (`rc-home` or `mm-home`):
+2. Edit `~/.agent-chat-gateway/config.yaml` and add the room to your watcher. If you're
+   watching several rooms with the same connector+agent, use `rooms:` instead of adding a
+   whole new entry per room — it expands into one watcher per room automatically, naming
+   each one `<connector>-<room>`:
    ```yaml
-   - name: dev-room
-     connector: rc-home   # or mm-home
-     room: "dev"           # bare channel name, no leading "#", on either platform
+   - connector: rc-home   # or mm-home
      agent: my-agent
-     session_id: null
+     rooms: ["general", "dev"]   # bare channel name, no leading "#", on either platform
    ```
-3. Restart the daemon: `agent-chat-gateway restart`
+   A one-off room still works as a single entry with `room:` instead of `rooms:` — see
+   `config.example.yaml` for the full annotated format, including `name:` for pinning a
+   specific watcher's identity (needed if you rely on its session surviving a config edit).
+3. Validate before restarting: `agent-chat-gateway config validate --config ~/.agent-chat-gateway/config.yaml`
+4. Restart the daemon: `agent-chat-gateway restart`
 
 ---
 

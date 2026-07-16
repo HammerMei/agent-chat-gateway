@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/HammerMei/agent-chat-gateway/main/gateway/schema/config.schema.json
 # agent-chat-gateway — example configuration
 # Copy this file to config.yaml and adjust to your setup.
 #
@@ -5,6 +6,28 @@
 # Use environment variables instead: set them in a .env file next to config.yaml
 # (copy .env.example → .env and fill in your values).
 # Any $VAR or ${VAR} reference in this file is automatically expanded at startup.
+#
+# ── Format notes (v0.2+) ──────────────────────────────────────────────────────
+# This example uses the compact config format: top-level `connector_defaults:` /
+# `agent_defaults:` / `watcher_defaults:` blocks that deep-merge into every entry
+# (the entry always wins on conflict), named `tool_presets:` you can reference by
+# name from any agent's tool allow-lists, and `rooms:` to bind one connector+agent
+# pair to many rooms without repeating the whole entry. None of this is required —
+# a single connector/agent/watcher setup barely needs it — but it keeps larger,
+# multi-bot deployments from becoming hundreds of near-duplicate lines. See
+# docs/migration-0.2.md if you're upgrading an older config.yaml.
+
+# ── Named tool-rule presets (optional) ────────────────────────────────────────
+# Reference a preset by name anywhere a tool-rule list is expected
+# (owner_allowed_tools / guest_allowed_tools). String items = preset names,
+# dict items = inline rules — the two forms can be freely mixed in one list.
+# A preset itself must be a flat list of inline rules (no preset-of-presets).
+tool_presets:
+  readonly-builtins:
+    - tool: "Read"
+    - tool: "Glob"
+    - tool: "Grep"
+    - tool: "WebSearch"
 
 connectors:
   # ── Voice Gateway (Siri / iOS Shortcuts) ─────────────────────────────────
@@ -121,14 +144,17 @@ agents:
     context_inject_files: []         # agent-level context files (layer 2); list, resolved relative to config dir
 
     # ── Tool allow lists ───────────────────────────────────────────────────
-    # Each entry is an object with:
-    #   tool:   (required) regex matched against the tool name
-    #   params: (optional) regex matched against the tool's primary parameter:
-    #             Bash        → tool_input["command"]   (Claude) / patterns[0] (OpenCode)
-    #             WebFetch    → tool_input["url"]        (Claude) / patterns[0] (OpenCode)
-    #             Read/Edit/
-    #             Write       → tool_input["file_path"]  (Claude) / patterns[0] (OpenCode)
-    #             unknown/MCP → full tool_input serialized as JSON (Claude) / patterns[0] (OpenCode)
+    # Each entry is either:
+    #   - a string naming a `tool_presets:` entry defined above (expanded in place), or
+    #   - an inline object with:
+    #       tool:   (required) regex matched against the tool name
+    #       params: (optional) regex matched against the tool's primary parameter:
+    #                 Bash        → tool_input["command"]   (Claude) / patterns[0] (OpenCode)
+    #                 WebFetch    → tool_input["url"]        (Claude) / patterns[0] (OpenCode)
+    #                 Read/Edit/
+    #                 Write       → tool_input["file_path"]  (Claude) / patterns[0] (OpenCode)
+    #                 unknown/MCP → full tool_input serialized as JSON (Claude) / patterns[0] (OpenCode)
+    # The two forms may be freely mixed; list order is preserved.
     #
     # owner_allowed_tools: auto-approved for owners — no RC notification sent.
     #   Anything NOT matched here triggers the human-in-the-loop approval flow.
@@ -144,12 +170,9 @@ agents:
       #   agent-chat-gateway schedule ...  — create/list/delete/pause/resume scheduled jobs
       #   agent-chat-gateway fetch-history ... — read filtered channel history
       #   agent-chat-gateway instructions ...  — read bundled tool instructions
-      #
-      # ── Read-only built-in tools: safe, never need owner approval ──────
-      - tool: "Read"                         # any file read
-      - tool: "Glob"                         # file pattern search
-      - tool: "Grep"                         # content search
-      - tool: "WebSearch"                    # web search
+
+      # ── Read-only built-in tools: preset defined above, safe, never need approval ──
+      - readonly-builtins
 
       # ── WebFetch: restrict by domain ───────────────────────────────────
       # params regex is matched against the full URL (tool_input["url"]).
@@ -176,10 +199,9 @@ agents:
         params: ".*\"action\":\\s*\"(get|list|read)\".*"  # read-only actions only
 
     guest_allowed_tools:
-      # Guests get a smaller subset — typically read-only tools only
-      - tool: "Read"
-      - tool: "Glob"
-      - tool: "Grep"
+      # Guests get a smaller subset — typically read-only tools only.
+      # Presets and inline rules mix freely, same as owner_allowed_tools above.
+      - readonly-builtins
       - tool: "WebFetch"
         params: "https?://[^/]*\\.wikipedia\\.org/.*"  # guests: Wikipedia only
       - tool: "mcp__rocketchat__get_.*"
@@ -244,7 +266,19 @@ watchers:
   #   agent-chat-gateway resume <watcher-name> — re-enable a paused watcher
   #   agent-chat-gateway reset  <watcher-name> — clear runtime state, start a fresh session
   #
-  # session_id:
+  # room / rooms:
+  #   room: "general"            — exactly one room; same as rooms: [general].
+  #   rooms: [general, "@alice"] — bind this connector+agent pair to several rooms at once.
+  #                                 Expands into one watcher per room at load time.
+  #
+  # name (optional):
+  #   Only allowed when the entry has exactly one room. If omitted, the watcher name is
+  #   auto-derived as "<connector>-<room>" (DM rooms like "@alice" become "<connector>-dm-alice").
+  #   Watcher names are persistent identifiers (state.json sessions, CLI pause/resume/reset,
+  #   attachment/system-prompt file paths) — set an explicit name on any watcher whose session
+  #   you want to survive editing the room list. See docs/migration-0.2.md.
+  #
+  # session_id: same one-room-only restriction as name.
   #   null (or omitted) — gateway auto-creates a session on first start and persists the ID.
   #                        'reset' clears the stored ID so a new session is created next time.
   #   "ses_abc123"      — gateway always connects to this specific session (sticky).
@@ -255,37 +289,66 @@ watchers:
   #
   # online_notification / offline_notification: customize the status message posted when
   #   this watcher starts or stops. Supports any text, emoji, or RC markdown.
-  #   Set to null (~) to suppress the message entirely for this watcher.
-  #   Defaults: "✅ _Agent online_" / "❌ _Agent offline_"
+  #   Default: null (no message). Set explicitly (or via watcher_defaults, below) to enable.
 
   # ── Voice watcher (pairs with the siri-voice connector above) ───────────
-  # - name: siri-watcher
-  #   connector: siri-voice
+  # - connector: siri-voice
   #   room: voice-room               # must be "voice-room" (fixed by VoiceConnector)
   #   agent: my-agent
-  #   session_id: ~
   #   context_inject_files:
   #     - gateway/contexts/voice-context.md  # enforces plain-text, no markdown/emoji for Siri
-  #   online_notification: ~         # suppress — no RC room to notify
-  #   offline_notification: ~
 
-  - name: general-room               # unique watcher name (used in CLI commands)
-    connector: rc-home               # must match a connector name above
-    room: general                    # room name, or @username for a DM
-    agent: my-agent                  # must match an agent name above
-    session_id: ~                    # null = auto-create
-    context_inject_files: []         # watcher-level extra context (usually empty)
-    online_notification: "✅ _Agent online_"    # set to ~ to suppress
-    offline_notification: "❌ _Agent offline_"  # set to ~ to suppress
+  - connector: rc-home              # must match a connector name above
+    agent: my-agent                 # must match an agent name above
+    rooms:
+      - general                     # -> watcher name: rc-home-general
+      # - "@your-admin-username"    # -> watcher name: rc-home-dm-your-admin-username
 
-  # - name: opencode-room
-  #   connector: rc-home
+  # - connector: rc-home
   #   room: opencode
   #   agent: opencode-agent
-  #   session_id: ~
-  #   context_inject_files: []
-  #   online_notification: "✅ _Agent online_"
-  #   offline_notification: "❌ _Agent offline_"
+
+# ── Defaults blocks (optional — most useful with 2+ connectors/agents) ───────
+# `connector_defaults:` / `agent_defaults:` / `watcher_defaults:` deep-merge into
+# every entry of the matching kind (the entry's own fields always win on conflict;
+# lists are replaced wholesale, not appended). This is what keeps a multi-bot
+# deployment (one connector + one agent per bot persona, fanned out across many
+# rooms) from turning into hundreds of near-duplicate lines. Example shape for a
+# fleet of bots sharing the same tool policy and agent-chain settings:
+#
+# agent_defaults:
+#   type: claude
+#   command: claude
+#   working_directory: ~/.agent-chat-gateway/work
+#   owner_allowed_tools: [readonly-builtins]
+#   permissions: {enabled: true, timeout: 300}
+#
+# connector_defaults:
+#   type: rocketchat
+#   agent_chain:
+#     agent_usernames: [laomei-bot, xiaomei-bot]
+#
+# agents:
+#   bot-a-agent: {}                       # inherits everything from agent_defaults
+#   bot-b-agent:
+#     timeout: 500                        # overrides just this one field
+#
+# connectors:
+#   - name: rc-bot-a
+#     server: {url: "$RC_URL", username: "$RC_USERNAME_A", password: "$RC_PASSWORD_A"}
+#   - name: rc-bot-b
+#     server: {url: "$RC_URL", username: "$RC_USERNAME_B", password: "$RC_PASSWORD_B"}
+#
+# watchers:
+#   - {connector: rc-bot-a, agent: bot-a-agent, rooms: [nest, hammer, "@glin"]}
+#   - {connector: rc-bot-b, agent: bot-b-agent, rooms: [nest, wave, "@glin"]}
+#
+# `watcher_defaults:` cannot set name/room/rooms/session_id (those identify a
+# specific watcher), but can set shared fields like `agent:` or notifications:
+#
+# watcher_defaults:
+#   online_notification: "✅ _Agent online_"   # restore the pre-0.2 default globally
+#   offline_notification: "❌ _Agent offline_"
 
 # ── Scheduler (optional) ──────────────────────────────────────────────────────
 # Controls the built-in cron scheduler.  All fields have sensible defaults

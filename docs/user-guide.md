@@ -323,6 +323,17 @@ agent-chat-gateway start
 | `connectors` | list | Yes | (none) | Chat platform connections |
 | `agents` | dict | Yes | (none) | AI agent backend definitions |
 | `watchers` | list | Yes | (none) | Room→agent mappings |
+| `tool_presets` | dict | No | `{}` | Named, reusable tool-rule lists — see [Tool Allow-Lists](#tool-allow-lists) |
+| `connector_defaults` | dict | No | `{}` | Deep-merged into every entry under `connectors:` |
+| `agent_defaults` | dict | No | `{}` | Deep-merged into every entry under `agents:` |
+| `watcher_defaults` | dict | No | `{}` | Deep-merged into every entry under `watchers:` |
+
+None of the four defaults/preset fields above are required — a single
+connector/agent/watcher setup rarely needs them. They exist to avoid
+repeating the same block across many connectors/agents/watchers in larger
+deployments. See `config.example.yaml` for a worked example and
+`docs/migration-0.2.md` if you're upgrading a config.yaml that predates them.
+Check your config any time with `agent-chat-gateway config validate --lint`.
 
 ### Connectors
 
@@ -458,32 +469,59 @@ watchers:
     connector: rc-main
     room: general
     agent: claude
-    session_id: null
-    context_inject_files: []
-    online_notification: "✅ _Agent online_"
-    offline_notification: "❌ _Agent offline_"
 ```
+
+Binding the same connector+agent to several rooms at once: use `rooms:`
+instead of `room:` — it expands into one watcher per room, with the name
+auto-derived as `<connector>-<room>` (a `@username` DM room becomes
+`<connector>-dm-<username>`) unless you set `name:` explicitly:
+
+```yaml
+watchers:
+  - connector: rc-main
+    agent: claude
+    rooms: [general, dev, "@alice"]
+    # -> rc-main-general, rc-main-dev, rc-main-dm-alice
+```
+
+`name:` and `session_id:` may only be set when the entry has exactly one
+room (via `room:`, or a single-item `rooms:`) — they pin a specific
+watcher's identity, which is ambiguous across an expanded multi-room entry.
+
+> ⚠️ **Watcher names are persistent identifiers** — they key session state
+> in `state.<connector>.json`, attachment cache directories, and injected
+> system-prompt files, and they're what you type into
+> `agent-chat-gateway pause|resume|reset`. Renaming a watcher (including by
+> switching it from an explicit `name:` to auto-generated `rooms:`) starts a
+> fresh session under the new name and orphans the old one. See
+> `docs/migration-0.2.md` for the safe way to rename a watcher that already
+> has state you care about.
 
 **Watcher Fields:**
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `name` | string | Yes | Unique watcher identifier (used in CLI commands) |
+| `name` | string | No | Watcher identifier used in CLI commands; auto-derived from `connector`+room if omitted. Only settable on a single-room entry. |
 | `connector` | string | Yes | Must match a connector name above |
-| `room` | string | Yes | Room/channel name (as known to the `connector` named above) or `@username` for DMs |
+| `room` | string | One of `room`/`rooms` | Room/channel name (as known to the `connector` named above) or `@username` for DMs |
+| `rooms` | list[string] | One of `room`/`rooms` | Bind this connector+agent pair to several rooms at once; expands into one watcher per room |
 | `agent` | string | No | Agent backend to use; falls back to `default_agent` if omitted |
-| `session_id` | string | No | Optional sticky session ID (e.g., `ses_abc123`); `null` = auto-create |
+| `session_id` | string | No | Optional sticky session ID (e.g., `ses_abc123`); `null` = auto-create. Only settable on a single-room entry. |
 | `context_inject_files` | list | No | Watcher-specific context files |
-| `online_notification` | string | No | Message posted when this watcher starts; `~` to suppress |
-| `offline_notification` | string | No | Message posted when this watcher stops; `~` to suppress |
+| `online_notification` | string | No | Message posted when this watcher starts; default `null` (no message) |
+| `offline_notification` | string | No | Message posted when this watcher stops; default `null` (no message) |
 
 ### Tool Allow-Lists
 
 `owner_allowed_tools` and `guest_allowed_tools` control which tools can be used without requiring permission approval.
 
-Each entry is an object with:
-- **`tool`** (required) — regex matched against the tool name
-- **`params`** (optional) — regex matched against the tool's primary parameter
+Each entry is either:
+- an object with **`tool`** (required, regex matched against the tool name)
+  and **`params`** (optional, regex matched against the tool's primary
+  parameter), or
+- a **string** naming a top-level `tool_presets:` entry — expanded in place,
+  so the same rule set can be shared across agents without repeating it. See
+  [permission-reference.md](permission-reference.md#named-presets) for details.
 
 **Example:**
 

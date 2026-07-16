@@ -235,6 +235,18 @@ The gateway SHALL:
 2. If permission timeouts are enabled, require that the overall agent timeout is greater than the permission timeout
 3. Prevent distinct watchers from reusing the same fixed session ID in a way that would create ambiguous routing
 
+### 8.4 Defaults Blocks, Tool Presets, and Watcher Room Expansion
+
+The gateway SHALL:
+1. Support top-level `connector_defaults`, `agent_defaults`, and `watcher_defaults` blocks that are deep-merged into every entry of the matching kind, with the entry's own fields taking precedence over the inherited default on conflict
+2. Reject a `*_defaults` block that sets an identity field belonging to a specific entry (`name` for `connector_defaults`; `name`, `room`, `rooms`, or `session_id` for `watcher_defaults`)
+3. Support a top-level `tool_presets` block of named, reusable tool-rule lists, referenced by name from `owner_allowed_tools`/`guest_allowed_tools`, freely mixable with inline tool-rule entries
+4. Validate every defined tool preset's rules at configuration load time, regardless of whether any agent references it
+5. Reject a tool preset whose rule list itself references another preset by name (presets SHALL be flat)
+6. Support a watcher `rooms` list as an alias that expands one watcher entry into one watcher per listed room, each with an automatically derived name of the form `<connector>-<sanitized-room>`
+7. Reject a watcher entry that sets both `room` and `rooms`, or that sets `name` or `session_id` while `rooms` contains more than one room
+8. Apply the same watcher-name uniqueness requirement to names produced by room expansion as to explicitly configured names
+
 ---
 
 ## 9. Error Handling and Recovery

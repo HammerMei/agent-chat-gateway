@@ -12,10 +12,12 @@ Run with:
 
 from __future__ import annotations
 
+import os
 import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from gateway.config import GatewayConfig
 
@@ -84,6 +86,25 @@ class TestWorkingDirectoryValidation(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(path)
         self.assertIn("lazy_instruction_loading", str(ctx.exception))
+
+    def test_tilde_working_directory_is_expanded(self):
+        """Regression: working_directory: ~/foo must expand to the user's home
+        directory, not be treated as a literal relative path segment named
+        '~' under the config file's directory (config.example.yaml and the
+        install-agent.md walkthroughs document `~/...` working_directory
+        values, so this must actually work)."""
+        with tempfile.TemporaryDirectory() as home_dir:
+            subdir = Path(home_dir) / "agent-work"
+            subdir.mkdir()
+            path = self._write_config(
+                "default:\n  type: claude\n  working_directory: ~/agent-work"
+            )
+            with patch.dict(os.environ, {"HOME": home_dir}):
+                config = GatewayConfig.from_file(path)
+            self.assertEqual(
+                config.agents["default"].working_directory,
+                str(subdir),
+            )
 
     def test_relative_directory_resolved_to_config_dir(self):
         """A relative working_directory is resolved relative to the config file's directory."""
@@ -193,7 +214,7 @@ class TestConfigValidationHardening(unittest.TestCase):
         """)
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(path)
-        self.assertIn("must have a non-empty 'room' field", str(ctx.exception))
+        self.assertIn("must have a non-empty 'room' or 'rooms' field", str(ctx.exception))
 
     def test_negative_max_queue_depth_raises(self):
         path = self._write_config("""\
@@ -957,6 +978,638 @@ class TestBuildAgentBackendUsesEffectiveMethods(unittest.TestCase):
             any("fetch-history" in (p or "") for p in guest_params),
             f"Built-in fetch-history rule missing from broker guest_allowed_tools: {guest_params}",
         )
+
+
+# ── Tests: _deep_merge helper ─────────────────────────────────────────────────
+
+
+class TestDeepMerge(unittest.TestCase):
+    """Unit tests for the private _deep_merge helper used by *_defaults blocks."""
+
+    def setUp(self):
+        from gateway.config import _deep_merge
+
+        self._deep_merge = _deep_merge
+
+    def test_nested_dicts_merge_recursively(self):
+        base = {"server": {"url": "http://x", "username": "bot"}}
+        override = {"server": {"username": "override-bot"}}
+        merged = self._deep_merge(base, override)
+        self.assertEqual(
+            merged, {"server": {"url": "http://x", "username": "override-bot"}}
+        )
+
+    def test_lists_replace_not_append(self):
+        base = {"tools": [{"tool": "Read"}, {"tool": "Grep"}]}
+        override = {"tools": [{"tool": "Write"}]}
+        merged = self._deep_merge(base, override)
+        self.assertEqual(merged["tools"], [{"tool": "Write"}])
+
+    def test_explicit_null_override_suppresses_default(self):
+        base = {"timezone": "America/Los_Angeles"}
+        override = {"timezone": None}
+        merged = self._deep_merge(base, override)
+        self.assertIsNone(merged["timezone"])
+
+    def test_scalar_override_wins(self):
+        merged = self._deep_merge({"timeout": 360}, {"timeout": 30})
+        self.assertEqual(merged["timeout"], 30)
+
+    def test_result_does_not_alias_base_or_override(self):
+        base = {"attachments": {"cache_dir_global": "shared"}}
+        override = {}
+        merged_a = self._deep_merge(base, override)
+        merged_b = self._deep_merge(base, override)
+        self.assertIsNot(merged_a["attachments"], merged_b["attachments"])
+        self.assertIsNot(merged_a["attachments"], base["attachments"])
+        # Mutating one merged result must not affect the other or the shared base.
+        merged_a["attachments"]["cache_dir_global"] = "mutated"
+        self.assertEqual(merged_b["attachments"]["cache_dir_global"], "shared")
+        self.assertEqual(base["attachments"]["cache_dir_global"], "shared")
+
+
+# ── Tests: connector_defaults / agent_defaults / watcher_defaults ────────────
+
+
+class TestConnectorDefaults(unittest.TestCase):
+    def _write_config(self, body: str) -> str:
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(textwrap.dedent(body))
+            return f.name
+
+    def test_connector_inherits_defaults(self):
+        path = self._write_config("""\
+            connector_defaults:
+              type: rocketchat
+              server: {url: http://localhost:3000, username: bot, password: pw}
+            connectors:
+              - name: rc1
+              - name: rc2
+                server: {username: bot2}
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watchers:
+              - name: w1
+                room: general
+        """)
+        config = GatewayConfig.from_file(path)
+        rc1, rc2 = config.connectors[0], config.connectors[1]
+        self.assertEqual(rc1.type, "rocketchat")
+        self.assertEqual(rc1.raw["server"]["username"], "bot")
+        # rc2 overrides only username; url/password still inherited from defaults.
+        self.assertEqual(rc2.raw["server"]["username"], "bot2")
+        self.assertEqual(rc2.raw["server"]["url"], "http://localhost:3000")
+        self.assertEqual(rc2.raw["server"]["password"], "pw")
+
+    def test_connector_defaults_forbids_name(self):
+        path = self._write_config("""\
+            connector_defaults:
+              name: not-allowed
+            connectors:
+              - name: rc1
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watchers:
+              - name: w1
+                room: general
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        self.assertIn("connector_defaults", str(ctx.exception))
+        self.assertIn("name", str(ctx.exception))
+
+    def test_connector_defaults_must_be_mapping(self):
+        path = self._write_config("""\
+            connector_defaults: not-a-mapping
+            connectors:
+              - name: rc1
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watchers:
+              - name: w1
+                room: general
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        self.assertIn("connector_defaults", str(ctx.exception))
+
+    def test_attachments_cache_dir_global_default_not_aliased_across_connectors(self):
+        """Regression: cache_dir_global resolution mutates the connector's raw dict
+        in place. Without a deep-copying merge, two connectors sharing
+        connector_defaults.attachments would alias the same nested dict, and
+        resolving/mutating it for the first connector would corrupt the second."""
+        path = self._write_config("""\
+            connector_defaults:
+              type: rocketchat
+              server: {url: http://localhost:3000, username: bot, password: pw}
+              attachments:
+                cache_dir_global: shared-cache
+            connectors:
+              - name: rc1
+              - name: rc2
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watchers:
+              - name: w1
+                room: general
+        """)
+        config = GatewayConfig.from_file(path)
+        a = config.connectors[0].raw["attachments"]
+        b = config.connectors[1].raw["attachments"]
+        self.assertIsNot(a, b)
+        self.assertEqual(a["cache_dir_global"], b["cache_dir_global"])
+        a["cache_dir_global"] = "mutated"
+        self.assertNotEqual(b["cache_dir_global"], "mutated")
+
+
+class TestAgentDefaults(unittest.TestCase):
+    def _write_config(self, body: str) -> str:
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(textwrap.dedent(body))
+            return f.name
+
+    def test_agent_inherits_defaults(self):
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agent_defaults:
+              type: claude
+              working_directory: /tmp
+              timeout: 500
+            agents:
+              default: {}
+              other:
+                timeout: 42
+            watchers:
+              - name: w1
+                room: general
+        """)
+        config = GatewayConfig.from_file(path)
+        self.assertEqual(config.agents["default"].working_directory, "/tmp")
+        self.assertEqual(config.agents["default"].timeout, 500)
+        # 'other' overrides timeout but still inherits working_directory/type.
+        self.assertEqual(config.agents["other"].timeout, 42)
+        self.assertEqual(config.agents["other"].working_directory, "/tmp")
+
+    def test_agent_defaults_permissions_deep_merge(self):
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agent_defaults:
+              type: claude
+              working_directory: /tmp
+              timeout: 500
+              permissions: {enabled: true, timeout: 300}
+            agents:
+              default:
+                permissions: {timeout: 100}
+            watchers:
+              - name: w1
+                room: general
+        """)
+        config = GatewayConfig.from_file(path)
+        perms = config.agents["default"].permissions
+        # enabled inherited from defaults, timeout overridden by the entry.
+        self.assertTrue(perms.enabled)
+        self.assertEqual(perms.timeout, 100)
+
+    def test_agent_defaults_tool_list_replaces_not_appends(self):
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agent_defaults:
+              type: claude
+              working_directory: /tmp
+              owner_allowed_tools:
+                - tool: Read
+                - tool: Grep
+            agents:
+              default:
+                owner_allowed_tools:
+                  - tool: Write
+            watchers:
+              - name: w1
+                room: general
+        """)
+        config = GatewayConfig.from_file(path)
+        tools = [r.tool for r in config.agents["default"].owner_allowed_tools]
+        self.assertEqual(tools, ["Write"])
+
+
+class TestWatcherDefaults(unittest.TestCase):
+    def _write_config(self, body: str) -> str:
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(textwrap.dedent(body))
+            return f.name
+
+    def test_watcher_inherits_connector_and_agent(self):
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watcher_defaults:
+              connector: rc
+              agent: default
+            watchers:
+              - name: w1
+                room: general
+        """)
+        config = GatewayConfig.from_file(path)
+        wc = config.watchers[0]
+        self.assertEqual(wc.connector, "rc")
+        self.assertEqual(wc.agent, "default")
+
+    def test_watcher_defaults_forbids_identity_fields(self):
+        for key, value in (
+            ("name", "shared-name"),
+            ("room", "general"),
+            ("rooms", ["general"]),
+            ("session_id", "sticky-1"),
+        ):
+            with self.subTest(key=key):
+                path = self._write_config(f"""\
+                    connectors:
+                      - name: rc
+                        type: rocketchat
+                        server: {{url: http://localhost:3000, username: bot, password: pw}}
+                    agents:
+                      default:
+                        type: claude
+                        working_directory: /tmp
+                    watcher_defaults:
+                      {key}: {value!r}
+                    watchers:
+                      - name: w1
+                        room: general
+                """)
+                with self.assertRaises(ValueError) as ctx:
+                    GatewayConfig.from_file(path)
+                self.assertIn("watcher_defaults", str(ctx.exception))
+                self.assertIn(key, str(ctx.exception))
+
+
+# ── Tests: tool_presets ────────────────────────────────────────────────────────
+
+
+class TestToolPresets(unittest.TestCase):
+    def _write_config(self, body: str) -> str:
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(textwrap.dedent(body))
+            return f.name
+
+    def test_preset_reference_resolves_to_rules(self):
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            tool_presets:
+              readonly:
+                - tool: Read
+                - tool: Grep
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+                owner_allowed_tools:
+                  - readonly
+            watchers:
+              - name: w1
+                room: general
+        """)
+        config = GatewayConfig.from_file(path)
+        tools = [r.tool for r in config.agents["default"].owner_allowed_tools]
+        self.assertEqual(tools, ["Read", "Grep"])
+
+    def test_preset_and_inline_rules_are_mixable_and_ordered(self):
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            tool_presets:
+              readonly:
+                - tool: Read
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+                owner_allowed_tools:
+                  - tool: Bash
+                    params: "git .*"
+                  - readonly
+                  - tool: Write
+            watchers:
+              - name: w1
+                room: general
+        """)
+        config = GatewayConfig.from_file(path)
+        tools = [r.tool for r in config.agents["default"].owner_allowed_tools]
+        self.assertEqual(tools, ["Bash", "Read", "Write"])
+
+    def test_unknown_preset_reference_raises(self):
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+                owner_allowed_tools:
+                  - nonexistent
+            watchers:
+              - name: w1
+                room: general
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        self.assertIn("unknown tool preset 'nonexistent'", str(ctx.exception))
+
+    def test_preset_referencing_another_preset_raises(self):
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            tool_presets:
+              base:
+                - tool: Read
+              wrapper:
+                - base
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watchers:
+              - name: w1
+                room: general
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        self.assertIn("presets cannot reference another preset", str(ctx.exception))
+
+    def test_invalid_preset_rule_raises_even_if_unused(self):
+        """Presets are validated eagerly at load, even if no agent references them."""
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            tool_presets:
+              broken:
+                - tool: '[invalid'
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watchers:
+              - name: w1
+                room: general
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        self.assertIn("invalid tool rule", str(ctx.exception).lower())
+
+    def test_invalid_inline_rule_raises_with_agent_and_field_context(self):
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+                guest_allowed_tools:
+                  - tool: '[invalid'
+            watchers:
+              - name: w1
+                room: general
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        msg = str(ctx.exception)
+        self.assertIn("invalid tool rule", msg.lower())
+        self.assertIn("guest_allowed_tools", msg)
+
+
+# ── Tests: watcher rooms: expansion + auto-naming ─────────────────────────────
+
+
+class TestWatcherRoomsExpansion(unittest.TestCase):
+    def _write_config(self, watchers_block: str) -> str:
+        cfg = textwrap.dedent(f"""\
+            connectors:
+              - name: rc-home
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watchers:
+{textwrap.indent(textwrap.dedent(watchers_block), "              ")}
+        """)
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(cfg)
+            return f.name
+
+    def test_rooms_list_expands_to_one_watcher_per_room(self):
+        path = self._write_config("""\
+            - connector: rc-home
+              rooms: [general, dev, '@alice']
+        """)
+        config = GatewayConfig.from_file(path)
+        names = {w.name: w.room for w in config.watchers}
+        self.assertEqual(
+            names,
+            {
+                "rc-home-general": "general",
+                "rc-home-dev": "dev",
+                "rc-home-dm-alice": "@alice",
+            },
+        )
+
+    def test_room_singular_is_alias_for_single_item_rooms(self):
+        path = self._write_config("""\
+            - connector: rc-home
+              room: general
+        """)
+        config = GatewayConfig.from_file(path)
+        self.assertEqual(len(config.watchers), 1)
+        self.assertEqual(config.watchers[0].name, "rc-home-general")
+        self.assertEqual(config.watchers[0].room, "general")
+
+    def test_room_and_rooms_both_set_raises(self):
+        path = self._write_config("""\
+            - connector: rc-home
+              room: general
+              rooms: [dev]
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        self.assertIn("set either 'room' or 'rooms', not both", str(ctx.exception))
+
+    def test_rooms_must_be_non_empty_list(self):
+        path = self._write_config("""\
+            - connector: rc-home
+              rooms: []
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        self.assertIn("'rooms' must be a non-empty list", str(ctx.exception))
+
+    def test_rooms_with_duplicate_room_raises(self):
+        path = self._write_config("""\
+            - connector: rc-home
+              rooms: [general, general]
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        self.assertIn("duplicate room(s)", str(ctx.exception))
+
+    def test_explicit_name_with_multiple_rooms_raises(self):
+        path = self._write_config("""\
+            - connector: rc-home
+              name: my-watcher
+              rooms: [general, dev]
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        self.assertIn("'name' can only be set when there is exactly one room", str(ctx.exception))
+
+    def test_explicit_session_id_with_multiple_rooms_raises(self):
+        path = self._write_config("""\
+            - connector: rc-home
+              session_id: sticky-1
+              rooms: [general, dev]
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        self.assertIn(
+            "'session_id' can only be set when there is exactly one room",
+            str(ctx.exception),
+        )
+
+    def test_explicit_name_preserved_on_single_room_entry(self):
+        path = self._write_config("""\
+            - connector: rc-home
+              name: general-room
+              room: ops
+        """)
+        config = GatewayConfig.from_file(path)
+        self.assertEqual(config.watchers[0].name, "general-room")
+
+    def test_auto_name_collision_across_entries_raises(self):
+        path = self._write_config("""\
+            - connector: rc-home
+              room: general
+            - connector: rc-home
+              room: general
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        msg = str(ctx.exception)
+        self.assertIn("Duplicate watcher name 'rc-home-general'", msg)
+        self.assertIn("set an explicit 'name:' to disambiguate", msg)
+
+    def test_room_sanitization_examples(self):
+        from gateway.config import _auto_watcher_name
+
+        for room, expected_fragment in (
+            ("general", "general"),
+            ("@alice", "dm-alice"),
+            ("team/town-square", "team-town-square"),
+        ):
+            with self.subTest(room=room):
+                self.assertEqual(
+                    _auto_watcher_name("mm", room), f"mm-{expected_fragment}"
+                )
+
+
+# ── Tests: quiet notification defaults ────────────────────────────────────────
+
+
+class TestQuietNotificationDefaults(unittest.TestCase):
+    """Migration-0.2 behavior change: online/offline notifications default to
+    quiet (None) instead of posting '_Agent online_'/'_Agent offline_'."""
+
+    def _write_config(self, watcher_extra: str = "") -> str:
+        cfg = textwrap.dedent(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watchers:
+              - name: w1
+                room: general
+{textwrap.indent(textwrap.dedent(watcher_extra), "                ")}
+        """)
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(cfg)
+            return f.name
+
+    def test_notifications_default_to_none(self):
+        path = self._write_config()
+        config = GatewayConfig.from_file(path)
+        self.assertIsNone(config.watchers[0].online_notification)
+        self.assertIsNone(config.watchers[0].offline_notification)
+
+    def test_watcher_defaults_can_restore_old_behavior_globally(self):
+        path = self._write_config()
+        # Inject watcher_defaults restoring the pre-0.2 notification text.
+        with open(path) as f:
+            body = f.read()
+        body = body.replace(
+            "connectors:",
+            "watcher_defaults:\n"
+            "  online_notification: '✅ _Agent online_'\n"
+            "  offline_notification: '❌ _Agent offline_'\n"
+            "connectors:",
+            1,
+        )
+        with open(path, "w") as f:
+            f.write(body)
+        config = GatewayConfig.from_file(path)
+        self.assertEqual(config.watchers[0].online_notification, "✅ _Agent online_")
+        self.assertEqual(config.watchers[0].offline_notification, "❌ _Agent offline_")
+
+    def test_explicit_notification_overrides_default(self):
+        path = self._write_config(
+            "online_notification: 'hi there'\noffline_notification: 'bye'"
+        )
+        config = GatewayConfig.from_file(path)
+        self.assertEqual(config.watchers[0].online_notification, "hi there")
+        self.assertEqual(config.watchers[0].offline_notification, "bye")
 
 
 if __name__ == "__main__":

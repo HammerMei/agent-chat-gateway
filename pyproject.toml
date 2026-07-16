@@ -50,6 +50,7 @@ build-backend = "hatchling.build"
 [dependency-groups]
 dev = [
     "coverage>=7.13.5",
+    "jsonschema>=4.23.0",
     "pytest>=9.0.2",
     "pytest-cov>=7.1.0",
     "pytest-timeout>=2.3",

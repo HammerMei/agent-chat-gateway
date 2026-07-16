@@ -1,0 +1,211 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/HammerMei/agent-chat-gateway/main/gateway/schema/config.schema.json",
+  "title": "agent-chat-gateway config.yaml",
+  "description": "Hand-written schema for editor autocomplete / typo-checking of config.yaml. It intentionally does NOT re-validate every connector-type-specific field (server/allowed_users/attachments/agent_chain vary by connector 'type') — that stays the job of `acg config validate`. See docs/migration-0.2.md for the format this schema describes (v0.2+: connector_defaults/agent_defaults/watcher_defaults, tool_presets, watcher rooms:).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["connectors", "agents"],
+  "properties": {
+    "tool_presets": {
+      "type": "object",
+      "description": "Named, reusable lists of inline tool rules. Reference a preset by name from owner_allowed_tools/guest_allowed_tools. A preset's own list may only contain inline rules (no preset-of-presets).",
+      "additionalProperties": {
+        "type": "array",
+        "items": { "$ref": "#/$defs/toolRule" }
+      }
+    },
+    "connector_defaults": {
+      "type": "object",
+      "description": "Deep-merged into every connector entry below (the entry's own fields win on conflict). Must not set 'name' — that identifies a specific connector.",
+      "not": { "required": ["name"] }
+    },
+    "agent_defaults": {
+      "type": "object",
+      "description": "Deep-merged into every entry under 'agents:' (the entry's own fields win on conflict)."
+    },
+    "watcher_defaults": {
+      "type": "object",
+      "description": "Deep-merged into every watcher entry below (the entry's own fields win on conflict). Must not set 'name', 'room', 'rooms', or 'session_id' — those identify a specific watcher.",
+      "not": {
+        "anyOf": [
+          { "required": ["name"] },
+          { "required": ["room"] },
+          { "required": ["rooms"] },
+          { "required": ["session_id"] }
+        ]
+      }
+    },
+    "connectors": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/connector" }
+    },
+    "agents": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "$ref": "#/$defs/agent" }
+    },
+    "default_agent": {
+      "type": "string",
+      "description": "Name of the agent used when a watcher omits 'agent:'. Defaults to the first agent defined."
+    },
+    "watchers": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/watcher" }
+    },
+    "max_queue_depth": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Max pending messages per room queue; 0 = unbounded."
+    },
+    "scheduler": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "completed_job_ttl_days": { "type": "integer", "minimum": 0 }
+      }
+    }
+  },
+  "$defs": {
+    "toolRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tool"],
+      "properties": {
+        "tool": {
+          "type": "string",
+          "description": "Regex matched against the tool name (case-insensitive, fullmatch)."
+        },
+        "params": {
+          "type": "string",
+          "description": "Optional regex matched against the tool's primary parameter (command / url / file_path / full JSON, depending on the tool)."
+        }
+      }
+    },
+    "toolEntry": {
+      "description": "Either the name of a 'tool_presets:' entry (string), or an inline tool rule (object). The two forms may be freely mixed in one list.",
+      "oneOf": [
+        { "type": "string" },
+        { "$ref": "#/$defs/toolRule" }
+      ]
+    },
+    "permissions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "timeout": { "type": "integer", "minimum": 0 },
+        "skip_owner_approval": { "type": "boolean" }
+      }
+    },
+    "historyHandoff": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "fetch_count": { "type": "integer", "minimum": 0 },
+        "verbatim_tail": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "connector": {
+      "type": "object",
+      "description": "additionalProperties is intentionally left open — server/allowed_users/attachments/agent_chain and other fields vary by connector 'type' (rocketchat/mattermost/voice/script) and are validated by each connector's own config parser, not by this schema.",
+      "required": ["name", "type"],
+      "properties": {
+        "name": { "type": "string" },
+        "type": {
+          "type": "string",
+          "enum": ["rocketchat", "mattermost", "voice", "script"]
+        },
+        "context_inject_files": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["claude", "opencode"]
+        },
+        "command": { "type": "string" },
+        "new_session_args": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "working_directory": {
+          "type": "string",
+          "description": "Required (directly or via agent_defaults); must exist on disk when the gateway loads."
+        },
+        "session_prefix": { "type": "string" },
+        "lazy_instruction_loading": { "type": "boolean" },
+        "context_inject_files": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "owner_allowed_tools": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/toolEntry" }
+        },
+        "guest_allowed_tools": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/toolEntry" }
+        },
+        "timeout": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Must be greater than permissions.timeout."
+        },
+        "permissions": { "$ref": "#/$defs/permissions" }
+      }
+    },
+    "watcher": {
+      "type": "object",
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "anyOf": [
+            { "required": ["room"] },
+            { "required": ["rooms"] }
+          ]
+        },
+        {
+          "not": { "required": ["room", "rooms"] }
+        }
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Only allowed when the entry has exactly one room; auto-derived from connector+room otherwise."
+        },
+        "connector": { "type": "string" },
+        "room": {
+          "type": "string",
+          "description": "Exactly one room; alias for rooms: [<room>]."
+        },
+        "rooms": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" },
+          "description": "Bind this connector+agent pair to several rooms at once; expands into one watcher per room."
+        },
+        "agent": { "type": "string" },
+        "session_id": {
+          "type": ["string", "null"],
+          "description": "Only allowed when the entry has exactly one room."
+        },
+        "context_inject_files": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "online_notification": { "type": ["string", "null"] },
+        "offline_notification": { "type": ["string", "null"] },
+        "history_handoff": { "$ref": "#/$defs/historyHandoff" }
+      }
+    }
+  }
+}
