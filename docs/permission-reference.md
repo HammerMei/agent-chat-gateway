@@ -69,6 +69,43 @@ agents:
       timeout: 300                 # seconds before auto-deny
 ```
 
+### Named Presets
+
+Any list item in `owner_allowed_tools` / `guest_allowed_tools` can be either
+an inline rule object (as above) or a **string naming a top-level
+`tool_presets` entry** — useful once the same rule set is repeated across
+multiple agents:
+
+```yaml
+tool_presets:
+  readonly:
+    - tool: "Read"
+    - tool: "Grep"
+    - tool: "Glob"
+
+agents:
+  my-agent:
+    owner_allowed_tools:
+      - readonly                     # preset reference — expands to the 3 rules above
+      - tool: "Bash"                 # inline rules and preset references mix freely
+        params: "git (log|diff).*"
+  other-agent:
+    owner_allowed_tools:
+      - readonly                     # same preset, no duplication
+```
+
+Presets are resolved before matching begins — at runtime there is no
+difference between a rule that came from a preset and one written inline.
+Rules:
+- List order is preserved regardless of which items are presets vs. inline.
+- A preset's own rule list must be flat inline rules only — a preset cannot
+  reference another preset by name.
+- All presets are regex-validated at config load time, even ones no agent
+  currently references, so a broken preset fails fast instead of only
+  surfacing when finally used.
+- An unknown preset name in an allow-list is a config load error naming the
+  agent, the field, and the list of presets that do exist.
+
 ### Matching Rules
 
 Each rule is an object with two regex fields:
@@ -467,12 +504,18 @@ Content-Type: application/json
 ### Complete YAML Schema
 
 ```yaml
+tool_presets:
+  a-preset-name:
+    - tool: "regex_pattern"
+      params: "optional_regex_pattern"
+
 agents:
   my-agent:
     # ... agent config ...
 
     owner_allowed_tools:
-      - tool: "regex_pattern"
+      - a-preset-name                # string = tool_presets reference
+      - tool: "regex_pattern"        # object = inline rule; the two mix freely
         params: "optional_regex_pattern"
 
     guest_allowed_tools:
@@ -490,10 +533,11 @@ agents:
 
 | Path | Type | Default | Description |
 |------|------|---------|-------------|
-| `agents[*].owner_allowed_tools` | list[ToolRule] | `[]` | Tools owner can execute without approval |
+| `tool_presets` | map[string, list[ToolRule]] | `{}` | Named, reusable tool-rule lists |
+| `agents[*].owner_allowed_tools` | list[ToolRule \| preset name] | `[]` | Tools owner can execute without approval |
 | `agents[*].owner_allowed_tools[*].tool` | regex string | (required) | Case-insensitive regex on tool name |
 | `agents[*].owner_allowed_tools[*].params` | regex string | (optional) | Case-insensitive regex on primary parameter |
-| `agents[*].guest_allowed_tools` | list[ToolRule] | `[]` | Tools guest can execute (auto-approved) |
+| `agents[*].guest_allowed_tools` | list[ToolRule \| preset name] | `[]` | Tools guest can execute (auto-approved) |
 | `agents[*].guest_allowed_tools[*].tool` | regex string | (required) | Case-insensitive regex on tool name |
 | `agents[*].guest_allowed_tools[*].params` | regex string | (optional) | Case-insensitive regex on primary parameter |
 | `agents[*].permissions.enabled` | bool | `false` | Enable approval workflow for this agent |

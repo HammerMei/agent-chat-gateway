@@ -106,14 +106,19 @@ class GatewayConfig:
                 f"config.yaml 'connectors:' must be a list (got {type(connectors_raw).__name__})."
             )
 
+        connector_defaults = _extract_defaults_block(
+            raw, "connector_defaults", frozenset({"name"})
+        )
+
         connectors: list[ConnectorConfig] = []
         seen_connector_names: set[str] = set()
-        for i, cc in enumerate(connectors_raw):
-            if not isinstance(cc, Mapping):
+        for i, cc_raw in enumerate(connectors_raw):
+            if not isinstance(cc_raw, Mapping):
                 raise ValueError(
                     f"Connector entry at index {i} must be a mapping "
-                    f"(got {type(cc).__name__})."
+                    f"(got {type(cc_raw).__name__})."
                 )
+            cc = _deep_merge(connector_defaults, cc_raw)
             name = cc.get("name", "")
             connector_type = cc.get("type", "")
             if not name:
@@ -172,13 +177,17 @@ class GatewayConfig:
             )
         default_agent = raw.get("default_agent", "")
 
+        agent_defaults = _extract_defaults_block(raw, "agent_defaults", frozenset())
+        tool_presets = _parse_tool_presets(raw)
+
         agents: dict[str, AgentConfig] = {}
-        for agent_name, agent_raw in agents_raw.items():
-            if not isinstance(agent_raw, Mapping):
+        for agent_name, agent_raw_entry in agents_raw.items():
+            if not isinstance(agent_raw_entry, Mapping):
                 raise ValueError(
                     f"Agent '{agent_name}' config must be a mapping "
-                    f"(got {type(agent_raw).__name__})."
+                    f"(got {type(agent_raw_entry).__name__})."
                 )
+            agent_raw = _deep_merge(agent_defaults, agent_raw_entry)
             perm_raw = agent_raw.get("permissions", {})
             if perm_raw and not isinstance(perm_raw, Mapping):
                 raise ValueError(
@@ -190,10 +199,14 @@ class GatewayConfig:
             raw_ctx = agent_raw.get("context_inject_files", [])
             ctx_files = _resolve_paths(raw_ctx, config_dir)
 
-            # Resolve working_directory relative to the config file's directory
+            # Resolve working_directory: expand a leading ~ first (matching
+            # the cache_dir_global handling below), then resolve relative to
+            # the config file's directory if still not absolute.
             working_directory = agent_raw.get("working_directory", "")
-            if working_directory and not Path(working_directory).is_absolute():
-                working_directory = str((config_dir / working_directory).resolve())
+            if working_directory:
+                working_directory = str(Path(working_directory).expanduser())
+                if not Path(working_directory).is_absolute():
+                    working_directory = str((config_dir / working_directory).resolve())
 
             # Validate: working_directory is required and must exist
             if not working_directory:
@@ -222,11 +235,17 @@ class GatewayConfig:
                 session_prefix=agent_raw.get("session_prefix", "agent-chat"),
                 lazy_instruction_loading=lazy_instruction_loading,
                 context_inject_files=ctx_files,
-                owner_allowed_tools=_parse_tool_rules(
-                    agent_raw.get("owner_allowed_tools", []), agent_name
+                owner_allowed_tools=_resolve_tool_entries(
+                    agent_raw.get("owner_allowed_tools", []),
+                    tool_presets,
+                    agent_name,
+                    "owner_allowed_tools",
                 ),
-                guest_allowed_tools=_parse_tool_rules(
-                    agent_raw.get("guest_allowed_tools", []), agent_name
+                guest_allowed_tools=_resolve_tool_entries(
+                    agent_raw.get("guest_allowed_tools", []),
+                    tool_presets,
+                    agent_name,
+                    "guest_allowed_tools",
                 ),
                 timeout=agent_raw.get("timeout", 360),
                 permissions=PermissionConfig(
@@ -271,50 +290,88 @@ class GatewayConfig:
             raise ValueError(
                 f"config.yaml 'watchers:' must be a list (got {type(watchers_raw).__name__})."
             )
+
+        watcher_defaults = _extract_defaults_block(
+            raw, "watcher_defaults", frozenset({"name", "room", "rooms", "session_id"})
+        )
+
         seen_watcher_names: set[str] = set()
-        for i, wc in enumerate(watchers_raw):
-            if not isinstance(wc, Mapping):
+        for i, wc_raw in enumerate(watchers_raw):
+            if not isinstance(wc_raw, Mapping):
                 raise ValueError(
                     f"Watcher entry at index {i} must be a mapping "
-                    f"(got {type(wc).__name__})."
+                    f"(got {type(wc_raw).__name__})."
                 )
-            watcher_name = wc.get("name", "")
-            if not watcher_name:
-                raise ValueError("Each watcher entry must have a 'name' field")
-            if "/" in watcher_name:
-                raise ValueError(
-                    f"Watcher name '{watcher_name}' must not contain '/' — "
-                    "watcher names are used as filesystem path components "
-                    "(e.g. <working_directory>/.acg-attachments/<name>, "
-                    "<RUNTIME_DIR>/system-prompts/<name>.md) "
-                    "and a '/' could escape the intended directory."
-                )
-            if watcher_name in seen_watcher_names:
-                raise ValueError(
-                    f"Duplicate watcher name '{watcher_name}' found. "
-                    "Each watcher must use a unique name."
-                )
-            seen_watcher_names.add(watcher_name)
+            wc = _deep_merge(watcher_defaults, wc_raw)
 
-            watcher_room = wc.get("room", "")
-            if not watcher_room:
+            # ── room / rooms: exactly one form, 'room' is a single-item alias ──
+            raw_room = wc.get("room")
+            raw_rooms = wc.get("rooms")
+            if raw_room and raw_rooms:
                 raise ValueError(
-                    f"Watcher '{watcher_name}' must have a non-empty 'room' field"
+                    f"Watcher entry at index {i}: set either 'room' or 'rooms', not both."
                 )
+            if raw_rooms is not None:
+                if not isinstance(raw_rooms, list) or not raw_rooms:
+                    raise ValueError(
+                        f"Watcher entry at index {i}: 'rooms' must be a non-empty list "
+                        "of room names."
+                    )
+                if not all(isinstance(r, str) and r for r in raw_rooms):
+                    raise ValueError(
+                        f"Watcher entry at index {i}: 'rooms' entries must be "
+                        "non-empty strings."
+                    )
+                if len(set(raw_rooms)) != len(raw_rooms):
+                    dupes = sorted({r for r in raw_rooms if raw_rooms.count(r) > 1})
+                    raise ValueError(
+                        f"Watcher entry at index {i}: 'rooms' contains duplicate "
+                        f"room(s): {dupes}."
+                    )
+                rooms_list = list(raw_rooms)
+            elif raw_room:
+                rooms_list = [raw_room]
+            else:
+                raise ValueError(
+                    f"Watcher entry at index {i} must have a non-empty "
+                    "'room' or 'rooms' field"
+                )
+
+            # 'name' / 'session_id' pin a single sticky identity — only meaningful
+            # when the entry expands to exactly one watcher.
+            explicit_name = wc.get("name") or None
+            explicit_session_id = wc.get("session_id") or None
+            if len(rooms_list) > 1:
+                if explicit_name:
+                    raise ValueError(
+                        f"Watcher entry at index {i}: 'name' can only be set when "
+                        f"there is exactly one room (found {len(rooms_list)} in "
+                        "'rooms') — remove 'name' or split into single-room entries."
+                    )
+                if explicit_session_id:
+                    raise ValueError(
+                        f"Watcher entry at index {i}: 'session_id' can only be set "
+                        f"when there is exactly one room (found {len(rooms_list)} in "
+                        "'rooms') — remove 'session_id' or split into single-room "
+                        "entries."
+                    )
 
             watcher_connector = wc.get("connector", "")
             if watcher_connector and watcher_connector not in connector_names:
                 raise ValueError(
-                    f"Watcher '{watcher_name}' references unknown connector '{watcher_connector}'"
+                    f"Watcher entry at index {i} references unknown connector "
+                    f"'{watcher_connector}'"
                 )
+            resolved_connector = watcher_connector or connectors[0].name
 
             watcher_agent = wc.get("agent", default_agent)
             if watcher_agent not in agents:
                 raise ValueError(
-                    f"Watcher '{watcher_name}' references unknown agent '{watcher_agent}'"
+                    f"Watcher entry at index {i} references unknown agent "
+                    f"'{watcher_agent}'"
                 )
 
-            # Resolve watcher-level context_inject_files
+            # Resolve watcher-level context_inject_files (shared across expanded rooms)
             raw_ctx = wc.get("context_inject_files", [])
             ctx_files = _resolve_paths(raw_ctx, config_dir)
 
@@ -325,23 +382,45 @@ class GatewayConfig:
                 verbatim_tail=hh_raw.get("verbatim_tail", 15),
             )
 
-            watchers.append(
-                WatcherConfig(
-                    name=watcher_name,
-                    connector=watcher_connector or connectors[0].name,
-                    room=watcher_room,
-                    agent=watcher_agent,
-                    session_id=wc.get("session_id") or None,
-                    context_inject_files=ctx_files,
-                    online_notification=wc.get(
-                        "online_notification", "✅ _Agent online_"
-                    ),
-                    offline_notification=wc.get(
-                        "offline_notification", "❌ _Agent offline_"
-                    ),
-                    history_handoff=history_handoff,
+            for room in rooms_list:
+                watcher_name = explicit_name or _auto_watcher_name(
+                    resolved_connector, room
                 )
-            )
+                if "/" in watcher_name:
+                    raise ValueError(
+                        f"Watcher name '{watcher_name}' must not contain '/' — "
+                        "watcher names are used as filesystem path components "
+                        "(e.g. <working_directory>/.acg-attachments/<name>, "
+                        "<RUNTIME_DIR>/system-prompts/<name>.md) "
+                        "and a '/' could escape the intended directory."
+                    )
+                if watcher_name in seen_watcher_names:
+                    origin = (
+                        "explicit 'name:'"
+                        if explicit_name
+                        else f"auto-generated from connector '{resolved_connector}' "
+                        f"+ room '{room}'"
+                    )
+                    raise ValueError(
+                        f"Duplicate watcher name '{watcher_name}' found ({origin}). "
+                        "Each watcher must use a unique name — set an explicit "
+                        "'name:' to disambiguate."
+                    )
+                seen_watcher_names.add(watcher_name)
+
+                watchers.append(
+                    WatcherConfig(
+                        name=watcher_name,
+                        connector=resolved_connector,
+                        room=room,
+                        agent=watcher_agent,
+                        session_id=explicit_session_id,
+                        context_inject_files=ctx_files,
+                        online_notification=wc.get("online_notification"),
+                        offline_notification=wc.get("offline_notification"),
+                        history_handoff=history_handoff,
+                    )
+                )
 
         # Validate no duplicate sticky session IDs across watchers — duplicate IDs
         # cause silent overwrite of session→room / session→connector routing maps,
@@ -390,17 +469,163 @@ class GatewayConfig:
         )
 
 
-def _parse_tool_rules(raw_list: list, agent_name: str = "") -> list["ToolRule"]:
-    """Parse a list of raw config entries into ToolRule objects."""
-    rules = []
+def _extract_defaults_block(
+    raw: dict, key: str, forbidden_keys: frozenset[str]
+) -> dict:
+    """Pop and validate a top-level ``<x>_defaults:`` mapping.
+
+    Returns an empty dict if the key is absent. Raises ValueError if the
+    block is not a mapping, or if it sets a key that identifies an
+    individual entry (e.g. ``name``) rather than something safe to inherit
+    across every entry.
+    """
+    block = raw.get(key, {}) or {}
+    if not isinstance(block, Mapping):
+        raise ValueError(
+            f"config.yaml '{key}:' must be a mapping (got {type(block).__name__})."
+        )
+    bad = sorted(forbidden_keys & block.keys())
+    if bad:
+        raise ValueError(
+            f"config.yaml '{key}:' must not set {bad} — these fields identify "
+            "an individual entry and must be set per-entry, not inherited."
+        )
+    return dict(block)
+
+
+def _deep_copy(value):
+    """Recursively copy dicts/lists so merged config entries never alias."""
+    if isinstance(value, Mapping):
+        return {k: _deep_copy(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_deep_copy(v) for v in value]
+    return value
+
+
+def _deep_merge(base: Mapping, override: Mapping) -> dict:
+    """Deep-merge two mappings; ``override`` wins at every level.
+
+    - Both values are dicts -> recursively merged.
+    - Otherwise (list, scalar, or ``None``) -> the override value replaces
+      the base value verbatim. An explicit ``null`` in ``override``
+      intentionally suppresses a base value, rather than being treated as
+      "unset".
+    - Always returns a brand-new nested structure so the result never shares
+      a mutable dict/list with ``base`` or ``override``. This matters
+      because per-entry parsing later mutates dicts in place (e.g. resolving
+      ``attachments.cache_dir_global`` to an absolute path) — without a deep
+      copy, that mutation would leak into a shared ``*_defaults`` block and
+      corrupt every other entry merged against it.
+    """
+    merged = {k: _deep_copy(v) for k, v in base.items()}
+    for k, v in override.items():
+        if k in merged and isinstance(merged[k], dict) and isinstance(v, Mapping):
+            merged[k] = _deep_merge(merged[k], v)
+        else:
+            merged[k] = _deep_copy(v)
+    return merged
+
+
+def _parse_tool_presets(raw: dict) -> dict[str, list["ToolRule"]]:
+    """Parse and validate the top-level ``tool_presets:`` block.
+
+    Each preset is a named list of inline tool-rule dicts (same shape as
+    ``owner_allowed_tools``/``guest_allowed_tools`` entries). Presets are
+    flat: a preset's rule list may not reference another preset by name.
+    All presets are parsed and regex-validated eagerly here, even if unused
+    by any agent, so a broken preset fails fast at config load.
+    """
+    presets_raw = raw.get("tool_presets", {}) or {}
+    if not isinstance(presets_raw, Mapping):
+        raise ValueError(
+            f"config.yaml 'tool_presets:' must be a mapping "
+            f"(got {type(presets_raw).__name__})."
+        )
+    presets: dict[str, list[ToolRule]] = {}
+    for preset_name, rules_raw in presets_raw.items():
+        if not isinstance(rules_raw, list):
+            raise ValueError(
+                f"tool_presets['{preset_name}'] must be a list of tool rules "
+                f"(got {type(rules_raw).__name__})."
+            )
+        rules: list[ToolRule] = []
+        for i, entry in enumerate(rules_raw):
+            if isinstance(entry, str):
+                raise ValueError(
+                    f"tool_presets['{preset_name}'][{i}]: presets cannot reference "
+                    f"another preset ('{entry}') — a preset must be a flat list of "
+                    "inline tool rules."
+                )
+            try:
+                rules.append(ToolRule.from_config(entry))
+            except ValueError as e:
+                raise ValueError(
+                    f"tool_presets['{preset_name}']: invalid tool rule at index {i}: {e}"
+                ) from e
+        presets[preset_name] = rules
+    return presets
+
+
+def _resolve_tool_entries(
+    raw_list: list,
+    presets: dict[str, list["ToolRule"]],
+    agent_name: str,
+    field_name: str,
+) -> list["ToolRule"]:
+    """Resolve one agent's owner/guest_allowed_tools list into ToolRule objects.
+
+    Each entry is either a string (the name of a ``tool_presets:`` entry,
+    expanded in place) or a dict (an inline ``{tool, params}`` rule). Both
+    forms may be freely mixed; list order is preserved.
+    """
+    rules: list[ToolRule] = []
     for i, entry in enumerate(raw_list):
+        if isinstance(entry, str):
+            preset = presets.get(entry)
+            if preset is None:
+                available = ", ".join(sorted(presets)) or "(none defined)"
+                raise ValueError(
+                    f"Agent '{agent_name}': unknown tool preset '{entry}' in "
+                    f"{field_name}[{i}]. Available presets: {available}"
+                )
+            rules.extend(preset)
+            continue
         try:
             rules.append(ToolRule.from_config(entry))
         except ValueError as e:
             raise ValueError(
-                f"Agent '{agent_name}': invalid tool rule at index {i}: {e}"
+                f"Agent '{agent_name}': invalid tool rule at index {i} in "
+                f"{field_name}: {e}"
             ) from e
     return rules
+
+
+_NAME_SANITIZE_RE = re.compile(r"[^A-Za-z0-9._-]")
+_NAME_COLLAPSE_DASH_RE = re.compile(r"-{2,}")
+
+
+def _sanitize_room_for_name(room: str) -> str:
+    """Turn a room identifier into a filesystem/CLI-safe watcher-name fragment.
+
+    - A leading '@' (DM room, e.g. '@alice') becomes a 'dm-' prefix: '@alice' -> 'dm-alice'.
+    - Any character outside [A-Za-z0-9._-] (including '/') becomes '-'.
+    - Runs of '-' collapse to one; leading/trailing '-' and '.' are stripped.
+    """
+    prefix = "dm-" if room.startswith("@") else ""
+    body = room[1:] if room.startswith("@") else room
+    body = _NAME_SANITIZE_RE.sub("-", body)
+    sanitized = _NAME_COLLAPSE_DASH_RE.sub("-", prefix + body).strip("-.")
+    if not sanitized:
+        raise ValueError(
+            f"Could not derive a safe watcher name from room {room!r} — "
+            "set an explicit 'name:' for this entry."
+        )
+    return sanitized
+
+
+def _auto_watcher_name(connector: str, room: str) -> str:
+    """Deterministic watcher name for a (connector, room) pair: '<connector>-<room>'."""
+    return f"{connector}-{_sanitize_room_for_name(room)}"
 
 
 def _resolve_paths(paths: list, base_dir: Path) -> list[str]:

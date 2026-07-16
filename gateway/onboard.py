@@ -82,11 +82,18 @@ def generate_config_yaml(
         connector_type: ``"rocketchat"`` (only supported type currently).
         connector_data: Connector-specific fields (owners, server_url, …).
         watchers: List of ``{"name": ..., "room": ...}`` dicts.
-        working_directory: Absolute path to the opencode project directory.
-            Only used when ``agent_type == "opencode"``; ignored otherwise.
+        working_directory: Absolute path to the agent's working directory.
+            ``GatewayConfig.from_file`` requires every agent to have one
+            (checked at config load, regardless of backend) — the caller
+            (``run_onboard``) is responsible for always providing one, not
+            just for opencode.
     """
     owners = connector_data.get("owners", [])
 
+    # Fields matching the built-in dataclass defaults (attachments size/timeout,
+    # reply_in_thread, permission_reply_in_thread, context_inject_files: []) are
+    # intentionally omitted — restating a default adds noise without changing
+    # behavior. Only deliberate, non-default choices are written out.
     connector = {
         "name": "rc-home",
         "type": "rocketchat",
@@ -99,51 +106,40 @@ def generate_config_yaml(
             "owners": list(owners),
             "guests": [],
         },
-        "attachments": {
-            "max_file_size_mb": 10,
-            "download_timeout": 30,
-        },
-        "reply_in_thread": False,
-        "permission_reply_in_thread": True,
-        "context_inject_files": [],  # built-in context files are auto-injected; add user files here
     }
 
     agent_command = agent_type  # "claude" or "opencode"
     agent: dict = {
         "type": agent_type,
         "command": agent_command,
-        "session_prefix": "agent-chat",
-        "context_inject_files": [],
-        "owner_allowed_tools": [],
-        "guest_allowed_tools": [],
-        "timeout": 360,
+        # Permission gating defaults to on for a fresh setup — this is a
+        # deliberate safety choice, not a restated default (AgentConfig
+        # defaults permissions.enabled to False), so it stays explicit.
         "permissions": {
             "enabled": True,
             "timeout": 300,
         },
     }
-    # opencode requires an explicit working_directory so it can find
-    # .opencode/opencode.json (and the role-enforcement plugin).
-    if agent_type == "opencode" and working_directory:
+    # Required for every backend — GatewayConfig.from_file rejects an agent
+    # with no working_directory regardless of type. opencode additionally
+    # needs this to find .opencode/opencode.json and the role-enforcement
+    # plugin; claude just needs a cwd to run in and create files under.
+    if working_directory:
         agent["working_directory"] = working_directory
 
-    watcher_list = []
-    for w in watchers:
-        watcher_list.append({
-            "name": w["name"],
-            "connector": "rc-home",
-            "room": w["room"],
-            "agent": "my-agent",
-            "session_id": None,
-            "context_inject_files": [],
-            "online_notification": "✅ _Agent online_",
-            "offline_notification": "❌ _Agent offline_",
-        })
+    # Group every wizard-collected room into a single watcher entry via
+    # `rooms:` — the gateway expands it into one watcher per room and derives
+    # each watcher's name from connector+room automatically at load time.
+    watcher_entry = {
+        "connector": "rc-home",
+        "agent": "my-agent",
+        "rooms": [w["room"] for w in watchers],
+    }
 
     config = {
         "connectors": [connector],
         "agents": {"my-agent": agent},
-        "watchers": watcher_list,
+        "watchers": [watcher_entry],
     }
 
     return yaml.dump(config, default_flow_style=False, allow_unicode=True, sort_keys=False)
@@ -469,18 +465,23 @@ def run_onboard(repo_path: Path | None = None) -> None:
 
     credentials = _step_rocketchat_credentials()
 
-    # opencode needs a working directory for its config + plugin.
-    opencode_working_dir: Path | None = None
+    # Every agent needs a working_directory (GatewayConfig.from_file requires
+    # it regardless of backend). opencode additionally needs it to find
+    # .opencode/opencode.json and the role-enforcement plugin, so it gets an
+    # explicit interactive step; claude just needs a cwd to run in, so it
+    # defaults quietly to ~/.agent-chat-gateway/work (created if missing).
     if agent_type == "opencode":
-        opencode_working_dir = _step_opencode_working_dir()
+        working_dir = _step_opencode_working_dir()
+    else:
+        working_dir = RUNTIME_DIR / "work"
+        working_dir.mkdir(parents=True, exist_ok=True)
 
     watchers = _step_watchers(credentials["owners"])
 
     # Summary
     console.print("\n[bold cyan]Summary[/bold cyan]")
     console.print(f"  Agent backend : [bold]{agent_type}[/bold]")
-    if opencode_working_dir:
-        console.print(f"  Working dir   : {opencode_working_dir}")
+    console.print(f"  Working dir   : {working_dir}")
     console.print(f"  Connector     : [bold]{connector_type}[/bold]")
     console.print(f"  Server URL    : {credentials['server_url']}")
     console.print(f"  Bot username  : {credentials['bot_username']}")
@@ -495,10 +496,9 @@ def run_onboard(repo_path: Path | None = None) -> None:
     # Write files
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 
-    working_dir_str = str(opencode_working_dir) if opencode_working_dir else None
     config_yaml = generate_config_yaml(
         agent_type, connector_type, credentials, watchers,
-        working_directory=working_dir_str,
+        working_directory=str(working_dir),
     )
     CONFIG_FILE.write_text(config_yaml)
     console.print(f"\n  [green]✓[/green] Wrote {CONFIG_FILE}")

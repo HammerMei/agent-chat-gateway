@@ -30,15 +30,25 @@ connectors:
     permission_reply_in_thread: false
     context_inject_files: []  # rc-gateway-context.md is auto-injected by ACG at layer 0
 
+# All four agents below share the same working_directory/timeout/permissions/
+# guest_allowed_tools — only type/command/session_prefix/owner_allowed_tools differ.
+agent_defaults:
+  new_session_args: []
+  context_inject_files: []
+  working_directory: /root/.agent-chat-gateway/work
+  guest_allowed_tools: []
+  timeout: 180
+  permissions:
+    enabled: true
+    timeout: 60
+    skip_owner_approval: false
+
 agents:
   # ── OpenCode — bound to DM ────────────────────────────────────────────────
   e2e-opencode:
     type: opencode
     command: opencode
-    new_session_args: []
     session_prefix: e2e-oc
-    context_inject_files: []
-    working_directory: /root/.agent-chat-gateway/work
     owner_allowed_tools:
       - tool: "read"
       - tool: "glob"
@@ -46,103 +56,58 @@ agents:
       - tool: "write"
       - tool: "external_directory"
       - tool: "bash"
-    guest_allowed_tools: []
-    timeout: 180
-    permissions:
-      enabled: true
-      timeout: 60
-      skip_owner_approval: false
 
   # ── Claude Code — bound to team channel ───────────────────────────────────
   e2e-claude:
     type: claude
     command: claude
-    new_session_args: []
     session_prefix: e2e-cc
-    context_inject_files: []
-    working_directory: /root/.agent-chat-gateway/work
     owner_allowed_tools:
       - tool: "Read"
       - tool: "Glob"
       - tool: "Grep"
       - tool: "Write"
       - tool: "Bash"
-    guest_allowed_tools: []
-    timeout: 180
-    permissions:
-      enabled: true
-      timeout: 60
-      skip_owner_approval: false
 
   # ── Claude Code — permission test only (empty allowlist) ──────────────────
   e2e-claude-permission:
     type: claude
     command: claude
-    new_session_args: []
     session_prefix: e2e-perm
-    context_inject_files: []
-    working_directory: /root/.agent-chat-gateway/work
-    owner_allowed_tools: []
-    guest_allowed_tools: []
-    timeout: 180
-    permissions:
-      enabled: true
-      timeout: 60
-      skip_owner_approval: false
 
   # ── OpenCode — permission test only (empty allowlist) ─────────────────────
   e2e-opencode-permission:
     type: opencode
     command: opencode
-    new_session_args: []
     session_prefix: e2e-oc-perm
-    context_inject_files: []
-    working_directory: /root/.agent-chat-gateway/work
-    owner_allowed_tools: []
-    guest_allowed_tools: []
-    timeout: 180
-    permissions:
-      enabled: true
-      timeout: 60
-      skip_owner_approval: false
+
+# All watchers share the same connector and an empty context_inject_files list.
+# session_id and online/offline_notification are omitted entirely — they now
+# default to null (auto-create session / quiet) so there's nothing to state.
+# Explicit 'name:' is kept on every entry (rather than relying on rooms:
+# auto-naming) because tests/e2e/test_schedule_e2e.py references watcher names
+# 'e2e-dm' and 'e2e-claude-channel' literally.
+watcher_defaults:
+  connector: rc-e2e
+  context_inject_files: []
 
 watchers:
   # DM: test_user ↔ acg_bot → OpenCode
   - name: e2e-dm
-    connector: rc-e2e
     room: "@test_user"
     agent: e2e-opencode
-    session_id: null
-    context_inject_files: []
-    online_notification: null
-    offline_notification: null
 
   # Team channel → Claude Code
   - name: e2e-claude-channel
-    connector: rc-e2e
     room: "acg-e2e-claude"
     agent: e2e-claude
-    session_id: null
-    context_inject_files: []
-    online_notification: null
-    offline_notification: null
 
   # Permission test channel → Claude Code (empty allowlist)
   - name: e2e-permission
-    connector: rc-e2e
     room: "acg-e2e-permission"
     agent: e2e-claude-permission
-    session_id: null
-    context_inject_files: []
-    online_notification: null
-    offline_notification: null
 
   # Permission test channel → OpenCode (empty allowlist)
   - name: e2e-opencode-permission
-    connector: rc-e2e
     room: "acg-e2e-opencode-permission"
     agent: e2e-opencode-permission
-    session_id: null
-    context_inject_files: []
-    online_notification: null
-    offline_notification: null

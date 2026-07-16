@@ -293,15 +293,31 @@ watchers:
 - ✅ Multi-agent setup (different agents per watcher)
 - ✅ Cross-field validation (e.g., agent timeout > permission timeout)
 - ✅ Relative path resolution (relative to config file location)
+- ✅ `connector_defaults` / `agent_defaults` / `watcher_defaults` — deep-merge
+  shared fields into every entry of the matching kind
+- ✅ `tool_presets` — named, reusable tool-rule lists referenced by name from
+  `owner_allowed_tools` / `guest_allowed_tools`
+- ✅ Watcher `rooms: [a, b, ...]` — one connector+agent pair expands into one
+  watcher per room, with an auto-derived name (`<connector>-<room>`)
+- ✅ JSON Schema (`gateway/schema/config.schema.json`) for editor
+  autocomplete and inline typo-checking
 
 #### Configuration Validation
 - ✅ Connector names must be unique
-- ✅ Watcher names must be unique
+- ✅ Watcher names must be unique (including names auto-derived from `rooms:`)
 - ✅ Watchers must reference existing connectors and agents
 - ✅ Default agent must reference existing agent (if specified)
 - ✅ Required paths must exist at validation time
 - ✅ Queue depth settings reject invalid values
 - ✅ Sticky session IDs validated for uniqueness
+- ✅ `*_defaults` blocks reject identity fields (e.g. `name`, `room`/`rooms`,
+  `session_id`) that must be set per-entry, not inherited
+- ✅ `tool_presets` are regex-validated eagerly at load, even if unused
+- ✅ `agent-chat-gateway config validate [--lint]` — checks config.yaml
+  without starting the daemon: structural validation, per-connector-type
+  credential checks (e.g. empty Rocket.Chat/Mattermost `server:` fields),
+  and a warning when persisted `state.<connector>.json` references a watcher
+  name no longer in the config
 
 ---
 

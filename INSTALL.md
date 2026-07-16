@@ -212,7 +212,9 @@ tail -50 ~/.agent-chat-gateway/gateway.log
 ```
 
 Common causes:
-- Invalid config YAML — run `python3 -c "import yaml; yaml.safe_load(open('$HOME/.agent-chat-gateway/config.yaml'))"` to validate
+- Invalid config YAML — run `agent-chat-gateway config validate` to check syntax, cross-references,
+  and per-connector credentials without starting the daemon (add `--lint` to also flag redundant
+  defaults)
 - Wrong Rocket.Chat credentials — verify RC_URL, RC_USERNAME, RC_PASSWORD in `~/.agent-chat-gateway/.env`
 - Wrong Mattermost credentials — verify `server.url`/`server.team`/`server.token` (or `username`/`password`) in `config.yaml`
 - Bot account not added to the watched room in Rocket.Chat, or not a member of the configured `server.team` in Mattermost

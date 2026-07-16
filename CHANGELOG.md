@@ -10,6 +10,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Compact config.yaml format (v0.2)**: top-level `connector_defaults:` /
+  `agent_defaults:` / `watcher_defaults:` blocks deep-merge into every entry
+  of the matching kind; named `tool_presets:` can be referenced by name from
+  any agent's `owner_allowed_tools`/`guest_allowed_tools`; and watcher
+  `rooms: [a, b, ...]` binds one connector+agent pair to many rooms at once
+  (auto-deriving each expanded watcher's name as `<connector>-<room>`). None
+  of this is required — existing config.yaml files keep working unchanged.
+  See `docs/migration-0.2.md`.
+- **`agent-chat-gateway config validate [--config PATH] [--lint]`** — checks
+  config.yaml without starting the daemon: full structural validation, plus
+  per-connector-type checks (e.g. empty Rocket.Chat/Mattermost credentials)
+  that were previously only caught lazily at daemon start, plus a warning
+  when a connector's persisted `state.<connector>.json` references a watcher
+  name no longer in the config (session about to be dropped). `--lint` flags
+  config values that just restate a built-in default or duplicate an
+  inherited `*_defaults` value.
+- **JSON Schema for config.yaml** (`gateway/schema/config.schema.json`) —
+  `config.example.yaml` references it via a `# yaml-language-server: $schema=`
+  comment for editor autocomplete and inline typo-checking.
 - **Mattermost connector** — a second full chat platform connector (REST v4 +
   WebSocket), alongside Rocket.Chat, with dual auth (Bot Token or
   username/password), RBAC role/mention filtering, threaded replies,
@@ -20,6 +39,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   precomputes the weekday (e.g. `day: Sun`) alongside `ts:` so agents don't
   have to infer it from a bare date, which was unreliable and could cause
   scheduled weekday tasks to be silently skipped (#53).
+
+### Changed
+- **BREAKING: `online_notification`/`offline_notification` default to quiet
+  (`null`) instead of `"✅ _Agent online_"` / `"❌ _Agent offline_"`.** No
+  config error results — watchers that never set these fields explicitly
+  simply stop announcing online/offline after upgrading. Restore the old
+  behavior globally with `watcher_defaults: {online_notification: "✅ _Agent
+  online_", offline_notification: "❌ _Agent offline_"}`. See
+  `docs/migration-0.2.md`.
 
 ### Fixed
 - **Scheduled-task messages now carry a usable `ts:`/`day:` timestamp.**

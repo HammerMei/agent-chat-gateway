@@ -131,6 +131,24 @@ def main():
         help="Instruction document to print",
     )
 
+    # config (sub-subcommands)
+    config_p = sub.add_parser("config", help="Config file utilities")
+    config_sub = config_p.add_subparsers(dest="config_cmd", help="Config subcommands")
+
+    config_validate_p = config_sub.add_parser(
+        "validate",
+        help="Validate config.yaml without starting the daemon",
+    )
+    config_validate_p.add_argument(
+        "--config", default=DEFAULT_CONFIG,
+        help="Path to config.yaml (default: $ACG_CONFIG or ~/.agent-chat-gateway/config.yaml)",
+    )
+    config_validate_p.add_argument(
+        "--lint", action="store_true",
+        help="Also flag values that just restate a built-in default or duplicate "
+             "a *_defaults entry",
+    )
+
     # schedule (sub-subcommands)
     schedule_p = sub.add_parser("schedule", help="Manage scheduled agent tasks")
     schedule_sub = schedule_p.add_subparsers(dest="schedule_cmd", help="Schedule subcommands")
@@ -327,6 +345,53 @@ def main():
 
     elif args.command == "schedule":
         _run_schedule(args)
+
+    elif args.command == "config":
+        _run_config(args)
+
+
+def _run_config(args) -> None:
+    """Handle 'config' subcommands."""
+    if not getattr(args, "config_cmd", None):
+        print("Usage: agent-chat-gateway config {validate}")
+        sys.exit(1)
+
+    if args.config_cmd == "validate":
+        _run_config_validate(args)
+    else:
+        print(f"Unknown config subcommand: {args.config_cmd}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _run_config_validate(args) -> None:
+    """Handle 'config validate': load + cross-check config.yaml, no daemon needed."""
+    from .config_validate import validate_config
+
+    result = validate_config(args.config, lint=args.lint)
+
+    if result.errors:
+        print(f"✗ {args.config}: {len(result.errors)} error(s)", file=sys.stderr)
+        for err in result.errors:
+            print(f"  - {err}", file=sys.stderr)
+    else:
+        summary = f"✓ {args.config}: valid — {result.watcher_count} watcher(s)"
+        if result.entry_count and result.entry_count != result.watcher_count:
+            summary += f" (expanded from {result.entry_count} entries)"
+        print(summary)
+
+    for warning in result.warnings:
+        print(f"  ⚠ {warning}")
+
+    if args.lint:
+        if result.lint_findings:
+            print(f"\n{len(result.lint_findings)} lint finding(s):")
+            for finding in result.lint_findings:
+                print(f"  - {finding}")
+        else:
+            print("\nlint: no redundant defaults found")
+
+    if not result.ok:
+        sys.exit(1)
 
 
 def _run_instructions(args) -> None:
