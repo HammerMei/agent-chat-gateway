@@ -39,6 +39,13 @@ class OverviewScreen(Screen):
         # tab bar itself, not the list, so surfacing this in the footer (same
         # action, just visible) is the fix for "how do I get into the list?"
         Binding("tab", "app.focus_next", "Focus next / enter list", show=True),
+        # App already binds ctrl+q -> quit (show=False, Textual's own
+        # default) — 'q' here is the documented, discoverable quit key (the
+        # design's original intent, missed at first implementation). Scoped
+        # to OverviewScreen (not detail screens) since phase 2/3 add text
+        # Input widgets on those screens, where a bare 'q' typed into a field
+        # must not quit the app.
+        Binding("q", "app.quit", "Quit", show=True),
     ]
 
     def compose(self) -> ComposeResult:
