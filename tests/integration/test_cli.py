@@ -15,6 +15,7 @@ import json
 import shutil
 import socket
 import tempfile
+import textwrap
 import threading
 import time
 import unittest
@@ -177,6 +178,182 @@ class TestCLIInstructions(_CLITestBase):
         self.assertEqual(stderr, "")
         self.assertIn("# fetch-history", stdout)
         self.assertIn("agent-chat-gateway fetch-history", stdout)
+
+
+# ---------------------------------------------------------------------------
+# Tests: config validate command
+# ---------------------------------------------------------------------------
+
+class TestCLIConfigValidate(_CLITestBase):
+    """config validate: validate config.yaml without contacting the daemon.
+
+    gateway.core.state.RUNTIME_DIR is patched to a per-test temp dir in every
+    case — otherwise the state-orphan check would read this machine's real
+    ~/.agent-chat-gateway/state.*.json files and make the test non-hermetic.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.agent_dir = Path(self.tmp) / "work"
+        self.agent_dir.mkdir()
+        self.runtime_dir = Path(self.tmp) / "runtime"
+
+    def _write(self, yaml_text: str) -> str:
+        path = Path(self.tmp) / "config.yaml"
+        path.write_text(textwrap.dedent(yaml_text))
+        return str(path)
+
+    def _run_validate(self, extra_args: list[str] | None = None, config_path: str | None = None):
+        args = ["config", "validate", "--config", config_path] + (extra_args or [])
+        with patch("gateway.core.state.RUNTIME_DIR", self.runtime_dir):
+            return self._run(args)
+
+    def test_valid_config_exits_zero(self):
+        cfg_path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                room: general
+        """)
+        stdout, stderr, code = self._run_validate(config_path=cfg_path)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("✓", stdout)
+        self.assertIn("1 watcher(s)", stdout)
+
+    def test_missing_working_directory_exits_one(self):
+        cfg_path = self._write("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agents:
+              default:
+                type: claude
+            watchers:
+              - name: w1
+                room: general
+        """)
+        stdout, stderr, code = self._run_validate(config_path=cfg_path)
+
+        self.assertEqual(code, 1)
+        self.assertIn("working_directory is required", stderr)
+
+    def test_empty_rocketchat_credentials_flagged_as_errors(self):
+        """from_connector_config silently defaults server.url/username/password
+        to "" — config_validate.py must catch what from_file alone does not."""
+        cfg_path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                room: general
+        """)
+        stdout, stderr, code = self._run_validate(config_path=cfg_path)
+
+        self.assertEqual(code, 1)
+        self.assertIn("server.url is empty", stderr)
+        self.assertIn("server.username is empty", stderr)
+        self.assertIn("server.password is empty", stderr)
+
+    def test_lint_flags_redundant_default(self):
+        cfg_path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+                timeout: 360
+            watchers:
+              - name: w1
+                room: general
+        """)
+        stdout, stderr, code = self._run_validate(["--lint"], config_path=cfg_path)
+
+        self.assertEqual(code, 0)
+        self.assertIn("agents.default.timeout", stdout)
+        self.assertIn("restates the built-in default", stdout)
+
+    def test_lint_with_no_findings_says_so(self):
+        cfg_path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                room: general
+        """)
+        stdout, stderr, code = self._run_validate(["--lint"], config_path=cfg_path)
+
+        self.assertEqual(code, 0)
+        self.assertIn("no redundant defaults found", stdout)
+
+    def test_rooms_expansion_reflected_in_summary(self):
+        cfg_path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - connector: rc
+                rooms: [general, dev]
+        """)
+        stdout, stderr, code = self._run_validate(config_path=cfg_path)
+
+        self.assertEqual(code, 0)
+        self.assertIn("2 watcher(s)", stdout)
+        self.assertIn("expanded from 1 entries", stdout)
+
+    def test_state_orphan_produces_warning(self):
+        cfg_path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                room: general
+        """)
+        self.runtime_dir.mkdir()
+        (self.runtime_dir / "state.rc.json").write_text(json.dumps({
+            "watchers": [{"watcher_name": "stale-watcher", "session_id": "x", "room_id": "y"}]
+        }))
+
+        stdout, stderr, code = self._run_validate(config_path=cfg_path)
+
+        self.assertEqual(code, 0)
+        self.assertIn("stale-watcher", stdout)
+        self.assertIn("dropped on next start", stdout)
 
 
 # ---------------------------------------------------------------------------

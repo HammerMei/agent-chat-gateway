@@ -537,17 +537,31 @@ opencode run -s <session-id> --format json [-f <file> ...]
 
 ```
 config.yaml (user-editable)
-    ├─ connectors: [RocketChatConfig, ...]
-    ├─ agents: [AgentConfig, ...]
-    ├─ timeout: 360
-    ├─ default_agent: "assistance"
-    └─ plugins: [PluginConfig, ...]
-         → GatewayConfig (validated dataclass)
-            → AgentConfig, ConnectorConfig, PermissionConfig
-                → CoreConfig (passed to SessionManager)
+    ├─ tool_presets: {name: [ToolRule, ...]}              # named, reusable tool-rule lists
+    ├─ connector_defaults / agent_defaults / watcher_defaults  # deep-merged into entries below
+    ├─ connectors: [ConnectorConfig, ...]                 # room="a" | rooms=[a,b,...] on watchers
+    ├─ agents: {name: AgentConfig, ...}
+    ├─ default_agent: "my-agent"
+    ├─ watchers: [WatcherConfig, ...]
+    ├─ max_queue_depth: 100
+    └─ scheduler: {completed_job_ttl_days: 7}
+         → GatewayConfig.from_file()
+            1. expand $VAR / ${VAR} env references
+            2. deep-merge *_defaults into each connector/agent/watcher entry
+            3. resolve tool_presets references in owner/guest_allowed_tools
+            4. expand watcher rooms: into one WatcherConfig per room
+               (auto-name: "<connector>-<room>" unless name: is explicit)
+            5. validate cross-references (unknown connector/agent, dup names, ...)
+            → GatewayConfig (validated dataclass)
+               → AgentConfig, ConnectorConfig, WatcherConfig, PermissionConfig
+                  → CoreConfig (passed to SessionManager)
 ```
 
-All fields support env-var expansion via `$VARIABLE` syntax.
+All fields support env-var expansion via `$VARIABLE` syntax. See
+`docs/migration-0.2.md` for the compact-format rationale and
+`gateway/schema/config.schema.json` for the field-level JSON Schema. Run
+`agent-chat-gateway config validate --lint` to check a config.yaml without
+starting the daemon.
 
 ### Startup Sequence
 

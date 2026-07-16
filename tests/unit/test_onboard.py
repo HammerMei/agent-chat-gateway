@@ -154,15 +154,14 @@ class TestGenerateConfigYaml:
         agent = config["agents"]["my-agent"]
         assert agent["type"] == "claude"
         assert agent["command"] == "claude"
-        assert agent["timeout"] == 360
         assert agent["permissions"]["enabled"] is True
 
+        # A single watcher entry using rooms: — the gateway expands it into
+        # one watcher per room (with an auto-derived name) at load time.
         watcher = config["watchers"][0]
-        assert watcher["name"] == "dm-alice"
-        assert watcher["room"] == "@alice"
         assert watcher["connector"] == "rc-home"
         assert watcher["agent"] == "my-agent"
-        assert watcher["session_id"] is None
+        assert watcher["rooms"] == ["@alice"]
 
     def test_generate_config_yaml_opencode_rocketchat(self):
         """Agent type is correctly set to opencode."""
@@ -182,7 +181,7 @@ class TestGenerateConfigYaml:
         assert agent["command"] == "opencode"
 
     def test_generate_config_yaml_multiple_watchers(self):
-        """Multiple watchers are all present in the output."""
+        """Multiple rooms collapse into one watcher entry's rooms: list."""
         connector_data = {
             "server_url": "https://chat.example.com",
             "bot_username": "bot",
@@ -198,11 +197,8 @@ class TestGenerateConfigYaml:
         result = generate_config_yaml("claude", "rocketchat", connector_data, watchers)
         config = self._parse(result)
 
-        assert len(config["watchers"]) == 3
-        names = [w["name"] for w in config["watchers"]]
-        assert "dm-alice" in names
-        assert "general" in names
-        assert "dev-room" in names
+        assert len(config["watchers"]) == 1
+        assert config["watchers"][0]["rooms"] == ["@alice", "general", "dev"]
 
     def test_generate_config_yaml_multiple_owners(self):
         """Multiple owners are listed in allowed_users.owners."""
@@ -235,29 +231,26 @@ class TestGenerateConfigYaml:
         parsed = yaml.safe_load(result)
         # Round-trip: dump and parse again
         reparsed = yaml.safe_load(yaml.dump(parsed))
-        assert reparsed["agents"]["my-agent"]["timeout"] == 360
+        assert reparsed["agents"]["my-agent"]["permissions"]["timeout"] == 300
 
-    def test_generate_config_yaml_session_id_is_null(self):
-        """session_id renders as null in YAML."""
-        connector_data = {"owners": ["alice"], "server_url": "https://x.com", "bot_username": "b", "bot_password": "p"}
-        watchers = [{"name": "dm-alice", "room": "@alice"}]
-        result = generate_config_yaml("claude", "rocketchat", connector_data, watchers)
-        config = self._parse(result)
-        assert config["watchers"][0]["session_id"] is None
-
-    def test_generate_config_yaml_notifications_present(self):
-        """online_notification and offline_notification are set on each watcher."""
+    def test_generate_config_yaml_omits_boilerplate_fields(self):
+        """The minimal-format output must not restate per-watcher boilerplate
+        (name/session_id/notifications) that the pre-0.2 template used to
+        write out for every watcher — those are now either auto-derived at
+        config-load time or default to quiet/None."""
         connector_data = {"owners": ["alice"], "server_url": "https://x.com", "bot_username": "b", "bot_password": "p"}
         watchers = [{"name": "dm-alice", "room": "@alice"}]
         result = generate_config_yaml("claude", "rocketchat", connector_data, watchers)
         config = self._parse(result)
         w = config["watchers"][0]
-        assert "online_notification" in w
-        assert "offline_notification" in w
+        assert "name" not in w
+        assert "session_id" not in w
+        assert "online_notification" not in w
+        assert "offline_notification" not in w
 
 
 # ---------------------------------------------------------------------------
-# generate_config_yaml — opencode working_directory
+# generate_config_yaml — working_directory
 # ---------------------------------------------------------------------------
 
 class TestGenerateConfigYamlOpencode:
@@ -280,8 +273,10 @@ class TestGenerateConfigYamlOpencode:
         config = self._parse(result)
         assert config["agents"]["my-agent"]["working_directory"] == str(tmp_path)
 
-    def test_working_directory_omitted_for_claude(self, tmp_path: Path):
-        """working_directory is NOT included when agent_type is claude."""
+    def test_working_directory_included_for_claude_when_provided(self, tmp_path: Path):
+        """working_directory is included for claude too when given — omitting it
+        made GatewayConfig.from_file reject every claude config the wizard
+        generated (working_directory is required regardless of backend)."""
         connector_data = {
             "owners": ["alice"],
             "server_url": "https://chat.example.com",
@@ -294,7 +289,7 @@ class TestGenerateConfigYamlOpencode:
             working_directory=str(tmp_path),
         )
         config = self._parse(result)
-        assert "working_directory" not in config["agents"]["my-agent"]
+        assert config["agents"]["my-agent"]["working_directory"] == str(tmp_path)
 
     def test_working_directory_omitted_when_none(self):
         """working_directory absent from agent block when not provided."""
@@ -602,6 +597,13 @@ class TestRunOnboard:
         assert "agents" in config
         assert "watchers" in config
 
+        # claude gets a default working_directory (created on disk) even though
+        # it's never prompted for one — GatewayConfig.from_file requires it
+        # for every backend, not just opencode.
+        expected_work_dir = tmp_path / "work"
+        assert config["agents"]["my-agent"]["working_directory"] == str(expected_work_dir)
+        assert expected_work_dir.is_dir()
+
         # .env has the right keys
         env_text = env_file.read_text()
         assert "RC_URL=https://chat.example.com" in env_text
@@ -611,6 +613,12 @@ class TestRunOnboard:
         # install_meta has method set
         meta = json.loads(meta_file.read_text())
         assert meta["method"] in ("git", "unknown")
+
+        # The generated config must actually load — this is the real
+        # regression check for the "claude working_directory missing" bug.
+        from gateway.config import GatewayConfig
+        loaded = GatewayConfig.from_file(str(config_file))
+        assert loaded.agents["my-agent"].working_directory == str(expected_work_dir)
 
     def test_run_onboard_abort_at_confirm(self, tmp_path: Path):
         """run_onboard exits cleanly when user declines to write files."""
