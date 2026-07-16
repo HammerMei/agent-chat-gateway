@@ -114,6 +114,23 @@ class TestOverviewRender:
             await pilot.pause()
             assert isinstance(app.focused, DataTable)
 
+    async def test_q_key_is_a_visible_quit_binding(self, tmp_path, work_dir):
+        """'q' is the documented, discoverable quit key (App's own ctrl+q
+        default stays too, but is hidden — show=False — so it doesn't count
+        as discoverable on its own)."""
+        config_path = _write_config(tmp_path, _valid_config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            bound = app.screen.active_bindings.get("q")
+            assert bound is not None
+            assert bound.binding.show is True
+            assert bound.binding.action == "app.quit"
+
+            await pilot.press("q")
+            await pilot.pause()
+            assert app.is_running is False
+
     async def test_connector_type_inherited_from_defaults_is_shown_not_a_placeholder(
         self, tmp_path, work_dir
     ):
