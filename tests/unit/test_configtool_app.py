@@ -95,6 +95,25 @@ class TestOverviewRender:
             assert app.screen.query_one("#defaults-table", DataTable).row_count == 3
             assert app.screen.query_one("#presets-table", DataTable).row_count == 1
 
+    async def test_tab_binding_is_visible_in_footer_and_moves_focus_into_table(
+        self, tmp_path, work_dir
+    ):
+        """On mount, focus starts on the tab bar, not the list — 'tab' is
+        rebound here (same app.focus_next action Screen already binds, just
+        with show=True) so the footer surfaces the one key needed to reach
+        the list at all. Regression for a real UX gap a user hit."""
+        config_path = _write_config(tmp_path, _valid_config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            bound = app.screen.active_bindings.get("tab")
+            assert bound is not None
+            assert bound.binding.show is True
+
+            await pilot.press("tab")
+            await pilot.pause()
+            assert isinstance(app.focused, DataTable)
+
     async def test_connector_type_inherited_from_defaults_is_shown_not_a_placeholder(
         self, tmp_path, work_dir
     ):
