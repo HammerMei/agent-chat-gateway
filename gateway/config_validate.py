@@ -24,6 +24,7 @@ save-time check.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 import yaml
 
@@ -64,6 +65,30 @@ _CONNECTOR_LINT_DEFAULTS: list[tuple[str, object]] = [
 ]
 
 
+@dataclass(frozen=True)
+class Finding:
+    """A single validation/lint result, attributed to an entity where the
+    check that produced it actually knows which entity is at fault.
+
+    Additive alongside ValidationResult's flat string lists (errors/
+    warnings/lint_findings), which remain the source of truth for
+    `acg config validate`'s CLI output — this exists so the config TUI can
+    attach a finding to the right row/screen without re-parsing message
+    text. Not every finding can be attributed this precisely: a
+    GatewayConfig.from_file load failure (bad structure, unknown reference,
+    etc.) covers most cross-field checks and is inherently global — it gets
+    entity_kind="global", entity_name=None. See docs/design/config-tool.md's
+    validation-attribution section for why threading entity context through
+    every from_file raise site is out of scope.
+    """
+
+    severity: Literal["error", "warning", "lint"]
+    entity_kind: Literal["connector", "agent", "watcher", "global"]
+    entity_name: str | None
+    field: str | None
+    message: str
+
+
 @dataclass
 class ValidationResult:
     config_path: str
@@ -72,6 +97,7 @@ class ValidationResult:
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     lint_findings: list[str] = field(default_factory=list)
+    findings: list[Finding] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -86,6 +112,15 @@ def validate_config(config_path: str, lint: bool = False) -> ValidationResult:
         config = GatewayConfig.from_file(config_path)
     except (ValueError, FileNotFoundError) as exc:
         result.errors.append(str(exc))
+        result.findings.append(
+            Finding(
+                severity="error",
+                entity_kind="global",
+                entity_name=None,
+                field=None,
+                message=str(exc),
+            )
+        )
         return result
 
     result.watcher_count = len(config.watchers)
@@ -118,21 +153,32 @@ def _check_connectors(config: GatewayConfig, result: ValidationResult) -> None:
         try:
             cfg = validator(connector)
         except ValueError as exc:
-            result.errors.append(f"Connector '{connector.name}' ({connector.type}): {exc}")
+            msg = f"Connector '{connector.name}' ({connector.type}): {exc}"
+            result.errors.append(msg)
+            result.findings.append(
+                Finding("error", "connector", connector.name, None, msg)
+            )
             continue
+
+        def _empty_field(field_path: str) -> None:
+            msg = f"Connector '{connector.name}': {field_path} is empty"
+            result.errors.append(msg)
+            result.findings.append(
+                Finding("error", "connector", connector.name, field_path, msg)
+            )
 
         if connector.type == "rocketchat":
             if not cfg.server_url:
-                result.errors.append(f"Connector '{connector.name}': server.url is empty")
+                _empty_field("server.url")
             if not cfg.username:
-                result.errors.append(f"Connector '{connector.name}': server.username is empty")
+                _empty_field("server.username")
             if not cfg.password:
-                result.errors.append(f"Connector '{connector.name}': server.password is empty")
+                _empty_field("server.password")
         elif connector.type == "mattermost":
             if not cfg.server_url:
-                result.errors.append(f"Connector '{connector.name}': server.url is empty")
+                _empty_field("server.url")
             if not cfg.team:
-                result.errors.append(f"Connector '{connector.name}': server.team is empty")
+                _empty_field("server.team")
 
 
 def _check_state_orphans(config: GatewayConfig, result: ValidationResult) -> None:
@@ -150,12 +196,16 @@ def _check_state_orphans(config: GatewayConfig, result: ValidationResult) -> Non
         configured = configured_by_connector.get(connector.name, set())
         for st in states:
             if st.watcher_name not in configured:
-                result.warnings.append(
+                msg = (
                     f"Connector '{connector.name}': state.json has watcher "
                     f"'{st.watcher_name}' with no matching entry in this config — "
                     "its session/pause state will be dropped on next start. "
                     "Restore the old watcher name (e.g. an explicit 'name:') "
                     "if you want to keep it."
+                )
+                result.warnings.append(msg)
+                result.findings.append(
+                    Finding("warning", "connector", connector.name, None, msg)
                 )
 
 
@@ -169,7 +219,7 @@ def _lint_config(raw: dict, result: ValidationResult) -> None:
     for agent_name, agent_raw in (raw.get("agents") or {}).items():
         if isinstance(agent_raw, dict):
             _lint_entry(
-                f"agents.{agent_name}", agent_raw, "agent_defaults", agent_defaults,
+                "agent", agent_name, agent_raw, "agent_defaults", agent_defaults,
                 _AGENT_LINT_DEFAULTS, result,
             )
 
@@ -177,7 +227,7 @@ def _lint_config(raw: dict, result: ValidationResult) -> None:
         if isinstance(wc, dict):
             label = wc.get("name") or f"watchers[{i}]"
             _lint_entry(
-                f"watchers.{label}", wc, "watcher_defaults", watcher_defaults,
+                "watcher", label, wc, "watcher_defaults", watcher_defaults,
                 _WATCHER_LINT_DEFAULTS, result,
             )
 
@@ -186,41 +236,55 @@ def _lint_config(raw: dict, result: ValidationResult) -> None:
             continue
         name = cc.get("name") or "?"
         _lint_entry(
-            f"connectors.{name}", cc, "connector_defaults", connector_defaults,
+            "connector", name, cc, "connector_defaults", connector_defaults,
             _CONNECTOR_LINT_DEFAULTS, result,
         )
         attach = cc.get("attachments")
         if isinstance(attach, dict):
             if attach.get("max_file_size_mb") == 10:
-                result.lint_findings.append(
+                msg = (
                     f"connectors.{name}.attachments.max_file_size_mb: restates the "
                     "built-in default (10) — can be omitted."
                 )
+                result.lint_findings.append(msg)
+                result.findings.append(
+                    Finding("lint", "connector", name, "attachments.max_file_size_mb", msg)
+                )
             if attach.get("download_timeout") == 30:
-                result.lint_findings.append(
+                msg = (
                     f"connectors.{name}.attachments.download_timeout: restates the "
                     "built-in default (30) — can be omitted."
+                )
+                result.lint_findings.append(msg)
+                result.findings.append(
+                    Finding("lint", "connector", name, "attachments.download_timeout", msg)
                 )
 
 
 def _lint_entry(
-    label: str,
+    entity_kind: Literal["connector", "agent", "watcher"],
+    entity_name: str,
     entry: dict,
     defaults_block_name: str,
     defaults_block: dict,
     default_table: list[tuple[str, object]],
     result: ValidationResult,
 ) -> None:
+    label = f"{entity_kind}s.{entity_name}"
     for key, default_value in default_table:
         if key not in entry:
             continue
         if entry[key] == default_value:
-            result.lint_findings.append(
+            msg = (
                 f"{label}.{key}: restates the built-in default ({default_value!r}) — "
                 "can be omitted."
             )
+            result.lint_findings.append(msg)
+            result.findings.append(Finding("lint", entity_kind, entity_name, key, msg))
         elif key in defaults_block and entry[key] == defaults_block[key]:
-            result.lint_findings.append(
+            msg = (
                 f"{label}.{key}: matches the inherited {defaults_block_name}.{key} "
                 f"value ({entry[key]!r}) — can be omitted from this entry."
             )
+            result.lint_findings.append(msg)
+            result.findings.append(Finding("lint", entity_kind, entity_name, key, msg))

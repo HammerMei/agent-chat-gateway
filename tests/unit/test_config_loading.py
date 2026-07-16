@@ -1612,5 +1612,91 @@ class TestQuietNotificationDefaults(unittest.TestCase):
         self.assertEqual(config.watchers[0].offline_notification, "bye")
 
 
+# ── Tests: description: field (informational only, ignored at runtime) ──────
+
+
+class TestDescriptionField(unittest.TestCase):
+    """'description:' is a purely informational annotation (read by the
+    config TUI) — the loader must accept it everywhere without letting it
+    affect behavior: it must not appear in a connector's raw dict, and a
+    *_defaults block's own description must never propagate into entries."""
+
+    def _write_config(self, body: str) -> str:
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(textwrap.dedent(body))
+            return f.name
+
+    def test_connector_description_is_not_in_raw(self):
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                description: "Primary bot account"
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watchers:
+              - name: w1
+                room: general
+        """)
+        config = GatewayConfig.from_file(path)
+        self.assertNotIn("description", config.connectors[0].raw)
+
+    def test_connector_defaults_description_does_not_propagate(self):
+        path = self._write_config("""\
+            connector_defaults:
+              description: "Shared settings for all bots"
+              type: rocketchat
+              server: {url: http://localhost:3000, username: bot, password: pw}
+            connectors:
+              - name: rc1
+              - name: rc2
+                description: "This one's special"
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watchers:
+              - name: w1
+                room: general
+        """)
+        config = GatewayConfig.from_file(path)
+        # Neither connector's raw should carry a 'description' key — rc1 never
+        # had one of its own, and rc2's own value must not have been merged
+        # with (or overwritten by) the defaults block's description.
+        self.assertNotIn("description", config.connectors[0].raw)
+        self.assertNotIn("description", config.connectors[1].raw)
+
+    def test_agent_and_watcher_description_do_not_break_loading(self):
+        """agents/watchers already ignore unknown keys via .get() — this just
+        pins that 'description' specifically doesn't need special handling
+        there and doesn't leak into any typed field."""
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agent_defaults:
+              description: "Shared claude settings"
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+                description: "The main agent"
+            watcher_defaults:
+              description: "Shared watcher settings"
+            watchers:
+              - name: w1
+                room: general
+                description: "General channel watcher"
+        """)
+        config = GatewayConfig.from_file(path)
+        self.assertEqual(config.agents["default"].working_directory, "/tmp")
+        self.assertEqual(len(config.watchers), 1)
+        self.assertEqual(config.watchers[0].name, "w1")
+
+
 if __name__ == "__main__":
     unittest.main()

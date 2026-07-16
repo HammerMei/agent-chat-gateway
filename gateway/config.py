@@ -152,11 +152,15 @@ class GatewayConfig:
                 # Write the resolved value back into the raw config
                 cc["attachments"] = attach_raw
 
-            # Store everything except name/type/context_inject_files as the raw connector config
+            # Store everything except name/type/context_inject_files/description
+            # as the raw connector config. 'description' is an optional,
+            # informational-only annotation (shown by the config TUI) — it
+            # must never leak into connector `raw` (which is passed verbatim
+            # to each connector type's from_connector_config()).
             connector_raw = {
                 k: v
                 for k, v in cc.items()
-                if k not in ("name", "type", "context_inject_files")
+                if k not in ("name", "type", "context_inject_files", "description")
             }
             connectors.append(
                 ConnectorConfig(
@@ -478,6 +482,11 @@ def _extract_defaults_block(
     block is not a mapping, or if it sets a key that identifies an
     individual entry (e.g. ``name``) rather than something safe to inherit
     across every entry.
+
+    An optional ``description`` on the defaults block itself (annotating the
+    shared block, shown by the config TUI) is stripped from the returned
+    dict — it must never deep-merge into every entry, or every entry would
+    end up displaying the defaults block's description as its own.
     """
     block = raw.get(key, {}) or {}
     if not isinstance(block, Mapping):
@@ -490,7 +499,9 @@ def _extract_defaults_block(
             f"config.yaml '{key}:' must not set {bad} — these fields identify "
             "an individual entry and must be set per-entry, not inherited."
         )
-    return dict(block)
+    result = dict(block)
+    result.pop("description", None)
+    return result
 
 
 def _deep_copy(value):
