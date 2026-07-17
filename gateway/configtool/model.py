@@ -18,12 +18,17 @@ are still visible:
 Critically, ``EditableConfig`` loads via plain ``yaml.safe_load`` — never via
 ``GatewayConfig.from_file``, which expands ``$VAR``/``${VAR}`` environment
 references (gateway/config.py's ``_expand_env_vars``). If the editor ever
-loaded (or, in a later phase, saved) through that path, a save would write
-resolved secrets — passwords, tokens — into config.yaml in plain text.
+loaded (or saved) through that path, a save would write resolved secrets —
+passwords, tokens — into config.yaml in plain text. ``save()`` writes
+``document`` back out with plain ``yaml.dump`` for the same reason: whatever
+``$VAR`` string was loaded is the same ``$VAR`` string written back.
 """
 
 from __future__ import annotations
 
+import os
+import shutil
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -31,7 +36,7 @@ from pathlib import Path
 import yaml
 
 from ..config import GatewayConfig, WatcherConfig, _deep_merge, _extract_defaults_block
-from ..config_validate import Finding
+from ..config_validate import Finding, validate_config
 
 # Mirrors the forbidden-key sets GatewayConfig.from_file enforces for each
 # *_defaults block (gateway/config.py's calls to _extract_defaults_block) —
@@ -78,18 +83,21 @@ class EditableConfig:
     # every single call — repaint_from_memory() alone calls it once per
     # connector/agent/watcher row PLUS once per defaults-table row, all for
     # the same 3 blocks. Cached here, keyed by kind, invalidated by
-    # load()/reload() (the only two places `document` changes). Not part of
-    # equality/repr — it's a memoization detail, not observable state.
-    # NOTE for whoever adds in-place mutation (Phase 2's save() work, item 7):
-    # this cache is only invalidated by load()/reload() today because nothing
-    # currently mutates `document` any other way. Any future code path that
-    # edits `document` directly (e.g. a form committing a field change) MUST
-    # also clear `_defaults_cache` — Phase 1 also holds this same invariant
-    # implicitly today (its accessors were simply always fresh); this comment
-    # keeps it explicit now that there's a cache to forget.
+    # load()/reload()/mark_dirty() (the only ways `document` changes). Not
+    # part of equality/repr — it's a memoization detail, not observable state.
     _defaults_cache: dict[str, dict] = field(
         default_factory=dict, init=False, repr=False, compare=False
     )
+    # Code review item 7: whether `document` has unsaved changes since the
+    # last load()/reload()/save(). There is deliberately no per-field mutation
+    # API here (e.g. `set_entry_field()`) — Phase 2's edit screens mutate
+    # `document` (and the raw dicts reachable from it) directly, in whatever
+    # shape each form needs, and then call `mark_dirty()`. That is the ONE
+    # sanctioned seam: it is where cache invalidation and dirty-tracking both
+    # live, so every future mutation path — a single field, a whole entry
+    # replace, a list append/remove — stays correct by calling it, without
+    # this class needing to anticipate each mutation shape up front.
+    dirty: bool = field(default=False, init=False, compare=False)
 
     @classmethod
     def load(cls, path: str | Path) -> "EditableConfig":
@@ -117,6 +125,65 @@ class EditableConfig:
         fresh = EditableConfig.load(self.path)
         self.document = fresh.document
         self._defaults_cache.clear()
+        self.dirty = False
+
+    def mark_dirty(self) -> None:
+        """Call this after mutating `document` (or any raw dict reachable
+        from it) directly. See the `dirty`/`_defaults_cache` field comments
+        above — this is the one required step after any in-place edit."""
+        self._defaults_cache.clear()
+        self.dirty = True
+
+    def save(self) -> None:
+        """Validate-before-write via a same-directory temp file
+        (docs/design/config-tool.md decision 5):
+
+        1. Serialize `document` to `<path>.tmp`, BESIDE the real file (never
+           /tmp — `working_directory`/`context_inject_files` in the config
+           resolve relative to the real file's directory, and a temp file
+           elsewhere would validate paths that don't mean the same thing
+           once moved).
+        2. Run the real `validate_config()` against that temp file. If it
+           doesn't validate, delete the temp file and raise ValueError with
+           the errors — the real config on disk is never touched.
+        3. Only on success: copy the real file to a timestamped backup
+           (`config.yaml.bak.<unix-ts>`, matching gateway/onboard.py's
+           existing convention) and atomically replace it with the temp
+           file (`os.replace` — atomic on POSIX, so a reader/the daemon
+           never observes a partially-written config.yaml).
+
+        Raises FileNotFoundError if `path` doesn't exist yet (nothing to
+        back up) — Phase 2/3 forms only ever call save() on an already-loaded
+        EditableConfig, so this should not happen in practice; surfaced
+        rather than silently skipping the backup step.
+        """
+        if not self.path.exists():
+            raise FileNotFoundError(
+                f"Cannot save: {self.path} no longer exists (nothing to back up)."
+            )
+
+        tmp_path = self.path.with_name(self.path.name + ".tmp")
+        try:
+            with open(tmp_path, "w") as f:
+                yaml.dump(self.document, f, sort_keys=False, allow_unicode=True)
+
+            result = validate_config(str(tmp_path))
+            if not result.ok:
+                raise ValueError(
+                    "Refusing to save — the result would no longer be a "
+                    "valid config:\n" + "\n".join(result.errors)
+                )
+
+            backup_path = self.path.with_name(f"{self.path.name}.bak.{int(time.time())}")
+            shutil.copy2(self.path, backup_path)
+            os.replace(tmp_path, self.path)
+        finally:
+            # Only ever removes OUR OWN temp file, not the real config: if
+            # os.replace() above succeeded, tmp_path no longer exists at this
+            # path (it WAS renamed to self.path) and unlink is a no-op.
+            tmp_path.unlink(missing_ok=True)
+
+        self.dirty = False
 
     # ── Raw entry accessors (pre-merge, as-authored) ─────────────────────────
 

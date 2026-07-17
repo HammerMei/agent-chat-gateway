@@ -26,6 +26,7 @@ import pytest
 from textual.widgets import DataTable, Static
 
 from gateway.configtool.app import ConfigToolApp
+from gateway.configtool.modals import ConfirmModal
 from gateway.configtool.screens.agent_detail import AgentDetailScreen
 from gateway.configtool.screens.connector_detail import ConnectorDetailScreen
 from gateway.configtool.screens.defaults import DefaultsScreen
@@ -474,6 +475,94 @@ class TestEditorEscapeHatch:
             app.reload_config()
             await pilot.pause()
             assert app.screen.query_one("#watchers-table", DataTable).row_count == 4
+
+
+class TestDirtyQuitGating:
+    """ConfigToolApp.action_quit() (Phase 2 foundation: no edit screen exists
+    yet to ever set `dirty` for real, but the gating mechanism itself is
+    built now, alongside save()/dirty tracking, per docs/design/config-tool.md
+    decision 5's ConfirmModal — exercised here via `mark_dirty()` directly,
+    the same seam a real edit screen will use."""
+
+    async def test_quit_with_no_unsaved_changes_exits_immediately_no_modal(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _valid_config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.editable_config.dirty is False
+
+            await pilot.press("q")
+            await pilot.pause()
+            assert app.is_running is False
+
+    async def test_quit_with_unsaved_changes_shows_confirm_modal(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _valid_config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.editable_config.mark_dirty()
+
+            await pilot.press("q")
+            await pilot.pause()
+            assert app.is_running is True  # not exited yet — modal is up
+            assert isinstance(app.screen, ConfirmModal)
+
+    async def test_confirming_the_modal_discards_and_quits(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _valid_config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.editable_config.mark_dirty()
+
+            await pilot.press("q")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmModal)
+
+            # Cancel holds focus by default (safe-by-default) — tab to the
+            # Confirm button, then Enter presses whichever button is
+            # focused (Button's own key handling, not a screen binding).
+            await pilot.press("tab", "enter")
+            await pilot.pause()
+            assert app.is_running is False
+
+    async def test_cancelling_the_modal_via_its_default_focused_button(
+        self, tmp_path, work_dir
+    ):
+        """Enter with no other input presses the default-focused Cancel
+        button — the safe outcome when a user just reflexively hits Enter."""
+        config_path = _write_config(tmp_path, _valid_config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.editable_config.mark_dirty()
+
+            await pilot.press("q")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmModal)
+
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.is_running is True
+            assert isinstance(app.screen, OverviewScreen)
+
+    async def test_cancelling_the_modal_keeps_the_app_running(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _valid_config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.editable_config.mark_dirty()
+
+            await pilot.press("q")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmModal)
+
+            await pilot.press("escape")  # ConfirmModal's "cancel" binding
+            await pilot.pause()
+            assert app.is_running is True
+            assert isinstance(app.screen, OverviewScreen)
+            assert app.editable_config.dirty is True  # unsaved change untouched
 
 
 if __name__ == "__main__":
