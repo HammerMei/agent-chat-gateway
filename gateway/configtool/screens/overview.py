@@ -2,14 +2,16 @@
 
 Five tabs: Connectors, Agents, Watchers, Defaults, Tool Presets — the latter
 two are first-class per docs/design/config-tool.md (shared resources, not
-footnotes). Phase 1 is read-only: selecting a row pushes a *DetailScreen in
-view mode; there is no add/edit/delete yet.
+footnotes). Selecting a row pushes a *DetailScreen in view mode. 'n'
+(new_entity) creates an entry on the active tab — so far only Agents
+supports it; other tabs still notify rather than doing nothing or crashing.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
@@ -17,12 +19,15 @@ from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Static, TabbedContent, TabPane
 
 from ..formatting import status_badge
+from ..modals import TypePickerModal
 from ..model import StatusIndex
 from .agent_detail import AgentDetailScreen
 from .connector_detail import ConnectorDetailScreen
 from .defaults import DefaultsScreen
 from .tool_presets import ToolPresetsScreen
 from .watcher_detail import WatcherDetailScreen
+
+_AGENT_TYPES = ("claude", "opencode")
 
 if TYPE_CHECKING:
     from ..app import ConfigToolApp
@@ -46,6 +51,7 @@ class OverviewScreen(Screen):
         # Input widgets on those screens, where a bare 'q' typed into a field
         # must not quit the app.
         Binding("q", "app.quit", "Quit", show=True),
+        Binding("n", "new_entity", "New", show=True),
     ]
 
     def compose(self) -> ComposeResult:
@@ -78,6 +84,32 @@ class OverviewScreen(Screen):
     def action_edit_config(self) -> None:
         app: "ConfigToolApp" = self.app  # type: ignore[assignment]
         app.open_editor_and_reload()
+
+    @work
+    async def action_new_entity(self) -> None:
+        """'n' — scoped to whichever tab is active. Only Agents supports
+        creation so far (docs/design/config-tool.md's Phase 2 order does
+        connector/agent CRUD together; agent landed first — see the design
+        doc's Phase 2 status). Other tabs just notify, rather than doing
+        nothing silently or crashing."""
+        app: "ConfigToolApp" = self.app  # type: ignore[assignment]
+        if app.editable_config is None:
+            self.notify("Config does not currently load — nothing to add to.", severity="error")
+            return
+
+        active_tab = self.query_one(TabbedContent).active
+        if active_tab != "tab-agents":
+            self.notify("Creating a new entry isn't supported on this tab yet.", severity="warning")
+            return
+
+        agent_type = await self.app.push_screen_wait(
+            TypePickerModal("New agent — pick a type", list(_AGENT_TYPES))
+        )
+        if agent_type is None:
+            return
+        self.app.push_screen(
+            AgentDetailScreen(app.editable_config, "", {"type": agent_type}, mode="create")
+        )
 
     def action_refresh(self) -> None:
         # Must go through app.reload_config() (re-reads EditableConfig.document
