@@ -80,16 +80,17 @@ class TestNewAgentEntryPoint:
             await pilot.pause()
             assert isinstance(app.screen, TypePickerModal)
 
-    async def test_n_key_on_connectors_tab_notifies_instead_of_crashing(
+    async def test_n_key_on_watchers_tab_notifies_instead_of_crashing(
         self, tmp_path, work_dir
     ):
-        """Connector creation isn't built yet (separate task) — pressing 'n'
-        on that tab must be a friendly no-op, not a crash or silent no-op."""
+        """Watcher creation is Phase 3, not built yet — pressing 'n' on that
+        tab must be a friendly no-op, not a crash or silent no-op. (Connector
+        creation, tested elsewhere, now IS supported on tab-connectors.)"""
         config_path = _write_config(tmp_path, _config_with_one_agent(work_dir))
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            app.screen.query_one("TabbedContent").active = "tab-connectors"
+            app.screen.query_one("TabbedContent").active = "tab-watchers"
             await pilot.pause()
 
             await pilot.press("n")
