@@ -37,6 +37,7 @@ A subclass provides:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Literal
 
@@ -58,11 +59,47 @@ class FieldSpec:
     kind: Literal["str", "int", "bool", "list", "enum"]
     label: str
     options: tuple[str, ...] | None = None
-    secret: bool = False  # mask the widget's display (Input(password=True))
+    # Masks the widget's display (Input(password=True)) AND renders a
+    # "Store in .env" Checkbox next to it (docs/design/config-tool.md
+    # decision 6) — default ON. See looks_like_env_var_reference()/
+    # env_var_name_for() below and ConnectorDetailScreen.action_save() for
+    # how the toggle actually gets acted on.
+    secret: bool = False
+
+
+_ENV_VAR_REF_RE = re.compile(r"^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$")
+
+
+def looks_like_env_var_reference(value: str) -> bool:
+    """True if `value` is ENTIRELY a `$VAR` or `${VAR}` reference (matching
+    both forms `gateway/config.py`'s `_expand_env_vars` resolves, via
+    `os.path.expandvars`). Used to avoid double-writing `.env` when a secret
+    field's new value is already a placeholder the user typed directly
+    (referencing an externally-managed var) rather than a genuine new
+    plaintext secret."""
+    return bool(_ENV_VAR_REF_RE.match(value))
+
+
+def env_var_name_for(entity_name: str, field_key: str) -> str:
+    """Deterministic `.env` var name for a secret field: `"<ENTITY>_<FIELD>"`,
+    uppercased, any non-alphanumeric character replaced with `_`. E.g.
+    connector `"rc-home"` + field `"server.password"` -> `"RC_HOME_PASSWORD"`.
+    Accepted, documented risk (not handled): this could collide with an
+    unrelated existing `.env` key sharing the same generated name — rare in
+    practice, not worth a collision-detection UI for v1.
+    """
+    suffix = field_key.rsplit(".", 1)[-1]
+    sanitized_entity = re.sub(r"[^A-Za-z0-9]", "_", entity_name).upper()
+    sanitized_field = re.sub(r"[^A-Za-z0-9]", "_", suffix).upper()
+    return f"{sanitized_entity}_{sanitized_field}"
 
 
 def widget_id(key: str) -> str:
     return "field-" + key.replace(".", "-")
+
+
+def env_toggle_widget_id(key: str) -> str:
+    return widget_id(key) + "-env-toggle"
 
 
 def get_nested(d: dict, dotted_key: str) -> object:
@@ -394,6 +431,13 @@ class FormScreen(DetailScreen):
             # future field key containing a literal dash.
             widget.field_key = spec.key
             yield widget
+            if spec.secret:
+                # Default ON (docs/design/config-tool.md decision 6) — acted
+                # on only if this field's value actually changes on Save;
+                # see ConnectorDetailScreen.action_save().
+                yield Checkbox(
+                    "Store in .env", value=True, id=env_toggle_widget_id(spec.key)
+                )
             yield Static(prov_text, classes="field-provenance")
 
     # ── dirty tracking (per-screen, not EditableConfig.dirty — nothing is
