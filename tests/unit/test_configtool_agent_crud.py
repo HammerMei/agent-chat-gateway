@@ -19,7 +19,7 @@ from textual.widgets import Checkbox, DataTable, Footer, Input, Select, Static
 from textual.widgets._footer import FooterKey
 
 from gateway.configtool.app import ConfigToolApp
-from gateway.configtool.modals import ConfirmModal, TypePickerModal
+from gateway.configtool.modals import ConfirmModal, MessageModal, TypePickerModal
 from gateway.configtool.screens.agent_detail import AgentDetailScreen
 from gateway.configtool.screens.overview import OverviewScreen
 
@@ -80,16 +80,17 @@ class TestNewAgentEntryPoint:
             await pilot.pause()
             assert isinstance(app.screen, TypePickerModal)
 
-    async def test_n_key_on_connectors_tab_notifies_instead_of_crashing(
+    async def test_n_key_on_watchers_tab_notifies_instead_of_crashing(
         self, tmp_path, work_dir
     ):
-        """Connector creation isn't built yet (separate task) — pressing 'n'
-        on that tab must be a friendly no-op, not a crash or silent no-op."""
+        """Watcher creation is Phase 3, not built yet — pressing 'n' on that
+        tab must be a friendly no-op, not a crash or silent no-op. (Connector
+        creation, tested elsewhere, now IS supported on tab-connectors.)"""
         config_path = _write_config(tmp_path, _config_with_one_agent(work_dir))
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            app.screen.query_one("TabbedContent").active = "tab-connectors"
+            app.screen.query_one("TabbedContent").active = "tab-watchers"
             await pilot.pause()
 
             await pilot.press("n")
@@ -163,6 +164,10 @@ class TestCreateAgent:
             await pilot.press("ctrl+s")
             await pilot.pause()
 
+            assert isinstance(app.screen, MessageModal)
+            await pilot.press("enter")  # dismiss
+            await pilot.pause()
+
             assert isinstance(app.screen, AgentDetailScreen)
             assert app.screen.mode == "create"
             # The original agent must be untouched.
@@ -184,6 +189,9 @@ class TestCreateAgent:
             await pilot.pause()
 
             await pilot.press("ctrl+s")
+            await pilot.pause()
+            assert isinstance(app.screen, MessageModal)
+            await pilot.press("enter")  # dismiss
             await pilot.pause()
             assert isinstance(app.screen, AgentDetailScreen)
             assert app.screen.mode == "create"
@@ -212,6 +220,10 @@ class TestCreateAgent:
             )
             await pilot.pause()
             await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            assert isinstance(app.screen, MessageModal)
+            await pilot.press("enter")  # dismiss
             await pilot.pause()
 
             assert isinstance(app.screen, AgentDetailScreen)
@@ -368,11 +380,76 @@ class TestEditAgent:
             await pilot.press("ctrl+s")
             await pilot.pause()
 
+            assert isinstance(app.screen, MessageModal)
+            await pilot.press("enter")  # dismiss
+            await pilot.pause()
+
             assert isinstance(app.screen, AgentDetailScreen)
             assert app.screen.mode == "edit"
             assert app.editable_config.dirty is False
             entry = app.editable_config.agents_raw["existing-agent"]
             assert "timeout" not in entry
+
+    async def test_a_save_that_fails_validate_config_does_not_mutate_the_live_entry(
+        self, tmp_path, work_dir
+    ):
+        """User-reported: setting timeout to a value that parses fine as an
+        integer but fails validate_config() (timeout <= permissions.timeout,
+        with permissions enabled), having Save fail, then pressing Back
+        still showed the invalid value — i.e. the failed save had already
+        mutated the SAME dict object already living in cfg.document, since
+        edit mode used to pass self.entry itself (not a copy) as the
+        in-progress target_entry. Fixed by always applying updates to a
+        COPY and only swapping it into `document` (installed BEFORE save(),
+        rolled back on failure) — this pins the original entry stays
+        completely untouched, in memory AND on disk, after a rejected save."""
+        config_path = _write_config(
+            tmp_path,
+            _config_with_one_agent(
+                work_dir, "timeout: 500\npermissions: {enabled: true, timeout: 300}\n"
+            ),
+        )
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_in_edit_mode(pilot, app)
+
+            app.screen.query_one("#field-timeout", Input).value = "-1"
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            assert isinstance(app.screen, MessageModal)
+            body = str(app.screen.query_one("#message-body").render())
+            assert "timeout" in body
+            await pilot.press("enter")  # dismiss
+            await pilot.pause()
+
+            assert isinstance(app.screen, AgentDetailScreen)
+            assert app.screen.mode == "edit"
+
+            # The ORIGINAL entry must be completely untouched — not just
+            # "no timeout key", but the exact original value preserved.
+            entry = app.editable_config.agents_raw["existing-agent"]
+            assert entry["timeout"] == 500
+
+            # Escape (discarding this still-open edit) and confirm the
+            # view-mode screen (and the file on disk) show the ORIGINAL
+            # value too, not the rejected -1.
+            await pilot.press("escape")
+            await pilot.pause()
+            if isinstance(app.screen, ConfirmModal):
+                await pilot.press("tab", "enter")  # Discard
+                await pilot.pause()
+
+            assert isinstance(app.screen, AgentDetailScreen)
+            assert app.screen.mode == "view"
+            body = app.screen._body_text()
+            assert "timeout: 500" in body
+            assert "-1" not in body
+
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert raw["agents"]["existing-agent"]["timeout"] == 500
 
     async def test_working_directory_warning_appears_for_a_missing_directory(
         self, tmp_path, work_dir
@@ -608,3 +685,301 @@ class TestFooterHintsMatchAvailableActions:
             assert "ctrl+s" in keys
             assert "e" not in keys
             assert "tab" in keys
+
+
+class TestFirstFieldFocus:
+    """Regression: the form's VerticalScroll container was itself the first
+    stop in the Tab cycle (it's focusable by default, for keyboard
+    scrolling) — user-reported needing to press Tab TWICE after entering
+    edit mode to reach the first real field. Fixed with can_focus=False on
+    the container; scrolling still works via mouse wheel/PageUp/PageDown."""
+
+    async def test_create_mode_auto_focuses_the_name_field_with_zero_tabs(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _config_with_one_agent(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.screen.query_one("TabbedContent").active = "tab-agents"
+            await pilot.pause()
+            await pilot.press("n")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert app.screen.focused is not None
+            assert app.screen.focused.id == "field-name"
+
+    async def test_edit_mode_reaches_the_first_field_with_a_single_tab(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _config_with_one_agent(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_in_edit_mode(pilot, app)
+
+            await pilot.press("tab")
+            await pilot.pause()
+            assert app.screen.focused is not None
+            assert app.screen.focused.id == "field-description"
+
+
+def _config_with_two_agents(work_dir: Path) -> str:
+    """'existing-agent' is referenced by the watcher; 'unused-agent' is not
+    — used to test both the delete-succeeds and delete-blocked paths."""
+    return f"""\
+        agents:
+          existing-agent:
+            working_directory: {work_dir}
+          unused-agent:
+            working_directory: {work_dir}
+        connectors:
+          - name: rc
+            type: rocketchat
+            server: {{url: "http://localhost:3000", username: bot, password: pw}}
+        watchers:
+          - connector: rc
+            agent: existing-agent
+            room: general
+    """
+
+
+async def _open_agent_in_view_mode(pilot, app, row: int = 0) -> None:
+    table = app.screen.query_one("#agents-table", DataTable)
+    table.focus()
+    table.move_cursor(row=row)
+    await pilot.press("enter")
+    await pilot.pause()
+
+
+class TestDeleteAgent:
+    async def test_d_key_on_an_unreferenced_agent_shows_confirm_modal(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _config_with_two_agents(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_in_view_mode(pilot, app, row=1)  # unused-agent
+
+            await pilot.press("d")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmModal)
+
+    async def test_cancelling_the_delete_keeps_the_agent(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _config_with_two_agents(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_in_view_mode(pilot, app, row=1)  # unused-agent
+
+            await pilot.press("d")
+            await pilot.pause()
+            await pilot.press("enter")  # Cancel is focused by default
+            await pilot.pause()
+            assert isinstance(app.screen, AgentDetailScreen)
+            assert app.screen.mode == "view"
+            assert "unused-agent" in app.editable_config.agents_raw
+
+    async def test_confirming_delete_of_an_unreferenced_agent_succeeds(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _config_with_two_agents(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            # row 1 is "unused-agent" (dict order: existing-agent, unused-agent)
+            await _open_agent_in_view_mode(pilot, app, row=1)
+            assert app.screen.agent_name == "unused-agent"
+
+            await pilot.press("d")
+            await pilot.pause()
+            await pilot.press("tab", "enter")  # Delete
+            await pilot.pause()
+
+            assert isinstance(app.screen, OverviewScreen)
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert "unused-agent" not in raw["agents"]
+            assert "existing-agent" in raw["agents"]
+            assert list(Path(config_path).parent.glob("config.yaml.bak.*"))
+
+    async def test_deleting_a_referenced_agent_is_blocked_before_the_confirm(
+        self, tmp_path, work_dir
+    ):
+        """A watcher still references 'existing-agent' — the pre-delete
+        check catches this BEFORE even offering the destructive confirm,
+        naming the referencing watcher in a MessageModal rather than
+        relying on save()'s generic validator error."""
+        config_path = _write_config(tmp_path, _config_with_two_agents(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_in_view_mode(pilot, app, row=0)
+            assert app.screen.agent_name == "existing-agent"
+
+            await pilot.press("d")
+            await pilot.pause()
+
+            assert isinstance(app.screen, MessageModal)
+            body = str(app.screen.query_one("#message-body").render())
+            assert "existing-agent" in body
+            await pilot.press("enter")  # dismiss
+            await pilot.pause()
+
+            # Stays on the (still-view-mode) detail screen — nothing was
+            # ever removed from `document` in the first place.
+            assert isinstance(app.screen, AgentDetailScreen)
+            assert app.screen.mode == "view"
+            assert "existing-agent" in app.editable_config.agents_raw
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert "existing-agent" in raw["agents"]  # untouched on disk too
+
+    async def test_delete_is_hidden_from_the_footer_while_editing(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _config_with_two_agents(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_in_edit_mode(pilot, app)
+
+            from textual.widgets import Footer
+            from textual.widgets._footer import FooterKey
+
+            keys = {k.key for k in app.screen.query_one(Footer).query(FooterKey)}
+            assert "d" not in keys
+
+
+class TestResetFieldToInherited:
+    """ctrl+r (action_reset_field()) — user-reported gap: str/int/list
+    fields can revert to inherited by clearing the box to blank, but a
+    Checkbox/Select has no "blank" state, so a bool/enum field stayed
+    explicit forever once touched, even set back to a value matching the
+    default. This is the fix: reset the FOCUSED field regardless of kind."""
+
+    async def test_resetting_an_explicit_boolean_reverts_it_to_inherited_on_save(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(
+            tmp_path,
+            _config_with_one_agent(work_dir, "lazy_instruction_loading: false\n"),
+        )
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_in_edit_mode(pilot, app)
+
+            checkbox = app.screen.query_one("#field-lazy_instruction_loading", Checkbox)
+            assert checkbox.value is False  # explicit, matches the entry above
+            checkbox.focus()
+            await pilot.pause()
+
+            await pilot.press("ctrl+r")
+            await pilot.pause()
+            # Reset shows the pure-default value (AgentConfig's own default,
+            # True — agent_defaults in this fixture doesn't set it either).
+            assert checkbox.value is True
+
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            entry = app.editable_config.agents_raw["existing-agent"]
+            assert "lazy_instruction_loading" not in entry  # reverted to inherited
+
+    async def test_resetting_a_string_field_also_reverts_it_to_inherited(
+        self, tmp_path, work_dir
+    ):
+        """Confirms ctrl+r works uniformly across field kinds, not just
+        booleans — even though str fields already had clear-to-blank."""
+        config_path = _write_config(
+            tmp_path, _config_with_one_agent(work_dir, "session_prefix: custom\n")
+        )
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_in_edit_mode(pilot, app)
+
+            field = app.screen.query_one("#field-session_prefix", Input)
+            assert field.value == "custom"
+            field.focus()
+            await pilot.pause()
+
+            await pilot.press("ctrl+r")
+            await pilot.pause()
+            assert field.value == "agent-chat"  # AgentConfig's own default
+
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            entry = app.editable_config.agents_raw["existing-agent"]
+            assert "session_prefix" not in entry
+
+    async def test_changing_the_field_again_after_reset_overrides_the_reset(
+        self, tmp_path, work_dir
+    ):
+        """Reset then a further real edit must NOT be silently swallowed —
+        normal diff-based semantics take back over once the widget's value
+        no longer matches what reset set it to."""
+        config_path = _write_config(
+            tmp_path,
+            _config_with_one_agent(work_dir, "lazy_instruction_loading: false\n"),
+        )
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_in_edit_mode(pilot, app)
+
+            checkbox = app.screen.query_one("#field-lazy_instruction_loading", Checkbox)
+            checkbox.focus()
+            await pilot.pause()
+            await pilot.press("ctrl+r")
+            await pilot.pause()
+            assert checkbox.value is True
+
+            checkbox.value = False  # change it again, away from the reset value
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            entry = app.editable_config.agents_raw["existing-agent"]
+            assert entry["lazy_instruction_loading"] is False  # explicit, not reverted
+
+    async def test_ctrl_r_on_a_non_field_widget_is_a_safe_no_op(self, tmp_path, work_dir):
+        """Name/Description inputs aren't tagged with field_key (no
+        *_defaults concept) — pressing ctrl+r while focused there must do
+        nothing, not crash."""
+        config_path = _write_config(tmp_path, _config_with_one_agent(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_in_edit_mode(pilot, app)
+
+            desc = app.screen.query_one("#field-description", Input)
+            desc.value = "some description"
+            desc.focus()
+            await pilot.pause()
+
+            await pilot.press("ctrl+r")  # must not raise
+            await pilot.pause()
+            assert desc.value == "some description"  # untouched
+
+    async def test_ctrl_r_hint_only_shown_while_editing(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _config_with_one_agent(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.screen.query_one("#agents-table", DataTable)
+            table.focus()
+            table.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause()
+
+            keys = {k.key for k in app.screen.query_one(Footer).query(FooterKey)}
+            assert "ctrl+r" not in keys  # view mode — nothing to reset
+
+            await pilot.press("e")
+            await pilot.pause()
+            keys = {k.key for k in app.screen.query_one(Footer).query(FooterKey)}
+            assert "ctrl+r" in keys
