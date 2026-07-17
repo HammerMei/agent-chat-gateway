@@ -2,7 +2,9 @@
 row in the screen inventory). `ConfirmModal` is the first one built, landing
 alongside `EditableConfig.save()`/dirty tracking — everything that needs to
 ask "discard unsaved changes?" before navigating away or quitting shares it.
-Later phases add `TypePickerModal`/`EntityPickerModal`/`PresetOrInlineModal`/
+`MessageModal` (dismiss-only) followed once user feedback showed `self.notify()`
+toasts auto-vanish before an error message this important can be read.
+Later phases add `EntityPickerModal`/`PresetOrInlineModal`/
 `InlineToolRuleModal` here too.
 """
 
@@ -74,6 +76,70 @@ class ConfirmModal(ModalScreen[bool]):
 
     def action_cancel(self) -> None:
         self.dismiss(False)
+
+
+class MessageModal(ModalScreen[None]):
+    """A dismiss-only informational/error dialog. User-reported:
+    `self.notify(..., severity="error")` toasts auto-vanish on their own
+    timer, and a save/delete failure's explanation (often several lines —
+    e.g. a validator error) needs more than a glance to actually read. This
+    stays up until the user presses Enter/Escape or clicks OK — callers
+    `await self.app.push_screen_wait(MessageModal(...))`. Use for anything
+    the user needs time to read (validation/save/delete failures); routine
+    short confirmations ("Saved.") stay as `self.notify()` toasts — this
+    isn't a blanket replacement, just for messages worth blocking on.
+    """
+
+    BINDINGS = [
+        Binding("escape", "dismiss_modal", "OK", show=False),
+        Binding("enter", "dismiss_modal", "OK", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    MessageModal {
+        align: center middle;
+    }
+    #message-dialog {
+        width: auto;
+        max-width: 80;
+        height: auto;
+        border: thick $error;
+        padding: 1 2;
+        background: $surface;
+    }
+    #message-title {
+        text-style: bold;
+    }
+    #message-body {
+        margin-top: 1;
+    }
+    #message-buttons {
+        height: auto;
+        margin-top: 1;
+        align: right middle;
+    }
+    """
+
+    def __init__(self, message: str, title: str = "Error"):
+        super().__init__()
+        self.message = message
+        self.title_text = title
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="message-dialog"):
+            yield Static(self.title_text, id="message-title")
+            yield Static(self.message, id="message-body")
+            with Horizontal(id="message-buttons"):
+                yield Button("OK", id="ok", variant="primary")
+
+    def on_mount(self) -> None:
+        self.query_one("#ok", Button).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(None)
+
+    def action_dismiss_modal(self) -> None:
+        self.dismiss(None)
 
 
 class TypePickerModal(ModalScreen[str | None]):

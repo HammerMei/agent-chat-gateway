@@ -28,13 +28,15 @@ from __future__ import annotations
 
 from typing import Literal
 
+from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, VerticalScroll
 from textual.widgets import Input, Static
 
 from ..formatting import mask_if_secret, provenance_label
+from ..modals import MessageModal
 from ..model import EditableConfig
-from .form_common import FieldSpec, FormScreen, apply_update
+from .form_common import FieldSpec, FormScreen, apply_update, find_referencing_watcher_labels
 
 CONNECTOR_TYPES = ("rocketchat", "mattermost", "voice", "script")
 
@@ -138,6 +140,9 @@ class ConnectorDetailScreen(FormScreen):
         connectors = self.cfg.document.setdefault("connectors", [])
         connectors.insert(self._deleted_index, self.entry)
 
+    def _referencing_watcher_labels(self) -> list[str]:
+        return find_referencing_watcher_labels(self.cfg, connector_name=self._entity_label())
+
     def _on_enter_edit_mode(self) -> None:
         self._compute_initial_values(self.entry)
 
@@ -240,23 +245,33 @@ class ConnectorDetailScreen(FormScreen):
 
     # ── save ─────────────────────────────────────────────────────────────────
 
+    @work
     async def action_save(self) -> None:
         if self.mode == "view":
             return
 
         updates = self._collect_field_updates()
         if updates is None:
-            return  # a field failed to parse; notify() already shown
+            await self.app.push_screen_wait(
+                MessageModal(self._last_field_error or "Invalid field.", title="Could not save")
+            )
+            return
 
         name = self.entry.get("name")
         if self.mode == "create":
             name = self.query_one("#field-name", Input).value.strip()
             if not name:
-                self.notify("Name is required.", severity="error")
+                await self.app.push_screen_wait(
+                    MessageModal("Name is required.", title="Could not save")
+                )
                 return
             existing_names = {c.get("name") for c in self.cfg.connectors_raw}
             if name in existing_names:
-                self.notify(f"A connector named '{name}' already exists.", severity="error")
+                await self.app.push_screen_wait(
+                    MessageModal(
+                        f"A connector named '{name}' already exists.", title="Could not save"
+                    )
+                )
                 return
 
         target_entry = self.entry if self.mode == "edit" else dict(self.entry)
@@ -279,7 +294,7 @@ class ConnectorDetailScreen(FormScreen):
                 # ran — remove it so a failed save doesn't leave a phantom
                 # half-created connector sitting in memory.
                 del self.cfg.document["connectors"][inserted_index]
-            self.notify(f"Could not save: {exc}", severity="error")
+            await self.app.push_screen_wait(MessageModal(str(exc), title="Could not save"))
             return
 
         self.app.pop_screen()

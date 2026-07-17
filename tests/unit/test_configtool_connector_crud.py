@@ -19,7 +19,7 @@ import yaml
 from textual.widgets import DataTable, Input
 
 from gateway.configtool.app import ConfigToolApp
-from gateway.configtool.modals import ConfirmModal, TypePickerModal
+from gateway.configtool.modals import ConfirmModal, MessageModal, TypePickerModal
 from gateway.configtool.screens.connector_detail import ConnectorDetailScreen
 from gateway.configtool.screens.overview import OverviewScreen
 
@@ -174,6 +174,10 @@ class TestCreateConnector:
             await pilot.press("ctrl+s")
             await pilot.pause()
 
+            assert isinstance(app.screen, MessageModal)
+            await pilot.press("enter")  # dismiss
+            await pilot.pause()
+
             assert isinstance(app.screen, ConnectorDetailScreen)
             assert app.screen.mode == "create"
             raw = yaml.safe_load(Path(config_path).read_text())
@@ -189,6 +193,9 @@ class TestCreateConnector:
             await pilot.pause()
 
             await pilot.press("ctrl+s")
+            await pilot.pause()
+            assert isinstance(app.screen, MessageModal)
+            await pilot.press("enter")  # dismiss
             await pilot.pause()
             assert isinstance(app.screen, ConnectorDetailScreen)
             assert app.screen.mode == "create"
@@ -215,6 +222,10 @@ class TestCreateConnector:
             app.screen.query_one("#field-server-password", Input).value = "p"
             await pilot.pause()
             await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            assert isinstance(app.screen, MessageModal)
+            await pilot.press("enter")  # dismiss
             await pilot.pause()
 
             assert isinstance(app.screen, ConnectorDetailScreen)
@@ -424,12 +435,14 @@ async def _open_connector_in_view_mode(pilot, app, row: int = 0) -> None:
 
 
 class TestDeleteConnector:
-    async def test_d_key_shows_confirm_modal(self, tmp_path, work_dir):
+    async def test_d_key_on_an_unreferenced_connector_shows_confirm_modal(
+        self, tmp_path, work_dir
+    ):
         config_path = _write_config(tmp_path, _config_with_two_connectors(work_dir))
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            await _open_connector_in_view_mode(pilot, app)
+            await _open_connector_in_view_mode(pilot, app, row=1)  # rc-orphan
 
             await pilot.press("d")
             await pilot.pause()
@@ -472,12 +485,13 @@ class TestDeleteConnector:
             assert "rc-referenced" in names
             assert list(Path(config_path).parent.glob("config.yaml.bak.*"))
 
-    async def test_deleting_a_referenced_connector_fails_and_rolls_back(
+    async def test_deleting_a_referenced_connector_is_blocked_before_the_confirm(
         self, tmp_path, work_dir
     ):
-        """A watcher still references 'rc-referenced' — save()'s
-        validate_config() must reject the deletion, and the connector must
-        be restored, not left removed-from-memory-but-not-saved."""
+        """A watcher still references 'rc-referenced' — the pre-delete check
+        catches this BEFORE even offering the destructive confirm, naming
+        the referencing watcher in a MessageModal rather than relying on
+        save()'s generic validator error."""
         config_path = _write_config(tmp_path, _config_with_two_connectors(work_dir))
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
@@ -486,7 +500,11 @@ class TestDeleteConnector:
 
             await pilot.press("d")
             await pilot.pause()
-            await pilot.press("tab", "enter")  # Delete
+
+            assert isinstance(app.screen, MessageModal)
+            body = str(app.screen.query_one("#message-body").render())
+            assert "rc-referenced" in body
+            await pilot.press("enter")  # dismiss
             await pilot.pause()
 
             assert isinstance(app.screen, ConnectorDetailScreen)

@@ -47,8 +47,8 @@ from textual.containers import Horizontal, VerticalScroll
 from textual.widgets import Checkbox, Footer, Header, Input, Select, Static
 
 from ..formatting import provenance_label
-from ..modals import ConfirmModal
-from ..model import Provenance
+from ..modals import ConfirmModal, MessageModal
+from ..model import EditableConfig, Provenance
 from .base import DetailScreen
 
 
@@ -131,6 +131,35 @@ def read_widget_value(spec: FieldSpec, widget: object) -> object:
     return text or None
 
 
+def find_referencing_watcher_labels(
+    cfg: EditableConfig, *, connector_name: str | None = None, agent_name: str | None = None
+) -> list[str]:
+    """Which watchers currently reference the given connector and/or agent
+    name — checked against the MERGED value (`watcher_defaults` can set
+    `connector`/`agent` too; both are allowed there, unlike `name`/`room`/
+    `rooms`/`session_id`), so a watcher that only inherits its connector/agent
+    from `watcher_defaults` still counts. Used to give a clear pre-delete
+    warning instead of the generic validator error `save()` would otherwise
+    surface after the fact.
+    """
+    labels = []
+    for entry in cfg.watchers_raw:
+        try:
+            merged = cfg.merged_entry("watcher_defaults", entry)
+        except (ValueError, FileNotFoundError):
+            merged = entry
+        if connector_name is not None and merged.get("connector") != connector_name:
+            continue
+        if agent_name is not None and merged.get("agent") != agent_name:
+            continue
+        label = entry.get("name")
+        if not label:
+            rooms = entry.get("rooms")
+            label = ", ".join(rooms) if rooms else entry.get("room", "?")
+        labels.append(label)
+    return labels
+
+
 class FormScreen(DetailScreen):
     """Base for the config TUI's view/edit/create entity screens. See
     module docstring for the subclass contract."""
@@ -176,6 +205,7 @@ class FormScreen(DetailScreen):
         self.mode: Literal["view", "edit", "create"] = "view"
         self._form_dirty = False
         self._initial_values: dict[str, object] = {}
+        self._last_field_error: str | None = None
         # Input/Select fire their own Changed message once at initial mount
         # with whatever value the constructor was given (confirmed
         # empirically — Checkbox does not, but Input/Select do). Without this
@@ -232,6 +262,14 @@ class FormScreen(DetailScreen):
     def _reinsert_entry_into_document(self) -> None:
         """Undo `_remove_entry_from_document()` — called when `save()`
         rejects the deletion (e.g. a watcher still references this entity)."""
+        raise NotImplementedError
+
+    def _referencing_watcher_labels(self) -> list[str]:
+        """Which watchers (if any) currently reference this entity — checked
+        BEFORE the destructive confirm, so a blocked delete gets a clear
+        reason instead of the generic validator error `save()` would
+        otherwise surface. Subclasses call `find_referencing_watcher_labels()`
+        with their own kind of name."""
         raise NotImplementedError
 
     async def action_save(self) -> None:
@@ -376,16 +414,31 @@ class FormScreen(DetailScreen):
 
     @work
     async def action_delete(self) -> None:
-        """'d', view mode only (see check_action). Confirm -> remove from
-        `document` -> save(). If save() rejects the deletion (most commonly:
-        a watcher still references this entity — GatewayConfig.from_file
-        raises a clear "references unknown agent/connector" error, and
-        validate_config() surfaces it unchanged, same as every other
-        validation failure this tool relies on save() to catch rather than
-        reimplementing), the entry is reinserted so a rejected delete never
-        leaves `document` silently missing something that's still on disk."""
+        """'d', view mode only (see check_action). Checks for referencing
+        watchers FIRST (a clear, specific reason beats a generic validator
+        error) — if any exist, shows that reason and stops before even
+        offering the destructive confirm. Otherwise: confirm -> remove from
+        `document` -> save(). save() remains the backstop even after the
+        pre-check (belt-and-suspenders, not a replacement for it) — if it
+        still rejects the deletion for some reason the pre-check didn't
+        anticipate, the entry is reinserted so a rejected delete never
+        leaves `document` silently missing something that's still on disk.
+        """
         if self.mode != "view":
             return
+
+        blockers = self._referencing_watcher_labels()
+        if blockers:
+            await self.app.push_screen_wait(
+                MessageModal(
+                    f"Cannot delete {self._entity_noun()} "
+                    f"'{self._entity_label()}' — still used by watcher(s): "
+                    f"{', '.join(blockers)}.",
+                    title="Cannot delete",
+                )
+            )
+            return
+
         confirmed = await self.app.push_screen_wait(
             ConfirmModal(
                 f"Delete {self._entity_noun()} '{self._entity_label()}'? "
@@ -402,7 +455,7 @@ class FormScreen(DetailScreen):
             self.cfg.save()
         except (ValueError, FileNotFoundError) as exc:
             self._reinsert_entry_into_document()
-            self.notify(f"Could not delete: {exc}", severity="error")
+            await self.app.push_screen_wait(MessageModal(str(exc), title="Could not delete"))
             return
 
         self.app.pop_screen()
@@ -416,15 +469,18 @@ class FormScreen(DetailScreen):
     def _collect_field_updates(self) -> dict[str, object] | None:
         """Diff every form widget against `_initial_values`. Returns
         {dotted_key: new_value_or_None} for changed fields only (None means
-        "clear it — revert to inherited/default"), or None (having already
-        called self.notify()) if a field fails to parse."""
+        "clear it — revert to inherited/default"), or None if a field fails
+        to parse — the message is stashed in `self._last_field_error` rather
+        than shown directly (this method is sync; the caller, action_save(),
+        is the one in a position to `await` a `MessageModal`)."""
+        self._last_field_error: str | None = None
         updates: dict[str, object] = {}
         for spec in self._field_specs():
             widget = self.query_one("#" + widget_id(spec.key))
             try:
                 new_value = read_widget_value(spec, widget)
             except ValueError as exc:
-                self.notify(str(exc), severity="error")
+                self._last_field_error = str(exc)
                 return None
             if new_value != self._initial_values.get(spec.key):
                 updates[spec.key] = new_value

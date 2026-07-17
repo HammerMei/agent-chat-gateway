@@ -27,13 +27,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
+from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, VerticalScroll
 from textual.widgets import Input, Static
 
 from ..formatting import format_value, provenance_label
+from ..modals import MessageModal
 from ..model import EditableConfig
-from .form_common import FieldSpec, FormScreen, apply_update
+from .form_common import FieldSpec, FormScreen, apply_update, find_referencing_watcher_labels
 
 if TYPE_CHECKING:
     from ..app import ConfigToolApp
@@ -142,6 +144,9 @@ class AgentDetailScreen(FormScreen):
     def _reinsert_entry_into_document(self) -> None:
         self.cfg.document.setdefault("agents", {})[self.agent_name] = self.entry
 
+    def _referencing_watcher_labels(self) -> list[str]:
+        return find_referencing_watcher_labels(self.cfg, agent_name=self.agent_name)
+
     def _on_enter_edit_mode(self) -> None:
         self._compute_initial_values(self.entry)
 
@@ -244,22 +249,30 @@ class AgentDetailScreen(FormScreen):
 
     # ── save ─────────────────────────────────────────────────────────────────
 
+    @work
     async def action_save(self) -> None:
         if self.mode == "view":
             return
 
         updates = self._collect_field_updates()
         if updates is None:
-            return  # a field failed to parse; notify() already shown
+            await self.app.push_screen_wait(
+                MessageModal(self._last_field_error or "Invalid field.", title="Could not save")
+            )
+            return
 
         name = self.agent_name
         if self.mode == "create":
             name = self.query_one("#field-name", Input).value.strip()
             if not name:
-                self.notify("Name is required.", severity="error")
+                await self.app.push_screen_wait(
+                    MessageModal("Name is required.", title="Could not save")
+                )
                 return
             if name in self.cfg.agents_raw:
-                self.notify(f"An agent named '{name}' already exists.", severity="error")
+                await self.app.push_screen_wait(
+                    MessageModal(f"An agent named '{name}' already exists.", title="Could not save")
+                )
                 return
 
         target_entry = self.entry if self.mode == "edit" else dict(self.entry)
@@ -278,7 +291,7 @@ class AgentDetailScreen(FormScreen):
                 # ran — remove it so a failed save doesn't leave a phantom
                 # half-created agent sitting in memory.
                 del self.cfg.document["agents"][name]
-            self.notify(f"Could not save: {exc}", severity="error")
+            await self.app.push_screen_wait(MessageModal(str(exc), title="Could not save"))
             return
 
         self.app.pop_screen()

@@ -170,6 +170,7 @@ per-row status lookups.
 | `DefaultsScreen` | pushed | **Shipped** (view-only): shows blast radius per key |
 | `ToolPresetsScreen` | pushed | **Shipped** (view-only): rule list + "used by" (checked against the MERGED per-agent tool list, not the raw entry — see gotchas below) |
 | `ConfirmModal` | modal | **Shipped** (`gateway/configtool/modals.py`) — yes/no dialog, Cancel focused by default. Gates `ConfigToolApp.action_quit()` on `EditableConfig.dirty`, and `AgentDetailScreen`'s own per-screen form-dirty flag on Escape |
+| `MessageModal` | modal | **Shipped** (`gateway/configtool/modals.py`) — dismiss-only error/info dialog; replaces `notify(severity="error")` for anything worth blocking on (validation/save/delete failures) — user-reported that toasts vanish before a multi-line error can be read |
 | `TypePickerModal` | modal | **Shipped** (`gateway/configtool/modals.py`) — generic list-of-strings picker (`ListView`-based), reused as-is for both the agent-type picker (claude/opencode) and the connector-type picker (rocketchat/mattermost/voice/script) |
 | `EntityPickerModal`, `PresetOrInlineModal`, `InlineToolRuleModal` | modals | Not yet built (phase 2/3) |
 | `RoomListEditorScreen` | pushed (2nd level) | Not yet built (phase 3) |
@@ -339,6 +340,28 @@ Phase 2 first cleared the Phase 1 code review's deferred items 7–10
   right list index, since two connectors could in principle share
   byte-identical raw content. Hidden from the footer while
   editing/creating, via the same `check_action()` mechanism as 'Edit'/'Save'.
+  **Refined immediately after user testing:** the generic validator error
+  ("Watcher entry at index 11 references unknown connector 'X'") confused
+  the user, who reasonably expected a delete-specific reason. Added
+  `find_referencing_watcher_labels()` (checked against watchers' MERGED
+  value, since `watcher_defaults` may set `connector`/`agent` too) as a
+  pre-flight check *before* the destructive confirm — a blocked delete now
+  shows "Cannot delete agent 'X' — still used by watcher(s): general, dev."
+  and never even offers the confirm dialog. `save()`'s own rejection stays
+  in place as a belt-and-suspenders backstop for anything the pre-check
+  doesn't anticipate, not replaced by it.
+- **`MessageModal`, a dismiss-only error/info dialog (`gateway/configtool/modals.py`).**
+  User-reported: `self.notify(..., severity="error")` toasts auto-vanish on
+  their own timer, and a save/delete failure's explanation (often several
+  lines) needs more than a glance. Every error-severity `notify()` call
+  across `AgentDetailScreen`/`ConnectorDetailScreen`'s create/edit/delete
+  flows (duplicate/blank name, invalid integer, save() validation failures,
+  delete failures) was converted to `await self.app.push_screen_wait(MessageModal(...))`
+  — stays up until Enter/Escape/click. Success messages ("Saved.",
+  "Deleted.") deliberately stayed as `notify()` toasts — short and don't
+  need blocking review. `action_save()` on both screens is now
+  `@work`-decorated (needed for `push_screen_wait`, same gotcha as
+  `action_back()`/`action_quit()`).
 - **Not yet built:** the `.env` toggle wiring (above), the generic tree
   editor (deferred, above), tool-list editor + `PresetOrInlineModal` +
   `InlineToolRuleModal`, `ToolPresetsScreen` made editable (used-by
