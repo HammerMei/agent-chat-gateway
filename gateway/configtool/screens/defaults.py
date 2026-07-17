@@ -11,14 +11,9 @@ from __future__ import annotations
 
 from typing import Literal
 
-from textual.app import ComposeResult
-from textual.binding import Binding
-from textual.containers import VerticalScroll
-from textual.screen import Screen
-from textual.widgets import Footer, Header, Static
-
 from ..formatting import format_value
 from ..model import EditableConfig
+from .base import DetailScreen
 
 _ENTRY_ACCESSOR = {
     "connector_defaults": lambda cfg: cfg.connectors_raw,
@@ -27,19 +22,14 @@ _ENTRY_ACCESSOR = {
 }
 
 
-class DefaultsScreen(Screen):
-    BINDINGS = [Binding("escape", "back", "Back")]
+class DefaultsScreen(DetailScreen):
+    BODY_ID = "defaults-detail-body"
 
     def __init__(self, cfg: EditableConfig, kind: str, mode: Literal["view", "edit"] = "view"):
         super().__init__()
         self.cfg = cfg
         self.kind = kind
         self.mode = mode
-
-    def compose(self) -> ComposeResult:
-        yield Header()
-        yield VerticalScroll(Static(self._body_text(), id="defaults-detail-body"))
-        yield Footer()
 
     def _body_text(self) -> str:
         entries = _ENTRY_ACCESSOR[self.kind](self.cfg)
@@ -70,6 +60,3 @@ class DefaultsScreen(Screen):
             )
 
         return "\n".join(lines)
-
-    def action_back(self) -> None:
-        self.app.pop_screen()
