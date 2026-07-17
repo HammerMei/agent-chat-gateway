@@ -147,6 +147,12 @@ class AgentDetailScreen(FormScreen):
     def _referencing_watcher_labels(self) -> list[str]:
         return find_referencing_watcher_labels(self.cfg, agent_name=self.agent_name)
 
+    def _install_trial_entry(self, target_entry: dict) -> None:
+        self.cfg.document.setdefault("agents", {})[self.agent_name] = target_entry
+
+    def _rollback_trial_entry(self) -> None:
+        self.cfg.document.setdefault("agents", {})[self.agent_name] = self.entry
+
     def _on_enter_edit_mode(self) -> None:
         self._compute_initial_values(self.entry)
 
@@ -275,12 +281,21 @@ class AgentDetailScreen(FormScreen):
                 )
                 return
 
-        target_entry = self.entry if self.mode == "edit" else dict(self.entry)
+        # ALWAYS a trial copy, never self.entry directly — even for "edit",
+        # where self.entry is the SAME object already living in
+        # cfg.document. Mutating it here, before save() has even run, would
+        # leave invalid data sitting in the document if save() then fails
+        # (a real bug: reported as "Save failed, but Back still showed the
+        # invalid value" — the fix is never mutating the original until
+        # save() has actually succeeded).
+        target_entry = dict(self.entry)
         for key, value in updates.items():
             apply_update(target_entry, key, value)
 
         if self.mode == "create":
             self.cfg.document.setdefault("agents", {})[name] = target_entry
+        else:
+            self._install_trial_entry(target_entry)
         self.cfg.mark_dirty()
 
         try:
@@ -291,9 +306,12 @@ class AgentDetailScreen(FormScreen):
                 # ran — remove it so a failed save doesn't leave a phantom
                 # half-created agent sitting in memory.
                 del self.cfg.document["agents"][name]
+            else:
+                self._rollback_trial_entry()
             await self.app.push_screen_wait(MessageModal(str(exc), title="Could not save"))
             return
 
+        self.entry = target_entry
         self.app.pop_screen()
         app: "ConfigToolApp" = self.app  # type: ignore[assignment]
         app.notify(f"Saved agent '{name}'.", severity="information")

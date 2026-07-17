@@ -111,6 +111,17 @@ per-row status lookups.
    "duplicates the default" findings as the nudge to promote repeated
    overrides into defaults. List fields are provenance-binary at the
    whole-list level (merge replaces lists wholesale — no per-item marking).
+   **Known gap, user-reported, not yet fixed:** str/int/list fields can
+   revert an explicit override back to inherited by clearing the field to
+   blank (`apply_update()` pops the key). A `bool` field has no equivalent
+   gesture — a `Checkbox` only has True/False, no third "cleared" state —
+   so once a boolean field becomes explicit (any edit to it, even one that
+   happens to land back on the same value the default already has), there
+   is currently NO way to make it inherited again through this UI; the
+   entry keeps an explicit `true`/`false` forever unless hand-edited via
+   `$EDITOR`. Needs a deliberate UI decision (a tri-state control, a
+   separate "reset to default" affordance per field, etc.) — not fixed
+   opportunistically alongside the item that surfaced it.
 3. **`rooms:` group editing — two-tier rule:** deleting a room removes it
    from the list (normalizing `rooms: [x]` → `room: x`); editing a
    **per-room** field (`name`/`session_id` — already hard-restricted to
@@ -343,13 +354,20 @@ Phase 2 first cleared the Phase 1 code review's deferred items 7–10
   **Refined immediately after user testing:** the generic validator error
   ("Watcher entry at index 11 references unknown connector 'X'") confused
   the user, who reasonably expected a delete-specific reason. Added
-  `find_referencing_watcher_labels()` (checked against watchers' MERGED
-  value, since `watcher_defaults` may set `connector`/`agent` too) as a
-  pre-flight check *before* the destructive confirm — a blocked delete now
-  shows "Cannot delete agent 'X' — still used by watcher(s): general, dev."
-  and never even offers the confirm dialog. `save()`'s own rejection stays
-  in place as a belt-and-suspenders backstop for anything the pre-check
-  doesn't anticipate, not replaced by it.
+  `find_referencing_watcher_labels()` as a pre-flight check *before* the
+  destructive confirm — a blocked delete now shows "Cannot delete agent
+  'X' — still used by watcher(s): rc-general, rc-dev." and never even
+  offers the confirm dialog. `save()`'s own rejection stays in place as a
+  belt-and-suspenders backstop for anything the pre-check doesn't
+  anticipate, not replaced by it. **Second round, same feature:** the
+  labels initially fell back to the bare `room:`/joined `rooms:` string for
+  an unnamed watcher — inconsistent with the REAL name that watcher gets
+  everywhere else in the TUI (`_auto_watcher_name()`'s `"<connector>-<room>"`,
+  gateway/config.py), and wrong for a `rooms:` group (one joined label
+  instead of N separate real watchers). Rewritten to use
+  `cfg.expanded_watchers()` directly — the same real, already-correct data
+  the Overview's Watchers tab renders from — instead of re-deriving names
+  from the raw entry.
 - **`MessageModal`, a dismiss-only error/info dialog (`gateway/configtool/modals.py`).**
   User-reported: `self.notify(..., severity="error")` toasts auto-vanish on
   their own timer, and a save/delete failure's explanation (often several
@@ -362,6 +380,23 @@ Phase 2 first cleared the Phase 1 code review's deferred items 7–10
   need blocking review. `action_save()` on both screens is now
   `@work`-decorated (needed for `push_screen_wait`, same gotcha as
   `action_back()`/`action_quit()`).
+- **Real bug, user-reported: a rejected Save in edit mode still mutated the
+  live entry.** `action_save()`'s trial-copy logic was
+  `target_entry = self.entry if self.mode == "edit" else dict(self.entry)`
+  — for edit mode, `target_entry` WAS `self.entry`, the SAME dict object
+  already living in `cfg.document` (entries are held by reference
+  throughout this tool, never copied on load). Applying Save's updates to
+  it, then having `save()` reject the result, left the invalid data sitting
+  in `document` — no rollback path existed for edit mode (only create mode
+  deleted its phantom entry on failure). Reported exactly as it would
+  manifest: set an invalid `timeout`, Save fails with a clear error, press
+  Back anyway — the invalid value was still showing, even though nothing
+  had actually been written to disk. Fixed with the same
+  install/rollback-hook pattern delete already uses:
+  `_install_trial_entry(target_entry)` swaps a COPY (with updates applied)
+  into `document` *before* `save()` runs; `_rollback_trial_entry()` restores
+  the untouched original if `save()` rejects it. `self.entry` itself is
+  never mutated until `save()` has actually succeeded.
 - **Not yet built:** the `.env` toggle wiring (above), the generic tree
   editor (deferred, above), tool-list editor + `PresetOrInlineModal` +
   `InlineToolRuleModal`, `ToolPresetsScreen` made editable (used-by

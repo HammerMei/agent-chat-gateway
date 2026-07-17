@@ -365,6 +365,48 @@ class TestEditConnector:
             assert connector["timezone"] == "America/Los_Angeles"
             assert "require_mention" not in connector  # still inherited, not explicit
 
+    async def test_a_save_that_fails_validate_config_does_not_mutate_the_live_entry(
+        self, tmp_path, work_dir
+    ):
+        """Same bug class as AgentDetailScreen's equivalent test: edit mode
+        used to apply Save's updates directly to self.entry (the SAME dict
+        object already living in cfg.document), so a rejected save still
+        left the invalid data sitting in memory (and, if Back was pressed
+        without a further successful save, visibly shown). Clearing the
+        password field reverts it to inherited (empty, since no
+        connector_defaults sets it) — _check_connectors then rejects the
+        empty password, and BOTH the password clear AND the unrelated
+        username change made in the same edit session must roll back
+        together, atomically."""
+        config_path = _write_config(tmp_path, _config_with_one_rocketchat_connector(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_connector_in_edit_mode(pilot, app)
+
+            app.screen.query_one("#field-server-password", Input).value = ""
+            app.screen.query_one("#field-server-username", Input).value = "changed-username"
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            assert isinstance(app.screen, MessageModal)
+            body = str(app.screen.query_one("#message-body").render())
+            assert "password" in body
+            await pilot.press("enter")  # dismiss
+            await pilot.pause()
+
+            assert isinstance(app.screen, ConnectorDetailScreen)
+            assert app.screen.mode == "edit"
+
+            entry = app.editable_config.connectors_raw[0]
+            assert entry["server"]["password"] == "pw"  # original, untouched
+            assert entry["server"]["username"] == "bot"  # unrelated change also rolled back
+
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert raw["connectors"][0]["server"]["password"] == "pw"
+            assert raw["connectors"][0]["server"]["username"] == "bot"
+
 
 class TestConnectorEscapeConfirmation:
     async def test_escape_with_unsaved_changes_shows_confirm_modal(self, tmp_path, work_dir):

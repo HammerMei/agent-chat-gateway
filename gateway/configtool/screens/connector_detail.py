@@ -126,19 +126,29 @@ class ConnectorDetailScreen(FormScreen):
     def _entity_label(self) -> str:
         return self.entry.get("name", "?")
 
-    def _remove_entry_from_document(self) -> None:
-        connectors = self.cfg.document.get("connectors") or []
+    def _find_own_index(self) -> int:
         # Matched by object IDENTITY, not equality — connectors_raw is a
         # fresh list each call but wraps the SAME dict objects living in
         # `document`, and two connectors could (in a broken config) have
         # byte-identical raw content; identity is the only way to be sure
         # this is the exact entry this screen was opened on.
-        self._deleted_index = next(i for i, c in enumerate(connectors) if c is self.entry)
-        del connectors[self._deleted_index]
+        connectors = self.cfg.document.get("connectors") or []
+        return next(i for i, c in enumerate(connectors) if c is self.entry)
+
+    def _remove_entry_from_document(self) -> None:
+        self._deleted_index = self._find_own_index()
+        del self.cfg.document["connectors"][self._deleted_index]
 
     def _reinsert_entry_into_document(self) -> None:
         connectors = self.cfg.document.setdefault("connectors", [])
         connectors.insert(self._deleted_index, self.entry)
+
+    def _install_trial_entry(self, target_entry: dict) -> None:
+        self._edit_index = self._find_own_index()
+        self.cfg.document["connectors"][self._edit_index] = target_entry
+
+    def _rollback_trial_entry(self) -> None:
+        self.cfg.document["connectors"][self._edit_index] = self.entry
 
     def _referencing_watcher_labels(self) -> list[str]:
         return find_referencing_watcher_labels(self.cfg, connector_name=self._entity_label())
@@ -274,7 +284,14 @@ class ConnectorDetailScreen(FormScreen):
                 )
                 return
 
-        target_entry = self.entry if self.mode == "edit" else dict(self.entry)
+        # ALWAYS a trial copy, never self.entry directly — even for "edit",
+        # where self.entry is the SAME object already living in
+        # cfg.document. Mutating it here, before save() has even run, would
+        # leave invalid data sitting in the document if save() then fails
+        # (a real bug: reported as "Save failed, but Back still showed the
+        # invalid value" — the fix is never mutating the original until
+        # save() has actually succeeded).
+        target_entry = dict(self.entry)
         for key, value in updates.items():
             apply_update(target_entry, key, value)
 
@@ -284,6 +301,8 @@ class ConnectorDetailScreen(FormScreen):
             connectors = self.cfg.document.setdefault("connectors", [])
             connectors.append(target_entry)
             inserted_index = len(connectors) - 1
+        else:
+            self._install_trial_entry(target_entry)
         self.cfg.mark_dirty()
 
         try:
@@ -294,9 +313,12 @@ class ConnectorDetailScreen(FormScreen):
                 # ran — remove it so a failed save doesn't leave a phantom
                 # half-created connector sitting in memory.
                 del self.cfg.document["connectors"][inserted_index]
+            else:
+                self._rollback_trial_entry()
             await self.app.push_screen_wait(MessageModal(str(exc), title="Could not save"))
             return
 
+        self.entry = target_entry
         self.app.pop_screen()
         app = self.app
         app.notify(f"Saved connector '{name}'.", severity="information")
