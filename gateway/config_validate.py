@@ -129,7 +129,11 @@ def validate_config(config_path: str, lint: bool = False) -> ValidationResult:
         with open(config_path) as f:
             raw = yaml.safe_load(f) or {}
     except OSError as exc:
-        result.errors.append(f"Could not re-read {config_path}: {exc}")
+        msg = f"Could not re-read {config_path}: {exc}"
+        result.errors.append(msg)
+        result.findings.append(
+            Finding(severity="error", entity_kind="global", entity_name=None, field=None, message=msg)
+        )
         return result
 
     result.entry_count = len(raw.get("watchers") or [])

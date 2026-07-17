@@ -114,6 +114,57 @@ class TestEditableConfigLoad(_EditableConfigTestBase):
         self.assertEqual(len(cfg.watchers_raw), 2)
 
 
+class TestExpandedWatchersDesync(_EditableConfigTestBase):
+    """Regression: expanded_watchers() must raise ValueError (never a raw
+    IndexError) when the in-memory document and a fresh disk read disagree
+    on watcher count — e.g. an external process edits config.yaml without an
+    intervening reload() on this EditableConfig instance."""
+
+    def _cfg_with_rooms(self, rooms: str) -> tuple[EditableConfig, Path]:
+        path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - connector: rc
+                agent: default
+                rooms: [{rooms}]
+        """)
+        return EditableConfig.load(path), path
+
+    def test_fewer_rooms_on_disk_raises_value_error_not_index_error(self):
+        cfg, path = self._cfg_with_rooms("nest, hammer, dev")
+        path.write_text(path.read_text().replace(
+            "rooms: [nest, hammer, dev]", "rooms: [nest, hammer]"
+        ))
+        with self.assertRaises(ValueError) as ctx:
+            cfg.expanded_watchers()
+        self.assertIn("disagree on watcher count", str(ctx.exception))
+
+    def test_more_rooms_on_disk_raises_value_error_not_index_error(self):
+        cfg, path = self._cfg_with_rooms("nest, hammer")
+        path.write_text(path.read_text().replace(
+            "rooms: [nest, hammer]", "rooms: [nest, hammer, dev, extra]"
+        ))
+        with self.assertRaises(ValueError) as ctx:
+            cfg.expanded_watchers()
+        self.assertIn("disagree on watcher count", str(ctx.exception))
+
+    def test_reload_before_calling_resolves_the_desync(self):
+        cfg, path = self._cfg_with_rooms("nest, hammer, dev")
+        path.write_text(path.read_text().replace(
+            "rooms: [nest, hammer, dev]", "rooms: [nest, hammer]"
+        ))
+        cfg.reload()
+        expanded = cfg.expanded_watchers()  # must not raise
+        self.assertEqual(len(expanded), 2)
+
+
 class TestEditableConfigDefaultsBlock(_EditableConfigTestBase):
     def test_defaults_block_strips_description(self):
         path = self._write(f"""\

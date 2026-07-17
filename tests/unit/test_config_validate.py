@@ -429,6 +429,38 @@ class TestFindingsExtension(_ValidateConfigTestBase):
         result = self._validate(cfg)
         self.assertEqual(result.findings, [])
 
+    def test_second_read_oserror_produces_a_matching_finding(self):
+        """Regression: the OSError branch (a second, independent re-read of
+        config.yaml purely to compute entry_count) used to append to
+        result.errors without a matching Finding — the one error-append site
+        in this file that didn't. Patching gateway.config_validate's own
+        `open` (not gateway.config's) isolates the failure to just that
+        second read; GatewayConfig.from_file's own read succeeds normally."""
+        cfg = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                room: general
+        """)
+        with patch("gateway.config_validate.open", side_effect=OSError("boom")):
+            result = self._validate(cfg)
+
+        self.assertFalse(result.ok)
+        self.assertTrue(any("Could not re-read" in e for e in result.errors))
+        matching = [
+            f for f in result.findings
+            if f.entity_kind == "global" and "Could not re-read" in f.message
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0].severity, "error")
+
     def test_finding_is_a_frozen_dataclass_instance(self):
         f = Finding(
             severity="error", entity_kind="connector", entity_name="rc",

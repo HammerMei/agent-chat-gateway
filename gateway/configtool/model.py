@@ -175,6 +175,14 @@ class EditableConfig:
         keys are never touched by any `*_defaults` merge (both are forbidden
         there), so reading them directly off the raw entry is safe once the
         document is known to be schema-valid.
+
+        `validated_view()` re-reads config.yaml from disk on every call;
+        `self.watchers_raw` reads the in-memory `document` (only refreshed by
+        `load()`/`reload()`). If the file changes on disk without an
+        intervening `reload()` on this instance, the two can disagree on how
+        many watchers exist — raises ValueError in that case (never a raw
+        IndexError) so callers' existing `except (ValueError, FileNotFoundError)`
+        guards catch it like any other "can't compute this right now" case.
         """
         expanded = self.validated_view().watchers
         result: list[ExpandedWatcher] = []
@@ -185,10 +193,24 @@ class EditableConfig:
                 rooms = [entry.get("room")]
             count = len(rooms)
             for _ in range(count):
+                if idx >= len(expanded):
+                    raise ValueError(
+                        "expanded_watchers(): the in-memory document and the "
+                        "freshly-loaded config disagree on watcher count — "
+                        "config.yaml likely changed on disk since this was "
+                        "last loaded; call reload() first."
+                    )
                 result.append(
                     ExpandedWatcher(watcher=expanded[idx], raw_entry=entry, group_size=count)
                 )
                 idx += 1
+        if idx != len(expanded):
+            raise ValueError(
+                "expanded_watchers(): the in-memory document and the "
+                "freshly-loaded config disagree on watcher count — "
+                "config.yaml likely changed on disk since this was last "
+                "loaded; call reload() first."
+            )
         return result
 
 
