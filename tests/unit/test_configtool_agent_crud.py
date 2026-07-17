@@ -547,39 +547,64 @@ class TestFooterSurvivesRecompose:
             assert footer_key_count() > 0  # re-entered edit — this used to be 0
 
 
-class TestArrowKeyFieldNavigation:
-    """Up/Down move between form fields instead of scrolling the form
-    container (_AgentForm overrides VerticalScroll's inherited
-    action_scroll_up/down) — user-requested, since Tab-only navigation in a
-    long form is tedious. Home/End/PageUp/PageDown and the mouse wheel still
-    scroll if the form doesn't fit the terminal."""
+class TestFooterHintsMatchAvailableActions:
+    """User-reported: the footer showed 'e: Edit' even while already in edit
+    mode, where pressing 'e' is a no-op (action_edit() only does something
+    from view mode) — confusing. Fixed via check_action(): 'Edit' is hidden
+    once mode != "view"; 'Save' is hidden while mode == "view" (nothing to
+    save yet); 'Tab: Next field' is shown throughout, mirroring
+    OverviewScreen's existing tab-hint pattern, as the one reliable,
+    discoverable way to move between fields (an Up/Down alternative was
+    tried and reverted after user testing surfaced inconsistent behavior in
+    a real terminal that Pilot's headless driver didn't catch)."""
 
-    async def test_down_moves_focus_to_the_next_field(self, tmp_path, work_dir):
+    def _visible_keys(self, app) -> set[str]:
+        from textual.widgets import Footer
+        from textual.widgets._footer import FooterKey
+
+        return {k.key for k in app.screen.query_one(Footer).query(FooterKey)}
+
+    async def test_view_mode_shows_edit_not_save(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _config_with_one_agent(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.screen.query_one("#agents-table", DataTable)
+            table.focus()
+            table.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause()
+
+            keys = self._visible_keys(app)
+            assert "e" in keys
+            assert "ctrl+s" not in keys
+            assert "tab" in keys
+
+    async def test_edit_mode_shows_save_not_edit(self, tmp_path, work_dir):
         config_path = _write_config(tmp_path, _config_with_one_agent(work_dir))
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
             await _open_agent_in_edit_mode(pilot, app)
 
-            desc = app.screen.query_one("#field-description", Input)
-            desc.focus()
-            await pilot.pause()
+            keys = self._visible_keys(app)
+            assert "ctrl+s" in keys
+            assert "e" not in keys
+            assert "tab" in keys
 
-            await pilot.press("down")
-            await pilot.pause()
-            assert app.screen.focused.id == "field-type"
-
-    async def test_up_moves_focus_to_the_previous_field(self, tmp_path, work_dir):
+    async def test_create_mode_shows_save_not_edit(self, tmp_path, work_dir):
         config_path = _write_config(tmp_path, _config_with_one_agent(work_dir))
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            await _open_agent_in_edit_mode(pilot, app)
-
-            command_input = app.screen.query_one("#field-command", Input)
-            command_input.focus()
+            app.screen.query_one("TabbedContent").active = "tab-agents"
+            await pilot.pause()
+            await pilot.press("n")
+            await pilot.pause()
+            await pilot.press("enter")
             await pilot.pause()
 
-            await pilot.press("up")
-            await pilot.pause()
-            assert app.screen.focused.id == "field-type"
+            keys = self._visible_keys(app)
+            assert "ctrl+s" in keys
+            assert "e" not in keys
+            assert "tab" in keys

@@ -100,23 +100,6 @@ _PERMISSIONS_FORM_FIELDS: list[_FieldSpec] = [
 _ALL_FORM_FIELDS = (*_FORM_FIELDS, *_PERMISSIONS_FORM_FIELDS)
 
 
-class _AgentForm(VerticalScroll):
-    """The form's scroll container — Up/Down move between fields instead of
-    scrolling (VerticalScroll's own inherited action_scroll_up/down, bound
-    to up/down by default). A form is naturally row-oriented, so this reads
-    more like a real form than a scrollable document; Home/End/PageUp/
-    PageDown and the mouse wheel still scroll if the form doesn't fit the
-    terminal. Only overriding the two ACTIONS (not adding new BINDINGS) —
-    Select's own dropdown still handles up/down itself while open, since
-    that's resolved before it ever reaches this container."""
-
-    def action_scroll_up(self) -> None:
-        self.screen.focus_previous()
-
-    def action_scroll_down(self) -> None:
-        self.screen.focus_next()
-
-
 def _widget_id(key: str) -> str:
     return "field-" + key.replace(".", "-")
 
@@ -201,6 +184,13 @@ class AgentDetailScreen(DetailScreen):
     BINDINGS = [
         Binding("e", "edit", "Edit", show=True),
         Binding("ctrl+s", "save", "Save", show=True),
+        # Screen already binds tab/shift+tab to app.focus_next/focus_previous
+        # with show=False (textual/screen.py) — re-bound here with show=True,
+        # same pattern OverviewScreen already uses, so the footer tells the
+        # user how to move between fields (user-reported gap: Up/Down was
+        # tried as an alternative and reverted — see git history — Tab is
+        # the one reliable, discoverable way to navigate this form).
+        Binding("tab", "app.focus_next", "Next field", show=True),
     ]
 
     DEFAULT_CSS = """
@@ -257,6 +247,17 @@ class AgentDetailScreen(DetailScreen):
 
     def _stop_populating(self) -> None:
         self._populating = False
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Hide 'Edit' from the footer once already editing/creating (it's a
+        no-op there — action_edit() only does something from view mode —
+        and user-reported that a footer hint for a no-op key is confusing),
+        and hide 'Save' while still in view mode (nothing to save yet)."""
+        if action == "edit":
+            return self.mode == "view"
+        if action == "save":
+            return self.mode != "view"
+        return True
 
     # ── view mode ────────────────────────────────────────────────────────────
 
@@ -335,7 +336,7 @@ class AgentDetailScreen(DetailScreen):
             return None
 
     def _compose_form(self) -> ComposeResult:
-        with _AgentForm(id="agent-form"):
+        with VerticalScroll(id="agent-form"):
             if self.mode == "create":
                 yield Static("[bold]New agent[/bold]")
                 with Horizontal(classes="field-row"):
