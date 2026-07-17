@@ -1,7 +1,11 @@
 # Config editing tool — full design (M1–M3) + implementation status
 
 Status: **Phase 1 shipped** (read-only overview + detail screens + $EDITOR
-escape hatch). Phases 2–3 are designed below but not yet implemented. The
+escape hatch). **Phase 2 in progress:** items 7–10 from the Phase 1 code
+review cleared, plus `EditableConfig.save()`/dirty-tracking/`ConfirmModal`
+foundation shipped; entity create/edit screens, the `.env` writer, and the
+tool-list/preset editor are not yet built. Phase 3 is designed below but not
+yet started. The
 v0.2 format simplification (`connector_defaults`/`agent_defaults`/
 `watcher_defaults`, `tool_presets`, watcher `rooms:`) plus `acg config
 validate` and the JSON Schema (see `docs/migration-0.2.md`) are prerequisites
@@ -66,7 +70,16 @@ EditableConfig
 │     (and sibling-room count) it came from, by replaying the loader's own
 │     room-counting order — no name-generation/merge logic reimplemented
 ├── validated_view() -> GatewayConfig   (read-only; display/cross-ref only)
-└── save()   # phase 2+; not yet implemented
+├── dirty: bool / mark_dirty()   # Phase 2 foundation, shipped
+│     the ONE sanctioned seam after any in-place edit to `document` — clears
+│     the defaults_block() cache and flips `dirty`. There is deliberately no
+│     per-field mutation API (no `set_entry_field()`) on EditableConfig
+│     itself: each Phase 2/3 edit screen mutates `document` (or a raw dict
+│     reachable from it) in whatever shape that screen's form needs, then
+│     calls mark_dirty(). This resolved code review item 7 — the original
+│     open question was what shape a generic accessor API should take;
+│     the answer is that there isn't one, only the invalidation seam.
+└── save()   # Phase 2 foundation, shipped — see decision 5 below
 ```
 
 Shipped in Phase 1: `document`, `provenance`/`field_provenance`,
@@ -112,12 +125,20 @@ per-row status lookups.
    flow, a generic nested tree editor handles the body. Template drift
    degrades guidance only, never correctness — `_check_connectors`' real
    dataclass instantiation is the backstop.
-5. **Save flow: validate-before-write via a same-directory temp file.**
-   Serialize to `config.yaml.tmp` **beside** the real file (not `/tmp` —
-   `working_directory`/`context_inject_files` resolve relative to
-   `config_dir`), run the unchanged `validate_config(tmp)`, block save on
-   errors; on success: timestamped backup, then atomic rename. Never let a
-   transiently-broken config touch the path the daemon reads.
+5. **Save flow: validate-before-write via a same-directory temp file.
+   Shipped** as `EditableConfig.save()`. Serializes to `config.yaml.tmp`
+   **beside** the real file (not `/tmp` — `working_directory`/
+   `context_inject_files` resolve relative to `config_dir`), runs the
+   unchanged `validate_config(tmp)`, blocks save on errors (raises
+   `ValueError`, temp file deleted, real file untouched); on success:
+   timestamped backup (`config.yaml.bak.<unix-ts>`, `shutil.copy2`, matching
+   `onboard.py`'s convention) then `os.replace()` (atomic on POSIX) — the
+   daemon never observes a partially-written config.yaml. `dirty`/
+   `mark_dirty()` also shipped alongside it; `ConfigToolApp.action_quit()`
+   gates on `dirty` via a new `ConfirmModal` (Textual `@work`-decorated,
+   since `push_screen_wait()` requires a worker context) — no edit screen
+   sets `dirty` for real yet, but the mechanism is in place for Phase 2's
+   CRUD screens to use without further plumbing.
 6. **`.env` secret handling:** password/token/secret fields get a per-field
    "store in .env" toggle (default ON) → `${VAR}` placeholder in config,
    value into `.env`. Needs a new merge-by-key `.env` writer (`onboard.py`'s
@@ -134,7 +155,8 @@ per-row status lookups.
 | `ConnectorDetailScreen` / `AgentDetailScreen` / `WatcherDetailScreen` | pushed | **Shipped**, `mode="view"` only. Each already takes a `mode: Literal["view","edit","create"]` param — phase 2/3 flips it, no screen-class rework |
 | `DefaultsScreen` | pushed | **Shipped** (view-only): shows blast radius per key |
 | `ToolPresetsScreen` | pushed | **Shipped** (view-only): rule list + "used by" (checked against the MERGED per-agent tool list, not the raw entry — see gotchas below) |
-| `TypePickerModal`, `EntityPickerModal`, `PresetOrInlineModal`, `InlineToolRuleModal`, `ConfirmModal` | modals | Not yet built (phase 2/3) |
+| `ConfirmModal` | modal | **Shipped** (`gateway/configtool/modals.py`) — yes/no dialog, Cancel focused by default. Gates `ConfigToolApp.action_quit()` on `EditableConfig.dirty` today; Phase 2/3 edit screens will reuse it for their own discard-changes confirmations |
+| `TypePickerModal`, `EntityPickerModal`, `PresetOrInlineModal`, `InlineToolRuleModal` | modals | Not yet built (phase 2/3) |
 | `RoomListEditorScreen` | pushed (2nd level) | Not yet built (phase 3) |
 | `$EDITOR` escape hatch | action | **Shipped.** `App.suspend()` + subprocess; Overview-only |
 | `HelpScreen` | modal or pushed | **Not yet built — owner-requested addition, tracked for phase 2.** On mount, focus starts on the tab bar rather than the list (a real gap a user hit) — Phase 1's fix was surfacing the existing `tab`→focus-next binding in the footer (`Binding("tab", "app.focus_next", "Focus next / enter list", show=True)` on `OverviewScreen`), but a dedicated help screen (`?` binding, listing every screen's keybindings) is the more scalable fix once phase 2/3 add enough screens/actions that the footer alone gets crowded |
@@ -193,12 +215,26 @@ attribution on expanded watchers specifically.
 CRUD). Rationale: "add a new bot" = connector + agent first, watcher second —
 matches the actual dependency order; creation flows are also where the TUI
 beats `$EDITOR` most (typed forms, credential handling via `.env`, live regex
-validation), so front-loading them delivers value sooner.
-`EditableConfig.save()`, dirty-state tracking + `ConfirmModal`,
-`AgentDetailScreen`/`ConnectorDetailScreen` edit/create, `TypePickerModal` +
-per-type templates + generic tree editor for connector `raw`, `.env`
-merge-by-key writer + secret toggle, tool-list editor + `PresetOrInlineModal`
-+ `InlineToolRuleModal`, `ToolPresetsScreen` made editable (used-by warnings).
+validation), so front-loading them delivers value sooner. Before any new UI,
+Phase 2 first cleared the Phase 1 code review's deferred items 7–10
+(refactor/perf only, no behavior change — see "Implementation notes" below):
+
+- **Shipped:** items 9/10 (renamed `refresh_overview()` →
+  `repaint_from_memory()`; extracted a shared `DetailScreen` base class for
+  the five detail/list screens) and item 8 (`EditableConfig.defaults_block()`
+  cached per kind, invalidated by `load()`/`reload()`/`mark_dirty()`).
+- **Shipped:** item 7 (`EditableConfig` accessor redesign) resolved as
+  `dirty`/`mark_dirty()` — see the keystone diagram above — landing
+  together with `EditableConfig.save()`, since the right shape depended on
+  what the mutation layer needed, per the plan's own risk note.
+- **Shipped:** `EditableConfig.save()` (decision 5) and `ConfirmModal`
+  (`gateway/configtool/modals.py`), gating `ConfigToolApp.action_quit()`.
+
+**Not yet built:** `AgentDetailScreen`/`ConnectorDetailScreen` edit/create,
+`TypePickerModal` + per-type templates + generic tree editor for connector
+`raw`, `.env` merge-by-key writer + secret toggle, tool-list editor +
+`PresetOrInlineModal` + `InlineToolRuleModal`, `ToolPresetsScreen` made
+editable (used-by warnings).
 
 **Phase 3: Watcher CRUD + defaults editing.** `WatcherDetailScreen`
 edit/create; new-watcher flow (pickers now enumerate entities creatable
@@ -230,7 +266,8 @@ split-out insertion position).
   silently shows stale data even though the validation banner looks current.
   Real bug hit and fixed while building the `r` (refresh) binding — the fix
   is `action_refresh()` calling `self.app.reload_config()`, not
-  `self.refresh_overview()` directly.
+  `self.repaint_from_memory()` directly (renamed from `refresh_overview()`
+  in Phase 2's cleanup pass — the old name invited exactly this bug).
 - **Any field that's commonly set via a `*_defaults` block (or via
   `agent_defaults`/`connector_defaults` transitively) must be looked up
   through `merged_entry()`, not the raw entry.** Two real display bugs were
@@ -245,6 +282,25 @@ split-out insertion position).
   `merged_entry()`/`defaults_block()`/`expanded_watchers()` each
   independently call the real loader again and can raise the *same* error a
   second, unhandled time if not guarded per-table/per-screen.
+- **`App.push_screen_wait()` requires a Textual worker context — it calls
+  `get_current_worker()` internally and raises `NoActiveWorker` otherwise.**
+  A plain action method (even an `async def`) triggered by a keybinding is
+  NOT automatically a worker. `ConfigToolApp.action_quit()` needs
+  `await self.push_screen_wait(ConfirmModal(...))` to block on the user's
+  answer, so it's decorated `@work` (from `textual`). Any future action that
+  awaits a modal's result for its own control flow (rather than using
+  `push_screen(..., callback=...)`) needs the same decorator — confirmed
+  empirically while building the quit-confirmation flow (the first version,
+  undecorated, failed every Pilot test with `NoActiveWorker`).
+- **A modal's own `BINDINGS` can silently lose to a focused `Button`'s
+  built-in key handling.** `ConfirmModal` originally bound `enter` to a
+  screen-level `action_confirm`, matching `escape`→`action_cancel` — but
+  Textual auto-focuses the first focusable widget (the Cancel button) on
+  mount, and a focused `Button` handles Enter itself before it ever reaches
+  a screen binding. Fixed by dropping the screen-level Enter binding
+  entirely and explicitly focusing Cancel in `on_mount()` (safe-by-default:
+  a reflexive Enter cancels, not confirms); Tab+Enter reaches Confirm.
+  `escape`→cancel still needs its own binding since `Button` doesn't bind it.
 - Verified against the real, currently-live production config (8 connectors,
   4 agents, 24 watchers expanded from 12 raw entries, 2 tool presets):
   renders correctly, and drilling into all 36 rows (24 watchers + 8
