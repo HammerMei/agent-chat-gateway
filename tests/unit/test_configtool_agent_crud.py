@@ -850,3 +850,136 @@ class TestDeleteAgent:
 
             keys = {k.key for k in app.screen.query_one(Footer).query(FooterKey)}
             assert "d" not in keys
+
+
+class TestResetFieldToInherited:
+    """ctrl+r (action_reset_field()) — user-reported gap: str/int/list
+    fields can revert to inherited by clearing the box to blank, but a
+    Checkbox/Select has no "blank" state, so a bool/enum field stayed
+    explicit forever once touched, even set back to a value matching the
+    default. This is the fix: reset the FOCUSED field regardless of kind."""
+
+    async def test_resetting_an_explicit_boolean_reverts_it_to_inherited_on_save(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(
+            tmp_path,
+            _config_with_one_agent(work_dir, "lazy_instruction_loading: false\n"),
+        )
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_in_edit_mode(pilot, app)
+
+            checkbox = app.screen.query_one("#field-lazy_instruction_loading", Checkbox)
+            assert checkbox.value is False  # explicit, matches the entry above
+            checkbox.focus()
+            await pilot.pause()
+
+            await pilot.press("ctrl+r")
+            await pilot.pause()
+            # Reset shows the pure-default value (AgentConfig's own default,
+            # True — agent_defaults in this fixture doesn't set it either).
+            assert checkbox.value is True
+
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            entry = app.editable_config.agents_raw["existing-agent"]
+            assert "lazy_instruction_loading" not in entry  # reverted to inherited
+
+    async def test_resetting_a_string_field_also_reverts_it_to_inherited(
+        self, tmp_path, work_dir
+    ):
+        """Confirms ctrl+r works uniformly across field kinds, not just
+        booleans — even though str fields already had clear-to-blank."""
+        config_path = _write_config(
+            tmp_path, _config_with_one_agent(work_dir, "session_prefix: custom\n")
+        )
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_in_edit_mode(pilot, app)
+
+            field = app.screen.query_one("#field-session_prefix", Input)
+            assert field.value == "custom"
+            field.focus()
+            await pilot.pause()
+
+            await pilot.press("ctrl+r")
+            await pilot.pause()
+            assert field.value == "agent-chat"  # AgentConfig's own default
+
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            entry = app.editable_config.agents_raw["existing-agent"]
+            assert "session_prefix" not in entry
+
+    async def test_changing_the_field_again_after_reset_overrides_the_reset(
+        self, tmp_path, work_dir
+    ):
+        """Reset then a further real edit must NOT be silently swallowed —
+        normal diff-based semantics take back over once the widget's value
+        no longer matches what reset set it to."""
+        config_path = _write_config(
+            tmp_path,
+            _config_with_one_agent(work_dir, "lazy_instruction_loading: false\n"),
+        )
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_in_edit_mode(pilot, app)
+
+            checkbox = app.screen.query_one("#field-lazy_instruction_loading", Checkbox)
+            checkbox.focus()
+            await pilot.pause()
+            await pilot.press("ctrl+r")
+            await pilot.pause()
+            assert checkbox.value is True
+
+            checkbox.value = False  # change it again, away from the reset value
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            entry = app.editable_config.agents_raw["existing-agent"]
+            assert entry["lazy_instruction_loading"] is False  # explicit, not reverted
+
+    async def test_ctrl_r_on_a_non_field_widget_is_a_safe_no_op(self, tmp_path, work_dir):
+        """Name/Description inputs aren't tagged with field_key (no
+        *_defaults concept) — pressing ctrl+r while focused there must do
+        nothing, not crash."""
+        config_path = _write_config(tmp_path, _config_with_one_agent(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_in_edit_mode(pilot, app)
+
+            desc = app.screen.query_one("#field-description", Input)
+            desc.value = "some description"
+            desc.focus()
+            await pilot.pause()
+
+            await pilot.press("ctrl+r")  # must not raise
+            await pilot.pause()
+            assert desc.value == "some description"  # untouched
+
+    async def test_ctrl_r_hint_only_shown_while_editing(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _config_with_one_agent(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.screen.query_one("#agents-table", DataTable)
+            table.focus()
+            table.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause()
+
+            keys = {k.key for k in app.screen.query_one(Footer).query(FooterKey)}
+            assert "ctrl+r" not in keys  # view mode — nothing to reset
+
+            await pilot.press("e")
+            await pilot.pause()
+            keys = {k.key for k in app.screen.query_one(Footer).query(FooterKey)}
+            assert "ctrl+r" in keys
