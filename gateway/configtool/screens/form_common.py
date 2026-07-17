@@ -131,6 +131,24 @@ def read_widget_value(spec: FieldSpec, widget: object) -> object:
     return text or None
 
 
+def set_widget_value(spec: FieldSpec, widget: object, value: object) -> None:
+    """Set `widget`'s displayed value for `spec` — the inverse of
+    `read_widget_value()`. Used by `action_reset_field()` to show what a
+    field would display with zero explicit override (pure `*_defaults` /
+    dataclass fallback), on an ALREADY-MOUNTED, focused widget — unlike
+    `_compose_field_row()`, which sets the initial value via constructor
+    kwargs before the widget ever mounts."""
+    if spec.kind == "bool":
+        widget.value = bool(value)
+    elif spec.kind == "enum":
+        options = spec.options or ()
+        widget.value = value if value in options else (options or (None,))[0]
+    elif spec.kind == "list":
+        widget.value = list_to_text(value)
+    else:
+        widget.value = "" if value is None else str(value)
+
+
 def find_referencing_watcher_labels(
     cfg: EditableConfig, *, connector_name: str | None = None, agent_name: str | None = None
 ) -> list[str]:
@@ -179,6 +197,15 @@ class FormScreen(DetailScreen):
         # headless driver didn't catch — Tab is the one mechanism proven to
         # actually work everywhere.
         Binding("tab", "app.focus_next", "Next field", show=True),
+        # User-reported gap: str/int/list fields can revert an explicit
+        # override back to inherited by clearing the box to blank, but a
+        # Checkbox/Select has no "blank" state — once touched, a bool/enum
+        # field stayed explicit forever, even set back to the same value
+        # the default already has. ctrl+r (not a plain letter — those get
+        # swallowed by whichever Input has focus, same reason Up/Down
+        # navigation didn't work) resets the FOCUSED field specifically,
+        # regardless of kind.
+        Binding("ctrl+r", "reset_field", "Reset field", show=True),
     ]
 
     DEFAULT_CSS = """
@@ -208,6 +235,15 @@ class FormScreen(DetailScreen):
         self._form_dirty = False
         self._initial_values: dict[str, object] = {}
         self._last_field_error: str | None = None
+        # Fields explicitly reset via ctrl+r (action_reset_field()), mapped
+        # to the value the field was set to display AT reset time. Consulted
+        # by _collect_field_updates(): if the widget's CURRENT value still
+        # matches, the field is written as "clear/revert to inherited"
+        # regardless of what _initial_values says — the fix for the
+        # bool/enum revert-to-inherited gap (str/int/list already had this
+        # via clearing the box to blank). If the widget has since changed
+        # away from the reset value, normal diffing takes back over.
+        self._reset_keys: dict[str, object] = {}
         # Input/Select fire their own Changed message once at initial mount
         # with whatever value the constructor was given (confirmed
         # empirically — Checkbox does not, but Input/Select do). Without this
@@ -232,7 +268,7 @@ class FormScreen(DetailScreen):
         mode (nothing to save yet)."""
         if action in ("edit", "delete"):
             return self.mode == "view"
-        if action == "save":
+        if action in ("save", "reset_field"):
             return self.mode != "view"
         return True
 
@@ -308,6 +344,7 @@ class FormScreen(DetailScreen):
     # ── generic field snapshot / provenance / row rendering ─────────────────
 
     def _compute_initial_values(self, entry: dict) -> None:
+        self._reset_keys = {}  # fresh edit session — no lingering reset markers
         try:
             merged = self.cfg.merged_entry(self._defaults_kind(), entry)
         except (ValueError, FileNotFoundError):
@@ -334,23 +371,29 @@ class FormScreen(DetailScreen):
         with Horizontal(classes="field-row"):
             yield Static(spec.label, classes="field-label")
             if spec.kind == "bool":
-                yield Checkbox(value=bool(initial), id=widget_id(spec.key))
+                widget = Checkbox(value=bool(initial), id=widget_id(spec.key))
             elif spec.kind == "enum":
                 options = spec.options or ()
-                yield Select(
+                widget = Select(
                     [(o, o) for o in options],
                     value=initial if initial in options else (options or (None,))[0],
                     allow_blank=False,
                     id=widget_id(spec.key),
                 )
             elif spec.kind == "list":
-                yield Input(value=list_to_text(initial), id=widget_id(spec.key))
+                widget = Input(value=list_to_text(initial), id=widget_id(spec.key))
             else:
-                yield Input(
+                widget = Input(
                     value="" if initial is None else str(initial),
                     id=widget_id(spec.key),
                     password=spec.secret,
                 )
+            # Tagged so a focused widget can be mapped back to its FieldSpec
+            # (action_reset_field()) without unmunging widget_id()'s
+            # dot-to-dash id transform, which would be ambiguous for any
+            # future field key containing a literal dash.
+            widget.field_key = spec.key
+            yield widget
             yield Static(prov_text, classes="field-provenance")
 
     # ── dirty tracking (per-screen, not EditableConfig.dirty — nothing is
@@ -371,6 +414,34 @@ class FormScreen(DetailScreen):
         if self._populating:
             return
         self._form_dirty = True
+
+    def action_reset_field(self) -> None:
+        """ctrl+r: reset the FOCUSED field to its pure-defaults value (no
+        explicit override) — see the `_reset_keys` field comment for how
+        this becomes an actual "revert to inherited" on Save, regardless of
+        field kind. A no-op if focus isn't on a resettable field (e.g. the
+        Name/Description inputs, which aren't tagged with `field_key` — see
+        `_compose_field_row()` — since neither has a `*_defaults` concept)."""
+        widget = self.focused
+        field_key = getattr(widget, "field_key", None)
+        if field_key is None:
+            return
+        spec = next((s for s in self._field_specs() if s.key == field_key), None)
+        if spec is None:
+            return
+
+        try:
+            defaults_only = self.cfg.merged_entry(self._defaults_kind(), {})
+        except (ValueError, FileNotFoundError):
+            defaults_only = {}
+        value = get_nested(defaults_only, spec.key)
+        if value is None:
+            value = self._dataclass_defaults().get(spec.key)
+
+        set_widget_value(spec, widget, value)
+        self._reset_keys[spec.key] = read_widget_value(spec, widget)
+        self._form_dirty = True
+        self.notify(f"{spec.label}: will revert to inherited on Save.", severity="information")
 
     # ── navigation ───────────────────────────────────────────────────────────
 
@@ -502,6 +573,16 @@ class FormScreen(DetailScreen):
             except ValueError as exc:
                 self._last_field_error = str(exc)
                 return None
+            # A field ctrl+r-reset earlier this session (action_reset_field())
+            # always clears to inherited on Save, REGARDLESS of
+            # _initial_values — this is what makes bool/enum fields able to
+            # revert to inherited at all (they have no "blank" state to
+            # clear, unlike str/int/list). Only holds if the widget still
+            # shows the value reset set it to; if the user changed it again
+            # since, this falls through to the normal diff below.
+            if spec.key in self._reset_keys and new_value == self._reset_keys[spec.key]:
+                updates[spec.key] = None
+                continue
             if new_value != self._initial_values.get(spec.key):
                 updates[spec.key] = new_value
 

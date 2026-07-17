@@ -111,17 +111,21 @@ per-row status lookups.
    "duplicates the default" findings as the nudge to promote repeated
    overrides into defaults. List fields are provenance-binary at the
    whole-list level (merge replaces lists wholesale — no per-item marking).
-   **Known gap, user-reported, not yet fixed:** str/int/list fields can
-   revert an explicit override back to inherited by clearing the field to
-   blank (`apply_update()` pops the key). A `bool` field has no equivalent
-   gesture — a `Checkbox` only has True/False, no third "cleared" state —
-   so once a boolean field becomes explicit (any edit to it, even one that
-   happens to land back on the same value the default already has), there
-   is currently NO way to make it inherited again through this UI; the
-   entry keeps an explicit `true`/`false` forever unless hand-edited via
-   `$EDITOR`. Needs a deliberate UI decision (a tri-state control, a
-   separate "reset to default" affordance per field, etc.) — not fixed
-   opportunistically alongside the item that surfaced it.
+   **Gap fixed:** str/int/list fields could always revert an explicit
+   override back to inherited by clearing the field to blank
+   (`apply_update()` pops the key), but a `bool`/`enum` field had no
+   equivalent — a `Checkbox`/`Select` has no "blank" state, so once touched
+   it stayed explicit forever, even set back to a value matching the
+   default (user-reported, exactly this way). Fixed with `ctrl+r`
+   (`action_reset_field()`, `gateway/configtool/screens/form_common.py`):
+   resets the FOCUSED field to its pure-`*_defaults` value and marks it in
+   `self._reset_keys`; `_collect_field_updates()` writes a field in
+   `_reset_keys` as "clear to inherited" on Save regardless of kind, as
+   long as the widget still shows the reset value (a further real edit
+   supersedes it and falls back to normal diffing). Chosen over a tri-state
+   control or a per-row reset button — one consistent keybinding across
+   every field kind, including str/int/list where it's a faster alternative
+   to clearing the box.
 3. **`rooms:` group editing — two-tier rule:** deleting a room removes it
    from the list (normalizing `rooms: [x]` → `room: x`); editing a
    **per-room** field (`name`/`session_id` — already hard-restricted to
