@@ -106,7 +106,11 @@ class TestFindReferencingWatcherLabels(unittest.TestCase):
         labels = find_referencing_watcher_labels(cfg, connector_name="rc")
         self.assertEqual(labels, ["my-watcher"])
 
-    def test_label_falls_back_to_room_when_the_watcher_has_no_name(self):
+    def test_label_uses_the_real_auto_generated_name_when_the_watcher_has_no_name(self):
+        """The real name an unnamed watcher gets everywhere else in the TUI
+        (e.g. the Overview's Watchers tab) is `_auto_watcher_name()`'s
+        "<connector>-<room>" (gateway/config.py) — NOT the bare room string.
+        A user-reported mismatch here was the actual bug this test pins."""
         cfg = self._cfg(f"""\
             agents:
               default:
@@ -122,9 +126,11 @@ class TestFindReferencingWatcherLabels(unittest.TestCase):
                 room: general
         """)
         labels = find_referencing_watcher_labels(cfg, connector_name="rc")
-        self.assertEqual(labels, ["general"])
+        self.assertEqual(labels, ["rc-general"])
 
-    def test_label_falls_back_to_joined_rooms_when_the_watcher_has_no_name(self):
+    def test_a_rooms_group_produces_one_label_per_real_expanded_watcher(self):
+        """A `rooms: [a, b]` entry is 2 SEPARATE real watchers (rc-general,
+        rc-dev), not one joined "general, dev" string."""
         cfg = self._cfg(f"""\
             agents:
               default:
@@ -140,7 +146,27 @@ class TestFindReferencingWatcherLabels(unittest.TestCase):
                 rooms: [general, dev]
         """)
         labels = find_referencing_watcher_labels(cfg, connector_name="rc")
-        self.assertEqual(labels, ["general, dev"])
+        self.assertEqual(labels, ["rc-general", "rc-dev"])
+
+    def test_returns_empty_when_the_config_does_not_currently_load(self):
+        """A delete pre-check has nothing useful to say if the config is
+        already broken for some unrelated reason — save()'s own validation
+        remains the backstop for that; this must not raise."""
+        cfg = self._cfg(f"""\
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            watchers:
+              - connector: rc
+                agent: nonexistent-agent
+                room: general
+        """)
+        self.assertEqual(find_referencing_watcher_labels(cfg, connector_name="rc"), [])
 
     def test_multiple_referencing_watchers_are_all_returned(self):
         cfg = self._cfg(f"""\

@@ -390,6 +390,67 @@ class TestEditAgent:
             entry = app.editable_config.agents_raw["existing-agent"]
             assert "timeout" not in entry
 
+    async def test_a_save_that_fails_validate_config_does_not_mutate_the_live_entry(
+        self, tmp_path, work_dir
+    ):
+        """User-reported: setting timeout to a value that parses fine as an
+        integer but fails validate_config() (timeout <= permissions.timeout,
+        with permissions enabled), having Save fail, then pressing Back
+        still showed the invalid value — i.e. the failed save had already
+        mutated the SAME dict object already living in cfg.document, since
+        edit mode used to pass self.entry itself (not a copy) as the
+        in-progress target_entry. Fixed by always applying updates to a
+        COPY and only swapping it into `document` (installed BEFORE save(),
+        rolled back on failure) — this pins the original entry stays
+        completely untouched, in memory AND on disk, after a rejected save."""
+        config_path = _write_config(
+            tmp_path,
+            _config_with_one_agent(
+                work_dir, "timeout: 500\npermissions: {enabled: true, timeout: 300}\n"
+            ),
+        )
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_in_edit_mode(pilot, app)
+
+            app.screen.query_one("#field-timeout", Input).value = "-1"
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            assert isinstance(app.screen, MessageModal)
+            body = str(app.screen.query_one("#message-body").render())
+            assert "timeout" in body
+            await pilot.press("enter")  # dismiss
+            await pilot.pause()
+
+            assert isinstance(app.screen, AgentDetailScreen)
+            assert app.screen.mode == "edit"
+
+            # The ORIGINAL entry must be completely untouched — not just
+            # "no timeout key", but the exact original value preserved.
+            entry = app.editable_config.agents_raw["existing-agent"]
+            assert entry["timeout"] == 500
+
+            # Escape (discarding this still-open edit) and confirm the
+            # view-mode screen (and the file on disk) show the ORIGINAL
+            # value too, not the rejected -1.
+            await pilot.press("escape")
+            await pilot.pause()
+            if isinstance(app.screen, ConfirmModal):
+                await pilot.press("tab", "enter")  # Discard
+                await pilot.pause()
+
+            assert isinstance(app.screen, AgentDetailScreen)
+            assert app.screen.mode == "view"
+            body = app.screen._body_text()
+            assert "timeout: 500" in body
+            assert "-1" not in body
+
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert raw["agents"]["existing-agent"]["timeout"] == 500
+
     async def test_working_directory_warning_appears_for_a_missing_directory(
         self, tmp_path, work_dir
     ):

@@ -134,29 +134,31 @@ def read_widget_value(spec: FieldSpec, widget: object) -> object:
 def find_referencing_watcher_labels(
     cfg: EditableConfig, *, connector_name: str | None = None, agent_name: str | None = None
 ) -> list[str]:
-    """Which watchers currently reference the given connector and/or agent
-    name — checked against the MERGED value (`watcher_defaults` can set
-    `connector`/`agent` too; both are allowed there, unlike `name`/`room`/
-    `rooms`/`session_id`), so a watcher that only inherits its connector/agent
-    from `watcher_defaults` still counts. Used to give a clear pre-delete
-    warning instead of the generic validator error `save()` would otherwise
-    surface after the fact.
+    """Which EXPANDED watchers currently reference the given connector and/or
+    agent name — one label per real watcher, using `expanded_watchers()`
+    (the same real loader that names them everywhere else in the TUI, e.g.
+    the Overview's Watchers tab) rather than re-deriving names from the raw
+    entry. Two things this gets right that a raw-entry-only approach
+    wouldn't: (1) an unnamed watcher's real name is `_auto_watcher_name()`'s
+    `"<connector>-<room>"` (gateway/config.py), not the bare room string;
+    (2) a `rooms: [a, b]` group is N separate real watchers with N separate
+    names, not one joined "a, b" label. If the config doesn't currently
+    load at all, returns [] — `save()`'s own validation remains the backstop
+    for whatever's actually broken; a delete pre-check has nothing useful to
+    say about referencing watchers in a config that doesn't parse.
     """
+    try:
+        expanded = cfg.expanded_watchers()
+    except (ValueError, FileNotFoundError):
+        return []
     labels = []
-    for entry in cfg.watchers_raw:
-        try:
-            merged = cfg.merged_entry("watcher_defaults", entry)
-        except (ValueError, FileNotFoundError):
-            merged = entry
-        if connector_name is not None and merged.get("connector") != connector_name:
+    for ew in expanded:
+        w = ew.watcher
+        if connector_name is not None and w.connector != connector_name:
             continue
-        if agent_name is not None and merged.get("agent") != agent_name:
+        if agent_name is not None and w.agent != agent_name:
             continue
-        label = entry.get("name")
-        if not label:
-            rooms = entry.get("rooms")
-            label = ", ".join(rooms) if rooms else entry.get("room", "?")
-        labels.append(label)
+        labels.append(w.name)
     return labels
 
 
@@ -262,6 +264,24 @@ class FormScreen(DetailScreen):
     def _reinsert_entry_into_document(self) -> None:
         """Undo `_remove_entry_from_document()` — called when `save()`
         rejects the deletion (e.g. a watcher still references this entity)."""
+        raise NotImplementedError
+
+    def _install_trial_entry(self, target_entry: dict) -> None:
+        """EDIT mode only: temporarily substitute `target_entry` (a COPY of
+        `self.entry` with this Save's updates already applied) into
+        `self.cfg.document`, in place of the original. This runs BEFORE
+        `save()` — never mutate `self.entry` itself here, or a rejected
+        save leaves invalid data sitting in the document even though
+        nothing was ever written to disk (a real bug: user-reported that
+        setting an invalid value, having Save fail, then pressing Back
+        still showed the invalid value — because the old code mutated
+        the SAME dict object `document` already held). Call
+        `_rollback_trial_entry()` if `save()` rejects it."""
+        raise NotImplementedError
+
+    def _rollback_trial_entry(self) -> None:
+        """Undo `_install_trial_entry()` — restore the ORIGINAL `self.entry`
+        (untouched) into `document`. Called when `save()` rejects the trial."""
         raise NotImplementedError
 
     def _referencing_watcher_labels(self) -> list[str]:
