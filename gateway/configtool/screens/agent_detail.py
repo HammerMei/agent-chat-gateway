@@ -100,6 +100,23 @@ _PERMISSIONS_FORM_FIELDS: list[_FieldSpec] = [
 _ALL_FORM_FIELDS = (*_FORM_FIELDS, *_PERMISSIONS_FORM_FIELDS)
 
 
+class _AgentForm(VerticalScroll):
+    """The form's scroll container — Up/Down move between fields instead of
+    scrolling (VerticalScroll's own inherited action_scroll_up/down, bound
+    to up/down by default). A form is naturally row-oriented, so this reads
+    more like a real form than a scrollable document; Home/End/PageUp/
+    PageDown and the mouse wheel still scroll if the form doesn't fit the
+    terminal. Only overriding the two ACTIONS (not adding new BINDINGS) —
+    Select's own dropdown still handles up/down itself while open, since
+    that's resolved before it ever reaches this container."""
+
+    def action_scroll_up(self) -> None:
+        self.screen.focus_previous()
+
+    def action_scroll_down(self) -> None:
+        self.screen.focus_next()
+
+
 def _widget_id(key: str) -> str:
     return "field-" + key.replace(".", "-")
 
@@ -318,7 +335,7 @@ class AgentDetailScreen(DetailScreen):
             return None
 
     def _compose_form(self) -> ComposeResult:
-        with VerticalScroll(id="agent-form"):
+        with _AgentForm(id="agent-form"):
             if self.mode == "create":
                 yield Static("[bold]New agent[/bold]")
                 with Horizontal(classes="field-row"):
@@ -405,6 +422,17 @@ class AgentDetailScreen(DetailScreen):
         self._populating = True
         await self.recompose()
         self.call_after_refresh(self._stop_populating)
+        # Footer subscribes to Screen.bindings_updated_signal in ITS OWN
+        # on_mount — recompose() mounts a brand-new Footer instance, but
+        # nothing re-publishes that signal just because a new subscriber
+        # showed up, so the fresh Footer's `_bindings_ready` reactive stays
+        # False forever and it renders as a blank bar (confirmed empirically:
+        # reproduced by view -> edit -> back -> edit and inspecting Footer's
+        # FooterKey children directly — 4 at first mount, 0 after this
+        # recompose, permanently). refresh_bindings() is Screen's own public
+        # method for exactly this: it re-publishes the signal so every
+        # current subscriber (including the new Footer) recomputes.
+        self.refresh_bindings()
 
     @work
     async def action_back(self) -> None:
@@ -423,6 +451,7 @@ class AgentDetailScreen(DetailScreen):
             self.mode = "view"
             self._form_dirty = False
             await self.recompose()
+            self.refresh_bindings()  # see action_edit()'s comment — same fix
 
     def _collect_field_updates(self) -> dict[str, object] | None:
         """Diff every form widget against `_initial_values`. Returns
