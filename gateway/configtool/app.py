@@ -55,7 +55,7 @@ class ConfigToolApp(App):
         or a manual 'refresh' action) and repaint the active screen."""
         self._load()
         if isinstance(self.screen, OverviewScreen):
-            self.screen.refresh_overview()
+            self.screen.repaint_from_memory()
 
     def open_editor_and_reload(self) -> None:
         """Suspend the TUI, open $EDITOR on config.yaml, resume + reload.

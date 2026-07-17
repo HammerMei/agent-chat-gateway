@@ -12,28 +12,18 @@ from __future__ import annotations
 
 from typing import Literal
 
-from textual.app import ComposeResult
-from textual.binding import Binding
-from textual.containers import VerticalScroll
-from textual.screen import Screen
-from textual.widgets import Footer, Header, Static
-
 from ..model import EditableConfig
+from .base import DetailScreen
 
 
-class ToolPresetsScreen(Screen):
-    BINDINGS = [Binding("escape", "back", "Back")]
+class ToolPresetsScreen(DetailScreen):
+    BODY_ID = "preset-detail-body"
 
     def __init__(self, cfg: EditableConfig, preset_name: str, mode: Literal["view", "edit"] = "view"):
         super().__init__()
         self.cfg = cfg
         self.preset_name = preset_name
         self.mode = mode
-
-    def compose(self) -> ComposeResult:
-        yield Header()
-        yield VerticalScroll(Static(self._body_text(), id="preset-detail-body"))
-        yield Footer()
 
     def _body_text(self) -> str:
         rules = self.cfg.tool_presets_raw.get(self.preset_name, [])
@@ -63,6 +53,3 @@ class ToolPresetsScreen(Screen):
                 params = rule.get("params")
                 lines.append(f"  {tool} / {params or '(any)'}")
         return "\n".join(lines)
-
-    def action_back(self) -> None:
-        self.app.pop_screen()
