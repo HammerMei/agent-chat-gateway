@@ -340,6 +340,32 @@ split-out insertion position).
   `ConfigToolApp.action_quit()` — `AgentDetailScreen.action_back()` awaits a
   `ConfirmModal` result for its own discard-vs-keep-editing decision, so it's
   `@work`-decorated too.
+- **`Footer` goes permanently blank after `recompose()` unless you call
+  `Screen.refresh_bindings()` afterward.** User-reported: after entering
+  `AgentDetailScreen`'s edit mode once, the footer became a blank bar and
+  stayed blank for the rest of that screen's life — even going back to view
+  mode and re-entering edit. Root cause: `Footer.on_mount()` subscribes to
+  `Screen.bindings_updated_signal`; `Footer.compose()` renders nothing until
+  its `_bindings_ready` reactive is set, which only happens inside its own
+  `bindings_changed` signal callback. `recompose()` mounts a BRAND-NEW
+  `Footer` instance every time (view↔edit), which re-subscribes but never
+  receives that signal on its own — nothing re-fires it just because a new
+  subscriber showed up, since the screen's bindings didn't structurally
+  change from Textual's point of view. Fixed by calling
+  `self.refresh_bindings()` (Screen's own public method — re-publishes the
+  signal to every current subscriber) right after every `recompose()` in
+  `action_edit()`/`action_back()`. Any future screen that recomposes itself
+  in place (rather than pushing a new screen) needs this same call.
+- **`VerticalScroll` binds Up/Down to `action_scroll_up`/`action_scroll_down`
+  by default**, which is why a form wrapped in one only supported Tab/
+  Shift+Tab between fields. User-requested Up/Down field navigation: a small
+  `_AgentForm(VerticalScroll)` subclass overrides just those two ACTIONS
+  (not new bindings) to call `self.screen.focus_previous()`/`focus_next()`
+  instead of scrolling — Home/End/PageUp/PageDown and the mouse wheel still
+  scroll if the form doesn't fit the terminal. One caveat, not a bug: while
+  focus is ON the `type` field's `Select` widget, Up/Down are captured by
+  Select's own dropdown (matching ordinary combobox behavior everywhere) —
+  Tab still moves past it.
 - Verified against the real, currently-live production config (8 connectors,
   4 agents, 24 watchers expanded from 12 raw entries, 2 tool presets):
   renders correctly, and drilling into all 36 rows (24 watchers + 8

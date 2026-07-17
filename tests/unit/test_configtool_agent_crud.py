@@ -15,7 +15,8 @@ from pathlib import Path
 
 import pytest
 import yaml
-from textual.widgets import Checkbox, DataTable, Input, Select, Static
+from textual.widgets import Checkbox, DataTable, Footer, Input, Select, Static
+from textual.widgets._footer import FooterKey
 
 from gateway.configtool.app import ConfigToolApp
 from gateway.configtool.modals import ConfirmModal, TypePickerModal
@@ -503,3 +504,82 @@ class TestEscapeConfirmation:
             await pilot.pause()
             assert isinstance(app.screen, OverviewScreen)
             assert "abandoned" not in app.editable_config.agents_raw
+
+
+class TestFooterSurvivesRecompose:
+    """Regression: Footer subscribes to Screen.bindings_updated_signal in
+    its OWN on_mount — recompose() (used for every view<->edit transition)
+    mounts a brand-new Footer instance, but nothing re-publishes that signal
+    just because a new subscriber showed up, so the fresh Footer's
+    `_bindings_ready` reactive stayed False forever and it rendered as a
+    blank bar with zero FooterKey children, permanently, from the first
+    view->edit transition onward (user-reported). Fixed by calling
+    Screen.refresh_bindings() — its own public API for exactly this — right
+    after every recompose() in action_edit()/action_back()."""
+
+    async def test_footer_keys_survive_view_edit_view_edit_cycle(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _config_with_one_agent(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.screen.query_one("#agents-table", DataTable)
+            table.focus()
+            table.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause()
+
+            def footer_key_count() -> int:
+                footer = app.screen.query_one(Footer)
+                return len(list(footer.query(FooterKey)))
+
+            assert footer_key_count() > 0  # initial view mode
+
+            await pilot.press("e")
+            await pilot.pause()
+            assert footer_key_count() > 0  # edit mode — this used to be 0
+
+            await pilot.press("escape")
+            await pilot.pause()
+            assert footer_key_count() > 0  # back to view — this used to be 0
+
+            await pilot.press("e")
+            await pilot.pause()
+            assert footer_key_count() > 0  # re-entered edit — this used to be 0
+
+
+class TestArrowKeyFieldNavigation:
+    """Up/Down move between form fields instead of scrolling the form
+    container (_AgentForm overrides VerticalScroll's inherited
+    action_scroll_up/down) — user-requested, since Tab-only navigation in a
+    long form is tedious. Home/End/PageUp/PageDown and the mouse wheel still
+    scroll if the form doesn't fit the terminal."""
+
+    async def test_down_moves_focus_to_the_next_field(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _config_with_one_agent(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_in_edit_mode(pilot, app)
+
+            desc = app.screen.query_one("#field-description", Input)
+            desc.focus()
+            await pilot.pause()
+
+            await pilot.press("down")
+            await pilot.pause()
+            assert app.screen.focused.id == "field-type"
+
+    async def test_up_moves_focus_to_the_previous_field(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _config_with_one_agent(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_in_edit_mode(pilot, app)
+
+            command_input = app.screen.query_one("#field-command", Input)
+            command_input.focus()
+            await pilot.pause()
+
+            await pilot.press("up")
+            await pilot.pause()
+            assert app.screen.focused.id == "field-type"
