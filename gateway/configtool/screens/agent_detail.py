@@ -191,7 +191,12 @@ class AgentDetailScreen(FormScreen):
     # ── edit/create form ─────────────────────────────────────────────────────
 
     def _compose_form(self) -> ComposeResult:
-        with VerticalScroll(classes="entity-form"):
+        # can_focus=False: otherwise this container is itself the first
+        # focusable widget (user-reported: needed Tab TWICE to reach the
+        # first real field — once to focus this container, once to move
+        # past it). The container isn't meant to be focused on its own;
+        # scrolling still works via the mouse wheel/PageUp/PageDown.
+        with VerticalScroll(classes="entity-form", can_focus=False):
             if self.mode == "create":
                 yield Static("[bold]New agent[/bold]")
                 with Horizontal(classes="field-row"):

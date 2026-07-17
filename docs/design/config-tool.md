@@ -403,6 +403,19 @@ split-out insertion position).
   recomposes itself between modes (e.g. view → edit) has to re-arm the
   guard and reschedule `call_after_refresh` at the recompose call site
   itself, not rely on `on_mount` firing again.
+- **A `VerticalScroll` is itself focusable by default, and ends up FIRST in
+  the Tab cycle — before any of the widgets inside it.** User-reported:
+  entering edit mode needed Tab pressed TWICE to reach the first real field
+  (once to focus the form's own scroll container, once to move past it).
+  Same root cause hit `AUTO_FOCUS` too (Textual's own default,
+  `App.AUTO_FOCUS = "*"`, which normally auto-focuses the first focusable
+  widget on a screen's first mount): in CREATE mode — a genuine fresh
+  push, so `AUTO_FOCUS` does fire — focus still landed on the container,
+  not the Name field, for the same reason. Fixed both at once with
+  `VerticalScroll(classes="entity-form", can_focus=False)` on the form's own
+  container — it isn't meant to be independently focused; scrolling still
+  works via the mouse wheel/PageUp/PageDown. Worth checking for on any
+  future container that wraps a form's fields.
 - **`push_screen_wait()` needs a `@work`-decorated caller**, same gotcha as
   `ConfigToolApp.action_quit()` — `AgentDetailScreen.action_back()` awaits a
   `ConfirmModal` result for its own discard-vs-keep-editing decision, so it's

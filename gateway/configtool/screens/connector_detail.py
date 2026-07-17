@@ -182,7 +182,10 @@ class ConnectorDetailScreen(FormScreen):
 
     def _compose_form(self) -> ComposeResult:
         conn_type = self._connector_type()
-        with VerticalScroll(classes="entity-form"):
+        # can_focus=False: see AgentDetailScreen's identical comment — the
+        # container was itself the first stop in the Tab cycle, needing an
+        # extra Tab press to reach the first real field.
+        with VerticalScroll(classes="entity-form", can_focus=False):
             if self.mode == "create":
                 yield Static(f"[bold]New {conn_type} connector[/bold]")
                 with Horizontal(classes="field-row"):
