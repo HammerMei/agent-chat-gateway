@@ -208,6 +208,74 @@ class TestEditableConfigDefaultsBlock(_EditableConfigTestBase):
             cfg.defaults_block("watcher_defaults")
 
 
+class TestEditableConfigDefaultsBlockCaching(_EditableConfigTestBase):
+    """Code review item 8: defaults_block() is cached per kind (see
+    EditableConfig._defaults_cache) instead of re-running
+    _extract_defaults_block on every call. These tests pin the two things
+    that matter about a cache: repeated calls return the equivalent value,
+    and load()/reload() — the only ways `document` changes — invalidate it."""
+
+    def _cfg(self) -> tuple[EditableConfig, Path]:
+        path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "$RC_URL", username: bot, password: pw}}
+            agent_defaults:
+              type: claude
+              working_directory: {self.agent_dir}
+            agents:
+              default: {{}}
+            watchers:
+              - name: w1
+                room: general
+        """)
+        return EditableConfig.load(path), path
+
+    def test_repeated_calls_return_the_same_cached_object(self):
+        cfg, _ = self._cfg()
+        first = cfg.defaults_block("agent_defaults")
+        second = cfg.defaults_block("agent_defaults")
+        self.assertIs(first, second)
+
+    def test_reload_invalidates_the_cache(self):
+        cfg, path = self._cfg()
+        first = cfg.defaults_block("agent_defaults")
+        self.assertEqual(first["type"], "claude")
+
+        path.write_text(
+            path.read_text().replace("type: claude", "type: opencode")
+        )
+        cfg.reload()
+        second = cfg.defaults_block("agent_defaults")
+        self.assertEqual(second["type"], "opencode")
+        self.assertIsNot(first, second)
+
+    def test_a_failed_lookup_is_not_cached_as_a_false_success(self):
+        path = self._write("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: "$RC_URL", username: bot, password: pw}
+            watcher_defaults:
+              session_id: not-allowed
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watchers:
+              - name: w1
+                room: general
+        """)
+        cfg = EditableConfig.load(path)
+        with self.assertRaises(ValueError):
+            cfg.defaults_block("watcher_defaults")
+        # Calling again must still raise — a cache bug could swallow this
+        # into a stale/absent cached value instead of re-validating.
+        with self.assertRaises(ValueError):
+            cfg.defaults_block("watcher_defaults")
+
+
 class TestEditableConfigProvenance(_EditableConfigTestBase):
     def _cfg(self) -> EditableConfig:
         path = self._write(f"""\
