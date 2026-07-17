@@ -609,3 +609,42 @@ class TestFooterHintsMatchAvailableActions:
             assert "ctrl+s" in keys
             assert "e" not in keys
             assert "tab" in keys
+
+
+class TestFirstFieldFocus:
+    """Regression: the form's VerticalScroll container was itself the first
+    stop in the Tab cycle (it's focusable by default, for keyboard
+    scrolling) — user-reported needing to press Tab TWICE after entering
+    edit mode to reach the first real field. Fixed with can_focus=False on
+    the container; scrolling still works via mouse wheel/PageUp/PageDown."""
+
+    async def test_create_mode_auto_focuses_the_name_field_with_zero_tabs(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _config_with_one_agent(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.screen.query_one("TabbedContent").active = "tab-agents"
+            await pilot.pause()
+            await pilot.press("n")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert app.screen.focused is not None
+            assert app.screen.focused.id == "field-name"
+
+    async def test_edit_mode_reaches_the_first_field_with_a_single_tab(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _config_with_one_agent(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_in_edit_mode(pilot, app)
+
+            await pilot.press("tab")
+            await pilot.pause()
+            assert app.screen.focused is not None
+            assert app.screen.focused.id == "field-description"
