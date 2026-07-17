@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import textwrap
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from textual.widgets import DataTable, Static
@@ -130,6 +131,64 @@ class TestOverviewRender:
             await pilot.press("q")
             await pilot.pause()
             assert app.is_running is False
+
+    async def test_duplicate_connector_names_do_not_crash_the_table(self, tmp_path, work_dir):
+        """Regression: connectors_raw is the raw, pre-validation list — two
+        connectors sharing a name used to crash refresh_overview() with
+        Textual's DuplicateKey (add_row(key=name) on a repeated key). Rows
+        are now keyed by list position instead."""
+        config_path = _write_config(tmp_path, f"""\
+            connectors:
+              - name: rc-home
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+              - name: rc-home
+                type: rocketchat
+                server: {{url: "http://localhost:3001", username: bot2, password: pw2}}
+            agents:
+              default:
+                type: claude
+                working_directory: {work_dir}
+            watchers:
+              - name: w1
+                room: general
+        """)
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()  # must not raise DuplicateKey
+            table = app.screen.query_one("#connectors-table", DataTable)
+            assert table.row_count == 2
+
+            table.focus()
+            table.move_cursor(row=1)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, ConnectorDetailScreen)
+            body = str(app.screen.query_one("#connector-detail-body", Static).render())
+            assert "3001" in body  # drilled into the SECOND row, not the first
+
+    async def test_connectors_missing_name_do_not_crash_the_table(self, tmp_path, work_dir):
+        """Regression: two connectors both missing 'name:' both fell back to
+        the placeholder "?" and hit the same DuplicateKey crash."""
+        config_path = _write_config(tmp_path, f"""\
+            connectors:
+              - type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+              - type: rocketchat
+                server: {{url: "http://localhost:3001", username: bot2, password: pw2}}
+            agents:
+              default:
+                type: claude
+                working_directory: {work_dir}
+            watchers:
+              - name: w1
+                room: general
+        """)
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()  # must not raise DuplicateKey
+            table = app.screen.query_one("#connectors-table", DataTable)
+            assert table.row_count == 2
 
     async def test_connector_type_inherited_from_defaults_is_shown_not_a_placeholder(
         self, tmp_path, work_dir
@@ -277,6 +336,38 @@ class TestDetailScreenNavigation:
             body = str(app.screen.query_one("#watcher-detail-body", Static).render())
             assert "shared rooms: group" in body
 
+    async def test_selecting_watcher_row_after_config_becomes_invalid_does_not_crash(
+        self, tmp_path, work_dir
+    ):
+        """Regression: on_data_table_row_selected's watchers-table branch
+        used to call cfg.expanded_watchers() with no try/except at all,
+        unlike refresh_overview()'s equivalent call — selecting a row (any
+        row, including the keyless placeholder shown once the config is
+        already known-broken) after an external edit invalidated the file
+        crashed the whole app instead of being a no-op."""
+        config_path = _write_config(tmp_path, _valid_config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.screen.query_one("#watchers-table", DataTable)
+            assert table.row_count == 3
+
+            # Invalidate the file on disk without going through the app's
+            # own reload path (mirrors an external process/editor).
+            with open(config_path) as f:
+                text = f.read()
+            text = text.replace("http://localhost:3000", "$UNRESOLVED_XYZ_123")
+            with open(config_path, "w") as f:
+                f.write(text)
+
+            table.focus()
+            table.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert app.is_running is True
+            assert isinstance(app.screen, OverviewScreen)  # no detail screen pushed
+
     async def test_watcher_row_without_group_has_no_group_banner(self, tmp_path, work_dir):
         config_path = _write_config(tmp_path, f"""\
             connectors:
@@ -345,6 +436,24 @@ class TestEditorEscapeHatch:
             # Must not raise.
             app.open_editor_and_reload()
             await pilot.pause()
+            assert isinstance(app.screen, OverviewScreen)
+
+    async def test_malformed_editor_env_var_is_caught_and_notified_not_crashed(
+        self, tmp_path, work_dir
+    ):
+        """Regression: resolve_editor_command() (shlex.split on $EDITOR) used
+        to be called OUTSIDE the try/except meant to catch every editor-
+        launch failure — an $EDITOR with an unbalanced quote raised ValueError
+        before the try block was ever entered, crashing the app instead of
+        producing the intended notification."""
+        config_path = _write_config(tmp_path, _valid_config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            with patch.dict("os.environ", {"EDITOR": "vim '"}, clear=False):
+                app.open_editor_and_reload()  # must not raise
+            await pilot.pause()
+            assert app.is_running is True
             assert isinstance(app.screen, OverviewScreen)
 
     async def test_reload_config_after_external_edit_refreshes_overview(

@@ -64,8 +64,13 @@ class ConfigToolApp(App):
         Q6) — restricting it there means it can never race with an in-progress
         edit on some other screen holding unsaved in-memory state.
         """
-        editor_argv = resolve_editor_command(self.config_path)
         try:
+            # resolve_editor_command must stay INSIDE this try — it calls
+            # shlex.split() on $EDITOR/$VISUAL, which raises ValueError on
+            # unbalanced quoting (e.g. EDITOR="vim '"). That's exactly the
+            # kind of editor-launch failure this method exists to catch and
+            # notify on, not crash on.
+            editor_argv = resolve_editor_command(self.config_path)
             with self.suspend():
                 subprocess.call(editor_argv)  # pragma: no cover — needs a real terminal
         except Exception as exc:

@@ -136,8 +136,15 @@ class OverviewScreen(Screen):
         # crashing the whole overview; the banner above already has the
         # actual error text.
 
+        # Keyed by list POSITION, not by name — unlike agents_raw (a dict,
+        # inherently-unique keys) or watchers (names GatewayConfig.from_file
+        # already guarantees unique), connectors_raw is the raw, pre-
+        # validation list: two connectors can share a name, or both be
+        # missing one (falling back to "?"), and Textual's DataTable.add_row
+        # raises DuplicateKey on a repeated key — exactly the kind of config
+        # mistake this tool exists to surface gracefully, not crash on.
         connectors_table.add_columns("Name", "Type", "Status")
-        for c in cfg.connectors_raw:
+        for i, c in enumerate(cfg.connectors_raw):
             name = c.get("name", "?")
             try:
                 merged = cfg.merged_entry("connector_defaults", c)
@@ -145,7 +152,7 @@ class OverviewScreen(Screen):
                 merged = c
             connectors_table.add_row(
                 name, merged.get("type", "?"), status_badge(status.status_for("connector", name)),
-                key=name,
+                key=str(i),
             )
 
         agents_table.add_columns("Name", "Type", "Command", "Status")
@@ -201,15 +208,29 @@ class OverviewScreen(Screen):
         key = str(event.row_key.value)
 
         if table_id == "connectors-table":
-            entry = next((c for c in cfg.connectors_raw if c.get("name") == key), None)
-            if entry is not None:
-                self.app.push_screen(ConnectorDetailScreen(cfg, entry, mode="view"))
+            # key is the row's list position (see refresh_overview) — not
+            # the connector's name, which isn't guaranteed unique/present.
+            connectors = cfg.connectors_raw
+            index = int(key)
+            if 0 <= index < len(connectors):
+                self.app.push_screen(ConnectorDetailScreen(cfg, connectors[index], mode="view"))
         elif table_id == "agents-table":
             entry = cfg.agents_raw.get(key)
             if entry is not None:
                 self.app.push_screen(AgentDetailScreen(cfg, key, entry, mode="view"))
         elif table_id == "watchers-table":
-            ew = next((e for e in cfg.expanded_watchers() if e.watcher.name == key), None)
+            # Unlike refresh_overview()'s population of this same table,
+            # this used to call expanded_watchers() completely unguarded —
+            # if the config became invalid on disk after the table was
+            # painted (e.g. an external edit), selecting ANY row (including
+            # the keyless "(unavailable...)" placeholder row shown in that
+            # case) crashed the whole app. Guarded the same way
+            # refresh_overview() already is.
+            try:
+                expanded = cfg.expanded_watchers()
+            except (ValueError, FileNotFoundError):
+                return
+            ew = next((e for e in expanded if e.watcher.name == key), None)
             if ew is not None:
                 self.app.push_screen(WatcherDetailScreen(cfg, ew, mode="view"))
         elif table_id == "defaults-table":

@@ -241,6 +241,31 @@ class TestCLIConfigLaunchesTUI(_CLITestBase):
                 self._run(["config", "validate", "--config", str(cfg_path)])
         mock_run_app.assert_not_called()
 
+    def test_lint_before_subcommand_does_not_leak_into_validate(self):
+        """Regression: --lint used to share a dest with config_validate_p's
+        own --lint, so argparse's subparser dispatch silently overwrote it —
+        'config --lint validate' parsed to lint=False for validate_config
+        even though the flag was given. Now the two are independent, scoped
+        attributes (lint_for_tui vs. validate's own lint) — placing --lint
+        before the subcommand must not affect the subcommand's own value."""
+        with patch("gateway.config_validate.validate_config") as mock_validate:
+            mock_validate.return_value.ok = True
+            mock_validate.return_value.errors = []
+            mock_validate.return_value.warnings = []
+            mock_validate.return_value.lint_findings = []
+            mock_validate.return_value.entry_count = 0
+            mock_validate.return_value.watcher_count = 0
+            self._run(["config", "--lint", "validate", "--config", "/tmp/x.yaml"])
+        mock_validate.assert_called_once_with("/tmp/x.yaml", lint=False)
+
+    def test_lint_before_subcommand_sets_tui_lint_when_no_subcommand_given(self):
+        """The parent --lint (scoped to launching the TUI) still works
+        correctly on its own, independent of the child's own --lint."""
+        with patch("gateway.configtool.run_app") as mock_run_app:
+            mock_run_app.return_value = 0
+            self._run(["config", "--lint", "--config", "/tmp/x.yaml"])
+        mock_run_app.assert_called_once_with("/tmp/x.yaml", lint=True)
+
 
 # ---------------------------------------------------------------------------
 # Tests: config validate command
