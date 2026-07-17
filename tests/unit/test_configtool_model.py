@@ -8,10 +8,13 @@ writing resolved secrets back to disk in a later save-capable phase).
 
 from __future__ import annotations
 
+import os
 import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+
+import yaml
 
 from gateway.config import GatewayConfig
 from gateway.configtool.model import EditableConfig, Provenance
@@ -381,6 +384,134 @@ class TestEditableConfigValidatedView(_EditableConfigTestBase):
         cfg = EditableConfig.load(path)
         with self.assertRaises(ValueError):
             cfg.validated_view()
+
+
+class TestEditableConfigDirtyTracking(_EditableConfigTestBase):
+    def _cfg(self) -> EditableConfig:
+        path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                room: general
+        """)
+        return EditableConfig.load(path)
+
+    def test_freshly_loaded_config_is_not_dirty(self):
+        cfg = self._cfg()
+        self.assertFalse(cfg.dirty)
+
+    def test_mark_dirty_sets_the_flag_and_clears_the_defaults_cache(self):
+        cfg = self._cfg()
+        cached = cfg.defaults_block("agent_defaults")  # populate the cache
+        cfg.document["agent_defaults"] = {"type": "opencode"}
+        cfg.mark_dirty()
+        self.assertTrue(cfg.dirty)
+        self.assertIsNot(cfg.defaults_block("agent_defaults"), cached)
+        self.assertEqual(cfg.defaults_block("agent_defaults")["type"], "opencode")
+
+    def test_reload_clears_dirty(self):
+        cfg = self._cfg()
+        cfg.mark_dirty()
+        self.assertTrue(cfg.dirty)
+        cfg.reload()
+        self.assertFalse(cfg.dirty)
+
+
+class TestEditableConfigSave(_EditableConfigTestBase):
+    """EditableConfig.save() — docs/design/config-tool.md decision 5:
+    validate-before-write via a same-directory temp file, backup, atomic
+    rename. The $VAR-survives-save test is the security keystone (advisor
+    flagged this explicitly): if save() ever wrote a RESOLVED secret back to
+    config.yaml, that's an incident, not a bug.
+    """
+
+    ENV_VAR_NAME = "RC_URL_FOR_CONFIGTOOL_SAVE_TEST"
+
+    def setUp(self):
+        super().setUp()
+        os.environ[self.ENV_VAR_NAME] = "http://localhost:3000"
+        self.addCleanup(os.environ.pop, self.ENV_VAR_NAME, None)
+
+    def _valid_cfg_text(self) -> str:
+        return f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "${self.ENV_VAR_NAME}", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                room: general
+        """
+
+    def test_save_preserves_the_unresolved_env_var_placeholder(self):
+        path = self._write(self._valid_cfg_text())
+        cfg = EditableConfig.load(path)
+        cfg.save()
+        # Read back with plain yaml (never the env-expanding loader) — the
+        # literal "$VAR" string must survive, not the resolved URL.
+        raw = yaml.safe_load(path.read_text())
+        self.assertEqual(
+            raw["connectors"][0]["server"]["url"], f"${self.ENV_VAR_NAME}"
+        )
+
+    def test_save_writes_a_timestamped_backup_of_the_prior_contents(self):
+        path = self._write(self._valid_cfg_text())
+        original_text = path.read_text()
+        cfg = EditableConfig.load(path)
+        cfg.save()
+        backups = list(path.parent.glob("config.yaml.bak.*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_text(), original_text)
+
+    def test_save_clears_the_dirty_flag(self):
+        path = self._write(self._valid_cfg_text())
+        cfg = EditableConfig.load(path)
+        cfg.mark_dirty()
+        self.assertTrue(cfg.dirty)
+        cfg.save()
+        self.assertFalse(cfg.dirty)
+
+    def test_save_leaves_no_leftover_temp_file(self):
+        path = self._write(self._valid_cfg_text())
+        cfg = EditableConfig.load(path)
+        cfg.save()
+        self.assertFalse((path.parent / "config.yaml.tmp").exists())
+
+    def test_save_refuses_an_invalid_document_and_leaves_disk_untouched(self):
+        path = self._write(self._valid_cfg_text())
+        original_text = path.read_text()
+        cfg = EditableConfig.load(path)
+        del cfg.document["agents"]["default"]["working_directory"]
+        cfg.mark_dirty()
+
+        with self.assertRaises(ValueError):
+            cfg.save()
+
+        # The real file must be byte-identical to before the failed save —
+        # no partial/temp/backup artifacts left behind either.
+        self.assertEqual(path.read_text(), original_text)
+        self.assertFalse((path.parent / "config.yaml.tmp").exists())
+        self.assertEqual(list(path.parent.glob("config.yaml.bak.*")), [])
+        # dirty must stay set: the in-memory edit was never actually saved.
+        self.assertTrue(cfg.dirty)
+
+    def test_save_raises_file_not_found_if_the_config_file_is_gone(self):
+        path = self._write(self._valid_cfg_text())
+        cfg = EditableConfig.load(path)
+        path.unlink()
+        with self.assertRaises(FileNotFoundError):
+            cfg.save()
 
 
 if __name__ == "__main__":

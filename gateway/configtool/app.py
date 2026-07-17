@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import subprocess
 
+from textual import work
 from textual.app import App
 
 from ..config_validate import ValidationResult, validate_config
 from .editor import resolve_editor_command
+from .modals import ConfirmModal
 from .model import EditableConfig
 from .screens.overview import OverviewScreen
 
@@ -42,6 +44,28 @@ class ConfigToolApp(App):
 
     def on_mount(self) -> None:
         self.push_screen(OverviewScreen())
+
+    @work
+    async def action_quit(self) -> None:
+        """Overrides App's default action_quit (bound to ctrl+q, and to the
+        visible 'q' binding on OverviewScreen) to gate on unsaved changes.
+        No Phase 2/3 edit screen exists yet to ever set `dirty`, but this is
+        the mechanism they'll all rely on — built now, alongside save()/
+        dirty tracking, rather than bolted on once the first edit screen
+        needs it.
+
+        `@work` is required here, not optional: `push_screen_wait()` calls
+        `get_current_worker()` internally and raises `NoActiveWorker` if this
+        method runs as a plain action coroutine instead of inside a Textual
+        worker task (confirmed empirically — every keybinding-triggered
+        action normally runs as a bare coroutine, not a worker)."""
+        if self.editable_config is not None and self.editable_config.dirty:
+            discard = await self.push_screen_wait(
+                ConfirmModal("Discard unsaved changes and quit?", confirm_label="Discard")
+            )
+            if not discard:
+                return
+        self.exit()
 
     # ── Shared, non-action helpers (called from OverviewScreen's actions) ───
 
