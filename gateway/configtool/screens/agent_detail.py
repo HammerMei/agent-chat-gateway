@@ -16,14 +16,9 @@ from __future__ import annotations
 
 from typing import Literal
 
-from textual.app import ComposeResult
-from textual.binding import Binding
-from textual.containers import VerticalScroll
-from textual.screen import Screen
-from textual.widgets import Footer, Header, Static
-
 from ..formatting import format_value, provenance_label
 from ..model import EditableConfig
+from .base import DetailScreen
 
 # Top-level agent fields worth a dedicated provenance-annotated line, in the
 # same order as AgentConfig's own fields (gateway/core/config.py).
@@ -34,8 +29,8 @@ _KNOWN_FIELDS = [
 ]
 
 
-class AgentDetailScreen(Screen):
-    BINDINGS = [Binding("escape", "back", "Back")]
+class AgentDetailScreen(DetailScreen):
+    BODY_ID = "agent-detail-body"
 
     def __init__(
         self,
@@ -49,11 +44,6 @@ class AgentDetailScreen(Screen):
         self.agent_name = name
         self.entry = entry
         self.mode = mode
-
-    def compose(self) -> ComposeResult:
-        yield Header()
-        yield VerticalScroll(Static(self._body_text(), id="agent-detail-body"))
-        yield Footer()
 
     def _body_text(self) -> str:
         description = self.entry.get("description")
@@ -95,6 +85,3 @@ class AgentDetailScreen(Screen):
                     lines.append(f"  {tool} / {params or '(any)'}")
 
         return "\n".join(lines)
-
-    def action_back(self) -> None:
-        self.app.pop_screen()

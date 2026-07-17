@@ -13,14 +13,9 @@ from __future__ import annotations
 
 from typing import Literal
 
-from textual.app import ComposeResult
-from textual.binding import Binding
-from textual.containers import VerticalScroll
-from textual.screen import Screen
-from textual.widgets import Footer, Header, Static
-
 from ..formatting import format_value, provenance_label
 from ..model import EditableConfig, ExpandedWatcher
+from .base import DetailScreen
 
 _KNOWN_FIELDS = [
     "session_id", "online_notification", "offline_notification",
@@ -28,8 +23,8 @@ _KNOWN_FIELDS = [
 ]
 
 
-class WatcherDetailScreen(Screen):
-    BINDINGS = [Binding("escape", "back", "Back")]
+class WatcherDetailScreen(DetailScreen):
+    BODY_ID = "watcher-detail-body"
 
     def __init__(
         self,
@@ -41,11 +36,6 @@ class WatcherDetailScreen(Screen):
         self.cfg = cfg
         self.expanded_watcher = expanded_watcher
         self.mode = mode
-
-    def compose(self) -> ComposeResult:
-        yield Header()
-        yield VerticalScroll(Static(self._body_text(), id="watcher-detail-body"))
-        yield Footer()
 
     def _body_text(self) -> str:
         ew = self.expanded_watcher
@@ -86,6 +76,3 @@ class WatcherDetailScreen(Screen):
             )
 
         return "\n".join(lines)
-
-    def action_back(self) -> None:
-        self.app.pop_screen()
