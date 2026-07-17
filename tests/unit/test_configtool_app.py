@@ -12,7 +12,7 @@ building this suite) — so the $EDITOR round-trip's actual suspend+subprocess
 line cannot be exercised here (see `# pragma: no cover` in app.py). What
 *is* tested here: that `open_editor_and_reload()` handles that failure
 gracefully (notifies, doesn't crash) rather than propagating it, and that
-`reload_config()`/`refresh_overview()` — the part of the round-trip that
+`reload_config()`/`repaint_from_memory()` — the part of the round-trip that
 matters for correctness — work correctly on their own.
 """
 
@@ -134,7 +134,7 @@ class TestOverviewRender:
 
     async def test_duplicate_connector_names_do_not_crash_the_table(self, tmp_path, work_dir):
         """Regression: connectors_raw is the raw, pre-validation list — two
-        connectors sharing a name used to crash refresh_overview() with
+        connectors sharing a name used to crash repaint_from_memory() with
         Textual's DuplicateKey (add_row(key=name) on a repeated key). Rows
         are now keyed by list position instead."""
         config_path = _write_config(tmp_path, f"""\
@@ -341,7 +341,7 @@ class TestDetailScreenNavigation:
     ):
         """Regression: on_data_table_row_selected's watchers-table branch
         used to call cfg.expanded_watchers() with no try/except at all,
-        unlike refresh_overview()'s equivalent call — selecting a row (any
+        unlike repaint_from_memory()'s equivalent call — selecting a row (any
         row, including the keyless placeholder shown once the config is
         already known-broken) after an external edit invalidated the file
         crashed the whole app instead of being a no-op."""

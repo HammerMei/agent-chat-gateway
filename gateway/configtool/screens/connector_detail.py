@@ -12,18 +12,13 @@ from __future__ import annotations
 
 from typing import Literal
 
-from textual.app import ComposeResult
-from textual.binding import Binding
-from textual.containers import VerticalScroll
-from textual.screen import Screen
-from textual.widgets import Footer, Header, Static
-
 from ..formatting import mask_if_secret, provenance_label
 from ..model import EditableConfig
+from .base import DetailScreen
 
 
-class ConnectorDetailScreen(Screen):
-    BINDINGS = [Binding("escape", "back", "Back")]
+class ConnectorDetailScreen(DetailScreen):
+    BODY_ID = "connector-detail-body"
 
     def __init__(
         self,
@@ -35,11 +30,6 @@ class ConnectorDetailScreen(Screen):
         self.cfg = cfg
         self.entry = entry
         self.mode = mode
-
-    def compose(self) -> ComposeResult:
-        yield Header()
-        yield VerticalScroll(Static(self._body_text(), id="connector-detail-body"))
-        yield Footer()
 
     def _body_text(self) -> str:
         name = self.entry.get("name", "?")
@@ -80,6 +70,3 @@ class ConnectorDetailScreen(Screen):
             )
             return f"{prefix}{key}:\n{sub}"
         return f"{prefix}{key}: {mask_if_secret(key, value)}"
-
-    def action_back(self) -> None:
-        self.app.pop_screen()

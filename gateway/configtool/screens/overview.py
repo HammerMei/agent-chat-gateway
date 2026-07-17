@@ -71,7 +71,7 @@ class OverviewScreen(Screen):
             "#defaults-table", "#presets-table",
         ):
             self.query_one(table_id, DataTable).cursor_type = "row"
-        self.refresh_overview()
+        self.repaint_from_memory()
 
     # ── Actions ──────────────────────────────────────────────────────────────
 
@@ -81,7 +81,7 @@ class OverviewScreen(Screen):
 
     def action_refresh(self) -> None:
         # Must go through app.reload_config() (re-reads EditableConfig.document
-        # from disk), NOT call self.refresh_overview() directly — that only
+        # from disk), NOT call self.repaint_from_memory() directly — that only
         # repaints from whatever EditableConfig already has in memory, which
         # run_validate() (reading the file fresh internally) can silently
         # disagree with once the file has changed on disk since app startup.
@@ -90,7 +90,13 @@ class OverviewScreen(Screen):
 
     # ── Core refresh logic (the one testable seam per docs/design) ──────────
 
-    def refresh_overview(self) -> None:
+    def repaint_from_memory(self) -> None:
+        """Redraw every tab from EditableConfig's CURRENT in-memory document —
+        does not touch disk. Name is deliberate (code review item 9: the prior
+        name `refresh_overview` invited exactly the bug action_refresh's
+        comment above warns against — reaching for "the refresh method" and
+        getting a stale repaint instead of a disk reload). Call
+        `app.reload_config()` when the on-disk file may have changed."""
         app: "ConfigToolApp" = self.app  # type: ignore[assignment]
         banner = self.query_one("#banner", Static)
 
@@ -208,7 +214,7 @@ class OverviewScreen(Screen):
         key = str(event.row_key.value)
 
         if table_id == "connectors-table":
-            # key is the row's list position (see refresh_overview) — not
+            # key is the row's list position (see repaint_from_memory) — not
             # the connector's name, which isn't guaranteed unique/present.
             connectors = cfg.connectors_raw
             index = int(key)
@@ -219,13 +225,13 @@ class OverviewScreen(Screen):
             if entry is not None:
                 self.app.push_screen(AgentDetailScreen(cfg, key, entry, mode="view"))
         elif table_id == "watchers-table":
-            # Unlike refresh_overview()'s population of this same table,
+            # Unlike repaint_from_memory()'s population of this same table,
             # this used to call expanded_watchers() completely unguarded —
             # if the config became invalid on disk after the table was
             # painted (e.g. an external edit), selecting ANY row (including
             # the keyless "(unavailable...)" placeholder row shown in that
             # case) crashed the whole app. Guarded the same way
-            # refresh_overview() already is.
+            # repaint_from_memory() already is.
             try:
                 expanded = cfg.expanded_watchers()
             except (ValueError, FileNotFoundError):

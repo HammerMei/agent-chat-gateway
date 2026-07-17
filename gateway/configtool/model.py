@@ -24,7 +24,7 @@ resolved secrets — passwords, tokens — into config.yaml in plain text.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
@@ -73,6 +73,23 @@ class EditableConfig:
 
     document: dict
     path: Path
+    # Code review item 8: defaults_block() (and, transitively, merged_entry()/
+    # field_provenance()) re-ran _extract_defaults_block from scratch on
+    # every single call — repaint_from_memory() alone calls it once per
+    # connector/agent/watcher row PLUS once per defaults-table row, all for
+    # the same 3 blocks. Cached here, keyed by kind, invalidated by
+    # load()/reload() (the only two places `document` changes). Not part of
+    # equality/repr — it's a memoization detail, not observable state.
+    # NOTE for whoever adds in-place mutation (Phase 2's save() work, item 7):
+    # this cache is only invalidated by load()/reload() today because nothing
+    # currently mutates `document` any other way. Any future code path that
+    # edits `document` directly (e.g. a form committing a field change) MUST
+    # also clear `_defaults_cache` — Phase 1 also holds this same invariant
+    # implicitly today (its accessors were simply always fresh); this comment
+    # keeps it explicit now that there's a cache to forget.
+    _defaults_cache: dict[str, dict] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
 
     @classmethod
     def load(cls, path: str | Path) -> "EditableConfig":
@@ -99,6 +116,7 @@ class EditableConfig:
         round-trip, or a manual 'refresh' action)."""
         fresh = EditableConfig.load(self.path)
         self.document = fresh.document
+        self._defaults_cache.clear()
 
     # ── Raw entry accessors (pre-merge, as-authored) ─────────────────────────
 
@@ -122,9 +140,13 @@ class EditableConfig:
     def defaults_block(self, kind: str) -> dict:
         """Return the named `*_defaults:` block (description stripped, same
         as the real loader) — 'connector_defaults' | 'agent_defaults' |
-        'watcher_defaults'."""
-        forbidden = _DEFAULTS_FORBIDDEN_KEYS[kind]
-        return _extract_defaults_block(self.document, kind, forbidden)
+        'watcher_defaults'. Cached per kind (see `_defaults_cache`); the
+        underlying `document` never changes except via load()/reload(),
+        both of which invalidate the cache."""
+        if kind not in self._defaults_cache:
+            forbidden = _DEFAULTS_FORBIDDEN_KEYS[kind]
+            self._defaults_cache[kind] = _extract_defaults_block(self.document, kind, forbidden)
+        return self._defaults_cache[kind]
 
     # ── Provenance / effective value (reuses the real merge, never reimplemented) ──
 
@@ -132,7 +154,14 @@ class EditableConfig:
         """`entry_raw` deep-merged against its matching *_defaults block —
         the exact value GatewayConfig.from_file would compute for this one
         entry before its own further per-entry processing (path resolution,
-        tool-preset resolution, etc). Uses the real _deep_merge."""
+        tool-preset resolution, etc). Uses the real _deep_merge.
+
+        Deliberately NOT cached (unlike defaults_block() above): _deep_merge
+        already deep-copies on every call, so it's cheap; caching it would
+        need a key derived from entry_raw's identity, which stops being safe
+        the moment a later phase starts mutating entries in place for
+        editing. defaults_block() is document-scoped and only invalidated by
+        load()/reload(), which is a much simpler invariant to keep correct."""
         return _deep_merge(self.defaults_block(kind), entry_raw)
 
     def field_provenance(self, kind: str, entry_raw: dict, field: str) -> Provenance:
