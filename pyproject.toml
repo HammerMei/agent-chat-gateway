@@ -28,6 +28,7 @@ dependencies = [
     "tree-sitter>=0.23.0",
     "tree-sitter-bash>=0.23.0",
     "croniter>=2.0.0",
+    "textual>=8.2.0",
 ]
 
 [project.urls]
@@ -52,6 +53,7 @@ dev = [
     "coverage>=7.13.5",
     "jsonschema>=4.23.0",
     "pytest>=9.0.2",
+    "pytest-asyncio>=0.24.0",
     "pytest-cov>=7.1.0",
     "pytest-timeout>=2.3",
     "ruff>=0.4.0",
@@ -59,6 +61,7 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "auto"
 markers = [
     "integration: multi-component tests with real I/O or multiple subsystems",
     "e2e: end-to-end tests requiring Docker + ANTHROPIC_API_KEY (run via make e2e-test)",
