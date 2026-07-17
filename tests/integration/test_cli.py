@@ -181,6 +181,93 @@ class TestCLIInstructions(_CLITestBase):
 
 
 # ---------------------------------------------------------------------------
+# Tests: config (no subcommand) — launches the interactive config TUI
+# ---------------------------------------------------------------------------
+
+class TestCLIConfigLaunchesTUI(_CLITestBase):
+    """'config' with no subcommand launches gateway.configtool.run_app.
+
+    _run() redirects stdout/stderr to io.StringIO, which is never a TTY, so
+    every case here exercises run_app's own TTY guard — the same guard a
+    real piped/non-interactive invocation would hit. A test that needs to
+    verify the *arguments* run_app receives patches run_app itself rather
+    than trying to actually launch a full-screen Textual app in a test.
+    """
+
+    def test_no_subcommand_hits_tty_guard_and_exits_one(self):
+        stdout, stderr, code = self._run(["config"])
+        self.assertEqual(code, 1)
+        self.assertIn("requires an interactive terminal", stderr)
+
+    def test_no_subcommand_does_not_print_old_usage_message(self):
+        """Regression: before this change, no-subcommand printed a plain
+        usage string and exited 1 — it must now attempt to launch the TUI
+        (and hit the TTY guard under test) instead."""
+        stdout, stderr, code = self._run(["config"])
+        self.assertNotIn("Usage: agent-chat-gateway config", stdout + stderr)
+
+    def test_config_and_lint_flags_are_forwarded_to_run_app(self):
+        with patch("gateway.configtool.run_app") as mock_run_app:
+            mock_run_app.return_value = 0
+            self._run(["config", "--config", "/tmp/example-config.yaml", "--lint"])
+        mock_run_app.assert_called_once_with("/tmp/example-config.yaml", lint=True)
+
+    def test_lint_defaults_to_false(self):
+        with patch("gateway.configtool.run_app") as mock_run_app:
+            mock_run_app.return_value = 0
+            self._run(["config", "--config", "/tmp/example-config.yaml"])
+        mock_run_app.assert_called_once_with("/tmp/example-config.yaml", lint=False)
+
+    def test_default_config_path_used_when_omitted(self):
+        with patch("gateway.configtool.run_app") as mock_run_app:
+            mock_run_app.return_value = 0
+            self._run(["config"])
+        from gateway.cli import DEFAULT_CONFIG
+        mock_run_app.assert_called_once_with(DEFAULT_CONFIG, lint=False)
+
+    def test_exit_code_propagates_from_run_app(self):
+        with patch("gateway.configtool.run_app") as mock_run_app:
+            mock_run_app.return_value = 1
+            _, _, code = self._run(["config"])
+        self.assertEqual(code, 1)
+
+    def test_validate_subcommand_still_dispatches_normally_not_to_tui(self):
+        """Non-regression: 'config validate' must never fall through to
+        run_app — the two dispatch paths must stay mutually exclusive."""
+        with patch("gateway.configtool.run_app") as mock_run_app:
+            cfg_path = Path(self.tmp) / "config.yaml"
+            cfg_path.write_text("connectors: []\nagents: {}\n")
+            with patch("gateway.core.state.RUNTIME_DIR", Path(self.tmp) / "runtime"):
+                self._run(["config", "validate", "--config", str(cfg_path)])
+        mock_run_app.assert_not_called()
+
+    def test_lint_before_subcommand_does_not_leak_into_validate(self):
+        """Regression: --lint used to share a dest with config_validate_p's
+        own --lint, so argparse's subparser dispatch silently overwrote it —
+        'config --lint validate' parsed to lint=False for validate_config
+        even though the flag was given. Now the two are independent, scoped
+        attributes (lint_for_tui vs. validate's own lint) — placing --lint
+        before the subcommand must not affect the subcommand's own value."""
+        with patch("gateway.config_validate.validate_config") as mock_validate:
+            mock_validate.return_value.ok = True
+            mock_validate.return_value.errors = []
+            mock_validate.return_value.warnings = []
+            mock_validate.return_value.lint_findings = []
+            mock_validate.return_value.entry_count = 0
+            mock_validate.return_value.watcher_count = 0
+            self._run(["config", "--lint", "validate", "--config", "/tmp/x.yaml"])
+        mock_validate.assert_called_once_with("/tmp/x.yaml", lint=False)
+
+    def test_lint_before_subcommand_sets_tui_lint_when_no_subcommand_given(self):
+        """The parent --lint (scoped to launching the TUI) still works
+        correctly on its own, independent of the child's own --lint."""
+        with patch("gateway.configtool.run_app") as mock_run_app:
+            mock_run_app.return_value = 0
+            self._run(["config", "--lint", "--config", "/tmp/x.yaml"])
+        mock_run_app.assert_called_once_with("/tmp/x.yaml", lint=True)
+
+
+# ---------------------------------------------------------------------------
 # Tests: config validate command
 # ---------------------------------------------------------------------------
 

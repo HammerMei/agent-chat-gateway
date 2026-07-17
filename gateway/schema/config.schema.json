@@ -18,15 +18,33 @@
     "connector_defaults": {
       "type": "object",
       "description": "Deep-merged into every connector entry below (the entry's own fields win on conflict). Must not set 'name' — that identifies a specific connector.",
+      "properties": {
+        "description": {
+          "type": "string",
+          "description": "Optional annotation for this shared block (informational only; never merged into entries)."
+        }
+      },
       "not": { "required": ["name"] }
     },
     "agent_defaults": {
       "type": "object",
-      "description": "Deep-merged into every entry under 'agents:' (the entry's own fields win on conflict)."
+      "description": "Deep-merged into every entry under 'agents:' (the entry's own fields win on conflict).",
+      "properties": {
+        "description": {
+          "type": "string",
+          "description": "Optional annotation for this shared block (informational only; never merged into entries)."
+        }
+      }
     },
     "watcher_defaults": {
       "type": "object",
       "description": "Deep-merged into every watcher entry below (the entry's own fields win on conflict). Must not set 'name', 'room', 'rooms', or 'session_id' — those identify a specific watcher.",
+      "properties": {
+        "description": {
+          "type": "string",
+          "description": "Optional annotation for this shared block (informational only; never merged into entries)."
+        }
+      },
       "not": {
         "anyOf": [
           { "required": ["name"] },
@@ -118,6 +136,10 @@
           "type": "string",
           "enum": ["rocketchat", "mattermost", "voice", "script"]
         },
+        "description": {
+          "type": "string",
+          "description": "Optional annotation for this connector (informational only; ignored at runtime)."
+        },
         "context_inject_files": {
           "type": "array",
           "items": { "type": "string" }
@@ -128,6 +150,10 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "description": {
+          "type": "string",
+          "description": "Optional annotation for this agent (informational only; ignored at runtime)."
+        },
         "type": {
           "type": "string",
           "enum": ["claude", "opencode"]
@@ -178,6 +204,10 @@
         }
       ],
       "properties": {
+        "description": {
+          "type": "string",
+          "description": "Optional annotation for this watcher (informational only; ignored at runtime)."
+        },
         "name": {
           "type": "string",
           "description": "Only allowed when the entry has exactly one room; auto-derived from connector+room otherwise."
