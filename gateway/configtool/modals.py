@@ -12,7 +12,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, Static
+from textual.widgets import Button, Label, ListItem, ListView, Static
 
 
 class ConfirmModal(ModalScreen[bool]):
@@ -74,3 +74,52 @@ class ConfirmModal(ModalScreen[bool]):
 
     def action_cancel(self) -> None:
         self.dismiss(False)
+
+
+class TypePickerModal(ModalScreen[str | None]):
+    """Pick one of a fixed set of string options — e.g. an agent's `type`
+    (claude/opencode) or a connector's `type` (rocketchat/mattermost/voice/
+    script). `dismiss(None)` on cancel/Escape, `dismiss(chosen)` on
+    Enter/click. Generic across both use cases rather than one modal per
+    entity kind — the two callers just differ in `title` and `options`.
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
+
+    DEFAULT_CSS = """
+    TypePickerModal {
+        align: center middle;
+    }
+    #type-picker-dialog {
+        width: auto;
+        min-width: 30;
+        max-width: 60;
+        height: auto;
+        border: thick $primary;
+        padding: 1 2;
+        background: $surface;
+    }
+    #type-picker-list {
+        height: auto;
+        margin-top: 1;
+    }
+    """
+
+    def __init__(self, title: str, options: list[str]):
+        super().__init__()
+        self.title_text = title
+        self.options = options
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="type-picker-dialog"):
+            yield Static(self.title_text, id="type-picker-title")
+            yield ListView(
+                *[ListItem(Label(option), name=option) for option in self.options],
+                id="type-picker-list",
+            )
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        self.dismiss(event.item.name)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)

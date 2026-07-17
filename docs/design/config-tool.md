@@ -2,10 +2,11 @@
 
 Status: **Phase 1 shipped** (read-only overview + detail screens + $EDITOR
 escape hatch). **Phase 2 in progress:** items 7–10 from the Phase 1 code
-review cleared, plus `EditableConfig.save()`/dirty-tracking/`ConfirmModal`
-foundation shipped; entity create/edit screens, the `.env` writer, and the
-tool-list/preset editor are not yet built. Phase 3 is designed below but not
-yet started. The
+review cleared; `EditableConfig.save()`/dirty-tracking/`ConfirmModal`
+foundation shipped; agent create/edit shipped (`AgentDetailScreen`,
+`TypePickerModal`, `n` on the Agents tab). Connector create/edit, the `.env`
+writer, and the tool-list/preset editor are not yet built. Phase 3 is
+designed below but not yet started. The
 v0.2 format simplification (`connector_defaults`/`agent_defaults`/
 `watcher_defaults`, `tool_presets`, watcher `rooms:`) plus `acg config
 validate` and the JSON Schema (see `docs/migration-0.2.md`) are prerequisites
@@ -152,11 +153,13 @@ per-row status lookups.
 | Screen | Kind | Status |
 |---|---|---|
 | `OverviewScreen` | root | **Shipped.** 5 tabs: Connectors, Agents, Watchers, Defaults, Tool Presets |
-| `ConnectorDetailScreen` / `AgentDetailScreen` / `WatcherDetailScreen` | pushed | **Shipped**, `mode="view"` only. Each already takes a `mode: Literal["view","edit","create"]` param — phase 2/3 flips it, no screen-class rework |
+| `AgentDetailScreen` | pushed | **Shipped, all 3 modes.** view/edit/create. Form fields are a manually-maintained mirror of `$defs/agent` (not a runtime schema interpreter — safe since the schema is closed). Nothing is written to `document` until Save; Save diffs every field against its value-at-open and writes only what changed (docs/design/config-tool.md decision 2). Tool-list fields (`owner_allowed_tools`/`guest_allowed_tools`) stay view-only here — separate tool-list-editor work. Escape with unsaved changes routes through `ConfirmModal` |
+| `ConnectorDetailScreen` / `WatcherDetailScreen` | pushed | **Shipped**, `mode="view"` only still — connector edit/create is the next Phase 2 slice; watcher CRUD is Phase 3. Each already takes a `mode: Literal["view","edit","create"]` param — no screen-class rework needed when their turn comes |
 | `DefaultsScreen` | pushed | **Shipped** (view-only): shows blast radius per key |
 | `ToolPresetsScreen` | pushed | **Shipped** (view-only): rule list + "used by" (checked against the MERGED per-agent tool list, not the raw entry — see gotchas below) |
-| `ConfirmModal` | modal | **Shipped** (`gateway/configtool/modals.py`) — yes/no dialog, Cancel focused by default. Gates `ConfigToolApp.action_quit()` on `EditableConfig.dirty` today; Phase 2/3 edit screens will reuse it for their own discard-changes confirmations |
-| `TypePickerModal`, `EntityPickerModal`, `PresetOrInlineModal`, `InlineToolRuleModal` | modals | Not yet built (phase 2/3) |
+| `ConfirmModal` | modal | **Shipped** (`gateway/configtool/modals.py`) — yes/no dialog, Cancel focused by default. Gates `ConfigToolApp.action_quit()` on `EditableConfig.dirty`, and `AgentDetailScreen`'s own per-screen form-dirty flag on Escape |
+| `TypePickerModal` | modal | **Shipped** (`gateway/configtool/modals.py`) — generic list-of-strings picker (`ListView`-based), used today for the agent-type picker (claude/opencode); the connector-type picker (rocketchat/mattermost/voice/script) will reuse the same class |
+| `EntityPickerModal`, `PresetOrInlineModal`, `InlineToolRuleModal` | modals | Not yet built (phase 2/3) |
 | `RoomListEditorScreen` | pushed (2nd level) | Not yet built (phase 3) |
 | `$EDITOR` escape hatch | action | **Shipped.** `App.suspend()` + subprocess; Overview-only |
 | `HelpScreen` | modal or pushed | **Not yet built — owner-requested addition, tracked for phase 2.** On mount, focus starts on the tab bar rather than the list (a real gap a user hit) — Phase 1's fix was surfacing the existing `tab`→focus-next binding in the footer (`Binding("tab", "app.focus_next", "Focus next / enter list", show=True)` on `OverviewScreen`), but a dedicated help screen (`?` binding, listing every screen's keybindings) is the more scalable fix once phase 2/3 add enough screens/actions that the footer alone gets crowded |
@@ -169,9 +172,20 @@ Max stack depth 3 (Overview → detail → modal/RoomListEditor).
   detail screen in create mode, per-type template pre-filled. Mattermost gets
   a token-XOR-user/pass toggle (mirrors `MattermostConfig.__post_init__`);
   secrets masked + `.env` toggle.
-- **New agent:** type picker (claude/opencode) → schema-driven form;
-  `working_directory` existence is a pre-save **warning**, not a blocker
-  (syntactic validity vs. "ready to run" are different questions).
+- **New agent — shipped.** Type picker (claude/opencode, via the generic
+  `TypePickerModal`) → form (`gateway/configtool/screens/agent_detail.py`,
+  a manually-maintained mirror of `$defs/agent`, matching Phase 1's
+  `_KNOWN_FIELDS` pattern rather than a runtime schema interpreter — safe
+  because the schema is closed). **Correction from the original design:**
+  `working_directory` existence is NOT a soft warning at save time —
+  `GatewayConfig.from_file` hard-requires the directory to exist (raises
+  `ValueError`), and `save()` reuses that unchanged validator by design (see
+  decision 5's rationale for never special-casing it), so a missing
+  directory still hard-blocks Save. What's actually built: an early, live,
+  non-blocking inline hint next to the field (updates as you type, resolved
+  the same way the loader resolves it — `expanduser()` then relative to
+  `config_dir`) so the user finds out before hitting Save, not just from a
+  generic validator error after.
 - **New watcher:** connector Select + agent Select + room(s) free text
   (single or comma-list — mirrors the `room`/`rooms` duality already in the
   format). Agent Select pre-suggests the connector's existing pairing
@@ -229,11 +243,19 @@ Phase 2 first cleared the Phase 1 code review's deferred items 7–10
   what the mutation layer needed, per the plan's own risk note.
 - **Shipped:** `EditableConfig.save()` (decision 5) and `ConfirmModal`
   (`gateway/configtool/modals.py`), gating `ConfigToolApp.action_quit()`.
+- **Shipped:** `AgentDetailScreen` edit/create + `TypePickerModal` (generic,
+  built for reuse by the connector-type picker). `n` on the Agents tab of
+  `OverviewScreen` (`action_new_entity`) opens it; other tabs notify rather
+  than doing nothing or crashing, since they don't support creation yet.
+  Tool-list fields stay view-only on this screen (separate work, below).
+  See "Implementation notes" for the write-back diffing mechanism and two
+  Textual gotchas hit while building it (`@work`/`push_screen_wait`, and
+  Input/Select firing `Changed` once at initial mount).
 
-**Not yet built:** `AgentDetailScreen`/`ConnectorDetailScreen` edit/create,
-`TypePickerModal` + per-type templates + generic tree editor for connector
-`raw`, `.env` merge-by-key writer + secret toggle, tool-list editor +
-`PresetOrInlineModal` + `InlineToolRuleModal`, `ToolPresetsScreen` made
+**Not yet built:** `ConnectorDetailScreen` edit/create, `TypePickerModal`'s
+connector-type variant + per-type templates + generic tree editor for
+connector `raw`, `.env` merge-by-key writer + secret toggle, tool-list editor
++ `PresetOrInlineModal` + `InlineToolRuleModal`, `ToolPresetsScreen` made
 editable (used-by warnings).
 
 **Phase 3: Watcher CRUD + defaults editing.** `WatcherDetailScreen`
@@ -301,6 +323,23 @@ split-out insertion position).
   entirely and explicitly focusing Cancel in `on_mount()` (safe-by-default:
   a reflexive Enter cancels, not confirms); Tab+Enter reaches Confirm.
   `escape`→cancel still needs its own binding since `Button` doesn't bind it.
+- **`Input` and `Select` fire their own `Changed` message once at initial
+  mount, using whatever value the constructor was given — `Checkbox` does
+  not.** Confirmed empirically while building `AgentDetailScreen`'s
+  edit/create form: simply opening the edit form (before the user touches
+  anything) immediately marked it dirty and would have wrongly prompted a
+  discard-confirmation on Escape. Fixed with a `self._populating` guard,
+  set before composing the form and cleared via `self.call_after_refresh(...)`
+  (confirmed empirically to run AFTER that initial burst of Changed
+  messages, not before). Important: `Screen.recompose()` does NOT re-run
+  `on_mount()` — only the screen's own first push does — so a screen that
+  recomposes itself between modes (e.g. view → edit) has to re-arm the
+  guard and reschedule `call_after_refresh` at the recompose call site
+  itself, not rely on `on_mount` firing again.
+- **`push_screen_wait()` needs a `@work`-decorated caller**, same gotcha as
+  `ConfigToolApp.action_quit()` — `AgentDetailScreen.action_back()` awaits a
+  `ConfirmModal` result for its own discard-vs-keep-editing decision, so it's
+  `@work`-decorated too.
 - Verified against the real, currently-live production config (8 connectors,
   4 agents, 24 watchers expanded from 12 raw entries, 2 tool presets):
   renders correctly, and drilling into all 36 rows (24 watchers + 8
