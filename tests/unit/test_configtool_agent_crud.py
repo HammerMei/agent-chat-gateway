@@ -234,6 +234,27 @@ class TestCreateAgent:
 
 
 class TestEditAgent:
+    async def test_provenance_markers_are_within_the_visible_terminal_width(
+        self, tmp_path, work_dir
+    ):
+        """Real layout bug, caught via the connector screen's "Store in
+        .env" checkbox being reported invisible: Input's own DEFAULT_CSS is
+        width:100%, which — inside the Horizontal field-row — claimed the
+        ENTIRE row, pushing every field's provenance marker (the "(explicit)"
+        / "(inherited from defaults)" label) off past the terminal's right
+        edge since this form first shipped. Fixed with width:1fr on Input
+        within .field-row (matching Select's own DEFAULT_CSS, which never
+        had this problem)."""
+        config_path = _write_config(tmp_path, _config_with_one_agent(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await _open_agent_in_edit_mode(pilot, app)
+            markers = list(app.screen.query(".field-provenance"))
+            assert markers  # sanity: there are provenance markers to check
+            for marker in markers:
+                assert marker.region.x + marker.region.width <= app.size.width
+
     async def test_edit_mode_prefills_the_effective_merged_value(self, tmp_path, work_dir):
         config_path = _write_config(
             tmp_path, _config_with_one_agent(work_dir, "session_prefix: custom-prefix\n")
