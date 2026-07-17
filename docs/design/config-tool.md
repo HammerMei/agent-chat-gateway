@@ -512,6 +512,27 @@ split-out insertion position).
   container — it isn't meant to be independently focused; scrolling still
   works via the mouse wheel/PageUp/PageDown. Worth checking for on any
   future container that wraps a form's fields.
+- **`Input`'s own `DEFAULT_CSS` is `width: 100%` — inside a `Horizontal`
+  field-row, that claims the ENTIRE row, pushing every sibling that comes
+  after it off past the terminal's right edge.** User-reported: the new
+  "Store in .env" `Checkbox` (task #27) was completely invisible. Confirmed
+  via `widget.region` (NOT just `query_one()` succeeding — Pilot's query
+  finds a widget regardless of where it's actually rendered, which is
+  exactly why this shipped unnoticed): the checkbox's region started at
+  `x=146` in a 120-column terminal, fully off-screen. The SAME root cause
+  had already been silently hiding every field's provenance marker (the
+  "(explicit)"/"(inherited from defaults)" label) on both `AgentDetailScreen`
+  and `ConnectorDetailScreen` since Phase 2's agent form first shipped — a
+  dim decorative label going unnoticed off-screen is a lot less obvious
+  than a missing interactive control, which is probably why it took the
+  checkbox to surface it. `Select`'s own `DEFAULT_CSS` already uses `width:
+  1fr` and never had this problem — fixed by adding
+  `FormScreen .field-row Input { width: 1fr; }`, so the Input shares the
+  row's remaining space with its fixed/auto-width siblings instead of
+  claiming all of it. **Any future field-row widget added after an Input
+  needs a `.region`-based test, not just a `query_one()` existence check —
+  that's the only way this class of bug gets caught before a user reports
+  it.**
 - **`push_screen_wait()` needs a `@work`-decorated caller**, same gotcha as
   `ConfigToolApp.action_quit()` — `AgentDetailScreen.action_back()` awaits a
   `ConfirmModal` result for its own discard-vs-keep-editing decision, so it's

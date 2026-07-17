@@ -260,9 +260,25 @@ class FormScreen(DetailScreen):
     FormScreen .field-provenance {
         padding-top: 1;
         margin-left: 2;
+        width: auto;
     }
     FormScreen Checkbox {
         width: auto;
+    }
+    /* Input's own DEFAULT_CSS is `width: 100%` — inside a Horizontal
+    field-row, that claims the ENTIRE row's width, pushing every sibling
+    that comes after it (the "Store in .env" Checkbox, the provenance
+    marker) off past the terminal's right edge. Confirmed as the actual,
+    user-reported cause of a "missing" checkbox — it was rendering, just
+    off-screen; the SAME bug had already been silently hiding every
+    provenance marker on every field row since Phase 2's agent form
+    shipped (a dim decorative label going unnoticed off-screen is a lot
+    less obvious than an interactive control). `1fr` matches Select's own
+    DEFAULT_CSS (which never had this problem) — share the row's
+    remaining space with fixed/auto-width siblings instead of claiming
+    all of it. */
+    FormScreen .field-row Input {
+        width: 1fr;
     }
     """
 

@@ -421,6 +421,23 @@ class TestEnvSecretToggle:
     is left alone (the user is explicitly pointing at an externally-managed
     var, not typing a new secret)."""
 
+    async def test_toggle_is_within_the_visible_terminal_width(self, tmp_path, work_dir):
+        """User-reported: the checkbox wasn't visible at all. Root cause:
+        Input's own DEFAULT_CSS is width:100%, which — inside the
+        Horizontal field-row — claimed the ENTIRE row, pushing the
+        Checkbox (and every field's provenance marker, actually, since
+        Phase 2's agent form first shipped) off past the terminal's right
+        edge. It was rendering, just off-screen; Pilot's query_one() found
+        it regardless of position, which is exactly why this had to be
+        caught by checking .region, not just presence in the DOM."""
+        config_path = _write_config(tmp_path, _config_with_one_rocketchat_connector(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await _open_connector_in_edit_mode(pilot, app)
+            toggle = app.screen.query_one("#field-server-password-env-toggle", Checkbox)
+            assert toggle.region.x + toggle.region.width <= app.size.width
+
     async def test_toggle_is_checked_by_default(self, tmp_path, work_dir):
         config_path = _write_config(tmp_path, _config_with_one_rocketchat_connector(work_dir))
         app = ConfigToolApp(config_path)
