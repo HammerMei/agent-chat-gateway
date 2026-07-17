@@ -140,11 +140,21 @@ per-row status lookups.
    since `push_screen_wait()` requires a worker context) — no edit screen
    sets `dirty` for real yet, but the mechanism is in place for Phase 2's
    CRUD screens to use without further plumbing.
-6. **`.env` secret handling:** password/token/secret fields get a per-field
+6. **`.env` secret handling.** Password/token/secret fields get a per-field
    "store in .env" toggle (default ON) → `${VAR}` placeholder in config,
-   value into `.env`. Needs a new merge-by-key `.env` writer (`onboard.py`'s
-   `_write_env` overwrites the whole file with 3 hardcoded keys — insufficient
-   once multiple connectors each need their own secret upserted).
+   value into `.env`. **Writer shipped:** `gateway/configtool/env_writer.py`'s
+   `upsert_env_vars()` (`onboard.py`'s own `_write_env` overwrites the whole
+   file with 3 hardcoded keys — insufficient once multiple connectors each
+   need their own secret upserted independently). Merges by key: an existing
+   `KEY=...` line is replaced in place; a new key is appended; every other
+   line — comments, blank lines, unrelated keys — is preserved verbatim, in
+   its original position. Restricts the file to 0600 after every write.
+   `.env` resolves the same way `gateway/config.py`'s loader itself resolves
+   it — `EditableConfig.path.parent / ".env"` (`load_dotenv(path.parent /
+   ".env")`), NOT `onboard.py`'s hardcoded `~/.agent-chat-gateway/` — since a
+   config file can live anywhere. The toggle UI + connector-form wiring
+   (choosing the env var name, writing the `${VAR}` placeholder into the
+   entry) lands with connector create/edit, the writer's first real caller.
 
 ## Part 2 — Screens / navigation / UX
 
