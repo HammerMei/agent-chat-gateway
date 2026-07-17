@@ -19,7 +19,7 @@ from textual.widgets import Checkbox, DataTable, Footer, Input, Select, Static
 from textual.widgets._footer import FooterKey
 
 from gateway.configtool.app import ConfigToolApp
-from gateway.configtool.modals import ConfirmModal, TypePickerModal
+from gateway.configtool.modals import ConfirmModal, MessageModal, TypePickerModal
 from gateway.configtool.screens.agent_detail import AgentDetailScreen
 from gateway.configtool.screens.overview import OverviewScreen
 
@@ -164,6 +164,10 @@ class TestCreateAgent:
             await pilot.press("ctrl+s")
             await pilot.pause()
 
+            assert isinstance(app.screen, MessageModal)
+            await pilot.press("enter")  # dismiss
+            await pilot.pause()
+
             assert isinstance(app.screen, AgentDetailScreen)
             assert app.screen.mode == "create"
             # The original agent must be untouched.
@@ -185,6 +189,9 @@ class TestCreateAgent:
             await pilot.pause()
 
             await pilot.press("ctrl+s")
+            await pilot.pause()
+            assert isinstance(app.screen, MessageModal)
+            await pilot.press("enter")  # dismiss
             await pilot.pause()
             assert isinstance(app.screen, AgentDetailScreen)
             assert app.screen.mode == "create"
@@ -213,6 +220,10 @@ class TestCreateAgent:
             )
             await pilot.pause()
             await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            assert isinstance(app.screen, MessageModal)
+            await pilot.press("enter")  # dismiss
             await pilot.pause()
 
             assert isinstance(app.screen, AgentDetailScreen)
@@ -367,6 +378,10 @@ class TestEditAgent:
             app.screen.query_one("#field-timeout", Input).value = "not-a-number"
             await pilot.pause()
             await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            assert isinstance(app.screen, MessageModal)
+            await pilot.press("enter")  # dismiss
             await pilot.pause()
 
             assert isinstance(app.screen, AgentDetailScreen)
@@ -679,12 +694,14 @@ async def _open_agent_in_view_mode(pilot, app, row: int = 0) -> None:
 
 
 class TestDeleteAgent:
-    async def test_d_key_shows_confirm_modal(self, tmp_path, work_dir):
+    async def test_d_key_on_an_unreferenced_agent_shows_confirm_modal(
+        self, tmp_path, work_dir
+    ):
         config_path = _write_config(tmp_path, _config_with_two_agents(work_dir))
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            await _open_agent_in_view_mode(pilot, app)
+            await _open_agent_in_view_mode(pilot, app, row=1)  # unused-agent
 
             await pilot.press("d")
             await pilot.pause()
@@ -695,7 +712,7 @@ class TestDeleteAgent:
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            await _open_agent_in_view_mode(pilot, app)
+            await _open_agent_in_view_mode(pilot, app, row=1)  # unused-agent
 
             await pilot.press("d")
             await pilot.pause()
@@ -727,13 +744,13 @@ class TestDeleteAgent:
             assert "existing-agent" in raw["agents"]
             assert list(Path(config_path).parent.glob("config.yaml.bak.*"))
 
-    async def test_deleting_a_referenced_agent_fails_and_rolls_back(
+    async def test_deleting_a_referenced_agent_is_blocked_before_the_confirm(
         self, tmp_path, work_dir
     ):
-        """A watcher still references 'existing-agent' — save()'s
-        validate_config() must reject the deletion (GatewayConfig.from_file
-        raises "references unknown agent"), and the agent must be restored,
-        not left removed-from-memory-but-not-saved."""
+        """A watcher still references 'existing-agent' — the pre-delete
+        check catches this BEFORE even offering the destructive confirm,
+        naming the referencing watcher in a MessageModal rather than
+        relying on save()'s generic validator error."""
         config_path = _write_config(tmp_path, _config_with_two_agents(work_dir))
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
@@ -743,10 +760,15 @@ class TestDeleteAgent:
 
             await pilot.press("d")
             await pilot.pause()
-            await pilot.press("tab", "enter")  # Delete
+
+            assert isinstance(app.screen, MessageModal)
+            body = str(app.screen.query_one("#message-body").render())
+            assert "existing-agent" in body
+            await pilot.press("enter")  # dismiss
             await pilot.pause()
 
-            # Stays on the (still-view-mode) detail screen — delete failed.
+            # Stays on the (still-view-mode) detail screen — nothing was
+            # ever removed from `document` in the first place.
             assert isinstance(app.screen, AgentDetailScreen)
             assert app.screen.mode == "view"
             assert "existing-agent" in app.editable_config.agents_raw
