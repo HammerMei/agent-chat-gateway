@@ -3,9 +3,10 @@
 Status: **Phase 1 shipped** (read-only overview + detail screens + $EDITOR
 escape hatch). **Phase 2 in progress:** items 7–10 from the Phase 1 code
 review cleared; `EditableConfig.save()`/dirty-tracking/`ConfirmModal`
-foundation shipped; agent create/edit shipped (`AgentDetailScreen`,
-`TypePickerModal`, `n` on the Agents tab). Connector create/edit, the `.env`
-writer, and the tool-list/preset editor are not yet built. Phase 3 is
+foundation shipped; agent create/edit shipped; connector create/edit shipped
+(per-type field lists — the generic tree editor originally planned is
+deferred, see Part 3); the `.env` writer is shipped but not yet wired to a
+UI toggle. The tool-list/preset editor is not yet built. Phase 3 is
 designed below but not yet started. The
 v0.2 format simplification (`connector_defaults`/`agent_defaults`/
 `watcher_defaults`, `tool_presets`, watcher `rooms:`) plus `acg config
@@ -164,11 +165,12 @@ per-row status lookups.
 |---|---|---|
 | `OverviewScreen` | root | **Shipped.** 5 tabs: Connectors, Agents, Watchers, Defaults, Tool Presets |
 | `AgentDetailScreen` | pushed | **Shipped, all 3 modes.** view/edit/create. Form fields are a manually-maintained mirror of `$defs/agent` (not a runtime schema interpreter — safe since the schema is closed). Nothing is written to `document` until Save; Save diffs every field against its value-at-open and writes only what changed (docs/design/config-tool.md decision 2). Tool-list fields (`owner_allowed_tools`/`guest_allowed_tools`) stay view-only here — separate tool-list-editor work. Escape with unsaved changes routes through `ConfirmModal` |
-| `ConnectorDetailScreen` / `WatcherDetailScreen` | pushed | **Shipped**, `mode="view"` only still — connector edit/create is the next Phase 2 slice; watcher CRUD is Phase 3. Each already takes a `mode: Literal["view","edit","create"]` param — no screen-class rework needed when their turn comes |
+| `ConnectorDetailScreen` | pushed | **Shipped, all 3 modes.** Per-type fixed field lists (tree editor deferred — see Part 3). `type`/`name` immutable in edit mode |
+| `WatcherDetailScreen` | pushed | **Shipped**, `mode="view"` only still — Phase 3. Already takes a `mode: Literal["view","edit","create"]` param — no screen-class rework needed when its turn comes |
 | `DefaultsScreen` | pushed | **Shipped** (view-only): shows blast radius per key |
 | `ToolPresetsScreen` | pushed | **Shipped** (view-only): rule list + "used by" (checked against the MERGED per-agent tool list, not the raw entry — see gotchas below) |
 | `ConfirmModal` | modal | **Shipped** (`gateway/configtool/modals.py`) — yes/no dialog, Cancel focused by default. Gates `ConfigToolApp.action_quit()` on `EditableConfig.dirty`, and `AgentDetailScreen`'s own per-screen form-dirty flag on Escape |
-| `TypePickerModal` | modal | **Shipped** (`gateway/configtool/modals.py`) — generic list-of-strings picker (`ListView`-based), used today for the agent-type picker (claude/opencode); the connector-type picker (rocketchat/mattermost/voice/script) will reuse the same class |
+| `TypePickerModal` | modal | **Shipped** (`gateway/configtool/modals.py`) — generic list-of-strings picker (`ListView`-based), reused as-is for both the agent-type picker (claude/opencode) and the connector-type picker (rocketchat/mattermost/voice/script) |
 | `EntityPickerModal`, `PresetOrInlineModal`, `InlineToolRuleModal` | modals | Not yet built (phase 2/3) |
 | `RoomListEditorScreen` | pushed (2nd level) | Not yet built (phase 3) |
 | `$EDITOR` escape hatch | action | **Shipped.** `App.suspend()` + subprocess; Overview-only |
@@ -262,11 +264,66 @@ Phase 2 first cleared the Phase 1 code review's deferred items 7–10
   Textual gotchas hit while building it (`@work`/`push_screen_wait`, and
   Input/Select firing `Changed` once at initial mount).
 
-**Not yet built:** `ConnectorDetailScreen` edit/create, `TypePickerModal`'s
-connector-type variant + per-type templates + generic tree editor for
-connector `raw`, `.env` merge-by-key writer + secret toggle, tool-list editor
-+ `PresetOrInlineModal` + `InlineToolRuleModal`, `ToolPresetsScreen` made
-editable (used-by warnings).
+- **Shipped:** `gateway/configtool/env_writer.py`'s `upsert_env_vars()` — the
+  merge-by-key `.env` writer (decision 6). No UI wiring yet (see below).
+- **Shipped:** `FormScreen` (`gateway/configtool/screens/form_common.py`) —
+  `AgentDetailScreen`'s edit/create machinery (populating guard,
+  check_action, `@work action_back` + `ConfirmModal`, the generic
+  field-diff/Save collection, `refresh_bindings()` after `recompose()`)
+  extracted into a shared base once `ConnectorDetailScreen` became a second
+  concrete user, rather than guessed at up front. `FieldSpec`/`widget_id`/
+  `get_nested`/`apply_update`/`read_widget_value` moved alongside it as
+  plain reusable functions. Each subclass still owns its own field list,
+  `*_defaults` kind, dataclass-default map, `_compose_form()`, and
+  `action_save()` (insertion semantics differ enough — a dict keyed by name
+  vs. a list where each entry carries its own `name` — that forcing a
+  shared implementation would be more awkward than it's worth).
+- **Shipped:** `ConnectorDetailScreen` edit/create + the connector-type
+  variant of `TypePickerModal` (rocketchat/mattermost/voice/script), wired
+  to `n` on the Connectors tab. **Deliberate scope cut from the original
+  design:** per-type FIXED field lists (`_FIELDS_BY_TYPE` in
+  `connector_detail.py`) instead of the generic nested tree editor
+  originally planned for `raw`. Verified first that every real connector
+  type's raw shape is exactly one level deep (`server.url`,
+  `allowed_users.owners`, `attachments.*`, etc.) — precisely what
+  `FormScreen`'s existing dotted-key machinery already handles, so this
+  isn't a compromise so much as reuse of code already proven correct for
+  agent's `permissions.*`. The tree editor is deferred, not abandoned — it
+  would only earn its complexity for truly arbitrary/unknown keys, and the
+  `$EDITOR` escape hatch already covers that case; build it later if
+  per-type forms + `$EDITOR` turn out not to be enough in practice.
+  `type`/`name` are immutable in edit mode (only chosen at creation, via the
+  type picker) — rocketchat/mattermost's raw shapes differ enough that
+  letting `type` change in place would mean the form reshaping itself
+  around one of its own fields, and a `name` change would silently orphan
+  any watcher referencing the old name. Mattermost's token-XOR-user/pass
+  constraint gets a plain informational `Static` line, not an interactive
+  RadioSet — `save()`'s `validate_config()` (which runs the real
+  `MattermostConfig.__post_init__`) is the actual enforcement either way,
+  so the simpler static hint was chosen over building a stateful widget for
+  guidance alone.
+- **Deferred, not built:** the `.env` "store in .env" toggle itself. Typing
+  a plaintext secret directly into a masked field (`Input(password=True)` —
+  display-only masking; `.value` is always the real string, same as every
+  other field) and saving writes it to config.yaml in plaintext today,
+  exactly like the existing `$EDITOR` escape hatch already allows — not a
+  regression, just not yet automated. The writer (`upsert_env_vars`) and the
+  masked-secret Input widgets are both in place; wiring a toggle to
+  auto-generate an env var name, call the writer, and rewrite the entry's
+  field to a `${VAR}` placeholder is a self-contained follow-up.
+- **Verified (the actual keystone test for this screen, same weight as
+  `EditableConfig.save()`'s $VAR round-trip):** opening an existing
+  connector whose `server.password` is `"${SOME_VAR}"`, editing an
+  unrelated field, and saving leaves the password field's raw value
+  exactly `"${SOME_VAR}"` — never resolved, never masked at the data level.
+  Holds naturally from the existing diff-based Save mechanism (the widget's
+  initial snapshot and its unedited value-at-save are both the same literal
+  placeholder string) — no special-casing needed, confirmed by a dedicated
+  test rather than assumed.
+
+**Not yet built:** the `.env` toggle wiring (above), the generic tree editor
+(deferred, above), tool-list editor + `PresetOrInlineModal` +
+`InlineToolRuleModal`, `ToolPresetsScreen` made editable (used-by warnings).
 
 **Phase 3: Watcher CRUD + defaults editing.** `WatcherDetailScreen`
 edit/create; new-watcher flow (pickers now enumerate entities creatable
