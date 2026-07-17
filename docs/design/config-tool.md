@@ -5,9 +5,9 @@ escape hatch). **Phase 2 in progress:** items 7–10 from the Phase 1 code
 review cleared; `EditableConfig.save()`/dirty-tracking/`ConfirmModal`
 foundation shipped; agent create/edit shipped; connector create/edit shipped
 (per-type field lists — the generic tree editor originally planned is
-deferred, see Part 3); the `.env` writer is shipped but not yet wired to a
-UI toggle. The tool-list/preset editor is not yet built. Phase 3 is
-designed below but not yet started. The
+deferred, see Part 3); delete shipped for both agents and connectors; the
+`.env` "store in .env" toggle shipped. The tool-list/preset editor is not
+yet built. Phase 3 is designed below but not yet started. The
 v0.2 format simplification (`connector_defaults`/`agent_defaults`/
 `watcher_defaults`, `tool_presets`, watcher `rooms:`) plus `acg config
 validate` and the JSON Schema (see `docs/migration-0.2.md`) are prerequisites
@@ -318,15 +318,30 @@ Phase 2 first cleared the Phase 1 code review's deferred items 7–10
   `MattermostConfig.__post_init__`) is the actual enforcement either way,
   so the simpler static hint was chosen over building a stateful widget for
   guidance alone.
-- **Deferred, not built:** the `.env` "store in .env" toggle itself. Typing
-  a plaintext secret directly into a masked field (`Input(password=True)` —
-  display-only masking; `.value` is always the real string, same as every
-  other field) and saving writes it to config.yaml in plaintext today,
-  exactly like the existing `$EDITOR` escape hatch already allows — not a
-  regression, just not yet automated. The writer (`upsert_env_vars`) and the
-  masked-secret Input widgets are both in place; wiring a toggle to
-  auto-generate an env var name, call the writer, and rewrite the entry's
-  field to a `${VAR}` placeholder is a self-contained follow-up.
+- **Shipped: the `.env` "store in .env" toggle.** A "Store in .env"
+  `Checkbox` (default ON) next to every `secret=True` field
+  (`FieldSpec.secret` already existed for masking; now also drives this).
+  On Save, for each secret field that ACTUALLY changed to a genuine new
+  plaintext value (a value already matching `$VAR`/`${VAR}` — checked via
+  `looks_like_env_var_reference()` — is left alone, since the user is
+  explicitly referencing an externally-managed var, not typing a new
+  secret) with the toggle checked: `env_var_name_for()` generates a
+  deterministic name (`"<ENTITY>_<FIELD>"`, e.g. `RC_HOME_PASSWORD`),
+  `upsert_env_vars()` writes it to `.env`, and the entry's field becomes
+  `"${VAR}"`. **Ordering subtlety that cost a wrong-first-attempt:** the
+  `.env` write must happen BEFORE `cfg.save()`, not after — `save()`'s own
+  `validate_config()` calls `GatewayConfig.from_file`, which resolves every
+  `${VAR}` placeholder immediately (`load_dotenv(path.parent / ".env")` +
+  `os.path.expandvars`); if the var isn't in `.env` yet, `save()` itself
+  fails with "unresolved environment variable" before config.yaml is ever
+  written. Accepted trade-off from writing `.env` first: if `cfg.save()`
+  still fails for some OTHER, unrelated reason afterward, the value already
+  written to `.env` is left there, unreferenced by anything — harmless,
+  equivalent to a user having pre-populated `.env` with a value not wired
+  up yet; not worth building a transactional rollback for. Also accepted,
+  documented, not handled: the generated var name could collide with an
+  unrelated existing `.env` key — rare, not worth a collision-detection UI
+  for v1.
 - **Verified (the actual keystone test for this screen, same weight as
   `EditableConfig.save()`'s $VAR round-trip):** opening an existing
   connector whose `server.password` is `"${SOME_VAR}"`, editing an

@@ -31,12 +31,21 @@ from typing import Literal
 from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, VerticalScroll
-from textual.widgets import Input, Static
+from textual.widgets import Checkbox, Input, Static
 
+from ..env_writer import upsert_env_vars
 from ..formatting import mask_if_secret, provenance_label
 from ..modals import MessageModal
 from ..model import EditableConfig
-from .form_common import FieldSpec, FormScreen, apply_update, find_referencing_watcher_labels
+from .form_common import (
+    FieldSpec,
+    FormScreen,
+    apply_update,
+    env_toggle_widget_id,
+    env_var_name_for,
+    find_referencing_watcher_labels,
+    looks_like_env_var_reference,
+)
 
 CONNECTOR_TYPES = ("rocketchat", "mattermost", "voice", "script")
 
@@ -281,6 +290,46 @@ class ConnectorDetailScreen(FormScreen):
                     MessageModal(
                         f"A connector named '{name}' already exists.", title="Could not save"
                     )
+                )
+                return
+
+        # Secret fields with "Store in .env" checked: if the field's value
+        # actually changed to a genuine new plaintext secret (not already a
+        # $VAR/${VAR} reference the user typed directly), swap it for a
+        # ${VAR} placeholder in `updates`.
+        env_writes: dict[str, str] = {}
+        entity_name_for_env = name if self.mode == "create" else self.entry.get("name", "?")
+        for spec in self._field_specs():
+            if not spec.secret or spec.key not in updates:
+                continue
+            new_value = updates[spec.key]
+            if not new_value or looks_like_env_var_reference(new_value):
+                continue
+            toggle = self.query_one(f"#{env_toggle_widget_id(spec.key)}", Checkbox)
+            if not toggle.value:
+                continue
+            var_name = env_var_name_for(entity_name_for_env, spec.key)
+            env_writes[var_name] = new_value
+            updates[spec.key] = f"${{{var_name}}}"
+
+        if env_writes:
+            # MUST happen BEFORE cfg.save(), not after: save()'s own
+            # validate_config() calls GatewayConfig.from_file, which
+            # resolves every ${VAR} placeholder immediately via
+            # load_dotenv(path.parent / ".env") + os.path.expandvars — if
+            # the var isn't in .env yet, save() itself fails with
+            # "unresolved environment variable" before config.yaml is ever
+            # written. Accepted trade-off: if cfg.save() still fails for
+            # some OTHER, unrelated reason after this, the value written
+            # here is left in .env, unreferenced by anything — harmless,
+            # equivalent to a user having pre-populated .env with a value
+            # not wired up yet. Nothing else has been touched yet at this
+            # point, so a failure here is a clean, early return.
+            try:
+                upsert_env_vars(self.cfg.path.parent / ".env", env_writes)
+            except OSError as exc:
+                await self.app.push_screen_wait(
+                    MessageModal(f"Could not write to .env: {exc}", title="Could not save")
                 )
                 return
 

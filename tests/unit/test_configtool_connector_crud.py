@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 import yaml
-from textual.widgets import DataTable, Input
+from textual.widgets import Checkbox, DataTable, Input
 
 from gateway.configtool.app import ConfigToolApp
 from gateway.configtool.modals import ConfirmModal, MessageModal, TypePickerModal
@@ -100,6 +100,10 @@ class TestCreateConnector:
             app.screen.query_one("#field-server-url", Input).value = "http://rc2.local"
             app.screen.query_one("#field-server-username", Input).value = "bot2"
             app.screen.query_one("#field-server-password", Input).value = "pw2"
+            # "Store in .env" defaults ON (tested separately below) — off
+            # here since this test is about basic field persistence, not
+            # the secret-handling behavior.
+            app.screen.query_one("#field-server-password-env-toggle", Checkbox).value = False
             await pilot.pause()
             await pilot.press("ctrl+s")
             await pilot.pause()
@@ -272,13 +276,13 @@ class TestEditConnector:
         finally:
             os.environ.pop("RC_PASSWORD_CONNECTOR_TEST", None)
 
-    async def test_editing_and_changing_the_secret_writes_the_new_plaintext_value(
+    async def test_editing_and_changing_the_secret_with_the_env_toggle_off_writes_plaintext(
         self, tmp_path, work_dir
     ):
-        """Documented v1 scope: there is no '.env toggle' yet (deferred — see
-        docs/design/config-tool.md) — typing a new secret directly writes it
-        to config.yaml in plaintext, exactly like the existing $EDITOR escape
-        hatch already allows. Not a regression, just not-yet-automated."""
+        """"Store in .env" defaults ON (tested separately below) — with it
+        explicitly turned off, typing a new secret directly writes it to
+        config.yaml in plaintext, exactly like the existing $EDITOR escape
+        hatch already allows."""
         config_path = _write_config(
             tmp_path, _config_with_one_rocketchat_connector(work_dir, password="oldpw")
         )
@@ -288,6 +292,7 @@ class TestEditConnector:
             await _open_connector_in_edit_mode(pilot, app)
 
             app.screen.query_one("#field-server-password", Input).value = "brand-new-secret"
+            app.screen.query_one("#field-server-password-env-toggle", Checkbox).value = False
             await pilot.pause()
             await pilot.press("ctrl+s")
             await pilot.pause()
@@ -406,6 +411,146 @@ class TestEditConnector:
             raw = yaml.safe_load(Path(config_path).read_text())
             assert raw["connectors"][0]["server"]["password"] == "pw"
             assert raw["connectors"][0]["server"]["username"] == "bot"
+
+
+class TestEnvSecretToggle:
+    """"Store in .env" (docs/design/config-tool.md decision 6) — a per-
+    secret-field Checkbox, default ON, next to every masked field. Acted on
+    only when that field's value actually changes to a genuine new
+    plaintext secret; a value already looking like a $VAR/${VAR} reference
+    is left alone (the user is explicitly pointing at an externally-managed
+    var, not typing a new secret)."""
+
+    async def test_toggle_is_checked_by_default(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _config_with_one_rocketchat_connector(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_connector_in_edit_mode(pilot, app)
+            toggle = app.screen.query_one("#field-server-password-env-toggle", Checkbox)
+            assert toggle.value is True
+
+    async def test_changing_a_secret_with_the_toggle_on_writes_a_placeholder_and_the_env_file(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _config_with_one_rocketchat_connector(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_connector_in_edit_mode(pilot, app)
+
+            app.screen.query_one("#field-server-password", Input).value = "super-secret-value"
+            # toggle already defaults True — leave it
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            assert isinstance(app.screen, OverviewScreen)
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert raw["connectors"][0]["server"]["password"] == "${RC_EXISTING_PASSWORD}"
+
+            env_path = Path(tmp_path) / ".env"
+            env_text = env_path.read_text()
+            assert "RC_EXISTING_PASSWORD=super-secret-value" in env_text
+
+    async def test_env_var_name_combines_connector_name_and_field(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _config_with_one_rocketchat_connector(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_connector_in_edit_mode(pilot, app)
+
+            app.screen.query_one("#field-server-username", Input).value = "newbot"
+            app.screen.query_one("#field-server-password", Input).value = "hunter2"
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            raw = yaml.safe_load(Path(config_path).read_text())
+            # username isn't a secret field -- untouched by env logic.
+            assert raw["connectors"][0]["server"]["username"] == "newbot"
+            assert raw["connectors"][0]["server"]["password"] == "${RC_EXISTING_PASSWORD}"
+
+    async def test_a_value_already_looking_like_a_var_reference_is_left_alone(
+        self, tmp_path, work_dir, monkeypatch
+    ):
+        # Set so save()'s own validate_config() can actually resolve it —
+        # this test is about the TUI not re-wrapping/rewriting an
+        # already-a-reference value, not about whether the var resolves.
+        monkeypatch.setenv("SOME_OTHER_VAR", "resolved-value")
+        config_path = _write_config(tmp_path, _config_with_one_rocketchat_connector(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_connector_in_edit_mode(pilot, app)
+
+            app.screen.query_one("#field-server-password", Input).value = "${SOME_OTHER_VAR}"
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            raw = yaml.safe_load(Path(config_path).read_text())
+            # Left exactly as typed -- not re-wrapped, and nothing written
+            # to .env for a var the user is explicitly already referencing.
+            assert raw["connectors"][0]["server"]["password"] == "${SOME_OTHER_VAR}"
+            assert not (Path(tmp_path) / ".env").exists()
+
+    async def test_untouched_secret_field_never_triggers_env_writes(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _config_with_one_rocketchat_connector(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_connector_in_edit_mode(pilot, app)
+
+            app.screen.query_one("#field-timezone", Input).value = "America/New_York"
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert raw["connectors"][0]["server"]["password"] == "pw"  # untouched
+            assert not (Path(tmp_path) / ".env").exists()
+
+    async def test_env_write_failure_leaves_config_yaml_completely_untouched(
+        self, tmp_path, work_dir, monkeypatch
+    ):
+        """.env MUST be written before cfg.save(), not after: save()'s own
+        validate_config() resolves every ${VAR} placeholder immediately
+        (GatewayConfig.from_file -> load_dotenv + expandvars) — if the var
+        isn't in .env yet, save() itself fails with "unresolved environment
+        variable" before config.yaml is ever touched. So a failure writing
+        to .env is a clean, early return: nothing else has happened yet."""
+        config_path = _write_config(tmp_path, _config_with_one_rocketchat_connector(work_dir))
+        app = ConfigToolApp(config_path)
+
+        def _boom(env_path, updates):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(
+            "gateway.configtool.screens.connector_detail.upsert_env_vars", _boom
+        )
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_connector_in_edit_mode(pilot, app)
+
+            app.screen.query_one("#field-server-password", Input).value = "super-secret-value"
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            assert isinstance(app.screen, MessageModal)
+            body = str(app.screen.query_one("#message-body").render())
+            assert "disk full" in body
+
+            assert isinstance(app.screen, MessageModal)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, ConnectorDetailScreen)
+            assert app.screen.mode == "edit"
+
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert raw["connectors"][0]["server"]["password"] == "pw"  # untouched
 
 
 class TestConnectorEscapeConfirmation:
