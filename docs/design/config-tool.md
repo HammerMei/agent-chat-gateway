@@ -356,16 +356,31 @@ split-out insertion position).
   signal to every current subscriber) right after every `recompose()` in
   `action_edit()`/`action_back()`. Any future screen that recomposes itself
   in place (rather than pushing a new screen) needs this same call.
-- **`VerticalScroll` binds Up/Down to `action_scroll_up`/`action_scroll_down`
-  by default**, which is why a form wrapped in one only supported Tab/
-  Shift+Tab between fields. User-requested Up/Down field navigation: a small
-  `_AgentForm(VerticalScroll)` subclass overrides just those two ACTIONS
-  (not new bindings) to call `self.screen.focus_previous()`/`focus_next()`
-  instead of scrolling — Home/End/PageUp/PageDown and the mouse wheel still
-  scroll if the form doesn't fit the terminal. One caveat, not a bug: while
-  focus is ON the `type` field's `Select` widget, Up/Down are captured by
-  Select's own dropdown (matching ordinary combobox behavior everywhere) —
-  Tab still moves past it.
+- **Up/Down field navigation was tried and reverted.** `VerticalScroll`
+  (the form's container) binds Up/Down to `action_scroll_up`/
+  `action_scroll_down` by default; a small `_AgentForm(VerticalScroll)`
+  subclass overriding just those two actions to call
+  `self.screen.focus_previous()`/`focus_next()` worked under Pilot's
+  headless driver (regression tests passed) but was unreliable in the
+  user's real terminal session — pressing Down sometimes did nothing,
+  sometimes stopped advancing partway through the form. Root cause not
+  isolated (Pilot's key-event simulation apparently doesn't reproduce
+  whatever the real terminal/session does differently); reverted rather
+  than ship a navigation feature that's flaky in exactly the environment it
+  needs to work in. **What shipped instead:** a `tab`→`app.focus_next`
+  binding re-bound with `show=True` (same pattern `OverviewScreen` already
+  uses) so the footer tells the user how to move between fields at all —
+  Tab/Shift+Tab was always the reliable mechanism underneath either way.
+- **The footer showed 'Edit' even while already editing** (where pressing
+  `e` is a no-op — `action_edit()` only does something from view mode),
+  which read as broken rather than merely redundant. Fixed with
+  `check_action()`: BINDINGS don't need to change per mode, just their
+  visibility — `check_action("edit", ...)` returns `mode == "view"`,
+  `check_action("save", ...)` returns `mode != "view"`. Works together with
+  the `refresh_bindings()` fix above: the same call that fixes the
+  went-permanently-blank bug also re-evaluates `check_action` for every
+  binding, so mode-based visibility updates immediately on the same
+  recompose, no separate plumbing needed.
 - Verified against the real, currently-live production config (8 connectors,
   4 agents, 24 watchers expanded from 12 raw entries, 2 tool presets):
   renders correctly, and drilling into all 36 rows (24 watchers + 8
