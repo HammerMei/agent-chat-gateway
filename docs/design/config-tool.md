@@ -3,9 +3,10 @@
 Status: **Phase 1 shipped** (read-only overview + detail screens + $EDITOR
 escape hatch). **Phase 2 in progress:** items 7–10 from the Phase 1 code
 review cleared; `EditableConfig.save()`/dirty-tracking/`ConfirmModal`
-foundation shipped; agent create/edit shipped (`AgentDetailScreen`,
-`TypePickerModal`, `n` on the Agents tab). Connector create/edit, the `.env`
-writer, and the tool-list/preset editor are not yet built. Phase 3 is
+foundation shipped; agent create/edit shipped; connector create/edit shipped
+(per-type field lists — the generic tree editor originally planned is
+deferred, see Part 3); the `.env` writer is shipped but not yet wired to a
+UI toggle. The tool-list/preset editor is not yet built. Phase 3 is
 designed below but not yet started. The
 v0.2 format simplification (`connector_defaults`/`agent_defaults`/
 `watcher_defaults`, `tool_presets`, watcher `rooms:`) plus `acg config
@@ -110,6 +111,21 @@ per-row status lookups.
    "duplicates the default" findings as the nudge to promote repeated
    overrides into defaults. List fields are provenance-binary at the
    whole-list level (merge replaces lists wholesale — no per-item marking).
+   **Gap fixed:** str/int/list fields could always revert an explicit
+   override back to inherited by clearing the field to blank
+   (`apply_update()` pops the key), but a `bool`/`enum` field had no
+   equivalent — a `Checkbox`/`Select` has no "blank" state, so once touched
+   it stayed explicit forever, even set back to a value matching the
+   default (user-reported, exactly this way). Fixed with `ctrl+r`
+   (`action_reset_field()`, `gateway/configtool/screens/form_common.py`):
+   resets the FOCUSED field to its pure-`*_defaults` value and marks it in
+   `self._reset_keys`; `_collect_field_updates()` writes a field in
+   `_reset_keys` as "clear to inherited" on Save regardless of kind, as
+   long as the widget still shows the reset value (a further real edit
+   supersedes it and falls back to normal diffing). Chosen over a tri-state
+   control or a per-row reset button — one consistent keybinding across
+   every field kind, including str/int/list where it's a faster alternative
+   to clearing the box.
 3. **`rooms:` group editing — two-tier rule:** deleting a room removes it
    from the list (normalizing `rooms: [x]` → `room: x`); editing a
    **per-room** field (`name`/`session_id` — already hard-restricted to
@@ -164,11 +180,13 @@ per-row status lookups.
 |---|---|---|
 | `OverviewScreen` | root | **Shipped.** 5 tabs: Connectors, Agents, Watchers, Defaults, Tool Presets |
 | `AgentDetailScreen` | pushed | **Shipped, all 3 modes.** view/edit/create. Form fields are a manually-maintained mirror of `$defs/agent` (not a runtime schema interpreter — safe since the schema is closed). Nothing is written to `document` until Save; Save diffs every field against its value-at-open and writes only what changed (docs/design/config-tool.md decision 2). Tool-list fields (`owner_allowed_tools`/`guest_allowed_tools`) stay view-only here — separate tool-list-editor work. Escape with unsaved changes routes through `ConfirmModal` |
-| `ConnectorDetailScreen` / `WatcherDetailScreen` | pushed | **Shipped**, `mode="view"` only still — connector edit/create is the next Phase 2 slice; watcher CRUD is Phase 3. Each already takes a `mode: Literal["view","edit","create"]` param — no screen-class rework needed when their turn comes |
+| `ConnectorDetailScreen` | pushed | **Shipped, all 3 modes.** Per-type fixed field lists (tree editor deferred — see Part 3). `type`/`name` immutable in edit mode |
+| `WatcherDetailScreen` | pushed | **Shipped**, `mode="view"` only still — Phase 3. Already takes a `mode: Literal["view","edit","create"]` param — no screen-class rework needed when its turn comes |
 | `DefaultsScreen` | pushed | **Shipped** (view-only): shows blast radius per key |
 | `ToolPresetsScreen` | pushed | **Shipped** (view-only): rule list + "used by" (checked against the MERGED per-agent tool list, not the raw entry — see gotchas below) |
 | `ConfirmModal` | modal | **Shipped** (`gateway/configtool/modals.py`) — yes/no dialog, Cancel focused by default. Gates `ConfigToolApp.action_quit()` on `EditableConfig.dirty`, and `AgentDetailScreen`'s own per-screen form-dirty flag on Escape |
-| `TypePickerModal` | modal | **Shipped** (`gateway/configtool/modals.py`) — generic list-of-strings picker (`ListView`-based), used today for the agent-type picker (claude/opencode); the connector-type picker (rocketchat/mattermost/voice/script) will reuse the same class |
+| `MessageModal` | modal | **Shipped** (`gateway/configtool/modals.py`) — dismiss-only error/info dialog; replaces `notify(severity="error")` for anything worth blocking on (validation/save/delete failures) — user-reported that toasts vanish before a multi-line error can be read |
+| `TypePickerModal` | modal | **Shipped** (`gateway/configtool/modals.py`) — generic list-of-strings picker (`ListView`-based), reused as-is for both the agent-type picker (claude/opencode) and the connector-type picker (rocketchat/mattermost/voice/script) |
 | `EntityPickerModal`, `PresetOrInlineModal`, `InlineToolRuleModal` | modals | Not yet built (phase 2/3) |
 | `RoomListEditorScreen` | pushed (2nd level) | Not yet built (phase 3) |
 | `$EDITOR` escape hatch | action | **Shipped.** `App.suspend()` + subprocess; Overview-only |
@@ -262,11 +280,131 @@ Phase 2 first cleared the Phase 1 code review's deferred items 7–10
   Textual gotchas hit while building it (`@work`/`push_screen_wait`, and
   Input/Select firing `Changed` once at initial mount).
 
-**Not yet built:** `ConnectorDetailScreen` edit/create, `TypePickerModal`'s
-connector-type variant + per-type templates + generic tree editor for
-connector `raw`, `.env` merge-by-key writer + secret toggle, tool-list editor
-+ `PresetOrInlineModal` + `InlineToolRuleModal`, `ToolPresetsScreen` made
-editable (used-by warnings).
+- **Shipped:** `gateway/configtool/env_writer.py`'s `upsert_env_vars()` — the
+  merge-by-key `.env` writer (decision 6). No UI wiring yet (see below).
+- **Shipped:** `FormScreen` (`gateway/configtool/screens/form_common.py`) —
+  `AgentDetailScreen`'s edit/create machinery (populating guard,
+  check_action, `@work action_back` + `ConfirmModal`, the generic
+  field-diff/Save collection, `refresh_bindings()` after `recompose()`)
+  extracted into a shared base once `ConnectorDetailScreen` became a second
+  concrete user, rather than guessed at up front. `FieldSpec`/`widget_id`/
+  `get_nested`/`apply_update`/`read_widget_value` moved alongside it as
+  plain reusable functions. Each subclass still owns its own field list,
+  `*_defaults` kind, dataclass-default map, `_compose_form()`, and
+  `action_save()` (insertion semantics differ enough — a dict keyed by name
+  vs. a list where each entry carries its own `name` — that forcing a
+  shared implementation would be more awkward than it's worth).
+- **Shipped:** `ConnectorDetailScreen` edit/create + the connector-type
+  variant of `TypePickerModal` (rocketchat/mattermost/voice/script), wired
+  to `n` on the Connectors tab. **Deliberate scope cut from the original
+  design:** per-type FIXED field lists (`_FIELDS_BY_TYPE` in
+  `connector_detail.py`) instead of the generic nested tree editor
+  originally planned for `raw`. Verified first that every real connector
+  type's raw shape is exactly one level deep (`server.url`,
+  `allowed_users.owners`, `attachments.*`, etc.) — precisely what
+  `FormScreen`'s existing dotted-key machinery already handles, so this
+  isn't a compromise so much as reuse of code already proven correct for
+  agent's `permissions.*`. The tree editor is deferred, not abandoned — it
+  would only earn its complexity for truly arbitrary/unknown keys, and the
+  `$EDITOR` escape hatch already covers that case; build it later if
+  per-type forms + `$EDITOR` turn out not to be enough in practice.
+  `type`/`name` are immutable in edit mode (only chosen at creation, via the
+  type picker) — rocketchat/mattermost's raw shapes differ enough that
+  letting `type` change in place would mean the form reshaping itself
+  around one of its own fields, and a `name` change would silently orphan
+  any watcher referencing the old name. Mattermost's token-XOR-user/pass
+  constraint gets a plain informational `Static` line, not an interactive
+  RadioSet — `save()`'s `validate_config()` (which runs the real
+  `MattermostConfig.__post_init__`) is the actual enforcement either way,
+  so the simpler static hint was chosen over building a stateful widget for
+  guidance alone.
+- **Deferred, not built:** the `.env` "store in .env" toggle itself. Typing
+  a plaintext secret directly into a masked field (`Input(password=True)` —
+  display-only masking; `.value` is always the real string, same as every
+  other field) and saving writes it to config.yaml in plaintext today,
+  exactly like the existing `$EDITOR` escape hatch already allows — not a
+  regression, just not yet automated. The writer (`upsert_env_vars`) and the
+  masked-secret Input widgets are both in place; wiring a toggle to
+  auto-generate an env var name, call the writer, and rewrite the entry's
+  field to a `${VAR}` placeholder is a self-contained follow-up.
+- **Verified (the actual keystone test for this screen, same weight as
+  `EditableConfig.save()`'s $VAR round-trip):** opening an existing
+  connector whose `server.password` is `"${SOME_VAR}"`, editing an
+  unrelated field, and saving leaves the password field's raw value
+  exactly `"${SOME_VAR}"` — never resolved, never masked at the data level.
+  Holds naturally from the existing diff-based Save mechanism (the widget's
+  initial snapshot and its unedited value-at-save are both the same literal
+  placeholder string) — no special-casing needed, confirmed by a dedicated
+  test rather than assumed.
+
+- **Shipped (added after initial Phase 2 review — user caught that "CRUD"
+  was being used loosely and Delete had never actually been designed for
+  agents/connectors; checked, and they were right, nothing in this
+  document specified it before now):** `d` from view mode on
+  `AgentDetailScreen`/`ConnectorDetailScreen` — `FormScreen.action_delete()`
+  (`gateway/configtool/screens/form_common.py`), shared the same way
+  `action_back()`/`action_edit()` are. `ConfirmModal` first, then remove
+  from `document`, `mark_dirty()`, `save()`. Same "let save() be the
+  backstop" philosophy as everything else in this screen: no reference-
+  counting reimplemented here — deleting an agent/connector still
+  referenced by a watcher fails `save()`'s `validate_config()` with
+  `GatewayConfig.from_file`'s own existing "references unknown agent/
+  connector" error, and the entry is reinserted into `document` so a
+  rejected delete never leaves memory silently out of sync with disk.
+  Connector deletion matches by object IDENTITY (not equality) to find the
+  right list index, since two connectors could in principle share
+  byte-identical raw content. Hidden from the footer while
+  editing/creating, via the same `check_action()` mechanism as 'Edit'/'Save'.
+  **Refined immediately after user testing:** the generic validator error
+  ("Watcher entry at index 11 references unknown connector 'X'") confused
+  the user, who reasonably expected a delete-specific reason. Added
+  `find_referencing_watcher_labels()` as a pre-flight check *before* the
+  destructive confirm — a blocked delete now shows "Cannot delete agent
+  'X' — still used by watcher(s): rc-general, rc-dev." and never even
+  offers the confirm dialog. `save()`'s own rejection stays in place as a
+  belt-and-suspenders backstop for anything the pre-check doesn't
+  anticipate, not replaced by it. **Second round, same feature:** the
+  labels initially fell back to the bare `room:`/joined `rooms:` string for
+  an unnamed watcher — inconsistent with the REAL name that watcher gets
+  everywhere else in the TUI (`_auto_watcher_name()`'s `"<connector>-<room>"`,
+  gateway/config.py), and wrong for a `rooms:` group (one joined label
+  instead of N separate real watchers). Rewritten to use
+  `cfg.expanded_watchers()` directly — the same real, already-correct data
+  the Overview's Watchers tab renders from — instead of re-deriving names
+  from the raw entry.
+- **`MessageModal`, a dismiss-only error/info dialog (`gateway/configtool/modals.py`).**
+  User-reported: `self.notify(..., severity="error")` toasts auto-vanish on
+  their own timer, and a save/delete failure's explanation (often several
+  lines) needs more than a glance. Every error-severity `notify()` call
+  across `AgentDetailScreen`/`ConnectorDetailScreen`'s create/edit/delete
+  flows (duplicate/blank name, invalid integer, save() validation failures,
+  delete failures) was converted to `await self.app.push_screen_wait(MessageModal(...))`
+  — stays up until Enter/Escape/click. Success messages ("Saved.",
+  "Deleted.") deliberately stayed as `notify()` toasts — short and don't
+  need blocking review. `action_save()` on both screens is now
+  `@work`-decorated (needed for `push_screen_wait`, same gotcha as
+  `action_back()`/`action_quit()`).
+- **Real bug, user-reported: a rejected Save in edit mode still mutated the
+  live entry.** `action_save()`'s trial-copy logic was
+  `target_entry = self.entry if self.mode == "edit" else dict(self.entry)`
+  — for edit mode, `target_entry` WAS `self.entry`, the SAME dict object
+  already living in `cfg.document` (entries are held by reference
+  throughout this tool, never copied on load). Applying Save's updates to
+  it, then having `save()` reject the result, left the invalid data sitting
+  in `document` — no rollback path existed for edit mode (only create mode
+  deleted its phantom entry on failure). Reported exactly as it would
+  manifest: set an invalid `timeout`, Save fails with a clear error, press
+  Back anyway — the invalid value was still showing, even though nothing
+  had actually been written to disk. Fixed with the same
+  install/rollback-hook pattern delete already uses:
+  `_install_trial_entry(target_entry)` swaps a COPY (with updates applied)
+  into `document` *before* `save()` runs; `_rollback_trial_entry()` restores
+  the untouched original if `save()` rejects it. `self.entry` itself is
+  never mutated until `save()` has actually succeeded.
+- **Not yet built:** the `.env` toggle wiring (above), the generic tree
+  editor (deferred, above), tool-list editor + `PresetOrInlineModal` +
+  `InlineToolRuleModal`, `ToolPresetsScreen` made editable (used-by
+  warnings).
 
 **Phase 3: Watcher CRUD + defaults editing.** `WatcherDetailScreen`
 edit/create; new-watcher flow (pickers now enumerate entities creatable
@@ -346,6 +484,19 @@ split-out insertion position).
   recomposes itself between modes (e.g. view → edit) has to re-arm the
   guard and reschedule `call_after_refresh` at the recompose call site
   itself, not rely on `on_mount` firing again.
+- **A `VerticalScroll` is itself focusable by default, and ends up FIRST in
+  the Tab cycle — before any of the widgets inside it.** User-reported:
+  entering edit mode needed Tab pressed TWICE to reach the first real field
+  (once to focus the form's own scroll container, once to move past it).
+  Same root cause hit `AUTO_FOCUS` too (Textual's own default,
+  `App.AUTO_FOCUS = "*"`, which normally auto-focuses the first focusable
+  widget on a screen's first mount): in CREATE mode — a genuine fresh
+  push, so `AUTO_FOCUS` does fire — focus still landed on the container,
+  not the Name field, for the same reason. Fixed both at once with
+  `VerticalScroll(classes="entity-form", can_focus=False)` on the form's own
+  container — it isn't meant to be independently focused; scrolling still
+  works via the mouse wheel/PageUp/PageDown. Worth checking for on any
+  future container that wraps a form's fields.
 - **`push_screen_wait()` needs a `@work`-decorated caller**, same gotcha as
   `ConfigToolApp.action_quit()` — `AgentDetailScreen.action_back()` awaits a
   `ConfirmModal` result for its own discard-vs-keep-editing decision, so it's

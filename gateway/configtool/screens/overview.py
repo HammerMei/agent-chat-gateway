@@ -22,7 +22,7 @@ from ..formatting import status_badge
 from ..modals import TypePickerModal
 from ..model import StatusIndex
 from .agent_detail import AgentDetailScreen
-from .connector_detail import ConnectorDetailScreen
+from .connector_detail import CONNECTOR_TYPES, ConnectorDetailScreen
 from .defaults import DefaultsScreen
 from .tool_presets import ToolPresetsScreen
 from .watcher_detail import WatcherDetailScreen
@@ -87,29 +87,36 @@ class OverviewScreen(Screen):
 
     @work
     async def action_new_entity(self) -> None:
-        """'n' — scoped to whichever tab is active. Only Agents supports
-        creation so far (docs/design/config-tool.md's Phase 2 order does
-        connector/agent CRUD together; agent landed first — see the design
-        doc's Phase 2 status). Other tabs just notify, rather than doing
-        nothing silently or crashing."""
+        """'n' — scoped to whichever tab is active. Agents and Connectors
+        support creation; Watchers/Defaults/Tool Presets don't yet (Phase 3).
+        Unsupported tabs just notify, rather than doing nothing silently or
+        crashing."""
         app: "ConfigToolApp" = self.app  # type: ignore[assignment]
         if app.editable_config is None:
             self.notify("Config does not currently load — nothing to add to.", severity="error")
             return
 
         active_tab = self.query_one(TabbedContent).active
-        if active_tab != "tab-agents":
+        if active_tab == "tab-agents":
+            agent_type = await self.app.push_screen_wait(
+                TypePickerModal("New agent — pick a type", list(_AGENT_TYPES))
+            )
+            if agent_type is None:
+                return
+            self.app.push_screen(
+                AgentDetailScreen(app.editable_config, "", {"type": agent_type}, mode="create")
+            )
+        elif active_tab == "tab-connectors":
+            connector_type = await self.app.push_screen_wait(
+                TypePickerModal("New connector — pick a type", list(CONNECTOR_TYPES))
+            )
+            if connector_type is None:
+                return
+            self.app.push_screen(
+                ConnectorDetailScreen(app.editable_config, {"type": connector_type}, mode="create")
+            )
+        else:
             self.notify("Creating a new entry isn't supported on this tab yet.", severity="warning")
-            return
-
-        agent_type = await self.app.push_screen_wait(
-            TypePickerModal("New agent — pick a type", list(_AGENT_TYPES))
-        )
-        if agent_type is None:
-            return
-        self.app.push_screen(
-            AgentDetailScreen(app.editable_config, "", {"type": agent_type}, mode="create")
-        )
 
     def action_refresh(self) -> None:
         # Must go through app.reload_config() (re-reads EditableConfig.document
