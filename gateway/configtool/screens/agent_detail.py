@@ -133,6 +133,15 @@ class AgentDetailScreen(FormScreen):
     def _entity_noun(self) -> str:
         return "agent"
 
+    def _entity_label(self) -> str:
+        return self.agent_name
+
+    def _remove_entry_from_document(self) -> None:
+        del self.cfg.document["agents"][self.agent_name]
+
+    def _reinsert_entry_into_document(self) -> None:
+        self.cfg.document.setdefault("agents", {})[self.agent_name] = self.entry
+
     def _on_enter_edit_mode(self) -> None:
         self._compute_initial_values(self.entry)
 

@@ -391,3 +391,107 @@ class TestConnectorEscapeConfirmation:
             assert isinstance(app.screen, OverviewScreen)
             raw = yaml.safe_load(Path(config_path).read_text())
             assert len(raw["connectors"]) == 1  # nothing added
+
+
+def _config_with_two_connectors(work_dir: Path) -> str:
+    """'rc-referenced' is used by the watcher; 'rc-orphan' is not — used to
+    test both the delete-succeeds and delete-blocked paths."""
+    return f"""\
+        agents:
+          default:
+            type: claude
+            working_directory: {work_dir}
+        connectors:
+          - name: rc-referenced
+            type: rocketchat
+            server: {{url: "http://localhost:3000", username: bot, password: pw}}
+          - name: rc-orphan
+            type: rocketchat
+            server: {{url: "http://localhost:3001", username: bot2, password: pw2}}
+        watchers:
+          - connector: rc-referenced
+            agent: default
+            room: general
+    """
+
+
+async def _open_connector_in_view_mode(pilot, app, row: int = 0) -> None:
+    table = app.screen.query_one("#connectors-table", DataTable)
+    table.focus()
+    table.move_cursor(row=row)
+    await pilot.press("enter")
+    await pilot.pause()
+
+
+class TestDeleteConnector:
+    async def test_d_key_shows_confirm_modal(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _config_with_two_connectors(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_connector_in_view_mode(pilot, app)
+
+            await pilot.press("d")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmModal)
+
+    async def test_cancelling_the_delete_keeps_the_connector(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _config_with_two_connectors(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_connector_in_view_mode(pilot, app, row=1)  # rc-orphan
+
+            await pilot.press("d")
+            await pilot.pause()
+            await pilot.press("enter")  # Cancel is focused by default
+            await pilot.pause()
+            assert isinstance(app.screen, ConnectorDetailScreen)
+            assert app.screen.mode == "view"
+            names = {c.get("name") for c in app.editable_config.connectors_raw}
+            assert "rc-orphan" in names
+
+    async def test_confirming_delete_of_an_unreferenced_connector_succeeds(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _config_with_two_connectors(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_connector_in_view_mode(pilot, app, row=1)  # rc-orphan
+
+            await pilot.press("d")
+            await pilot.pause()
+            await pilot.press("tab", "enter")  # Delete
+            await pilot.pause()
+
+            assert isinstance(app.screen, OverviewScreen)
+            raw = yaml.safe_load(Path(config_path).read_text())
+            names = {c["name"] for c in raw["connectors"]}
+            assert "rc-orphan" not in names
+            assert "rc-referenced" in names
+            assert list(Path(config_path).parent.glob("config.yaml.bak.*"))
+
+    async def test_deleting_a_referenced_connector_fails_and_rolls_back(
+        self, tmp_path, work_dir
+    ):
+        """A watcher still references 'rc-referenced' — save()'s
+        validate_config() must reject the deletion, and the connector must
+        be restored, not left removed-from-memory-but-not-saved."""
+        config_path = _write_config(tmp_path, _config_with_two_connectors(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_connector_in_view_mode(pilot, app, row=0)  # rc-referenced
+
+            await pilot.press("d")
+            await pilot.pause()
+            await pilot.press("tab", "enter")  # Delete
+            await pilot.pause()
+
+            assert isinstance(app.screen, ConnectorDetailScreen)
+            assert app.screen.mode == "view"
+            names = {c.get("name") for c in app.editable_config.connectors_raw}
+            assert "rc-referenced" in names
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert any(c["name"] == "rc-referenced" for c in raw["connectors"])

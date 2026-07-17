@@ -321,9 +321,28 @@ Phase 2 first cleared the Phase 1 code review's deferred items 7–10
   placeholder string) — no special-casing needed, confirmed by a dedicated
   test rather than assumed.
 
-**Not yet built:** the `.env` toggle wiring (above), the generic tree editor
-(deferred, above), tool-list editor + `PresetOrInlineModal` +
-`InlineToolRuleModal`, `ToolPresetsScreen` made editable (used-by warnings).
+- **Shipped (added after initial Phase 2 review — user caught that "CRUD"
+  was being used loosely and Delete had never actually been designed for
+  agents/connectors; checked, and they were right, nothing in this
+  document specified it before now):** `d` from view mode on
+  `AgentDetailScreen`/`ConnectorDetailScreen` — `FormScreen.action_delete()`
+  (`gateway/configtool/screens/form_common.py`), shared the same way
+  `action_back()`/`action_edit()` are. `ConfirmModal` first, then remove
+  from `document`, `mark_dirty()`, `save()`. Same "let save() be the
+  backstop" philosophy as everything else in this screen: no reference-
+  counting reimplemented here — deleting an agent/connector still
+  referenced by a watcher fails `save()`'s `validate_config()` with
+  `GatewayConfig.from_file`'s own existing "references unknown agent/
+  connector" error, and the entry is reinserted into `document` so a
+  rejected delete never leaves memory silently out of sync with disk.
+  Connector deletion matches by object IDENTITY (not equality) to find the
+  right list index, since two connectors could in principle share
+  byte-identical raw content. Hidden from the footer while
+  editing/creating, via the same `check_action()` mechanism as 'Edit'/'Save'.
+- **Not yet built:** the `.env` toggle wiring (above), the generic tree
+  editor (deferred, above), tool-list editor + `PresetOrInlineModal` +
+  `InlineToolRuleModal`, `ToolPresetsScreen` made editable (used-by
+  warnings).
 
 **Phase 3: Watcher CRUD + defaults editing.** `WatcherDetailScreen`
 edit/create; new-watcher flow (pickers now enumerate entities creatable
