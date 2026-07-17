@@ -121,6 +121,23 @@ class ConnectorDetailScreen(FormScreen):
     def _entity_noun(self) -> str:
         return "connector"
 
+    def _entity_label(self) -> str:
+        return self.entry.get("name", "?")
+
+    def _remove_entry_from_document(self) -> None:
+        connectors = self.cfg.document.get("connectors") or []
+        # Matched by object IDENTITY, not equality — connectors_raw is a
+        # fresh list each call but wraps the SAME dict objects living in
+        # `document`, and two connectors could (in a broken config) have
+        # byte-identical raw content; identity is the only way to be sure
+        # this is the exact entry this screen was opened on.
+        self._deleted_index = next(i for i, c in enumerate(connectors) if c is self.entry)
+        del connectors[self._deleted_index]
+
+    def _reinsert_entry_into_document(self) -> None:
+        connectors = self.cfg.document.setdefault("connectors", [])
+        connectors.insert(self._deleted_index, self.entry)
+
     def _on_enter_edit_mode(self) -> None:
         self._compute_initial_values(self.entry)
 

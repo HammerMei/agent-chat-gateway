@@ -648,3 +648,122 @@ class TestFirstFieldFocus:
             await pilot.pause()
             assert app.screen.focused is not None
             assert app.screen.focused.id == "field-description"
+
+
+def _config_with_two_agents(work_dir: Path) -> str:
+    """'existing-agent' is referenced by the watcher; 'unused-agent' is not
+    — used to test both the delete-succeeds and delete-blocked paths."""
+    return f"""\
+        agents:
+          existing-agent:
+            working_directory: {work_dir}
+          unused-agent:
+            working_directory: {work_dir}
+        connectors:
+          - name: rc
+            type: rocketchat
+            server: {{url: "http://localhost:3000", username: bot, password: pw}}
+        watchers:
+          - connector: rc
+            agent: existing-agent
+            room: general
+    """
+
+
+async def _open_agent_in_view_mode(pilot, app, row: int = 0) -> None:
+    table = app.screen.query_one("#agents-table", DataTable)
+    table.focus()
+    table.move_cursor(row=row)
+    await pilot.press("enter")
+    await pilot.pause()
+
+
+class TestDeleteAgent:
+    async def test_d_key_shows_confirm_modal(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _config_with_two_agents(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_in_view_mode(pilot, app)
+
+            await pilot.press("d")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmModal)
+
+    async def test_cancelling_the_delete_keeps_the_agent(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _config_with_two_agents(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_in_view_mode(pilot, app)
+
+            await pilot.press("d")
+            await pilot.pause()
+            await pilot.press("enter")  # Cancel is focused by default
+            await pilot.pause()
+            assert isinstance(app.screen, AgentDetailScreen)
+            assert app.screen.mode == "view"
+            assert "unused-agent" in app.editable_config.agents_raw
+
+    async def test_confirming_delete_of_an_unreferenced_agent_succeeds(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _config_with_two_agents(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            # row 1 is "unused-agent" (dict order: existing-agent, unused-agent)
+            await _open_agent_in_view_mode(pilot, app, row=1)
+            assert app.screen.agent_name == "unused-agent"
+
+            await pilot.press("d")
+            await pilot.pause()
+            await pilot.press("tab", "enter")  # Delete
+            await pilot.pause()
+
+            assert isinstance(app.screen, OverviewScreen)
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert "unused-agent" not in raw["agents"]
+            assert "existing-agent" in raw["agents"]
+            assert list(Path(config_path).parent.glob("config.yaml.bak.*"))
+
+    async def test_deleting_a_referenced_agent_fails_and_rolls_back(
+        self, tmp_path, work_dir
+    ):
+        """A watcher still references 'existing-agent' — save()'s
+        validate_config() must reject the deletion (GatewayConfig.from_file
+        raises "references unknown agent"), and the agent must be restored,
+        not left removed-from-memory-but-not-saved."""
+        config_path = _write_config(tmp_path, _config_with_two_agents(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_in_view_mode(pilot, app, row=0)
+            assert app.screen.agent_name == "existing-agent"
+
+            await pilot.press("d")
+            await pilot.pause()
+            await pilot.press("tab", "enter")  # Delete
+            await pilot.pause()
+
+            # Stays on the (still-view-mode) detail screen — delete failed.
+            assert isinstance(app.screen, AgentDetailScreen)
+            assert app.screen.mode == "view"
+            assert "existing-agent" in app.editable_config.agents_raw
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert "existing-agent" in raw["agents"]  # untouched on disk too
+
+    async def test_delete_is_hidden_from_the_footer_while_editing(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _config_with_two_agents(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_in_edit_mode(pilot, app)
+
+            from textual.widgets import Footer
+            from textual.widgets._footer import FooterKey
+
+            keys = {k.key for k in app.screen.query_one(Footer).query(FooterKey)}
+            assert "d" not in keys

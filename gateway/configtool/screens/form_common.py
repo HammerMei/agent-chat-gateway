@@ -137,6 +137,7 @@ class FormScreen(DetailScreen):
 
     BINDINGS = [
         Binding("e", "edit", "Edit", show=True),
+        Binding("d", "delete", "Delete", show=True),
         Binding("ctrl+s", "save", "Save", show=True),
         # Screen already binds tab/shift+tab to app.focus_next/focus_previous
         # with show=False (textual/screen.py) — re-bound here with show=True
@@ -193,11 +194,11 @@ class FormScreen(DetailScreen):
         self._populating = False
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        """Hide 'Edit' from the footer once already editing/creating (it's a
-        no-op there — action_edit() only does something from view mode; a
-        footer hint for a no-op key reads as broken, not just redundant),
-        and hide 'Save' while still in view mode (nothing to save yet)."""
-        if action == "edit":
+        """Hide 'Edit'/'Delete' from the footer once already editing/creating
+        (both are no-ops there; a footer hint for a no-op key reads as
+        broken, not just redundant), and hide 'Save' while still in view
+        mode (nothing to save yet)."""
+        if action in ("edit", "delete"):
             return self.mode == "view"
         if action == "save":
             return self.mode != "view"
@@ -215,6 +216,22 @@ class FormScreen(DetailScreen):
         raise NotImplementedError
 
     def _compose_form(self) -> ComposeResult:
+        raise NotImplementedError
+
+    def _entity_label(self) -> str:
+        """Used in the delete-confirmation message and the post-delete
+        notification (e.g. an agent/connector's name)."""
+        raise NotImplementedError
+
+    def _remove_entry_from_document(self) -> None:
+        """Delete this entity's raw entry from `self.cfg.document` in place.
+        Must record whatever this subclass needs (e.g. the entry's index in
+        a list) to support `_reinsert_entry_into_document()` undoing it."""
+        raise NotImplementedError
+
+    def _reinsert_entry_into_document(self) -> None:
+        """Undo `_remove_entry_from_document()` — called when `save()`
+        rejects the deletion (e.g. a watcher still references this entity)."""
         raise NotImplementedError
 
     async def action_save(self) -> None:
@@ -353,9 +370,45 @@ class FormScreen(DetailScreen):
             self.refresh_bindings()  # see action_edit()'s comment — same fix
 
     def _entity_noun(self) -> str:
-        """Used only in the discard-confirmation message ("... to this
-        agent?" / "... to this connector?")."""
+        """Used in the discard- and delete-confirmation messages ("... to
+        this agent?" / "... to this connector?")."""
         return "entry"
+
+    @work
+    async def action_delete(self) -> None:
+        """'d', view mode only (see check_action). Confirm -> remove from
+        `document` -> save(). If save() rejects the deletion (most commonly:
+        a watcher still references this entity — GatewayConfig.from_file
+        raises a clear "references unknown agent/connector" error, and
+        validate_config() surfaces it unchanged, same as every other
+        validation failure this tool relies on save() to catch rather than
+        reimplementing), the entry is reinserted so a rejected delete never
+        leaves `document` silently missing something that's still on disk."""
+        if self.mode != "view":
+            return
+        confirmed = await self.app.push_screen_wait(
+            ConfirmModal(
+                f"Delete {self._entity_noun()} '{self._entity_label()}'? "
+                "This cannot be undone.",
+                confirm_label="Delete",
+            )
+        )
+        if not confirmed:
+            return
+
+        self._remove_entry_from_document()
+        self.cfg.mark_dirty()
+        try:
+            self.cfg.save()
+        except (ValueError, FileNotFoundError) as exc:
+            self._reinsert_entry_into_document()
+            self.notify(f"Could not delete: {exc}", severity="error")
+            return
+
+        self.app.pop_screen()
+        app = self.app
+        app.notify(f"Deleted {self._entity_noun()} '{self._entity_label()}'.", severity="information")
+        app.reload_config()  # type: ignore[attr-defined]
 
     # ── generic diff collection (Save calls this, then applies the result
     # however this entity needs to — see module docstring) ──────────────────
