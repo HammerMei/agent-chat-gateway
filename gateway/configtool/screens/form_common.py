@@ -243,6 +243,16 @@ class FormScreen(DetailScreen):
         # navigation didn't work) resets the FOCUSED field specifically,
         # regardless of kind.
         Binding("ctrl+r", "reset_field", "Reset field", show=True),
+        # User-requested (nice-to-have, not a bug): a way to check what's
+        # actually in a masked secret field before saving. ctrl+t (NOT
+        # ctrl+p — that's Textual's own App.COMMAND_PALETTE_BINDING, which
+        # takes priority over any screen-level binding for the same key and
+        # silently ate every keypress until this was caught by a failing
+        # test) toggles the FOCUSED field's Input.password reactive —
+        # masking is display-only (Input(password=True) never affects
+        # .value), so this is purely cosmetic and doesn't touch anything
+        # read_widget_value() or the diff logic sees.
+        Binding("ctrl+t", "toggle_password_visibility", "Show/hide password", show=True),
     ]
 
     DEFAULT_CSS = """
@@ -321,7 +331,7 @@ class FormScreen(DetailScreen):
         mode (nothing to save yet)."""
         if action in ("edit", "delete"):
             return self.mode == "view"
-        if action in ("save", "reset_field"):
+        if action in ("save", "reset_field", "toggle_password_visibility"):
             return self.mode != "view"
         return True
 
@@ -503,6 +513,21 @@ class FormScreen(DetailScreen):
         self._form_dirty = True
         self.notify(f"{spec.label}: will revert to inherited on Save.", severity="information")
 
+    def action_toggle_password_visibility(self) -> None:
+        """ctrl+t: reveal/re-mask the FOCUSED secret field. A no-op if focus
+        isn't on a masked Input (Input.password is always False for a
+        non-secret field, so toggling it there would be a silent, confusing
+        no-visible-effect action — checked explicitly via the field's own
+        FieldSpec.secret, not just "is this an Input")."""
+        widget = self.focused
+        field_key = getattr(widget, "field_key", None)
+        if field_key is None or not isinstance(widget, Input):
+            return
+        spec = next((s for s in self._field_specs() if s.key == field_key), None)
+        if spec is None or not spec.secret:
+            return
+        widget.password = not widget.password
+
     # ── navigation ───────────────────────────────────────────────────────────
 
     async def action_edit(self) -> None:
@@ -609,10 +634,17 @@ class FormScreen(DetailScreen):
             await self.app.push_screen_wait(MessageModal(str(exc), title="Could not delete"))
             return
 
+        self._on_deleted_successfully()
         self.app.pop_screen()
         app = self.app
         app.notify(f"Deleted {self._entity_noun()} '{self._entity_label()}'.", severity="information")
         app.reload_config()  # type: ignore[attr-defined]
+
+    def _on_deleted_successfully(self) -> None:
+        """Hook for subclass-specific cleanup once the deletion is confirmed
+        durable (document saved to disk). No-op by default;
+        ConnectorDetailScreen uses this to remove any `.env` entries this
+        connector owned (see its own override)."""
 
     # ── generic diff collection (Save calls this, then applies the result
     # however this entity needs to — see module docstring) ──────────────────

@@ -512,13 +512,44 @@ class TestEnvSecretToggle:
             assert raw["connectors"][0]["server"]["password"] == "${SOME_OTHER_VAR}"
             assert not (Path(tmp_path) / ".env").exists()
 
-    async def test_untouched_secret_field_never_triggers_env_writes(self, tmp_path, work_dir):
+    async def test_untouched_plaintext_secret_still_migrates_to_env_when_toggle_left_on(
+        self, tmp_path, work_dir
+    ):
+        """User-reported fix: leaving the toggle at its default (checked)
+        and saving — even without retyping the password, even editing a
+        completely unrelated field — is how an EXISTING plaintext secret
+        (e.g. saved earlier with the toggle unchecked) gets migrated into
+        .env. There was previously no other way to do this short of
+        retyping the same password, which the user correctly flagged as
+        broken/confusing."""
         config_path = _write_config(tmp_path, _config_with_one_rocketchat_connector(work_dir))
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
             await _open_connector_in_edit_mode(pilot, app)
 
+            app.screen.query_one("#field-timezone", Input).value = "America/New_York"
+            # password field and its "Store in .env" toggle: untouched,
+            # toggle at its default (checked).
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert raw["connectors"][0]["server"]["password"] == "${RC_EXISTING_PASSWORD}"
+            env_text = (Path(tmp_path) / ".env").read_text()
+            assert "RC_EXISTING_PASSWORD=pw" in env_text
+
+    async def test_untouched_secret_field_is_left_alone_when_toggle_is_off(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _config_with_one_rocketchat_connector(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_connector_in_edit_mode(pilot, app)
+
+            app.screen.query_one("#field-server-password-env-toggle", Checkbox).value = False
             app.screen.query_one("#field-timezone", Input).value = "America/New_York"
             await pilot.pause()
             await pilot.press("ctrl+s")
@@ -527,6 +558,34 @@ class TestEnvSecretToggle:
             raw = yaml.safe_load(Path(config_path).read_text())
             assert raw["connectors"][0]["server"]["password"] == "pw"  # untouched
             assert not (Path(tmp_path) / ".env").exists()
+
+    async def test_reopening_after_migration_shows_the_toggle_checked_and_is_a_no_op(
+        self, tmp_path, work_dir
+    ):
+        """Once a field is already "${VAR}", it looks_like_env_var_reference()
+        and is left alone on every subsequent save — no infinite
+        reconversion, no redundant .env writes."""
+        config_path = _write_config(tmp_path, _config_with_one_rocketchat_connector(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_connector_in_edit_mode(pilot, app)
+            await pilot.press("ctrl+s")  # migrate on the first save (default toggle)
+            await pilot.pause()
+
+            await _open_connector_in_edit_mode(pilot, app)
+            pw_input = app.screen.query_one("#field-server-password", Input)
+            assert pw_input.value == "${RC_EXISTING_PASSWORD}"
+            toggle = app.screen.query_one("#field-server-password-env-toggle", Checkbox)
+            assert toggle.value is True
+
+            app.screen.query_one("#field-timezone", Input).value = "America/Chicago"
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert raw["connectors"][0]["server"]["password"] == "${RC_EXISTING_PASSWORD}"
 
     async def test_env_write_failure_leaves_config_yaml_completely_untouched(
         self, tmp_path, work_dir, monkeypatch
@@ -568,6 +627,63 @@ class TestEnvSecretToggle:
 
             raw = yaml.safe_load(Path(config_path).read_text())
             assert raw["connectors"][0]["server"]["password"] == "pw"  # untouched
+
+    async def test_generated_var_name_colliding_with_an_unrelated_existing_env_key_is_blocked(
+        self, tmp_path, work_dir
+    ):
+        """User-asked: if there's already an unrelated RC_EXISTING_PASSWORD
+        in .env, does the tool know to use a different name, or could it
+        silently overwrite something? Answer: neither — it refuses to save
+        rather than guess. A real collision (a name this connector doesn't
+        already own) blocks the save with a clear message; the existing
+        .env value is left completely untouched."""
+        config_path = _write_config(tmp_path, _config_with_one_rocketchat_connector(work_dir))
+        env_path = tmp_path / ".env"
+        env_path.write_text("RC_EXISTING_PASSWORD=someone-elses-unrelated-secret\n")
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_connector_in_edit_mode(pilot, app)
+
+            app.screen.query_one("#field-server-password", Input).value = "my-new-secret"
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            assert isinstance(app.screen, MessageModal)
+            body = str(app.screen.query_one("#message-body").render())
+            assert "RC_EXISTING_PASSWORD" in body
+            assert "already exists" in body
+
+            # Neither config.yaml nor .env was touched.
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert raw["connectors"][0]["server"]["password"] == "pw"
+            assert env_path.read_text() == "RC_EXISTING_PASSWORD=someone-elses-unrelated-secret\n"
+
+    async def test_re_saving_a_connector_that_already_owns_the_var_is_not_a_collision(
+        self, tmp_path, work_dir
+    ):
+        """The var already existing is only a problem if this connector
+        DOESN'T already own it — a plain re-save (e.g. after migration)
+        must not falsely trip the collision guard."""
+        config_path = _write_config(tmp_path, _config_with_one_rocketchat_connector(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_connector_in_edit_mode(pilot, app)
+            await pilot.press("ctrl+s")  # migrates password -> ${RC_EXISTING_PASSWORD}
+            await pilot.pause()
+
+            await _open_connector_in_edit_mode(pilot, app)
+            app.screen.query_one("#field-timezone", Input).value = "America/Denver"
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            assert isinstance(app.screen, OverviewScreen)  # no collision MessageModal
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert raw["connectors"][0]["timezone"] == "America/Denver"
+            assert raw["connectors"][0]["server"]["password"] == "${RC_EXISTING_PASSWORD}"
 
 
 class TestConnectorEscapeConfirmation:
@@ -717,3 +833,97 @@ class TestDeleteConnector:
             assert "rc-referenced" in names
             raw = yaml.safe_load(Path(config_path).read_text())
             assert any(c["name"] == "rc-referenced" for c in raw["connectors"])
+
+    async def test_deleting_a_connector_removes_its_own_env_secret_but_not_others(
+        self, tmp_path, work_dir
+    ):
+        """User-reported: deleting a connector left its .env secret behind,
+        orphaned. Only removes the key matching THIS connector's exact
+        deterministic var name where the raw entry's value is exactly that
+        placeholder — an unrelated key (even one that happens to look like
+        it could belong to some other connector) must survive. A second,
+        unreferenced connector ("rc-orphan") is the one being deleted here
+        — "rc-referenced" and its watcher stay untouched so the config
+        still has >=1 connector afterward and the delete isn't blocked by
+        the referencing-watcher check."""
+        config_path = _write_config(
+            tmp_path,
+            f"""\
+                agents:
+                  default:
+                    type: claude
+                    working_directory: {work_dir}
+                connectors:
+                  - name: rc-referenced
+                    type: rocketchat
+                    server: {{url: "http://localhost:3000", username: bot, password: pw}}
+                  - name: rc-orphan
+                    type: rocketchat
+                    server: {{url: "http://localhost:3001", username: bot2, password: "${{RC_ORPHAN_PASSWORD}}"}}
+                watchers:
+                  - connector: rc-referenced
+                    agent: default
+                    room: general
+            """,
+        )
+        env_path = tmp_path / ".env"
+        env_path.write_text("RC_ORPHAN_PASSWORD=secret123\nUNRELATED_KEY=keep-me\n")
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            await _open_connector_in_view_mode(pilot, app, row=1)  # rc-orphan
+            assert app.screen.entry.get("name") == "rc-orphan"
+            await pilot.press("d")
+            await pilot.pause()
+            await pilot.press("tab", "enter")  # Delete
+            await pilot.pause()
+
+            assert isinstance(app.screen, OverviewScreen)
+            env_text = env_path.read_text()
+            assert "RC_ORPHAN_PASSWORD" not in env_text
+            assert "UNRELATED_KEY=keep-me" in env_text
+
+
+class TestPasswordVisibilityToggle:
+    """ctrl+t (nice-to-have, user-requested) — reveal/re-mask the FOCUSED
+    secret field. Purely cosmetic: Input.password only affects display,
+    never .value, so it has zero interaction with the diff/save logic."""
+
+    async def test_ctrl_t_reveals_and_re_masks_the_focused_password_field(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _config_with_one_rocketchat_connector(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_connector_in_edit_mode(pilot, app)
+
+            pw_input = app.screen.query_one("#field-server-password", Input)
+            assert pw_input.password is True  # masked by default
+            pw_input.focus()
+            await pilot.pause()
+
+            await pilot.press("ctrl+t")
+            await pilot.pause()
+            assert pw_input.password is False
+            assert pw_input.value == "pw"  # .value was never masked to begin with
+
+            await pilot.press("ctrl+t")
+            await pilot.pause()
+            assert pw_input.password is True
+
+    async def test_ctrl_t_on_a_non_secret_field_is_a_safe_no_op(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _config_with_one_rocketchat_connector(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_connector_in_edit_mode(pilot, app)
+
+            url_input = app.screen.query_one("#field-server-url", Input)
+            url_input.focus()
+            await pilot.pause()
+
+            await pilot.press("ctrl+t")  # must not raise
+            await pilot.pause()
+            assert url_input.password is False
