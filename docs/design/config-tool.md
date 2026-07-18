@@ -321,8 +321,8 @@ Phase 2 first cleared the Phase 1 code review's deferred items 7–10
 - **Shipped: the `.env` "store in .env" toggle.** A "Store in .env"
   `Checkbox` (default ON) next to every `secret=True` field
   (`FieldSpec.secret` already existed for masking; now also drives this).
-  On Save, for each secret field that ACTUALLY changed to a genuine new
-  plaintext value (a value already matching `$VAR`/`${VAR}` — checked via
+  On Save, for each secret field whose CURRENT value is a genuine plaintext
+  value (a value already matching `$VAR`/`${VAR}` — checked via
   `looks_like_env_var_reference()` — is left alone, since the user is
   explicitly referencing an externally-managed var, not typing a new
   secret) with the toggle checked: `env_var_name_for()` generates a
@@ -338,10 +338,45 @@ Phase 2 first cleared the Phase 1 code review's deferred items 7–10
   still fails for some OTHER, unrelated reason afterward, the value already
   written to `.env` is left there, unreferenced by anything — harmless,
   equivalent to a user having pre-populated `.env` with a value not wired
-  up yet; not worth building a transactional rollback for. Also accepted,
-  documented, not handled: the generated var name could collide with an
-  unrelated existing `.env` key — rare, not worth a collision-detection UI
-  for v1.
+  up yet; not worth building a transactional rollback for.
+- **Three user-reported follow-ups on the toggle, all fixed:**
+  1. *Not gated on "did this session's edit change the field."* The
+     original implementation only converted a secret to `.env` if
+     `spec.key in updates` — meaning a plaintext secret saved earlier with
+     the toggle unchecked could never be migrated later without literally
+     retyping the same password (which the user correctly flagged as a
+     dead end). Now every secret field's CURRENT value is checked
+     regardless of whether it changed THIS session — leaving the toggle at
+     its default (checked) and saving, even while editing a totally
+     unrelated field, migrates an already-plaintext secret into `.env`.
+     Already-a-`${VAR}` values are still skipped either way, so this
+     doesn't cause repeated/redundant `.env` writes on every subsequent save.
+  2. *Deleting a connector left its `.env` secret orphaned.* Fixed via a
+     new `FormScreen._on_deleted_successfully()` hook, fired after the
+     document save succeeds — `ConnectorDetailScreen`'s override removes
+     any `.env` key matching the deleted connector's exact deterministic
+     name, but ONLY where the raw entry's value was EXACTLY that
+     placeholder (never a heuristic "looks like it belongs to this
+     connector" guess).
+  3. *Var name collisions were an accepted, silent risk — user pushed
+     back, correctly.* What shipped instead: `read_env_vars()` checks
+     whether the generated name already exists in `.env` before writing;
+     if it does AND this connector doesn't already own it (its pre-save
+     value for that field wasn't already this exact placeholder — a plain
+     re-save isn't a collision), the save is BLOCKED with a clear message
+     naming the conflicting key, rather than silently overwriting an
+     unrelated secret. `env_writer.py` gained `read_env_vars()` (parse
+     `.env` into a dict) and `remove_env_vars()` (drop specific keys,
+     same merge-preserving-everything-else behavior as `upsert_env_vars()`)
+     to support both fixes.
+- **Shipped (nice-to-have, user-requested): `ctrl+t` reveals/re-masks the
+  FOCUSED secret field** (`Input.password` is a reactive — display-only,
+  never affects `.value`, so this has zero interaction with the diff/save
+  logic). **Gotcha:** the natural first choice, `ctrl+p`, is Textual's own
+  `App.COMMAND_PALETTE_BINDING` — a priority binding that silently
+  intercepts the keypress before it ever reaches a screen-level binding
+  for the same key. Caught by a failing test, not shipped wrong; moved to
+  `ctrl+t`.
 - **Verified (the actual keystone test for this screen, same weight as
   `EditableConfig.save()`'s $VAR round-trip):** opening an existing
   connector whose `server.password` is `"${SOME_VAR}"`, editing an

@@ -33,7 +33,7 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal, VerticalScroll
 from textual.widgets import Checkbox, Input, Static
 
-from ..env_writer import upsert_env_vars
+from ..env_writer import read_env_vars, remove_env_vars, upsert_env_vars
 from ..formatting import mask_if_secret, provenance_label
 from ..modals import MessageModal
 from ..model import EditableConfig
@@ -44,7 +44,10 @@ from .form_common import (
     env_toggle_widget_id,
     env_var_name_for,
     find_referencing_watcher_labels,
+    get_nested,
     looks_like_env_var_reference,
+    read_widget_value,
+    widget_id,
 )
 
 CONNECTOR_TYPES = ("rocketchat", "mattermost", "voice", "script")
@@ -161,6 +164,29 @@ class ConnectorDetailScreen(FormScreen):
 
     def _referencing_watcher_labels(self) -> list[str]:
         return find_referencing_watcher_labels(self.cfg, connector_name=self._entity_label())
+
+    def _on_deleted_successfully(self) -> None:
+        """User-reported: deleting a connector left its .env secret(s)
+        behind, orphaned. Removes any .env key this connector owned — ONLY
+        keys matching the exact deterministic naming convention
+        (env_var_name_for), and only where the raw entry's field value was
+        EXACTLY that placeholder (never a heuristic guess at what "belongs"
+        to this connector) — self.entry still holds its last content here;
+        _remove_entry_from_document() only detached it from
+        cfg.document's list, it didn't clear the dict itself."""
+        entity_name = self.entry.get("name", "?")
+        keys_to_remove = set()
+        for spec in self._field_specs():
+            if not spec.secret:
+                continue
+            value = get_nested(self.entry, spec.key)
+            if not isinstance(value, str):
+                continue
+            var_name = env_var_name_for(entity_name, spec.key)
+            if value == f"${{{var_name}}}":
+                keys_to_remove.add(var_name)
+        if keys_to_remove:
+            remove_env_vars(self.cfg.path.parent / ".env", keys_to_remove)
 
     def _on_enter_edit_mode(self) -> None:
         self._compute_initial_values(self.entry)
@@ -293,23 +319,51 @@ class ConnectorDetailScreen(FormScreen):
                 )
                 return
 
-        # Secret fields with "Store in .env" checked: if the field's value
-        # actually changed to a genuine new plaintext secret (not already a
-        # $VAR/${VAR} reference the user typed directly), swap it for a
-        # ${VAR} placeholder in `updates`.
+        # Secret fields with "Store in .env" checked: convert the field's
+        # CURRENT value — not just a value that changed THIS session — to a
+        # ${VAR} placeholder, as long as it's a genuine plaintext secret
+        # (not already a $VAR/${VAR} reference, left alone either way).
+        # Deliberately not gated on `spec.key in updates`: leaving the
+        # toggle checked (its default) and saving is how an ALREADY-
+        # plaintext field (e.g. one saved earlier with the toggle
+        # unchecked) gets migrated into .env — user-reported that there was
+        # otherwise no way to do this short of retyping the same password.
         env_writes: dict[str, str] = {}
         entity_name_for_env = name if self.mode == "create" else self.entry.get("name", "?")
+        env_path = self.cfg.path.parent / ".env"
         for spec in self._field_specs():
-            if not spec.secret or spec.key not in updates:
+            if not spec.secret:
                 continue
-            new_value = updates[spec.key]
-            if not new_value or looks_like_env_var_reference(new_value):
+            widget = self.query_one("#" + widget_id(spec.key))
+            current_value = read_widget_value(spec, widget)
+            if not current_value or looks_like_env_var_reference(current_value):
                 continue
             toggle = self.query_one(f"#{env_toggle_widget_id(spec.key)}", Checkbox)
             if not toggle.value:
                 continue
             var_name = env_var_name_for(entity_name_for_env, spec.key)
-            env_writes[var_name] = new_value
+
+            # Collision guard: refuse rather than silently overwrite an
+            # unrelated existing .env entry that happens to share the
+            # generated name. Not a collision if this connector already
+            # owns the name (its pre-save value for this field was already
+            # this exact placeholder — a re-save, not a conflict).
+            original_value = get_nested(self.entry, spec.key)
+            existing_env = read_env_vars(env_path)
+            if var_name in existing_env and original_value != f"${{{var_name}}}":
+                await self.app.push_screen_wait(
+                    MessageModal(
+                        f"'{var_name}' already exists in .env and isn't "
+                        f"currently used by this connector's {spec.label} — "
+                        "refusing to overwrite it. Rename this connector, "
+                        "or resolve the conflict in .env manually, then "
+                        "try again.",
+                        title="Could not save",
+                    )
+                )
+                return
+
+            env_writes[var_name] = current_value
             updates[spec.key] = f"${{{var_name}}}"
 
         if env_writes:
@@ -326,7 +380,7 @@ class ConnectorDetailScreen(FormScreen):
             # not wired up yet. Nothing else has been touched yet at this
             # point, so a failure here is a clean, early return.
             try:
-                upsert_env_vars(self.cfg.path.parent / ".env", env_writes)
+                upsert_env_vars(env_path, env_writes)
             except OSError as exc:
                 await self.app.push_screen_wait(
                     MessageModal(f"Could not write to .env: {exc}", title="Could not save")
