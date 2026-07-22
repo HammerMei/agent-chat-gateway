@@ -37,6 +37,7 @@ A subclass provides:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Literal
 
@@ -46,6 +47,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, VerticalScroll
 from textual.widgets import Checkbox, Footer, Header, Input, Select, Static
 
+from ..env_writer import read_env_vars
 from ..formatting import provenance_label
 from ..modals import ConfirmModal, MessageModal
 from ..model import EditableConfig, Provenance
@@ -58,11 +60,47 @@ class FieldSpec:
     kind: Literal["str", "int", "bool", "list", "enum"]
     label: str
     options: tuple[str, ...] | None = None
-    secret: bool = False  # mask the widget's display (Input(password=True))
+    # Masks the widget's display (Input(password=True)) AND renders a
+    # "Store in .env" Checkbox next to it (docs/design/config-tool.md
+    # decision 6) — default ON. See looks_like_env_var_reference()/
+    # env_var_name_for() below and ConnectorDetailScreen.action_save() for
+    # how the toggle actually gets acted on.
+    secret: bool = False
+
+
+_ENV_VAR_REF_RE = re.compile(r"^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$")
+
+
+def looks_like_env_var_reference(value: str) -> bool:
+    """True if `value` is ENTIRELY a `$VAR` or `${VAR}` reference (matching
+    both forms `gateway/config.py`'s `_expand_env_vars` resolves, via
+    `os.path.expandvars`). Used to avoid double-writing `.env` when a secret
+    field's new value is already a placeholder the user typed directly
+    (referencing an externally-managed var) rather than a genuine new
+    plaintext secret."""
+    return bool(_ENV_VAR_REF_RE.match(value))
+
+
+def env_var_name_for(entity_name: str, field_key: str) -> str:
+    """Deterministic `.env` var name for a secret field: `"<ENTITY>_<FIELD>"`,
+    uppercased, any non-alphanumeric character replaced with `_`. E.g.
+    connector `"rc-home"` + field `"server.password"` -> `"RC_HOME_PASSWORD"`.
+    Accepted, documented risk (not handled): this could collide with an
+    unrelated existing `.env` key sharing the same generated name — rare in
+    practice, not worth a collision-detection UI for v1.
+    """
+    suffix = field_key.rsplit(".", 1)[-1]
+    sanitized_entity = re.sub(r"[^A-Za-z0-9]", "_", entity_name).upper()
+    sanitized_field = re.sub(r"[^A-Za-z0-9]", "_", suffix).upper()
+    return f"{sanitized_entity}_{sanitized_field}"
 
 
 def widget_id(key: str) -> str:
     return "field-" + key.replace(".", "-")
+
+
+def env_toggle_widget_id(key: str) -> str:
+    return widget_id(key) + "-env-toggle"
 
 
 def get_nested(d: dict, dotted_key: str) -> object:
@@ -206,6 +244,16 @@ class FormScreen(DetailScreen):
         # navigation didn't work) resets the FOCUSED field specifically,
         # regardless of kind.
         Binding("ctrl+r", "reset_field", "Reset field", show=True),
+        # User-requested (nice-to-have, not a bug): a way to check what's
+        # actually in a masked secret field before saving. ctrl+t (NOT
+        # ctrl+p — that's Textual's own App.COMMAND_PALETTE_BINDING, which
+        # takes priority over any screen-level binding for the same key and
+        # silently ate every keypress until this was caught by a failing
+        # test) toggles the FOCUSED field's Input.password reactive —
+        # masking is display-only (Input(password=True) never affects
+        # .value), so this is purely cosmetic and doesn't touch anything
+        # read_widget_value() or the diff logic sees.
+        Binding("ctrl+t", "toggle_password_visibility", "Show/hide password", show=True),
     ]
 
     DEFAULT_CSS = """
@@ -223,9 +271,25 @@ class FormScreen(DetailScreen):
     FormScreen .field-provenance {
         padding-top: 1;
         margin-left: 2;
+        width: auto;
     }
     FormScreen Checkbox {
         width: auto;
+    }
+    /* Input's own DEFAULT_CSS is `width: 100%` — inside a Horizontal
+    field-row, that claims the ENTIRE row's width, pushing every sibling
+    that comes after it (the "Store in .env" Checkbox, the provenance
+    marker) off past the terminal's right edge. Confirmed as the actual,
+    user-reported cause of a "missing" checkbox — it was rendering, just
+    off-screen; the SAME bug had already been silently hiding every
+    provenance marker on every field row since Phase 2's agent form
+    shipped (a dim decorative label going unnoticed off-screen is a lot
+    less obvious than an interactive control). `1fr` matches Select's own
+    DEFAULT_CSS (which never had this problem) — share the row's
+    remaining space with fixed/auto-width siblings instead of claiming
+    all of it. */
+    FormScreen .field-row Input {
+        width: 1fr;
     }
     """
 
@@ -268,7 +332,7 @@ class FormScreen(DetailScreen):
         mode (nothing to save yet)."""
         if action in ("edit", "delete"):
             return self.mode == "view"
-        if action in ("save", "reset_field"):
+        if action in ("save", "reset_field", "toggle_password_visibility"):
             return self.mode != "view"
         return True
 
@@ -354,8 +418,41 @@ class FormScreen(DetailScreen):
             value = get_nested(merged, spec.key)
             if value is None:
                 value = dataclass_defaults.get(spec.key)
+            if spec.secret:
+                value = self._resolve_secret_display(value)
             self._initial_values[spec.key] = value
         self._initial_values["description"] = entry.get("description")
+
+    def _resolve_secret_display(self, raw_value: object) -> object:
+        """For a secret field whose effective value is a `$VAR`/`${VAR}`
+        reference, resolve it against `.env` FOR DISPLAY ONLY, so the user
+        can actually see and edit the real password instead of the literal
+        placeholder text (user-reported: "how do you expect user to change
+        the password" if all they can see is `${SOME_VAR}`).
+
+        This does NOT weaken the security keystone documented at the top of
+        this module (`EditableConfig` never resolves `$VAR` on load/save):
+        `self.entry`/`cfg.document` still hold the raw placeholder string
+        the whole time — this reads `.env` directly via `env_writer.
+        read_env_vars()`, the same file `ConnectorDetailScreen.action_save()`
+        already reads/writes, never `GatewayConfig.from_file`/`load_dotenv`/
+        `os.environ`. Only `_initial_values` (the widget's starting display
+        value AND the diff baseline `_collect_field_updates()` compares
+        against) uses the resolved form, so leaving the field untouched
+        diffs as "unchanged" — nothing gets written to `document` or `.env`
+        — and typing a new value diffs as a genuine change exactly like any
+        other field.
+
+        Falls back to `raw_value` unchanged if it isn't an env reference, or
+        if the referenced var isn't in `.env` (e.g. sourced from the shell
+        environment instead) — never silently blanks a field that has a
+        real value; `_compose_field_row()` adds a hint for this fallback
+        case so it doesn't look identical to "value not found at all"."""
+        if not isinstance(raw_value, str) or not looks_like_env_var_reference(raw_value):
+            return raw_value
+        var_name = raw_value.strip("${}")
+        resolved = read_env_vars(self.cfg.path.parent / ".env").get(var_name)
+        return raw_value if resolved is None else resolved
 
     def _field_provenance(self, spec: FieldSpec, entry: dict) -> Provenance | None:
         top_key = spec.key.split(".", 1)[0]
@@ -368,6 +465,22 @@ class FormScreen(DetailScreen):
         provenance = self._field_provenance(spec, entry)
         prov_text = f"[dim]({provenance_label(provenance)})[/dim]" if provenance else ""
         initial = self._initial_values.get(spec.key)
+        # own_raw is this entry's OWN explicit value (pre-merge, unresolved)
+        # for a secret field — used to decide the "Store in .env" checkbox's
+        # default (below) and to detect the fallback case where
+        # _resolve_secret_display() couldn't resolve the var (the widget is
+        # then showing the raw placeholder, same as `own_raw`, rather than
+        # an actual secret) so a hint can be added instead of looking
+        # identical to a field that simply has no provenance marker.
+        own_raw = get_nested(entry, spec.key) if spec.secret else None
+        if (
+            spec.secret
+            and isinstance(own_raw, str)
+            and looks_like_env_var_reference(own_raw)
+            and initial == own_raw
+        ):
+            hint = "[dim](not found in .env — type a new value to set one)[/dim]"
+            prov_text = f"{prov_text} {hint}" if prov_text else hint
         with Horizontal(classes="field-row"):
             yield Static(spec.label, classes="field-label")
             if spec.kind == "bool":
@@ -394,6 +507,22 @@ class FormScreen(DetailScreen):
             # future field key containing a literal dash.
             widget.field_key = spec.key
             yield widget
+            if spec.secret:
+                # Reflects whether THIS entry's own field is already stored
+                # in .env (own_raw looks like a $VAR/${VAR} reference) —
+                # NOT hardcoded True. User-reported bug: unchecking this,
+                # saving as plaintext, then reopening the form showed the
+                # checkbox checked again regardless of what was actually on
+                # disk, because this used to default to True unconditionally.
+                # create mode has no own_raw yet, so it keeps the original
+                # default-ON nudge (docs/design/config-tool.md decision 6)
+                # to encourage using .env for a brand new secret.
+                toggle_default = self.mode == "create" or (
+                    isinstance(own_raw, str) and looks_like_env_var_reference(own_raw)
+                )
+                yield Checkbox(
+                    "Store in .env", value=toggle_default, id=env_toggle_widget_id(spec.key)
+                )
             yield Static(prov_text, classes="field-provenance")
 
     # ── dirty tracking (per-screen, not EditableConfig.dirty — nothing is
@@ -437,11 +566,28 @@ class FormScreen(DetailScreen):
         value = get_nested(defaults_only, spec.key)
         if value is None:
             value = self._dataclass_defaults().get(spec.key)
+        if spec.secret:
+            value = self._resolve_secret_display(value)
 
         set_widget_value(spec, widget, value)
         self._reset_keys[spec.key] = read_widget_value(spec, widget)
         self._form_dirty = True
         self.notify(f"{spec.label}: will revert to inherited on Save.", severity="information")
+
+    def action_toggle_password_visibility(self) -> None:
+        """ctrl+t: reveal/re-mask the FOCUSED secret field. A no-op if focus
+        isn't on a masked Input (Input.password is always False for a
+        non-secret field, so toggling it there would be a silent, confusing
+        no-visible-effect action — checked explicitly via the field's own
+        FieldSpec.secret, not just "is this an Input")."""
+        widget = self.focused
+        field_key = getattr(widget, "field_key", None)
+        if field_key is None or not isinstance(widget, Input):
+            return
+        spec = next((s for s in self._field_specs() if s.key == field_key), None)
+        if spec is None or not spec.secret:
+            return
+        widget.password = not widget.password
 
     # ── navigation ───────────────────────────────────────────────────────────
 
@@ -549,10 +695,17 @@ class FormScreen(DetailScreen):
             await self.app.push_screen_wait(MessageModal(str(exc), title="Could not delete"))
             return
 
+        self._on_deleted_successfully()
         self.app.pop_screen()
         app = self.app
         app.notify(f"Deleted {self._entity_noun()} '{self._entity_label()}'.", severity="information")
         app.reload_config()  # type: ignore[attr-defined]
+
+    def _on_deleted_successfully(self) -> None:
+        """Hook for subclass-specific cleanup once the deletion is confirmed
+        durable (document saved to disk). No-op by default;
+        ConnectorDetailScreen uses this to remove any `.env` entries this
+        connector owned (see its own override)."""
 
     # ── generic diff collection (Save calls this, then applies the result
     # however this entity needs to — see module docstring) ──────────────────

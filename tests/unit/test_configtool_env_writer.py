@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from gateway.configtool.env_writer import upsert_env_vars
+from gateway.configtool.env_writer import read_env_vars, remove_env_vars, upsert_env_vars
 
 
 class TestUpsertEnvVars(unittest.TestCase):
@@ -94,6 +94,78 @@ class TestUpsertEnvVars(unittest.TestCase):
         self.env_path.chmod(0o644)
         upsert_env_vars(self.env_path, {"RC_URL": "http://new"})
         self.assertEqual(self._permissions(self.env_path), "0o600")
+
+
+class TestReadEnvVars(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.env_path = self.tmp / ".env"
+
+    def test_returns_empty_dict_when_file_does_not_exist(self):
+        self.assertEqual(read_env_vars(self.env_path), {})
+
+    def test_reads_simple_key_value_pairs(self):
+        self.env_path.write_text("RC_URL=http://old\nRC_PASSWORD=hunter2\n")
+        self.assertEqual(
+            read_env_vars(self.env_path),
+            {"RC_URL": "http://old", "RC_PASSWORD": "hunter2"},
+        )
+
+    def test_unquotes_a_quoted_value(self):
+        self.env_path.write_text('NAME="hello world"\n')
+        self.assertEqual(read_env_vars(self.env_path), {"NAME": "hello world"})
+
+    def test_ignores_comments_and_blank_lines(self):
+        self.env_path.write_text("# a comment\n\nRC_URL=http://old\n")
+        self.assertEqual(read_env_vars(self.env_path), {"RC_URL": "http://old"})
+
+    def test_a_commented_out_key_is_not_read(self):
+        self.env_path.write_text("# RC_PASSWORD=disabled\n")
+        self.assertEqual(read_env_vars(self.env_path), {})
+
+
+class TestRemoveEnvVars(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.env_path = self.tmp / ".env"
+
+    def test_no_op_when_file_does_not_exist(self):
+        remove_env_vars(self.env_path, {"RC_PASSWORD"})  # must not raise
+        self.assertFalse(self.env_path.exists())
+
+    def test_removes_the_matching_key_and_leaves_everything_else(self):
+        self.env_path.write_text(
+            "# top comment\nRC_URL=http://old\nRC_PASSWORD=hunter2\n\nMM_TOKEN=abc\n"
+        )
+        remove_env_vars(self.env_path, {"RC_PASSWORD"})
+        self.assertEqual(
+            self.env_path.read_text(),
+            "# top comment\nRC_URL=http://old\n\nMM_TOKEN=abc\n",
+        )
+
+    def test_removes_multiple_keys_at_once(self):
+        self.env_path.write_text("A=1\nB=2\nC=3\n")
+        remove_env_vars(self.env_path, {"A", "C"})
+        self.assertEqual(self.env_path.read_text(), "B=2\n")
+
+    def test_a_commented_out_key_is_not_removed(self):
+        self.env_path.write_text("# RC_PASSWORD=disabled\nRC_URL=http://old\n")
+        remove_env_vars(self.env_path, {"RC_PASSWORD"})
+        self.assertEqual(
+            self.env_path.read_text(), "# RC_PASSWORD=disabled\nRC_URL=http://old\n"
+        )
+
+    def test_no_op_when_key_is_not_present(self):
+        self.env_path.write_text("RC_URL=http://old\n")
+        original = self.env_path.read_text()
+        remove_env_vars(self.env_path, {"NOT_PRESENT"})
+        self.assertEqual(self.env_path.read_text(), original)
+
+    def test_restricts_permissions_to_0600_after_removal(self):
+        self.env_path.write_text("RC_PASSWORD=hunter2\n")
+        self.env_path.chmod(0o644)
+        remove_env_vars(self.env_path, {"RC_PASSWORD"})
+        self.assertEqual(oct(self.env_path.stat().st_mode & 0o777), "0o600")
 
 
 if __name__ == "__main__":

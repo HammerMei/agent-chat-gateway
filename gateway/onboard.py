@@ -411,13 +411,23 @@ def _handle_existing_config() -> bool:
     if choice == "2":
         import time
         ts = int(time.time())
+        # Same `.config-backups/` directory the config TUI's own save()
+        # (gateway/configtool/model.py) uses — one place, not two competing
+        # conventions, and chmod'd 0700 since a backup can hold a plaintext
+        # secret (an unmigrated password/token) same as the live files do.
+        backup_dir = CONFIG_FILE.parent / ".config-backups"
+        if CONFIG_FILE.exists() or ENV_FILE.exists():
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            backup_dir.chmod(0o700)
         if CONFIG_FILE.exists():
-            bak = CONFIG_FILE.parent / f"config.yaml.bak.{ts}"
+            bak = backup_dir / f"config.yaml.bak.{ts}"
             shutil.copy2(CONFIG_FILE, bak)
+            bak.chmod(0o600)
             console.print(f"  Backed up config to [dim]{bak}[/dim]")
         if ENV_FILE.exists():
-            bak_env = ENV_FILE.parent / f".env.bak.{ts}"
+            bak_env = backup_dir / f".env.bak.{ts}"
             shutil.copy2(ENV_FILE, bak_env)
+            bak_env.chmod(0o600)
             console.print(f"  Backed up .env to [dim]{bak_env}[/dim]")
 
     return True  # continue with wizard
@@ -501,6 +511,10 @@ def run_onboard(repo_path: Path | None = None) -> None:
         working_directory=str(working_dir),
     )
     CONFIG_FILE.write_text(config_yaml)
+    # Matches ENV_FILE's own chmod below — config.yaml can hold a plaintext
+    # secret just as easily as .env can (a field saved with "Store in .env"
+    # off), so it gets the same treatment from the moment it's created.
+    CONFIG_FILE.chmod(0o600)
     console.print(f"\n  [green]✓[/green] Wrote {CONFIG_FILE}")
 
     _write_env(

@@ -146,11 +146,30 @@ class EditableConfig:
         2. Run the real `validate_config()` against that temp file. If it
            doesn't validate, delete the temp file and raise ValueError with
            the errors — the real config on disk is never touched.
-        3. Only on success: copy the real file to a timestamped backup
-           (`config.yaml.bak.<unix-ts>`, matching gateway/onboard.py's
-           existing convention) and atomically replace it with the temp
-           file (`os.replace` — atomic on POSIX, so a reader/the daemon
-           never observes a partially-written config.yaml).
+        3. Only on success: copy the real file to a timestamped backup under
+           `<config_dir>/.config-backups/` (`config.yaml.bak.<unix-ts>`,
+           matching gateway/onboard.py's own backup step, which writes to
+           the same directory) and atomically replace it with the temp file
+           (`os.replace` — atomic on POSIX, so a reader/the daemon never
+           observes a partially-written config.yaml).
+
+        `config.yaml` and every backup snapshot can hold a plaintext secret
+        — either a field saved with "Store in .env" unchecked, or a secret
+        that was migrated into `.env` LATER but still appears in plaintext
+        in a backup taken before that migration. Both `config.yaml` itself
+        and each backup file are chmod'd 0600 here (matching the treatment
+        `.env`/`env_writer.py` already give the `.env` file) — `config.yaml`
+        specifically needs this on EVERY save because writing `tmp_path` via
+        plain `open(..., "w")` takes the process umask, not whatever
+        permissions the real file had before; without this line, a manual
+        `chmod 600 config.yaml` would silently revert to the umask default
+        the very next time this method runs. The backup directory itself is
+        chmod'd 0700 for the same reason a bare `.gitignore` entry on
+        `config.yaml.bak.*` isn't enough by itself: it also keeps the whole
+        deployment's history of past secrets out of a directory readers
+        might casually `ls`/glob/back up without expecting a pile of
+        `config.yaml.bak.*` files that will keep growing on every future
+        save either.
 
         Raises FileNotFoundError if `path` doesn't exist yet (nothing to
         back up) — Phase 2/3 forms only ever call save() on an already-loaded
@@ -174,9 +193,14 @@ class EditableConfig:
                     "valid config:\n" + "\n".join(result.errors)
                 )
 
-            backup_path = self.path.with_name(f"{self.path.name}.bak.{int(time.time())}")
+            backup_dir = self.path.parent / ".config-backups"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            backup_dir.chmod(0o700)
+            backup_path = backup_dir / f"{self.path.name}.bak.{int(time.time())}"
             shutil.copy2(self.path, backup_path)
+            backup_path.chmod(0o600)
             os.replace(tmp_path, self.path)
+            self.path.chmod(0o600)
         finally:
             # Only ever removes OUR OWN temp file, not the real config: if
             # os.replace() above succeeded, tmp_path no longer exists at this
