@@ -735,8 +735,10 @@ class TestRunOnboard:
         ):
             run_onboard(repo_path=tmp_path)
 
-        # At least one .bak file should exist for config
-        bak_files = list(tmp_path.glob("config.yaml.bak.*"))
+        # At least one .bak file should exist for config, under the shared
+        # .config-backups/ directory (same convention as the config TUI's
+        # own EditableConfig.save()).
+        bak_files = list((tmp_path / ".config-backups").glob("config.yaml.bak.*"))
         assert len(bak_files) >= 1
         # New config was written
         new_config = yaml.safe_load(config_file.read_text())
