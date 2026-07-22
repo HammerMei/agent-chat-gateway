@@ -47,6 +47,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, VerticalScroll
 from textual.widgets import Checkbox, Footer, Header, Input, Select, Static
 
+from ..env_writer import read_env_vars
 from ..formatting import provenance_label
 from ..modals import ConfirmModal, MessageModal
 from ..model import EditableConfig, Provenance
@@ -417,8 +418,41 @@ class FormScreen(DetailScreen):
             value = get_nested(merged, spec.key)
             if value is None:
                 value = dataclass_defaults.get(spec.key)
+            if spec.secret:
+                value = self._resolve_secret_display(value)
             self._initial_values[spec.key] = value
         self._initial_values["description"] = entry.get("description")
+
+    def _resolve_secret_display(self, raw_value: object) -> object:
+        """For a secret field whose effective value is a `$VAR`/`${VAR}`
+        reference, resolve it against `.env` FOR DISPLAY ONLY, so the user
+        can actually see and edit the real password instead of the literal
+        placeholder text (user-reported: "how do you expect user to change
+        the password" if all they can see is `${SOME_VAR}`).
+
+        This does NOT weaken the security keystone documented at the top of
+        this module (`EditableConfig` never resolves `$VAR` on load/save):
+        `self.entry`/`cfg.document` still hold the raw placeholder string
+        the whole time — this reads `.env` directly via `env_writer.
+        read_env_vars()`, the same file `ConnectorDetailScreen.action_save()`
+        already reads/writes, never `GatewayConfig.from_file`/`load_dotenv`/
+        `os.environ`. Only `_initial_values` (the widget's starting display
+        value AND the diff baseline `_collect_field_updates()` compares
+        against) uses the resolved form, so leaving the field untouched
+        diffs as "unchanged" — nothing gets written to `document` or `.env`
+        — and typing a new value diffs as a genuine change exactly like any
+        other field.
+
+        Falls back to `raw_value` unchanged if it isn't an env reference, or
+        if the referenced var isn't in `.env` (e.g. sourced from the shell
+        environment instead) — never silently blanks a field that has a
+        real value; `_compose_field_row()` adds a hint for this fallback
+        case so it doesn't look identical to "value not found at all"."""
+        if not isinstance(raw_value, str) or not looks_like_env_var_reference(raw_value):
+            return raw_value
+        var_name = raw_value.strip("${}")
+        resolved = read_env_vars(self.cfg.path.parent / ".env").get(var_name)
+        return raw_value if resolved is None else resolved
 
     def _field_provenance(self, spec: FieldSpec, entry: dict) -> Provenance | None:
         top_key = spec.key.split(".", 1)[0]
@@ -431,6 +465,22 @@ class FormScreen(DetailScreen):
         provenance = self._field_provenance(spec, entry)
         prov_text = f"[dim]({provenance_label(provenance)})[/dim]" if provenance else ""
         initial = self._initial_values.get(spec.key)
+        # own_raw is this entry's OWN explicit value (pre-merge, unresolved)
+        # for a secret field — used to decide the "Store in .env" checkbox's
+        # default (below) and to detect the fallback case where
+        # _resolve_secret_display() couldn't resolve the var (the widget is
+        # then showing the raw placeholder, same as `own_raw`, rather than
+        # an actual secret) so a hint can be added instead of looking
+        # identical to a field that simply has no provenance marker.
+        own_raw = get_nested(entry, spec.key) if spec.secret else None
+        if (
+            spec.secret
+            and isinstance(own_raw, str)
+            and looks_like_env_var_reference(own_raw)
+            and initial == own_raw
+        ):
+            hint = "[dim](not found in .env — type a new value to set one)[/dim]"
+            prov_text = f"{prov_text} {hint}" if prov_text else hint
         with Horizontal(classes="field-row"):
             yield Static(spec.label, classes="field-label")
             if spec.kind == "bool":
@@ -458,11 +508,20 @@ class FormScreen(DetailScreen):
             widget.field_key = spec.key
             yield widget
             if spec.secret:
-                # Default ON (docs/design/config-tool.md decision 6) — acted
-                # on only if this field's value actually changes on Save;
-                # see ConnectorDetailScreen.action_save().
+                # Reflects whether THIS entry's own field is already stored
+                # in .env (own_raw looks like a $VAR/${VAR} reference) —
+                # NOT hardcoded True. User-reported bug: unchecking this,
+                # saving as plaintext, then reopening the form showed the
+                # checkbox checked again regardless of what was actually on
+                # disk, because this used to default to True unconditionally.
+                # create mode has no own_raw yet, so it keeps the original
+                # default-ON nudge (docs/design/config-tool.md decision 6)
+                # to encourage using .env for a brand new secret.
+                toggle_default = self.mode == "create" or (
+                    isinstance(own_raw, str) and looks_like_env_var_reference(own_raw)
+                )
                 yield Checkbox(
-                    "Store in .env", value=True, id=env_toggle_widget_id(spec.key)
+                    "Store in .env", value=toggle_default, id=env_toggle_widget_id(spec.key)
                 )
             yield Static(prov_text, classes="field-provenance")
 
@@ -507,6 +566,8 @@ class FormScreen(DetailScreen):
         value = get_nested(defaults_only, spec.key)
         if value is None:
             value = self._dataclass_defaults().get(spec.key)
+        if spec.secret:
+            value = self._resolve_secret_display(value)
 
         set_widget_value(spec, widget, value)
         self._reset_keys[spec.key] = read_widget_value(spec, widget)

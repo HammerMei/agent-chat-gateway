@@ -341,14 +341,33 @@ class ConnectorDetailScreen(FormScreen):
             toggle = self.query_one(f"#{env_toggle_widget_id(spec.key)}", Checkbox)
             if not toggle.value:
                 continue
-            var_name = env_var_name_for(entity_name_for_env, spec.key)
+
+            # Reuse the var name this field is ALREADY referencing (e.g. a
+            # rotation: the widget shows the resolved secret — see
+            # FormScreen._resolve_secret_display() — and the user typed a
+            # NEW value over it) rather than always generating the
+            # deterministic name. Otherwise a field whose current var name
+            # doesn't happen to match the deterministic convention (most
+            # commonly: hand-edited via the $EDITOR escape hatch before
+            # ever touching this toggle) would get a SECOND, differently-
+            # named .env entry on rotation, orphaning the original with the
+            # stale old value still sitting in it. Only a genuine
+            # plaintext-to-.env migration (original_value isn't a
+            # reference at all) generates a fresh deterministic name.
+            original_value = get_nested(self.entry, spec.key)
+            if isinstance(original_value, str) and looks_like_env_var_reference(original_value):
+                var_name = original_value.strip("${}")
+            else:
+                var_name = env_var_name_for(entity_name_for_env, spec.key)
 
             # Collision guard: refuse rather than silently overwrite an
             # unrelated existing .env entry that happens to share the
             # generated name. Not a collision if this connector already
             # owns the name (its pre-save value for this field was already
-            # this exact placeholder — a re-save, not a conflict).
-            original_value = get_nested(self.entry, spec.key)
+            # this exact placeholder — a re-save/rotation, not a conflict) —
+            # always true when var_name was just reused from original_value
+            # above, so this guard is only ever load-bearing for the fresh-
+            # generation branch.
             existing_env = read_env_vars(env_path)
             if var_name in existing_env and original_value != f"${{{var_name}}}":
                 await self.app.push_screen_wait(

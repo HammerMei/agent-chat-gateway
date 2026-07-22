@@ -142,7 +142,7 @@ class TestCreateAgent:
             assert raw["agents"]["brand-new"]["type"] == "claude"
             assert raw["agents"]["brand-new"]["working_directory"] == str(work_dir)
             # A backup of the pre-save file must exist (EditableConfig.save()).
-            assert list(Path(config_path).parent.glob("config.yaml.bak.*"))
+            assert list((Path(config_path).parent / ".config-backups").glob("config.yaml.bak.*"))
 
     async def test_creating_with_a_duplicate_name_shows_an_error_and_stays_in_the_form(
         self, tmp_path, work_dir
@@ -824,7 +824,7 @@ class TestDeleteAgent:
             raw = yaml.safe_load(Path(config_path).read_text())
             assert "unused-agent" not in raw["agents"]
             assert "existing-agent" in raw["agents"]
-            assert list(Path(config_path).parent.glob("config.yaml.bak.*"))
+            assert list((Path(config_path).parent / ".config-backups").glob("config.yaml.bak.*"))
 
     async def test_deleting_a_referenced_agent_is_blocked_before_the_confirm(
         self, tmp_path, work_dir

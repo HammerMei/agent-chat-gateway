@@ -14,6 +14,7 @@ htmlcov/
 *.log
 .env
 config.yaml
+.config-backups/
 .DS_Store
 example-agents/**/node_modules/
 .claude

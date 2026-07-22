@@ -113,7 +113,7 @@ class TestCreateConnector:
             names = {c["name"]: c for c in raw["connectors"]}
             assert names["rc-second"]["server"]["url"] == "http://rc2.local"
             assert names["rc-second"]["server"]["password"] == "pw2"
-            assert list(Path(config_path).parent.glob("config.yaml.bak.*"))
+            assert list((Path(config_path).parent / ".config-backups").glob("config.yaml.bak.*"))
 
     async def test_creating_a_voice_connector_uses_the_flat_field_list(
         self, tmp_path, work_dir
@@ -242,7 +242,16 @@ class TestEditConnector:
     async def test_editing_an_unrelated_field_leaves_an_existing_secret_placeholder_untouched(
         self, tmp_path, work_dir
     ):
-        """THE keystone test for this screen (see module docstring)."""
+        """THE keystone test for this screen (see module docstring): the
+        raw document (`self.entry`/`cfg.document`) never gets a resolved
+        secret written into it, regardless of what the widget shows for
+        editing. This specific fixture sets the var via `os.environ`
+        directly, WITHOUT an actual `.env` FILE on disk — `_resolve_secret_
+        display()` only ever reads the `.env` file (never `os.environ`/
+        `GatewayConfig`), so this is also the regression test for that
+        fallback path: an unresolvable reference still shows the literal
+        placeholder (with a hint, not a blank field) rather than blanking
+        or crashing."""
         os.environ["RC_PASSWORD_CONNECTOR_TEST"] = "the-real-secret-value"
         try:
             config_path = _write_config(
@@ -257,11 +266,15 @@ class TestEditConnector:
                 await _open_connector_in_edit_mode(pilot, app)
 
                 pw_input = app.screen.query_one("#field-server-password", Input)
-                # The widget must show the literal placeholder, never the
-                # resolved secret and never a masked "****" at the data level
-                # (masking is display-only via Input(password=True); .value
-                # is always the real underlying string).
+                # No .env file exists, so the var can't be resolved for
+                # display — the widget must show the literal placeholder,
+                # never the resolved secret and never a masked "****" at the
+                # data level (masking is display-only via
+                # Input(password=True); .value is always the real
+                # underlying string).
                 assert pw_input.value == "${RC_PASSWORD_CONNECTOR_TEST}"
+                prov = app.screen.query(".field-provenance")
+                assert any("not found in .env" in str(s.render()) for s in prov)
 
                 app.screen.query_one("#field-server-username", Input).value = "renamed-bot"
                 await pilot.pause()
@@ -415,11 +428,17 @@ class TestEditConnector:
 
 class TestEnvSecretToggle:
     """"Store in .env" (docs/design/config-tool.md decision 6) — a per-
-    secret-field Checkbox, default ON, next to every masked field. Acted on
-    only when that field's value actually changes to a genuine new
-    plaintext secret; a value already looking like a $VAR/${VAR} reference
-    is left alone (the user is explicitly pointing at an externally-managed
-    var, not typing a new secret)."""
+    secret-field Checkbox next to every masked field. Its default reflects
+    the field's ACTUAL current state (checked iff the raw value already
+    looks like a $VAR/${VAR} reference) rather than always being True —
+    user-reported: unchecking it, saving as plaintext, then reopening the
+    form showed it checked again regardless of what was really on disk,
+    because it used to be hardcoded True unconditionally. create mode still
+    defaults ON (nothing to reflect yet — encourages using .env for a brand
+    new secret). Acted on only when the checkbox ends up checked at Save
+    time; a value already looking like a $VAR/${VAR} reference is left
+    alone either way (the user is explicitly pointing at an externally-
+    managed var, not typing a new secret)."""
 
     async def test_toggle_is_within_the_visible_terminal_width(self, tmp_path, work_dir):
         """User-reported: the checkbox wasn't visible at all. Root cause:
@@ -438,8 +457,24 @@ class TestEnvSecretToggle:
             toggle = app.screen.query_one("#field-server-password-env-toggle", Checkbox)
             assert toggle.region.x + toggle.region.width <= app.size.width
 
-    async def test_toggle_is_checked_by_default(self, tmp_path, work_dir):
+    async def test_toggle_defaults_unchecked_when_the_field_is_currently_plaintext(
+        self, tmp_path, work_dir
+    ):
         config_path = _write_config(tmp_path, _config_with_one_rocketchat_connector(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_connector_in_edit_mode(pilot, app)
+            toggle = app.screen.query_one("#field-server-password-env-toggle", Checkbox)
+            assert toggle.value is False
+
+    async def test_toggle_defaults_checked_when_the_field_is_already_in_env(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(
+            tmp_path, _config_with_one_rocketchat_connector(work_dir, password="${RC_PW}")
+        )
+        (tmp_path / ".env").write_text("RC_PW=already-migrated\n")
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
@@ -447,7 +482,90 @@ class TestEnvSecretToggle:
             toggle = app.screen.query_one("#field-server-password-env-toggle", Checkbox)
             assert toggle.value is True
 
-    async def test_changing_a_secret_with_the_toggle_on_writes_a_placeholder_and_the_env_file(
+    async def test_edit_mode_shows_the_real_resolved_secret_not_the_placeholder(
+        self, tmp_path, work_dir
+    ):
+        """User-reported: seeing only "${RC_PW}" gave no way to tell what
+        the current password even was, or how to change it short of
+        blindly overwriting an unknown value. The widget must show the
+        actual secret (read directly from the .env file, never via
+        GatewayConfig/os.environ — see FormScreen._resolve_secret_display())
+        so the user can see it and, if they want, type a new one over it."""
+        config_path = _write_config(
+            tmp_path, _config_with_one_rocketchat_connector(work_dir, password="${RC_PW}")
+        )
+        (tmp_path / ".env").write_text("RC_PW=the-real-password\n")
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_connector_in_edit_mode(pilot, app)
+            pw_input = app.screen.query_one("#field-server-password", Input)
+            assert pw_input.value == "the-real-password"
+            assert pw_input.password is True  # still masked by default (ctrl+t reveals)
+
+    async def test_leaving_a_resolved_secret_untouched_is_a_no_op_on_save(
+        self, tmp_path, work_dir
+    ):
+        """The resolved display value is also the diff baseline
+        (_initial_values) — an untouched field must not look "changed"
+        just because it's now showing a real secret instead of a
+        placeholder, or every save would needlessly rewrite .env and
+        re-diff a field the user never touched."""
+        config_path = _write_config(
+            tmp_path, _config_with_one_rocketchat_connector(work_dir, password="${RC_PW}")
+        )
+        (tmp_path / ".env").write_text("RC_PW=the-real-password\n")
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_connector_in_edit_mode(pilot, app)
+            app.screen.query_one("#field-timezone", Input).value = "America/Denver"
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert raw["connectors"][0]["server"]["password"] == "${RC_PW}"
+            assert (tmp_path / ".env").read_text() == "RC_PW=the-real-password\n"
+
+    async def test_typing_a_new_password_over_the_resolved_value_rotates_the_env_secret(
+        self, tmp_path, work_dir
+    ):
+        """The user-reported "how do I change the password" flow: select
+        all / type over the resolved value, leave the toggle at its
+        default (checked — the field is already env-backed), save. Same
+        var name, new value — a rotation, not a rename."""
+        config_path = _write_config(
+            tmp_path, _config_with_one_rocketchat_connector(work_dir, password="${RC_PW}")
+        )
+        (tmp_path / ".env").write_text("RC_PW=old-password\n")
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_connector_in_edit_mode(pilot, app)
+            pw_input = app.screen.query_one("#field-server-password", Input)
+            assert pw_input.value == "old-password"
+            pw_input.value = "new-rotated-password"
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert raw["connectors"][0]["server"]["password"] == "${RC_PW}"
+            assert (tmp_path / ".env").read_text() == "RC_PW=new-rotated-password\n"
+
+    async def test_toggle_defaults_checked_in_create_mode(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _config_with_one_rocketchat_connector(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_type_picker_for_connectors(pilot, app)
+            await pilot.press("enter")  # rocketchat
+            await pilot.pause()
+            toggle = app.screen.query_one("#field-server-password-env-toggle", Checkbox)
+            assert toggle.value is True
+
+    async def test_changing_a_secret_with_the_toggle_checked_writes_a_placeholder_and_the_env_file(
         self, tmp_path, work_dir
     ):
         config_path = _write_config(tmp_path, _config_with_one_rocketchat_connector(work_dir))
@@ -457,7 +575,9 @@ class TestEnvSecretToggle:
             await _open_connector_in_edit_mode(pilot, app)
 
             app.screen.query_one("#field-server-password", Input).value = "super-secret-value"
-            # toggle already defaults True — leave it
+            # Toggle defaults unchecked (field is currently plaintext) — the
+            # user must explicitly opt in to storing the NEW value in .env.
+            app.screen.query_one("#field-server-password-env-toggle", Checkbox).value = True
             await pilot.pause()
             await pilot.press("ctrl+s")
             await pilot.pause()
@@ -479,6 +599,7 @@ class TestEnvSecretToggle:
 
             app.screen.query_one("#field-server-username", Input).value = "newbot"
             app.screen.query_one("#field-server-password", Input).value = "hunter2"
+            app.screen.query_one("#field-server-password-env-toggle", Checkbox).value = True
             await pilot.pause()
             await pilot.press("ctrl+s")
             await pilot.pause()
@@ -512,16 +633,19 @@ class TestEnvSecretToggle:
             assert raw["connectors"][0]["server"]["password"] == "${SOME_OTHER_VAR}"
             assert not (Path(tmp_path) / ".env").exists()
 
-    async def test_untouched_plaintext_secret_still_migrates_to_env_when_toggle_left_on(
+    async def test_checking_the_toggle_without_retyping_the_secret_still_migrates_it_to_env(
         self, tmp_path, work_dir
     ):
-        """User-reported fix: leaving the toggle at its default (checked)
-        and saving — even without retyping the password, even editing a
-        completely unrelated field — is how an EXISTING plaintext secret
-        (e.g. saved earlier with the toggle unchecked) gets migrated into
-        .env. There was previously no other way to do this short of
-        retyping the same password, which the user correctly flagged as
-        broken/confusing."""
+        """User-reported fix: checking the toggle and saving — even without
+        retyping the password, even editing a completely unrelated field at
+        the same time — is how an EXISTING plaintext secret (e.g. saved
+        earlier with the toggle unchecked) gets migrated into .env. There
+        was previously no other way to do this short of retyping the same
+        password, which the user correctly flagged as broken/confusing.
+        (The toggle itself defaults unchecked for an already-plaintext
+        field — see TestEnvSecretToggle's defaulting tests — so migrating
+        it is now a deliberate, explicit action rather than something that
+        happens implicitly just by saving any other field.)"""
         config_path = _write_config(tmp_path, _config_with_one_rocketchat_connector(work_dir))
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
@@ -529,8 +653,8 @@ class TestEnvSecretToggle:
             await _open_connector_in_edit_mode(pilot, app)
 
             app.screen.query_one("#field-timezone", Input).value = "America/New_York"
-            # password field and its "Store in .env" toggle: untouched,
-            # toggle at its default (checked).
+            # password field itself: untouched. Toggle: explicitly checked.
+            app.screen.query_one("#field-server-password-env-toggle", Checkbox).value = True
             await pilot.pause()
             await pilot.press("ctrl+s")
             await pilot.pause()
@@ -564,18 +688,27 @@ class TestEnvSecretToggle:
     ):
         """Once a field is already "${VAR}", it looks_like_env_var_reference()
         and is left alone on every subsequent save — no infinite
-        reconversion, no redundant .env writes."""
+        reconversion, no redundant .env writes. Also: reopening resolves
+        the placeholder back to the real secret for display/editing
+        (user-reported: seeing only "${VAR}" gave no way to tell what the
+        current password even was) — masked by default via ctrl+t, same as
+        any other secret field, never shown in the clear unmasked."""
         config_path = _write_config(tmp_path, _config_with_one_rocketchat_connector(work_dir))
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
             await _open_connector_in_edit_mode(pilot, app)
-            await pilot.press("ctrl+s")  # migrate on the first save (default toggle)
+            # Toggle defaults unchecked (field is currently plaintext) — check
+            # it explicitly to migrate on this first save.
+            app.screen.query_one("#field-server-password-env-toggle", Checkbox).value = True
+            await pilot.pause()
+            await pilot.press("ctrl+s")
             await pilot.pause()
 
             await _open_connector_in_edit_mode(pilot, app)
             pw_input = app.screen.query_one("#field-server-password", Input)
-            assert pw_input.value == "${RC_EXISTING_PASSWORD}"
+            assert pw_input.value == "pw"  # resolved from .env, not the placeholder
+            assert pw_input.password is True
             toggle = app.screen.query_one("#field-server-password-env-toggle", Checkbox)
             assert toggle.value is True
 
@@ -611,6 +744,7 @@ class TestEnvSecretToggle:
             await _open_connector_in_edit_mode(pilot, app)
 
             app.screen.query_one("#field-server-password", Input).value = "super-secret-value"
+            app.screen.query_one("#field-server-password-env-toggle", Checkbox).value = True
             await pilot.pause()
             await pilot.press("ctrl+s")
             await pilot.pause()
@@ -646,6 +780,7 @@ class TestEnvSecretToggle:
             await _open_connector_in_edit_mode(pilot, app)
 
             app.screen.query_one("#field-server-password", Input).value = "my-new-secret"
+            app.screen.query_one("#field-server-password-env-toggle", Checkbox).value = True
             await pilot.pause()
             await pilot.press("ctrl+s")
             await pilot.pause()
@@ -671,6 +806,7 @@ class TestEnvSecretToggle:
         async with app.run_test() as pilot:
             await pilot.pause()
             await _open_connector_in_edit_mode(pilot, app)
+            app.screen.query_one("#field-server-password-env-toggle", Checkbox).value = True
             await pilot.press("ctrl+s")  # migrates password -> ${RC_EXISTING_PASSWORD}
             await pilot.pause()
 
@@ -803,7 +939,7 @@ class TestDeleteConnector:
             names = {c["name"] for c in raw["connectors"]}
             assert "rc-orphan" not in names
             assert "rc-referenced" in names
-            assert list(Path(config_path).parent.glob("config.yaml.bak.*"))
+            assert list((Path(config_path).parent / ".config-backups").glob("config.yaml.bak.*"))
 
     async def test_deleting_a_referenced_connector_is_blocked_before_the_confirm(
         self, tmp_path, work_dir
