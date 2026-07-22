@@ -142,7 +142,7 @@ class TestCreateAgent:
             assert raw["agents"]["brand-new"]["type"] == "claude"
             assert raw["agents"]["brand-new"]["working_directory"] == str(work_dir)
             # A backup of the pre-save file must exist (EditableConfig.save()).
-            assert list(Path(config_path).parent.glob("config.yaml.bak.*"))
+            assert list((Path(config_path).parent / ".config-backups").glob("config.yaml.bak.*"))
 
     async def test_creating_with_a_duplicate_name_shows_an_error_and_stays_in_the_form(
         self, tmp_path, work_dir
@@ -234,6 +234,27 @@ class TestCreateAgent:
 
 
 class TestEditAgent:
+    async def test_provenance_markers_are_within_the_visible_terminal_width(
+        self, tmp_path, work_dir
+    ):
+        """Real layout bug, caught via the connector screen's "Store in
+        .env" checkbox being reported invisible: Input's own DEFAULT_CSS is
+        width:100%, which — inside the Horizontal field-row — claimed the
+        ENTIRE row, pushing every field's provenance marker (the "(explicit)"
+        / "(inherited from defaults)" label) off past the terminal's right
+        edge since this form first shipped. Fixed with width:1fr on Input
+        within .field-row (matching Select's own DEFAULT_CSS, which never
+        had this problem)."""
+        config_path = _write_config(tmp_path, _config_with_one_agent(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await _open_agent_in_edit_mode(pilot, app)
+            markers = list(app.screen.query(".field-provenance"))
+            assert markers  # sanity: there are provenance markers to check
+            for marker in markers:
+                assert marker.region.x + marker.region.width <= app.size.width
+
     async def test_edit_mode_prefills_the_effective_merged_value(self, tmp_path, work_dir):
         config_path = _write_config(
             tmp_path, _config_with_one_agent(work_dir, "session_prefix: custom-prefix\n")
@@ -803,7 +824,7 @@ class TestDeleteAgent:
             raw = yaml.safe_load(Path(config_path).read_text())
             assert "unused-agent" not in raw["agents"]
             assert "existing-agent" in raw["agents"]
-            assert list(Path(config_path).parent.glob("config.yaml.bak.*"))
+            assert list((Path(config_path).parent / ".config-backups").glob("config.yaml.bak.*"))
 
     async def test_deleting_a_referenced_agent_is_blocked_before_the_confirm(
         self, tmp_path, work_dir

@@ -5,9 +5,9 @@ escape hatch). **Phase 2 in progress:** items 7–10 from the Phase 1 code
 review cleared; `EditableConfig.save()`/dirty-tracking/`ConfirmModal`
 foundation shipped; agent create/edit shipped; connector create/edit shipped
 (per-type field lists — the generic tree editor originally planned is
-deferred, see Part 3); the `.env` writer is shipped but not yet wired to a
-UI toggle. The tool-list/preset editor is not yet built. Phase 3 is
-designed below but not yet started. The
+deferred, see Part 3); delete shipped for both agents and connectors; the
+`.env` "store in .env" toggle shipped. The tool-list/preset editor is not
+yet built. Phase 3 is designed below but not yet started. The
 v0.2 format simplification (`connector_defaults`/`agent_defaults`/
 `watcher_defaults`, `tool_presets`, watcher `rooms:`) plus `acg config
 validate` and the JSON Schema (see `docs/migration-0.2.md`) are prerequisites
@@ -148,9 +148,14 @@ per-row status lookups.
    `context_inject_files` resolve relative to `config_dir`), runs the
    unchanged `validate_config(tmp)`, blocks save on errors (raises
    `ValueError`, temp file deleted, real file untouched); on success:
-   timestamped backup (`config.yaml.bak.<unix-ts>`, `shutil.copy2`, matching
-   `onboard.py`'s convention) then `os.replace()` (atomic on POSIX) — the
-   daemon never observes a partially-written config.yaml. `dirty`/
+   timestamped backup under `<config_dir>/.config-backups/`
+   (`config.yaml.bak.<unix-ts>`, `shutil.copy2`, matching `onboard.py`'s own
+   backup step, which writes to the same directory) then `os.replace()`
+   (atomic on POSIX) — the daemon never observes a partially-written
+   config.yaml. Both `config.yaml` and every backup are `chmod`'d `0600`
+   (the backup directory `0700`) on every save — see decision 6's
+   discussion below for why this matters as much for `config.yaml` as for
+   `.env`. `dirty`/
    `mark_dirty()` also shipped alongside it; `ConfigToolApp.action_quit()`
    gates on `dirty` via a new `ConfirmModal` (Textual `@work`-decorated,
    since `push_screen_wait()` requires a worker context) — no edit screen
@@ -318,15 +323,65 @@ Phase 2 first cleared the Phase 1 code review's deferred items 7–10
   `MattermostConfig.__post_init__`) is the actual enforcement either way,
   so the simpler static hint was chosen over building a stateful widget for
   guidance alone.
-- **Deferred, not built:** the `.env` "store in .env" toggle itself. Typing
-  a plaintext secret directly into a masked field (`Input(password=True)` —
-  display-only masking; `.value` is always the real string, same as every
-  other field) and saving writes it to config.yaml in plaintext today,
-  exactly like the existing `$EDITOR` escape hatch already allows — not a
-  regression, just not yet automated. The writer (`upsert_env_vars`) and the
-  masked-secret Input widgets are both in place; wiring a toggle to
-  auto-generate an env var name, call the writer, and rewrite the entry's
-  field to a `${VAR}` placeholder is a self-contained follow-up.
+- **Shipped: the `.env` "store in .env" toggle.** A "Store in .env"
+  `Checkbox` (default ON) next to every `secret=True` field
+  (`FieldSpec.secret` already existed for masking; now also drives this).
+  On Save, for each secret field whose CURRENT value is a genuine plaintext
+  value (a value already matching `$VAR`/`${VAR}` — checked via
+  `looks_like_env_var_reference()` — is left alone, since the user is
+  explicitly referencing an externally-managed var, not typing a new
+  secret) with the toggle checked: `env_var_name_for()` generates a
+  deterministic name (`"<ENTITY>_<FIELD>"`, e.g. `RC_HOME_PASSWORD`),
+  `upsert_env_vars()` writes it to `.env`, and the entry's field becomes
+  `"${VAR}"`. **Ordering subtlety that cost a wrong-first-attempt:** the
+  `.env` write must happen BEFORE `cfg.save()`, not after — `save()`'s own
+  `validate_config()` calls `GatewayConfig.from_file`, which resolves every
+  `${VAR}` placeholder immediately (`load_dotenv(path.parent / ".env")` +
+  `os.path.expandvars`); if the var isn't in `.env` yet, `save()` itself
+  fails with "unresolved environment variable" before config.yaml is ever
+  written. Accepted trade-off from writing `.env` first: if `cfg.save()`
+  still fails for some OTHER, unrelated reason afterward, the value already
+  written to `.env` is left there, unreferenced by anything — harmless,
+  equivalent to a user having pre-populated `.env` with a value not wired
+  up yet; not worth building a transactional rollback for.
+- **Three user-reported follow-ups on the toggle, all fixed:**
+  1. *Not gated on "did this session's edit change the field."* The
+     original implementation only converted a secret to `.env` if
+     `spec.key in updates` — meaning a plaintext secret saved earlier with
+     the toggle unchecked could never be migrated later without literally
+     retyping the same password (which the user correctly flagged as a
+     dead end). Now every secret field's CURRENT value is checked
+     regardless of whether it changed THIS session — leaving the toggle at
+     its default (checked) and saving, even while editing a totally
+     unrelated field, migrates an already-plaintext secret into `.env`.
+     Already-a-`${VAR}` values are still skipped either way, so this
+     doesn't cause repeated/redundant `.env` writes on every subsequent save.
+  2. *Deleting a connector left its `.env` secret orphaned.* Fixed via a
+     new `FormScreen._on_deleted_successfully()` hook, fired after the
+     document save succeeds — `ConnectorDetailScreen`'s override removes
+     any `.env` key matching the deleted connector's exact deterministic
+     name, but ONLY where the raw entry's value was EXACTLY that
+     placeholder (never a heuristic "looks like it belongs to this
+     connector" guess).
+  3. *Var name collisions were an accepted, silent risk — user pushed
+     back, correctly.* What shipped instead: `read_env_vars()` checks
+     whether the generated name already exists in `.env` before writing;
+     if it does AND this connector doesn't already own it (its pre-save
+     value for that field wasn't already this exact placeholder — a plain
+     re-save isn't a collision), the save is BLOCKED with a clear message
+     naming the conflicting key, rather than silently overwriting an
+     unrelated secret. `env_writer.py` gained `read_env_vars()` (parse
+     `.env` into a dict) and `remove_env_vars()` (drop specific keys,
+     same merge-preserving-everything-else behavior as `upsert_env_vars()`)
+     to support both fixes.
+- **Shipped (nice-to-have, user-requested): `ctrl+t` reveals/re-masks the
+  FOCUSED secret field** (`Input.password` is a reactive — display-only,
+  never affects `.value`, so this has zero interaction with the diff/save
+  logic). **Gotcha:** the natural first choice, `ctrl+p`, is Textual's own
+  `App.COMMAND_PALETTE_BINDING` — a priority binding that silently
+  intercepts the keypress before it ever reaches a screen-level binding
+  for the same key. Caught by a failing test, not shipped wrong; moved to
+  `ctrl+t`.
 - **Verified (the actual keystone test for this screen, same weight as
   `EditableConfig.save()`'s $VAR round-trip):** opening an existing
   connector whose `server.password` is `"${SOME_VAR}"`, editing an
@@ -336,6 +391,99 @@ Phase 2 first cleared the Phase 1 code review's deferred items 7–10
   initial snapshot and its unedited value-at-save are both the same literal
   placeholder string) — no special-casing needed, confirmed by a dedicated
   test rather than assumed.
+- **User pushed back on the whole feature: is `.env` worth it, versus just
+  relying on `config.yaml`'s own file permissions?** Investigated rather
+  than assumed. Findings that settled it: `.env` was the ONLY thing in this
+  codebase getting deliberate secret hardening (`onboard.py` `chmod 0600`)
+  — `config.yaml` itself was never chmod'd anywhere, and worse,
+  `EditableConfig.save()` writes `config.yaml.tmp` via plain `open(...,
+  "w")` (process umask, not whatever the real file's permissions were) and
+  atomically replaces the real file with it — so even a MANUAL `chmod 600
+  config.yaml` would silently revert to the umask default (typically 644)
+  on the very next TUI save. Separately, every save's `config.yaml.bak.
+  <unix-ts>` backup (and `onboard.py`'s own backup step) sat right next to
+  the real files, matched by neither `.gitignore` entry (`config.yaml`/
+  `.env` are exact-filename matches, not globs) nor any chmod — meaning a
+  password that was EVER in plaintext, even briefly before being migrated
+  into `.env`, lived on forever in an unprotected, git-visible-if-not-for-
+  luck snapshot. Conclusion: "just use config.yaml permissions instead"
+  wasn't actually a real alternative as things stood — nothing enforced
+  config.yaml's permissions at all, and doing so properly (chmod every
+  save, chmod every backup, fix `.gitignore`) is comparable effort to
+  fixing `.env`'s rough edges, with the downside of losing the "config.yaml
+  is structurally safe to share/back up, `.env` is the only sensitive file"
+  separation. **Decision: keep `.env`, harden both.** Shipped as part of
+  the same round:
+  - `EditableConfig.save()` now writes every backup under
+    `<config_dir>/.config-backups/` (created `chmod 0700`; each backup file
+    `chmod 0600`) instead of scattered flat `.bak.<ts>` files beside
+    `config.yaml`, and `chmod`s `config.yaml` itself to `0600` after every
+    successful save — closing the "manual chmod gets silently undone" gap.
+    `onboard.py`'s own backup step (the "start fresh" wizard path) and its
+    initial `config.yaml` write were aligned to the same directory/chmod
+    convention, so there's one backup location and one permission
+    convention, not two. `.gitignore` gained `.config-backups/`.
+  - **Two more toggle bugs, both from the same root cause — the checkbox
+    was hardcoded `value=True` unconditionally, never reflecting the
+    field's actual current state:**
+    1. *Reopening after an explicit uncheck-and-save-as-plaintext showed
+       the checkbox checked again.* Fixed: the checkbox's initial value
+       now reflects reality — checked iff the field's own raw value
+       already looks like a `$VAR`/`${VAR}` reference, unchecked otherwise
+       (create mode still defaults checked — there's no current state to
+       reflect yet, and it nudges new secrets toward `.env`). Direct
+       consequence: leaving the toggle at ITS default no longer silently
+       migrates an untouched plaintext secret just because some unrelated
+       field changed (the "migrate without retyping" fix from the previous
+       round) — migrating now requires explicitly CHECKING a box that
+       accurately started unchecked, which is a deliberate action instead
+       of an implicit side effect of saving anything else. Still zero
+       retyping required either way.
+    2. *A field already pointing at `.env` only ever showed the literal
+       `"${VAR}"` placeholder — no way to see or sanely change the actual
+       password.* `FormScreen._resolve_secret_display()` resolves a
+       `$VAR`/`${VAR}` field's value against `.env` FOR DISPLAY ONLY (reads
+       `env_writer.read_env_vars()` directly — never `GatewayConfig.
+       from_file`/`load_dotenv`/`os.environ` — so the keystone above still
+       holds: `self.entry`/`document` never see a resolved value). Both
+       `_compute_initial_values()` (the diff baseline) and the widget's
+       starting value go through this, so an untouched field still diffs
+       as "unchanged" — nothing gets written anywhere — and typing a new
+       value over the resolved display diffs as a genuine change, exactly
+       like any other field; this is the actual fix for "how do you expect
+       the user to change the password." Falls back to the literal
+       placeholder (with a `(not found in .env — type a new value to set
+       one)` hint) when the var isn't resolvable — e.g. sourced from the
+       shell environment rather than a `.env` file — never silently
+       blanking a field that has a real value. `action_reset_field()`
+       (ctrl+r) goes through the same resolver for consistency.
+       **Bug caught while writing this fix's own test:** rotating an
+       already-`.env`-backed secret (typing a new value over the resolved
+       display, toggle left at its now-correctly-checked default) was
+       recomputing a FRESH deterministic var name
+       (`env_var_name_for()`) instead of reusing whatever var name the
+       field was ALREADY pointing at — harmless for a field the tool
+       itself had migrated (deterministic name matches by construction),
+       but for a field hand-set to a non-conventional name via the
+       `$EDITOR` escape hatch, rotation would have silently spawned a
+       SECOND, differently-named `.env` entry and orphaned the original
+       with the stale old password still in it. Fixed:
+       `ConnectorDetailScreen.action_save()` now reuses the var name
+       extracted from the field's own current raw value when it's already
+       a reference, and only falls back to generating a fresh deterministic
+       name for a genuine plaintext-to-`.env` migration — the collision
+       guard is unaffected (it's only ever load-bearing on that
+       fresh-generation path; reusing an owned name can never collide with
+       itself by construction).
+  - **Known, accepted, out-of-scope-for-now gap:** unchecking the toggle on
+    an already-`.env`-backed field WITHOUT changing the value does nothing
+    — the diff sees "unchanged" (the resolved display looks the same
+    either way) and nothing gets written, so the field stays `.env`-backed.
+    "Un-migrate this secret back to plaintext without rotating it" is a
+    real but different feature from anything the user actually asked for
+    this round (which was: see/change the value, and stop the checkbox
+    lying about the field's actual state) — not built, to avoid scope
+    creep past what was requested.
 
 - **Shipped (added after initial Phase 2 review — user caught that "CRUD"
   was being used loosely and Delete had never actually been designed for
@@ -497,6 +645,27 @@ split-out insertion position).
   container — it isn't meant to be independently focused; scrolling still
   works via the mouse wheel/PageUp/PageDown. Worth checking for on any
   future container that wraps a form's fields.
+- **`Input`'s own `DEFAULT_CSS` is `width: 100%` — inside a `Horizontal`
+  field-row, that claims the ENTIRE row, pushing every sibling that comes
+  after it off past the terminal's right edge.** User-reported: the new
+  "Store in .env" `Checkbox` (task #27) was completely invisible. Confirmed
+  via `widget.region` (NOT just `query_one()` succeeding — Pilot's query
+  finds a widget regardless of where it's actually rendered, which is
+  exactly why this shipped unnoticed): the checkbox's region started at
+  `x=146` in a 120-column terminal, fully off-screen. The SAME root cause
+  had already been silently hiding every field's provenance marker (the
+  "(explicit)"/"(inherited from defaults)" label) on both `AgentDetailScreen`
+  and `ConnectorDetailScreen` since Phase 2's agent form first shipped — a
+  dim decorative label going unnoticed off-screen is a lot less obvious
+  than a missing interactive control, which is probably why it took the
+  checkbox to surface it. `Select`'s own `DEFAULT_CSS` already uses `width:
+  1fr` and never had this problem — fixed by adding
+  `FormScreen .field-row Input { width: 1fr; }`, so the Input shares the
+  row's remaining space with its fixed/auto-width siblings instead of
+  claiming all of it. **Any future field-row widget added after an Input
+  needs a `.region`-based test, not just a `query_one()` existence check —
+  that's the only way this class of bug gets caught before a user reports
+  it.**
 - **`push_screen_wait()` needs a `@work`-decorated caller**, same gotcha as
   `ConfigToolApp.action_quit()` — `AgentDetailScreen.action_back()` awaits a
   `ConfirmModal` result for its own discard-vs-keep-editing decision, so it's

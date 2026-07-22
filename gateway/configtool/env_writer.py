@@ -52,3 +52,50 @@ def upsert_env_vars(env_path: Path, updates: dict[str, str]) -> None:
     env_path.parent.mkdir(parents=True, exist_ok=True)
     env_path.write_text(("\n".join(lines) + "\n") if lines else "")
     env_path.chmod(0o600)
+
+
+def _unquote(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        return value[1:-1]
+    return value
+
+
+def read_env_vars(env_path: Path) -> dict[str, str]:
+    """Read the current `KEY=value` pairs from `.env` at `env_path` (empty
+    dict if it doesn't exist). Used to check whether a key already exists —
+    and with what value — before `upsert_env_vars()` would silently
+    overwrite it (see `ConnectorDetailScreen.action_save()`'s pre-write
+    collision check)."""
+    if not env_path.exists():
+        return {}
+    result: dict[str, str] = {}
+    for raw_line in env_path.read_text().splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        result[key.strip()] = _unquote(value.strip())
+    return result
+
+
+def remove_env_vars(env_path: Path, keys: set[str]) -> None:
+    """Remove any `KEY=...` line whose key is in `keys` from `.env` at
+    `env_path`. A no-op if the file doesn't exist or none of `keys` are
+    present. Every other line — comments, blank lines, unrelated keys — is
+    preserved exactly as-is, in its original position. Restricts the file
+    to 0600 after writing, same as `upsert_env_vars()`."""
+    if not env_path.exists():
+        return
+    lines: list[str] = []
+    changed = False
+    for raw_line in env_path.read_text().splitlines():
+        stripped = raw_line.strip()
+        key = stripped.split("=", 1)[0].strip() if "=" in stripped else ""
+        if key and not stripped.startswith("#") and key in keys:
+            changed = True
+            continue
+        lines.append(raw_line)
+    if not changed:
+        return
+    env_path.write_text(("\n".join(lines) + "\n") if lines else "")
+    env_path.chmod(0o600)

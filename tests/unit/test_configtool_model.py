@@ -470,9 +470,19 @@ class TestEditableConfigSave(_EditableConfigTestBase):
         original_text = path.read_text()
         cfg = EditableConfig.load(path)
         cfg.save()
-        backups = list(path.parent.glob("config.yaml.bak.*"))
+        backup_dir = path.parent / ".config-backups"
+        backups = list(backup_dir.glob("config.yaml.bak.*"))
         self.assertEqual(len(backups), 1)
         self.assertEqual(backups[0].read_text(), original_text)
+        # secrets-adjacent files: backup dir owner-only, backup file owner-only
+        self.assertEqual(oct(backup_dir.stat().st_mode)[-3:], "700")
+        self.assertEqual(oct(backups[0].stat().st_mode)[-3:], "600")
+
+    def test_save_chmods_config_yaml_to_owner_only(self):
+        path = self._write(self._valid_cfg_text())
+        cfg = EditableConfig.load(path)
+        cfg.save()
+        self.assertEqual(oct(path.stat().st_mode)[-3:], "600")
 
     def test_save_clears_the_dirty_flag(self):
         path = self._write(self._valid_cfg_text())
@@ -502,7 +512,7 @@ class TestEditableConfigSave(_EditableConfigTestBase):
         # no partial/temp/backup artifacts left behind either.
         self.assertEqual(path.read_text(), original_text)
         self.assertFalse((path.parent / "config.yaml.tmp").exists())
-        self.assertEqual(list(path.parent.glob("config.yaml.bak.*")), [])
+        self.assertFalse((path.parent / ".config-backups").exists())
         # dirty must stay set: the in-memory edit was never actually saved.
         self.assertTrue(cfg.dirty)
 
