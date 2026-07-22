@@ -6,8 +6,7 @@
 #   ├── docker-compose.yml        (this file, renamed)
 #   ├── .env                      (secrets — never commit this)
 #   ├── config/
-#   │   ├── config.yaml           (gateway config)
-#   │   └── .env                  (RC credentials)
+#   │   └── config.yaml           (gateway config — RC credentials go directly in it)
 #   ├── agents/                   (agent working directories, auto-created)
 #   │   ├── claude_agent/
 #   │   └── opencode_agent/
@@ -18,8 +17,7 @@
 # Setup (one-time):
 #   1. Copy this directory to your deployment location
 #   2. vim .env                                      # fill in CLAUDE_CODE_OAUTH_TOKEN
-#   3. vim config/.env                               # fill in RC_URL, RC_USERNAME, RC_PASSWORD
-#   4. vim config/config.yaml                        # set owners, rooms, agents
+#   3. vim config/config.yaml                        # fill in RC credentials, owners, rooms, agents
 #
 # Optional — customize agent personas/context per agent backend:
 #   vim agents/claude_agent/CLAUDE.md                # Claude Code agent persona & instructions
@@ -38,7 +36,8 @@ services:
 
     volumes:
       # ── ACG config ────────────────────────────────────────────────────────
-      # config.yaml + .env (RC credentials) — symlinked into runtime dir
+      # config.yaml (RC credentials go directly in it — chmod 600) —
+      # symlinked into runtime dir
       - ./config:/root/.agent-chat-gateway/config
 
       # ── Agent working directories ─────────────────────────────────────────

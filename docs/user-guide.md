@@ -42,7 +42,7 @@ Quick summary:
 ```bash
 pip install agent-chat-gateway
 mkdir -p ~/.agent-chat-gateway
-# Create config.yaml and .env (see Configuration section below)
+# Create config.yaml (see Configuration section below)
 agent-chat-gateway start
 ```
 
@@ -561,25 +561,29 @@ Always use explicit domain patterns to prevent SSRF attacks. Avoid `params: ".*"
   params: "https?://(www\\.)?github\\.com/.*"
 ```
 
-### Environment Variables
+### Secrets and Environment Variables
 
-The gateway supports `$VAR` and `${VAR}` expansion in string fields. Create a `.env` file next to your `config.yaml`:
-
-```bash
-# ~/.agent-chat-gateway/.env
-RC_PASSWORD=your_bot_password
-RC_USERNAME=mybot
-RC_URL=https://chat.example.com
-```
-
-Then reference them in your config:
+Store credentials directly in `config.yaml` — no separate file needed:
 
 ```yaml
 server:
-  url: "${RC_URL}"
-  username: "${RC_USERNAME}"
-  password: "${RC_PASSWORD}"
+  url: "https://chat.example.com"
+  username: "mybot"
+  password: "your_bot_password"
 ```
+
+`config.yaml` is chmod'd `0600` automatically, both by the config TUI on every
+save and by `agent-chat-gateway start` — as long as you don't commit your
+filled-in copy to version control, plaintext here is safe.
+
+The gateway still supports `$VAR` and `${VAR}` expansion in string fields,
+resolved from a `.env` file colocated with `config.yaml` (or the process
+environment) — this is for **backward compatibility with existing configs**,
+not the recommended way to store a new secret. If a `.env` file is present,
+the next `agent-chat-gateway start` folds its value(s) into `config.yaml` as
+literal text and removes `.env` automatically (one-time). Run
+`agent-chat-gateway config migrate-env` first if you'd rather do that as a
+manual step or a dry run.
 
 ---
 

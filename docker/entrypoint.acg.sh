@@ -28,10 +28,14 @@
 #       acg:latest
 #
 #   acg-config/ must contain:
-#     ├── .env          RC_URL, RC_USERNAME, RC_PASSWORD
-#     └── config.yaml   full gateway config
+#     └── config.yaml   full gateway config (secrets in plaintext — chmod 600)
 #
-#   See docker/acg-config.example/ for a ready-to-copy template.
+#   .env is no longer required: if acg-config/ still has one from before this
+#   change, it's picked up on first start, its secret(s) folded into
+#   config.yaml as literal values, and then removed automatically (one-time —
+#   see `agent-chat-gateway config migrate-env` for a manual/dry run).
+#
+#   See docker/docker-compose.example/config/ for a ready-to-copy template.
 #
 # Mode 2: Environment variables (quick start / CI)
 #   config.yaml is auto-generated from env vars:
@@ -69,22 +73,31 @@ error()   { printf '\033[0;31m[ACG] Error:\033[0m %s\n' "$*" >&2; exit 1; }
 MOUNTED_CONFIG="$RUNTIME_DIR/config/config.yaml"
 MOUNTED_ENV="$RUNTIME_DIR/config/.env"
 
-if [ -f "$MOUNTED_CONFIG" ] && [ -f "$MOUNTED_ENV" ]; then
+if [ -f "$MOUNTED_CONFIG" ]; then
     # ── Mode 1: symlink from mounted $RUNTIME_DIR/config ──────────────────────────────
+    # Keyed off config.yaml ALONE, not "both files present": the gateway
+    # auto-migrates a .env-backed secret into config.yaml on its first start
+    # (one-time, docs/design/config-tool.md decision 6 revisited) and
+    # removes .env once done. Requiring .env here would make Mode 1
+    # misdetect as Mode 2 (and demand -e RC_URL=... again, or hard-fail) on
+    # every container restart after that first migration.
     info "Config mode: volume mount ($RUNTIME_DIR/config detected)"
 
     ln -sf "$MOUNTED_CONFIG" "$RUNTIME_DIR/config.yaml"
-    ln -sf "$MOUNTED_ENV"    "$RUNTIME_DIR/.env"
-    chmod 600 "$MOUNTED_ENV"
-
     success "Symlinked: $RUNTIME_DIR/config.yaml → $MOUNTED_CONFIG"
-    success "Symlinked: $RUNTIME_DIR/.env → $MOUNTED_ENV"
+
+    # .env is optional now — only present for a config not yet migrated.
+    if [ -f "$MOUNTED_ENV" ]; then
+        ln -sf "$MOUNTED_ENV" "$RUNTIME_DIR/.env"
+        chmod 600 "$MOUNTED_ENV"
+        success "Symlinked: $RUNTIME_DIR/.env → $MOUNTED_ENV"
+    fi
 
 else
     # ── Mode 2: generate config from env vars ────────────────────────────────
     info "Config mode: env vars ($RUNTIME_DIR/config not found — generating config)"
 
-    : "${RC_URL:?RC_URL is required (or mount config.yaml + .env to $RUNTIME_DIR/config)}"
+    : "${RC_URL:?RC_URL is required (or mount config.yaml to $RUNTIME_DIR/config)}"
     : "${RC_USERNAME:?RC_USERNAME is required}"
     : "${RC_PASSWORD:?RC_PASSWORD is required}"
     : "${ACG_OWNER_USERS:?ACG_OWNER_USERS is required (comma-separated, e.g. alice,bob)}"
@@ -92,16 +105,17 @@ else
     AGENT_TYPE="${AGENT_TYPE:-claude}"
     info "Generating config: agent=$AGENT_TYPE, owners=$ACG_OWNER_USERS"
 
-    # Write .env
-    cat > "$RUNTIME_DIR/.env" << EOF
-RC_URL="$RC_URL"
-RC_USERNAME="$RC_USERNAME"
-RC_PASSWORD="$RC_PASSWORD"
-EOF
-    chmod 600 "$RUNTIME_DIR/.env"
-    success "Written: $RUNTIME_DIR/.env"
+    # Credentials go straight into config.yaml as plaintext (chmod 600, same
+    # as onboard.py's own generator) — no .env, matching the rest of the
+    # project post-decision-6-revisited. config.yaml is chmod'd below, right
+    # after it's written.
 
-    # Generate config.yaml
+    # Generate config.yaml. Deliberately a QUOTED heredoc ('PYEOF') so bash
+    # never text-substitutes RC_URL/USERNAME/PASSWORD into the Python source
+    # — a password containing a quote or backslash would otherwise corrupt
+    # (or inject into) the script. Read via os.environ instead, same as
+    # ACG_OWNER_USERS/AGENT_TYPE below — plain runtime lookup, no
+    # interpolation-into-source-text risk.
     "$RUNTIME_DIR/repo/.venv/bin/python3" - << 'PYEOF'
 import os, yaml
 
@@ -117,9 +131,9 @@ config = {
         "name": "rocketchat",
         "type": "rocketchat",
         "server": {
-            "url":      "$RC_URL",
-            "username": "$RC_USERNAME",
-            "password": "$RC_PASSWORD",
+            "url":      os.environ["RC_URL"],
+            "username": os.environ["RC_USERNAME"],
+            "password": os.environ["RC_PASSWORD"],
         },
         "allowed_users": {
             "owners": owner_users,
@@ -176,6 +190,7 @@ config = {
 config_path = os.path.join(runtime_dir, "config.yaml")
 with open(config_path, "w") as f:
     yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
+os.chmod(config_path, 0o600)  # holds a plaintext secret now — same as .env always was
 
 print(f"[ACG] Written: {config_path}")
 print(f"[ACG]   agent={agent_type}, room={watcher_room}, owners={owner_users}")

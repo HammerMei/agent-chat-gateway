@@ -287,8 +287,14 @@ watchers:
 
 #### Features
 - ✅ YAML configuration file
-- ✅ Environment variable expansion (`$VAR`, `${VAR}`)
-- ✅ `.env` file support for expansion values
+- ✅ Secrets stored directly in `config.yaml` (chmod'd `0600` automatically —
+  both by the config TUI and by `agent-chat-gateway start`)
+- ✅ Environment variable expansion (`$VAR`, `${VAR}`) — supported for
+  backward compatibility with existing configs; no longer the recommended
+  way to store new secrets
+- ✅ Auto-migration: a `.env`-backed secret is folded into `config.yaml` as a
+  literal value on first start, then `.env` is removed (one-time; also
+  available as `agent-chat-gateway config migrate-env` for a manual run)
 - ✅ Multi-connector setup (multiple chat instances)
 - ✅ Multi-agent setup (different agents per watcher)
 - ✅ Cross-field validation (e.g., agent timeout > permission timeout)

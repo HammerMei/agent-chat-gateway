@@ -24,6 +24,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import yaml
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -441,6 +442,89 @@ class TestCLIConfigValidate(_CLITestBase):
         self.assertEqual(code, 0)
         self.assertIn("stale-watcher", stdout)
         self.assertIn("dropped on next start", stdout)
+
+
+class TestCLIConfigMigrateEnv(_CLITestBase):
+    """config migrate-env: standalone entry point for the same one-time
+    migration gateway/daemon.py's start_daemon() runs automatically."""
+
+    def setUp(self):
+        super().setUp()
+        self.agent_dir = Path(self.tmp) / "work"
+        self.agent_dir.mkdir()
+
+    def _write(self, yaml_text: str) -> str:
+        path = Path(self.tmp) / "config.yaml"
+        path.write_text(textwrap.dedent(yaml_text))
+        return str(path)
+
+    def _run_migrate(self, config_path: str):
+        return self._run(["config", "migrate-env", "--config", config_path])
+
+    def test_no_env_file_reports_nothing_to_do(self):
+        cfg_path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                room: general
+        """)
+        stdout, stderr, code = self._run_migrate(cfg_path)
+
+        self.assertEqual(code, 0)
+        self.assertIn("Nothing to migrate", stdout)
+
+    def test_migrates_and_reports_the_reference_count(self):
+        cfg_path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: "${{RC_PASSWORD}}"}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                room: general
+        """)
+        (Path(self.tmp) / ".env").write_text("RC_PASSWORD=hunter2\n")
+
+        stdout, stderr, code = self._run_migrate(cfg_path)
+
+        self.assertEqual(code, 0)
+        self.assertIn("Migrated 1 secret reference(s)", stdout)
+        self.assertFalse((Path(self.tmp) / ".env").exists())
+        raw = yaml.safe_load(Path(cfg_path).read_text())
+        self.assertEqual(raw["connectors"][0]["server"]["password"], "hunter2")
+
+    def test_unresolvable_reference_exits_nonzero(self):
+        cfg_path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: "${{MISSING_VAR}}"}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                room: general
+        """)
+        (Path(self.tmp) / ".env").write_text("UNRELATED=1\n")
+
+        stdout, stderr, code = self._run_migrate(cfg_path)
+
+        self.assertEqual(code, 1)
+        self.assertIn("Migration failed", stderr)
+        self.assertTrue((Path(self.tmp) / ".env").exists())
 
 
 # ---------------------------------------------------------------------------

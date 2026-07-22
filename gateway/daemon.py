@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 from .config import GatewayConfig
+from .config_migrate import migrate_env_to_config
 from .runtime_lock import LOCK_FILE as PID_FILE  # noqa: F401 — re-exported for cli.py
 from .runtime_lock import RUNTIME_DIR, locked_pid
 from .runtime_lock import acquire as _lock_acquire
@@ -50,12 +51,18 @@ def _wait_for_startup_signal(read_fd: int) -> None:
     """Block reading from the startup pipe until the daemon closes it.
 
     Protocol written by the daemon:
+      - Zero or more ``info:<message>\\n`` lines for informational notices
+        that happened during startup but didn't fail anything (e.g. a one-
+        time config migration) — always shown, success or degraded.
       - Zero or more ``error:<message>\\n`` lines for non-fatal startup failures.
       - A final ``ok\\n`` line to confirm the startup sequence completed.
 
     If the pipe closes without an ``ok`` line the daemon crashed before completing
-    startup (e.g. config error, unhandled exception).  In that case we report
-    failure and exit 1.
+    startup (e.g. config error, unhandled exception, a FAILED one-time config
+    migration — see gateway/config_migrate.py's fail-closed contract).  In
+    that case we report failure and exit 1; the specific reason lives only
+    in the log (matching how every other fatal startup failure already
+    behaves here — config load, lock acquisition, etc.).
 
     This function never returns — it always calls sys.exit().
     """
@@ -72,6 +79,7 @@ def _wait_for_startup_signal(read_fd: int) -> None:
             pass
 
     lines = data.decode(errors="replace").splitlines()
+    infos = [line[len("info:"):].strip() for line in lines if line.startswith("info:")]
     errors = [line[len("error:"):].strip() for line in lines if line.startswith("error:")]
     has_ok = any(line.strip() == "ok" for line in lines)
 
@@ -81,6 +89,9 @@ def _wait_for_startup_signal(read_fd: int) -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+
+    for msg in infos:
+        print(f"  ℹ {msg}")
 
     if errors:
         print("Gateway started with warnings:", file=sys.stderr)
@@ -172,6 +183,36 @@ def start_daemon(config_path: str) -> None:
         except OSError:
             pass
         sys.exit(1)
+
+    # One-time migration: fold a .env-backed secret directly into
+    # config.yaml as a literal value, then remove .env (docs/design/
+    # config-tool.md decision 6 revisited — enforced migration rather than
+    # indefinitely supporting both forms). No-op, every subsequent start,
+    # once .env is gone. Failure is fatal and fail-closed, same as the
+    # lock-acquire/config-load failures below — a half-migrated config is
+    # worse than refusing to start.
+    try:
+        migration = migrate_env_to_config(config_path)
+    except Exception as e:
+        logger.error("Config migration failed: %s", e)
+        try:
+            os.write(write_fd, f"error:Config migration failed: {e}\n".encode())
+            os.close(write_fd)
+        except OSError:
+            pass
+        _cleanup()
+        sys.exit(1)
+
+    if migration.migrated:
+        msg = (
+            f"Migrated {migration.ref_count} secret reference(s) from .env "
+            f"into config.yaml; .env moved to {migration.env_backup_path}."
+        )
+        logger.info(msg)
+        try:
+            os.write(write_fd, f"info:{msg}\n".encode())
+        except OSError:
+            pass
 
     # Load config — failure is fatal; signal the parent before exiting
     try:

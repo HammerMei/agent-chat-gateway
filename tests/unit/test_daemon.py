@@ -7,6 +7,7 @@ intentionally excluded.
 
 from __future__ import annotations
 
+import io
 import os
 import signal
 import tempfile
@@ -137,6 +138,29 @@ class TestWaitForStartupSignal(unittest.TestCase):
         with self.assertRaises(SystemExit) as ctx:
             daemon_mod._wait_for_startup_signal(read_fd)
         self.assertEqual(ctx.exception.code, 1)
+
+    def test_info_line_is_printed_to_the_console_on_success(self):
+        """A one-time config migration (gateway/config_migrate.py) reports
+        via an 'info:' line — must reach stdout, not just the log file, per
+        the user-requested "not a completely silent operation" ask."""
+        data = b"info:Migrated 1 secret reference(s) from .env into config.yaml.\nok\n"
+        read_fd = self._make_pipe_with_data(data)
+        with patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
+            with self.assertRaises(SystemExit) as ctx:
+                daemon_mod._wait_for_startup_signal(read_fd)
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertIn("Migrated 1 secret reference(s)", mock_stdout.getvalue())
+
+    def test_info_line_is_printed_even_when_degraded(self):
+        data = (
+            b"info:Migrated 1 secret reference(s) from .env into config.yaml.\n"
+            b"error:Some sidecar failed\nok\n"
+        )
+        read_fd = self._make_pipe_with_data(data)
+        with patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
+            with self.assertRaises(SystemExit):
+                daemon_mod._wait_for_startup_signal(read_fd)
+        self.assertIn("Migrated 1 secret reference(s)", mock_stdout.getvalue())
 
 
 # ── stop_daemon ───────────────────────────────────────────────────────────────

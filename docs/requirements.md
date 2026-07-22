@@ -225,8 +225,10 @@ The gateway SHALL validate that:
 The gateway SHALL:
 1. Require that path-based configuration values (e.g., working directories) exist at validation time
 2. Resolve relative paths relative to the configuration file location
-3. Support environment variable expansion in all configuration values (e.g., `$VARIABLE` or `${VARIABLE}`)
-4. Optionally support a `.env` file colocated with the configuration file for variable expansion
+3. Store secrets directly in the configuration file, restricting its permissions (`chmod 0600`) whenever the gateway or its config tool writes it
+4. Support environment variable expansion in all configuration values (e.g., `$VARIABLE` or `${VARIABLE}`) for backward compatibility with existing configs — no longer the recommended way to store a new secret
+5. Support a `.env` file colocated with the configuration file for variable expansion (backward compatibility only)
+6. Automatically migrate a `.env`-backed secret into the configuration file as a literal value on first start, then remove `.env` — a one-time operation, also available as a standalone command for a manual/dry run
 
 ### 8.3 Configuration Validation
 
