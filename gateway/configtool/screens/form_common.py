@@ -60,11 +60,14 @@ class FieldSpec:
     kind: Literal["str", "int", "bool", "list", "enum"]
     label: str
     options: tuple[str, ...] | None = None
-    # Masks the widget's display (Input(password=True)) AND renders a
-    # "Store in .env" Checkbox next to it (docs/design/config-tool.md
-    # decision 6) — default ON. See looks_like_env_var_reference()/
-    # env_var_name_for() below and ConnectorDetailScreen.action_save() for
-    # how the toggle actually gets acted on.
+    # Masks the widget's display (Input(password=True)). docs/design/
+    # config-tool.md decision 6 revisited: secrets are stored directly in
+    # config.yaml (chmod 0600) rather than split into a companion .env file
+    # — this form never writes a new $VAR/${VAR} reference. If a field's
+    # CURRENT value already is one (an existing config not yet auto-
+    # migrated — see gateway/config_migrate.py), _resolve_secret_display()
+    # below still resolves it for display/editing rather than showing the
+    # raw placeholder.
     secret: bool = False
 
 
@@ -74,33 +77,15 @@ _ENV_VAR_REF_RE = re.compile(r"^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$")
 def looks_like_env_var_reference(value: str) -> bool:
     """True if `value` is ENTIRELY a `$VAR` or `${VAR}` reference (matching
     both forms `gateway/config.py`'s `_expand_env_vars` resolves, via
-    `os.path.expandvars`). Used to avoid double-writing `.env` when a secret
-    field's new value is already a placeholder the user typed directly
-    (referencing an externally-managed var) rather than a genuine new
-    plaintext secret."""
+    `os.path.expandvars`). Used by `_resolve_secret_display()` below to spot
+    a field an existing (not yet auto-migrated — gateway/config_migrate.py)
+    config still references via `.env`, so it can be resolved for display
+    instead of shown as a raw placeholder."""
     return bool(_ENV_VAR_REF_RE.match(value))
-
-
-def env_var_name_for(entity_name: str, field_key: str) -> str:
-    """Deterministic `.env` var name for a secret field: `"<ENTITY>_<FIELD>"`,
-    uppercased, any non-alphanumeric character replaced with `_`. E.g.
-    connector `"rc-home"` + field `"server.password"` -> `"RC_HOME_PASSWORD"`.
-    Accepted, documented risk (not handled): this could collide with an
-    unrelated existing `.env` key sharing the same generated name — rare in
-    practice, not worth a collision-detection UI for v1.
-    """
-    suffix = field_key.rsplit(".", 1)[-1]
-    sanitized_entity = re.sub(r"[^A-Za-z0-9]", "_", entity_name).upper()
-    sanitized_field = re.sub(r"[^A-Za-z0-9]", "_", suffix).upper()
-    return f"{sanitized_entity}_{sanitized_field}"
 
 
 def widget_id(key: str) -> str:
     return "field-" + key.replace(".", "-")
-
-
-def env_toggle_widget_id(key: str) -> str:
-    return widget_id(key) + "-env-toggle"
 
 
 def get_nested(d: dict, dotted_key: str) -> object:
@@ -466,8 +451,7 @@ class FormScreen(DetailScreen):
         prov_text = f"[dim]({provenance_label(provenance)})[/dim]" if provenance else ""
         initial = self._initial_values.get(spec.key)
         # own_raw is this entry's OWN explicit value (pre-merge, unresolved)
-        # for a secret field — used to decide the "Store in .env" checkbox's
-        # default (below) and to detect the fallback case where
+        # for a secret field — used only to detect the fallback case where
         # _resolve_secret_display() couldn't resolve the var (the widget is
         # then showing the raw placeholder, same as `own_raw`, rather than
         # an actual secret) so a hint can be added instead of looking
@@ -507,22 +491,6 @@ class FormScreen(DetailScreen):
             # future field key containing a literal dash.
             widget.field_key = spec.key
             yield widget
-            if spec.secret:
-                # Reflects whether THIS entry's own field is already stored
-                # in .env (own_raw looks like a $VAR/${VAR} reference) —
-                # NOT hardcoded True. User-reported bug: unchecking this,
-                # saving as plaintext, then reopening the form showed the
-                # checkbox checked again regardless of what was actually on
-                # disk, because this used to default to True unconditionally.
-                # create mode has no own_raw yet, so it keeps the original
-                # default-ON nudge (docs/design/config-tool.md decision 6)
-                # to encourage using .env for a brand new secret.
-                toggle_default = self.mode == "create" or (
-                    isinstance(own_raw, str) and looks_like_env_var_reference(own_raw)
-                )
-                yield Checkbox(
-                    "Store in .env", value=toggle_default, id=env_toggle_widget_id(spec.key)
-                )
             yield Static(prov_text, classes="field-provenance")
 
     # ── dirty tracking (per-screen, not EditableConfig.dirty — nothing is

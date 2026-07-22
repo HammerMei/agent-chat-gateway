@@ -5,9 +5,13 @@ escape hatch). **Phase 2 in progress:** items 7–10 from the Phase 1 code
 review cleared; `EditableConfig.save()`/dirty-tracking/`ConfirmModal`
 foundation shipped; agent create/edit shipped; connector create/edit shipped
 (per-type field lists — the generic tree editor originally planned is
-deferred, see Part 3); delete shipped for both agents and connectors; the
-`.env` "store in .env" toggle shipped. The tool-list/preset editor is not
-yet built. Phase 3 is designed below but not yet started. The
+deferred, see Part 3); delete shipped for both agents and connectors. The
+`.env` "store in .env" toggle shipped, then removed in favor of storing
+secrets directly in `config.yaml` (chmod 0600) with an enforced one-time
+auto-migration for any config still using `.env` — see decision 6's
+"Reversed shortly after" entry below for the full reasoning. The
+tool-list/preset editor is not yet built. Phase 3 is designed below but not
+yet started. The
 v0.2 format simplification (`connector_defaults`/`agent_defaults`/
 `watcher_defaults`, `tool_presets`, watcher `rooms:`) plus `acg config
 validate` and the JSON Schema (see `docs/migration-0.2.md`) are prerequisites
@@ -484,6 +488,78 @@ Phase 2 first cleared the Phase 1 code review's deferred items 7–10
     this round (which was: see/change the value, and stop the checkbox
     lying about the field's actual state) — not built, to avoid scope
     creep past what was requested.
+
+- **Reversed shortly after, in a follow-up PR: "keep `.env`, harden both"
+  above became "remove `.env` entirely, enforce a one-time migration."**
+  User's own framing: two supported formats going forward is tech debt by
+  itself, and "if the migration is simple — even manual — enforcing it
+  beats indefinitely supporting both." Two design questions this settled:
+  1. *Why not just auto-collapse an explicit field back to "inherited" when
+     its value happens to match the default* (a related question raised in
+     the same conversation, about `require_mention`/`connector_defaults`)*?*
+     Answer: the tool can't tell "I want this pinned regardless of future
+     default changes" apart from "this happens to match right now" from the
+     value alone — collapsing on value-match would silently reinterpret
+     past intent the next time someone edits the shared default. `--lint`
+     surfacing the redundancy as a suggestion (a real, separate gap:
+     `_CONNECTOR_LINT_DEFAULTS` didn't cover `require_mention`/
+     `filter_sender` at all) plus `ctrl+r` as the explicit "yes, track the
+     default" action is the correct split — decide, don't guess.
+  2. *Why offer a "Store in .env" checkbox at all if the goal is "all
+     secrets in `.env`"?* Because it couldn't have been a real gate anyway
+     — the `$EDITOR` escape hatch lets anyone write a plaintext secret with
+     zero friction regardless of what the form does, and nothing in
+     `config_validate.py` flagged a plaintext secret either. A checkbox in
+     one editing surface was a nudge, not enforcement — once `config.yaml`
+     itself got the same `chmod 0600` hardening `.env` had, plaintext-in-
+     config.yaml stopped being a strictly worse choice, just a different
+     one (one file to manage vs. an easier "share config.yaml without also
+     handing over secrets"). The sharing benefit is real but conditional
+     (matters if you actually share your config) — best served by a
+     dedicated export/redaction path rather than by two files as the
+     permanent norm for everyone.
+  - **Shipped:** `gateway/config_migrate.py` — one-time migration resolving
+    every `$VAR`/`${VAR}` in the raw document to its literal value (reusing
+    `EditableConfig.load()`/`.save()` and `gateway/config.py`'s own
+    `load_dotenv`/`_expand_env_vars` — never reimplemented, so the resolved
+    values are guaranteed to match what the daemon already used at
+    runtime), then moves `.env` into `.config-backups/`. Backup -> migrate
+    -> validate -> fail-closed: a migration that would fail
+    `validate_config()` never touches the real `config.yaml`.
+  - Same function, two triggers, per the design principle "separate the
+    mutation LOGIC from the TRIGGER": automatic at every
+    `gateway/daemon.py` `start_daemon()` (becomes a permanent no-op once
+    `.env` is gone — this is what makes it actual enforcement rather than
+    a nag someone can ignore forever) and standalone via
+    `agent-chat-gateway config migrate-env` for a manual/dry run. A
+    successful migration is reported on BOTH the log and the console — the
+    startup handshake pipe gained an `info:` line type alongside the
+    existing `error:`/`ok`, specifically so this isn't a silent operation.
+  - `docker/entrypoint.acg.sh`: Mode 1 (volume mount) now keys off
+    `config.yaml` alone, not `config.yaml` + `.env` — otherwise a container
+    restart after the first migration would misdetect as Mode 2 and demand
+    `-e RC_URL=...` again or hard-fail. Mode 2 (env-var quick start) writes
+    credentials straight into the generated `config.yaml` instead of
+    generating `.env`.
+  - The TUI's "Store in .env" checkbox, the `env_writer.py` write path
+    (`upsert_env_vars()`/`remove_env_vars()`), the delete-time `.env`
+    cleanup hook, and `env_var_name_for()` were all removed — dead code
+    once nothing writes a NEW `.env` reference. `_resolve_secret_display()`
+    (resolve an EXISTING `${VAR}` for display/editing) and
+    `read_env_vars()` stay: an existing config not yet auto-migrated still
+    needs to display/edit sanely. `onboard.py`'s wizard writes credentials
+    directly into `config.yaml` instead of generating a companion `.env`.
+  - **Known limitation, not fixed (pre-existing, orthogonal):**
+    `EditableConfig.save()`'s `os.replace()` replaces a destination that IS
+    a symlink rather than writing through it — in Docker's Mode 1 (runtime
+    `config.yaml`/`.env` symlinked to a bind-mounted host directory), the
+    first migration decouples the container's `config.yaml` from the host
+    mount, and the moved-aside `.env` may still be a symlink to a host file
+    that's never actually deleted — a later container restart can re-run
+    the migration (harmless, just not a true no-op in that one deployment
+    shape). Documented in `gateway/config_migrate.py`, not special-cased —
+    fixing `EditableConfig.save()`'s general symlink handling is a separate,
+    bigger change than this round asked for.
 
 - **Shipped (added after initial Phase 2 review — user caught that "CRUD"
   was being used loosely and Delete had never actually been designed for
