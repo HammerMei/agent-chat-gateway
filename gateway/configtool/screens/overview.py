@@ -9,9 +9,11 @@ the same confirm/referencing-watcher-check/save flow FormScreen.
 action_delete() already has, without requiring a screen push first (user-
 reported: 'e' used to be shadowed by this screen's OWN 'e' binding for the
 $EDITOR escape hatch — see action_edit_config() below, now on ctrl+e). 'n'
-(new_entity) creates an entry on the active tab — so far only Agents/
-Connectors support it; other tabs still notify rather than doing nothing
-or crashing.
+(new_entity) creates an entry on the active tab — Agents/Connectors/Tool
+Presets support it; Watchers/Defaults still notify rather than doing
+nothing or crashing (Phase 3). 'd' additionally deletes the whole preset
+under the cursor on the Tool Presets tab (there's no separate "edit mode"
+to give 'e' a meaning there — see tool_presets.py).
 """
 
 from __future__ import annotations
@@ -27,11 +29,12 @@ from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Static, TabbedContent, TabPane
 
 from ..formatting import status_badge
-from ..modals import TypePickerModal
+from ..modals import ConfirmModal, MessageModal, TextPromptModal, TypePickerModal
 from ..model import StatusIndex
 from .agent_detail import AgentDetailScreen
 from .connector_detail import CONNECTOR_TYPES, ConnectorDetailScreen
 from .defaults import DefaultsScreen
+from .form_common import find_agents_referencing_preset
 from .tool_presets import ToolPresetsScreen
 from .watcher_detail import WatcherDetailScreen
 
@@ -149,15 +152,31 @@ class OverviewScreen(Screen):
         ready on that tab's list, not on the tab bar."""
         self._focus_active_tab_table()
 
+    def on_screen_resume(self) -> None:
+        """Fires whenever this screen becomes the active one again after a
+        pushed screen is popped — including Escape out of ToolPresetsScreen,
+        which (unlike every other mutating flow in this app) doesn't pop
+        itself after a successful add/delete-rule, so there's no single
+        "just popped, call reload_config()" call site to hang a repaint off
+        of. Repainting here instead covers that case (and is a harmless,
+        idempotent no-op on every other screen-pop path, which already
+        repaints explicitly right before or after popping)."""
+        self.repaint_from_memory()
+
     # ── Actions ──────────────────────────────────────────────────────────────
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        """Hide 'Edit'/'Delete' from the footer on tabs that don't support
-        them (Watchers/Defaults/Tool Presets — Phase 3) so the footer never
+        """Hide 'Edit' from the footer on tabs that don't support it
+        (Watchers/Defaults — Phase 3; Tool Presets has no separate "edit
+        mode" to enter, see tool_presets.py). 'Delete' additionally supports
+        Tool Presets (deletes the whole preset, not a rule — see
+        action_delete_row() below) so the footer never
         advertises a key that would just notify "not supported yet"."""
-        if action in ("edit_row", "delete_row"):
-            active_tab = self.query_one(TabbedContent).active
+        active_tab = self.query_one(TabbedContent).active
+        if action == "edit_row":
             return active_tab in ("tab-connectors", "tab-agents")
+        if action == "delete_row":
+            return active_tab in ("tab-connectors", "tab-agents", "tab-presets")
         return True
 
     def action_edit_config(self) -> None:
@@ -222,8 +241,10 @@ class OverviewScreen(Screen):
 
     @work
     async def action_delete_row(self) -> None:
-        """'d' on the Connectors/Agents tabs: delete the row under the
-        cursor directly, reusing FormScreen.action_delete()'s existing
+        """'d' on the Connectors/Agents/Tool-Presets tabs: delete the row
+        under the cursor directly.
+
+        Connectors/Agents reuse FormScreen.action_delete()'s existing
         confirm/referencing-watcher-check/save flow verbatim (no
         reimplementation) — just triggered without a screen push first.
 
@@ -237,6 +258,11 @@ class OverviewScreen(Screen):
         the screen in place (it was designed to be reached via view mode,
         where staying put makes sense — reached from here, staying put
         would leave the user looking at a screen they never asked to see).
+
+        Tool Presets has no FormScreen/detail-screen delete flow to reuse
+        (ToolPresetsScreen itself only edits ONE preset's rules, never
+        deletes the whole preset — see its own module docstring), so this
+        deletes the preset directly, inline, via _delete_preset_row().
         """
         app: "ConfigToolApp" = self.app  # type: ignore[assignment]
         cfg = app.editable_config
@@ -245,6 +271,9 @@ class OverviewScreen(Screen):
             return
 
         active_tab = self.query_one(TabbedContent).active
+        if active_tab == "tab-presets":
+            await self._delete_preset_row(cfg)
+            return
         if active_tab == "tab-connectors":
             key = self._cursor_row_key("connectors-table")
             if key is None:
@@ -282,12 +311,60 @@ class OverviewScreen(Screen):
             # them back to the list instead, same as Escape would.
             self.app.pop_screen()
 
+    async def _delete_preset_row(self, cfg) -> None:
+        """Delete the WHOLE preset under the cursor on the Tool Presets tab
+        (not a single rule — see ToolPresetsScreen's own module docstring
+        for why deleting one preset's rules never deletes the preset
+        itself). Checks find_agents_referencing_preset() FIRST, same
+        pre-check-before-destructive-confirm pattern
+        find_referencing_watcher_labels() gives connectors/agents — a
+        blocked delete gets a clear, specific reason instead of a generic
+        validator error."""
+        key = self._cursor_row_key("presets-table")
+        if key is None or key not in cfg.tool_presets_raw:
+            return
+
+        used_by = find_agents_referencing_preset(cfg, key)
+        if used_by:
+            await self.app.push_screen_wait(
+                MessageModal(
+                    f"Cannot delete tool preset '{key}' — still used by agent(s): "
+                    f"{', '.join(used_by)}.",
+                    title="Cannot delete",
+                )
+            )
+            return
+
+        confirmed = await self.app.push_screen_wait(
+            ConfirmModal(
+                f"Delete tool preset '{key}'? This cannot be undone.",
+                confirm_label="Delete",
+            )
+        )
+        if not confirmed:
+            return
+
+        presets = cfg.document.get("tool_presets", {})
+        removed = presets.pop(key, None)
+        cfg.mark_dirty()
+        try:
+            cfg.save()
+        except (ValueError, FileNotFoundError) as exc:
+            if removed is not None:
+                presets[key] = removed
+            await self.app.push_screen_wait(MessageModal(str(exc), title="Could not delete"))
+            return
+
+        self.notify(f"Deleted tool preset '{key}'.", severity="information")
+        app: "ConfigToolApp" = self.app  # type: ignore[assignment]
+        app.reload_config()
+
     @work
     async def action_new_entity(self) -> None:
-        """'n' — scoped to whichever tab is active. Agents and Connectors
-        support creation; Watchers/Defaults/Tool Presets don't yet (Phase 3).
-        Unsupported tabs just notify, rather than doing nothing silently or
-        crashing."""
+        """'n' — scoped to whichever tab is active. Agents, Connectors, and
+        Tool Presets support creation; Watchers/Defaults don't yet
+        (Phase 3). Unsupported tabs just notify, rather than doing nothing
+        silently or crashing."""
         app: "ConfigToolApp" = self.app  # type: ignore[assignment]
         if app.editable_config is None:
             self.notify("Config does not currently load — nothing to add to.", severity="error")
@@ -312,6 +389,18 @@ class OverviewScreen(Screen):
             self.app.push_screen(
                 ConnectorDetailScreen(app.editable_config, {"type": connector_type}, mode="create")
             )
+        elif active_tab == "tab-presets":
+            # No document/disk write here — a brand-new preset only
+            # actually materializes once the first rule is added inside
+            # ToolPresetsScreen (see its module docstring), so escaping out
+            # without adding anything leaves no trace.
+            name = await self.app.push_screen_wait(TextPromptModal("New tool preset — name"))
+            if name is None:
+                return
+            if name in app.editable_config.tool_presets_raw:
+                self.notify(f"A tool preset named '{name}' already exists.", severity="error")
+                return
+            self.app.push_screen(ToolPresetsScreen(app.editable_config, name))
         else:
             self.notify("Creating a new entry isn't supported on this tab yet.", severity="warning")
 
@@ -498,4 +587,4 @@ class OverviewScreen(Screen):
         elif table_id == "defaults-table":
             self.app.push_screen(DefaultsScreen(cfg, key, mode="view"))
         elif table_id == "presets-table":
-            self.app.push_screen(ToolPresetsScreen(cfg, key, mode="view"))
+            self.app.push_screen(ToolPresetsScreen(cfg, key))

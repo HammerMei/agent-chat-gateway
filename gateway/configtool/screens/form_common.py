@@ -188,6 +188,34 @@ def find_referencing_watcher_labels(
     return labels
 
 
+def find_agents_referencing_preset(cfg: EditableConfig, preset_name: str) -> list[str]:
+    """Which agents currently reference the given `tool_presets` entry, via
+    either `owner_allowed_tools` or `guest_allowed_tools` — checked against
+    the MERGED view (`agent_defaults` + entry), not the raw entry alone, so
+    a preset referenced only via `agent_defaults` (common: shared across
+    every agent that doesn't override its own tool list) still shows up as
+    "used by" that agent. Used by both `ToolPresetsScreen` (its own
+    used-by display) and `OverviewScreen`'s direct-delete-a-preset flow
+    (blocks the delete with this list, same pre-check pattern
+    `find_referencing_watcher_labels()` above uses for connectors/agents).
+    If the config doesn't currently load, returns [] — same reasoning as
+    that function: a delete pre-check has nothing useful to say about a
+    config that doesn't parse; `save()`'s own validation remains the
+    backstop.
+    """
+    used_by = []
+    for name, entry in cfg.agents_raw.items():
+        try:
+            merged = cfg.merged_entry("agent_defaults", entry)
+        except (ValueError, FileNotFoundError):
+            merged = entry
+        owner_tools = merged.get("owner_allowed_tools") or []
+        guest_tools = merged.get("guest_allowed_tools") or []
+        if preset_name in owner_tools or preset_name in guest_tools:
+            used_by.append(name)
+    return used_by
+
+
 class FormScreen(DetailScreen):
     """Base for the config TUI's view/edit/create entity screens. See
     module docstring for the subclass contract."""
