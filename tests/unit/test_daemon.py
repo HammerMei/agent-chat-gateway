@@ -1,8 +1,11 @@
 """Unit tests for gateway.daemon (pure-logic functions).
 
-Tests cover: is_running, _wait_for_startup_signal, _cleanup, stop_daemon.
-start_daemon uses os.fork() which is not suitable for unit tests and is
-intentionally excluded.
+Tests cover: is_running, _wait_for_startup_signal, _cleanup, stop_daemon,
+_harden_config_permissions, _sanitize_pipe_message. start_daemon() itself
+uses os.fork() which is not suitable for unit tests and is intentionally
+excluded — _harden_config_permissions()/_sanitize_pipe_message() are
+extracted as standalone functions specifically so the logic start_daemon()
+calls into is still testable without forking.
 """
 
 from __future__ import annotations
@@ -10,6 +13,7 @@ from __future__ import annotations
 import io
 import os
 import signal
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -33,6 +37,30 @@ def _patch_paths(tmpdir: str):
         patch.object(runtime_lock_mod, "LOCK_FILE", td / "gateway.pid"),
         patch.object(daemon_mod, "LOG_FILE", td / "gateway.log"),
     )
+
+
+# ── _harden_config_permissions / _sanitize_pipe_message ───────────────────────
+
+class TestHardenConfigPermissions(unittest.TestCase):
+    def test_chmods_config_to_0600_regardless_of_starting_permissions(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.yaml"
+            config_path.write_text("connectors: []\n")
+            config_path.chmod(0o644)
+
+            daemon_mod._harden_config_permissions(str(config_path))
+
+            self.assertEqual(stat.S_IMODE(config_path.stat().st_mode), 0o600)
+
+
+class TestSanitizePipeMessage(unittest.TestCase):
+    def test_strips_embedded_newlines(self):
+        result = daemon_mod._sanitize_pipe_message("line one\nline two\r\nline three")
+        self.assertNotIn("\n", result)
+        self.assertNotIn("\r", result)
+
+    def test_leaves_a_single_line_message_unchanged(self):
+        self.assertEqual(daemon_mod._sanitize_pipe_message("all good"), "all good")
 
 
 # ── is_running ────────────────────────────────────────────────────────────────

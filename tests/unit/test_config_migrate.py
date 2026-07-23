@@ -174,6 +174,78 @@ class TestMigrateEnvToConfig(unittest.TestCase):
         self.assertEqual(result.ref_count, 0)
         self.assertFalse(self.env_path.exists())
 
+    def test_ref_count_counts_bare_dollar_form_without_braces(self):
+        """The counting regex must match gateway/config.py's _expand_env_vars()
+        exactly (a code-review finding caught them diverging) — $VAR (no
+        braces) is one of the two forms it resolves."""
+        self._write_config(self._valid_cfg_text("$RC_PASSWORD"))
+        self.env_path.write_text("RC_PASSWORD=hunter2\n")
+
+        result = migrate_env_to_config(self.config_path)
+
+        self.assertEqual(result.ref_count, 1)
+        raw = yaml.safe_load(self.config_path.read_text())
+        self.assertEqual(raw["connectors"][0]["server"]["password"], "hunter2")
+
+    def test_missing_config_file_with_no_env_either_is_still_a_no_op(self):
+        """Code-review finding: the .env-exists check must run BEFORE
+        config.yaml is loaded, so a fresh install (neither file exists yet)
+        gets a clean no-op here — letting GatewayConfig.from_file() be the
+        one to raise the clear 'config file not found' error later, instead
+        of this function raising a confusing 'migration failed' for what is
+        actually just a missing config file."""
+        self.assertFalse(self.config_path.exists())
+        self.assertFalse(self.env_path.exists())
+
+        result = migrate_env_to_config(self.config_path)
+
+        self.assertFalse(result.migrated)
+
+    def test_missing_config_file_with_an_env_present_still_raises(self):
+        """The no-op path only applies when .env is ALSO missing — if .env
+        exists but config.yaml doesn't, that's a real error (nothing to
+        load), not silently swallowed."""
+        self.env_path.write_text("RC_PASSWORD=hunter2\n")
+        self.assertFalse(self.config_path.exists())
+
+        with self.assertRaises(FileNotFoundError):
+            migrate_env_to_config(self.config_path)
+
+    def test_resolves_symlinked_config_path_and_migrates_the_real_host_files(self):
+        """Code-review finding: migrating via an unresolved symlink path
+        (e.g. Docker Mode 1's runtime config.yaml/.env symlinked to a
+        bind-mounted host directory) used to let EditableConfig.save()'s
+        os.replace() decouple the container-local symlink from the real
+        file instead of writing through to it, silently reporting success
+        while the real host files were never touched. Resolving the path
+        unconditionally at the top of migrate_env_to_config() fixes this
+        for every caller, not just the ones that remembered to resolve
+        first."""
+        host_dir = Path(self.tmp) / "host"
+        host_dir.mkdir()
+        host_config = host_dir / "config.yaml"
+        host_env = host_dir / ".env"
+        host_config.write_text(textwrap.dedent(self._valid_cfg_text("${RC_PASSWORD}")))
+        host_env.write_text("RC_PASSWORD=hunter2\n")
+
+        runtime_dir = Path(self.tmp) / "runtime"
+        runtime_dir.mkdir()
+        symlinked_config = runtime_dir / "config.yaml"
+        symlinked_config.symlink_to(host_config)
+        (runtime_dir / ".env").symlink_to(host_env)
+
+        result = migrate_env_to_config(symlinked_config)
+
+        self.assertTrue(result.migrated)
+        # The REAL host file must be updated, not just the runtime symlink.
+        raw = yaml.safe_load(host_config.read_text())
+        self.assertEqual(raw["connectors"][0]["server"]["password"], "hunter2")
+        # The real host .env must be gone (moved into the host's own
+        # .config-backups/, since config_path resolves there too).
+        self.assertFalse(host_env.exists())
+        self.assertTrue(result.env_backup_path.exists())
+        self.assertEqual(result.env_backup_path.read_text(), "RC_PASSWORD=hunter2\n")
+
 
 if __name__ == "__main__":
     unittest.main()

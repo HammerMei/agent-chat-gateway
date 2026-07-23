@@ -663,17 +663,10 @@ class FormScreen(DetailScreen):
             await self.app.push_screen_wait(MessageModal(str(exc), title="Could not delete"))
             return
 
-        self._on_deleted_successfully()
         self.app.pop_screen()
         app = self.app
         app.notify(f"Deleted {self._entity_noun()} '{self._entity_label()}'.", severity="information")
         app.reload_config()  # type: ignore[attr-defined]
-
-    def _on_deleted_successfully(self) -> None:
-        """Hook for subclass-specific cleanup once the deletion is confirmed
-        durable (document saved to disk). No-op by default;
-        ConnectorDetailScreen uses this to remove any `.env` entries this
-        connector owned (see its own override)."""
 
     # ── generic diff collection (Save calls this, then applies the result
     # however this entity needs to — see module docstring) ──────────────────

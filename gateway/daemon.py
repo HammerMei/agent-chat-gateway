@@ -23,6 +23,34 @@ logger = logging.getLogger("agent-chat-gateway.daemon")
 LOG_FILE = RUNTIME_DIR / "gateway.log"
 
 
+def _harden_config_permissions(config_path: str) -> None:
+    """Chmod config.yaml to 0600, unconditionally.
+
+    Code-review finding: `migrate_env_to_config()`'s own `cfg.save()` only
+    chmods config.yaml when a migration actually ran (i.e. only when a
+    `.env` file existed) — a hand-written config.yaml that never had a
+    companion `.env` (exactly what the docs now recommend) was never
+    getting this protection from `agent-chat-gateway start` at all,
+    contradicting the documented guarantee. Extracted as its own function
+    so it's unit-testable without going through `os.fork()` (this whole
+    module's docstring already notes `start_daemon()` itself isn't
+    unit-testable that way).
+    """
+    Path(config_path).chmod(0o600)
+
+
+def _sanitize_pipe_message(message: str) -> str:
+    """Strip embedded newlines from a message before writing it into the
+    startup handshake pipe's line-oriented `info:`/`error:`/`ok` protocol —
+    matches `gateway/service.py`'s `_write_startup_signal()`, which already
+    does this for the same reason: an embedded newline would split one
+    message into multiple, unparseable protocol lines. `EditableConfig.
+    save()`'s `ValueError` (propagated through `migrate_env_to_config()`)
+    is genuinely multi-line (`"\\n".join(result.errors)`), so this isn't
+    just theoretical."""
+    return message.replace("\n", " ").replace("\r", " ")
+
+
 def _setup_logging() -> None:
     """Configure file-based logging for the daemon."""
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
@@ -196,7 +224,10 @@ def start_daemon(config_path: str) -> None:
     except Exception as e:
         logger.error("Config migration failed: %s", e)
         try:
-            os.write(write_fd, f"error:Config migration failed: {e}\n".encode())
+            os.write(
+                write_fd,
+                f"error:Config migration failed: {_sanitize_pipe_message(str(e))}\n".encode(),
+            )
             os.close(write_fd)
         except OSError:
             pass
@@ -210,9 +241,15 @@ def start_daemon(config_path: str) -> None:
         )
         logger.info(msg)
         try:
-            os.write(write_fd, f"info:{msg}\n".encode())
+            os.write(write_fd, f"info:{_sanitize_pipe_message(msg)}\n".encode())
         except OSError:
             pass
+
+    # config.yaml can hold a plaintext secret whether or not a migration
+    # just ran (e.g. a hand-written config.yaml that never had a .env) —
+    # chmod it unconditionally rather than relying on migrate_env_to_config()
+    # having done it as a side effect of its own cfg.save().
+    _harden_config_permissions(config_path)
 
     # Load config — failure is fatal; signal the parent before exiting
     try:

@@ -20,18 +20,19 @@ command (`agent-chat-gateway config migrate-env`) for a manual/dry-run/
 Docker-entrypoint invocation. Same function either way — no logic
 duplicated between the two call sites.
 
-Known limitation (Docker bind-mount deployments only): `EditableConfig.
-save()` writes via `os.replace()`, which replaces a destination that is
-itself a symlink rather than writing through it — so in the Docker
-entrypoint's Mode 1 (`docker/entrypoint.acg.sh` symlinks the runtime
-`config.yaml`/`.env` to a bind-mounted host directory), the FIRST migration
-inside the container turns the container's `config.yaml` into a real file
-decoupled from the host mount, and the moved-aside `.env` may still be a
-symlink pointing at a host file that itself never gets removed. A later
-container restart can therefore re-run this migration (harmless — it's
-idempotent in effect, just not a true no-op in that one deployment shape).
-Pre-existing characteristic of `EditableConfig.save()`'s symlink handling,
-not something this module special-cases.
+Symlink safety (Docker bind-mount deployments): `EditableConfig.save()`
+writes via `os.replace()`, which replaces a destination that is itself a
+symlink rather than writing through it — relevant because the Docker
+entrypoint's Mode 1 (`docker/entrypoint.acg.sh`) symlinks the runtime
+`config.yaml`/`.env` to a bind-mounted host directory. Code-review finding:
+`gateway/daemon.py`'s automatic trigger resolved `config_path` before
+calling this function, so it was accidentally safe — but the standalone
+`agent-chat-gateway config migrate-env` CLI command (the one Docker users
+are explicitly told to run manually) did NOT resolve first, so it would
+silently "migrate" the container-local symlinks only, never touch the real
+host files, and report false success. Fixed by resolving `config_path`
+unconditionally as the very first step below, so every caller gets the
+same guarantee regardless of whether it remembered to resolve first.
 
 Safety model: backup -> migrate -> validate -> fail-closed. Reuses
 `EditableConfig.load()`/`.save()` for the raw load and the validate-before-
@@ -56,7 +57,7 @@ from dotenv import load_dotenv
 from .config import _expand_env_vars
 from .configtool.model import EditableConfig
 
-_ENV_REF_RE = re.compile(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?")
+_ENV_REF_RE = re.compile(r"\$\{?\w+")  # matches gateway/config.py's _expand_env_vars() exactly
 
 
 @dataclass
@@ -86,26 +87,38 @@ def migrate_env_to_config(config_path: str | Path) -> MigrationResult:
     """If a `.env` file sits next to `config_path`, resolve every `$VAR`/
     `${VAR}` reference in the raw config document to its literal value,
     save the result (validated, backed up, atomically — see module
-    docstring), then move `.env` into `.config-backups/` (created by the
-    save above) so nothing is silently deleted.
+    docstring), then move `.env` into `.config-backups/` (created as part
+    of that save) so nothing is silently deleted.
 
     No-op (`MigrationResult(migrated=False)`) if `.env` doesn't exist —
     this is what makes the migration permanently self-limiting: once it has
     run once for a given config directory, every later call (e.g. every
-    subsequent daemon start) is a cheap no-op forever.
+    subsequent daemon start) is a cheap no-op forever. Checked BEFORE
+    loading/parsing config.yaml at all (a plain `Path.exists()` stat) —
+    code-review finding: this used to load and fully YAML-parse config.yaml
+    first and check `.env` second, meaning every daemon start double-parsed
+    config.yaml (once here, once moments later via `GatewayConfig.
+    from_file()`) for a check that resolves to "nothing to do" the
+    overwhelming majority of the time.
 
-    Raises `ValueError` if any reference can't be resolved (missing from
-    both `.env` and the process environment — same check
-    `_expand_env_vars` already performs for the real daemon load path) —
-    the caller must treat this as fatal: `.env` and config.yaml are left
-    completely untouched, and starting the gateway with a half-migrated or
-    still-referencing config would be worse than refusing to start.
+    Raises `FileNotFoundError` if `config_path` itself doesn't exist (only
+    reachable once `.env` does — see above) and `ValueError` if any
+    reference can't be resolved (missing from both `.env` and the process
+    environment — same check `_expand_env_vars` already performs for the
+    real daemon load path). The caller must treat both as fatal: `.env` and
+    config.yaml are left completely untouched, and starting the gateway
+    with a half-migrated or still-referencing config would be worse than
+    refusing to start.
     """
-    cfg = EditableConfig.load(config_path)
-    env_path = cfg.path.parent / ".env"
+    # Resolved unconditionally, before anything else touches the path — see
+    # module docstring's "Symlink safety" section. Cheap even in the (now
+    # overwhelmingly common) no-.env case, unlike the YAML parse below.
+    config_path = Path(config_path).resolve()
+    env_path = config_path.parent / ".env"
     if not env_path.exists():
         return MigrationResult(migrated=False)
 
+    cfg = EditableConfig.load(config_path)
     ref_count = _count_env_refs(cfg.document)
 
     # Merge .env's own values into THIS process's environment — the exact
@@ -123,17 +136,17 @@ def migrate_env_to_config(config_path: str | Path) -> MigrationResult:
 
     cfg.document = expanded
     cfg.mark_dirty()
-    cfg.save()  # validate + timestamped backup + atomic replace + chmod
+    cfg.save()  # validate + timestamped backup + atomic replace + chmod —
+    # this ALSO creates and chmod(0o700)s .config-backups/, reused directly
+    # below rather than re-created (code-review finding: this used to
+    # mkdir+chmod it again here, redundant work on a directory save() just
+    # built correctly moments earlier).
 
     # Only remove .env once the migrated config.yaml is durably saved —
-    # moved (not deleted outright) into a .config-backups/ directory, so
-    # there's one designated place for "anything historical," not a stray
-    # .env.migrated left in the live config directory. Created here rather
-    # than assumed from cfg.save()'s own backup step, so this function
-    # doesn't depend on that convention already existing.
+    # moved (not deleted outright) into .config-backups/, so there's one
+    # designated place for "anything historical," not a stray .env.migrated
+    # left in the live config directory.
     backup_dir = cfg.path.parent / ".config-backups"
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    backup_dir.chmod(0o700)
     backup_path = backup_dir / f".env.pre-migration.{int(time.time())}"
     env_path.rename(backup_path)
     backup_path.chmod(0o600)

@@ -526,6 +526,35 @@ class TestCLIConfigMigrateEnv(_CLITestBase):
         self.assertIn("Migration failed", stderr)
         self.assertTrue((Path(self.tmp) / ".env").exists())
 
+    def test_plain_oserror_is_caught_cleanly_not_a_raw_traceback(self):
+        """Code-review finding: the original except clause only caught
+        (ValueError, FileNotFoundError) — a plain OSError (e.g. a
+        PermissionError from env_path.rename()) would have crashed with an
+        unhandled traceback instead of the clean '✗ Migration failed' message."""
+        cfg_path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                room: general
+        """)
+
+        with patch(
+            "gateway.config_migrate.migrate_env_to_config",
+            side_effect=OSError("disk full"),
+        ):
+            stdout, stderr, code = self._run_migrate(cfg_path)
+
+        self.assertEqual(code, 1)
+        self.assertIn("Migration failed", stderr)
+        self.assertIn("disk full", stderr)
+
 
 # ---------------------------------------------------------------------------
 # Tests: status command

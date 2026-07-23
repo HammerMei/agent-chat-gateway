@@ -549,17 +549,76 @@ Phase 2 first cleared the Phase 1 code review's deferred items 7–10
     `read_env_vars()` stay: an existing config not yet auto-migrated still
     needs to display/edit sanely. `onboard.py`'s wizard writes credentials
     directly into `config.yaml` instead of generating a companion `.env`.
-  - **Known limitation, not fixed (pre-existing, orthogonal):**
-    `EditableConfig.save()`'s `os.replace()` replaces a destination that IS
-    a symlink rather than writing through it — in Docker's Mode 1 (runtime
-    `config.yaml`/`.env` symlinked to a bind-mounted host directory), the
-    first migration decouples the container's `config.yaml` from the host
-    mount, and the moved-aside `.env` may still be a symlink to a host file
-    that's never actually deleted — a later container restart can re-run
-    the migration (harmless, just not a true no-op in that one deployment
-    shape). Documented in `gateway/config_migrate.py`, not special-cased —
-    fixing `EditableConfig.save()`'s general symlink handling is a separate,
-    bigger change than this round asked for.
+  - **8-angle code review round (user-requested) on the full removal +
+    auto-migration diff, before merge.** 8 independent finder agents (line-
+    by-line, removed-behavior audit, cross-file tracer, reuse, simplification,
+    efficiency, altitude, CLAUDE.md conventions) surfaced 10 confirmed
+    findings — all fixed:
+    1. **`config.yaml` was never unconditionally `chmod 0o600`'d** —
+       `migrate_env_to_config()`'s `cfg.save()` only did it as a side
+       effect of an actual migration, so a hand-written `config.yaml` with
+       no `.env` (exactly the path the docs now recommend) was never
+       protected by `agent-chat-gateway start` at all, contradicting the
+       documented guarantee. Fixed with a new `gateway/daemon.py`
+       `_harden_config_permissions()`, called unconditionally in
+       `start_daemon()` regardless of whether migration ran.
+    2. **The `agent-chat-gateway config migrate-env` CLI command didn't
+       resolve the config path** before use, unlike `start_daemon()`'s
+       automatic trigger — so in Docker's Mode 1 (symlinked bind-mount),
+       running it manually (exactly what `docker/entrypoint.acg.sh`'s own
+       comments recommend) silently "migrated" the container-local symlinks
+       only, left the real host files untouched, and reported false
+       success. This turned what the module docstring called a "known,
+       accepted limitation" into an actual bug once traced to its real
+       cause — the daemon path only ever looked safe by accident (it
+       happened to resolve the path for an unrelated reason). Fixed by
+       resolving `config_path` unconditionally as the first line of
+       `migrate_env_to_config()` itself, so every caller gets the guarantee
+       uniformly rather than depending on each call site remembering to.
+    3. `_run_config_migrate_env()` only caught `(ValueError,
+       FileNotFoundError)`, not plain `OSError` (e.g. a `PermissionError`
+       from `env_path.rename()`) — could crash with a raw traceback. Now
+       catches `(ValueError, OSError)` (`FileNotFoundError` is already an
+       `OSError` subclass).
+    4. `gateway/daemon.py`'s new `info:`/`error:` pipe writes bypassed
+       `gateway/service.py`'s `_write_startup_signal()`, which already
+       strips embedded newlines to protect the line-oriented handshake
+       protocol — and `EditableConfig.save()`'s `ValueError` genuinely can
+       contain them (`"\n".join(result.errors)`). Fixed with a small
+       `_sanitize_pipe_message()` helper applied at both new write sites.
+    5. `migrate_env_to_config()` fully YAML-parsed `config.yaml` via
+       `EditableConfig.load()` BEFORE checking whether `.env` even existed
+       — meaning every daemon start double-parsed `config.yaml` (once here,
+       once via `GatewayConfig.from_file()`) for a check that resolves to
+       "nothing to do" the overwhelming majority of the time. Fixed by
+       checking `.env`'s existence (a plain `Path.exists()` stat) first;
+       this also naturally fixed finding 10 below as a side effect.
+    6. The `.config-backups/` directory bootstrap (`mkdir` + `chmod 0o700`)
+       was duplicated between `migrate_env_to_config()` and
+       `EditableConfig.save()` (which the former's own `cfg.save()` call,
+       moments earlier in the same function, already performs). Removed
+       the redundant copy — reuse, don't re-create.
+    7. `_count_env_refs()`'s regex diverged from `_expand_env_vars()`'s
+       (`gateway/config.py`) — two different definitions of "is this an
+       env-var reference." Fixed to match exactly.
+    8. `_on_deleted_successfully()` was a permanently dead hook — its
+       docstring described `ConnectorDetailScreen`'s `.env`-cleanup
+       override, deleted in this same branch's earlier commit — with no
+       remaining caller. Removed entirely (call site + definition) rather
+       than left as an always-no-op hook with a misleading comment.
+    9. `EditableConfig.save()`'s docstring still described the removed
+       "Store in .env" checkbox and got the migration direction backwards.
+       Corrected.
+    10. A missing `config.yaml` (fresh install, before onboarding) surfaced
+        as "Config migration failed: Config file not found" instead of the
+        clearer pre-existing "Failed to load config: Config file not
+        found" — fixed as a side effect of finding 5's reordering (a
+        missing config with no `.env` now falls through to
+        `GatewayConfig.from_file()`'s own, clearer error).
+    New tests added for each: a real symlinked-config-path repro (confirms
+    the real host files get migrated, not just the runtime symlinks), a
+    chmod-permissions test, a pipe-message-sanitization test, an `OSError`-
+    catch test, and reorder/no-op edge cases.
 
 - **Shipped (added after initial Phase 2 review — user caught that "CRUD"
   was being used loosely and Delete had never actually been designed for

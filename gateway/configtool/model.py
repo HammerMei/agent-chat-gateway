@@ -154,11 +154,12 @@ class EditableConfig:
            observes a partially-written config.yaml).
 
         `config.yaml` and every backup snapshot can hold a plaintext secret
-        — either a field saved with "Store in .env" unchecked, or a secret
-        that was migrated into `.env` LATER but still appears in plaintext
-        in a backup taken before that migration. Both `config.yaml` itself
-        and each backup file are chmod'd 0600 here (matching the treatment
-        `.env`/`env_writer.py` already give the `.env` file) — `config.yaml`
+        — secrets are stored directly in config.yaml (docs/design/
+        config-tool.md decision 6 revisited; a not-yet-migrated `.env`
+        reference gets folded in as a literal value by
+        `gateway/config_migrate.py`, never the other direction). Both
+        `config.yaml` itself and each backup file are chmod'd 0600 here
+        (matching the treatment `.env` used to get) — `config.yaml`
         specifically needs this on EVERY save because writing `tmp_path` via
         plain `open(..., "w")` takes the process umask, not whatever
         permissions the real file had before; without this line, a manual

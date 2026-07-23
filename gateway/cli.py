@@ -438,7 +438,10 @@ def _run_config_migrate_env(args) -> None:
 
     try:
         result = migrate_env_to_config(args.config)
-    except (ValueError, FileNotFoundError) as e:
+    except (ValueError, OSError) as e:
+        # OSError also covers FileNotFoundError (raised by EditableConfig.
+        # load()) plus e.g. a PermissionError from env_path.rename() —
+        # both should print cleanly here, not crash with a raw traceback.
         print(f"✗ Migration failed: {e}", file=sys.stderr)
         sys.exit(1)
 
