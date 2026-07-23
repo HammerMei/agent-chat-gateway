@@ -825,6 +825,53 @@ Phase 2 first cleared the Phase 1 code review's deferred items 7–10
     `@work` wrapper around it — `action_delete_row()` calls `_do_delete()`
     directly, no nested worker at all.
 
+- **Follow-up UX request in the same conversation: focus should default to
+  the list itself (not the tab bar), and left/right should switch
+  tabs — even while the list has focus — without the user needing to Tab
+  their way onto the tab bar first.** Rationale mirrors the `e`/`d` move
+  above: minimize keystrokes for the common case (browse a list, act on a
+  row) rather than requiring a navigation detour every time.
+  - **Shipped:** `OverviewScreen.on_mount()` now focuses the active tab's
+    `DataTable` directly (`_focus_active_tab_table()`), instead of leaving
+    initial focus on the tab bar (previously mitigated only by making `tab`
+    a visible footer hint — "Focus next / enter list" — still true, but no
+    longer the first thing a user needs to press). `on_tabbed_content_
+    tab_activated()` re-focuses the newly-active tab's table on EVERY tab
+    change, regardless of cause (the new left/right actions below, or a
+    plain mouse click) — one path for "the active tab changed," rather than
+    re-implementing the focus step at each call site that can change tabs.
+  - `action_previous_tab()`/`action_next_tab()` (bound to `left`/`right`,
+    wrapping at both ends) just set `TabbedContent.active` — deliberately
+    NOT also handling focus themselves, since setting `.active` already
+    fires the same `TabActivated` message a mouse click would, so the
+    handler above covers it.
+  - **A real binding-precedence issue, resolved via `priority=True`, not
+    assumed to "just work":** `DataTable` (which now has focus in the
+    common case, per the previous point) already binds `left`/`right` to
+    its own cell/column cursor movement. Textual's key-binding resolution
+    walks the chain starting at the FOCUSED widget and outward — so without
+    `priority=True` on `OverviewScreen`'s own `left`/`right` bindings,
+    `DataTable`'s bindings would always be checked and matched FIRST, and
+    `OverviewScreen`'s tab-switch actions would never even be considered.
+    `priority=True` (the same mechanism Textual's own `App.BINDINGS` uses
+    for `ctrl+q`, confirmed by reading `app.py`, not assumed by name alone)
+    checks the screen's bindings before dispatching to the focused widget
+    at all, which is what makes this correct — not an accident of
+    `cursor_type="row"` (every table on this screen) already making
+    `DataTable`'s own left/right cell-navigation a no-op today; the
+    priority ordering is what keeps this correct even if a future tab ever
+    needs `DataTable`'s own left/right behavior for something real.
+  - New tests (`tests/unit/test_configtool_app.py::TestArrowKeyTabSwitching`)
+    cover: next/previous with wraparound at both ends, that left/right win
+    even when a `DataTable` explicitly holds focus first (the actual
+    regression this priority ordering exists to prevent), and that a plain
+    programmatic/mouse tab switch focuses the table the same way the new
+    keyboard actions do. The pre-existing "focus starts on the tab bar,
+    press tab to reach the list" test was replaced (not just patched) to
+    assert the new, opposite default explicitly, with a second test
+    confirming `tab` still works as a fallback way to move focus rather
+    than having quietly stopped doing anything.
+
 - **Shipped (added after initial Phase 2 review — user caught that "CRUD"
   was being used loosely and Delete had never actually been designed for
   agents/connectors; checked, and they were right, nothing in this

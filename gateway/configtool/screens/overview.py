@@ -37,6 +37,17 @@ from .watcher_detail import WatcherDetailScreen
 
 _AGENT_TYPES = ("claude", "opencode")
 
+# Tab IDs in display order — used by action_previous_tab()/action_next_tab()
+# to wrap around, and to look up each tab's own DataTable id for focusing.
+_TAB_ORDER = ("tab-connectors", "tab-agents", "tab-watchers", "tab-defaults", "tab-presets")
+_TABLE_ID_FOR_TAB = {
+    "tab-connectors": "connectors-table",
+    "tab-agents": "agents-table",
+    "tab-watchers": "watchers-table",
+    "tab-defaults": "defaults-table",
+    "tab-presets": "presets-table",
+}
+
 if TYPE_CHECKING:
     from ..app import ConfigToolApp
 
@@ -74,6 +85,21 @@ class OverviewScreen(Screen):
         # the footer doesn't advertise a no-op.
         Binding("e", "edit_row", "Edit", show=True),
         Binding("d", "delete_row", "Delete", show=True),
+        # User-requested: focus starts on the list itself (see on_mount()),
+        # not the tab bar, so left/right must be able to switch tabs WITHOUT
+        # the user first moving focus off the list. priority=True is
+        # required: DataTable (which has focus in the common case now) has
+        # its OWN left/right bindings (cell/column cursor movement), and the
+        # binding chain used to resolve a keypress starts at the FOCUSED
+        # widget and walks up — without priority=True, DataTable's own
+        # binding would always win and this one would never even be
+        # considered. (cursor_type="row" everywhere in this screen, so
+        # DataTable's left/right never actually do anything useful today
+        # regardless — but priority=True is what makes this correct even if
+        # that ever changes, not an accident of DataTable being otherwise
+        # idle on these keys.)
+        Binding("left", "previous_tab", "Previous tab", show=True, priority=True),
+        Binding("right", "next_tab", "Next tab", show=True, priority=True),
     ]
 
     def compose(self) -> ComposeResult:
@@ -100,6 +126,28 @@ class OverviewScreen(Screen):
         ):
             self.query_one(table_id, DataTable).cursor_type = "row"
         self.repaint_from_memory()
+        # User-requested: default focus straight to the list, not the tab
+        # bar — "tab: Focus next / enter list" (the BINDINGS comment above)
+        # was the previous fix for reaching the list at all; this goes
+        # further and puts focus there immediately, so the very first
+        # keypress (arrow keys to move the cursor, 'e'/'d' to act on a row)
+        # already lands on the table with no extra step.
+        self._focus_active_tab_table()
+
+    def _focus_active_tab_table(self) -> None:
+        active_tab = self.query_one(TabbedContent).active
+        table_id = _TABLE_ID_FOR_TAB.get(active_tab)
+        if table_id is not None:
+            self.query_one(f"#{table_id}", DataTable).focus()
+
+    def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
+        """Fires whenever the active tab changes, by ANY means — clicking a
+        tab, action_previous_tab()/action_next_tab() below, or a future
+        programmatic switch — so the list-focus behavior stays correct
+        without needing to be re-applied at every call site that changes
+        tabs. User-requested: switching tabs should always leave focus
+        ready on that tab's list, not on the tab bar."""
+        self._focus_active_tab_table()
 
     # ── Actions ──────────────────────────────────────────────────────────────
 
@@ -115,6 +163,25 @@ class OverviewScreen(Screen):
     def action_edit_config(self) -> None:
         app: "ConfigToolApp" = self.app  # type: ignore[assignment]
         app.open_editor_and_reload()
+
+    def action_previous_tab(self) -> None:
+        """'left' — wraps from the first tab to the last. Setting `.active`
+        (rather than any lower-level Tabs API) triggers TabbedContent's own
+        TabActivated message the same way a mouse click would, so
+        on_tabbed_content_tab_activated() re-focuses the list for us — one
+        path for "the active tab changed," not a second one special-cased
+        for the keyboard."""
+        tabs = self.query_one(TabbedContent)
+        index = _TAB_ORDER.index(tabs.active)
+        tabs.active = _TAB_ORDER[(index - 1) % len(_TAB_ORDER)]
+
+    def action_next_tab(self) -> None:
+        """'right' — wraps from the last tab to the first. See
+        action_previous_tab()'s docstring for why this only sets `.active`
+        rather than also handling focus here directly."""
+        tabs = self.query_one(TabbedContent)
+        index = _TAB_ORDER.index(tabs.active)
+        tabs.active = _TAB_ORDER[(index + 1) % len(_TAB_ORDER)]
 
     @work
     async def action_edit_row(self) -> None:
