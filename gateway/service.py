@@ -339,16 +339,50 @@ class GatewayService:
             # 3. run_once() connects each SessionManager without blocking — the daemon
             #    loop below keeps the process alive.  We intentionally avoid sm.run()
             #    so that only the GatewayService owns the control socket.
-            sm_error_lists = await asyncio.gather(
+            #
+            # return_exceptions=True is required here — without it, the FIRST
+            # SessionManager.run_once() to raise (e.g. a newly added connector
+            # with a bad URL failing DNS/connect almost instantly) makes
+            # gather() propagate immediately WITHOUT cancelling the other,
+            # still-in-flight run_once() calls (a real RC/Mattermost login +
+            # DDP handshake is much slower). Those keep running as orphaned
+            # background tasks. The `except Exception` below used to route
+            # straight into `shutdown()` -> `session_manager.shutdown()` ->
+            # `save_state()` for EVERY entry, including the one whose
+            # run_once() hadn't finished populating its watcher states yet —
+            # unconditionally overwriting that connector's state.<name>.json
+            # with an empty/partial dict and silently wiping out real
+            # session IDs for a connector that was never actually part of
+            # the failure. Awaiting every result here (success or exception)
+            # before deciding what to do next closes that race: by the time
+            # any exception is re-raised, no run_once() call is still
+            # in-flight, so shutdown() can no longer race one.
+            sm_results = await asyncio.gather(
                 *[
                     e.session_manager.run_once(
                         unavailable_agents=self._runtime_manager.unavailable_agents,
                     )
                     for e in self._entries
-                ]
+                ],
+                return_exceptions=True,
             )
-            for errs in sm_error_lists:
-                startup_errors.extend(errs)
+            first_exception: BaseException | None = None
+            for entry, result in zip(self._entries, sm_results, strict=True):
+                if isinstance(result, BaseException):
+                    logger.error(
+                        "SessionManager for connector '%s' failed during startup: %s",
+                        entry.name,
+                        result,
+                    )
+                    startup_errors.append(
+                        f"Connector '{entry.name}' failed to start: {result}"
+                    )
+                    if first_exception is None:
+                        first_exception = result
+                else:
+                    startup_errors.extend(result)
+            if first_exception is not None:
+                raise first_exception
 
             # Load persisted jobs and start the job scheduler AFTER connectors are
             # connected and watchers are up.  Starting it before run_once() would

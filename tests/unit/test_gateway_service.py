@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import unittest
 from types import SimpleNamespace
@@ -49,6 +50,83 @@ class TestGatewayServiceRun(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("ok", payload)
         service._runtime_manager.stop_all.assert_awaited_once()
         service._control.stop.assert_awaited_once()
+
+    async def test_one_connector_failing_fast_does_not_orphan_a_slower_ones_state(self):
+        """Repro for the user-reported bug: create a connector with a bad
+        URL, restart — the daemon fails to start (as expected), but a
+        PREVIOUSLY-WORKING connector's watchers also had their session
+        state reset.
+
+        Root cause: `run()`'s `asyncio.gather(*[sm.run_once() for e in
+        entries])` has no `return_exceptions=True`. When one SessionManager's
+        run_once() raises quickly (a bad connector failing to connect) while
+        another's is still in-flight (a real RC/Mattermost login + DDP
+        handshake, which takes longer), gather() propagates the first
+        exception immediately WITHOUT cancelling the still-running sibling
+        task — it keeps running as an orphan. run()'s `except` block then
+        calls `shutdown()` on ALL entries, including the one whose run_once()
+        hadn't finished populating its watcher states yet. That
+        SessionManager's save_state() then unconditionally overwrites
+        state.<connector>.json with an empty/partial dict, wiping out
+        session IDs that were never touched by anything in this run.
+
+        This test drives the REAL run()/shutdown() flow (only the two
+        SessionManagers are mocked) so it fails against the real orphaned-
+        task behavior and passes once run() is fixed to await/cancel
+        siblings before shutting anything down.
+        """
+        service = _make_service()
+        service._runtime_manager.start_all = AsyncMock(return_value=[])
+        service._runtime_manager.has_active_brokers = False
+        service._runtime_manager.unavailable_agents = set()
+        service._runtime_manager.stop_all = AsyncMock()
+        service._control.start = AsyncMock()
+        service._control.stop = AsyncMock()
+
+        good_run_once_finished = asyncio.Event()
+        good_shutdown_called_before_finished = False
+
+        async def slow_good_run_once(**kwargs):
+            nonlocal good_shutdown_called_before_finished
+            # Simulate a real RC/Mattermost connect() taking longer than a
+            # bad connector's near-instant DNS/connection-refused failure.
+            await asyncio.sleep(0.05)
+            good_run_once_finished.set()
+            return []
+
+        async def good_shutdown():
+            nonlocal good_shutdown_called_before_finished
+            if not good_run_once_finished.is_set():
+                good_shutdown_called_before_finished = True
+
+        good_sm = MagicMock()
+        good_sm.run_once = AsyncMock(side_effect=slow_good_run_once)
+        good_sm.shutdown = AsyncMock(side_effect=good_shutdown)
+
+        bad_sm = MagicMock()
+        bad_sm.run_once = AsyncMock(side_effect=ConnectionError("bad url: test"))
+        bad_sm.shutdown = AsyncMock()
+
+        service._entries = [
+            SimpleNamespace(name="good-existing-connector", session_manager=good_sm),
+            SimpleNamespace(name="bad-new-connector", session_manager=bad_sm),
+        ]
+
+        with self.assertRaises(ConnectionError):
+            await service.run(startup_fd=-1)
+
+        # Give the orphaned good_sm.run_once() task a chance to actually
+        # finish in the background, so the assertion below reflects what
+        # happened DURING shutdown, not a timing fluke of the test itself.
+        await asyncio.sleep(0.1)
+
+        self.assertFalse(
+            good_shutdown_called_before_finished,
+            "good-existing-connector's shutdown() (and therefore save_state()) "
+            "ran before its run_once() had finished populating watcher "
+            "state — this is the orphaned-task race that wipes out session "
+            "IDs for a connector that was never actually part of the failure.",
+        )
 
 
 class TestGatewayServiceShutdown(unittest.IsolatedAsyncioTestCase):
