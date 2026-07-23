@@ -82,8 +82,10 @@ _KNOWN_FIELDS = [
 # config.py) — used ONLY to prefill the form with the true effective value
 # when a field is set by neither the entry nor agent_defaults. Unlike view
 # mode (which simply omits a line for an absent field), a form editing that
-# field needs to show what it would actually evaluate to right now.
-_AGENT_DATACLASS_DEFAULTS: dict[str, object] = {
+# field needs to show what it would actually evaluate to right now. Public
+# (no leading underscore): DefaultsScreen reuses this dict too, as the
+# "no shared default set" fallback value for editing agent_defaults itself.
+AGENT_DATACLASS_DEFAULTS: dict[str, object] = {
     "type": "claude",
     "command": "claude",
     "working_directory": "",
@@ -112,7 +114,12 @@ _PERMISSIONS_FORM_FIELDS: list[FieldSpec] = [
     FieldSpec("permissions.timeout", "int", "Permissions timeout (seconds)"),
     FieldSpec("permissions.skip_owner_approval", "bool", "Skip owner approval"),
 ]
-_ALL_FORM_FIELDS = (*_FORM_FIELDS, *_PERMISSIONS_FORM_FIELDS)
+# Public (no leading underscore): also reused by DefaultsScreen to edit
+# agent_defaults with the exact same field set, schema-derived-so-zero-
+# drift-risk reasoning applies just as much there — every one of these keys
+# is legal in agent_defaults too (gateway/config.py's forbidden-keys set for
+# agent_defaults is empty).
+AGENT_FORM_FIELDS = (*_FORM_FIELDS, *_PERMISSIONS_FORM_FIELDS)
 
 
 def _resolve_working_directory(config_path: Path, raw_value: str) -> Path:
@@ -208,13 +215,13 @@ class AgentDetailScreen(FormScreen):
         self._tool_list_state()
 
     def _field_specs(self) -> tuple[FieldSpec, ...]:
-        return _ALL_FORM_FIELDS
+        return AGENT_FORM_FIELDS
 
     def _defaults_kind(self) -> str:
         return "agent_defaults"
 
     def _dataclass_defaults(self) -> dict[str, object]:
-        return _AGENT_DATACLASS_DEFAULTS
+        return AGENT_DATACLASS_DEFAULTS
 
     # ── tool-list editor (owner_allowed_tools / guest_allowed_tools) ────────
 
