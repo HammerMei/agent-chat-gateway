@@ -287,8 +287,15 @@ watchers:
 
 #### Features
 - ✅ YAML configuration file
-- ✅ Environment variable expansion (`$VAR`, `${VAR}`)
-- ✅ `.env` file support for expansion values
+- ✅ Secrets stored directly in `config.yaml` (chmod'd `0600` automatically —
+  both by the config TUI and by `agent-chat-gateway start`)
+- ✅ Auto-migration: a legacy `.env`-backed config (`$VAR`/`${VAR}` references
+  resolved from a colocated `.env` file) is folded into `config.yaml` as
+  literal values on first start (or before the config TUI opens), then
+  `.env` is removed (one-time; also available as `agent-chat-gateway config
+  migrate-env` for a manual run). After migration — or for any config
+  written from scratch — `$VAR`/`${VAR}` is not a recognized syntax; a value
+  that merely looks like one is a plain string, used as written.
 - ✅ Multi-connector setup (multiple chat instances)
 - ✅ Multi-agent setup (different agents per watcher)
 - ✅ Cross-field validation (e.g., agent timeout > permission timeout)
@@ -315,7 +322,9 @@ watchers:
 - ✅ `tool_presets` are regex-validated eagerly at load, even if unused
 - ✅ `agent-chat-gateway config validate [--lint]` — checks config.yaml
   without starting the daemon: structural validation, per-connector-type
-  credential checks (e.g. empty Rocket.Chat/Mattermost `server:` fields),
+  credential checks (e.g. empty Rocket.Chat/Mattermost `server:` fields, or
+  a `server.url` that doesn't look like a URL — a lenient scheme+netloc
+  check, so it catches plain typos without rejecting unusual schemes/ports),
   and a warning when persisted `state.<connector>.json` references a watcher
   name no longer in the config
 

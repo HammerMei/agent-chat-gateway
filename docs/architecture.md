@@ -74,7 +74,7 @@ graph TD
 | **cli.py** | argparse CLI entry point (start/stop/restart/status/list/pause/resume/reset/send/onboard/upgrade) | `main()`, command dispatch |
 | **service.py** | Top-level orchestrator; wires connectors + agents + permission brokers | `GatewayService`, `AgentRuntimeManager`, `ConnectorEntry` |
 | **control.py** | Unix socket ControlServer; routes CLI commands to daemon | `ControlServer`, `handle_cli_command()` |
-| **config.py** | YAML loader with env-var expansion and cross-validation | `GatewayConfig`, `AgentConfig`, `PermissionConfig` |
+| **config.py** | YAML loader with cross-validation | `GatewayConfig`, `AgentConfig`, `PermissionConfig` |
 | **runtime_lock.py** | Shared PID file and runtime directory utilities | `RUNTIME_DIR`, `LOCK_FILE`, `acquire()`, `release()` |
 | **onboard.py** | Interactive setup wizard for initial configuration | `run_wizard()` |
 | **upgrade.py** | Self-upgrade logic for daemon updates | `upgrade_if_needed()` |
@@ -546,18 +546,22 @@ config.yaml (user-editable)
     ├─ max_queue_depth: 100
     └─ scheduler: {completed_job_ttl_days: 7}
          → GatewayConfig.from_file()
-            1. expand $VAR / ${VAR} env references
-            2. deep-merge *_defaults into each connector/agent/watcher entry
-            3. resolve tool_presets references in owner/guest_allowed_tools
-            4. expand watcher rooms: into one WatcherConfig per room
+            1. deep-merge *_defaults into each connector/agent/watcher entry
+            2. resolve tool_presets references in owner/guest_allowed_tools
+            3. expand watcher rooms: into one WatcherConfig per room
                (auto-name: "<connector>-<room>" unless name: is explicit)
-            5. validate cross-references (unknown connector/agent, dup names, ...)
+            4. validate cross-references (unknown connector/agent, dup names, ...)
             → GatewayConfig (validated dataclass)
                → AgentConfig, ConnectorConfig, WatcherConfig, PermissionConfig
                   → CoreConfig (passed to SessionManager)
 ```
 
-All fields support env-var expansion via `$VARIABLE` syntax. See
+Secrets are stored directly in config.yaml as literal values (chmod'd
+`0600`). `$VAR`/`${VAR}` is NOT expanded — a value that happens to look
+like one is used as a plain string, same as any other. A legacy config
+still using a colocated `.env` file with `$VAR`/`${VAR}` references is
+auto-migrated to literal values on first `agent-chat-gateway start` (or
+before the config TUI opens) — see `gateway/config_migrate.py`. See
 `docs/migration-0.2.md` for the compact-format rationale and
 `gateway/schema/config.schema.json` for the field-level JSON Schema. Run
 `agent-chat-gateway config validate --lint` to check a config.yaml without
@@ -790,7 +794,7 @@ connectors:
   - name: discord-main
     type: discord
     server:
-      bot_token: "$DISCORD_TOKEN"
+      bot_token: "your-discord-bot-token"
     allowed_users:
       owners:
         - alice
@@ -834,7 +838,7 @@ Add to `config.yaml`:
 agents:
   research:
     type: anthropic-api
-    api_key: "$ANTHROPIC_API_KEY"
+    api_key: "your-anthropic-api-key"
     model: claude-3-opus-20240229
     new_session_args: []
 ```

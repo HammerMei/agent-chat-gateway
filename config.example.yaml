@@ -2,10 +2,16 @@
 # agent-chat-gateway — example configuration
 # Copy this file to config.yaml and adjust to your setup.
 #
-# Secrets (passwords, tokens) should never be written here directly.
-# Use environment variables instead: set them in a .env file next to config.yaml
-# (copy .env.example → .env and fill in your values).
-# Any $VAR or ${VAR} reference in this file is automatically expanded at startup.
+# Secrets (passwords, tokens) go directly in this file as plain values below —
+# config.yaml is chmod'd 0600 automatically (by the config TUI on every save,
+# and by `agent-chat-gateway start`), so this is safe as long as you don't
+# commit your filled-in copy to version control.
+#
+# $VAR / ${VAR} is NOT expanded — a value that happens to look like one is
+# used exactly as written, like any other string. (If you're upgrading from
+# an older setup that used a `.env` file with $VAR references, the next
+# `agent-chat-gateway start` — or opening `agent-chat-gateway config` —
+# migrates those into literal values here automatically, one-time.)
 #
 # ── Format notes (v0.2+) ──────────────────────────────────────────────────────
 # This example uses the compact config format: top-level `connector_defaults:` /
@@ -41,7 +47,7 @@ connectors:
   #   type: voice
   #   port: 8765                     # HTTP port the gateway listens on
   #   host: "0.0.0.0"               # bind address (default: all interfaces)
-  #   secret: "$VOICE_SECRET"        # Bearer token required in Authorization header
+  #   secret: "your-strong-random-token"  # Bearer token required in Authorization header
   #   timeout: 45                    # seconds to wait for agent reply
   #
   # ⚠️  IMPORTANT — permissions for voice agents:
@@ -58,9 +64,9 @@ connectors:
   - name: rc-home                    # unique name for this connector (used in CLI commands)
     type: rocketchat
     server:
-      url: "$RC_URL"                 # e.g. https://chat.example.com
-      username: "$RC_USERNAME"       # bot account username
-      password: "$RC_PASSWORD"       # bot account password (set in .env)
+      url: "https://chat.example.com"
+      username: "your-bot-username"
+      password: "your-bot-password"
     allowed_users:
       owners:
         - your-admin-username        # full access: can use all tools, approve/deny requests
@@ -341,9 +347,9 @@ watchers:
 #
 # connectors:
 #   - name: rc-bot-a
-#     server: {url: "$RC_URL", username: "$RC_USERNAME_A", password: "$RC_PASSWORD_A"}
+#     server: {url: "https://chat.example.com", username: "bot-a", password: "bot-a-password"}
 #   - name: rc-bot-b
-#     server: {url: "$RC_URL", username: "$RC_USERNAME_B", password: "$RC_PASSWORD_B"}
+#     server: {url: "https://chat.example.com", username: "bot-b", password: "bot-b-password"}
 #
 # watchers:
 #   - {connector: rc-bot-a, agent: bot-a-agent, rooms: [nest, hammer, "@glin"]}

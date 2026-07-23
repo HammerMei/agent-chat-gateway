@@ -8,6 +8,10 @@ adds two things `from_file` alone cannot catch, plus an optional lint pass:
    MattermostConfig, VoiceConfig) are normally only built lazily when the
    daemon actually starts a connector — a bad or empty ``server:`` block goes
    unnoticed until then. Building them here surfaces those errors immediately.
+   This also includes a lenient ``server.url`` format check (scheme + netloc
+   only, via ``urllib.parse.urlparse``) that catches obvious typos (e.g. a
+   URL field left as plain text like "test") without rejecting unusual but
+   well-formed schemes/ports.
 2. A state.json orphan check: warns when a connector's persisted watcher
    state references a watcher name no longer present in the config — that
    session/pause state is silently dropped on the next gateway start
@@ -25,6 +29,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Literal
+from urllib.parse import urlparse
 
 import yaml
 
@@ -146,6 +151,14 @@ def validate_config(config_path: str, lint: bool = False) -> ValidationResult:
     return result
 
 
+def _looks_like_url(value: str) -> bool:
+    """Lenient URL format check: scheme + netloc only (catches obvious typos
+    like "test" or "localhost:3000" without a scheme). Deliberately does not
+    second-guess unusual-but-valid schemes, ports, or paths."""
+    parsed = urlparse(value)
+    return bool(parsed.scheme) and bool(parsed.netloc)
+
+
 def _check_connectors(config: GatewayConfig, result: ValidationResult) -> None:
     """Instantiate each connector's own config dataclass and flag empty
     credentials — fields from_connector_config defaults to "" rather than
@@ -171,9 +184,21 @@ def _check_connectors(config: GatewayConfig, result: ValidationResult) -> None:
                 Finding("error", "connector", connector.name, field_path, msg)
             )
 
+        def _bad_url_field(field_path: str, value: str) -> None:
+            msg = (
+                f"Connector '{connector.name}': {field_path} ({value!r}) "
+                "does not look like a URL (expected e.g. 'https://host')"
+            )
+            result.errors.append(msg)
+            result.findings.append(
+                Finding("error", "connector", connector.name, field_path, msg)
+            )
+
         if connector.type == "rocketchat":
             if not cfg.server_url:
                 _empty_field("server.url")
+            elif not _looks_like_url(cfg.server_url):
+                _bad_url_field("server.url", cfg.server_url)
             if not cfg.username:
                 _empty_field("server.username")
             if not cfg.password:
@@ -181,6 +206,8 @@ def _check_connectors(config: GatewayConfig, result: ValidationResult) -> None:
         elif connector.type == "mattermost":
             if not cfg.server_url:
                 _empty_field("server.url")
+            elif not _looks_like_url(cfg.server_url):
+                _bad_url_field("server.url", cfg.server_url)
             if not cfg.team:
                 _empty_field("server.team")
 

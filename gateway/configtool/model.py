@@ -15,13 +15,17 @@ are still visible:
      been expanded into three independent ``WatcherConfig`` objects; the
      group itself no longer exists as data.
 
-Critically, ``EditableConfig`` loads via plain ``yaml.safe_load`` — never via
-``GatewayConfig.from_file``, which expands ``$VAR``/``${VAR}`` environment
-references (gateway/config.py's ``_expand_env_vars``). If the editor ever
-loaded (or saved) through that path, a save would write resolved secrets —
-passwords, tokens — into config.yaml in plain text. ``save()`` writes
-``document`` back out with plain ``yaml.dump`` for the same reason: whatever
-``$VAR`` string was loaded is the same ``$VAR`` string written back.
+``EditableConfig`` loads via plain ``yaml.safe_load`` — never via
+``GatewayConfig.from_file`` — for the two structural reasons above
+(provenance, raw ``rooms:`` groupings). Historically this also mattered for
+a third reason: ``from_file()`` used to expand ``$VAR``/``${VAR}``
+environment references, and loading through it would have written a
+resolved secret in plain text on save. That's no longer a live concern —
+``from_file()`` doesn't resolve ``$VAR`` at all anymore (docs/design/
+config-tool.md decision 6, final revision: secrets live directly in
+config.yaml, any ``.env``-backed config is auto-migrated on first use) — but
+the plain-``yaml.safe_load``/plain-``yaml.dump`` round-trip stays exactly as
+important for the two reasons that remain.
 """
 
 from __future__ import annotations
@@ -154,11 +158,12 @@ class EditableConfig:
            observes a partially-written config.yaml).
 
         `config.yaml` and every backup snapshot can hold a plaintext secret
-        — either a field saved with "Store in .env" unchecked, or a secret
-        that was migrated into `.env` LATER but still appears in plaintext
-        in a backup taken before that migration. Both `config.yaml` itself
-        and each backup file are chmod'd 0600 here (matching the treatment
-        `.env`/`env_writer.py` already give the `.env` file) — `config.yaml`
+        — secrets are stored directly in config.yaml (docs/design/
+        config-tool.md decision 6 revisited; a not-yet-migrated `.env`
+        reference gets folded in as a literal value by
+        `gateway/config_migrate.py`, never the other direction). Both
+        `config.yaml` itself and each backup file are chmod'd 0600 here
+        (matching the treatment `.env` used to get) — `config.yaml`
         specifically needs this on EVERY save because writing `tmp_path` via
         plain `open(..., "w")` takes the process umask, not whatever
         permissions the real file had before; without this line, a manual
@@ -270,9 +275,9 @@ class EditableConfig:
     # ── Read-only validated view ─────────────────────────────────────────────
 
     def validated_view(self) -> GatewayConfig:
-        """The fully-parsed, env-expanded, merged GatewayConfig — for display
-        and cross-reference only (e.g. "this watcher's agent is X"). Loads via
-        the real gateway loader; never mutate anything based on what this
+        """The fully-parsed, merged GatewayConfig — for display and cross-
+        reference only (e.g. "this watcher's agent is X"). Loads via the
+        real gateway loader; never mutate anything based on what this
         returns — only `document` is ever written back to disk."""
         return GatewayConfig.from_file(self.path)
 

@@ -82,11 +82,11 @@ connectors:
   - name: mm-bot-a
     type: mattermost
     agent_chain: {agent_usernames: [bot-a, bot-b], max_turns: 5, ttl_seconds: 60}
-    server: {url: "$MM_URL", team: home, username: "$MM_USER_A", password: "$MM_PASS_A"}
+    server: {url: "https://chat.example.com", team: home, username: "bot-a", password: "bot-a-password"}
   - name: mm-bot-b
     type: mattermost
     agent_chain: {agent_usernames: [bot-a, bot-b], max_turns: 5, ttl_seconds: 60}
-    server: {url: "$MM_URL", team: home, username: "$MM_USER_B", password: "$MM_PASS_B"}
+    server: {url: "https://chat.example.com", team: home, username: "bot-b", password: "bot-b-password"}
 
 # After — one shared block, per-connector fields only where they differ
 connector_defaults:
@@ -95,9 +95,9 @@ connector_defaults:
 
 connectors:
   - name: mm-bot-a
-    server: {url: "$MM_URL", team: home, username: "$MM_USER_A", password: "$MM_PASS_A"}
+    server: {url: "https://chat.example.com", team: home, username: "bot-a", password: "bot-a-password"}
   - name: mm-bot-b
-    server: {url: "$MM_URL", team: home, username: "$MM_USER_B", password: "$MM_PASS_B"}
+    server: {url: "https://chat.example.com", team: home, username: "bot-b", password: "bot-b-password"}
 ```
 
 **Tool allow-lists copied into every agent:**

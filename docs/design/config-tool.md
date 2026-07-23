@@ -5,9 +5,13 @@ escape hatch). **Phase 2 in progress:** items 7–10 from the Phase 1 code
 review cleared; `EditableConfig.save()`/dirty-tracking/`ConfirmModal`
 foundation shipped; agent create/edit shipped; connector create/edit shipped
 (per-type field lists — the generic tree editor originally planned is
-deferred, see Part 3); delete shipped for both agents and connectors; the
-`.env` "store in .env" toggle shipped. The tool-list/preset editor is not
-yet built. Phase 3 is designed below but not yet started. The
+deferred, see Part 3); delete shipped for both agents and connectors. The
+`.env` "store in .env" toggle shipped, then removed in favor of storing
+secrets directly in `config.yaml` (chmod 0600) with an enforced one-time
+auto-migration for any config still using `.env` — see decision 6's
+"Reversed shortly after" entry below for the full reasoning. The
+tool-list/preset editor is not yet built. Phase 3 is designed below but not
+yet started. The
 v0.2 format simplification (`connector_defaults`/`agent_defaults`/
 `watcher_defaults`, `tool_presets`, watcher `rooms:`) plus `acg config
 validate` and the JSON Schema (see `docs/migration-0.2.md`) are prerequisites
@@ -484,6 +488,389 @@ Phase 2 first cleared the Phase 1 code review's deferred items 7–10
     this round (which was: see/change the value, and stop the checkbox
     lying about the field's actual state) — not built, to avoid scope
     creep past what was requested.
+
+- **Reversed shortly after, in a follow-up PR: "keep `.env`, harden both"
+  above became "remove `.env` entirely, enforce a one-time migration."**
+  User's own framing: two supported formats going forward is tech debt by
+  itself, and "if the migration is simple — even manual — enforcing it
+  beats indefinitely supporting both." Two design questions this settled:
+  1. *Why not just auto-collapse an explicit field back to "inherited" when
+     its value happens to match the default* (a related question raised in
+     the same conversation, about `require_mention`/`connector_defaults`)*?*
+     Answer: the tool can't tell "I want this pinned regardless of future
+     default changes" apart from "this happens to match right now" from the
+     value alone — collapsing on value-match would silently reinterpret
+     past intent the next time someone edits the shared default. `--lint`
+     surfacing the redundancy as a suggestion (a real, separate gap:
+     `_CONNECTOR_LINT_DEFAULTS` didn't cover `require_mention`/
+     `filter_sender` at all) plus `ctrl+r` as the explicit "yes, track the
+     default" action is the correct split — decide, don't guess.
+  2. *Why offer a "Store in .env" checkbox at all if the goal is "all
+     secrets in `.env`"?* Because it couldn't have been a real gate anyway
+     — the `$EDITOR` escape hatch lets anyone write a plaintext secret with
+     zero friction regardless of what the form does, and nothing in
+     `config_validate.py` flagged a plaintext secret either. A checkbox in
+     one editing surface was a nudge, not enforcement — once `config.yaml`
+     itself got the same `chmod 0600` hardening `.env` had, plaintext-in-
+     config.yaml stopped being a strictly worse choice, just a different
+     one (one file to manage vs. an easier "share config.yaml without also
+     handing over secrets"). The sharing benefit is real but conditional
+     (matters if you actually share your config) — best served by a
+     dedicated export/redaction path rather than by two files as the
+     permanent norm for everyone.
+  - **Shipped:** `gateway/config_migrate.py` — one-time migration resolving
+    every `$VAR`/`${VAR}` in the raw document to its literal value (reusing
+    `EditableConfig.load()`/`.save()` and `gateway/config.py`'s own
+    `load_dotenv`/`_expand_env_vars` — never reimplemented, so the resolved
+    values are guaranteed to match what the daemon already used at
+    runtime), then moves `.env` into `.config-backups/`. Backup -> migrate
+    -> validate -> fail-closed: a migration that would fail
+    `validate_config()` never touches the real `config.yaml`.
+  - Same function, two triggers, per the design principle "separate the
+    mutation LOGIC from the TRIGGER": automatic at every
+    `gateway/daemon.py` `start_daemon()` (becomes a permanent no-op once
+    `.env` is gone — this is what makes it actual enforcement rather than
+    a nag someone can ignore forever) and standalone via
+    `agent-chat-gateway config migrate-env` for a manual/dry run. A
+    successful migration is reported on BOTH the log and the console — the
+    startup handshake pipe gained an `info:` line type alongside the
+    existing `error:`/`ok`, specifically so this isn't a silent operation.
+  - `docker/entrypoint.acg.sh`: Mode 1 (volume mount) now keys off
+    `config.yaml` alone, not `config.yaml` + `.env` — otherwise a container
+    restart after the first migration would misdetect as Mode 2 and demand
+    `-e RC_URL=...` again or hard-fail. Mode 2 (env-var quick start) writes
+    credentials straight into the generated `config.yaml` instead of
+    generating `.env`.
+  - The TUI's "Store in .env" checkbox, the `env_writer.py` write path
+    (`upsert_env_vars()`/`remove_env_vars()`), the delete-time `.env`
+    cleanup hook, and `env_var_name_for()` were all removed — dead code
+    once nothing writes a NEW `.env` reference. `_resolve_secret_display()`
+    (resolve an EXISTING `${VAR}` for display/editing) and
+    `read_env_vars()` stay: an existing config not yet auto-migrated still
+    needs to display/edit sanely. `onboard.py`'s wizard writes credentials
+    directly into `config.yaml` instead of generating a companion `.env`.
+  - **8-angle code review round (user-requested) on the full removal +
+    auto-migration diff, before merge.** 8 independent finder agents (line-
+    by-line, removed-behavior audit, cross-file tracer, reuse, simplification,
+    efficiency, altitude, CLAUDE.md conventions) surfaced 10 confirmed
+    findings — all fixed:
+    1. **`config.yaml` was never unconditionally `chmod 0o600`'d** —
+       `migrate_env_to_config()`'s `cfg.save()` only did it as a side
+       effect of an actual migration, so a hand-written `config.yaml` with
+       no `.env` (exactly the path the docs now recommend) was never
+       protected by `agent-chat-gateway start` at all, contradicting the
+       documented guarantee. Fixed with a new `gateway/daemon.py`
+       `_harden_config_permissions()`, called unconditionally in
+       `start_daemon()` regardless of whether migration ran.
+    2. **The `agent-chat-gateway config migrate-env` CLI command didn't
+       resolve the config path** before use, unlike `start_daemon()`'s
+       automatic trigger — so in Docker's Mode 1 (symlinked bind-mount),
+       running it manually (exactly what `docker/entrypoint.acg.sh`'s own
+       comments recommend) silently "migrated" the container-local symlinks
+       only, left the real host files untouched, and reported false
+       success. This turned what the module docstring called a "known,
+       accepted limitation" into an actual bug once traced to its real
+       cause — the daemon path only ever looked safe by accident (it
+       happened to resolve the path for an unrelated reason). Fixed by
+       resolving `config_path` unconditionally as the first line of
+       `migrate_env_to_config()` itself, so every caller gets the guarantee
+       uniformly rather than depending on each call site remembering to.
+    3. `_run_config_migrate_env()` only caught `(ValueError,
+       FileNotFoundError)`, not plain `OSError` (e.g. a `PermissionError`
+       from `env_path.rename()`) — could crash with a raw traceback. Now
+       catches `(ValueError, OSError)` (`FileNotFoundError` is already an
+       `OSError` subclass).
+    4. `gateway/daemon.py`'s new `info:`/`error:` pipe writes bypassed
+       `gateway/service.py`'s `_write_startup_signal()`, which already
+       strips embedded newlines to protect the line-oriented handshake
+       protocol — and `EditableConfig.save()`'s `ValueError` genuinely can
+       contain them (`"\n".join(result.errors)`). Fixed with a small
+       `_sanitize_pipe_message()` helper applied at both new write sites.
+    5. `migrate_env_to_config()` fully YAML-parsed `config.yaml` via
+       `EditableConfig.load()` BEFORE checking whether `.env` even existed
+       — meaning every daemon start double-parsed `config.yaml` (once here,
+       once via `GatewayConfig.from_file()`) for a check that resolves to
+       "nothing to do" the overwhelming majority of the time. Fixed by
+       checking `.env`'s existence (a plain `Path.exists()` stat) first;
+       this also naturally fixed finding 10 below as a side effect.
+    6. The `.config-backups/` directory bootstrap (`mkdir` + `chmod 0o700`)
+       was duplicated between `migrate_env_to_config()` and
+       `EditableConfig.save()` (which the former's own `cfg.save()` call,
+       moments earlier in the same function, already performs). Removed
+       the redundant copy — reuse, don't re-create.
+    7. `_count_env_refs()`'s regex diverged from `_expand_env_vars()`'s
+       (`gateway/config.py`) — two different definitions of "is this an
+       env-var reference." Fixed to match exactly.
+    8. `_on_deleted_successfully()` was a permanently dead hook — its
+       docstring described `ConnectorDetailScreen`'s `.env`-cleanup
+       override, deleted in this same branch's earlier commit — with no
+       remaining caller. Removed entirely (call site + definition) rather
+       than left as an always-no-op hook with a misleading comment.
+    9. `EditableConfig.save()`'s docstring still described the removed
+       "Store in .env" checkbox and got the migration direction backwards.
+       Corrected.
+    10. A missing `config.yaml` (fresh install, before onboarding) surfaced
+        as "Config migration failed: Config file not found" instead of the
+        clearer pre-existing "Failed to load config: Config file not
+        found" — **claimed** fixed as a side effect of finding 5's
+        reordering. Round 2 (below) found this claim didn't actually hold
+        and the reordering introduced a worse, new regression instead.
+    New tests added for each: a real symlinked-config-path repro (confirms
+    the real host files get migrated, not just the runtime symlinks), a
+    chmod-permissions test, a pipe-message-sanitization test, an `OSError`-
+    catch test, and reorder/no-op edge cases.
+
+  - **Round 2 (user-requested a second pass on round 1's own fixes) — 8
+    more findings, all fixed. The headline: round 1's fixes for #1 and #5/
+    #10 above INTERACTED to create a new, real regression neither one had
+    in isolation, caught by three independent finder angles (removed-
+    behavior audit, line-by-line, cross-file tracer) converging on the
+    same root cause.**
+    1. **The interaction bug.** Round 1's reordering (check `.env` before
+       loading config.yaml) let a MISSING config.yaml with no `.env`
+       alongside it slip through `migrate_env_to_config()` as a silent,
+       false `MigrationResult(migrated=False)` no-op — no exception at
+       all. That, in turn, meant round 1's OTHER new line —
+       `_harden_config_permissions()`'s unconditional, unguarded
+       `chmod()` — was reached with a nonexistent file and crashed with an
+       uncaught `FileNotFoundError`, bypassing `_cleanup()` and the clean
+       "error:" pipe message every other fatal branch in `start_daemon()`
+       produces. Separately, the CLI's `config migrate-env` reported a
+       FALSE "Nothing to migrate" success (exit 0) for the same missing-
+       path case — masking a broken `--config` path or not-yet-mounted
+       Docker volume as a healthy no-op. Fixed by adding an explicit,
+       unconditional `config_path.exists()` check as the actual first
+       thing `migrate_env_to_config()` does (still before `.env`'s own
+       check, so the double-parse fix is unaffected) — raising
+       `FileNotFoundError` immediately, regardless of whether `.env`
+       exists, so this can never be silently skipped by any caller again.
+       This walks back round 1's claim about finding #10 above: the clean
+       "Failed to load config" wording doesn't get inherited this way
+       after all — `start_daemon()`'s existing "Config migration failed"
+       wrapper catches it instead, same as before round 1 touched anything
+       — but the ACTUAL regression (uncaught crash / false success) is
+       what mattered and is what's fixed.
+    2. **A second, independent way `_harden_config_permissions()` could
+       crash `start_daemon()`:** a config.yaml that exists but is
+       read-only or owned by a different uid than the daemon process
+       (both realistic for a Docker `:ro` bind-mount or host-uid-mismatched
+       volume) makes `chmod()` raise `PermissionError` even though the
+       file loads fine — silently converting a previously-working
+       deployment (pre-this-PR, `start_daemon()` never chmod'd config.yaml
+       unconditionally at all) into a hard, every-single-start crash.
+       Fixed: wrapped in `try/except OSError`, logging a warning rather
+       than failing startup — permission-hardening is now best-effort,
+       never a startup blocker.
+    3. `gateway/cli.py`'s `_run_config_migrate_env()` still didn't catch
+       `yaml.YAMLError` (raised by `EditableConfig.load()` for malformed
+       YAML — neither a `ValueError` nor an `OSError`). Widened to a bare
+       `except Exception`, matching `gateway/daemon.py`'s own handling of
+       this exact function.
+    4. **The sanitize-message fix from round 1 was itself incomplete AND a
+       new duplication** — flagged independently by the reuse, altitude,
+       and simplification angles. It added a LOCAL `_sanitize_pipe_message()`
+       in `gateway/daemon.py`, applied at only the 2 new write sites round 1
+       introduced — leaving 3 PRE-EXISTING pipe writes (lock-acquire
+       failure, config-load failure, service-crash failure) unsanitized,
+       and duplicating `gateway/service.py`'s own inline copy of the exact
+       same logic in `_write_startup_signal()`. Concrete trigger: a
+       malformed config.yaml makes `GatewayConfig.from_file()` raise
+       `yaml.YAMLError`, whose message is routinely multi-line — written
+       unsanitized, it would split into extra unparseable pipe lines.
+       Fixed properly this time: `sanitize_pipe_message()` is now a single
+       public function in `gateway/service.py` (used by
+       `_write_startup_signal()` there), imported into `gateway/daemon.py`
+       and applied at all 5 of its pipe-write sites, old and new alike.
+    5. **The regex-divergence fix from round 1 also didn't eliminate the
+       duplication** (reuse + simplification angles, independently) — it
+       made the two regex *strings* match, but `_count_env_refs()`'s copy
+       and `_expand_env_vars()`'s copy were still two independent literals
+       tied together only by a comment, exactly the setup that let them
+       drift apart the first time. Fixed properly: `gateway/config.py` now
+       exports `ENV_VAR_REF_RE` as a named module-level constant (the ONE
+       definition), and `gateway/config_migrate.py` imports it instead of
+       declaring its own.
+    - **Assessed, not changed:** `.config-backups/` bootstrap logic is now
+      independently implemented a THIRD time in `gateway/onboard.py`'s
+      `_handle_existing_config()` (the reuse angle's finding) — a real,
+      documented duplication, but lower priority (a rare, one-shot code
+      path) than the fixes above; deferred rather than risking a broader
+      refactor of `onboard.py` in the same round. `_harden_config_
+      permissions()` as a separate function (simplification angle's
+      concern it's over-engineered for one line) — kept, for the same
+      testability-without-forking reason `_sanitize_pipe_message()`
+      originally was, and unlike that one it isn't reused elsewhere so
+      there's no reuse argument either way.
+
+- **Final revision, in a further follow-up: `$VAR`/`${VAR}` expansion
+  removed from `GatewayConfig.from_file()` entirely — not just deprecated,
+  gone.** User's own framing, continuing the same thread that produced the
+  "remove `.env`, enforce migration" decision above: with `.env` migration
+  now enforced at both `agent-chat-gateway start` and the config TUI's
+  launch (see below), the TUI's `_resolve_secret_display()` machinery
+  (resolve a `${VAR}` for display, added earlier this same document to
+  solve "how do you change a password behind a placeholder") existed ONLY
+  to serve a case — an unmigrated `.env`-backed config being opened in the
+  TUI — that shouldn't be reachable anymore. Keeping it "just in case" was
+  tech debt for a case the system itself now prevents.
+  - **Audited before cutting, not assumed:** is there any REAL usage of
+    `$VAR` resolved from an AMBIENT (non-`.env`) source — a systemd unit's
+    `Environment=`, a Kubernetes manifest, a bare `RC_PASSWORD=xxx
+    agent-chat-gateway start` invocation? Exhaustive repo search: no
+    systemd unit or K8s manifest exists anywhere in this project;
+    `docker/entrypoint.acg.sh`'s own env-var quick-start mode (Mode 2)
+    deliberately resolves credentials itself and writes LITERAL values
+    into the generated config.yaml, specifically avoiding `${VAR}`-in-
+    config.yaml; every doc mentioning `$VAR` already framed it as
+    "backward compatibility only, not recommended"; no committed example
+    anywhere used it as a live pattern. The only real exercise of ambient
+    (non-`.env`) resolution was two unit tests validating the mechanism
+    itself and the migration's own safety net for it. Conclusion: this was
+    gold-plating — a theoretical capability of `os.path.expandvars`
+    nothing in the project actually depended on.
+  - **The false-positive risk this closes:** with `${VAR}` still
+    "meaning something," a real secret whose plaintext value happens to
+    resemble a placeholder (`${SOME_WORD}`) risked being silently
+    misinterpreted — either raising a confusing "unresolved environment
+    variable" error for a password that was never meant to be a reference,
+    or (worse) actually resolving against an unrelated, coincidentally-
+    matching env var. Once `$VAR` is never expanded, a value is always
+    exactly what it says, full stop — this is the same reasoning applied
+    at the very start of this thread (the user: "what happens if someone's
+    password itself just looks like a VAR?").
+  - **Shipped:**
+    - `gateway/config.py`'s `GatewayConfig.from_file()` no longer calls
+      `load_dotenv()`/`_expand_env_vars()` at all. `_expand_env_vars()`
+      and `ENV_VAR_REF_RE` are KEPT (not dead code) — `gateway/
+      config_migrate.py`'s one-time migration is their only remaining
+      caller, still needing to resolve a legacy `.env`-backed value into
+      its literal form at migration time.
+    - The config TUI's launch (`gateway/configtool/__init__.py`'s
+      `run_app()`) now runs the SAME migration `agent-chat-gateway start`
+      runs, before ever constructing `ConfigToolApp` — closing the one
+      remaining gap where opening the TUI directly (without ever running
+      `start`) could still show a pre-migration `${VAR}`-referencing
+      config. A missing config.yaml is deliberately NOT fatal here (unlike
+      `start_daemon()`, which needs an actually-loadable config to run the
+      service) — the TUI already has its own graceful "does not currently
+      load" banner for that case, so `FileNotFoundError` is let through to
+      it rather than blocking the TUI from opening.
+    - `_resolve_secret_display()`, `looks_like_env_var_reference()`
+      (`gateway/configtool/screens/form_common.py`), and the entire
+      `gateway/configtool/env_writer.py` module (its last remaining
+      function, `read_env_vars()`, had no other caller) are all deleted —
+      genuinely dead code once the TUI can assume every secret field it
+      ever displays is already a real, literal value.
+    - Tests updated across the board to assert the new invariant: a
+      config value that looks like `${VAR}` — resolvable or not — is used
+      exactly as written, never raised on, never resolved, by BOTH
+      `GatewayConfig.from_file()` and `EditableConfig.load()` now (the
+      distinction between the two loaders that used to matter for this
+      reason no longer does; they still differ for the two reasons that
+      remain — provenance and raw `rooms:` groupings, per `EditableConfig`'s
+      own module docstring).
+
+- **User-requested UX improvement: `e`/`d` moved from the detail screen to
+  the list page itself, acting directly on the row under the cursor —
+  skipping the "select row -> land on read-only view -> press e/d again"
+  detour for the common case of just wanting to edit or delete one entry.**
+  Root cause of the reported friction: `OverviewScreen`'s OWN `e` binding
+  (the `$EDITOR`-on-the-whole-file escape hatch) was shadowing the user's
+  intent every time they pressed `e` on the list hoping to edit the
+  selected connector/agent — two completely different actions sharing one
+  key, on two different screens, with no visual cue which one would fire.
+  - **Shipped:** `OverviewScreen` gained its own `e`/`d` bindings
+    (`action_edit_row()`/`action_delete_row()`), scoped via `check_action()`
+    to the Connectors/Agents tabs only — the only two with a real
+    edit/delete flow (Watchers/Defaults/Tool Presets stay Phase 3). Edit
+    pushes the detail screen directly in `mode="edit"` (every detail
+    screen's constructor already accepted this — no new machinery needed
+    there) rather than `mode="view"` then simulating an `e` press. Delete
+    reuses `FormScreen.action_delete()`'s existing confirm/referencing-
+    watcher-check/save logic completely unchanged, just triggered from the
+    list without a screen push first.
+  - The old `e` -> `$EDITOR` binding moved to `ctrl+e` — clear of every
+    other single-letter binding on both screens (`e`/`d`/`r`/`n`/`q` here,
+    `ctrl+s`/`ctrl+r`/`ctrl+t` on `FormScreen`).
+  - **A screen that skips view mode entirely has no view state to fall
+    back to.** `FormScreen` gained a `_started_in_edit_mode` flag, set only
+    by the new list-page shortcut; `action_back()` checks it alongside the
+    existing `mode == "create"` case — both now pop straight back to
+    whatever pushed the screen, rather than falling back to a `mode="view"`
+    rendering of a screen the user, in this path, never asked to see. Without
+    this, Escape (or a cancelled/blocked delete) would have stranded the
+    user on a read-only page reachable only from this new shortcut, with
+    no way back to it via the normal row-selection flow.
+  - **Delete-from-the-list needed a screen pushed anyway** (`action_delete()`
+    requires `self.mode == "view"` and reads `self.cfg`/`self.entry`/
+    `self._referencing_watcher_labels()` off the instance) — pushed
+    silently, the delete action fires immediately (the confirm/blocked
+    modal covers it before it's ever really seen), and if the result is
+    anything other than a successful delete (cancelled, or blocked by a
+    referencing watcher — `action_delete()` deliberately leaves the screen
+    in place for both, correct for its own view-mode-entry design), an
+    explicit `pop_screen()` sends the user back to the list — the same
+    place a successful delete already returns them to.
+  - **A real implementation pitfall, caught by the test suite, not
+    assumed:** the first attempt called the existing `@work`-decorated
+    `action_delete()` and awaited the `Worker` it returns via `.wait()` —
+    nesting one `@work` worker inside another. This is fragile: if the
+    OUTER worker (`action_delete_row()`) is torn down while the INNER one
+    is still suspended at a `push_screen_wait()`, `Worker.wait()` re-raises
+    that as `WorkerCancelled` INSIDE the outer worker's own body — a
+    crash with no bug in the delete logic itself, and exactly the kind of
+    failure a quick manual test wouldn't reliably surface. Fixed by
+    extracting `action_delete()`'s body into a plain (non-`@work`)
+    `_do_delete()` coroutine, with `action_delete()` reduced to a thin
+    `@work` wrapper around it — `action_delete_row()` calls `_do_delete()`
+    directly, no nested worker at all.
+
+- **Follow-up UX request in the same conversation: focus should default to
+  the list itself (not the tab bar), and left/right should switch
+  tabs — even while the list has focus — without the user needing to Tab
+  their way onto the tab bar first.** Rationale mirrors the `e`/`d` move
+  above: minimize keystrokes for the common case (browse a list, act on a
+  row) rather than requiring a navigation detour every time.
+  - **Shipped:** `OverviewScreen.on_mount()` now focuses the active tab's
+    `DataTable` directly (`_focus_active_tab_table()`), instead of leaving
+    initial focus on the tab bar (previously mitigated only by making `tab`
+    a visible footer hint — "Focus next / enter list" — still true, but no
+    longer the first thing a user needs to press). `on_tabbed_content_
+    tab_activated()` re-focuses the newly-active tab's table on EVERY tab
+    change, regardless of cause (the new left/right actions below, or a
+    plain mouse click) — one path for "the active tab changed," rather than
+    re-implementing the focus step at each call site that can change tabs.
+  - `action_previous_tab()`/`action_next_tab()` (bound to `left`/`right`,
+    wrapping at both ends) just set `TabbedContent.active` — deliberately
+    NOT also handling focus themselves, since setting `.active` already
+    fires the same `TabActivated` message a mouse click would, so the
+    handler above covers it.
+  - **A real binding-precedence issue, resolved via `priority=True`, not
+    assumed to "just work":** `DataTable` (which now has focus in the
+    common case, per the previous point) already binds `left`/`right` to
+    its own cell/column cursor movement. Textual's key-binding resolution
+    walks the chain starting at the FOCUSED widget and outward — so without
+    `priority=True` on `OverviewScreen`'s own `left`/`right` bindings,
+    `DataTable`'s bindings would always be checked and matched FIRST, and
+    `OverviewScreen`'s tab-switch actions would never even be considered.
+    `priority=True` (the same mechanism Textual's own `App.BINDINGS` uses
+    for `ctrl+q`, confirmed by reading `app.py`, not assumed by name alone)
+    checks the screen's bindings before dispatching to the focused widget
+    at all, which is what makes this correct — not an accident of
+    `cursor_type="row"` (every table on this screen) already making
+    `DataTable`'s own left/right cell-navigation a no-op today; the
+    priority ordering is what keeps this correct even if a future tab ever
+    needs `DataTable`'s own left/right behavior for something real.
+  - New tests (`tests/unit/test_configtool_app.py::TestArrowKeyTabSwitching`)
+    cover: next/previous with wraparound at both ends, that left/right win
+    even when a `DataTable` explicitly holds focus first (the actual
+    regression this priority ordering exists to prevent), and that a plain
+    programmatic/mouse tab switch focuses the table the same way the new
+    keyboard actions do. The pre-existing "focus starts on the tab bar,
+    press tab to reach the list" test was replaced (not just patched) to
+    assert the new, opposite default explicitly, with a second test
+    confirming `tab` still works as a fallback way to move focus rather
+    than having quietly stopped doing anything.
 
 - **Shipped (added after initial Phase 2 review — user caught that "CRUD"
   was being used loosely and Delete had never actually been designed for

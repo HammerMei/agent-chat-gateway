@@ -42,7 +42,7 @@ Quick summary:
 ```bash
 pip install agent-chat-gateway
 mkdir -p ~/.agent-chat-gateway
-# Create config.yaml and .env (see Configuration section below)
+# Create config.yaml (see Configuration section below)
 agent-chat-gateway start
 ```
 
@@ -396,7 +396,7 @@ connectors:
 | `type` | string | Yes | Platform type: `rocketchat` or `mattermost` |
 | `server.url` | string | Yes | Chat server URL (e.g., `https://chat.example.com`) |
 | `server.username` | string | Yes (RC); one of username/password or token (Mattermost) | Bot account username |
-| `server.password` | string | Yes (RC); one of username/password or token (Mattermost) | Bot account password (use `${VAR}` for env expansion) |
+| `server.password` | string | Yes (RC); one of username/password or token (Mattermost) | Bot account password (plaintext — `config.yaml` is chmod'd `0600`) |
 | `server.team` | string | Yes (Mattermost only) | Team name the bot's channels belong to — Mattermost channels are team-scoped, unlike Rocket.Chat |
 | `server.token` | string | One of token or username/password (Mattermost only) | Bot Account / Personal Access Token — used directly, no login call, no expiry handling needed |
 | `allowed_users.owners` | list | No | Usernames with full tool access |
@@ -561,25 +561,29 @@ Always use explicit domain patterns to prevent SSRF attacks. Avoid `params: ".*"
   params: "https?://(www\\.)?github\\.com/.*"
 ```
 
-### Environment Variables
+### Secrets and Environment Variables
 
-The gateway supports `$VAR` and `${VAR}` expansion in string fields. Create a `.env` file next to your `config.yaml`:
-
-```bash
-# ~/.agent-chat-gateway/.env
-RC_PASSWORD=your_bot_password
-RC_USERNAME=mybot
-RC_URL=https://chat.example.com
-```
-
-Then reference them in your config:
+Store credentials directly in `config.yaml` — no separate file needed:
 
 ```yaml
 server:
-  url: "${RC_URL}"
-  username: "${RC_USERNAME}"
-  password: "${RC_PASSWORD}"
+  url: "https://chat.example.com"
+  username: "mybot"
+  password: "your_bot_password"
 ```
+
+`config.yaml` is chmod'd `0600` automatically, both by the config TUI on every
+save and by `agent-chat-gateway start` — as long as you don't commit your
+filled-in copy to version control, plaintext here is safe.
+
+The gateway does **not** expand `$VAR`/`${VAR}` in config values — a string
+that happens to look like a placeholder is used exactly as written, like
+any other string. If you're upgrading from an older setup that used a
+`.env` file with `${VAR}` references, the next `agent-chat-gateway start`
+(or opening `agent-chat-gateway config`) folds those values into `config.yaml`
+as literal text and removes `.env` automatically — one-time, no action
+needed. Run `agent-chat-gateway config migrate-env` first if you'd rather
+do that as a manual step or a dry run.
 
 ---
 
@@ -1147,7 +1151,6 @@ cat ~/.agent-chat-gateway/state.rc-main.json | jq .
 1. Validate YAML syntax: `python3 -c "import yaml; yaml.safe_load(open('$HOME/.agent-chat-gateway/config.yaml'))"`
 2. Check for missing required fields (see Configuration Reference above)
 3. Verify all connector/agent references match defined names
-4. Check environment variable expansion: `env | grep RC_` (if using `$RC_*`)
 
 ---
 

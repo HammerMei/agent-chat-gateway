@@ -65,9 +65,9 @@ cp -r docker/docker-compose.example my-acg
 cd my-acg
 
 # 2. Fill in your credentials and settings
-#    .env          — Claude Code OAuth token (see file for instructions)
-#    config/.env   — chat platform credentials (Rocket.Chat URL/username/password, or Mattermost URL/team/token)
-#    config/config.yaml — owners, rooms, agents
+#    .env                — Claude Code OAuth token (see file for instructions)
+#    config/config.yaml  — chat platform credentials (Rocket.Chat/Mattermost),
+#                           owners, rooms, agents — file gets chmod 600 automatically
 
 # 3. Start
 docker compose up -d

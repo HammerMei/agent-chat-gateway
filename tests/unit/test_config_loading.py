@@ -320,12 +320,18 @@ class TestCacheDirGlobalResolution(unittest.TestCase):
         self.assertEqual(actual, "~/.agent-chat-gateway/attachments")
 
 
-# ── Tests: env var expansion raises on unresolved placeholders (S3) ──────────
+# ── Tests: $VAR/${VAR} is a plain literal string, never resolved (S3, final revision) ──
 
 
-class TestEnvVarExpansionFailsOnUnresolved(unittest.TestCase):
-    """S3: Unresolved env var placeholders must raise ValueError at config load,
-    not silently use the literal placeholder string as a config value."""
+class TestDollarVarIsALiteralString(unittest.TestCase):
+    """docs/design/config-tool.md decision 6, final revision: GatewayConfig.
+    from_file() no longer expands $VAR/${VAR} at all — secrets live directly
+    in config.yaml, and any pre-existing .env-backed config is auto-migrated
+    into that form (gateway/config_migrate.py) before this loader ever runs.
+    A string that happens to look like a placeholder — resolvable or not —
+    is accepted and used exactly as written, same as any other string; this
+    also sidesteps the case a real secret's own value merely happens to
+    resemble ${SOMETHING}."""
 
     def _write_config_with_url(self, url: str) -> str:
         cfg = textwrap.dedent(f"""\
@@ -348,35 +354,42 @@ class TestEnvVarExpansionFailsOnUnresolved(unittest.TestCase):
             f.write(cfg)
             return f.name
 
-    def test_unresolved_dollar_brace_raises(self):
-        """${UNSET_VAR} placeholder must raise ValueError, not be used literally."""
+    def test_dollar_brace_form_is_used_literally_even_when_unresolvable(self):
         import os
-        # Ensure the variable is NOT set
         os.environ.pop("ACG_TEST_UNSET_12345", None)
         path = self._write_config_with_url("http://${ACG_TEST_UNSET_12345}:3000")
-        with self.assertRaises(ValueError) as ctx:
-            GatewayConfig.from_file(path)
-        self.assertIn("Unresolved environment variable", str(ctx.exception))
-        self.assertIn("ACG_TEST_UNSET_12345", str(ctx.exception))
 
-    def test_unresolved_dollar_plain_raises(self):
-        """$UNSET_VAR placeholder (without braces) must also raise ValueError."""
+        cfg = GatewayConfig.from_file(path)  # must not raise
+
+        self.assertEqual(
+            cfg.connectors[0].raw["server"]["url"], "http://${ACG_TEST_UNSET_12345}:3000"
+        )
+
+    def test_dollar_plain_form_is_used_literally_even_when_unresolvable(self):
         import os
         os.environ.pop("ACG_TEST_UNSET_99999", None)
         path = self._write_config_with_url("http://$ACG_TEST_UNSET_99999:3000")
-        with self.assertRaises(ValueError) as ctx:
-            GatewayConfig.from_file(path)
-        self.assertIn("Unresolved environment variable", str(ctx.exception))
 
-    def test_resolved_env_var_does_not_raise(self):
-        """A fully resolved env var must be accepted without error."""
+        cfg = GatewayConfig.from_file(path)  # must not raise
+
+        self.assertEqual(
+            cfg.connectors[0].raw["server"]["url"], "http://$ACG_TEST_UNSET_99999:3000"
+        )
+
+    def test_dollar_brace_form_is_NOT_resolved_even_when_the_var_is_set(self):
+        """The critical regression case: if a resolvable ${VAR} were
+        silently resolved, a real secret whose plaintext value happens to
+        look like a placeholder would be misinterpreted."""
         import os
         os.environ["ACG_TEST_SET_URL"] = "localhost"
         try:
             path = self._write_config_with_url("http://${ACG_TEST_SET_URL}:3000")
-            # Should not raise — the var is set
+
             cfg = GatewayConfig.from_file(path)
-            self.assertEqual(cfg.connectors[0].raw["server"]["url"], "http://localhost:3000")
+
+            self.assertEqual(
+                cfg.connectors[0].raw["server"]["url"], "http://${ACG_TEST_SET_URL}:3000"
+            )
         finally:
             os.environ.pop("ACG_TEST_SET_URL", None)
 

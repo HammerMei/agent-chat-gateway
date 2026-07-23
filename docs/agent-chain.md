@@ -100,7 +100,7 @@ connectors:
     server:
       url: "https://chat.example.com"
       username: "my-bot"
-      password: "${RC_PASSWORD}"
+      password: "your-bot-password"
     allowed_users:
       owners:
         - alice

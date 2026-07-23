@@ -171,6 +171,15 @@ def main():
              "a *_defaults entry",
     )
 
+    config_migrate_env_p = config_sub.add_parser(
+        "migrate-env",
+        help="One-time: fold .env secrets into config.yaml as literal values, then remove .env",
+    )
+    config_migrate_env_p.add_argument(
+        "--config", default=DEFAULT_CONFIG,
+        help="Path to config.yaml (default: $ACG_CONFIG or ~/.agent-chat-gateway/config.yaml)",
+    )
+
     # schedule (sub-subcommands)
     schedule_p = sub.add_parser("schedule", help="Manage scheduled agent tasks")
     schedule_sub = schedule_p.add_subparsers(dest="schedule_cmd", help="Schedule subcommands")
@@ -381,6 +390,8 @@ def _run_config(args) -> None:
 
     if args.config_cmd == "validate":
         _run_config_validate(args)
+    elif args.config_cmd == "migrate-env":
+        _run_config_migrate_env(args)
     else:
         print(f"Unknown config subcommand: {args.config_cmd}", file=sys.stderr)
         sys.exit(1)
@@ -415,6 +426,38 @@ def _run_config_validate(args) -> None:
 
     if not result.ok:
         sys.exit(1)
+
+
+def _run_config_migrate_env(args) -> None:
+    """Handle 'config migrate-env': the same one-time migration
+    gateway/daemon.py's start_daemon() runs automatically on every server
+    start — exposed standalone for a manual run, a dry check before
+    starting the gateway, or Docker's entrypoint script. No-op (exit 0,
+    clear message) if there's no .env to migrate."""
+    from .config_migrate import migrate_env_to_config
+
+    try:
+        result = migrate_env_to_config(args.config)
+    except Exception as e:
+        # Broad on purpose, matching gateway/daemon.py's own handling of
+        # this exact function: ValueError (unresolvable $VAR), OSError
+        # (FileNotFoundError, a PermissionError from env_path.rename()),
+        # and yaml.YAMLError (malformed config.yaml, from EditableConfig.
+        # load()'s yaml.safe_load()) all need the same clean treatment here
+        # — a raw traceback for any of them defeats the point of this
+        # command existing as a friendly, standalone entry point.
+        print(f"✗ Migration failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if not result.migrated:
+        print("Nothing to migrate — no .env file found.")
+        return
+
+    print(
+        f"✓ Migrated {result.ref_count} secret reference(s) from .env into "
+        f"{args.config}."
+    )
+    print(f"  .env moved to {result.env_backup_path}")
 
 
 def _run_instructions(args) -> None:
