@@ -770,6 +770,61 @@ Phase 2 first cleared the Phase 1 code review's deferred items 7–10
       remain — provenance and raw `rooms:` groupings, per `EditableConfig`'s
       own module docstring).
 
+- **User-requested UX improvement: `e`/`d` moved from the detail screen to
+  the list page itself, acting directly on the row under the cursor —
+  skipping the "select row -> land on read-only view -> press e/d again"
+  detour for the common case of just wanting to edit or delete one entry.**
+  Root cause of the reported friction: `OverviewScreen`'s OWN `e` binding
+  (the `$EDITOR`-on-the-whole-file escape hatch) was shadowing the user's
+  intent every time they pressed `e` on the list hoping to edit the
+  selected connector/agent — two completely different actions sharing one
+  key, on two different screens, with no visual cue which one would fire.
+  - **Shipped:** `OverviewScreen` gained its own `e`/`d` bindings
+    (`action_edit_row()`/`action_delete_row()`), scoped via `check_action()`
+    to the Connectors/Agents tabs only — the only two with a real
+    edit/delete flow (Watchers/Defaults/Tool Presets stay Phase 3). Edit
+    pushes the detail screen directly in `mode="edit"` (every detail
+    screen's constructor already accepted this — no new machinery needed
+    there) rather than `mode="view"` then simulating an `e` press. Delete
+    reuses `FormScreen.action_delete()`'s existing confirm/referencing-
+    watcher-check/save logic completely unchanged, just triggered from the
+    list without a screen push first.
+  - The old `e` -> `$EDITOR` binding moved to `ctrl+e` — clear of every
+    other single-letter binding on both screens (`e`/`d`/`r`/`n`/`q` here,
+    `ctrl+s`/`ctrl+r`/`ctrl+t` on `FormScreen`).
+  - **A screen that skips view mode entirely has no view state to fall
+    back to.** `FormScreen` gained a `_started_in_edit_mode` flag, set only
+    by the new list-page shortcut; `action_back()` checks it alongside the
+    existing `mode == "create"` case — both now pop straight back to
+    whatever pushed the screen, rather than falling back to a `mode="view"`
+    rendering of a screen the user, in this path, never asked to see. Without
+    this, Escape (or a cancelled/blocked delete) would have stranded the
+    user on a read-only page reachable only from this new shortcut, with
+    no way back to it via the normal row-selection flow.
+  - **Delete-from-the-list needed a screen pushed anyway** (`action_delete()`
+    requires `self.mode == "view"` and reads `self.cfg`/`self.entry`/
+    `self._referencing_watcher_labels()` off the instance) — pushed
+    silently, the delete action fires immediately (the confirm/blocked
+    modal covers it before it's ever really seen), and if the result is
+    anything other than a successful delete (cancelled, or blocked by a
+    referencing watcher — `action_delete()` deliberately leaves the screen
+    in place for both, correct for its own view-mode-entry design), an
+    explicit `pop_screen()` sends the user back to the list — the same
+    place a successful delete already returns them to.
+  - **A real implementation pitfall, caught by the test suite, not
+    assumed:** the first attempt called the existing `@work`-decorated
+    `action_delete()` and awaited the `Worker` it returns via `.wait()` —
+    nesting one `@work` worker inside another. This is fragile: if the
+    OUTER worker (`action_delete_row()`) is torn down while the INNER one
+    is still suspended at a `push_screen_wait()`, `Worker.wait()` re-raises
+    that as `WorkerCancelled` INSIDE the outer worker's own body — a
+    crash with no bug in the delete logic itself, and exactly the kind of
+    failure a quick manual test wouldn't reliably surface. Fixed by
+    extracting `action_delete()`'s body into a plain (non-`@work`)
+    `_do_delete()` coroutine, with `action_delete()` reduced to a thin
+    `@work` wrapper around it — `action_delete_row()` calls `_do_delete()`
+    directly, no nested worker at all.
+
 - **Shipped (added after initial Phase 2 review — user caught that "CRUD"
   was being used loosely and Delete had never actually been designed for
   agents/connectors; checked, and they were right, nothing in this

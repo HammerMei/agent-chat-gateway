@@ -2,9 +2,16 @@
 
 Five tabs: Connectors, Agents, Watchers, Defaults, Tool Presets — the latter
 two are first-class per docs/design/config-tool.md (shared resources, not
-footnotes). Selecting a row pushes a *DetailScreen in view mode. 'n'
-(new_entity) creates an entry on the active tab — so far only Agents
-supports it; other tabs still notify rather than doing nothing or crashing.
+footnotes). Selecting a row (Enter) pushes a *DetailScreen in view mode.
+'e'/'d' on the Connectors/Agents tabs act directly on the row under the
+cursor — edit opens straight into edit mode (no view detour), delete runs
+the same confirm/referencing-watcher-check/save flow FormScreen.
+action_delete() already has, without requiring a screen push first (user-
+reported: 'e' used to be shadowed by this screen's OWN 'e' binding for the
+$EDITOR escape hatch — see action_edit_config() below, now on ctrl+e). 'n'
+(new_entity) creates an entry on the active tab — so far only Agents/
+Connectors support it; other tabs still notify rather than doing nothing
+or crashing.
 """
 
 from __future__ import annotations
@@ -15,6 +22,7 @@ from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
+from textual.coordinate import Coordinate
 from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Static, TabbedContent, TabPane
 
@@ -37,7 +45,13 @@ class OverviewScreen(Screen):
     """Root screen — never popped (quitting the app pops the whole stack)."""
 
     BINDINGS = [
-        Binding("e", "edit_config", "Edit in $EDITOR"),
+        # User-reported: this used to be 'e', shadowing the row-level direct-
+        # edit shortcut below every time — pressing 'e' hoping to edit the
+        # selected connector/agent instead opened $EDITOR on the whole
+        # config.yaml. Moved to ctrl+e (clear of every other single-letter
+        # list-page/detail-screen binding: e/d/r/n/q here, ctrl+s/ctrl+r/
+        # ctrl+t on FormScreen).
+        Binding("ctrl+e", "edit_config", "Edit in $EDITOR", show=True),
         Binding("r", "refresh", "Refresh"),
         # Screen already binds tab/shift+tab to app.focus_next/focus_previous
         # with show=False (textual/screen.py) — on mount, focus starts on the
@@ -52,6 +66,14 @@ class OverviewScreen(Screen):
         # must not quit the app.
         Binding("q", "app.quit", "Quit", show=True),
         Binding("n", "new_entity", "New", show=True),
+        # Direct edit/delete on the row under the cursor (Connectors/Agents
+        # tabs only — the only ones with a real detail-screen mode="edit"/
+        # delete flow) — user-requested, to skip "select row -> view page ->
+        # press e/d" for the common case of just wanting to edit or delete
+        # one entry. check_action() below hides these on any other tab so
+        # the footer doesn't advertise a no-op.
+        Binding("e", "edit_row", "Edit", show=True),
+        Binding("d", "delete_row", "Delete", show=True),
     ]
 
     def compose(self) -> ComposeResult:
@@ -81,9 +103,117 @@ class OverviewScreen(Screen):
 
     # ── Actions ──────────────────────────────────────────────────────────────
 
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Hide 'Edit'/'Delete' from the footer on tabs that don't support
+        them (Watchers/Defaults/Tool Presets — Phase 3) so the footer never
+        advertises a key that would just notify "not supported yet"."""
+        if action in ("edit_row", "delete_row"):
+            active_tab = self.query_one(TabbedContent).active
+            return active_tab in ("tab-connectors", "tab-agents")
+        return True
+
     def action_edit_config(self) -> None:
         app: "ConfigToolApp" = self.app  # type: ignore[assignment]
         app.open_editor_and_reload()
+
+    @work
+    async def action_edit_row(self) -> None:
+        """'e' on the Connectors/Agents tabs: open the row under the cursor
+        DIRECTLY in edit mode — no view-mode detour. User-requested: the
+        common case is "I know which entry I want to change," and having to
+        select it, land on a read-only page, then press 'e' again was an
+        extra, pointless step for that case. (Selecting a row via Enter into
+        a read-only view first is still available and unchanged, e.g. for
+        just double-checking a value.)"""
+        app: "ConfigToolApp" = self.app  # type: ignore[assignment]
+        cfg = app.editable_config
+        if cfg is None:
+            self.notify("Config does not currently load.", severity="error")
+            return
+
+        active_tab = self.query_one(TabbedContent).active
+        if active_tab == "tab-connectors":
+            key = self._cursor_row_key("connectors-table")
+            if key is None:
+                return
+            entry = self._connector_entry_for_key(cfg, key)
+            if entry is None:
+                return
+            screen = ConnectorDetailScreen(cfg, entry, mode="edit")
+        elif active_tab == "tab-agents":
+            key = self._cursor_row_key("agents-table")
+            if key is None:
+                return
+            entry = cfg.agents_raw.get(key)
+            if entry is None:
+                return
+            screen = AgentDetailScreen(cfg, key, entry, mode="edit")
+        else:
+            return
+        screen._started_in_edit_mode = True
+        self.app.push_screen(screen)
+
+    @work
+    async def action_delete_row(self) -> None:
+        """'d' on the Connectors/Agents tabs: delete the row under the
+        cursor directly, reusing FormScreen.action_delete()'s existing
+        confirm/referencing-watcher-check/save flow verbatim (no
+        reimplementation) — just triggered without a screen push first.
+
+        Pushes the target screen (in view mode — action_delete() requires
+        it, see its own check) SILENTLY, immediately invokes its delete
+        action, then pops back out to the list regardless of outcome
+        (confirmed, cancelled, or blocked by a referencing watcher) —
+        action_delete() itself already pops the screen on a SUCCESSFUL
+        delete, so the extra pop_screen() below only fires for the
+        cancelled/blocked paths, where action_delete() deliberately leaves
+        the screen in place (it was designed to be reached via view mode,
+        where staying put makes sense — reached from here, staying put
+        would leave the user looking at a screen they never asked to see).
+        """
+        app: "ConfigToolApp" = self.app  # type: ignore[assignment]
+        cfg = app.editable_config
+        if cfg is None:
+            self.notify("Config does not currently load.", severity="error")
+            return
+
+        active_tab = self.query_one(TabbedContent).active
+        if active_tab == "tab-connectors":
+            key = self._cursor_row_key("connectors-table")
+            if key is None:
+                return
+            entry = self._connector_entry_for_key(cfg, key)
+            if entry is None:
+                return
+            screen = ConnectorDetailScreen(cfg, entry, mode="view")
+        elif active_tab == "tab-agents":
+            key = self._cursor_row_key("agents-table")
+            if key is None:
+                return
+            entry = cfg.agents_raw.get(key)
+            if entry is None:
+                return
+            screen = AgentDetailScreen(cfg, key, entry, mode="view")
+        else:
+            return
+
+        self.app.push_screen(screen)
+        # Call _do_delete() directly (a plain coroutine) rather than the
+        # @work-decorated action_delete() — nesting a second @work worker
+        # inside this one (via action_delete().wait()) turned out to be
+        # fragile: if this outer worker gets cancelled while the inner one
+        # is suspended at a push_screen_wait(), Worker.wait() re-raises
+        # that as WorkerCancelled INSIDE this method, an unrelated-looking
+        # crash. _do_delete() has the exact same logic, just callable
+        # without going through the worker system a second time.
+        await screen._do_delete()
+        if self.app.screen is screen:
+            # Cancelled, or blocked by a referencing watcher — action_delete()
+            # left the screen in place (correct for its OWN view-mode entry
+            # point). Reached from the list directly, staying here would
+            # strand the user on a screen they never asked to see — send
+            # them back to the list instead, same as Escape would.
+            self.app.pop_screen()
 
     @work
     async def action_new_entity(self) -> None:
@@ -244,6 +374,29 @@ class OverviewScreen(Screen):
 
     # ── Row selection → push detail screens ──────────────────────────────────
 
+    def _cursor_row_key(self, table_id: str) -> str | None:
+        """The row key under the cursor for the given table, or None if the
+        table is empty/cursor isn't on a valid row — shared by the direct
+        edit/delete actions below and (indirectly, via the same key lookup
+        logic) on_data_table_row_selected()."""
+        table = self.query_one(f"#{table_id}", DataTable)
+        if table.row_count == 0:
+            return None
+        try:
+            cell_key = table.coordinate_to_cell_key(Coordinate(table.cursor_row, 0))
+        except Exception:
+            return None
+        return str(cell_key.row_key.value)
+
+    def _connector_entry_for_key(self, cfg, key: str) -> dict | None:
+        # key is the row's list position (see repaint_from_memory) — not
+        # the connector's name, which isn't guaranteed unique/present.
+        connectors = cfg.connectors_raw
+        index = int(key)
+        if 0 <= index < len(connectors):
+            return connectors[index]
+        return None
+
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         app: "ConfigToolApp" = self.app  # type: ignore[assignment]
         cfg = app.editable_config
@@ -253,12 +406,9 @@ class OverviewScreen(Screen):
         key = str(event.row_key.value)
 
         if table_id == "connectors-table":
-            # key is the row's list position (see repaint_from_memory) — not
-            # the connector's name, which isn't guaranteed unique/present.
-            connectors = cfg.connectors_raw
-            index = int(key)
-            if 0 <= index < len(connectors):
-                self.app.push_screen(ConnectorDetailScreen(cfg, connectors[index], mode="view"))
+            entry = self._connector_entry_for_key(cfg, key)
+            if entry is not None:
+                self.app.push_screen(ConnectorDetailScreen(cfg, entry, mode="view"))
         elif table_id == "agents-table":
             entry = cfg.agents_raw.get(key)
             if entry is not None:

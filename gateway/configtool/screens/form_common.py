@@ -270,6 +270,14 @@ class FormScreen(DetailScreen):
     def __init__(self):
         super().__init__()
         self.mode: Literal["view", "edit", "create"] = "view"
+        # True when this screen was pushed ALREADY in edit mode (the list
+        # page's direct-edit shortcut — see OverviewScreen.action_edit_row())
+        # rather than reached via view mode's own 'e' key. Consulted by
+        # action_back(): a screen that skipped view mode entirely has no
+        # view state to "fall back" to — Escape (or a successful/cancelled
+        # delete) must pop straight back to the list, not flip to a view
+        # rendering of a screen the user never asked to see.
+        self._started_in_edit_mode = False
         self._form_dirty = False
         self._initial_values: dict[str, object] = {}
         self._last_field_error: str | None = None
@@ -543,7 +551,14 @@ class FormScreen(DetailScreen):
             )
             if not discard:
                 return
-        if self.mode == "create":
+        if self.mode == "create" or self._started_in_edit_mode:
+            # create: no view state to fall back to (never had one).
+            # started_in_edit_mode: this screen skipped view mode entirely
+            # (list page's direct-edit shortcut) — falling back to a view
+            # rendering here would show the user a screen they never asked
+            # to see instead of returning them to the list, as every other
+            # exit from this shortcut (Save, a blocked/cancelled delete)
+            # already does.
             self.app.pop_screen()
         else:
             self.mode = "view"
@@ -558,15 +573,29 @@ class FormScreen(DetailScreen):
 
     @work
     async def action_delete(self) -> None:
-        """'d', view mode only (see check_action). Checks for referencing
-        watchers FIRST (a clear, specific reason beats a generic validator
-        error) — if any exist, shows that reason and stops before even
-        offering the destructive confirm. Otherwise: confirm -> remove from
-        `document` -> save(). save() remains the backstop even after the
-        pre-check (belt-and-suspenders, not a replacement for it) — if it
-        still rejects the deletion for some reason the pre-check didn't
-        anticipate, the entry is reinserted so a rejected delete never
-        leaves `document` silently missing something that's still on disk.
+        """'d', view mode only (see check_action). Thin @work wrapper around
+        _do_delete() — kept separate so OverviewScreen's direct-delete-from-
+        the-list shortcut (action_delete_row()) can call _do_delete()
+        directly as a plain coroutine instead of nesting one @work worker
+        inside another. Nesting a second @work call and awaiting it via
+        Worker.wait() was tried first and found to be fragile: if the outer
+        worker (or the whole app/test) is torn down while the inner one is
+        still suspended at a push_screen_wait(), Worker.wait() re-raises
+        that as WorkerCancelled INSIDE the outer worker's own body — an
+        unrelated-looking crash with no bug in the delete logic itself.
+        A plain awaited coroutine has no such failure mode."""
+        await self._do_delete()
+
+    async def _do_delete(self) -> None:
+        """Checks for referencing watchers FIRST (a clear, specific reason
+        beats a generic validator error) — if any exist, shows that reason
+        and stops before even offering the destructive confirm. Otherwise:
+        confirm -> remove from `document` -> save(). save() remains the
+        backstop even after the pre-check (belt-and-suspenders, not a
+        replacement for it) — if it still rejects the deletion for some
+        reason the pre-check didn't anticipate, the entry is reinserted so
+        a rejected delete never leaves `document` silently missing
+        something that's still on disk.
         """
         if self.mode != "view":
             return
