@@ -121,6 +121,86 @@ class TestValidateConfigConnectorChecks(_ValidateConfigTestBase):
         self.assertFalse(result.ok)
         self.assertTrue(any("mm" in e for e in result.errors))
 
+    def test_malformed_rocketchat_url_is_an_error(self):
+        cfg = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "test", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                room: general
+        """)
+        result = self._validate(cfg)
+        self.assertFalse(result.ok)
+        self.assertTrue(
+            any("server.url" in e and "does not look like a URL" in e for e in result.errors)
+        )
+
+    def test_malformed_mattermost_url_is_an_error(self):
+        cfg = self._write(f"""\
+            connectors:
+              - name: mm
+                type: mattermost
+                server: {{url: "localhost:8065", team: home, token: tok}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                room: general
+        """)
+        result = self._validate(cfg)
+        self.assertFalse(result.ok)
+        self.assertTrue(
+            any("server.url" in e and "does not look like a URL" in e for e in result.errors)
+        )
+
+    def test_well_formed_url_with_uncommon_scheme_is_not_flagged(self):
+        """Lenient check: only scheme+netloc are required — an unusual but
+        well-formed scheme is not second-guessed."""
+        cfg = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "wss://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                room: general
+        """)
+        result = self._validate(cfg)
+        self.assertTrue(result.ok)
+
+    def test_empty_url_produces_only_the_empty_field_error_not_a_url_error(self):
+        """An empty server.url must not additionally be flagged as malformed
+        — that would be a confusing, redundant double-error for one field."""
+        cfg = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                room: general
+        """)
+        result = self._validate(cfg)
+        url_errors = [e for e in result.errors if "server.url" in e]
+        self.assertEqual(len(url_errors), 1)
+        self.assertIn("is empty", url_errors[0])
+
     def test_script_connector_is_not_validated(self):
         """ScriptConnector never reads ConnectorConfig.raw — nothing to check."""
         cfg = self._write(f"""\
@@ -362,6 +442,28 @@ class TestFindingsExtension(_ValidateConfigTestBase):
         for f in connector_findings.values():
             self.assertEqual(f.severity, "error")
             self.assertEqual(f.entity_name, "rc")
+
+    def test_malformed_url_produces_a_per_field_finding(self):
+        cfg = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "test", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                room: general
+        """)
+        result = self._validate(cfg)
+        connector_findings = {f.field: f for f in result.findings if f.entity_kind == "connector"}
+        self.assertEqual(connector_findings.keys(), {"server.url"})
+        finding = connector_findings["server.url"]
+        self.assertEqual(finding.severity, "error")
+        self.assertEqual(finding.entity_name, "rc")
+        self.assertIn("does not look like a URL", finding.message)
 
     def test_state_orphan_produces_warning_finding(self):
         cfg = self._write(f"""\

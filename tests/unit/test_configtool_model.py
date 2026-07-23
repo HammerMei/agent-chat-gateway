@@ -439,11 +439,14 @@ class TestEditableConfigSave(_EditableConfigTestBase):
     config.yaml, that's an incident, not a bug.
     """
 
-    ENV_VAR_NAME = "RC_URL_FOR_CONFIGTOOL_SAVE_TEST"
+    # A secret field (password), not url: config_validate's URL-format check
+    # (added alongside the "does this look like a URL" validation) would
+    # otherwise reject this placeholder as a malformed server.url.
+    ENV_VAR_NAME = "RC_PASSWORD_FOR_CONFIGTOOL_SAVE_TEST"
 
     def setUp(self):
         super().setUp()
-        os.environ[self.ENV_VAR_NAME] = "http://localhost:3000"
+        os.environ[self.ENV_VAR_NAME] = "hunter2"
         self.addCleanup(os.environ.pop, self.ENV_VAR_NAME, None)
 
     def _valid_cfg_text(self) -> str:
@@ -451,7 +454,7 @@ class TestEditableConfigSave(_EditableConfigTestBase):
             connectors:
               - name: rc
                 type: rocketchat
-                server: {{url: "${self.ENV_VAR_NAME}", username: bot, password: pw}}
+                server: {{url: "http://localhost:3000", username: bot, password: "${self.ENV_VAR_NAME}"}}
             agents:
               default:
                 type: claude
@@ -466,10 +469,10 @@ class TestEditableConfigSave(_EditableConfigTestBase):
         cfg = EditableConfig.load(path)
         cfg.save()
         # Read back with plain yaml (never the env-expanding loader) — the
-        # literal "$VAR" string must survive, not the resolved URL.
+        # literal "$VAR" string must survive, not the resolved secret.
         raw = yaml.safe_load(path.read_text())
         self.assertEqual(
-            raw["connectors"][0]["server"]["url"], f"${self.ENV_VAR_NAME}"
+            raw["connectors"][0]["server"]["password"], f"${self.ENV_VAR_NAME}"
         )
 
     def test_save_writes_a_timestamped_backup_of_the_prior_contents(self):

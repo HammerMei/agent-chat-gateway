@@ -322,7 +322,9 @@ watchers:
 - ✅ `tool_presets` are regex-validated eagerly at load, even if unused
 - ✅ `agent-chat-gateway config validate [--lint]` — checks config.yaml
   without starting the daemon: structural validation, per-connector-type
-  credential checks (e.g. empty Rocket.Chat/Mattermost `server:` fields),
+  credential checks (e.g. empty Rocket.Chat/Mattermost `server:` fields, or
+  a `server.url` that doesn't look like a URL — a lenient scheme+netloc
+  check, so it catches plain typos without rejecting unusual schemes/ports),
   and a warning when persisted `state.<connector>.json` references a watcher
   name no longer in the config
 
