@@ -1065,11 +1065,12 @@ split-out insertion position).
 **Owner decision, splitting Phase 3 in two:** watcher CRUD (the `rooms:`
 group auto-split rule especially) is a lot of surface for one branch —
 scoped down to just `DefaultsScreen` editing for this pass, watcher CRUD
-deferred to its own future branch. A follow-up question about the
-new-watcher flow's connector→agent pre-suggestion (scan existing
-`watchers:` entries for the picked connector, pre-fill the agent Select
-with whichever agent they already use) was answered but not yet
-implemented, since it belongs to that deferred work.
+deferred to its own future branch. The new-watcher flow's connector→agent
+picker was also decided ahead of time, for whenever that branch happens:
+**plain Select dropdowns, no pre-suggestion** — the owner didn't see enough
+value in scanning existing `watchers:` entries to guess which agent a
+newly-picked connector "usually" pairs with, versus just two independent
+dropdowns with no cross-referencing logic to build, maintain, or test.
 
 ### `DefaultsScreen` made editable (shipped, `agent_defaults`/`watcher_defaults` only)
 
