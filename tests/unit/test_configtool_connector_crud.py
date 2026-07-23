@@ -1,11 +1,10 @@
 """Pilot-based tests for ConnectorDetailScreen's create/edit flow.
 
-The security-critical property here (advisor-flagged: treat with the same
-weight as EditableConfig.save()'s $VAR round-trip test) is
-`test_editing_an_unrelated_field_leaves_an_existing_secret_placeholder_untouched`
-below — a connector's `server.password` set to `"${RC_PASSWORD}"` must
-survive an edit to a DIFFERENT field completely unresolved, never masked
-data, never the actual env var's real value.
+`test_editing_an_unrelated_field_leaves_a_placeholder_looking_value_untouched`
+below pins docs/design/config-tool.md decision 6's final form: a
+`server.password` value like `"${RC_PASSWORD}"` is just a plain string —
+never resolved, never given special treatment — so an edit to a DIFFERENT
+field must leave it exactly as typed.
 """
 
 from __future__ import annotations
@@ -235,20 +234,15 @@ class TestCreateConnector:
 
 
 class TestEditConnector:
-    async def test_editing_an_unrelated_field_leaves_an_existing_secret_placeholder_untouched(
+    async def test_editing_an_unrelated_field_leaves_a_placeholder_looking_value_untouched(
         self, tmp_path, work_dir
     ):
-        """THE keystone test for this screen (see module docstring): the
-        raw document (`self.entry`/`cfg.document`) never gets a resolved
-        secret written into it, regardless of what the widget shows for
-        editing. This specific fixture sets the var via `os.environ`
-        directly, WITHOUT an actual `.env` FILE on disk — `_resolve_secret_
-        display()` only ever reads the `.env` file (never `os.environ`/
-        `GatewayConfig`), so this is also the regression test for that
-        fallback path: an unresolvable reference still shows the literal
-        placeholder (with a hint, not a blank field) rather than blanking
-        or crashing."""
-        os.environ["RC_PASSWORD_CONNECTOR_TEST"] = "the-real-secret-value"
+        """docs/design/config-tool.md decision 6 (final revision): $VAR/
+        ${VAR} is no longer resolved anywhere in the normal load path — a
+        value that merely LOOKS like a placeholder is just a plain string,
+        same as any other. Editing an unrelated field must leave it exactly
+        as typed, never touched, never given special treatment."""
+        os.environ["RC_PASSWORD_CONNECTOR_TEST"] = "unrelated-value-must-not-leak-in"
         try:
             config_path = _write_config(
                 tmp_path,
@@ -262,15 +256,10 @@ class TestEditConnector:
                 await _open_connector_in_edit_mode(pilot, app)
 
                 pw_input = app.screen.query_one("#field-server-password", Input)
-                # No .env file exists, so the var can't be resolved for
-                # display — the widget must show the literal placeholder,
-                # never the resolved secret and never a masked "****" at the
-                # data level (masking is display-only via
-                # Input(password=True); .value is always the real
-                # underlying string).
+                # Shown exactly as written — no resolution, no hint, no
+                # special-casing of a value that happens to look like a
+                # placeholder.
                 assert pw_input.value == "${RC_PASSWORD_CONNECTOR_TEST}"
-                prov = app.screen.query(".field-provenance")
-                assert any("not found in .env" in str(s.render()) for s in prov)
 
                 app.screen.query_one("#field-server-username", Input).value = "renamed-bot"
                 await pilot.pause()

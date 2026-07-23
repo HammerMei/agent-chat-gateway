@@ -37,7 +37,6 @@ A subclass provides:
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import Literal
 
@@ -47,7 +46,6 @@ from textual.binding import Binding
 from textual.containers import Horizontal, VerticalScroll
 from textual.widgets import Checkbox, Footer, Header, Input, Select, Static
 
-from ..env_writer import read_env_vars
 from ..formatting import provenance_label
 from ..modals import ConfirmModal, MessageModal
 from ..model import EditableConfig, Provenance
@@ -61,27 +59,14 @@ class FieldSpec:
     label: str
     options: tuple[str, ...] | None = None
     # Masks the widget's display (Input(password=True)). docs/design/
-    # config-tool.md decision 6 revisited: secrets are stored directly in
-    # config.yaml (chmod 0600) rather than split into a companion .env file
-    # — this form never writes a new $VAR/${VAR} reference. If a field's
-    # CURRENT value already is one (an existing config not yet auto-
-    # migrated — see gateway/config_migrate.py), _resolve_secret_display()
-    # below still resolves it for display/editing rather than showing the
-    # raw placeholder.
+    # config-tool.md decision 6, final revision: secrets are stored
+    # directly in config.yaml (chmod 0600) and $VAR/${VAR} is never
+    # resolved by anything but the one-time migration
+    # (gateway/config_migrate.py) — by the time this screen opens, a
+    # pre-existing .env-backed config has already been migrated (the TUI
+    # launch path triggers it, same as `agent-chat-gateway start`), so a
+    # secret field's value is always its real, literal value here.
     secret: bool = False
-
-
-_ENV_VAR_REF_RE = re.compile(r"^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$")
-
-
-def looks_like_env_var_reference(value: str) -> bool:
-    """True if `value` is ENTIRELY a `$VAR` or `${VAR}` reference (matching
-    both forms `gateway/config.py`'s `_expand_env_vars` resolves, via
-    `os.path.expandvars`). Used by `_resolve_secret_display()` below to spot
-    a field an existing (not yet auto-migrated — gateway/config_migrate.py)
-    config still references via `.env`, so it can be resolved for display
-    instead of shown as a raw placeholder."""
-    return bool(_ENV_VAR_REF_RE.match(value))
 
 
 def widget_id(key: str) -> str:
@@ -403,41 +388,8 @@ class FormScreen(DetailScreen):
             value = get_nested(merged, spec.key)
             if value is None:
                 value = dataclass_defaults.get(spec.key)
-            if spec.secret:
-                value = self._resolve_secret_display(value)
             self._initial_values[spec.key] = value
         self._initial_values["description"] = entry.get("description")
-
-    def _resolve_secret_display(self, raw_value: object) -> object:
-        """For a secret field whose effective value is a `$VAR`/`${VAR}`
-        reference, resolve it against `.env` FOR DISPLAY ONLY, so the user
-        can actually see and edit the real password instead of the literal
-        placeholder text (user-reported: "how do you expect user to change
-        the password" if all they can see is `${SOME_VAR}`).
-
-        This does NOT weaken the security keystone documented at the top of
-        this module (`EditableConfig` never resolves `$VAR` on load/save):
-        `self.entry`/`cfg.document` still hold the raw placeholder string
-        the whole time — this reads `.env` directly via `env_writer.
-        read_env_vars()`, the same file `ConnectorDetailScreen.action_save()`
-        already reads/writes, never `GatewayConfig.from_file`/`load_dotenv`/
-        `os.environ`. Only `_initial_values` (the widget's starting display
-        value AND the diff baseline `_collect_field_updates()` compares
-        against) uses the resolved form, so leaving the field untouched
-        diffs as "unchanged" — nothing gets written to `document` or `.env`
-        — and typing a new value diffs as a genuine change exactly like any
-        other field.
-
-        Falls back to `raw_value` unchanged if it isn't an env reference, or
-        if the referenced var isn't in `.env` (e.g. sourced from the shell
-        environment instead) — never silently blanks a field that has a
-        real value; `_compose_field_row()` adds a hint for this fallback
-        case so it doesn't look identical to "value not found at all"."""
-        if not isinstance(raw_value, str) or not looks_like_env_var_reference(raw_value):
-            return raw_value
-        var_name = raw_value.strip("${}")
-        resolved = read_env_vars(self.cfg.path.parent / ".env").get(var_name)
-        return raw_value if resolved is None else resolved
 
     def _field_provenance(self, spec: FieldSpec, entry: dict) -> Provenance | None:
         top_key = spec.key.split(".", 1)[0]
@@ -450,21 +402,6 @@ class FormScreen(DetailScreen):
         provenance = self._field_provenance(spec, entry)
         prov_text = f"[dim]({provenance_label(provenance)})[/dim]" if provenance else ""
         initial = self._initial_values.get(spec.key)
-        # own_raw is this entry's OWN explicit value (pre-merge, unresolved)
-        # for a secret field — used only to detect the fallback case where
-        # _resolve_secret_display() couldn't resolve the var (the widget is
-        # then showing the raw placeholder, same as `own_raw`, rather than
-        # an actual secret) so a hint can be added instead of looking
-        # identical to a field that simply has no provenance marker.
-        own_raw = get_nested(entry, spec.key) if spec.secret else None
-        if (
-            spec.secret
-            and isinstance(own_raw, str)
-            and looks_like_env_var_reference(own_raw)
-            and initial == own_raw
-        ):
-            hint = "[dim](not found in .env — type a new value to set one)[/dim]"
-            prov_text = f"{prov_text} {hint}" if prov_text else hint
         with Horizontal(classes="field-row"):
             yield Static(spec.label, classes="field-label")
             if spec.kind == "bool":
@@ -534,8 +471,6 @@ class FormScreen(DetailScreen):
         value = get_nested(defaults_only, spec.key)
         if value is None:
             value = self._dataclass_defaults().get(spec.key)
-        if spec.secret:
-            value = self._resolve_secret_display(value)
 
         set_widget_value(spec, widget, value)
         self._reset_keys[spec.key] = read_widget_value(spec, widget)

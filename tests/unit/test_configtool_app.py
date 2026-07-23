@@ -219,17 +219,17 @@ class TestOverviewRender:
         self, tmp_path, work_dir
     ):
         """Regression: a config that parses as YAML but fails
-        GatewayConfig.from_file (here: unresolved $VAR) must not crash while
-        populating the watchers table via expanded_watchers() -> validated_view()."""
-        config_path = _write_config(tmp_path, f"""\
+        GatewayConfig.from_file (here: a missing working_directory) must
+        not crash while populating the watchers table via
+        expanded_watchers() -> validated_view()."""
+        config_path = _write_config(tmp_path, """\
             connectors:
               - name: rc
                 type: rocketchat
-                server: {{url: "$UNRESOLVED_VAR_XYZ", username: bot, password: pw}}
+                server: {url: "http://localhost:3000", username: bot, password: pw}
             agents:
               default:
                 type: claude
-                working_directory: {work_dir}
             watchers:
               - name: w1
                 room: general
@@ -354,10 +354,12 @@ class TestDetailScreenNavigation:
             assert table.row_count == 3
 
             # Invalidate the file on disk without going through the app's
-            # own reload path (mirrors an external process/editor).
+            # own reload path (mirrors an external process/editor) — drop
+            # the required working_directory so GatewayConfig.from_file()
+            # fails validation.
             with open(config_path) as f:
                 text = f.read()
-            text = text.replace("http://localhost:3000", "$UNRESOLVED_XYZ_123")
+            text = text.replace(f"working_directory: {work_dir}", "")
             with open(config_path, "w") as f:
                 f.write(text)
 

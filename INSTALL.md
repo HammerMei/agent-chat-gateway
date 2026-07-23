@@ -144,15 +144,14 @@ agent-chat-gateway onboard --repo-path ~/.agent-chat-gateway/repo
 
 ## Configuration
 
-The `onboard` wizard creates three files in `~/.agent-chat-gateway/`:
+The `onboard` wizard creates two files in `~/.agent-chat-gateway/`:
 
 | File | Purpose |
 |------|---------|
-| `config.yaml` | Connector, agent, and watcher definitions |
-| `.env` | Secrets: RC_URL, RC_USERNAME, RC_PASSWORD |
+| `config.yaml` | Connector, agent, and watcher definitions — including credentials, stored directly as plain values |
 | `install_meta.json` | Install method and version (used by `upgrade`) |
 
-**Never put passwords directly in `config.yaml`.** Use the `$RC_PASSWORD` env var reference — it is expanded automatically from `.env` at startup.
+`config.yaml` is chmod'd `0600` automatically (by the wizard, by `agent-chat-gateway start`, and by the config TUI on every save), so putting credentials directly in it is safe as long as you don't commit your filled-in copy to version control. `$VAR`/`${VAR}` references are not expanded — if you're upgrading from an older setup that used a `.env` file, the next `agent-chat-gateway start` (or opening `agent-chat-gateway config`) migrates it into `config.yaml` automatically, one-time.
 
 **Mattermost:** the `onboard` wizard only walks through Rocket.Chat setup today — it does not
 yet generate a Mattermost `connectors:` block. To add a Mattermost connector, run the wizard

@@ -56,10 +56,13 @@ class TestEditableConfigLoad(_EditableConfigTestBase):
 
     def test_env_var_reference_is_never_expanded(self):
         """Regression for the keystone decision: EditableConfig must load via
-        plain yaml.safe_load, never GatewayConfig.from_file — unresolved or
-        resolved, $VAR must survive as a literal string, and loading must NOT
-        raise even though $RC_URL is never set in the environment (unlike
-        GatewayConfig.from_file, which would raise on an unresolved var)."""
+        plain yaml.safe_load, never GatewayConfig.from_file. docs/design/
+        config-tool.md decision 6, final revision: GatewayConfig.from_file()
+        itself no longer expands $VAR either (a value that looks like a
+        placeholder is a plain literal, same as everywhere else) — so this
+        now also holds true via the real loader, confirmed below as a
+        cross-check that EditableConfig.load() didn't accidentally start
+        relying on that no-longer-distinctive behavior."""
         path = self._write(f"""\
             connectors:
               - name: rc
@@ -77,10 +80,14 @@ class TestEditableConfigLoad(_EditableConfigTestBase):
         self.assertEqual(
             cfg.connectors_raw[0]["server"]["url"], "$RC_URL_NEVER_SET_12345"
         )
-        # Sanity: the same file WOULD raise via the real loader, confirming
-        # EditableConfig.load is doing something meaningfully different.
-        with self.assertRaises(ValueError):
-            GatewayConfig.from_file(path)
+        # Cross-check: the real loader treats it identically now (a plain
+        # literal, not raised on, not resolved) — EditableConfig.load()'s
+        # own reasons for using plain yaml.safe_load (provenance, raw
+        # rooms: groupings — see module docstring) still stand regardless.
+        real_cfg = GatewayConfig.from_file(path)
+        self.assertEqual(
+            real_cfg.connectors[0].raw["server"]["url"], "$RC_URL_NEVER_SET_12345"
+        )
 
     def test_nonexistent_file_raises_file_not_found(self):
         with self.assertRaises(FileNotFoundError):

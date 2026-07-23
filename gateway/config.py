@@ -1,8 +1,25 @@
-"""Configuration loader with environment variable expansion.
+"""Configuration loader.
 
 Shared config dataclasses (``PermissionConfig``, ``ToolRule``, ``AgentConfig``,
 ``ConnectorConfig``, ``WatcherConfig``) are defined in ``gateway.core.config``
 and re-exported here so existing import paths continue to work.
+
+``GatewayConfig.from_file()`` no longer resolves ``$VAR``/``${VAR}`` in
+config values (docs/design/config-tool.md decision 6, final revision) —
+secrets live directly in config.yaml (``chmod 0600``), and any pre-existing
+``.env``-backed config is auto-migrated into that form on the first
+``agent-chat-gateway start`` (``gateway/config_migrate.py``) or the config
+TUI's launch, both enforced, not optional. An audit before removing this
+found ambient (non-``.env``) ``$VAR`` resolution had no real caller anywhere
+in this project — no systemd unit, no K8s manifest, no doc recommending it,
+no committed example using it; only unit tests exercising the mechanism
+itself. ``_expand_env_vars()``/``ENV_VAR_REF_RE`` below are KEPT (not dead
+code) — ``gateway/config_migrate.py``'s one-time migration still needs them
+to resolve a legacy ``.env``-backed value into a literal at migration time;
+they're simply no longer called from the normal load path. Once migrated
+(or if a value merely happens to look like ``${SOMETHING}``), it is treated
+as a plain string like any other — deliberately, so a password that
+happens to resemble a placeholder is never silently misinterpreted.
 """
 
 import logging
@@ -13,7 +30,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
-from dotenv import load_dotenv
 
 # Re-export core config types — canonical definitions in gateway.core.config
 from .core.config import (  # noqa: F401 — re-exports
@@ -77,9 +93,6 @@ class GatewayConfig:
         if not path.exists():
             raise FileNotFoundError(f"Config file not found: {path}")
 
-        # Auto-load .env from the same directory as config.yaml (no-op if absent)
-        load_dotenv(path.parent / ".env")
-
         with open(path) as f:
             raw = yaml.safe_load(f) or {}
 
@@ -89,8 +102,8 @@ class GatewayConfig:
                 f"got {type(raw).__name__}."
             )
 
-        # Expand env vars in all string values recursively
-        raw = _expand_env_vars(raw)
+        # No $VAR/${VAR} expansion here — see module docstring. Any such
+        # string in a loaded config is treated as a plain literal.
 
         config_dir = Path(path).parent
 
@@ -662,9 +675,16 @@ ENV_VAR_REF_RE = re.compile(r"\$\{?\w+")
 def _expand_env_vars(obj, _path: str = ""):
     """Recursively expand $ENV_VAR and ${ENV_VAR} in string values.
 
+    NOT called by `GatewayConfig.from_file()` (see module docstring) — the
+    real gateway loader treats `$VAR`/`${VAR}` as a plain literal string,
+    same as everything else. This function's only remaining caller is
+    `gateway/config_migrate.py`'s one-time migration, which uses it to
+    resolve a legacy `.env`-backed value into its literal form.
+
     Raises ValueError when an unresolved placeholder (e.g. ``${MISSING_VAR}``)
-    is detected so that startup fails immediately with a clear diagnostic instead
-    of silently using the literal placeholder string as a config value.
+    is detected, so a migration fails loudly rather than silently writing
+    the literal placeholder string into config.yaml as if it were the real
+    secret value.
     """
     if isinstance(obj, str):
         expanded = os.path.expandvars(obj)

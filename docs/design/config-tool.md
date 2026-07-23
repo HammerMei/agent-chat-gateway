@@ -702,6 +702,74 @@ Phase 2 first cleared the Phase 1 code review's deferred items 7–10
       originally was, and unlike that one it isn't reused elsewhere so
       there's no reuse argument either way.
 
+- **Final revision, in a further follow-up: `$VAR`/`${VAR}` expansion
+  removed from `GatewayConfig.from_file()` entirely — not just deprecated,
+  gone.** User's own framing, continuing the same thread that produced the
+  "remove `.env`, enforce migration" decision above: with `.env` migration
+  now enforced at both `agent-chat-gateway start` and the config TUI's
+  launch (see below), the TUI's `_resolve_secret_display()` machinery
+  (resolve a `${VAR}` for display, added earlier this same document to
+  solve "how do you change a password behind a placeholder") existed ONLY
+  to serve a case — an unmigrated `.env`-backed config being opened in the
+  TUI — that shouldn't be reachable anymore. Keeping it "just in case" was
+  tech debt for a case the system itself now prevents.
+  - **Audited before cutting, not assumed:** is there any REAL usage of
+    `$VAR` resolved from an AMBIENT (non-`.env`) source — a systemd unit's
+    `Environment=`, a Kubernetes manifest, a bare `RC_PASSWORD=xxx
+    agent-chat-gateway start` invocation? Exhaustive repo search: no
+    systemd unit or K8s manifest exists anywhere in this project;
+    `docker/entrypoint.acg.sh`'s own env-var quick-start mode (Mode 2)
+    deliberately resolves credentials itself and writes LITERAL values
+    into the generated config.yaml, specifically avoiding `${VAR}`-in-
+    config.yaml; every doc mentioning `$VAR` already framed it as
+    "backward compatibility only, not recommended"; no committed example
+    anywhere used it as a live pattern. The only real exercise of ambient
+    (non-`.env`) resolution was two unit tests validating the mechanism
+    itself and the migration's own safety net for it. Conclusion: this was
+    gold-plating — a theoretical capability of `os.path.expandvars`
+    nothing in the project actually depended on.
+  - **The false-positive risk this closes:** with `${VAR}` still
+    "meaning something," a real secret whose plaintext value happens to
+    resemble a placeholder (`${SOME_WORD}`) risked being silently
+    misinterpreted — either raising a confusing "unresolved environment
+    variable" error for a password that was never meant to be a reference,
+    or (worse) actually resolving against an unrelated, coincidentally-
+    matching env var. Once `$VAR` is never expanded, a value is always
+    exactly what it says, full stop — this is the same reasoning applied
+    at the very start of this thread (the user: "what happens if someone's
+    password itself just looks like a VAR?").
+  - **Shipped:**
+    - `gateway/config.py`'s `GatewayConfig.from_file()` no longer calls
+      `load_dotenv()`/`_expand_env_vars()` at all. `_expand_env_vars()`
+      and `ENV_VAR_REF_RE` are KEPT (not dead code) — `gateway/
+      config_migrate.py`'s one-time migration is their only remaining
+      caller, still needing to resolve a legacy `.env`-backed value into
+      its literal form at migration time.
+    - The config TUI's launch (`gateway/configtool/__init__.py`'s
+      `run_app()`) now runs the SAME migration `agent-chat-gateway start`
+      runs, before ever constructing `ConfigToolApp` — closing the one
+      remaining gap where opening the TUI directly (without ever running
+      `start`) could still show a pre-migration `${VAR}`-referencing
+      config. A missing config.yaml is deliberately NOT fatal here (unlike
+      `start_daemon()`, which needs an actually-loadable config to run the
+      service) — the TUI already has its own graceful "does not currently
+      load" banner for that case, so `FileNotFoundError` is let through to
+      it rather than blocking the TUI from opening.
+    - `_resolve_secret_display()`, `looks_like_env_var_reference()`
+      (`gateway/configtool/screens/form_common.py`), and the entire
+      `gateway/configtool/env_writer.py` module (its last remaining
+      function, `read_env_vars()`, had no other caller) are all deleted —
+      genuinely dead code once the TUI can assume every secret field it
+      ever displays is already a real, literal value.
+    - Tests updated across the board to assert the new invariant: a
+      config value that looks like `${VAR}` — resolvable or not — is used
+      exactly as written, never raised on, never resolved, by BOTH
+      `GatewayConfig.from_file()` and `EditableConfig.load()` now (the
+      distinction between the two loaders that used to matter for this
+      reason no longer does; they still differ for the two reasons that
+      remain — provenance and raw `rooms:` groupings, per `EditableConfig`'s
+      own module docstring).
+
 - **Shipped (added after initial Phase 2 review — user caught that "CRUD"
   was being used loosely and Delete had never actually been designed for
   agents/connectors; checked, and they were right, nothing in this
