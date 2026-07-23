@@ -188,15 +188,17 @@ per-row status lookups.
 | Screen | Kind | Status |
 |---|---|---|
 | `OverviewScreen` | root | **Shipped.** 5 tabs: Connectors, Agents, Watchers, Defaults, Tool Presets |
-| `AgentDetailScreen` | pushed | **Shipped, all 3 modes.** view/edit/create. Form fields are a manually-maintained mirror of `$defs/agent` (not a runtime schema interpreter — safe since the schema is closed). Nothing is written to `document` until Save; Save diffs every field against its value-at-open and writes only what changed (docs/design/config-tool.md decision 2). Tool-list fields (`owner_allowed_tools`/`guest_allowed_tools`) stay view-only here — separate tool-list-editor work. Escape with unsaved changes routes through `ConfirmModal` |
+| `AgentDetailScreen` | pushed | **Shipped, all 3 modes.** view/edit/create. Form fields are a manually-maintained mirror of `$defs/agent` (not a runtime schema interpreter — safe since the schema is closed). Nothing is written to `document` until Save; Save diffs every field against its value-at-open and writes only what changed (docs/design/config-tool.md decision 2). Tool-list fields (`owner_allowed_tools`/`guest_allowed_tools`) are **shipped, editable** — two `ListView`s ('a' add via `PresetOrInlineModal`, 'x' remove), diffed the same way (against the MERGED value at open) but OUTSIDE the `FieldSpec` pipeline, since a list of preset-refs/inline-rule-dicts doesn't fit it. Escape with unsaved changes routes through `ConfirmModal` |
 | `ConnectorDetailScreen` | pushed | **Shipped, all 3 modes.** Per-type fixed field lists (tree editor deferred — see Part 3). `type`/`name` immutable in edit mode |
 | `WatcherDetailScreen` | pushed | **Shipped**, `mode="view"` only still — Phase 3. Already takes a `mode: Literal["view","edit","create"]` param — no screen-class rework needed when its turn comes |
 | `DefaultsScreen` | pushed | **Shipped** (view-only): shows blast radius per key |
-| `ToolPresetsScreen` | pushed | **Shipped** (view-only): rule list + "used by" (checked against the MERGED per-agent tool list, not the raw entry — see gotchas below) |
+| `ToolPresetsScreen` | pushed | **Shipped, editable.** Rule list + "used by" (checked against the MERGED per-agent tool list, not the raw entry — see gotchas below). 'a' adds a rule (`InlineToolRuleModal`) / 'd' removes the selected one — both save immediately (no separate edit mode; a bare list of rules has no provenance/blast-radius concept to protect). Deleting the WHOLE preset happens from `OverviewScreen`'s Tool Presets tab instead (`d` on the row), not from inside this screen |
 | `ConfirmModal` | modal | **Shipped** (`gateway/configtool/modals.py`) — yes/no dialog, Cancel focused by default. Gates `ConfigToolApp.action_quit()` on `EditableConfig.dirty`, and `AgentDetailScreen`'s own per-screen form-dirty flag on Escape |
 | `MessageModal` | modal | **Shipped** (`gateway/configtool/modals.py`) — dismiss-only error/info dialog; replaces `notify(severity="error")` for anything worth blocking on (validation/save/delete failures) — user-reported that toasts vanish before a multi-line error can be read |
 | `TypePickerModal` | modal | **Shipped** (`gateway/configtool/modals.py`) — generic list-of-strings picker (`ListView`-based), reused as-is for both the agent-type picker (claude/opencode) and the connector-type picker (rocketchat/mattermost/voice/script) |
-| `EntityPickerModal`, `PresetOrInlineModal`, `InlineToolRuleModal` | modals | Not yet built (phase 2/3) |
+| `PresetOrInlineModal`, `InlineToolRuleModal` | modals | **Shipped** (`gateway/configtool/modals.py`) — the tool-list editor's "add a rule" flow: reference an existing preset / write an inline rule (live regex validation, same compile flags `ToolRule.from_config()` uses) / detour to create a brand-new preset |
+| `TextPromptModal` | modal | **Shipped** (`gateway/configtool/modals.py`) — free-text equivalent of `TypePickerModal`, added for the "new tool preset — name" prompt (preset names aren't a fixed enum) |
+| `EntityPickerModal` | modal | Not yet built (phase 3 — watcher creation's connector/agent picker) |
 | `RoomListEditorScreen` | pushed (2nd level) | Not yet built (phase 3) |
 | `$EDITOR` escape hatch | action | **Shipped.** `App.suspend()` + subprocess; Overview-only |
 | `HelpScreen` | modal or pushed | **Not yet built — owner-requested addition, tracked for phase 2.** On mount, focus starts on the tab bar rather than the list (a real gap a user hit) — Phase 1's fix was surfacing the existing `tab`→focus-next binding in the footer (`Binding("tab", "app.focus_next", "Focus next / enter list", show=True)` on `OverviewScreen`), but a dedicated help screen (`?` binding, listing every screen's keybindings) is the more scalable fix once phase 2/3 add enough screens/actions that the footer alone gets crowded |
@@ -937,9 +939,121 @@ Phase 2 first cleared the Phase 1 code review's deferred items 7–10
   the untouched original if `save()` rejects it. `self.entry` itself is
   never mutated until `save()` has actually succeeded.
 - **Not yet built:** the `.env` toggle wiring (above), the generic tree
-  editor (deferred, above), tool-list editor + `PresetOrInlineModal` +
-  `InlineToolRuleModal`, `ToolPresetsScreen` made editable (used-by
-  warnings).
+  editor (deferred, above). The tool-list editor (`PresetOrInlineModal` /
+  `InlineToolRuleModal` / editable `ToolPresetsScreen`) shipped in a later
+  session — see its own entry further down.
+
+### Tool-list editor: `PresetOrInlineModal` / `InlineToolRuleModal` / editable `ToolPresetsScreen` (shipped)
+
+Closes the last item from Phase 2's "not yet built" list above. Lets an
+agent's `owner_allowed_tools`/`guest_allowed_tools` be edited directly in the
+TUI, and lets `tool_presets` entries be created, extended, and deleted
+without the `$EDITOR` escape hatch.
+
+- **Where the list lives, and how Save diffs it.** Tool lists sit OUTSIDE
+  `FormScreen`'s `FieldSpec`/`apply_update()` pipeline entirely — that
+  machinery is scalar-field-shaped (str/int/bool/enum/comma-list), and a
+  list of preset-name-strings interleaved with inline-rule-dicts doesn't fit
+  it without distorting it for every other field. Instead,
+  `AgentDetailScreen._tool_list_state()` snapshots the MERGED (effective)
+  value of both keys when the form opens — the exact same "what's currently
+  in effect" semantics `_compute_initial_values()` already uses for every
+  scalar field — into `self._tool_lists`/`self._tool_lists_initial`.
+  `action_save()` diffs the FINAL local list against that snapshot directly
+  (not through `_collect_field_updates()`) and writes `target_entry[key]`
+  only if it actually changed. Untouched stays untouched — opening the form
+  and saving some unrelated field never converts an inherited tool list into
+  an explicit override, matching decision 2 ("editing an inherited field
+  always writes an explicit per-entry override") applied honestly: nothing
+  written unless something was actually edited.
+- **Clearing the list to empty is NOT the same as "revert to inherited."**
+  Every other list-shaped `FieldSpec` (`new_session_args`,
+  `context_inject_files`) treats "cleared to blank" as "pop the key, go back
+  to inherited" (`read_widget_value()`'s `text_to_list(...) or None`). Tool
+  allow-lists deliberately do NOT follow that rule: an agent explicitly
+  narrowed to zero allowed tools is a meaningfully different, security-
+  relevant state from "never set this key, inherit whatever `agent_defaults`
+  grants" — silently reinterpreting "the user emptied the list in the
+  editor" as "go back to inheriting" would be a real, quiet privilege
+  change in the wrong direction (a NARROWER intent turning into a WIDER
+  effective grant). So a changed list — even an empty one — is always
+  written in full as an explicit override; there is no "reset tool list to
+  inherited" affordance yet (a plausible follow-up, not built this pass).
+- **`PresetOrInlineModal`** merges what would otherwise be two separate
+  modals (a fixed 3-way choice, plus a picker over existing preset names)
+  into one `ListView`: every current `tool_presets` name first (dismisses
+  `("preset", name)`), then two fixed rows — write an inline rule
+  (`("inline", None)`) or create a brand-new preset (`("new_preset", None)`).
+  Doing the reference-a-preset case as items IN this same list (rather than
+  a separate `EntityPickerModal` step after choosing "reference a preset")
+  avoids an extra modal hop for what's the single most common case in
+  practice (add a preset a sibling agent already uses).
+- **The "create a new preset" branch is a ONE-WAY detour, not a
+  return-with-result flow.** Choosing it pushes `ToolPresetsScreen` for the
+  new name directly; the user adds rules there, then presses Escape to
+  return to the agent form and references it like any other existing preset
+  via the normal "preset" path. No plumbing threads the new name back
+  through the screen stack automatically — simpler, and matches how
+  `PresetOrInlineModal`'s own docstring frames it. Confirmed by test
+  (`test_creating_a_new_preset_detours_to_tool_presets_screen`) that the
+  agent form's tool list is provably untouched immediately after the
+  detour.
+- **A brand-new preset never touches disk until its first rule is added.**
+  `OverviewScreen.action_new_entity()`'s `tab-presets` branch (and the
+  "create new preset" detour above) push `ToolPresetsScreen` for a name that
+  may not exist in `tool_presets` yet — no `document`/`save()` call at that
+  point. `ToolPresetsScreen.action_add_rule()`'s
+  `presets.setdefault(preset_name, [])` is what actually materializes the
+  key, right before the first rule is appended and saved. Escaping out
+  before adding anything therefore leaves zero trace in `config.yaml` — no
+  separate "rollback an empty create" path was needed. The one rollback
+  path that DOES exist (`action_add_rule()`'s `except` branch) tracks
+  whether the key existed BEFORE this attempt (`existed_before`) so a
+  failed first-ever add correctly deletes the just-created empty key, while
+  a failed add to an ALREADY-existing (if unusually rule-less) preset does
+  not wrongly delete that preset.
+- **Deleting the whole preset lives on `OverviewScreen`'s Tool Presets tab
+  (`d`), not inside `ToolPresetsScreen`.** `ToolPresetsScreen` only ever
+  edits ONE preset's own rule list (add/remove a rule) — a second,
+  much-more-destructive "delete everything under this name" action inside
+  the same screen, on the same 'd' key that already means
+  "delete the selected rule," would be one keystroke away from the wrong
+  outcome. Whole-preset deletion instead reuses the exact
+  pre-check-before-destructive-confirm shape `find_referencing_watcher_labels()`
+  already established for connectors/agents — a new
+  `find_agents_referencing_preset()` in `form_common.py` (relocated,
+  unchanged logic, from what used to be inline in
+  `ToolPresetsScreen._body_text()`) blocks the delete with a clear
+  `MessageModal` naming every referencing agent, checked against the MERGED
+  view (an agent that only inherits the preset via `agent_defaults` still
+  counts as a user, not just entries with an explicit override).
+- **`OverviewScreen.on_screen_resume()`, a new hook, not a preset-specific
+  special case.** Every OTHER mutating flow in this app pops its screen
+  immediately after a successful save and calls `app.reload_config()` right
+  after — that's the one and only place Overview's tables get repainted
+  from a fresh reload. `ToolPresetsScreen`'s add/delete-rule intentionally
+  does NOT pop after succeeding (so a user can add several rules to one
+  preset in a single sitting without re-entering it each time), so there
+  was no pop-then-reload call site to hang a repaint off of. Rather than
+  bolt a preset-specific reload call onto `ToolPresetsScreen` itself (which
+  would need to know about `OverviewScreen`, breaking the direction
+  dependencies are supposed to flow in this app), `OverviewScreen` now
+  implements Textual's `on_screen_resume()` — fired whenever it becomes the
+  active screen again after ANY pushed screen pops, for ANY reason — and
+  just calls `self.repaint_from_memory()`. Confirmed harmless and
+  idempotent on every pre-existing pop-then-reload path (repainting twice
+  costs nothing observable), and it is what makes "add three rules to a
+  preset, then Escape all the way back to Overview, and see the updated
+  rule count" work without `ToolPresetsScreen` reaching into `OverviewScreen`
+  at all.
+- Test coverage: `tests/unit/test_configtool_tool_presets.py` (add/delete
+  rule persistence + rollback, invalid-regex inline validation, the
+  new/duplicate/delete-blocked/delete-confirmed preset flows on
+  `OverviewScreen`) and `tests/unit/test_configtool_agent_tool_list.py`
+  (merged-value prefill, untouched-writes-nothing, explicit-empty-override,
+  reference-existing-preset, write-inline-rule, cancel-leaves-untouched,
+  create-new-preset-detour). `uv run pytest tests/unit tests/integration -q`
+  and `uv run ruff check gateway/ tests/` both green.
 
 **Phase 3: Watcher CRUD + defaults editing.** `WatcherDetailScreen`
 edit/create; new-watcher flow (pickers now enumerate entities creatable
