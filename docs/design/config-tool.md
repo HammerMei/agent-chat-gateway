@@ -612,13 +612,95 @@ Phase 2 first cleared the Phase 1 code review's deferred items 7–10
     10. A missing `config.yaml` (fresh install, before onboarding) surfaced
         as "Config migration failed: Config file not found" instead of the
         clearer pre-existing "Failed to load config: Config file not
-        found" — fixed as a side effect of finding 5's reordering (a
-        missing config with no `.env` now falls through to
-        `GatewayConfig.from_file()`'s own, clearer error).
+        found" — **claimed** fixed as a side effect of finding 5's
+        reordering. Round 2 (below) found this claim didn't actually hold
+        and the reordering introduced a worse, new regression instead.
     New tests added for each: a real symlinked-config-path repro (confirms
     the real host files get migrated, not just the runtime symlinks), a
     chmod-permissions test, a pipe-message-sanitization test, an `OSError`-
     catch test, and reorder/no-op edge cases.
+
+  - **Round 2 (user-requested a second pass on round 1's own fixes) — 8
+    more findings, all fixed. The headline: round 1's fixes for #1 and #5/
+    #10 above INTERACTED to create a new, real regression neither one had
+    in isolation, caught by three independent finder angles (removed-
+    behavior audit, line-by-line, cross-file tracer) converging on the
+    same root cause.**
+    1. **The interaction bug.** Round 1's reordering (check `.env` before
+       loading config.yaml) let a MISSING config.yaml with no `.env`
+       alongside it slip through `migrate_env_to_config()` as a silent,
+       false `MigrationResult(migrated=False)` no-op — no exception at
+       all. That, in turn, meant round 1's OTHER new line —
+       `_harden_config_permissions()`'s unconditional, unguarded
+       `chmod()` — was reached with a nonexistent file and crashed with an
+       uncaught `FileNotFoundError`, bypassing `_cleanup()` and the clean
+       "error:" pipe message every other fatal branch in `start_daemon()`
+       produces. Separately, the CLI's `config migrate-env` reported a
+       FALSE "Nothing to migrate" success (exit 0) for the same missing-
+       path case — masking a broken `--config` path or not-yet-mounted
+       Docker volume as a healthy no-op. Fixed by adding an explicit,
+       unconditional `config_path.exists()` check as the actual first
+       thing `migrate_env_to_config()` does (still before `.env`'s own
+       check, so the double-parse fix is unaffected) — raising
+       `FileNotFoundError` immediately, regardless of whether `.env`
+       exists, so this can never be silently skipped by any caller again.
+       This walks back round 1's claim about finding #10 above: the clean
+       "Failed to load config" wording doesn't get inherited this way
+       after all — `start_daemon()`'s existing "Config migration failed"
+       wrapper catches it instead, same as before round 1 touched anything
+       — but the ACTUAL regression (uncaught crash / false success) is
+       what mattered and is what's fixed.
+    2. **A second, independent way `_harden_config_permissions()` could
+       crash `start_daemon()`:** a config.yaml that exists but is
+       read-only or owned by a different uid than the daemon process
+       (both realistic for a Docker `:ro` bind-mount or host-uid-mismatched
+       volume) makes `chmod()` raise `PermissionError` even though the
+       file loads fine — silently converting a previously-working
+       deployment (pre-this-PR, `start_daemon()` never chmod'd config.yaml
+       unconditionally at all) into a hard, every-single-start crash.
+       Fixed: wrapped in `try/except OSError`, logging a warning rather
+       than failing startup — permission-hardening is now best-effort,
+       never a startup blocker.
+    3. `gateway/cli.py`'s `_run_config_migrate_env()` still didn't catch
+       `yaml.YAMLError` (raised by `EditableConfig.load()` for malformed
+       YAML — neither a `ValueError` nor an `OSError`). Widened to a bare
+       `except Exception`, matching `gateway/daemon.py`'s own handling of
+       this exact function.
+    4. **The sanitize-message fix from round 1 was itself incomplete AND a
+       new duplication** — flagged independently by the reuse, altitude,
+       and simplification angles. It added a LOCAL `_sanitize_pipe_message()`
+       in `gateway/daemon.py`, applied at only the 2 new write sites round 1
+       introduced — leaving 3 PRE-EXISTING pipe writes (lock-acquire
+       failure, config-load failure, service-crash failure) unsanitized,
+       and duplicating `gateway/service.py`'s own inline copy of the exact
+       same logic in `_write_startup_signal()`. Concrete trigger: a
+       malformed config.yaml makes `GatewayConfig.from_file()` raise
+       `yaml.YAMLError`, whose message is routinely multi-line — written
+       unsanitized, it would split into extra unparseable pipe lines.
+       Fixed properly this time: `sanitize_pipe_message()` is now a single
+       public function in `gateway/service.py` (used by
+       `_write_startup_signal()` there), imported into `gateway/daemon.py`
+       and applied at all 5 of its pipe-write sites, old and new alike.
+    5. **The regex-divergence fix from round 1 also didn't eliminate the
+       duplication** (reuse + simplification angles, independently) — it
+       made the two regex *strings* match, but `_count_env_refs()`'s copy
+       and `_expand_env_vars()`'s copy were still two independent literals
+       tied together only by a comment, exactly the setup that let them
+       drift apart the first time. Fixed properly: `gateway/config.py` now
+       exports `ENV_VAR_REF_RE` as a named module-level constant (the ONE
+       definition), and `gateway/config_migrate.py` imports it instead of
+       declaring its own.
+    - **Assessed, not changed:** `.config-backups/` bootstrap logic is now
+      independently implemented a THIRD time in `gateway/onboard.py`'s
+      `_handle_existing_config()` (the reuse angle's finding) — a real,
+      documented duplication, but lower priority (a rare, one-shot code
+      path) than the fixes above; deferred rather than risking a broader
+      refactor of `onboard.py` in the same round. `_harden_config_
+      permissions()` as a separate function (simplification angle's
+      concern it's over-engineered for one line) — kept, for the same
+      testability-without-forking reason `_sanitize_pipe_message()`
+      originally was, and unlike that one it isn't reused elsewhere so
+      there's no reuse argument either way.
 
 - **Shipped (added after initial Phase 2 review — user caught that "CRUD"
   was being used loosely and Delete had never actually been designed for

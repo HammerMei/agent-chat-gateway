@@ -307,6 +307,33 @@ class TestWriteStartupSignal(unittest.TestCase):
         self.assertIn("successfully", out.getvalue())
 
 
+class TestSanitizePipeMessage(unittest.TestCase):
+    """sanitize_pipe_message() — shared by _write_startup_signal() above AND
+    gateway/daemon.py's own pipe writes (lock-acquire/config-migration/
+    config-load/service-crash failures). Code-review finding: daemon.py
+    used to keep its own local, byte-for-byte duplicate of this exact
+    logic, applied at only 2 of its 5 write sites — consolidated here so
+    there's one definition, imported and applied everywhere."""
+
+    def test_strips_embedded_newlines(self):
+        from gateway.service import sanitize_pipe_message
+
+        result = sanitize_pipe_message("line one\nline two\r\nline three")
+        self.assertNotIn("\n", result)
+        self.assertNotIn("\r", result)
+
+    def test_leaves_a_single_line_message_unchanged(self):
+        from gateway.service import sanitize_pipe_message
+
+        self.assertEqual(sanitize_pipe_message("all good"), "all good")
+
+    def test_daemon_module_imports_the_same_function_not_a_local_copy(self):
+        import gateway.daemon
+        import gateway.service
+
+        self.assertIs(gateway.daemon.sanitize_pipe_message, gateway.service.sanitize_pipe_message)
+
+
 class TestServiceRunFatalHandshake(unittest.IsolatedAsyncioTestCase):
     """GatewayService.run() fatal paths must not emit 'ok' to the handshake pipe."""
 

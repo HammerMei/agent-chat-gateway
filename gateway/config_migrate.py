@@ -47,17 +47,14 @@ reimplementation that could quietly diverge.
 
 from __future__ import annotations
 
-import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-from .config import _expand_env_vars
+from .config import ENV_VAR_REF_RE, _expand_env_vars
 from .configtool.model import EditableConfig
-
-_ENV_REF_RE = re.compile(r"\$\{?\w+")  # matches gateway/config.py's _expand_env_vars() exactly
 
 
 @dataclass
@@ -75,7 +72,7 @@ def _count_env_refs(obj: object) -> int:
     string values, recursively — used only to report "N secret(s) migrated"
     to the user; not load-bearing for the migration itself."""
     if isinstance(obj, str):
-        return len(_ENV_REF_RE.findall(obj))
+        return len(ENV_VAR_REF_RE.findall(obj))
     if isinstance(obj, dict):
         return sum(_count_env_refs(v) for v in obj.values())
     if isinstance(obj, list):
@@ -101,19 +98,35 @@ def migrate_env_to_config(config_path: str | Path) -> MigrationResult:
     from_file()`) for a check that resolves to "nothing to do" the
     overwhelming majority of the time.
 
-    Raises `FileNotFoundError` if `config_path` itself doesn't exist (only
-    reachable once `.env` does — see above) and `ValueError` if any
-    reference can't be resolved (missing from both `.env` and the process
-    environment — same check `_expand_env_vars` already performs for the
-    real daemon load path). The caller must treat both as fatal: `.env` and
-    config.yaml are left completely untouched, and starting the gateway
-    with a half-migrated or still-referencing config would be worse than
-    refusing to start.
+    Raises `FileNotFoundError` if `config_path` itself doesn't exist —
+    checked explicitly and unconditionally, REGARDLESS of whether `.env`
+    exists (a second code-review finding, on the fix above: checking
+    `.env` before confirming `config_path` exists let a missing config with
+    no `.env` alongside it slip through as a silent, false "nothing to
+    migrate" no-op instead of a clear error — misleading standalone via the
+    CLI, `agent-chat-gateway config migrate-env`, and worse via `gateway/
+    daemon.py`'s automatic trigger, where it let the subsequent
+    unconditional `_harden_config_permissions()` chmod call crash on a
+    nonexistent file with an unhandled traceback instead of a clean
+    diagnostic). Also raises `ValueError` if any reference can't be
+    resolved (missing from both `.env` and the process environment — same
+    check `_expand_env_vars` already performs for the real daemon load
+    path). The caller must treat both as fatal: `.env` and config.yaml are
+    left completely untouched, and starting the gateway with a half-
+    migrated or still-referencing config would be worse than refusing to
+    start.
     """
     # Resolved unconditionally, before anything else touches the path — see
     # module docstring's "Symlink safety" section. Cheap even in the (now
     # overwhelmingly common) no-.env case, unlike the YAML parse below.
     config_path = Path(config_path).resolve()
+    if not config_path.exists():
+        # Matches EditableConfig.load()'s / GatewayConfig.from_file()'s own
+        # wording exactly, since this is effectively the same check, just
+        # performed earlier (before the .env stat below) so it can never be
+        # silently skipped by the "no .env" no-op path.
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+
     env_path = config_path.parent / ".env"
     if not env_path.exists():
         return MigrationResult(migrated=False)

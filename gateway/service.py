@@ -471,6 +471,19 @@ class GatewayService:
 # ── Module-level helpers ───────────────────────────────────────────────────────
 
 
+def sanitize_pipe_message(message: str) -> str:
+    """Strip embedded newlines from a message before writing it into the
+    daemon startup handshake pipe's line-oriented `info:`/`error:`/`ok`
+    protocol — an embedded newline would split one message into multiple,
+    unparseable protocol lines. Shared by `_write_startup_signal()` below
+    AND `gateway/daemon.py`'s own pipe writes (lock-acquire/config-
+    migration/config-load/service-crash failures) — code-review finding:
+    those two files used to each keep an independent inline copy of this
+    exact sanitization, applied inconsistently (only 2 of daemon.py's 5
+    write sites), so this is now the one place it's defined."""
+    return message.replace("\n", " ").replace("\r", " ")
+
+
 def _write_startup_signal(fd: int, errors: list[str], *, fatal: bool = False) -> None:
     """Write startup result to the daemon handshake pipe and close it.
 
@@ -487,9 +500,7 @@ def _write_startup_signal(fd: int, errors: list[str], *, fatal: bool = False) ->
     presence of the ``ok`` marker.
     """
     try:
-        # Sanitize error messages: newlines would split a single message into
-        # multiple protocol lines, confusing the parent's line-by-line parser.
-        sanitized = [e.replace("\n", " ").replace("\r", " ") for e in errors]
+        sanitized = [sanitize_pipe_message(e) for e in errors]
         payload = "".join(f"error:{e}\n" for e in sanitized)
         if not fatal:
             payload += "ok\n"

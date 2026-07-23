@@ -461,6 +461,21 @@ class TestCLIConfigMigrateEnv(_CLITestBase):
     def _run_migrate(self, config_path: str):
         return self._run(["config", "migrate-env", "--config", config_path])
 
+    def test_missing_config_path_reports_an_error_not_a_false_success(self):
+        """Round-2 code-review finding: a missing config path used to be
+        reported as a false 'Nothing to migrate' success (exit 0) whenever
+        no .env sat alongside it — because the .env-exists check ran before
+        confirming config.yaml itself existed. Must now report the missing
+        file clearly and exit non-zero."""
+        missing_path = str(Path(self.tmp) / "does-not-exist.yaml")
+        self.assertFalse(Path(missing_path).exists())
+
+        stdout, stderr, code = self._run_migrate(missing_path)
+
+        self.assertEqual(code, 1)
+        self.assertIn("Migration failed", stderr)
+        self.assertNotIn("Nothing to migrate", stdout)
+
     def test_no_env_file_reports_nothing_to_do(self):
         cfg_path = self._write(f"""\
             connectors:

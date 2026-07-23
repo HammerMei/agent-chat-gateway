@@ -652,6 +652,12 @@ def _resolve_paths(paths: list, base_dir: Path) -> list[str]:
 
 _config_logger = logging.getLogger("agent-chat-gateway.config")
 
+# $VAR / ${VAR} reference pattern — the one place this is defined.
+# gateway/config_migrate.py's migration imports this directly (code-review
+# finding: it used to keep its own independent copy of this exact regex,
+# which had already drifted out of sync once).
+ENV_VAR_REF_RE = re.compile(r"\$\{?\w+")
+
 
 def _expand_env_vars(obj, _path: str = ""):
     """Recursively expand $ENV_VAR and ${ENV_VAR} in string values.
@@ -669,7 +675,7 @@ def _expand_env_vars(obj, _path: str = ""):
         # when it still appears verbatim in the expanded output.
         unresolved = [
             m.group()
-            for m in re.finditer(r"\$\{?\w+", obj)
+            for m in ENV_VAR_REF_RE.finditer(obj)
             if m.group() in expanded
         ]
         if unresolved:

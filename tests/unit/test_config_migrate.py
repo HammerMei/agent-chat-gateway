@@ -187,19 +187,24 @@ class TestMigrateEnvToConfig(unittest.TestCase):
         raw = yaml.safe_load(self.config_path.read_text())
         self.assertEqual(raw["connectors"][0]["server"]["password"], "hunter2")
 
-    def test_missing_config_file_with_no_env_either_is_still_a_no_op(self):
-        """Code-review finding: the .env-exists check must run BEFORE
-        config.yaml is loaded, so a fresh install (neither file exists yet)
-        gets a clean no-op here — letting GatewayConfig.from_file() be the
-        one to raise the clear 'config file not found' error later, instead
-        of this function raising a confusing 'migration failed' for what is
-        actually just a missing config file."""
+    def test_missing_config_file_with_no_env_either_still_raises(self):
+        """Round-2 code-review finding, correcting round 1's own fix: checking
+        .env's existence before config_path's own existence let a missing
+        config with no .env slip through as a silent, false "nothing to
+        migrate" no-op — misleading standalone via the CLI (reports success
+        for a typo'd/missing path) and worse via gateway/daemon.py's
+        automatic trigger, where the no-op let the very next line
+        (_harden_config_permissions(), an unconditional chmod) crash on the
+        nonexistent file with an unhandled traceback. config_path's own
+        existence is now checked explicitly and unconditionally, regardless
+        of whether .env exists — still before EditableConfig.load() ever
+        runs, so the efficiency fix (no wasted YAML parse in the common
+        case) is unaffected."""
         self.assertFalse(self.config_path.exists())
         self.assertFalse(self.env_path.exists())
 
-        result = migrate_env_to_config(self.config_path)
-
-        self.assertFalse(result.migrated)
+        with self.assertRaises(FileNotFoundError):
+            migrate_env_to_config(self.config_path)
 
     def test_missing_config_file_with_an_env_present_still_raises(self):
         """The no-op path only applies when .env is ALSO missing — if .env

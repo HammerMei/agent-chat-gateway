@@ -438,10 +438,14 @@ def _run_config_migrate_env(args) -> None:
 
     try:
         result = migrate_env_to_config(args.config)
-    except (ValueError, OSError) as e:
-        # OSError also covers FileNotFoundError (raised by EditableConfig.
-        # load()) plus e.g. a PermissionError from env_path.rename() —
-        # both should print cleanly here, not crash with a raw traceback.
+    except Exception as e:
+        # Broad on purpose, matching gateway/daemon.py's own handling of
+        # this exact function: ValueError (unresolvable $VAR), OSError
+        # (FileNotFoundError, a PermissionError from env_path.rename()),
+        # and yaml.YAMLError (malformed config.yaml, from EditableConfig.
+        # load()'s yaml.safe_load()) all need the same clean treatment here
+        # — a raw traceback for any of them defeats the point of this
+        # command existing as a friendly, standalone entry point.
         print(f"✗ Migration failed: {e}", file=sys.stderr)
         sys.exit(1)
 
