@@ -163,6 +163,26 @@ class TestGenerateConfigYaml:
         assert watcher["agent"] == "my-agent"
         assert watcher["rooms"] == ["@alice"]
 
+    def test_generate_config_yaml_writes_credentials_directly_not_env_placeholders(self):
+        """docs/design/config-tool.md decision 6 revisited: credentials go
+        straight into config.yaml as literal values — no more $RC_URL/
+        $RC_USERNAME/$RC_PASSWORD placeholder + companion .env file."""
+        connector_data = {
+            "server_url": "https://chat.example.com",
+            "bot_username": "bot",
+            "bot_password": "secret",
+            "owners": ["alice"],
+        }
+        watchers = [{"name": "dm-alice", "room": "@alice"}]
+
+        result = generate_config_yaml("claude", "rocketchat", connector_data, watchers)
+        config = self._parse(result)
+
+        server = config["connectors"][0]["server"]
+        assert server["url"] == "https://chat.example.com"
+        assert server["username"] == "bot"
+        assert server["password"] == "secret"
+
     def test_generate_config_yaml_opencode_rocketchat(self):
         """Agent type is correctly set to opencode."""
         connector_data = {
@@ -557,7 +577,9 @@ class TestRunOnboard:
         return _side_effect
 
     def test_run_onboard_happy_path(self, tmp_path: Path):
-        """run_onboard (claude) writes config, .env, and install_meta.json."""
+        """run_onboard (claude) writes config.yaml (credentials directly in
+        it — no companion .env, docs/design/config-tool.md decision 6
+        revisited) and install_meta.json."""
         from gateway.onboard import run_onboard
 
         config_file = tmp_path / "config.yaml"
@@ -588,7 +610,7 @@ class TestRunOnboard:
             run_onboard(repo_path=tmp_path)
 
         assert config_file.exists()
-        assert env_file.exists()
+        assert not env_file.exists()  # no companion .env written anymore
         assert meta_file.exists()
 
         # Config is valid YAML
@@ -597,6 +619,10 @@ class TestRunOnboard:
         assert "agents" in config
         assert "watchers" in config
 
+        # config.yaml is chmod'd 0600 immediately — it holds the plaintext
+        # credentials directly now.
+        assert oct(config_file.stat().st_mode)[-3:] == "600"
+
         # claude gets a default working_directory (created on disk) even though
         # it's never prompted for one — GatewayConfig.from_file requires it
         # for every backend, not just opencode.
@@ -604,11 +630,11 @@ class TestRunOnboard:
         assert config["agents"]["my-agent"]["working_directory"] == str(expected_work_dir)
         assert expected_work_dir.is_dir()
 
-        # .env has the right keys
-        env_text = env_file.read_text()
-        assert "RC_URL=https://chat.example.com" in env_text
-        assert "RC_USERNAME=bot" in env_text
-        assert "RC_PASSWORD=secret" in env_text
+        # Credentials are in config.yaml directly, as literal values.
+        server = config["connectors"][0]["server"]
+        assert server["url"] == "https://chat.example.com"
+        assert server["username"] == "bot"
+        assert server["password"] == "secret"
 
         # install_meta has method set
         meta = json.loads(meta_file.read_text())

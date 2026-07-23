@@ -24,6 +24,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import yaml
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -441,6 +442,133 @@ class TestCLIConfigValidate(_CLITestBase):
         self.assertEqual(code, 0)
         self.assertIn("stale-watcher", stdout)
         self.assertIn("dropped on next start", stdout)
+
+
+class TestCLIConfigMigrateEnv(_CLITestBase):
+    """config migrate-env: standalone entry point for the same one-time
+    migration gateway/daemon.py's start_daemon() runs automatically."""
+
+    def setUp(self):
+        super().setUp()
+        self.agent_dir = Path(self.tmp) / "work"
+        self.agent_dir.mkdir()
+
+    def _write(self, yaml_text: str) -> str:
+        path = Path(self.tmp) / "config.yaml"
+        path.write_text(textwrap.dedent(yaml_text))
+        return str(path)
+
+    def _run_migrate(self, config_path: str):
+        return self._run(["config", "migrate-env", "--config", config_path])
+
+    def test_missing_config_path_reports_an_error_not_a_false_success(self):
+        """Round-2 code-review finding: a missing config path used to be
+        reported as a false 'Nothing to migrate' success (exit 0) whenever
+        no .env sat alongside it — because the .env-exists check ran before
+        confirming config.yaml itself existed. Must now report the missing
+        file clearly and exit non-zero."""
+        missing_path = str(Path(self.tmp) / "does-not-exist.yaml")
+        self.assertFalse(Path(missing_path).exists())
+
+        stdout, stderr, code = self._run_migrate(missing_path)
+
+        self.assertEqual(code, 1)
+        self.assertIn("Migration failed", stderr)
+        self.assertNotIn("Nothing to migrate", stdout)
+
+    def test_no_env_file_reports_nothing_to_do(self):
+        cfg_path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                room: general
+        """)
+        stdout, stderr, code = self._run_migrate(cfg_path)
+
+        self.assertEqual(code, 0)
+        self.assertIn("Nothing to migrate", stdout)
+
+    def test_migrates_and_reports_the_reference_count(self):
+        cfg_path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: "${{RC_PASSWORD}}"}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                room: general
+        """)
+        (Path(self.tmp) / ".env").write_text("RC_PASSWORD=hunter2\n")
+
+        stdout, stderr, code = self._run_migrate(cfg_path)
+
+        self.assertEqual(code, 0)
+        self.assertIn("Migrated 1 secret reference(s)", stdout)
+        self.assertFalse((Path(self.tmp) / ".env").exists())
+        raw = yaml.safe_load(Path(cfg_path).read_text())
+        self.assertEqual(raw["connectors"][0]["server"]["password"], "hunter2")
+
+    def test_unresolvable_reference_exits_nonzero(self):
+        cfg_path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: "${{MISSING_VAR}}"}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                room: general
+        """)
+        (Path(self.tmp) / ".env").write_text("UNRELATED=1\n")
+
+        stdout, stderr, code = self._run_migrate(cfg_path)
+
+        self.assertEqual(code, 1)
+        self.assertIn("Migration failed", stderr)
+        self.assertTrue((Path(self.tmp) / ".env").exists())
+
+    def test_plain_oserror_is_caught_cleanly_not_a_raw_traceback(self):
+        """Code-review finding: the original except clause only caught
+        (ValueError, FileNotFoundError) — a plain OSError (e.g. a
+        PermissionError from env_path.rename()) would have crashed with an
+        unhandled traceback instead of the clean '✗ Migration failed' message."""
+        cfg_path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                room: general
+        """)
+
+        with patch(
+            "gateway.config_migrate.migrate_env_to_config",
+            side_effect=OSError("disk full"),
+        ):
+            stdout, stderr, code = self._run_migrate(cfg_path)
+
+        self.assertEqual(code, 1)
+        self.assertIn("Migration failed", stderr)
+        self.assertIn("disk full", stderr)
 
 
 # ---------------------------------------------------------------------------

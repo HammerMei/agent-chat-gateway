@@ -1,14 +1,22 @@
 """Unit tests for gateway.daemon (pure-logic functions).
 
-Tests cover: is_running, _wait_for_startup_signal, _cleanup, stop_daemon.
-start_daemon uses os.fork() which is not suitable for unit tests and is
-intentionally excluded.
+Tests cover: is_running, _wait_for_startup_signal, _cleanup, stop_daemon,
+_harden_config_permissions. start_daemon() itself uses os.fork() which is
+not suitable for unit tests and is intentionally excluded —
+_harden_config_permissions() is extracted as a standalone function
+specifically so the logic start_daemon() calls into is still testable
+without forking. sanitize_pipe_message() (imported here from
+gateway.service, code-review finding: consolidated from a duplicate local
+copy) is tested in tests/unit/test_gateway_service.py, alongside its other
+caller _write_startup_signal().
 """
 
 from __future__ import annotations
 
+import io
 import os
 import signal
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -32,6 +40,20 @@ def _patch_paths(tmpdir: str):
         patch.object(runtime_lock_mod, "LOCK_FILE", td / "gateway.pid"),
         patch.object(daemon_mod, "LOG_FILE", td / "gateway.log"),
     )
+
+
+# ── _harden_config_permissions ─────────────────────────────────────────────────
+
+class TestHardenConfigPermissions(unittest.TestCase):
+    def test_chmods_config_to_0600_regardless_of_starting_permissions(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.yaml"
+            config_path.write_text("connectors: []\n")
+            config_path.chmod(0o644)
+
+            daemon_mod._harden_config_permissions(str(config_path))
+
+            self.assertEqual(stat.S_IMODE(config_path.stat().st_mode), 0o600)
 
 
 # ── is_running ────────────────────────────────────────────────────────────────
@@ -137,6 +159,29 @@ class TestWaitForStartupSignal(unittest.TestCase):
         with self.assertRaises(SystemExit) as ctx:
             daemon_mod._wait_for_startup_signal(read_fd)
         self.assertEqual(ctx.exception.code, 1)
+
+    def test_info_line_is_printed_to_the_console_on_success(self):
+        """A one-time config migration (gateway/config_migrate.py) reports
+        via an 'info:' line — must reach stdout, not just the log file, per
+        the user-requested "not a completely silent operation" ask."""
+        data = b"info:Migrated 1 secret reference(s) from .env into config.yaml.\nok\n"
+        read_fd = self._make_pipe_with_data(data)
+        with patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
+            with self.assertRaises(SystemExit) as ctx:
+                daemon_mod._wait_for_startup_signal(read_fd)
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertIn("Migrated 1 secret reference(s)", mock_stdout.getvalue())
+
+    def test_info_line_is_printed_even_when_degraded(self):
+        data = (
+            b"info:Migrated 1 secret reference(s) from .env into config.yaml.\n"
+            b"error:Some sidecar failed\nok\n"
+        )
+        read_fd = self._make_pipe_with_data(data)
+        with patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
+            with self.assertRaises(SystemExit):
+                daemon_mod._wait_for_startup_signal(read_fd)
+        self.assertIn("Migrated 1 secret reference(s)", mock_stdout.getvalue())
 
 
 # ── stop_daemon ───────────────────────────────────────────────────────────────

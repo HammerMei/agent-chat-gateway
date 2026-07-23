@@ -98,9 +98,9 @@ def generate_config_yaml(
         "name": "rc-home",
         "type": "rocketchat",
         "server": {
-            "url": "$RC_URL",
-            "username": "$RC_USERNAME",
-            "password": "$RC_PASSWORD",
+            "url": connector_data["server_url"],
+            "username": connector_data["bot_username"],
+            "password": connector_data["bot_password"],
         },
         "allowed_users": {
             "owners": list(owners),
@@ -433,23 +433,6 @@ def _handle_existing_config() -> bool:
     return True  # continue with wizard
 
 
-def _write_env(server_url: str, bot_username: str, bot_password: str) -> None:
-    """Write .env file with Rocket.Chat credentials."""
-    # Quote value if it contains spaces
-    def _quote(v: str) -> str:
-        return f'"{v}"' if " " in v else v
-
-    lines = [
-        f"RC_URL={_quote(server_url)}",
-        f"RC_USERNAME={_quote(bot_username)}",
-        f"RC_PASSWORD={_quote(bot_password)}",
-    ]
-    ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
-    ENV_FILE.write_text("\n".join(lines) + "\n")
-    # Restrict permissions on .env
-    ENV_FILE.chmod(0o600)
-
-
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -511,18 +494,11 @@ def run_onboard(repo_path: Path | None = None) -> None:
         working_directory=str(working_dir),
     )
     CONFIG_FILE.write_text(config_yaml)
-    # Matches ENV_FILE's own chmod below — config.yaml can hold a plaintext
-    # secret just as easily as .env can (a field saved with "Store in .env"
-    # off), so it gets the same treatment from the moment it's created.
+    # Credentials are written directly into config.yaml (docs/design/
+    # config-tool.md decision 6 revisited — no companion .env file), so it
+    # gets chmod'd immediately, the same treatment .env used to get.
     CONFIG_FILE.chmod(0o600)
     console.print(f"\n  [green]✓[/green] Wrote {CONFIG_FILE}")
-
-    _write_env(
-        credentials["server_url"],
-        credentials["bot_username"],
-        credentials["bot_password"],
-    )
-    console.print(f"  [green]✓[/green] Wrote {ENV_FILE}")
 
     method = "git" if repo_path and repo_path.exists() else "unknown"
     write_install_meta(META_FILE, method=method, repo_path=repo_path, version=PROJECT_VERSION)

@@ -97,13 +97,27 @@ class TestOverviewRender:
             assert app.screen.query_one("#defaults-table", DataTable).row_count == 3
             assert app.screen.query_one("#presets-table", DataTable).row_count == 1
 
-    async def test_tab_binding_is_visible_in_footer_and_moves_focus_into_table(
-        self, tmp_path, work_dir
-    ):
-        """On mount, focus starts on the tab bar, not the list — 'tab' is
-        rebound here (same app.focus_next action Screen already binds, just
-        with show=True) so the footer surfaces the one key needed to reach
-        the list at all. Regression for a real UX gap a user hit."""
+    async def test_focus_starts_on_the_list_not_the_tab_bar(self, tmp_path, work_dir):
+        """User-requested UX change: focus lands directly on the active
+        tab's list on mount, so the very first keypress (arrow keys, e/d)
+        already acts on a row — no longer requires pressing 'tab' first to
+        reach the list. Left/right (below) now handle tab switching
+        instead, so 'tab'/'shift+tab' cycling through focusable widgets is
+        no longer the primary way to reach the list — see
+        test_tab_binding_is_still_available_as_a_fallback for confirmation
+        that binding wasn't removed, just no longer the FIRST thing needed."""
+        config_path = _write_config(tmp_path, _valid_config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert isinstance(app.focused, DataTable)
+            assert app.focused.id == "connectors-table"
+
+    async def test_tab_binding_is_still_available_as_a_fallback(self, tmp_path, work_dir):
+        """'tab' still cycles focus (Screen's own app.focus_next, rebound
+        here with show=True) — kept as a fallback/for moving off the list
+        (e.g. onto the tab bar itself), even though it's no longer required
+        to reach the list on mount."""
         config_path = _write_config(tmp_path, _valid_config_text(work_dir))
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
@@ -111,10 +125,6 @@ class TestOverviewRender:
             bound = app.screen.active_bindings.get("tab")
             assert bound is not None
             assert bound.binding.show is True
-
-            await pilot.press("tab")
-            await pilot.pause()
-            assert isinstance(app.focused, DataTable)
 
     async def test_q_key_is_a_visible_quit_binding(self, tmp_path, work_dir):
         """'q' is the documented, discoverable quit key (App's own ctrl+q
@@ -219,17 +229,17 @@ class TestOverviewRender:
         self, tmp_path, work_dir
     ):
         """Regression: a config that parses as YAML but fails
-        GatewayConfig.from_file (here: unresolved $VAR) must not crash while
-        populating the watchers table via expanded_watchers() -> validated_view()."""
-        config_path = _write_config(tmp_path, f"""\
+        GatewayConfig.from_file (here: a missing working_directory) must
+        not crash while populating the watchers table via
+        expanded_watchers() -> validated_view()."""
+        config_path = _write_config(tmp_path, """\
             connectors:
               - name: rc
                 type: rocketchat
-                server: {{url: "$UNRESOLVED_VAR_XYZ", username: bot, password: pw}}
+                server: {url: "http://localhost:3000", username: bot, password: pw}
             agents:
               default:
                 type: claude
-                working_directory: {work_dir}
             watchers:
               - name: w1
                 room: general
@@ -286,6 +296,108 @@ class TestOverviewRender:
             await pilot.pause()
             banner = str(app_lint.screen.query_one("#banner", Static).render())
             assert "lint finding" in banner
+
+
+class TestArrowKeyTabSwitching:
+    """User-requested: left/right switch tabs directly, even while focus is
+    on the list itself (the default focus target now — see
+    TestOverviewRender.test_focus_starts_on_the_list_not_the_tab_bar) —
+    without the user needing to move focus onto the tab bar first."""
+
+    async def test_right_switches_to_the_next_tab_and_focuses_its_table(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _valid_config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.screen.query_one("TabbedContent").active == "tab-connectors"
+            assert app.focused.id == "connectors-table"
+
+            await pilot.press("right")
+            await pilot.pause()
+
+            assert app.screen.query_one("TabbedContent").active == "tab-agents"
+            assert isinstance(app.focused, DataTable)
+            assert app.focused.id == "agents-table"
+
+    async def test_left_switches_to_the_previous_tab_and_focuses_its_table(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _valid_config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.screen.query_one("TabbedContent").active = "tab-watchers"
+            await pilot.pause()
+
+            await pilot.press("left")
+            await pilot.pause()
+
+            assert app.screen.query_one("TabbedContent").active == "tab-agents"
+            assert app.focused.id == "agents-table"
+
+    async def test_right_wraps_from_the_last_tab_to_the_first(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _valid_config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.screen.query_one("TabbedContent").active = "tab-presets"
+            await pilot.pause()
+
+            await pilot.press("right")
+            await pilot.pause()
+
+            assert app.screen.query_one("TabbedContent").active == "tab-connectors"
+            assert app.focused.id == "connectors-table"
+
+    async def test_left_wraps_from_the_first_tab_to_the_last(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _valid_config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.screen.query_one("TabbedContent").active == "tab-connectors"
+
+            await pilot.press("left")
+            await pilot.pause()
+
+            assert app.screen.query_one("TabbedContent").active == "tab-presets"
+            assert app.focused.id == "presets-table"
+
+    async def test_left_right_take_priority_over_the_focused_tables_own_binding(
+        self, tmp_path, work_dir
+    ):
+        """DataTable itself binds left/right to cell/column cursor movement
+        — this must not win just because the table has focus (which it
+        does, by default, now). priority=True on OverviewScreen's own
+        bindings is what makes this correct."""
+        config_path = _write_config(tmp_path, _valid_config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.screen.query_one("#connectors-table", DataTable)
+            table.focus()
+            await pilot.pause()
+
+            await pilot.press("right")
+            await pilot.pause()
+
+            assert app.screen.query_one("TabbedContent").active == "tab-agents"
+
+    async def test_clicking_a_tab_also_focuses_its_table(self, tmp_path, work_dir):
+        """on_tabbed_content_tab_activated() fires for ANY way the active
+        tab changes, not just the new left/right actions — switching via
+        the TabbedContent.active reactive directly (what a mouse click
+        does under the hood) must behave identically."""
+        config_path = _write_config(tmp_path, _valid_config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.screen.query_one("TabbedContent").active = "tab-defaults"
+            await pilot.pause()
+
+            assert isinstance(app.focused, DataTable)
+            assert app.focused.id == "defaults-table"
 
 
 class TestDetailScreenNavigation:
@@ -354,10 +466,12 @@ class TestDetailScreenNavigation:
             assert table.row_count == 3
 
             # Invalidate the file on disk without going through the app's
-            # own reload path (mirrors an external process/editor).
+            # own reload path (mirrors an external process/editor) — drop
+            # the required working_directory so GatewayConfig.from_file()
+            # fails validation.
             with open(config_path) as f:
                 text = f.read()
-            text = text.replace("http://localhost:3000", "$UNRESOLVED_XYZ_123")
+            text = text.replace(f"working_directory: {work_dir}", "")
             with open(config_path, "w") as f:
                 f.write(text)
 

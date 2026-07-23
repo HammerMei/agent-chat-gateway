@@ -89,34 +89,17 @@ Create a directory for the gateway's runtime files:
 mkdir -p ~/.agent-chat-gateway
 ```
 
-### Create `.env` file
-
-Store sensitive credentials — use whichever block matches the platform chosen in Step 2.
-
-**Rocket.Chat:**
-```bash
-cat > ~/.agent-chat-gateway/.env << 'EOF'
-RC_URL=https://your-rocket-chat-server.com
-RC_USERNAME=agent-bot
-RC_PASSWORD=your-bot-password
-EOF
-chmod 600 ~/.agent-chat-gateway/.env
-```
-Replace the values with your Rocket.Chat server URL and bot credentials.
-
-**Mattermost** (bot-token auth — the recommended path from Step 2's Option B; if using
-username/password instead, store `MM_USERNAME`/`MM_PASSWORD` in place of `MM_BOT_TOKEN`):
-```bash
-cat > ~/.agent-chat-gateway/.env << 'EOF'
-MM_URL=https://your-mattermost-server.com
-MM_TEAM=your-team-name
-MM_BOT_TOKEN=your-bot-access-token
-EOF
-chmod 600 ~/.agent-chat-gateway/.env
-```
-Replace the values with your Mattermost server URL, team name (the URL slug), and bot token.
-
 ### Create `config.yaml` file
+
+Credentials go directly into `config.yaml` below — no separate `.env` file needed.
+`agent-chat-gateway` chmods `config.yaml` to `0600` automatically (on every save via
+the config TUI, and on every `agent-chat-gateway start`), so this is safe as long as
+you don't commit your filled-in copy to version control.
+
+> Coming from an older setup that used a `.env` file? Nothing to do — the next
+> `agent-chat-gateway start` folds it into `config.yaml` automatically and removes
+> it (one-time). Run `agent-chat-gateway config migrate-env` first if you'd rather
+> do it manually / as a dry run.
 
 **Rocket.Chat:**
 ```bash
@@ -125,9 +108,9 @@ connectors:
   - name: rc-home
     type: rocketchat
     server:
-      url: $RC_URL
-      username: $RC_USERNAME
-      password: $RC_PASSWORD
+      url: https://your-rocket-chat-server.com
+      username: agent-bot
+      password: your-bot-password
     allowed_users:
       owners:
         - your-username
@@ -199,11 +182,11 @@ connectors:
   - name: mm-home
     type: mattermost
     server:
-      url: $MM_URL
-      team: $MM_TEAM
-      token: $MM_BOT_TOKEN
-      # username: $MM_USERNAME       # use this + password instead of token, not both
-      # password: $MM_PASSWORD
+      url: https://your-mattermost-server.com
+      team: your-team-name
+      token: your-bot-access-token
+      # username: your-bot-username   # use this + password instead of token, not both
+      # password: your-bot-password
     allowed_users:
       owners:
         - your-username

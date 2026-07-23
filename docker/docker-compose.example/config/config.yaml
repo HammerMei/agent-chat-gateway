@@ -1,16 +1,20 @@
 # agent-chat-gateway config — Docker example
 # Based on docker_env/config/config.yaml
 #
-# Place this file at:  ./config/config.yaml
-# Place credentials at: ./config/.env  (see .env example)
+# Place this file at: ./config/config.yaml
+# Fill in your Rocket.Chat credentials below directly — this file gets
+# chmod 600 automatically (both by the config TUI and this Docker image's
+# entrypoint), so plaintext here is fine; just don't commit your filled-in
+# copy to version control (docker/docker-compose.example/.gitignore excepts
+# THIS placeholder file only, on purpose).
 
 connectors:
   - name: rocketchat
     type: rocketchat
     server:
-      url: "$RC_URL"           # set in ./config/.env
-      username: "$RC_USERNAME"
-      password: "$RC_PASSWORD"
+      url: "http://rocketchat:3000"  # your Rocket.Chat server URL
+      username: "mybot"              # your bot's username
+      password: "changeme"           # your bot's password
     allowed_users:
       owners:
         - your-username        # change to your RC username
