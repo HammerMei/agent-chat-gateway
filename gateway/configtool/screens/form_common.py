@@ -213,7 +213,11 @@ class FormScreen(DetailScreen):
         # swallowed by whichever Input has focus, same reason Up/Down
         # navigation didn't work) resets the FOCUSED field specifically,
         # regardless of kind.
-        Binding("ctrl+r", "reset_field", "Reset field", show=True),
+        # Footer label deliberately says "to default", not just "Reset
+        # field" (user-reported: the shorter wording reads as "undo to
+        # whatever this field was before you started editing," which is
+        # NOT what this does — see action_reset_field()'s own docstring).
+        Binding("ctrl+r", "reset_field", "Reset to default", show=True),
         # User-requested (nice-to-have, not a bug): a way to check what's
         # actually in a masked secret field before saving. ctrl+t (NOT
         # ctrl+p — that's Textual's own App.COMMAND_PALETTE_BINDING, which
