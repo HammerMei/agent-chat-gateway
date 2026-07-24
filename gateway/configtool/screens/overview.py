@@ -3,17 +3,21 @@
 Five tabs: Connectors, Agents, Watchers, Defaults, Tool Presets — the latter
 two are first-class per docs/design/config-tool.md (shared resources, not
 footnotes). Selecting a row (Enter) pushes a *DetailScreen in view mode.
-'e'/'d' on the Connectors/Agents tabs act directly on the row under the
-cursor — edit opens straight into edit mode (no view detour), delete runs
-the same confirm/referencing-watcher-check/save flow FormScreen.
-action_delete() already has, without requiring a screen push first (user-
-reported: 'e' used to be shadowed by this screen's OWN 'e' binding for the
-$EDITOR escape hatch — see action_edit_config() below, now on ctrl+e). 'n'
+'e'/'d' on the Connectors/Agents/Defaults tabs act directly on the row
+under the cursor — edit opens straight into edit mode (no view detour;
+Defaults added once agent_defaults/watcher_defaults editing shipped —
+user-requested, for the same consistency the other tabs already have;
+connector_defaults specifically has nothing editable yet, so 'e' there
+just notifies rather than opening an empty form), delete runs the same
+confirm/referencing-watcher-check/save flow FormScreen.action_delete()
+already has, without requiring a screen push first (user-reported: 'e'
+used to be shadowed by this screen's OWN 'e' binding for the $EDITOR
+escape hatch — see action_edit_config() below, now on ctrl+e). 'n'
 (new_entity) creates an entry on the active tab — Agents/Connectors/Tool
-Presets support it; Watchers/Defaults still notify rather than doing
-nothing or crashing (Phase 3). 'd' additionally deletes the whole preset
-under the cursor on the Tool Presets tab (there's no separate "edit mode"
-to give 'e' a meaning there — see tool_presets.py).
+Presets support it; Watchers still notifies rather than doing nothing or
+crashing (Phase 3). 'd' additionally deletes the whole preset under the
+cursor on the Tool Presets tab (there's no separate "edit mode" to give
+'e' a meaning there — see tool_presets.py).
 """
 
 from __future__ import annotations
@@ -33,7 +37,7 @@ from ..modals import ConfirmModal, MessageModal, TextPromptModal, TypePickerModa
 from ..model import StatusIndex
 from .agent_detail import AgentDetailScreen
 from .connector_detail import CONNECTOR_TYPES, ConnectorDetailScreen
-from .defaults import DefaultsScreen
+from .defaults import DefaultsScreen, is_editable_kind
 from .form_common import find_agents_referencing_preset
 from .tool_presets import ToolPresetsScreen
 from .watcher_detail import WatcherDetailScreen
@@ -166,15 +170,21 @@ class OverviewScreen(Screen):
     # ── Actions ──────────────────────────────────────────────────────────────
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        """Hide 'Edit' from the footer on tabs that don't support it
-        (Watchers/Defaults — Phase 3; Tool Presets has no separate "edit
-        mode" to enter, see tool_presets.py). 'Delete' additionally supports
-        Tool Presets (deletes the whole preset, not a rule — see
-        action_delete_row() below) so the footer never
+        """Hide 'Edit' from the footer on tabs that don't support it at all
+        (Watchers — Phase 3; Tool Presets has no separate "edit mode" to
+        enter, see tool_presets.py). Defaults is included even though
+        connector_defaults specifically has nothing to edit — same
+        notify-instead-of-hiding precedent action_new_entity() already uses
+        for tabs it doesn't support at all (user-requested, matching the
+        Connectors/Agents/Tool-Presets convention for consistency, once
+        agent_defaults/watcher_defaults editing shipped — see
+        action_edit_row() below for the per-row check). 'Delete'
+        additionally supports Tool Presets (deletes the whole preset, not a
+        rule — see action_delete_row() below) so the footer never
         advertises a key that would just notify "not supported yet"."""
         active_tab = self.query_one(TabbedContent).active
         if action == "edit_row":
-            return active_tab in ("tab-connectors", "tab-agents")
+            return active_tab in ("tab-connectors", "tab-agents", "tab-defaults")
         if action == "delete_row":
             return active_tab in ("tab-connectors", "tab-agents", "tab-presets")
         return True
@@ -234,6 +244,18 @@ class OverviewScreen(Screen):
             if entry is None:
                 return
             screen = AgentDetailScreen(cfg, key, entry, mode="edit")
+        elif active_tab == "tab-defaults":
+            key = self._cursor_row_key("defaults-table")
+            if key is None:
+                return
+            if not is_editable_kind(key):
+                # connector_defaults specifically — nothing editable yet
+                # (see defaults.py's module docstring). Notify rather than
+                # silently doing nothing or crashing, same precedent
+                # action_new_entity() already uses for unsupported tabs.
+                self.notify(f"'{key}' has nothing editable yet.", severity="warning")
+                return
+            screen = DefaultsScreen(cfg, key, mode="edit")
         else:
             return
         screen._started_in_edit_mode = True

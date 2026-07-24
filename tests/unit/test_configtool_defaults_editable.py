@@ -307,3 +307,123 @@ class TestDefaultsEditDiscard:
 
             assert isinstance(app.screen, DefaultsScreen)
             assert app.screen.mode == "view"
+
+
+class TestDirectEditFromList:
+    """'e' directly on the Defaults tab's list row — no Enter-first detour —
+    matching the shortcut Connectors/Agents/Tool Presets already have
+    (OverviewScreen.action_edit_row()). Added after a user report that
+    turned out to be an actual, reasonable UX gap once agent_defaults/
+    watcher_defaults editing shipped, not a bug in the Enter-then-'e' path
+    (which already had its own coverage above)."""
+
+    async def test_e_on_agent_defaults_row_opens_edit_mode_directly(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.screen.query_one("TabbedContent").active = "tab-defaults"
+            await pilot.pause()
+            table = app.screen.query_one("#defaults-table", DataTable)
+            table.focus()
+            table.move_cursor(row=1)  # agent_defaults
+            await pilot.pause()
+
+            await pilot.press("e")
+            await pilot.pause()
+
+            assert isinstance(app.screen, DefaultsScreen)
+            assert app.screen.mode == "edit"
+            assert app.screen.query_one("#field-timeout", Input).value == "1800"
+
+    async def test_e_on_connector_defaults_row_notifies_instead_of_opening(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.screen.query_one("TabbedContent").active = "tab-defaults"
+            await pilot.pause()
+            table = app.screen.query_one("#defaults-table", DataTable)
+            table.focus()
+            table.move_cursor(row=0)  # connector_defaults
+            await pilot.pause()
+
+            await pilot.press("e")
+            await pilot.pause()
+
+            assert isinstance(app.screen, OverviewScreen)  # never navigated
+
+    async def test_escape_from_direct_edit_with_no_changes_returns_to_the_list(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.screen.query_one("TabbedContent").active = "tab-defaults"
+            await pilot.pause()
+            table = app.screen.query_one("#defaults-table", DataTable)
+            table.focus()
+            table.move_cursor(row=1)
+            await pilot.pause()
+            await pilot.press("e")
+            await pilot.pause()
+            assert app.screen.mode == "edit"
+
+            await pilot.press("escape")
+            await pilot.pause()
+
+            # No view-mode fallback -- straight back to the list, since
+            # this screen never had a view rendering to begin with.
+            assert isinstance(app.screen, OverviewScreen)
+
+    async def test_saving_with_no_changes_from_direct_edit_returns_to_the_list(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.screen.query_one("TabbedContent").active = "tab-defaults"
+            await pilot.pause()
+            table = app.screen.query_one("#defaults-table", DataTable)
+            table.focus()
+            table.move_cursor(row=1)
+            await pilot.pause()
+            await pilot.press("e")
+            await pilot.pause()
+
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            assert isinstance(app.screen, OverviewScreen)
+
+    async def test_saving_a_real_change_from_direct_edit_persists_and_returns(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.screen.query_one("TabbedContent").active = "tab-defaults"
+            await pilot.pause()
+            table = app.screen.query_one("#defaults-table", DataTable)
+            table.focus()
+            table.move_cursor(row=1)
+            await pilot.pause()
+            await pilot.press("e")
+            await pilot.pause()
+
+            app.screen.query_one("#field-timeout", Input).value = "120"
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmModal)  # agent-a is affected
+            await pilot.press("tab", "enter")
+            await pilot.pause()
+
+            assert isinstance(app.screen, OverviewScreen)
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert raw["agent_defaults"]["timeout"] == 120

@@ -1168,6 +1168,59 @@ dropdowns with no cross-referencing logic to build, maintain, or test.
 - `uv run pytest tests/unit tests/integration -q` — 2037 passed.
   `uv run ruff check gateway/ tests/` — clean.
 
+### Direct edit-from-list on the Defaults tab (shipped, follow-up)
+
+User-reported: after the above shipped, "I don't see a way to edit the
+defaults." Turned into a lengthy cross-machine investigation (headless
+`Pilot`-driven diagnostics against the user's real config, a live
+pty-driven real-terminal repro using Python's stdlib `pty` module to
+sidestep an ancient, unreliable `screen` build on the remote host,
+checking for a stale Python interpreter/dependency mismatch) that all
+independently confirmed the feature worked correctly — the actual cause
+turned out to be screen/terminology confusion during testing: the
+screenshots shared were `connector_defaults` (correctly non-editable),
+`WatcherDetailScreen` (a different, still-view-only screen — Phase 3),
+and `AgentDetailScreen` (editing one specific agent *entity*, an
+unrelated, already-shipped feature) — never actually the
+`agent_defaults`/`watcher_defaults` row this feature is about. Once
+pointed at the right row, editing worked exactly as built.
+
+What *was* a real, reasonable gap the report surfaced: unlike
+Connectors/Agents/Tool Presets, the Defaults tab had no direct
+edit-from-list shortcut — every other list-page action already lets you
+press 'e'/'d' on the row under the cursor without an Enter-first detour
+into a read-only view (`OverviewScreen.action_edit_row()`/
+`action_delete_row()`), but Defaults still required Enter → view → 'e'.
+Added for consistency:
+
+- `DefaultsScreen.__init__` now supports being constructed directly in
+  `mode="edit"` (calling `_compute_initial_values()` immediately, the same
+  way `AgentDetailScreen.__init__` already does) rather than only via the
+  `action_edit()` view→edit transition.
+- A new `_started_in_edit_mode` flag (mirroring `FormScreen`'s own field
+  of the same name) makes `action_back()` — and the "nothing changed"
+  branch of `action_save()` — pop straight back to the list instead of
+  falling back to a view-mode rendering the user never asked to see, for
+  a screen that skipped view mode entirely.
+- `OverviewScreen.check_action()`'s `edit_row` now includes `tab-defaults`
+  unconditionally (not gated per-row — check_action isn't re-evaluated on
+  every cursor movement within a table, only on binding-chain-changing
+  events like a screen push/pop, so a per-row-accurate footer hint isn't
+  cheaply achievable here); `action_edit_row()`'s new `tab-defaults` branch
+  checks the specific row via a new `is_editable_kind()` helper
+  (`defaults.py`) and notifies "'connector_defaults' has nothing editable
+  yet" rather than opening a broken/empty edit form — the same
+  notify-instead-of-hiding precedent `action_new_entity()` already uses
+  for tabs it doesn't support.
+- Test coverage: `TestDirectEditFromList` in
+  `tests/unit/test_configtool_defaults_editable.py` — 'e' on
+  agent_defaults opens edit mode directly with fields prefilled; 'e' on
+  connector_defaults notifies instead of navigating; Escape/an unchanged
+  Save both pop straight to the list (not a view-mode fallback); a real
+  change still shows the blast-radius confirm and persists correctly.
+- `uv run pytest tests/unit tests/integration -q` — 2042 passed.
+  `uv run ruff check gateway/ tests/` — clean.
+
 ## Implementation notes from Phase 1 (for whoever builds phase 2/3)
 
 - **Never name a Screen/Widget method `_render`** — it collides with

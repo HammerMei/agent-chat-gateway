@@ -113,6 +113,15 @@ _EDITABLE_KINDS: dict[str, tuple[tuple[FieldSpec, ...], dict[str, object]]] = {
 }
 
 
+def is_editable_kind(kind: str) -> bool:
+    """Whether `kind` has anything to edit at all — used by OverviewScreen's
+    direct-edit-from-list shortcut (action_edit_row()) to decide whether to
+    push straight into edit mode or just notify, without needing to
+    construct a DefaultsScreen (or reach into `_EDITABLE_KINDS` itself) to
+    find out."""
+    return bool(_EDITABLE_KINDS.get(kind, ((), {}))[0])
+
+
 def _labeled_entries(cfg: EditableConfig, kind: str) -> list[tuple[str, dict]]:
     """Like _ENTRY_ACCESSOR, but (label, raw_entry) pairs — used only by the
     edit flow's blast-radius CONFIRM dialog, which needs to NAME affected
@@ -152,6 +161,16 @@ class DefaultsScreen(DetailScreen):
         self._form_dirty = False
         self._last_field_error: str | None = None
         self._populating = False
+        # True when pushed ALREADY in edit mode (OverviewScreen's direct-
+        # edit-from-list shortcut — action_edit_row()) rather than reached
+        # via view mode's own 'e' key. Consulted by action_back(): a screen
+        # that skipped view mode entirely has no view state to "fall back"
+        # to — Escape must pop straight back to the list, matching
+        # FormScreen's own `_started_in_edit_mode` (form_common.py).
+        self._started_in_edit_mode = False
+        if self.mode != "view":
+            self._compute_initial_values()
+            self._populating = True
 
     def _field_specs(self) -> tuple[FieldSpec, ...]:
         return _EDITABLE_KINDS.get(self.kind, ((), {}))[0]
@@ -325,6 +344,13 @@ class DefaultsScreen(DetailScreen):
             )
             if not discard:
                 return
+        if self._started_in_edit_mode:
+            # This screen skipped view mode entirely (pushed straight into
+            # edit by OverviewScreen's direct-edit shortcut) — there is no
+            # view rendering to "fall back" to, so Escape must return to
+            # the list, the same as every other exit from that shortcut.
+            self.app.pop_screen()
+            return
         self.mode = "view"
         self._form_dirty = False
         await self.recompose()
@@ -386,6 +412,11 @@ class DefaultsScreen(DetailScreen):
             )
             return
         if not updates:
+            if self._started_in_edit_mode:
+                # No view state to fall back to (see action_back()) --
+                # nothing changed, so just return to the list directly.
+                self.app.pop_screen()
+                return
             self.mode = "view"
             await self.recompose()
             self.refresh_bindings()
