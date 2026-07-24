@@ -28,6 +28,46 @@ class DetailScreen(Screen):
 
     BODY_ID: str = "detail-body"
 
+    # Field-row layout shared by every screen with an actual edit FORM
+    # (FormScreen — AgentDetailScreen/ConnectorDetailScreen — and
+    # DefaultsScreen, which intentionally does NOT extend FormScreen — see
+    # its own module docstring for why). Lives here, on the common ancestor
+    # both reach, rather than duplicated in each: Textual's CSS type
+    # selectors below match by ancestry, not literal class name, so
+    # `DetailScreen .field-row` applies equally inside a FormScreen
+    # subclass's composed tree and a DefaultsScreen's.
+    DEFAULT_CSS = """
+    DetailScreen .entity-form {
+        padding: 1 2;
+    }
+    DetailScreen .field-row {
+        height: auto;
+        margin-bottom: 1;
+    }
+    DetailScreen .field-label {
+        width: 30;
+        padding-top: 1;
+    }
+    DetailScreen .field-provenance {
+        padding-top: 1;
+        margin-left: 2;
+        width: auto;
+    }
+    DetailScreen Checkbox {
+        width: auto;
+    }
+    /* Input's own DEFAULT_CSS is `width: 100%` — inside a Horizontal
+    field-row, that claims the ENTIRE row's width, pushing every sibling
+    that comes after it (a "Store in .env" Checkbox, a provenance/blast-
+    radius marker) off past the terminal's right edge. `1fr` matches
+    Select's own DEFAULT_CSS (which never had this problem) — share the
+    row's remaining space with fixed/auto-width siblings instead of
+    claiming all of it. */
+    DetailScreen .field-row Input {
+        width: 1fr;
+    }
+    """
+
     def compose(self) -> ComposeResult:
         yield Header()
         yield VerticalScroll(Static(self._body_text(), id=self.BODY_ID))

@@ -258,42 +258,12 @@ class FormScreen(DetailScreen):
         Binding("ctrl+t", "toggle_password_visibility", "Show/hide password", show=True),
     ]
 
-    DEFAULT_CSS = """
-    FormScreen .entity-form {
-        padding: 1 2;
-    }
-    FormScreen .field-row {
-        height: auto;
-        margin-bottom: 1;
-    }
-    FormScreen .field-label {
-        width: 30;
-        padding-top: 1;
-    }
-    FormScreen .field-provenance {
-        padding-top: 1;
-        margin-left: 2;
-        width: auto;
-    }
-    FormScreen Checkbox {
-        width: auto;
-    }
-    /* Input's own DEFAULT_CSS is `width: 100%` — inside a Horizontal
-    field-row, that claims the ENTIRE row's width, pushing every sibling
-    that comes after it (the "Store in .env" Checkbox, the provenance
-    marker) off past the terminal's right edge. Confirmed as the actual,
-    user-reported cause of a "missing" checkbox — it was rendering, just
-    off-screen; the SAME bug had already been silently hiding every
-    provenance marker on every field row since Phase 2's agent form
-    shipped (a dim decorative label going unnoticed off-screen is a lot
-    less obvious than an interactive control). `1fr` matches Select's own
-    DEFAULT_CSS (which never had this problem) — share the row's
-    remaining space with fixed/auto-width siblings instead of claiming
-    all of it. */
-    FormScreen .field-row Input {
-        width: 1fr;
-    }
-    """
+    # Field-row layout (.entity-form/.field-row/.field-label/.field-provenance/
+    # Checkbox/Input widths) moved to DetailScreen.DEFAULT_CSS (base.py) once
+    # DefaultsScreen needed the exact same layout without extending
+    # FormScreen — Textual's CSS type selectors match by ancestry, so
+    # `DetailScreen .field-row` (the common ancestor) covers both without
+    # duplicating the block here.
 
     def __init__(self):
         super().__init__()

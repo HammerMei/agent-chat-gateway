@@ -191,7 +191,7 @@ per-row status lookups.
 | `AgentDetailScreen` | pushed | **Shipped, all 3 modes.** view/edit/create. Form fields are a manually-maintained mirror of `$defs/agent` (not a runtime schema interpreter — safe since the schema is closed). Nothing is written to `document` until Save; Save diffs every field against its value-at-open and writes only what changed (docs/design/config-tool.md decision 2). Tool-list fields (`owner_allowed_tools`/`guest_allowed_tools`) are **shipped, editable** — two `ListView`s ('a' add via `PresetOrInlineModal`, 'x' remove), diffed the same way (against the MERGED value at open) but OUTSIDE the `FieldSpec` pipeline, since a list of preset-refs/inline-rule-dicts doesn't fit it. Escape with unsaved changes routes through `ConfirmModal` |
 | `ConnectorDetailScreen` | pushed | **Shipped, all 3 modes.** Per-type fixed field lists (tree editor deferred — see Part 3). `type`/`name` immutable in edit mode |
 | `WatcherDetailScreen` | pushed | **Shipped**, `mode="view"` only still — Phase 3. Already takes a `mode: Literal["view","edit","create"]` param — no screen-class rework needed when its turn comes |
-| `DefaultsScreen` | pushed | **Shipped** (view-only): shows blast radius per key |
+| `DefaultsScreen` | pushed | **Shipped, editable** for `agent_defaults`/`watcher_defaults` (reusing `AgentDetailScreen`'s own field list for the former; a small dedicated field list for the latter). `connector_defaults` stays view-only — deferred, see its own entry further down. Shows blast radius per key in both view and edit mode; Save blocks behind a `ConfirmModal` naming every entry that would see its effective value change, whenever that list is non-empty |
 | `ToolPresetsScreen` | pushed | **Shipped, editable.** Rule list + "used by" (checked against the MERGED per-agent tool list, not the raw entry — see gotchas below). 'a' adds a rule (`InlineToolRuleModal`) / 'd' removes the selected one — both save immediately (no separate edit mode; a bare list of rules has no provenance/blast-radius concept to protect). Deleting the WHOLE preset happens from `OverviewScreen`'s Tool Presets tab instead (`d` on the row), not from inside this screen |
 | `ConfirmModal` | modal | **Shipped** (`gateway/configtool/modals.py`) — yes/no dialog, Cancel focused by default. Gates `ConfigToolApp.action_quit()` on `EditableConfig.dirty`, and `AgentDetailScreen`'s own per-screen form-dirty flag on Escape |
 | `MessageModal` | modal | **Shipped** (`gateway/configtool/modals.py`) — dismiss-only error/info dialog; replaces `notify(severity="error")` for anything worth blocking on (validation/save/delete failures) — user-reported that toasts vanish before a multi-line error can be read |
@@ -1061,6 +1061,165 @@ in-app since phase 2); `RoomListEditorScreen`; the `rooms:` split rule +
 group `ConfirmModal`; `DefaultsScreen` made editable (lowest churn, last).
 Golden-file YAML round-trip tests (key order, description retention,
 split-out insertion position).
+
+**Owner decision, splitting Phase 3 in two:** watcher CRUD (the `rooms:`
+group auto-split rule especially) is a lot of surface for one branch —
+scoped down to just `DefaultsScreen` editing for this pass, watcher CRUD
+deferred to its own future branch. The new-watcher flow's connector→agent
+picker was also decided ahead of time, for whenever that branch happens:
+**plain Select dropdowns, no pre-suggestion** — the owner didn't see enough
+value in scanning existing `watchers:` entries to guess which agent a
+newly-picked connector "usually" pairs with, versus just two independent
+dropdowns with no cross-referencing logic to build, maintain, or test.
+
+### `DefaultsScreen` made editable (shipped, `agent_defaults`/`watcher_defaults` only)
+
+- **`connector_defaults` stays view-only, on purpose.** Which fields are
+  actually safe to share across every connector TYPE is a real, separate
+  design question — `reply_in_thread`/`permission_reply_in_thread`/
+  `require_mention`/`filter_sender`/`timezone` are plausibly fine (generic,
+  type-agnostic), but `server:` almost certainly isn't (a rocketchat and a
+  mattermost connector sharing one server URL makes no sense), and
+  `gateway/config.py`'s forbidden-keys set for `connector_defaults` doesn't
+  block it structurally. Rather than bury that judgment call in this
+  change, `_field_specs()` returns `()` for `connector_defaults` and
+  `check_action()` hides 'e' entirely when there's nothing editable —
+  deferred to its own pass.
+- **`agent_defaults` reuses `AgentDetailScreen`'s own field list verbatim**
+  (`AGENT_FORM_FIELDS`/`AGENT_DATACLASS_DEFAULTS`, renamed from
+  `_ALL_FORM_FIELDS`/`_AGENT_DATACLASS_DEFAULTS` to drop the leading
+  underscore now that they're a genuine cross-module contract) — zero
+  drift risk, since every key is legal in `agent_defaults` too
+  (`gateway/config.py`'s forbidden-keys set for it is empty).
+  `watcher_defaults` gets its own small field list
+  (`WATCHER_DEFAULTS_FIELDS`): `online_notification`, `offline_notification`,
+  `context_inject_files`, `history_handoff.*` — everything EXCEPT
+  `name`/`room`/`rooms`/`session_id`, which the loader already forbids
+  there (each pins one specific watcher's identity).
+- **Does NOT extend `FormScreen`.** A `*_defaults:` block has no "entity" to
+  create or delete, and its own fields have no provenance concept (a
+  defaults block doesn't itself inherit from anywhere — decision 2's
+  explicit/inherited/explicit-suppressing distinction is about an ENTRY
+  relative to its defaults block). Stretching `FormScreen`'s vocabulary over
+  that shape would cost more than it saves. Reuses the free helper
+  functions in `form_common.py` directly (`FieldSpec`,
+  `read_widget_value`/`set_widget_value`/`apply_update`/`widget_id`/
+  `get_nested`/`list_to_text`) — only the field-row rendering (blast-radius
+  counts instead of `FormScreen`'s explicit/inherited provenance marker) is
+  new.
+- **Refactor enabling the above:** the shared `.entity-form`/`.field-row`/
+  `.field-label`/`.field-provenance`/`Input` CSS block moved from
+  `FormScreen.DEFAULT_CSS` to `DetailScreen.DEFAULT_CSS` (`base.py`, the
+  nearest common ancestor both reach) — Textual's CSS type selectors match
+  by ancestry, not literal class name, so `DetailScreen .field-row` covers
+  both `FormScreen` subclasses and `DefaultsScreen` without duplicating the
+  block. Purely a relocation — full configtool suite re-run green
+  immediately after, before anything else was built on top.
+- **Blast-radius confirm (decision 2, now actually gated on).**
+  `action_save()` computes, per changed/removed key, which entries do NOT
+  already override it — those are exactly the entries whose EFFECTIVE
+  value is about to change. If that list is non-empty for ANY changed key,
+  a `ConfirmModal` names every affected entry per key before the write
+  proceeds; a key that turns out to affect nobody (every entry already
+  overrides it, or nobody exists yet) needs no confirmation. `description`
+  is excluded from this check entirely — it's informational only, never
+  merged into any entry (`_extract_defaults_block` strips it before merge,
+  same as the real loader).
+- **Real bug found and fixed while building this, in code written THIS
+  session (not a legacy one):** the first draft's diffing compared each
+  field's stored "initial value" (which uses the dataclass-default
+  fallback — e.g. `[]` for an absent `context_inject_files`, `""` for an
+  absent `working_directory`-shaped default) directly against
+  `read_widget_value()`'s untouched readback, which normalizes any EMPTY
+  "str"/"list"-kind box to `None` regardless of whether the underlying
+  value was `None`, `""`, or `[]`. The mismatch (`None != []`, or
+  `None != ""`) made an UNTOUCHED field register as "changed" on every
+  single Save whenever its current effective value happened to be
+  empty — caught immediately by
+  `test_untouched_fields_are_not_rewritten` and 3 other tests that failed
+  with a spurious extra key contaminating the blast-radius confirm's
+  entry list. Fixed in `_compute_initial_values()`: normalize a "str"/
+  "list"-kind stored initial value to `None` whenever it's present but
+  falsy, matching what the widget would read back if left untouched.
+  Deliberately excludes "int": an explicit `0` renders as the text `"0"`
+  (non-empty) and reads back as `0` again — no mismatch there, and
+  normalizing it away would introduce the exact same false positive in
+  reverse. **This same latent pattern likely exists in `FormScreen`'s own
+  `_collect_field_updates()`/`_compute_initial_values()`** (`AgentDetailScreen`/
+  `ConnectorDetailScreen`) for any "str"-kind field whose dataclass default
+  is `""` (e.g. `working_directory`) — traced through and found HARMLESS
+  there in every case checked (the resulting spurious "update" always
+  collapses to `apply_update()` popping an already-absent key, a no-op),
+  but not exhaustively audited across every field/connector type. Flagged
+  to the user as a discovered-but-out-of-scope follow-up, not fixed here —
+  fixing it touches shipped, already-tested entity-CRUD code unrelated to
+  this change, and deserves its own regression test rather than a
+  drive-by edit.
+- Test coverage: `tests/unit/test_configtool_defaults_editable.py` — edit-
+  mode visibility (agent_defaults editable, connector_defaults's 'e' a
+  no-op), untouched-fields-write-nothing (the regression test for the bug
+  above), blast-radius confirm shown only for keys with affected entries
+  and naming them correctly, confirm-cancelled leaves the file untouched,
+  zero-affected-entries saves straight through with no confirm at all,
+  `ctrl+r` clears a field back to "no shared default" (pops the key),
+  invalid-int shows a `MessageModal`, watcher_defaults' own field list
+  works the same way, and Escape's dirty-discard-confirm (and the no-op
+  case when nothing changed).
+- `uv run pytest tests/unit tests/integration -q` — 2037 passed.
+  `uv run ruff check gateway/ tests/` — clean.
+
+### Direct edit-from-list on the Defaults tab (shipped, follow-up)
+
+User-reported: after the above shipped, "I don't see a way to edit the
+defaults." Turned into a lengthy cross-machine investigation (headless
+`Pilot`-driven diagnostics against the user's real config, a live
+pty-driven real-terminal repro using Python's stdlib `pty` module to
+sidestep an ancient, unreliable `screen` build on the remote host,
+checking for a stale Python interpreter/dependency mismatch) that all
+independently confirmed the feature worked correctly — the actual cause
+turned out to be screen/terminology confusion during testing: the
+screenshots shared were `connector_defaults` (correctly non-editable),
+`WatcherDetailScreen` (a different, still-view-only screen — Phase 3),
+and `AgentDetailScreen` (editing one specific agent *entity*, an
+unrelated, already-shipped feature) — never actually the
+`agent_defaults`/`watcher_defaults` row this feature is about. Once
+pointed at the right row, editing worked exactly as built.
+
+What *was* a real, reasonable gap the report surfaced: unlike
+Connectors/Agents/Tool Presets, the Defaults tab had no direct
+edit-from-list shortcut — every other list-page action already lets you
+press 'e'/'d' on the row under the cursor without an Enter-first detour
+into a read-only view (`OverviewScreen.action_edit_row()`/
+`action_delete_row()`), but Defaults still required Enter → view → 'e'.
+Added for consistency:
+
+- `DefaultsScreen.__init__` now supports being constructed directly in
+  `mode="edit"` (calling `_compute_initial_values()` immediately, the same
+  way `AgentDetailScreen.__init__` already does) rather than only via the
+  `action_edit()` view→edit transition.
+- A new `_started_in_edit_mode` flag (mirroring `FormScreen`'s own field
+  of the same name) makes `action_back()` — and the "nothing changed"
+  branch of `action_save()` — pop straight back to the list instead of
+  falling back to a view-mode rendering the user never asked to see, for
+  a screen that skipped view mode entirely.
+- `OverviewScreen.check_action()`'s `edit_row` now includes `tab-defaults`
+  unconditionally (not gated per-row — check_action isn't re-evaluated on
+  every cursor movement within a table, only on binding-chain-changing
+  events like a screen push/pop, so a per-row-accurate footer hint isn't
+  cheaply achievable here); `action_edit_row()`'s new `tab-defaults` branch
+  checks the specific row via a new `is_editable_kind()` helper
+  (`defaults.py`) and notifies "'connector_defaults' has nothing editable
+  yet" rather than opening a broken/empty edit form — the same
+  notify-instead-of-hiding precedent `action_new_entity()` already uses
+  for tabs it doesn't support.
+- Test coverage: `TestDirectEditFromList` in
+  `tests/unit/test_configtool_defaults_editable.py` — 'e' on
+  agent_defaults opens edit mode directly with fields prefilled; 'e' on
+  connector_defaults notifies instead of navigating; Escape/an unchanged
+  Save both pop straight to the list (not a view-mode fallback); a real
+  change still shows the blast-radius confirm and persists correctly.
+- `uv run pytest tests/unit tests/integration -q` — 2042 passed.
+  `uv run ruff check gateway/ tests/` — clean.
 
 ## Implementation notes from Phase 1 (for whoever builds phase 2/3)
 
