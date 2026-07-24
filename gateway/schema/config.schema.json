@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/HammerMei/agent-chat-gateway/main/gateway/schema/config.schema.json",
   "title": "agent-chat-gateway config.yaml",
-  "description": "Hand-written schema for editor autocomplete / typo-checking of config.yaml. It intentionally does NOT re-validate every connector-type-specific field (server/allowed_users/attachments/agent_chain vary by connector 'type') — that stays the job of `acg config validate`. See docs/migration-0.2.md for the format this schema describes (v0.2+: connector_defaults/agent_defaults/watcher_defaults, tool_presets, watcher rooms:).",
+  "description": "Hand-written schema for editor autocomplete / typo-checking of config.yaml. It intentionally does NOT re-validate every connector-type-specific field (server/allowed_users/attachments/agent_chain vary by connector 'type') — that stays the job of `acg config validate`. See docs/migration-0.3.md for the format this schema describes (v0.3+: connector_templates/agent_templates/watcher_templates + per-entry 'inherits:', tool_presets, watcher rooms:).",
   "type": "object",
   "additionalProperties": false,
   "required": ["connectors", "agents"],
@@ -15,43 +15,59 @@
         "items": { "$ref": "#/$defs/toolRule" }
       }
     },
-    "connector_defaults": {
+    "agent_templates": {
       "type": "object",
-      "description": "Deep-merged into every connector entry below (the entry's own fields win on conflict). Must not set 'name' — that identifies a specific connector.",
-      "properties": {
-        "description": {
-          "type": "string",
-          "description": "Optional annotation for this shared block (informational only; never merged into entries)."
-        }
-      },
-      "not": { "required": ["name"] }
+      "description": "Named, reusable field blocks for agents. Reference one by name via an agent's 'inherits:' field (the agent's own fields win on conflict; flat one-tier merge — no nested templates).",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "description": {
+            "type": "string",
+            "description": "Optional annotation for this template (informational only; never merged into entries)."
+          }
+        },
+        "not": { "required": ["inherits"] }
+      }
     },
-    "agent_defaults": {
+    "connector_templates": {
       "type": "object",
-      "description": "Deep-merged into every entry under 'agents:' (the entry's own fields win on conflict).",
-      "properties": {
-        "description": {
-          "type": "string",
-          "description": "Optional annotation for this shared block (informational only; never merged into entries)."
+      "description": "Named, reusable field blocks for connectors. Reference one by name via a connector's 'inherits:' field. Must not set 'name' — that identifies a specific connector. No nested templates.",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "description": {
+            "type": "string",
+            "description": "Optional annotation for this template (informational only; never merged into entries)."
+          }
+        },
+        "not": {
+          "anyOf": [
+            { "required": ["name"] },
+            { "required": ["inherits"] }
+          ]
         }
       }
     },
-    "watcher_defaults": {
+    "watcher_templates": {
       "type": "object",
-      "description": "Deep-merged into every watcher entry below (the entry's own fields win on conflict). Must not set 'name', 'room', 'rooms', or 'session_id' — those identify a specific watcher.",
-      "properties": {
-        "description": {
-          "type": "string",
-          "description": "Optional annotation for this shared block (informational only; never merged into entries)."
+      "description": "Named, reusable field blocks for watchers. Reference one by name via a watcher's 'inherits:' field. Must not set 'name', 'room', 'rooms', or 'session_id' — those identify a specific watcher. No nested templates.",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "description": {
+            "type": "string",
+            "description": "Optional annotation for this template (informational only; never merged into entries)."
+          }
+        },
+        "not": {
+          "anyOf": [
+            { "required": ["name"] },
+            { "required": ["room"] },
+            { "required": ["rooms"] },
+            { "required": ["session_id"] },
+            { "required": ["inherits"] }
+          ]
         }
-      },
-      "not": {
-        "anyOf": [
-          { "required": ["name"] },
-          { "required": ["room"] },
-          { "required": ["rooms"] },
-          { "required": ["session_id"] }
-        ]
       }
     },
     "connectors": {
@@ -140,6 +156,10 @@
           "type": "string",
           "description": "Optional annotation for this connector (informational only; ignored at runtime)."
         },
+        "inherits": {
+          "type": "string",
+          "description": "Name of a 'connector_templates:' entry to deep-merge as this connector's base (this connector's own fields win on conflict)."
+        },
         "context_inject_files": {
           "type": "array",
           "items": { "type": "string" }
@@ -154,6 +174,10 @@
           "type": "string",
           "description": "Optional annotation for this agent (informational only; ignored at runtime)."
         },
+        "inherits": {
+          "type": "string",
+          "description": "Name of an 'agent_templates:' entry to deep-merge as this agent's base (this agent's own fields win on conflict). Templates cannot themselves set 'inherits'."
+        },
         "type": {
           "type": "string",
           "enum": ["claude", "opencode"]
@@ -165,7 +189,7 @@
         },
         "working_directory": {
           "type": "string",
-          "description": "Required (directly or via agent_defaults); must exist on disk when the gateway loads."
+          "description": "Required (directly or via an inherits: agent_templates entry); must exist on disk when the gateway loads."
         },
         "session_prefix": { "type": "string" },
         "lazy_instruction_loading": { "type": "boolean" },
@@ -207,6 +231,10 @@
         "description": {
           "type": "string",
           "description": "Optional annotation for this watcher (informational only; ignored at runtime)."
+        },
+        "inherits": {
+          "type": "string",
+          "description": "Name of a 'watcher_templates:' entry to deep-merge as this watcher's base (this watcher's own fields win on conflict)."
         },
         "name": {
           "type": "string",

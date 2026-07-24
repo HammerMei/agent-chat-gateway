@@ -41,6 +41,20 @@ from .core.config import (  # noqa: F401 — re-exports
     WatcherConfig,
 )
 
+# v0.2's global `*_defaults:` blocks (removed in v0.3 — see docs/migration-0.3.md) merged
+# flatly and unconditionally into EVERY entry of a kind, regardless of type: setting
+# `command`/`type` there to give claude agents a custom wrapper silently broke any
+# opencode agent that didn't override it (gateway/agents/opencode/adapter.py execs
+# `agent_cfg.command` directly as the sidecar binary). Named `*_templates:` + a per-entry
+# `inherits:` field (below) replace them — a template only ever applies to entries that
+# explicitly opt in, so type-specific fields are finally safe to share. A leftover old key
+# is a hard, actionable error rather than a silent behavior change.
+_REMOVED_DEFAULTS_KEYS: dict[str, str] = {
+    "agent_defaults": "agent_templates",
+    "connector_defaults": "connector_templates",
+    "watcher_defaults": "watcher_templates",
+}
+
 
 @dataclass
 class AttachmentConfig:
@@ -102,6 +116,15 @@ class GatewayConfig:
                 f"got {type(raw).__name__}."
             )
 
+        for old_key, new_key in _REMOVED_DEFAULTS_KEYS.items():
+            if old_key in raw:
+                raise ValueError(
+                    f"config.yaml '{old_key}:' is no longer supported (removed) — "
+                    f"define shared fields under '{new_key}:' instead and add "
+                    "'inherits: <template-name>' to each entry that should use "
+                    "them. See docs/migration-0.3.md."
+                )
+
         # No $VAR/${VAR} expansion here — see module docstring. Any such
         # string in a loaded config is treated as a plain literal.
 
@@ -119,8 +142,8 @@ class GatewayConfig:
                 f"config.yaml 'connectors:' must be a list (got {type(connectors_raw).__name__})."
             )
 
-        connector_defaults = _extract_defaults_block(
-            raw, "connector_defaults", frozenset({"name"})
+        connector_templates = _parse_templates_block(
+            raw, "connector_templates", frozenset({"name"})
         )
 
         connectors: list[ConnectorConfig] = []
@@ -131,7 +154,10 @@ class GatewayConfig:
                     f"Connector entry at index {i} must be a mapping "
                     f"(got {type(cc_raw).__name__})."
                 )
-            cc = _deep_merge(connector_defaults, cc_raw)
+            cc = _resolve_inherits(
+                cc_raw, connector_templates, "connector_templates",
+                "Connector entry", f"index {i}",
+            )
             name = cc.get("name", "")
             connector_type = cc.get("type", "")
             if not name:
@@ -194,7 +220,7 @@ class GatewayConfig:
             )
         default_agent = raw.get("default_agent", "")
 
-        agent_defaults = _extract_defaults_block(raw, "agent_defaults", frozenset())
+        agent_templates = _parse_templates_block(raw, "agent_templates", frozenset())
         tool_presets = _parse_tool_presets(raw)
 
         agents: dict[str, AgentConfig] = {}
@@ -204,7 +230,9 @@ class GatewayConfig:
                     f"Agent '{agent_name}' config must be a mapping "
                     f"(got {type(agent_raw_entry).__name__})."
                 )
-            agent_raw = _deep_merge(agent_defaults, agent_raw_entry)
+            agent_raw = _resolve_inherits(
+                agent_raw_entry, agent_templates, "agent_templates", "Agent", agent_name,
+            )
             perm_raw = agent_raw.get("permissions", {})
             if perm_raw and not isinstance(perm_raw, Mapping):
                 raise ValueError(
@@ -308,8 +336,8 @@ class GatewayConfig:
                 f"config.yaml 'watchers:' must be a list (got {type(watchers_raw).__name__})."
             )
 
-        watcher_defaults = _extract_defaults_block(
-            raw, "watcher_defaults", frozenset({"name", "room", "rooms", "session_id"})
+        watcher_templates = _parse_templates_block(
+            raw, "watcher_templates", frozenset({"name", "room", "rooms", "session_id"})
         )
 
         seen_watcher_names: set[str] = set()
@@ -319,7 +347,10 @@ class GatewayConfig:
                     f"Watcher entry at index {i} must be a mapping "
                     f"(got {type(wc_raw).__name__})."
                 )
-            wc = _deep_merge(watcher_defaults, wc_raw)
+            wc = _resolve_inherits(
+                wc_raw, watcher_templates, "watcher_templates",
+                "Watcher entry", f"index {i}",
+            )
 
             # ── room / rooms: exactly one form, 'room' is a single-item alias ──
             raw_room = wc.get("room")
@@ -491,6 +522,16 @@ def _extract_defaults_block(
 ) -> dict:
     """Pop and validate a top-level ``<x>_defaults:`` mapping.
 
+    NOT called anywhere in this module anymore — the ``*_defaults:``
+    mechanism was removed in v0.3 in favor of named ``*_templates:`` +
+    per-entry ``inherits:`` (see ``_parse_templates_block``/
+    ``_resolve_inherits`` below, and ``_REMOVED_DEFAULTS_KEYS`` above). Kept
+    defined, unused, purely because ``gateway/configtool/model.py`` still
+    imports and calls it directly (``EditableConfig.defaults_block()``) —
+    the config TUI's own reconciliation with the new mechanism is deferred
+    to a future pass; removing this function would break its import
+    entirely rather than just leave it showing stale information.
+
     Returns an empty dict if the key is absent. Raises ValueError if the
     block is not a mapping, or if it sets a key that identifies an
     individual entry (e.g. ``name``) rather than something safe to inherit
@@ -538,8 +579,8 @@ def _deep_merge(base: Mapping, override: Mapping) -> dict:
       a mutable dict/list with ``base`` or ``override``. This matters
       because per-entry parsing later mutates dicts in place (e.g. resolving
       ``attachments.cache_dir_global`` to an absolute path) — without a deep
-      copy, that mutation would leak into a shared ``*_defaults`` block and
-      corrupt every other entry merged against it.
+      copy, that mutation would leak into a shared template block
+      (referenced by another entry's ``inherits:``) and corrupt it.
     """
     merged = {k: _deep_copy(v) for k, v in base.items()}
     for k, v in override.items():
@@ -548,6 +589,99 @@ def _deep_merge(base: Mapping, override: Mapping) -> dict:
         else:
             merged[k] = _deep_copy(v)
     return merged
+
+
+def _parse_templates_block(
+    raw: dict, key: str, forbidden_keys: frozenset[str]
+) -> dict[str, dict]:
+    """Parse and validate a top-level ``<x>_templates:`` mapping: named,
+    reusable field blocks an entry opts into via its own ``inherits:``
+    field (resolved by ``_resolve_inherits`` below), replacing v0.2's single
+    global ``*_defaults:`` block per kind (see ``_REMOVED_DEFAULTS_KEYS``
+    above for why). Modeled directly on ``_extract_defaults_block``'s own
+    validation conventions, applied per named template instead of once.
+
+    Returns ``{}`` if the key is absent. Raises ValueError if the block, or
+    any one named template within it, is not a mapping; if a named template
+    sets a forbidden key (an identity field belonging to one specific
+    entry, e.g. ``name`` — never safe to share, mirrors
+    ``_extract_defaults_block``'s own message); or if a named template sets
+    ``inherits`` itself — templates cannot nest (mirrors
+    ``_parse_tool_presets``'s "no preset-of-presets" rule below).
+
+    Deliberately does NOT check for any field being "required" — a template
+    is meant to be a partial field set (e.g. a template need not set
+    ``working_directory``, since that's inherently per-agent); "is
+    everything required actually present" is checked only once, on the
+    fully-resolved (template ∪ entry) dict downstream, exactly where it
+    already ran before this mechanism existed.
+
+    An optional ``description`` on each named template (annotating it,
+    shown by the config TUI) is stripped before being returned — same rule
+    ``_extract_defaults_block`` applies, for the same reason: it must never
+    deep-merge into an entry that inherits this template.
+    """
+    templates_raw = raw.get(key, {}) or {}
+    if not isinstance(templates_raw, Mapping):
+        raise ValueError(
+            f"config.yaml '{key}:' must be a mapping (got {type(templates_raw).__name__})."
+        )
+    templates: dict[str, dict] = {}
+    for name, block in templates_raw.items():
+        if not isinstance(block, Mapping):
+            raise ValueError(
+                f"{key}['{name}'] must be a mapping (got {type(block).__name__})."
+            )
+        if "inherits" in block:
+            raise ValueError(
+                f"{key}['{name}'] must not set 'inherits' — templates cannot "
+                "inherit from another template (no nested templates)."
+            )
+        bad = sorted(forbidden_keys & block.keys())
+        if bad:
+            raise ValueError(
+                f"{key}['{name}'] must not set {bad} — these fields identify "
+                "an individual entry and must be set per-entry, not inherited."
+            )
+        result = dict(block)
+        result.pop("description", None)
+        templates[name] = result
+    return templates
+
+
+def _resolve_inherits(
+    entry_raw: Mapping,
+    templates: dict[str, dict],
+    templates_key: str,
+    entity_kind: str,
+    entity_label: str,
+) -> dict:
+    """Resolve one entry's ``inherits:`` field (if set) against the parsed
+    ``templates`` dict (from ``_parse_templates_block`` above): deep-merge
+    the named template's fields with the entry's own fields, the entry
+    winning on conflict (via the same ``_deep_merge`` the old ``*_defaults``
+    blocks used — the merge algorithm itself needed no changes for this new
+    purpose). No ``inherits:`` set -> the entry's own fields, unchanged.
+    ``inherits`` is always popped from the result — it is never itself a
+    real field downstream, whether resolved or absent.
+    """
+    entry = dict(entry_raw)
+    template_name = entry.pop("inherits", None)
+    if template_name is None:
+        return entry
+    if not isinstance(template_name, str) or not template_name:
+        raise ValueError(
+            f"{entity_kind} '{entity_label}': 'inherits' must be a non-empty "
+            f"string naming a {templates_key} entry (got {template_name!r})."
+        )
+    template = templates.get(template_name)
+    if template is None:
+        available = ", ".join(sorted(templates)) or "(none defined)"
+        raise ValueError(
+            f"{entity_kind} '{entity_label}': unknown {templates_key} "
+            f"'{template_name}'. Available templates: {available}"
+        )
+    return _deep_merge(template, entry)
 
 
 def _parse_tool_presets(raw: dict) -> dict[str, list["ToolRule"]]:

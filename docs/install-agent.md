@@ -254,7 +254,7 @@ EOF
 > room with the same connector+agent? Use `rooms: [a, b, ...]` instead of `room:` and
 > one entry expands into a watcher per room automatically — see Step 7 below and
 > `config.example.yaml` for the full annotated format (including `tool_presets` and
-> `*_defaults` blocks for larger multi-bot setups).
+> `*_templates`/`inherits:` for larger multi-bot setups).
 
 **Replace:**
 - `your-username` — your username on the chosen chat platform (the one who will own the bot)

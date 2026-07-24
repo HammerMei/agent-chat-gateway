@@ -1041,23 +1041,35 @@ class TestDeepMerge(unittest.TestCase):
         self.assertEqual(base["attachments"]["cache_dir_global"], "shared")
 
 
-# ── Tests: connector_defaults / agent_defaults / watcher_defaults ────────────
+# ── Tests: connector_templates / agent_templates / watcher_templates + inherits ──
+#
+# v0.3 removed the single global `*_defaults:` block per kind (it merged flatly
+# and unconditionally into EVERY entry regardless of type — setting type/command
+# in agent_defaults to give claude agents a custom wrapper silently broke any
+# opencode agent that didn't override it, since OpenCodeBackend execs
+# agent_cfg.command directly as the sidecar binary). Named `*_templates:` +
+# a per-entry `inherits: <name>` field replace it: a template only ever applies
+# to entries that explicitly opt in, so type-specific fields are finally safe
+# to share. See docs/migration-0.3.md.
 
 
-class TestConnectorDefaults(unittest.TestCase):
+class TestConnectorTemplates(unittest.TestCase):
     def _write_config(self, body: str) -> str:
         with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
             f.write(textwrap.dedent(body))
             return f.name
 
-    def test_connector_inherits_defaults(self):
+    def test_connector_inherits_template(self):
         path = self._write_config("""\
-            connector_defaults:
-              type: rocketchat
-              server: {url: http://localhost:3000, username: bot, password: pw}
+            connector_templates:
+              standard:
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
             connectors:
               - name: rc1
+                inherits: standard
               - name: rc2
+                inherits: standard
                 server: {username: bot2}
             agents:
               default:
@@ -1071,15 +1083,16 @@ class TestConnectorDefaults(unittest.TestCase):
         rc1, rc2 = config.connectors[0], config.connectors[1]
         self.assertEqual(rc1.type, "rocketchat")
         self.assertEqual(rc1.raw["server"]["username"], "bot")
-        # rc2 overrides only username; url/password still inherited from defaults.
+        # rc2 overrides only username; url/password still inherited from the template.
         self.assertEqual(rc2.raw["server"]["username"], "bot2")
         self.assertEqual(rc2.raw["server"]["url"], "http://localhost:3000")
         self.assertEqual(rc2.raw["server"]["password"], "pw")
 
-    def test_connector_defaults_forbids_name(self):
+    def test_connector_template_forbids_name(self):
         path = self._write_config("""\
-            connector_defaults:
-              name: not-allowed
+            connector_templates:
+              standard:
+                name: not-allowed
             connectors:
               - name: rc1
                 type: rocketchat
@@ -1094,12 +1107,12 @@ class TestConnectorDefaults(unittest.TestCase):
         """)
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(path)
-        self.assertIn("connector_defaults", str(ctx.exception))
+        self.assertIn("connector_templates", str(ctx.exception))
         self.assertIn("name", str(ctx.exception))
 
-    def test_connector_defaults_must_be_mapping(self):
+    def test_connector_templates_must_be_mapping(self):
         path = self._write_config("""\
-            connector_defaults: not-a-mapping
+            connector_templates: not-a-mapping
             connectors:
               - name: rc1
                 type: rocketchat
@@ -1114,22 +1127,25 @@ class TestConnectorDefaults(unittest.TestCase):
         """)
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(path)
-        self.assertIn("connector_defaults", str(ctx.exception))
+        self.assertIn("connector_templates", str(ctx.exception))
 
-    def test_attachments_cache_dir_global_default_not_aliased_across_connectors(self):
+    def test_attachments_cache_dir_global_template_not_aliased_across_connectors(self):
         """Regression: cache_dir_global resolution mutates the connector's raw dict
-        in place. Without a deep-copying merge, two connectors sharing
-        connector_defaults.attachments would alias the same nested dict, and
+        in place. Without a deep-copying merge, two connectors sharing the same
+        template's attachments would alias the same nested dict, and
         resolving/mutating it for the first connector would corrupt the second."""
         path = self._write_config("""\
-            connector_defaults:
-              type: rocketchat
-              server: {url: http://localhost:3000, username: bot, password: pw}
-              attachments:
-                cache_dir_global: shared-cache
+            connector_templates:
+              standard:
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+                attachments:
+                  cache_dir_global: shared-cache
             connectors:
               - name: rc1
+                inherits: standard
               - name: rc2
+                inherits: standard
             agents:
               default:
                 type: claude
@@ -1147,25 +1163,27 @@ class TestConnectorDefaults(unittest.TestCase):
         self.assertNotEqual(b["cache_dir_global"], "mutated")
 
 
-class TestAgentDefaults(unittest.TestCase):
+class TestAgentTemplates(unittest.TestCase):
     def _write_config(self, body: str) -> str:
         with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
             f.write(textwrap.dedent(body))
             return f.name
 
-    def test_agent_inherits_defaults(self):
+    def test_agent_inherits_template(self):
         path = self._write_config("""\
             connectors:
               - name: rc
                 type: rocketchat
                 server: {url: http://localhost:3000, username: bot, password: pw}
-            agent_defaults:
-              type: claude
-              working_directory: /tmp
-              timeout: 500
+            agent_templates:
+              standard:
+                type: claude
+                working_directory: /tmp
+                timeout: 500
             agents:
-              default: {}
+              default: {inherits: standard}
               other:
+                inherits: standard
                 timeout: 42
             watchers:
               - name: w1
@@ -1178,19 +1196,59 @@ class TestAgentDefaults(unittest.TestCase):
         self.assertEqual(config.agents["other"].timeout, 42)
         self.assertEqual(config.agents["other"].working_directory, "/tmp")
 
-    def test_agent_defaults_permissions_deep_merge(self):
+    def test_agent_template_can_set_type_and_command_independently(self):
+        """The motivating regression test for this whole redesign: a template
+        only applies to agents that opt in via inherits:, so type/command can
+        finally be shared safely — a claude-shaped template's command never
+        leaks onto an opencode agent (or vice versa) the way the old single
+        global agent_defaults block would have (OpenCodeBackend execs
+        agent_cfg.command directly as the sidecar binary — a claude-shaped
+        command there silently tried to spawn the wrong process)."""
         path = self._write_config("""\
             connectors:
               - name: rc
                 type: rocketchat
                 server: {url: http://localhost:3000, username: bot, password: pw}
-            agent_defaults:
-              type: claude
-              working_directory: /tmp
-              timeout: 500
-              permissions: {enabled: true, timeout: 300}
+            agent_templates:
+              claude-standard:
+                type: claude
+                command: claude-no-p
+              opencode-standard:
+                type: opencode
+                command: opencode
+            agents:
+              agent-a:
+                inherits: claude-standard
+                working_directory: /tmp
+              agent-b:
+                inherits: opencode-standard
+                working_directory: /tmp
+            watchers:
+              - name: w1
+                agent: agent-a
+                room: general
+        """)
+        config = GatewayConfig.from_file(path)
+        self.assertEqual(config.agents["agent-a"].type, "claude")
+        self.assertEqual(config.agents["agent-a"].command, "claude-no-p")
+        self.assertEqual(config.agents["agent-b"].type, "opencode")
+        self.assertEqual(config.agents["agent-b"].command, "opencode")
+
+    def test_agent_template_permissions_deep_merge(self):
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agent_templates:
+              standard:
+                type: claude
+                working_directory: /tmp
+                timeout: 500
+                permissions: {enabled: true, timeout: 300}
             agents:
               default:
+                inherits: standard
                 permissions: {timeout: 100}
             watchers:
               - name: w1
@@ -1198,24 +1256,26 @@ class TestAgentDefaults(unittest.TestCase):
         """)
         config = GatewayConfig.from_file(path)
         perms = config.agents["default"].permissions
-        # enabled inherited from defaults, timeout overridden by the entry.
+        # enabled inherited from the template, timeout overridden by the entry.
         self.assertTrue(perms.enabled)
         self.assertEqual(perms.timeout, 100)
 
-    def test_agent_defaults_tool_list_replaces_not_appends(self):
+    def test_agent_template_tool_list_replaces_not_appends(self):
         path = self._write_config("""\
             connectors:
               - name: rc
                 type: rocketchat
                 server: {url: http://localhost:3000, username: bot, password: pw}
-            agent_defaults:
-              type: claude
-              working_directory: /tmp
-              owner_allowed_tools:
-                - tool: Read
-                - tool: Grep
+            agent_templates:
+              standard:
+                type: claude
+                working_directory: /tmp
+                owner_allowed_tools:
+                  - tool: Read
+                  - tool: Grep
             agents:
               default:
+                inherits: standard
                 owner_allowed_tools:
                   - tool: Write
             watchers:
@@ -1226,14 +1286,62 @@ class TestAgentDefaults(unittest.TestCase):
         tools = [r.tool for r in config.agents["default"].owner_allowed_tools]
         self.assertEqual(tools, ["Write"])
 
+    def test_agent_unknown_inherits_reference_raises(self):
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agent_templates:
+              standard: {type: claude}
+            agents:
+              default:
+                inherits: nope
+                working_directory: /tmp
+            watchers:
+              - name: w1
+                room: general
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        msg = str(ctx.exception)
+        self.assertIn("unknown agent_templates", msg)
+        self.assertIn("nope", msg)
+        self.assertIn("standard", msg)  # lists the one available template
 
-class TestWatcherDefaults(unittest.TestCase):
+    def test_agent_template_cannot_set_inherits(self):
+        """No nested templates — mirrors tool_presets' own 'no preset-of-presets'
+        rule."""
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agent_templates:
+              bad:
+                inherits: other
+            agents:
+              default:
+                inherits: bad
+                working_directory: /tmp
+            watchers:
+              - name: w1
+                room: general
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        msg = str(ctx.exception)
+        self.assertIn("agent_templates", msg)
+        self.assertIn("must not set 'inherits'", msg)
+
+
+class TestWatcherTemplates(unittest.TestCase):
     def _write_config(self, body: str) -> str:
         with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
             f.write(textwrap.dedent(body))
             return f.name
 
-    def test_watcher_inherits_connector_and_agent(self):
+    def test_watcher_inherits_template(self):
         path = self._write_config("""\
             connectors:
               - name: rc
@@ -1243,11 +1351,13 @@ class TestWatcherDefaults(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watcher_defaults:
-              connector: rc
-              agent: default
+            watcher_templates:
+              standard:
+                connector: rc
+                agent: default
             watchers:
               - name: w1
+                inherits: standard
                 room: general
         """)
         config = GatewayConfig.from_file(path)
@@ -1255,7 +1365,7 @@ class TestWatcherDefaults(unittest.TestCase):
         self.assertEqual(wc.connector, "rc")
         self.assertEqual(wc.agent, "default")
 
-    def test_watcher_defaults_forbids_identity_fields(self):
+    def test_watcher_template_forbids_identity_fields(self):
         for key, value in (
             ("name", "shared-name"),
             ("room", "general"),
@@ -1272,16 +1382,121 @@ class TestWatcherDefaults(unittest.TestCase):
                       default:
                         type: claude
                         working_directory: /tmp
-                    watcher_defaults:
-                      {key}: {value!r}
+                    watcher_templates:
+                      standard:
+                        {key}: {value!r}
                     watchers:
                       - name: w1
                         room: general
                 """)
                 with self.assertRaises(ValueError) as ctx:
                     GatewayConfig.from_file(path)
-                self.assertIn("watcher_defaults", str(ctx.exception))
+                self.assertIn("watcher_templates", str(ctx.exception))
                 self.assertIn(key, str(ctx.exception))
+
+    def test_watcher_inherits_resolved_before_rooms_expansion(self):
+        """inherits: must resolve before the room/rooms expansion below it in
+        from_file — otherwise a rooms: group's expanded watchers wouldn't see
+        the template's fields at all."""
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watcher_templates:
+              standard:
+                online_notification: "hi"
+            watchers:
+              - connector: rc
+                agent: default
+                inherits: standard
+                rooms: [a, b, c]
+        """)
+        config = GatewayConfig.from_file(path)
+        self.assertEqual(len(config.watchers), 3)
+        for wc in config.watchers:
+            self.assertEqual(wc.online_notification, "hi")
+
+
+class TestRemovedDefaultsKeysRejected(unittest.TestCase):
+    """A leftover v0.2 '*_defaults:' key is a hard, actionable error — not a
+    silent no-op — since silently dropping it would silently drop whatever
+    permission/timeout/tool-allow settings someone still thinks are shared."""
+
+    def _write_config(self, body: str) -> str:
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(textwrap.dedent(body))
+            return f.name
+
+    def test_leftover_agent_defaults_key_raises(self):
+        path = self._write_config("""\
+            agent_defaults: {timeout: 100}
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watchers:
+              - name: w1
+                room: general
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        msg = str(ctx.exception)
+        self.assertIn("agent_defaults", msg)
+        self.assertIn("no longer supported", msg)
+        self.assertIn("agent_templates", msg)
+
+    def test_leftover_connector_defaults_key_raises(self):
+        path = self._write_config("""\
+            connector_defaults: {type: rocketchat}
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watchers:
+              - name: w1
+                room: general
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        msg = str(ctx.exception)
+        self.assertIn("connector_defaults", msg)
+        self.assertIn("no longer supported", msg)
+        self.assertIn("connector_templates", msg)
+
+    def test_leftover_watcher_defaults_key_raises(self):
+        path = self._write_config("""\
+            watcher_defaults: {connector: rc}
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watchers:
+              - name: w1
+                room: general
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        msg = str(ctx.exception)
+        self.assertIn("watcher_defaults", msg)
+        self.assertIn("no longer supported", msg)
+        self.assertIn("watcher_templates", msg)
 
 
 # ── Tests: tool_presets ────────────────────────────────────────────────────────
@@ -1597,17 +1812,24 @@ class TestQuietNotificationDefaults(unittest.TestCase):
         self.assertIsNone(config.watchers[0].online_notification)
         self.assertIsNone(config.watchers[0].offline_notification)
 
-    def test_watcher_defaults_can_restore_old_behavior_globally(self):
+    def test_watcher_template_can_restore_old_behavior_globally(self):
         path = self._write_config()
-        # Inject watcher_defaults restoring the pre-0.2 notification text.
+        # Inject a watcher_templates: entry restoring the pre-0.2 notification
+        # text, and opt the one watcher into it via inherits:.
         with open(path) as f:
             body = f.read()
         body = body.replace(
             "connectors:",
-            "watcher_defaults:\n"
-            "  online_notification: '✅ _Agent online_'\n"
-            "  offline_notification: '❌ _Agent offline_'\n"
+            "watcher_templates:\n"
+            "  standard:\n"
+            "    online_notification: '✅ _Agent online_'\n"
+            "    offline_notification: '❌ _Agent offline_'\n"
             "connectors:",
+            1,
+        )
+        body = body.replace(
+            "- name: w1\n    room: general",
+            "- name: w1\n    inherits: standard\n    room: general",
             1,
         )
         with open(path, "w") as f:
@@ -1632,7 +1854,7 @@ class TestDescriptionField(unittest.TestCase):
     """'description:' is a purely informational annotation (read by the
     config TUI) — the loader must accept it everywhere without letting it
     affect behavior: it must not appear in a connector's raw dict, and a
-    *_defaults block's own description must never propagate into entries."""
+    *_templates block's own description must never propagate into entries."""
 
     def _write_config(self, body: str) -> str:
         with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
@@ -1657,15 +1879,18 @@ class TestDescriptionField(unittest.TestCase):
         config = GatewayConfig.from_file(path)
         self.assertNotIn("description", config.connectors[0].raw)
 
-    def test_connector_defaults_description_does_not_propagate(self):
+    def test_connector_template_description_does_not_propagate(self):
         path = self._write_config("""\
-            connector_defaults:
-              description: "Shared settings for all bots"
-              type: rocketchat
-              server: {url: http://localhost:3000, username: bot, password: pw}
+            connector_templates:
+              standard:
+                description: "Shared settings for all bots"
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
             connectors:
               - name: rc1
+                inherits: standard
               - name: rc2
+                inherits: standard
                 description: "This one's special"
             agents:
               default:
@@ -1678,7 +1903,7 @@ class TestDescriptionField(unittest.TestCase):
         config = GatewayConfig.from_file(path)
         # Neither connector's raw should carry a 'description' key — rc1 never
         # had one of its own, and rc2's own value must not have been merged
-        # with (or overwritten by) the defaults block's description.
+        # with (or overwritten by) the template's description.
         self.assertNotIn("description", config.connectors[0].raw)
         self.assertNotIn("description", config.connectors[1].raw)
 
@@ -1691,15 +1916,18 @@ class TestDescriptionField(unittest.TestCase):
               - name: rc
                 type: rocketchat
                 server: {url: http://localhost:3000, username: bot, password: pw}
-            agent_defaults:
-              description: "Shared claude settings"
+            agent_templates:
+              standard:
+                description: "Shared claude settings"
             agents:
               default:
+                inherits: standard
                 type: claude
                 working_directory: /tmp
                 description: "The main agent"
-            watcher_defaults:
-              description: "Shared watcher settings"
+            watcher_templates:
+              standard:
+                description: "Shared watcher settings"
             watchers:
               - name: w1
                 room: general
