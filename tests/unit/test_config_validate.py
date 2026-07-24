@@ -303,18 +303,20 @@ class TestValidateConfigLint(_ValidateConfigTestBase):
             any("agents.default.timeout" in f for f in result.lint_findings)
         )
 
-    def test_lint_flags_entry_matching_agent_defaults(self):
+    def test_lint_flags_entry_matching_agent_template(self):
         cfg = self._write(f"""\
             connectors:
               - name: rc
                 type: rocketchat
                 server: {{url: http://localhost:3000, username: bot, password: pw}}
-            agent_defaults:
-              type: claude
-              working_directory: {self.agent_dir}
-              timeout: 500
+            agent_templates:
+              standard:
+                type: claude
+                working_directory: {self.agent_dir}
+                timeout: 500
             agents:
               default:
+                inherits: standard
                 timeout: 500
             watchers:
               - name: w1
@@ -323,7 +325,7 @@ class TestValidateConfigLint(_ValidateConfigTestBase):
         result = self._validate(cfg, lint=True)
         self.assertTrue(
             any(
-                "agents.default.timeout" in f and "agent_defaults" in f
+                "agents.default.timeout" in f and "agent_templates" in f
                 for f in result.lint_findings
             )
         )
@@ -334,12 +336,14 @@ class TestValidateConfigLint(_ValidateConfigTestBase):
               - name: rc
                 type: rocketchat
                 server: {{url: http://localhost:3000, username: bot, password: pw}}
-            agent_defaults:
-              type: claude
-              working_directory: {self.agent_dir}
-              timeout: 500
+            agent_templates:
+              standard:
+                type: claude
+                working_directory: {self.agent_dir}
+                timeout: 500
             agents:
               default:
+                inherits: standard
                 timeout: 999
             watchers:
               - name: w1
