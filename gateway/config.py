@@ -55,6 +55,20 @@ _REMOVED_DEFAULTS_KEYS: dict[str, str] = {
     "watcher_defaults": "watcher_templates",
 }
 
+# Per-type fallback for `command` when an agent (or its template) sets `type`
+# but not `command`. Deliberately NOT a single hardcoded string (e.g. always
+# "claude") — that was the other half of the bug _REMOVED_DEFAULTS_KEYS above
+# describes: a fixed fallback is wrong for whichever type it doesn't match
+# (an opencode agent silently defaulting to command "claude" would still exec
+# the wrong binary). `type` itself has no fallback and is required below,
+# same as `working_directory` — so this map only ever needs to cover known
+# types; an unrecognized `type` value surfaces at runtime instead
+# (gateway/service.py's "Unknown agent type" check), unchanged from before.
+_AGENT_TYPE_DEFAULT_COMMAND: dict[str, str] = {
+    "claude": "claude",
+    "opencode": "opencode",
+}
+
 
 @dataclass
 class AttachmentConfig:
@@ -271,10 +285,31 @@ class GatewayConfig:
                     f"Agent '{agent_name}': lazy_instruction_loading must be a boolean"
                 )
 
+            # Validate: type is required (directly or via an inherits: template) —
+            # no fallback. A silent default here is exactly the failure mode
+            # _AGENT_TYPE_DEFAULT_COMMAND's docstring describes: an agent that
+            # forgot `inherits:` (or a template) would otherwise look "valid"
+            # while silently running as the wrong type.
+            agent_type = agent_raw.get("type", "")
+            if not agent_type:
+                raise ValueError(
+                    f"Agent '{agent_name}': type is required (directly or via "
+                    "an inherits: agent_templates entry). Set it to 'claude' "
+                    "or 'opencode'."
+                )
+            if not isinstance(agent_type, str):
+                raise ValueError(
+                    f"Agent '{agent_name}': type must be a string "
+                    f"(got {type(agent_type).__name__})."
+                )
+            command = agent_raw.get("command") or _AGENT_TYPE_DEFAULT_COMMAND.get(
+                agent_type, ""
+            )
+
             agents[agent_name] = AgentConfig(
                 name=agent_name,
-                type=agent_raw.get("type", "claude"),
-                command=agent_raw.get("command", "claude"),
+                type=agent_type,
+                command=command,
                 new_session_args=agent_raw.get("new_session_args", []),
                 working_directory=working_directory,
                 session_prefix=agent_raw.get("session_prefix", "agent-chat"),

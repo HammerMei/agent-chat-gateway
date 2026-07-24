@@ -1234,6 +1234,91 @@ class TestAgentTemplates(unittest.TestCase):
         self.assertEqual(config.agents["agent-b"].type, "opencode")
         self.assertEqual(config.agents["agent-b"].command, "opencode")
 
+    def test_agent_without_type_and_without_inherits_raises(self):
+        """Reported gap: an agent that has agent_templates available but
+        forgets to set 'inherits:' (and doesn't set 'type:' directly) used to
+        silently fall back to the hardcoded default type/command ('claude'/
+        'claude') — a config that looked valid but silently ran the wrong
+        agent type/command. 'type:' is now required, same as
+        'working_directory:', so this is a hard, actionable error instead."""
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agent_templates:
+              standard:
+                type: opencode
+                command: opencode
+            agents:
+              forgot-inherits:
+                working_directory: /tmp
+            watchers:
+              - name: w1
+                room: general
+                agent: forgot-inherits
+        """)
+        with self.assertRaisesRegex(
+            ValueError,
+            "Agent 'forgot-inherits': type is required",
+        ):
+            GatewayConfig.from_file(path)
+
+    def test_agent_non_string_type_raises_cleanly(self):
+        """A malformed 'type:' (e.g. a YAML typo producing a list instead of
+        a string) must not crash inside the type-aware command fallback's
+        dict lookup (dict.get() on an unhashable key raises TypeError, which
+        `agent-chat-gateway config validate` doesn't catch) — it should
+        surface the same kind of clear ValueError as every other malformed-
+        field check in this loader."""
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agents:
+              bad-agent:
+                type: [claude]
+                working_directory: /tmp
+            watchers:
+              - name: w1
+                room: general
+                agent: bad-agent
+        """)
+        with self.assertRaisesRegex(
+            ValueError,
+            "Agent 'bad-agent': type must be a string",
+        ):
+            GatewayConfig.from_file(path)
+
+    def test_agent_command_defaults_per_type_not_a_fixed_fallback(self):
+        """The other half of the same gap: 'command' used to have a single
+        hardcoded fallback ('claude') regardless of 'type' — an agent with
+        type: opencode but no explicit command would silently get command:
+        claude, which OpenCodeBackend execs directly as the wrong sidecar
+        binary. The fallback is now chosen based on the agent's own
+        (required) type."""
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agents:
+              claude-agent:
+                type: claude
+                working_directory: /tmp
+              opencode-agent:
+                type: opencode
+                working_directory: /tmp
+            watchers:
+              - name: w1
+                room: general
+                agent: claude-agent
+        """)
+        config = GatewayConfig.from_file(path)
+        self.assertEqual(config.agents["claude-agent"].command, "claude")
+        self.assertEqual(config.agents["opencode-agent"].command, "opencode")
+
     def test_agent_template_permissions_deep_merge(self):
         path = self._write_config("""\
             connectors:

@@ -772,8 +772,10 @@ def _config_with_two_agents(work_dir: Path) -> str:
     return f"""\
         agents:
           existing-agent:
+            type: claude
             working_directory: {work_dir}
           unused-agent:
+            type: claude
             working_directory: {work_dir}
         connectors:
           - name: rc

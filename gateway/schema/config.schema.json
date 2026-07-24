@@ -180,9 +180,13 @@
         },
         "type": {
           "type": "string",
-          "enum": ["claude", "opencode"]
+          "enum": ["claude", "opencode"],
+          "description": "Required (directly or via an inherits: agent_templates entry) — no fallback."
         },
-        "command": { "type": "string" },
+        "command": {
+          "type": "string",
+          "description": "Defaults based on 'type' when omitted ('claude' for type: claude, 'opencode' for type: opencode) — not a single fixed fallback."
+        },
         "new_session_args": {
           "type": "array",
           "items": { "type": "string" }
