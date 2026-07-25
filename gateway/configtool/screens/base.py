@@ -61,9 +61,17 @@ class DetailScreen(Screen):
     own default, see the comment below), which claims the rest of the row
     and pushes the trailing "Change…" Button off past the terminal's right
     edge, exactly the failure mode `.field-row Input`'s own `width: 1fr`
-    override already exists to prevent. */
+    override already exists to prevent. A FIXED width (not `auto`) is used
+    here specifically — user-reported: `auto` sizes the box exactly to the
+    template name's own length, which puts the Button flush against (or,
+    depending on terminal font metrics, visually overlapping) the text with
+    no breathing room. Fixed width + `content-align: center` centers the
+    name within a consistent-looking column regardless of how long it is;
+    `margin-right` is the actual gap before the Button. */
     DetailScreen .field-value {
-        width: auto;
+        width: 30;
+        content-align: center middle;
+        margin-right: 2;
     }
     DetailScreen Checkbox {
         width: auto;
