@@ -28,14 +28,16 @@ class DetailScreen(Screen):
 
     BODY_ID: str = "detail-body"
 
-    # Field-row layout shared by every screen with an actual edit FORM
-    # (FormScreen — AgentDetailScreen/ConnectorDetailScreen — and
-    # DefaultsScreen, which intentionally does NOT extend FormScreen — see
-    # its own module docstring for why). Lives here, on the common ancestor
-    # both reach, rather than duplicated in each: Textual's CSS type
-    # selectors below match by ancestry, not literal class name, so
-    # `DetailScreen .field-row` applies equally inside a FormScreen
-    # subclass's composed tree and a DefaultsScreen's.
+    # Field-row layout shared by every screen with an actual edit FORM —
+    # all of them FormScreen subclasses now (AgentDetailScreen/
+    # ConnectorDetailScreen/TemplateDetailScreen). Historically also shared
+    # with the old DefaultsScreen (deleted in the v0.3 templates/inherits
+    # redesign — see template_detail.py), which deliberately did NOT extend
+    # FormScreen; kept here on the common ancestor rather than on FormScreen
+    # itself since that was true at the time. Textual's CSS type selectors
+    # below match by ancestry, not literal class name, so `DetailScreen
+    # .field-row` applies equally inside any FormScreen subclass's composed
+    # tree.
     DEFAULT_CSS = """
     DetailScreen .entity-form {
         padding: 1 2;
@@ -51,6 +53,16 @@ class DetailScreen(Screen):
     DetailScreen .field-provenance {
         padding-top: 1;
         margin-left: 2;
+        width: auto;
+    }
+    /* The Inherits row's current-value Static (agent_detail.py/
+    connector_detail.py's action_pick_inherits() rows) — a bare Static with
+    no width override defaults to 1fr (same as Input's own default, see the
+    comment below), which claims the rest of the row and pushes the trailing
+    "(press 'i' to change)" hint off past the terminal's right edge, exactly
+    the failure mode `.field-row Input`'s own `width: 1fr` override already
+    exists to prevent. */
+    DetailScreen .field-value {
         width: auto;
     }
     DetailScreen Checkbox {

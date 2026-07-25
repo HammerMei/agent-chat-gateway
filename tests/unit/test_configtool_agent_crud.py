@@ -30,19 +30,6 @@ def _write_config(tmp_path: Path, yaml_text: str) -> str:
     return str(path)
 
 
-# v0.3 removed the global agent_defaults: block from the real loader (see
-# docs/migration-0.3.md) in favor of named agent_templates:/inherits:. The
-# config TUI's own AgentDetailScreen._compute_initial_values() still resolves
-# the "effective merged value" against the OLD hardcoded "agent_defaults" kind
-# string by design (see docs/design/config-tool.md) — reconciling it with the
-# new mechanism is tracked separately. A test that specifically asserts the
-# form prefills from that merged value is skipped with this reason.
-_STALE_DEFAULTS_SKIP_REASON = (
-    "TUI *_defaults display deferred -- config engine moved to "
-    "*_templates/inherits, see docs/design/config-tool.md"
-)
-
-
 @pytest.fixture
 def work_dir(tmp_path: Path) -> Path:
     d = tmp_path / "work"
@@ -272,7 +259,6 @@ class TestEditAgent:
             for marker in markers:
                 assert marker.region.x + marker.region.width <= app.size.width
 
-    @pytest.mark.skip(reason=_STALE_DEFAULTS_SKIP_REASON)
     async def test_edit_mode_prefills_the_effective_merged_value(self, tmp_path, work_dir):
         config_path = _write_config(
             tmp_path, _config_with_one_agent(work_dir, "session_prefix: custom-prefix\n")
@@ -283,8 +269,9 @@ class TestEditAgent:
             await _open_agent_in_edit_mode(pilot, app)
 
             assert app.screen.query_one("#field-session_prefix", Input).value == "custom-prefix"
-            # timeout is absent from the entry itself but set in agent_defaults —
-            # the form must show the INHERITED effective value (1800), not blank.
+            # timeout is absent from the entry itself but set on its
+            # inherits: template (agent_templates.standard) — the form must
+            # show the INHERITED effective value (1800), not blank.
             assert app.screen.query_one("#field-timeout", Input).value == "1800"
 
     async def test_changing_one_field_writes_only_that_field(self, tmp_path, work_dir):

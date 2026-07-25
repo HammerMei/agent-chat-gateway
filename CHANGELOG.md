@@ -62,9 +62,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fighting over one global block. A leftover `*_defaults:` key is a hard,
   immediate load-time error (not a silent no-op) naming the replacement key.
   No automated migration — see `docs/migration-0.3.md` for the reasoning and
-  before/after recipes. **Known gap:** the config TUI's own
-  `*_defaults`-editing screens have not yet been updated to understand the
-  new mechanism — see the note at the top of `docs/design/config-tool.md`.
+  before/after recipes. The config TUI (`agent-chat-gateway config`) fully
+  understands the new mechanism: a "Templates" tab lists/creates/edits/
+  deletes named templates across all three kinds, and every agent/connector
+  entry has an Inherits picker.
 
 ### Fixed
 - **Scheduled-task messages now carry a usable `ts:`/`day:` timestamp.**

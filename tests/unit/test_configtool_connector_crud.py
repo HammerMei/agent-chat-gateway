@@ -29,21 +29,6 @@ def _write_config(tmp_path: Path, yaml_text: str) -> str:
     return str(path)
 
 
-# v0.3 removed the global connector_defaults: block from the real loader (see
-# docs/migration-0.3.md) in favor of named connector_templates:/inherits:.
-# The config TUI's own ConnectorDetailScreen still resolves the "effective/
-# inherited value" against the OLD hardcoded "connector_defaults" kind string
-# by design (see docs/design/config-tool.md) — a test whose whole premise is
-# "a field INHERITED (not explicit) from a shared default stays inherited
-# when untouched" has no way to set up a genuinely inherited starting point
-# anymore, so it's skipped with this reason rather than given a fixture that
-# would silently test something else.
-_STALE_DEFAULTS_SKIP_REASON = (
-    "TUI *_defaults display deferred -- config engine moved to "
-    "*_templates/inherits, see docs/design/config-tool.md"
-)
-
-
 @pytest.fixture
 def work_dir(tmp_path: Path) -> Path:
     d = tmp_path / "work"
@@ -340,23 +325,24 @@ class TestEditConnector:
             raw = yaml.safe_load(Path(config_path).read_text())
             assert raw["connectors"][0]["allowed_users"]["owners"] == ["alice", "bob"]
 
-    @pytest.mark.skip(reason=_STALE_DEFAULTS_SKIP_REASON)
     async def test_untouched_fields_are_not_written_as_explicit(self, tmp_path, work_dir):
-        """Regression for decision 2: connector_defaults-inherited fields
-        must stay inherited if the form is opened and something ELSE is
-        changed — displaying a merged/effective value must not itself count
-        as "explicit"."""
+        """Regression for decision 2: inherits:-template fields must stay
+        inherited if the form is opened and something ELSE is changed —
+        displaying a merged/effective value must not itself count as
+        "explicit"."""
         config_path = _write_config(
             tmp_path,
             f"""\
-                connector_defaults:
-                  require_mention: false
+                connector_templates:
+                  standard:
+                    require_mention: false
                 agents:
                   default:
                     type: claude
                     working_directory: {work_dir}
                 connectors:
                   - name: rc-existing
+                    inherits: standard
                     type: rocketchat
                     server: {{url: "http://localhost:3000", username: bot, password: pw}}
                 watchers:
@@ -371,7 +357,7 @@ class TestEditConnector:
             await _open_connector_in_edit_mode(pilot, app)
 
             require_mention = app.screen.query_one("#field-require_mention")
-            assert require_mention.value is False  # inherited from connector_defaults
+            assert require_mention.value is False  # inherited from connector_templates.standard
 
             app.screen.query_one("#field-timezone", Input).value = "America/Los_Angeles"
             await pilot.pause()
@@ -383,6 +369,46 @@ class TestEditConnector:
             assert connector["timezone"] == "America/Los_Angeles"
             assert "require_mention" not in connector  # still inherited, not explicit
 
+    async def test_type_from_template_only_still_shows_the_right_type_specific_fields(
+        self, tmp_path, work_dir
+    ):
+        """Regression for `_connector_type()`'s merge fix: a connector whose
+        `type` is set ONLY via its `inherits:` template (never on the raw
+        entry itself) must still pick the correct per-type field list in
+        edit mode — before the fix, `_connector_type()` read the RAW entry
+        directly and fell back to the wrong type ('rocketchat' regardless),
+        picking `rocketchat`'s fields even for a mattermost connector."""
+        config_path = _write_config(
+            tmp_path,
+            f"""\
+                connector_templates:
+                  standard:
+                    type: mattermost
+                agents:
+                  default:
+                    type: claude
+                    working_directory: {work_dir}
+                connectors:
+                  - name: mm-existing
+                    inherits: standard
+                    server: {{url: "http://localhost:3000", team: t, username: bot, password: pw}}
+                watchers:
+                  - connector: mm-existing
+                    agent: default
+                    room: general
+            """,
+        )
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_connector_in_edit_mode(pilot, app)
+
+            assert isinstance(app.screen, ConnectorDetailScreen)
+            # 'server.team' is mattermost-only (never in rocketchat's field
+            # list) — its presence here proves the merged (not raw) type
+            # was used to pick the field list.
+            assert app.screen.query_one("#field-server-team", Input).value == "t"
+
     async def test_a_save_that_fails_validate_config_does_not_mutate_the_live_entry(
         self, tmp_path, work_dir
     ):
@@ -391,11 +417,11 @@ class TestEditConnector:
         object already living in cfg.document), so a rejected save still
         left the invalid data sitting in memory (and, if Back was pressed
         without a further successful save, visibly shown). Clearing the
-        password field reverts it to inherited (empty, since no
-        connector_defaults sets it) — _check_connectors then rejects the
-        empty password, and BOTH the password clear AND the unrelated
-        username change made in the same edit session must roll back
-        together, atomically."""
+        password field reverts it to inherited (empty, since this connector
+        has no inherits: template setting it) — _check_connectors then
+        rejects the empty password, and BOTH the password clear AND the
+        unrelated username change made in the same edit session must roll
+        back together, atomically."""
         config_path = _write_config(tmp_path, _config_with_one_rocketchat_connector(work_dir))
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:

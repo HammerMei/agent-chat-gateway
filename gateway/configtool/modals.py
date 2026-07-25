@@ -463,3 +463,81 @@ class PresetOrInlineModal(ModalScreen[tuple[str, str | None] | None]):
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+
+class InheritsPickerModal(ModalScreen[tuple[str, str | None] | None]):
+    """Pick which named template (if any) an agent/connector entry's own
+    `inherits:` field should point to — the per-entry counterpart to
+    `PresetOrInlineModal` above, same shape: lists every existing template
+    name for the entry's kind, plus two fixed actions: clear the entry's
+    `inherits:` entirely, or detour through `TemplateDetailScreen` to create
+    a brand-new template (this modal itself never pushes another screen; the
+    caller does — same non-return-flow precedent `PresetOrInlineModal`'s own
+    `new_preset` branch already establishes: the caller creates the
+    template, the user backs out, then re-invokes this picker to actually
+    reference it).
+
+    Dismisses with `(kind, template_name)`: `kind` is `"template"`
+    (`template_name` set to the chosen template), `"none"` (clear
+    `inherits:`), or `"new_template"` (`template_name` is `None` for the
+    latter two). `dismiss(None)` on cancel/Escape.
+
+    `current` (the entry's existing `inherits:` value, if any) is shown
+    inline on its row rather than as a native ListView "selection," since
+    ListView itself has no persistent-highlight concept beyond cursor
+    position.
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
+
+    DEFAULT_CSS = """
+    InheritsPickerModal {
+        align: center middle;
+    }
+    #inherits-picker-dialog {
+        width: auto;
+        min-width: 40;
+        max-width: 60;
+        height: auto;
+        border: thick $primary;
+        padding: 1 2;
+        background: $surface;
+    }
+    #inherits-picker-list {
+        height: auto;
+        max-height: 15;
+        margin-top: 1;
+    }
+    """
+
+    _NONE_LABEL = "(none — no template)"
+    _NEW_TEMPLATE_LABEL = "+ Create a new template…"
+
+    def __init__(self, template_names: list[str], current: str | None):
+        super().__init__()
+        self.template_names = template_names
+        self.current = current
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="inherits-picker-dialog"):
+            yield Static("Pick inherits: template", id="inherits-picker-title")
+            items = [ListItem(Label(self._NONE_LABEL), name="none")]
+            for name in self.template_names:
+                suffix = "  (current)" if name == self.current else ""
+                items.append(
+                    ListItem(Label(f"→ template: {name}{suffix}"), name=f"template:{name}")
+                )
+            items.append(ListItem(Label(self._NEW_TEMPLATE_LABEL), name="new_template"))
+            yield ListView(*items, id="inherits-picker-list")
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        name = event.item.name or ""
+        if name.startswith("template:"):
+            self.dismiss(("template", name.removeprefix("template:")))
+        elif name == "none":
+            self.dismiss(("none", None))
+        elif name == "new_template":
+            self.dismiss(("new_template", None))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)

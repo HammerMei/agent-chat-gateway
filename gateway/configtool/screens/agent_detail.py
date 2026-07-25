@@ -3,7 +3,8 @@
 Unlike connectors, the agent schema is complete (additionalProperties:
 false in gateway/schema/config.schema.json's $defs/agent), so this shows a
 fixed field list with a provenance marker per field (explicit / inherited
-from agent_defaults / explicit-null-suppressing) instead of a generic dump.
+from the agent's own `inherits:` template / explicit-null-suppressing)
+instead of a generic dump.
 `_FORM_FIELDS`/`_PERMISSIONS_FORM_FIELDS` below are a manually-maintained
 mirror of that schema (matching Phase 1's `_KNOWN_FIELDS`, not a runtime
 JSON-schema interpreter) — safe because the schema is closed
@@ -43,10 +44,21 @@ from textual.containers import Horizontal, VerticalScroll
 from textual.widgets import Input, Label, ListItem, ListView, Static
 
 from ..formatting import format_value, provenance_label
-from ..modals import InlineToolRuleModal, MessageModal, PresetOrInlineModal, TextPromptModal
+from ..modals import (
+    InheritsPickerModal,
+    InlineToolRuleModal,
+    MessageModal,
+    PresetOrInlineModal,
+    TextPromptModal,
+)
 from ..model import EditableConfig
 from .form_common import FieldSpec, FormScreen, apply_update, find_referencing_watcher_labels
 from .tool_presets import ToolPresetsScreen
+
+# NOTE: TemplateDetailScreen (screens/template_detail.py) is deliberately
+# imported LOCALLY inside action_pick_inherits() below, not at module level —
+# template_detail.py itself imports AGENT_FORM_FIELDS/AGENT_DATACLASS_DEFAULTS
+# from this module, so a module-level import here would be circular.
 
 if TYPE_CHECKING:
     from ..app import ConfigToolApp
@@ -80,11 +92,12 @@ _KNOWN_FIELDS = [
 
 # AgentConfig/PermissionConfig's own dataclass defaults (gateway/core/
 # config.py) — used ONLY to prefill the form with the true effective value
-# when a field is set by neither the entry nor agent_defaults. Unlike view
-# mode (which simply omits a line for an absent field), a form editing that
-# field needs to show what it would actually evaluate to right now. Public
-# (no leading underscore): DefaultsScreen reuses this dict too, as the
-# "no shared default set" fallback value for editing agent_defaults itself.
+# when a field is set by neither the entry nor its inherits: template.
+# Unlike view mode (which simply omits a line for an absent field), a form
+# editing that field needs to show what it would actually evaluate to right
+# now. Public (no leading underscore): TemplateDetailScreen reuses this dict
+# too, as the "no dataclass default" fallback value for editing an agent
+# template's own fields.
 AGENT_DATACLASS_DEFAULTS: dict[str, object] = {
     "type": "claude",
     "command": "claude",
@@ -114,11 +127,11 @@ _PERMISSIONS_FORM_FIELDS: list[FieldSpec] = [
     FieldSpec("permissions.timeout", "int", "Permissions timeout (seconds)"),
     FieldSpec("permissions.skip_owner_approval", "bool", "Skip owner approval"),
 ]
-# Public (no leading underscore): also reused by DefaultsScreen to edit
-# agent_defaults with the exact same field set, schema-derived-so-zero-
-# drift-risk reasoning applies just as much there — every one of these keys
-# is legal in agent_defaults too (gateway/config.py's forbidden-keys set for
-# agent_defaults is empty).
+# Public (no leading underscore): also reused by TemplateDetailScreen to
+# edit an agent template with the exact same field set, schema-derived-so-
+# zero-drift-risk reasoning applies just as much there — every one of these
+# keys is legal in an agent template too (gateway/config.py's forbidden-keys
+# set for agent_templates is empty).
 AGENT_FORM_FIELDS = (*_FORM_FIELDS, *_PERMISSIONS_FORM_FIELDS)
 
 
@@ -155,6 +168,7 @@ class AgentDetailScreen(FormScreen):
     BINDINGS = [
         Binding("a", "add_tool_rule", "Add tool rule", show=True),
         Binding("x", "remove_tool_rule", "Remove tool rule", show=True),
+        Binding("i", "pick_inherits", "Inherits", show=True),
     ]
 
     DEFAULT_CSS = """
@@ -179,13 +193,19 @@ class AgentDetailScreen(FormScreen):
         self.mode = mode
         self._tool_lists: dict[str, list] = {}
         self._tool_lists_initial: dict[str, list] = {}
+        # See action_pick_inherits()/action_save() below — snapshotted once
+        # at form-open time, like every other field (module docstring's
+        # decision 2), NOT live-recomputed when the picker changes it mid-
+        # edit; re-enter edit mode after saving to see new effective values.
+        self._inherits_initial: str | None = self.cfg.entry_template_name(self.entry)
+        self._inherits_current: str | None = self._inherits_initial
         if self.mode != "view":
             self._compute_initial_values(self.entry)
             self._tool_list_state()
             self._populating = True
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        if action in ("add_tool_rule", "remove_tool_rule"):
+        if action in ("add_tool_rule", "remove_tool_rule", "pick_inherits"):
             return self.mode != "view"
         return super().check_action(action, parameters)
 
@@ -194,6 +214,9 @@ class AgentDetailScreen(FormScreen):
 
     def _entity_label(self) -> str:
         return self.agent_name
+
+    def _current_entry(self) -> dict:
+        return self.entry
 
     def _remove_entry_from_document(self) -> None:
         del self.cfg.document["agents"][self.agent_name]
@@ -213,12 +236,14 @@ class AgentDetailScreen(FormScreen):
     def _on_enter_edit_mode(self) -> None:
         self._compute_initial_values(self.entry)
         self._tool_list_state()
+        self._inherits_initial = self.cfg.entry_template_name(self.entry)
+        self._inherits_current = self._inherits_initial
 
     def _field_specs(self) -> tuple[FieldSpec, ...]:
         return AGENT_FORM_FIELDS
 
-    def _defaults_kind(self) -> str:
-        return "agent_defaults"
+    def _template_kind(self) -> str:
+        return "agent"
 
     def _dataclass_defaults(self) -> dict[str, object]:
         return AGENT_DATACLASS_DEFAULTS
@@ -229,11 +254,11 @@ class AgentDetailScreen(FormScreen):
         """(Re)snapshot both tool lists to their MERGED (effective) value —
         same semantics `_compute_initial_values()` uses for every scalar
         field: the form shows what's ACTUALLY in effect right now (inherited
-        from agent_defaults or explicit on this entry), and `action_save()`
-        below only writes an explicit override if the final list actually
-        differs from this snapshot."""
+        from the agent's own `inherits:` template or explicit on this
+        entry), and `action_save()` below only writes an explicit override
+        if the final list actually differs from this snapshot."""
         try:
-            merged = self.cfg.merged_entry(self._defaults_kind(), self.entry)
+            merged = self.cfg.merged_entry(self._template_kind(), self.entry)
         except (ValueError, FileNotFoundError):
             merged = dict(self.entry)
         self._tool_lists = {
@@ -318,6 +343,52 @@ class AgentDetailScreen(FormScreen):
         self._form_dirty = True
         self._refresh_tool_list(key)
 
+    # ── inherits: picker ─────────────────────────────────────────────────────
+
+    @work
+    async def action_pick_inherits(self) -> None:
+        if self.mode == "view":
+            return
+        template_names = sorted(self.cfg.templates("agent"))
+        choice = await self.app.push_screen_wait(
+            InheritsPickerModal(template_names, self._inherits_current)
+        )
+        if choice is None:
+            return
+        kind, name = choice
+
+        if kind == "template":
+            self._inherits_current = name
+        elif kind == "none":
+            self._inherits_current = None
+        elif kind == "new_template":
+            new_name = await self.app.push_screen_wait(
+                TextPromptModal("New agent template — name")
+            )
+            if new_name is None:
+                return
+            if new_name in self.cfg.templates("agent"):
+                await self.app.push_screen_wait(
+                    MessageModal(
+                        f"An agent template named '{new_name}' already exists.",
+                        title="Could not create",
+                    )
+                )
+                return
+            # One-way detour, not a return-with-result flow (see
+            # InheritsPickerModal's docstring): the user fills in the new
+            # template over there, presses Escape to come back HERE, then
+            # re-invokes 'i' to actually reference it.
+            from .template_detail import TemplateDetailScreen
+
+            self.app.push_screen(TemplateDetailScreen(self.cfg, "agent", new_name, {}, mode="create"))
+            return
+        else:
+            return
+
+        self._form_dirty = True
+        self.query_one("#inherits-value", Static).update(self._inherits_current or "(none)")
+
     # ── view mode ────────────────────────────────────────────────────────────
 
     def _body_text(self) -> str:
@@ -325,10 +396,12 @@ class AgentDetailScreen(FormScreen):
         lines = [f"[bold]{self.agent_name}[/bold]"]
         if description:
             lines.append(f"[dim]{description}[/dim]")
+        template_name = self.cfg.entry_template_name(self.entry)
+        lines.append(f"inherits: {template_name if template_name else '(none)'}")
         lines.append("")
 
         try:
-            merged = self.cfg.merged_entry("agent_defaults", self.entry)
+            merged = self.cfg.merged_entry("agent", self.entry)
         except (ValueError, FileNotFoundError) as exc:
             lines.append(f"[red]Could not compute effective values: {exc}[/red]")
             return "\n".join(lines)
@@ -336,10 +409,10 @@ class AgentDetailScreen(FormScreen):
         for key in _KNOWN_FIELDS:
             if key not in merged:
                 continue
-            provenance = self.cfg.field_provenance("agent_defaults", self.entry, key)
+            provenance = self.cfg.field_provenance("agent", self.entry, key)
             lines.append(
                 f"{key}: {format_value(merged[key])}  "
-                f"[dim]({provenance_label(provenance)})[/dim]"
+                f"[dim]({provenance_label(provenance, template_name)})[/dim]"
             )
 
         for label, field_key in (
@@ -348,9 +421,9 @@ class AgentDetailScreen(FormScreen):
         ):
             if field_key not in merged:
                 continue
-            provenance = self.cfg.field_provenance("agent_defaults", self.entry, field_key)
+            provenance = self.cfg.field_provenance("agent", self.entry, field_key)
             lines.append("")
-            lines.append(f"{label}:  [dim]({provenance_label(provenance)})[/dim]")
+            lines.append(f"{label}:  [dim]({provenance_label(provenance, template_name)})[/dim]")
             for item in merged.get(field_key) or []:
                 lines.append(f"  {_format_tool_rule(item)}")
 
@@ -379,6 +452,15 @@ class AgentDetailScreen(FormScreen):
                     id="field-description",
                     value=self._initial_values.get("description") or "",
                 )
+
+            with Horizontal(classes="field-row"):
+                yield Static("Inherits", classes="field-label")
+                yield Static(
+                    self._inherits_current or "(none)",
+                    id="inherits-value",
+                    classes="field-value",
+                )
+                yield Static("[dim](press 'i' to change)[/dim]", classes="field-provenance")
 
             for spec in _FORM_FIELDS:
                 yield from self._compose_field_row(spec, self.entry)
@@ -453,6 +535,14 @@ class AgentDetailScreen(FormScreen):
         target_entry = dict(self.entry)
         for key, value in updates.items():
             apply_update(target_entry, key, value)
+
+        # inherits: lives outside the FieldSpec/apply_update() pipeline too
+        # (it's driven by InheritsPickerModal, not an Input/Checkbox/Select
+        # widget) — diffed here directly against the snapshot taken when the
+        # form opened (or last re-entered edit mode), same "only write what
+        # actually changed" semantics as every other field.
+        if self._inherits_current != self._inherits_initial:
+            apply_update(target_entry, "inherits", self._inherits_current)
 
         # Tool lists live outside the FieldSpec/apply_update() pipeline (see
         # module docstring) — diffed here, directly, against the MERGED

@@ -5,7 +5,7 @@ Connector `raw` is deliberately type-flexible in the schema
 `additionalProperties: false`) — unlike Agent/WatcherDetailScreen, there's
 no single closed field list. The design originally called for a generic
 recursive tree editor to handle arbitrary/unknown keys; **deferred** here in
-favor of per-type fixed field lists (`_FIELDS_BY_TYPE` below), one level of
+favor of per-type fixed field lists (`FIELDS_BY_TYPE` below), one level of
 nesting matching every real connector type's actual raw shape exactly
 (`server.url`, `allowed_users.owners`, etc. — verified against all 4 types'
 own `from_connector_config()` before choosing this). The generic tree editor
@@ -30,13 +30,19 @@ from typing import Literal
 
 from textual import work
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, VerticalScroll
 from textual.widgets import Input, Static
 
 from ..formatting import mask_if_secret, provenance_label
-from ..modals import MessageModal
+from ..modals import InheritsPickerModal, MessageModal, TextPromptModal, TypePickerModal
 from ..model import EditableConfig
 from .form_common import FieldSpec, FormScreen, apply_update, find_referencing_watcher_labels
+
+# NOTE: TemplateDetailScreen (screens/template_detail.py) is deliberately
+# imported LOCALLY inside action_pick_inherits() below, not at module level —
+# template_detail.py itself imports FIELDS_BY_TYPE/DATACLASS_DEFAULTS_BY_TYPE
+# from this module, so a module-level import here would be circular.
 
 CONNECTOR_TYPES = ("rocketchat", "mattermost", "voice", "script")
 
@@ -74,7 +80,7 @@ _VOICE_FIELDS: tuple[FieldSpec, ...] = (
 )
 _SCRIPT_FIELDS: tuple[FieldSpec, ...] = ()  # ScriptConnector never reads raw
 
-_FIELDS_BY_TYPE: dict[str, tuple[FieldSpec, ...]] = {
+FIELDS_BY_TYPE: dict[str, tuple[FieldSpec, ...]] = {
     "rocketchat": _ROCKETCHAT_FIELDS,
     "mattermost": _MATTERMOST_FIELDS,
     "voice": _VOICE_FIELDS,
@@ -83,8 +89,8 @@ _FIELDS_BY_TYPE: dict[str, tuple[FieldSpec, ...]] = {
 
 # Each connector type's own dataclass defaults (gateway/connectors/*/config.py)
 # — used ONLY to prefill the form with the true effective value when a field
-# is set by neither the entry nor connector_defaults.
-_DATACLASS_DEFAULTS_BY_TYPE: dict[str, dict[str, object]] = {
+# is set by neither the entry nor its own inherits: template.
+DATACLASS_DEFAULTS_BY_TYPE: dict[str, dict[str, object]] = {
     "rocketchat": {
         "server.url": "", "server.username": "", "server.password": "",
         "allowed_users.owners": [], "allowed_users.guests": [],
@@ -106,6 +112,10 @@ _DATACLASS_DEFAULTS_BY_TYPE: dict[str, dict[str, object]] = {
 class ConnectorDetailScreen(FormScreen):
     BODY_ID = "connector-detail-body"
 
+    BINDINGS = [
+        Binding("i", "pick_inherits", "Inherits", show=True),
+    ]
+
     def __init__(
         self,
         cfg: EditableConfig,
@@ -116,15 +126,28 @@ class ConnectorDetailScreen(FormScreen):
         self.cfg = cfg
         self.entry = entry
         self.mode = mode
+        # See action_pick_inherits()/action_save() below — snapshotted once
+        # at form-open time, like every other field, NOT live-recomputed
+        # when the picker changes it mid-edit.
+        self._inherits_initial: str | None = self.cfg.entry_template_name(self.entry)
+        self._inherits_current: str | None = self._inherits_initial
         if self.mode != "view":
             self._compute_initial_values(self.entry)
             self._populating = True
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action == "pick_inherits":
+            return self.mode != "view"
+        return super().check_action(action, parameters)
 
     def _entity_noun(self) -> str:
         return "connector"
 
     def _entity_label(self) -> str:
         return self.entry.get("name", "?")
+
+    def _current_entry(self) -> dict:
+        return self.entry
 
     def _find_own_index(self) -> int:
         # Matched by object IDENTITY, not equality — connectors_raw is a
@@ -155,48 +178,62 @@ class ConnectorDetailScreen(FormScreen):
 
     def _on_enter_edit_mode(self) -> None:
         self._compute_initial_values(self.entry)
+        self._inherits_initial = self.cfg.entry_template_name(self.entry)
+        self._inherits_current = self._inherits_initial
 
     def _connector_type(self) -> str:
-        return self.entry.get("type", "rocketchat")
+        # Reads the MERGED type, not the raw entry directly — a connector
+        # whose 'type' comes only from its inherits: template (never set on
+        # the entry itself) still needs to select the right per-type field
+        # list/dataclass-defaults below.
+        try:
+            merged = self.cfg.merged_entry("connector", self.entry)
+        except (ValueError, FileNotFoundError):
+            merged = self.entry
+        return merged.get("type", "rocketchat")
 
     def _field_specs(self) -> tuple[FieldSpec, ...]:
-        return _FIELDS_BY_TYPE.get(self._connector_type(), ())
+        return FIELDS_BY_TYPE.get(self._connector_type(), ())
 
-    def _defaults_kind(self) -> str:
-        return "connector_defaults"
+    def _template_kind(self) -> str:
+        return "connector"
 
     def _dataclass_defaults(self) -> dict[str, object]:
-        return _DATACLASS_DEFAULTS_BY_TYPE.get(self._connector_type(), {})
+        return DATACLASS_DEFAULTS_BY_TYPE.get(self._connector_type(), {})
 
     # ── view mode ────────────────────────────────────────────────────────────
 
     def _body_text(self) -> str:
         name = self.entry.get("name", "?")
         description = self.entry.get("description")
+        template_name = self.cfg.entry_template_name(self.entry)
         try:
-            merged = self.cfg.merged_entry("connector_defaults", self.entry)
-            type_provenance = self.cfg.field_provenance(
-                "connector_defaults", self.entry, "type"
-            )
+            merged = self.cfg.merged_entry("connector", self.entry)
+            type_provenance = self.cfg.field_provenance("connector", self.entry, "type")
         except (ValueError, FileNotFoundError):
             merged = self.entry
             type_provenance = None
         conn_type = merged.get("type", "?")
 
-        type_suffix = f"  [dim]({provenance_label(type_provenance)})[/dim]" if type_provenance else ""
+        type_suffix = (
+            f"  [dim]({provenance_label(type_provenance, template_name)})[/dim]"
+            if type_provenance
+            else ""
+        )
         lines = [f"[bold]{name}[/bold]  (type: {conn_type}){type_suffix}"]
         if description:
             lines.append(f"[dim]{description}[/dim]")
+        lines.append(f"inherits: {template_name if template_name else '(none)'}")
         lines.append("")
 
         # 'type' itself is shown in the header above (with its own provenance
         # marker); everything else is a plain dump of this entry's OWN raw
-        # fields — connector_defaults values that this entry simply inherits
+        # fields — inherits: template values that this entry simply inherits
         # (and never overrides) are intentionally not repeated here, since
         # raw is type-flexible and there's no fixed field list to merge
         # against field-by-field the way agent/watcher detail screens do.
         for key, value in self.entry.items():
-            if key in ("name", "type", "description"):
+            if key in ("name", "type", "description", "inherits"):
                 continue
             lines.append(self._render_field(key, value, indent=0))
         return "\n".join(lines)
@@ -234,6 +271,15 @@ class ConnectorDetailScreen(FormScreen):
                     value=self._initial_values.get("description") or "",
                 )
 
+            with Horizontal(classes="field-row"):
+                yield Static("Inherits", classes="field-label")
+                yield Static(
+                    self._inherits_current or "(none)",
+                    id="inherits-value",
+                    classes="field-value",
+                )
+                yield Static("[dim](press 'i' to change)[/dim]", classes="field-provenance")
+
             if conn_type == "mattermost":
                 # UX guidance only — save()'s validate_config() (which runs
                 # the real MattermostConfig.__post_init__) is the actual
@@ -252,6 +298,64 @@ class ConnectorDetailScreen(FormScreen):
 
             for spec in self._field_specs():
                 yield from self._compose_field_row(spec, self.entry)
+
+    # ── inherits: picker ─────────────────────────────────────────────────────
+
+    @work
+    async def action_pick_inherits(self) -> None:
+        if self.mode == "view":
+            return
+        template_names = sorted(self.cfg.templates("connector"))
+        choice = await self.app.push_screen_wait(
+            InheritsPickerModal(template_names, self._inherits_current)
+        )
+        if choice is None:
+            return
+        kind, name = choice
+
+        if kind == "template":
+            self._inherits_current = name
+        elif kind == "none":
+            self._inherits_current = None
+        elif kind == "new_template":
+            # One-way detour, not a return-with-result flow — same precedent
+            # as AgentDetailScreen.action_pick_inherits()'s "new_template"
+            # branch. Connector templates always pick a type up front (this
+            # screen has no generic tree editor — see module docstring), so
+            # prompt for one before the name, same order
+            # OverviewScreen.action_new_entity() uses for a brand-new
+            # connector.
+            new_type = await self.app.push_screen_wait(
+                TypePickerModal("New connector template — pick a type", list(CONNECTOR_TYPES))
+            )
+            if new_type is None:
+                return
+            new_name = await self.app.push_screen_wait(
+                TextPromptModal("New connector template — name")
+            )
+            if new_name is None:
+                return
+            if new_name in self.cfg.templates("connector"):
+                await self.app.push_screen_wait(
+                    MessageModal(
+                        f"A connector template named '{new_name}' already exists.",
+                        title="Could not create",
+                    )
+                )
+                return
+            from .template_detail import TemplateDetailScreen
+
+            self.app.push_screen(
+                TemplateDetailScreen(
+                    self.cfg, "connector", new_name, {"type": new_type}, mode="create"
+                )
+            )
+            return
+        else:
+            return
+
+        self._form_dirty = True
+        self.query_one("#inherits-value", Static).update(self._inherits_current or "(none)")
 
     # ── save ─────────────────────────────────────────────────────────────────
 
@@ -294,6 +398,13 @@ class ConnectorDetailScreen(FormScreen):
         target_entry = dict(self.entry)
         for key, value in updates.items():
             apply_update(target_entry, key, value)
+
+        # inherits: lives outside the FieldSpec/apply_update() pipeline (it's
+        # driven by InheritsPickerModal, not an Input/Checkbox/Select widget)
+        # — diffed here directly against the snapshot taken when the form
+        # opened (or last re-entered edit mode).
+        if self._inherits_current != self._inherits_initial:
+            apply_update(target_entry, "inherits", self._inherits_current)
 
         inserted_index: int | None = None
         if self.mode == "create":

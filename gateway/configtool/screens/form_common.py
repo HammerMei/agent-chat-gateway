@@ -18,12 +18,13 @@ explicit null — see `apply_update()`.
 A subclass provides:
   - `_field_specs() -> tuple[FieldSpec, ...]` — which fields this form shows
     right now (may depend on entity-specific state, e.g. connector `type`).
-  - `_defaults_kind() -> str` — the `*_defaults` block this entry merges
-    against (`"agent_defaults"` / `"connector_defaults"` / ...).
+  - `_template_kind() -> str` — the `*_templates:` block this entry's own
+    `inherits:` field (if set) is resolved against (`"agent"` /
+    `"connector"` / `"watcher"`).
   - `_dataclass_defaults() -> dict[str, object]` — the true effective value
-    for a field set by neither the entry nor its `*_defaults` block (a form
-    needs to show what a field would actually evaluate to; view mode gets
-    away with just omitting the line).
+    for a field set by neither the entry nor its `inherits:` template (a
+    form needs to show what a field would actually evaluate to; view mode
+    gets away with just omitting the line).
   - `_compose_form() -> ComposeResult` — the form body (typically a
     `VerticalScroll` wrapping `_compose_field_row()` calls plus whatever
     entity-specific chrome — a name Input for create mode, etc.).
@@ -191,22 +192,22 @@ def find_referencing_watcher_labels(
 def find_agents_referencing_preset(cfg: EditableConfig, preset_name: str) -> list[str]:
     """Which agents currently reference the given `tool_presets` entry, via
     either `owner_allowed_tools` or `guest_allowed_tools` — checked against
-    the MERGED view (`agent_defaults` + entry), not the raw entry alone, so
-    a preset referenced only via `agent_defaults` (common: shared across
-    every agent that doesn't override its own tool list) still shows up as
-    "used by" that agent. Used by both `ToolPresetsScreen` (its own
-    used-by display) and `OverviewScreen`'s direct-delete-a-preset flow
-    (blocks the delete with this list, same pre-check pattern
-    `find_referencing_watcher_labels()` above uses for connectors/agents).
-    If the config doesn't currently load, returns [] — same reasoning as
-    that function: a delete pre-check has nothing useful to say about a
-    config that doesn't parse; `save()`'s own validation remains the
-    backstop.
+    the MERGED view (entry resolved against its own `inherits:` template, if
+    any), not the raw entry alone, so a preset referenced only via an
+    agent's `inherits:` template (common: shared across every agent that
+    doesn't override its own tool list) still shows up as "used by" that
+    agent. Used by both `ToolPresetsScreen` (its own used-by display) and
+    `OverviewScreen`'s direct-delete-a-preset flow (blocks the delete with
+    this list, same pre-check pattern `find_referencing_watcher_labels()`
+    above uses for connectors/agents). If the config doesn't currently load,
+    returns [] — same reasoning as that function: a delete pre-check has
+    nothing useful to say about a config that doesn't parse; `save()`'s own
+    validation remains the backstop.
     """
     used_by = []
     for name, entry in cfg.agents_raw.items():
         try:
-            merged = cfg.merged_entry("agent_defaults", entry)
+            merged = cfg.merged_entry("agent", entry)
         except (ValueError, FileNotFoundError):
             merged = entry
         owner_tools = merged.get("owner_allowed_tools") or []
@@ -214,6 +215,48 @@ def find_agents_referencing_preset(cfg: EditableConfig, preset_name: str) -> lis
         if preset_name in owner_tools or preset_name in guest_tools:
             used_by.append(name)
     return used_by
+
+
+def find_entries_referencing_template(
+    cfg: EditableConfig, kind: str, template_name: str
+) -> list[tuple[str, dict]]:
+    """Which entries of `kind` ('agent' | 'connector' | 'watcher') currently
+    have `inherits: == template_name` — the blast-radius / delete-precheck
+    primitive for a NAMED template, scoped to just that one template (unlike
+    the old global `*_defaults` blocks, where "who's affected" meant "every
+    entry in the config" — the whole point of named templates is that
+    different entries can inherit different templates, so blast radius must
+    be scoped accordingly). Direct analogue of
+    `find_agents_referencing_preset()` above, generalized across kinds.
+
+    Returns `(label, raw_entry)` pairs, not just labels — `TemplateDetailScreen`
+    needs each entry's own dict too (to check "does this entry already
+    override the field being changed"), not merely a count/name list. Callers
+    that only need labels do `[name for name, _ in ...]`.
+    """
+    if kind == "agent":
+        entries = list(cfg.agents_raw.items())
+    elif kind == "connector":
+        entries = [(e.get("name", "?"), e) for e in cfg.connectors_raw]
+    else:
+        # Label with the REAL expanded watcher name(s) (matching
+        # `find_referencing_watcher_labels()`'s own naming, and the
+        # Watchers tab), not a synthetic "<connector>/<room>" guess — a raw
+        # entry with a `rooms:` group expands into several real watchers,
+        # matched back to this raw entry by identity (same pattern
+        # `ConnectorDetailScreen._find_own_index()` uses). Falls back to
+        # "?" only if the config doesn't currently load at all (blast-radius
+        # display has nothing better to say in that case either).
+        try:
+            expanded = cfg.expanded_watchers()
+        except (ValueError, FileNotFoundError):
+            expanded = []
+        entries = []
+        for w in cfg.watchers_raw:
+            names = [ew.watcher.name for ew in expanded if ew.raw_entry is w]
+            label = ", ".join(names) if names else (w.get("name") or "?")
+            entries.append((label, w))
+    return [(name, entry) for name, entry in entries if entry.get("inherits") == template_name]
 
 
 class FormScreen(DetailScreen):
@@ -321,7 +364,7 @@ class FormScreen(DetailScreen):
     def _field_specs(self) -> tuple[FieldSpec, ...]:
         raise NotImplementedError
 
-    def _defaults_kind(self) -> str:
+    def _template_kind(self) -> str:
         raise NotImplementedError
 
     def _dataclass_defaults(self) -> dict[str, object]:
@@ -333,6 +376,13 @@ class FormScreen(DetailScreen):
     def _entity_label(self) -> str:
         """Used in the delete-confirmation message and the post-delete
         notification (e.g. an agent/connector's name)."""
+        raise NotImplementedError
+
+    def _current_entry(self) -> dict:
+        """This screen's own raw entry dict (`self.entry` on every concrete
+        subclass) — used by `action_reset_field()`, which has no natural
+        parameter-passing path (it's a key-binding handler, not called from
+        `_compose_form()` the way `_compose_field_row()` is)."""
         raise NotImplementedError
 
     def _remove_entry_from_document(self) -> None:
@@ -372,6 +422,14 @@ class FormScreen(DetailScreen):
         with their own kind of name."""
         raise NotImplementedError
 
+    def _delete_blocker_noun(self) -> str:
+        """The noun used in the delete-blocked message ("still used by
+        {noun}(s): ..."). Unchanged default for Agent/ConnectorDetailScreen
+        (blocked by referencing watchers); `TemplateDetailScreen` overrides
+        this to its own `kind` (blocked by referencing agents/connectors/
+        watchers instead)."""
+        return "watcher"
+
     async def action_save(self) -> None:
         raise NotImplementedError
 
@@ -390,7 +448,7 @@ class FormScreen(DetailScreen):
     def _compute_initial_values(self, entry: dict) -> None:
         self._reset_keys = {}  # fresh edit session — no lingering reset markers
         try:
-            merged = self.cfg.merged_entry(self._defaults_kind(), entry)
+            merged = self.cfg.merged_entry(self._template_kind(), entry)
         except (ValueError, FileNotFoundError):
             merged = dict(entry)
         dataclass_defaults = self._dataclass_defaults()
@@ -404,13 +462,16 @@ class FormScreen(DetailScreen):
     def _field_provenance(self, spec: FieldSpec, entry: dict) -> Provenance | None:
         top_key = spec.key.split(".", 1)[0]
         try:
-            return self.cfg.field_provenance(self._defaults_kind(), entry, top_key)
+            return self.cfg.field_provenance(self._template_kind(), entry, top_key)
         except (ValueError, FileNotFoundError):
             return None
 
     def _compose_field_row(self, spec: FieldSpec, entry: dict) -> ComposeResult:
         provenance = self._field_provenance(spec, entry)
-        prov_text = f"[dim]({provenance_label(provenance)})[/dim]" if provenance else ""
+        template_name = self.cfg.entry_template_name(entry)
+        prov_text = (
+            f"[dim]({provenance_label(provenance, template_name)})[/dim]" if provenance else ""
+        )
         initial = self._initial_values.get(spec.key)
         with Horizontal(classes="field-row"):
             yield Static(spec.label, classes="field-label")
@@ -460,12 +521,20 @@ class FormScreen(DetailScreen):
         self._form_dirty = True
 
     def action_reset_field(self) -> None:
-        """ctrl+r: reset the FOCUSED field to its pure-defaults value (no
-        explicit override) — see the `_reset_keys` field comment for how
-        this becomes an actual "revert to inherited" on Save, regardless of
-        field kind. A no-op if focus isn't on a resettable field (e.g. the
-        Name/Description inputs, which aren't tagged with `field_key` — see
-        `_compose_field_row()` — since neither has a `*_defaults` concept)."""
+        """ctrl+r: reset the FOCUSED field to its pure-template/dataclass
+        value (no explicit override on THIS entry) — see the `_reset_keys`
+        field comment for how this becomes an actual "revert to inherited"
+        on Save, regardless of field kind. A no-op if focus isn't on a
+        resettable field (e.g. the Name/Description inputs, which aren't
+        tagged with `field_key` — see `_compose_field_row()` — since neither
+        has an `inherits:` concept).
+
+        Resolves against the entry's OWN `inherits:` name (if any) — NOT
+        against an empty entry — so resetting one field doesn't lose the
+        entry's other fields' effective values from whichever template it
+        actually opted into (an empty-entry probe would silently behave as
+        "no inherits: at all," which is only correct for the field being
+        reset itself, not a valid stand-in for the whole entry)."""
         widget = self.focused
         field_key = getattr(widget, "field_key", None)
         if field_key is None:
@@ -474,8 +543,10 @@ class FormScreen(DetailScreen):
         if spec is None:
             return
 
+        inherits_name = self._current_entry().get("inherits")
+        probe = {"inherits": inherits_name} if inherits_name is not None else {}
         try:
-            defaults_only = self.cfg.merged_entry(self._defaults_kind(), {})
+            defaults_only = self.cfg.merged_entry(self._template_kind(), probe)
         except (ValueError, FileNotFoundError):
             defaults_only = {}
         value = get_nested(defaults_only, spec.key)
@@ -603,8 +674,8 @@ class FormScreen(DetailScreen):
             await self.app.push_screen_wait(
                 MessageModal(
                     f"Cannot delete {self._entity_noun()} "
-                    f"'{self._entity_label()}' — still used by watcher(s): "
-                    f"{', '.join(blockers)}.",
+                    f"'{self._entity_label()}' — still used by "
+                    f"{self._delete_blocker_noun()}(s): {', '.join(blockers)}.",
                     title="Cannot delete",
                 )
             )

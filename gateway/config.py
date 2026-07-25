@@ -552,47 +552,6 @@ class GatewayConfig:
         )
 
 
-def _extract_defaults_block(
-    raw: dict, key: str, forbidden_keys: frozenset[str]
-) -> dict:
-    """Pop and validate a top-level ``<x>_defaults:`` mapping.
-
-    NOT called anywhere in this module anymore — the ``*_defaults:``
-    mechanism was removed in v0.3 in favor of named ``*_templates:`` +
-    per-entry ``inherits:`` (see ``_parse_templates_block``/
-    ``_resolve_inherits`` below, and ``_REMOVED_DEFAULTS_KEYS`` above). Kept
-    defined, unused, purely because ``gateway/configtool/model.py`` still
-    imports and calls it directly (``EditableConfig.defaults_block()``) —
-    the config TUI's own reconciliation with the new mechanism is deferred
-    to a future pass; removing this function would break its import
-    entirely rather than just leave it showing stale information.
-
-    Returns an empty dict if the key is absent. Raises ValueError if the
-    block is not a mapping, or if it sets a key that identifies an
-    individual entry (e.g. ``name``) rather than something safe to inherit
-    across every entry.
-
-    An optional ``description`` on the defaults block itself (annotating the
-    shared block, shown by the config TUI) is stripped from the returned
-    dict — it must never deep-merge into every entry, or every entry would
-    end up displaying the defaults block's description as its own.
-    """
-    block = raw.get(key, {}) or {}
-    if not isinstance(block, Mapping):
-        raise ValueError(
-            f"config.yaml '{key}:' must be a mapping (got {type(block).__name__})."
-        )
-    bad = sorted(forbidden_keys & block.keys())
-    if bad:
-        raise ValueError(
-            f"config.yaml '{key}:' must not set {bad} — these fields identify "
-            "an individual entry and must be set per-entry, not inherited."
-        )
-    result = dict(block)
-    result.pop("description", None)
-    return result
-
-
 def _deep_copy(value):
     """Recursively copy dicts/lists so merged config entries never alias."""
     if isinstance(value, Mapping):

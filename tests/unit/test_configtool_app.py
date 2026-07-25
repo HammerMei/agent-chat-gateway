@@ -29,8 +29,8 @@ from gateway.configtool.app import ConfigToolApp
 from gateway.configtool.modals import ConfirmModal
 from gateway.configtool.screens.agent_detail import AgentDetailScreen
 from gateway.configtool.screens.connector_detail import ConnectorDetailScreen
-from gateway.configtool.screens.defaults import DefaultsScreen
 from gateway.configtool.screens.overview import OverviewScreen
+from gateway.configtool.screens.template_detail import TemplateDetailScreen
 from gateway.configtool.screens.tool_presets import ToolPresetsScreen
 from gateway.configtool.screens.watcher_detail import WatcherDetailScreen
 
@@ -39,21 +39,6 @@ def _write_config(tmp_path: Path, yaml_text: str) -> str:
     path = tmp_path / "config.yaml"
     path.write_text(textwrap.dedent(yaml_text))
     return str(path)
-
-
-# v0.3 removed the global agent_defaults:/connector_defaults:/watcher_defaults:
-# blocks from the real loader (see docs/migration-0.3.md) in favor of named
-# *_templates:/inherits:. The config TUI (gateway/configtool/*) is an explicit,
-# deliberate exception: EditableConfig.defaults_block()/merged_entry()/
-# field_provenance() still compute against the OLD kind-string keys by
-# design — reconciling the TUI with the new mechanism is tracked separately,
-# not part of the config-schema redesign itself. Tests below that assert
-# specifically on that old provenance/blast-radius/used-by computation are
-# skipped with this reason rather than fixed or deleted.
-_STALE_DEFAULTS_SKIP_REASON = (
-    "TUI *_defaults display deferred -- config engine moved to "
-    "*_templates/inherits, see docs/design/config-tool.md"
-)
 
 
 def _valid_config_text(work_dir: Path) -> str:
@@ -113,7 +98,9 @@ class TestOverviewRender:
             assert app.screen.query_one("#connectors-table", DataTable).row_count == 1
             assert app.screen.query_one("#agents-table", DataTable).row_count == 1
             assert app.screen.query_one("#watchers-table", DataTable).row_count == 3
-            assert app.screen.query_one("#defaults-table", DataTable).row_count == 3
+            # 1 connector_templates entry + 1 agent_templates entry (no
+            # watcher_templates in this fixture).
+            assert app.screen.query_one("#templates-table", DataTable).row_count == 2
             assert app.screen.query_one("#presets-table", DataTable).row_count == 1
 
     async def test_focus_starts_on_the_list_not_the_tab_bar(self, tmp_path, work_dir):
@@ -220,7 +207,6 @@ class TestOverviewRender:
             table = app.screen.query_one("#connectors-table", DataTable)
             assert table.row_count == 2
 
-    @pytest.mark.skip(reason=_STALE_DEFAULTS_SKIP_REASON)
     async def test_connector_type_inherited_from_template_is_shown_not_a_placeholder(
         self, tmp_path, work_dir
     ):
@@ -413,11 +399,11 @@ class TestArrowKeyTabSwitching:
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            app.screen.query_one("TabbedContent").active = "tab-defaults"
+            app.screen.query_one("TabbedContent").active = "tab-templates"
             await pilot.pause()
 
             assert isinstance(app.focused, DataTable)
-            assert app.focused.id == "defaults-table"
+            assert app.focused.id == "templates-table"
 
 
 class TestDetailScreenNavigation:
@@ -440,7 +426,6 @@ class TestDetailScreenNavigation:
             await pilot.pause()
             assert isinstance(app.screen, OverviewScreen)
 
-    @pytest.mark.skip(reason=_STALE_DEFAULTS_SKIP_REASON)
     async def test_agent_row_pushes_detail_screen_with_provenance(self, tmp_path, work_dir):
         config_path = _write_config(tmp_path, _valid_config_text(work_dir))
         app = ConfigToolApp(config_path)
@@ -453,7 +438,7 @@ class TestDetailScreenNavigation:
             await pilot.pause()
             assert isinstance(app.screen, AgentDetailScreen)
             body = str(app.screen.query_one("#agent-detail-body", Static).render())
-            assert "inherited from defaults" in body
+            assert "from 'standard'" in body
             assert "preset: readonly" in body
 
     async def test_watcher_row_pushes_detail_with_group_banner(self, tmp_path, work_dir):
@@ -529,22 +514,26 @@ class TestDetailScreenNavigation:
             body = str(app.screen.query_one("#watcher-detail-body", Static).render())
             assert "shared rooms: group" not in body
 
-    @pytest.mark.skip(reason=_STALE_DEFAULTS_SKIP_REASON)
-    async def test_defaults_row_pushes_detail_with_blast_radius(self, tmp_path, work_dir):
+    async def test_template_row_pushes_detail_with_used_by_and_blast_radius(
+        self, tmp_path, work_dir
+    ):
         config_path = _write_config(tmp_path, _valid_config_text(work_dir))
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            table = app.screen.query_one("#defaults-table", DataTable)
+            table = app.screen.query_one("#templates-table", DataTable)
             table.focus()
-            table.move_cursor(row=1)  # agent_defaults
+            # Row order: TEMPLATE_KINDS = (agent, connector, watcher) — row 0
+            # is agent_templates.standard (this fixture has no watcher
+            # templates), row 1 is connector_templates.standard.
+            table.move_cursor(row=0)
             await pilot.press("enter")
             await pilot.pause()
-            assert isinstance(app.screen, DefaultsScreen)
-            body = str(app.screen.query_one("#defaults-detail-body", Static).render())
-            assert "entries inherit" in body
+            assert isinstance(app.screen, TemplateDetailScreen)
+            assert app.screen.kind == "agent"
+            body = str(app.screen.query_one("#template-detail-body", Static).render())
+            assert "my-agent" in body  # "used by" — the only agent inheriting it
 
-    @pytest.mark.skip(reason=_STALE_DEFAULTS_SKIP_REASON)
     async def test_preset_row_pushes_detail_showing_used_by(self, tmp_path, work_dir):
         config_path = _write_config(tmp_path, _valid_config_text(work_dir))
         app = ConfigToolApp(config_path)
