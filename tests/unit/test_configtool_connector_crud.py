@@ -223,6 +223,48 @@ class TestCreateConnector:
             assert app.screen.query_one("#mm-auth-token-group").display is True
             assert app.screen.query_one("#mm-auth-userpass-group").display is False
 
+    async def test_mm_auth_groups_dont_overlap_the_field_after_them(self, tmp_path, work_dir):
+        """Real layout bug, caught via a user screenshot: Container's own
+        DEFAULT_CSS is `height: 1fr` (fill available space), not `auto` —
+        #mm-auth-token-group/#mm-auth-userpass-group were competing for a
+        FRACTION of the VerticalScroll's space instead of sizing to their
+        own 1-2 field rows, squishing/overlapping the row that comes right
+        after (Owners). Fixed with an explicit `height: auto` override on
+        both groups in ConnectorDetailScreen.DEFAULT_CSS."""
+        config_path = _write_config(
+            tmp_path,
+            f"""\
+            agents:
+              default:
+                type: claude
+                working_directory: {work_dir}
+            connectors:
+              - name: mm
+                type: mattermost
+                server: {{url: "http://mm.local", team: t, username: glin, password: pw}}
+                allowed_users: {{owners: [glin, josie]}}
+            watchers:
+              - connector: mm
+                agent: default
+                room: general
+            """,
+        )
+        app = ConfigToolApp(config_path)
+        async with app.run_test(size=(120, 50)) as pilot:
+            await pilot.pause()
+            await _open_connector_in_edit_mode(pilot, app)
+
+            password_input = app.screen.query_one("#field-server-password", Input)
+            owners_label = next(
+                w
+                for w in app.screen.query(".field-label")
+                if str(w.render()).strip().startswith("Owners")
+            )
+            assert (
+                password_input.region.y + password_input.region.height
+                <= owners_label.region.y
+            )
+
     async def test_switching_auth_method_clears_the_other_groups_fields_on_save(
         self, tmp_path, work_dir
     ):

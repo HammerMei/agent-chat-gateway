@@ -163,6 +163,18 @@ class ConnectorDetailScreen(FormScreen):
     ConnectorDetailScreen .hidden {
         display: none;
     }
+    /* Container's own DEFAULT_CSS is `height: 1fr` (fill available space),
+    not `auto` — user-reported, with a screenshot: the mattermost auth
+    groups' field rows rendered squished/overlapping the row after them,
+    since #mm-auth-token-group/#mm-auth-userpass-group were competing for a
+    FRACTION of the VerticalScroll's space instead of sizing to their own
+    1-2 field rows. Same failure family as `.field-row Input`'s width:1fr
+    override above (a Textual default meant for filling a viewport, wrong
+    for a wrapper around a fixed few rows of content). */
+    ConnectorDetailScreen #mm-auth-token-group,
+    ConnectorDetailScreen #mm-auth-userpass-group {
+        height: auto;
+    }
     """
 
     def __init__(
