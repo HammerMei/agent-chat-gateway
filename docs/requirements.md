@@ -236,17 +236,19 @@ The gateway SHALL:
 2. If permission timeouts are enabled, require that the overall agent timeout is greater than the permission timeout
 3. Prevent distinct watchers from reusing the same fixed session ID in a way that would create ambiguous routing
 
-### 8.4 Defaults Blocks, Tool Presets, and Watcher Room Expansion
+### 8.4 Templates, Tool Presets, and Watcher Room Expansion
 
 The gateway SHALL:
-1. Support top-level `connector_defaults`, `agent_defaults`, and `watcher_defaults` blocks that are deep-merged into every entry of the matching kind, with the entry's own fields taking precedence over the inherited default on conflict
-2. Reject a `*_defaults` block that sets an identity field belonging to a specific entry (`name` for `connector_defaults`; `name`, `room`, `rooms`, or `session_id` for `watcher_defaults`)
+1. Support top-level `connector_templates`, `agent_templates`, and `watcher_templates` blocks — each a mapping of template name to a partial field block — referenced from an individual connector/agent/watcher entry via that entry's own `inherits: <template-name>` field, deep-merged with the entry's own fields taking precedence over the template's on conflict. An entry that omits `inherits:` is entirely unaffected by any template (v0.3; supersedes the v0.2 `connector_defaults`/`agent_defaults`/`watcher_defaults` blocks, which deep-merged unconditionally into every entry of a kind regardless of type — removed entirely, see requirement 9 below)
+2. Reject a named template that sets an identity field belonging to a specific entry (`name` for `connector_templates`; `name`, `room`, `rooms`, or `session_id` for `watcher_templates`)
 3. Support a top-level `tool_presets` block of named, reusable tool-rule lists, referenced by name from `owner_allowed_tools`/`guest_allowed_tools`, freely mixable with inline tool-rule entries
 4. Validate every defined tool preset's rules at configuration load time, regardless of whether any agent references it
 5. Reject a tool preset whose rule list itself references another preset by name (presets SHALL be flat)
 6. Support a watcher `rooms` list as an alias that expands one watcher entry into one watcher per listed room, each with an automatically derived name of the form `<connector>-<sanitized-room>`
 7. Reject a watcher entry that sets both `room` and `rooms`, or that sets `name` or `session_id` while `rooms` contains more than one room
 8. Apply the same watcher-name uniqueness requirement to names produced by room expansion as to explicitly configured names
+9. Reject a leftover top-level `connector_defaults`, `agent_defaults`, or `watcher_defaults` key immediately, with an error naming the replacement (`connector_templates`/`agent_templates`/`watcher_templates`) — never silently ignore it, since a silent no-op would silently drop whatever settings an operator still believes are shared
+10. Reject an `inherits:` field naming a template that does not exist in the matching `*_templates` block, and reject a named template that itself sets `inherits:` (no nested templates)
 
 ---
 

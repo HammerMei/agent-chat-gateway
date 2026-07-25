@@ -17,8 +17,8 @@ adds two things `from_file` alone cannot catch, plus an optional lint pass:
    session/pause state is silently dropped on the next gateway start
    (see gateway/core/watcher_lifecycle.py's state-pruning behavior).
 3. ``--lint``: flags config values that just restate a built-in default, or
-   duplicate a value already provided by the matching ``*_defaults`` block —
-   noise that can be deleted without changing behavior.
+   duplicate a value already inherited from the entry's own ``inherits:``
+   template — noise that can be deleted without changing behavior.
 
 Used by the ``acg config validate`` CLI command; written as a plain function
 (not a CLI-only code path) so a future config-editing tool can reuse the same
@@ -33,7 +33,7 @@ from urllib.parse import urlparse
 
 import yaml
 
-from .config import GatewayConfig, _extract_defaults_block
+from .config import GatewayConfig, _parse_templates_block
 from .connectors.mattermost.config import MattermostConfig
 from .connectors.rocketchat.config import RocketChatConfig
 from .connectors.voice.config import VoiceConfig
@@ -241,16 +241,21 @@ def _check_state_orphans(config: GatewayConfig, result: ValidationResult) -> Non
 
 
 def _lint_config(raw: dict, result: ValidationResult) -> None:
-    agent_defaults = _extract_defaults_block(raw, "agent_defaults", frozenset())
-    watcher_defaults = _extract_defaults_block(
-        raw, "watcher_defaults", frozenset({"name", "room", "rooms", "session_id"})
+    # Safe to re-parse here without try/except: _lint_config only ever runs
+    # after validate_config()'s own GatewayConfig.from_file() call already
+    # succeeded (the early `return result` on the ValueError/FileNotFoundError
+    # path above), so every entry's `inherits:` (if any) is already known to
+    # resolve — these calls cannot raise.
+    agent_templates = _parse_templates_block(raw, "agent_templates", frozenset())
+    watcher_templates = _parse_templates_block(
+        raw, "watcher_templates", frozenset({"name", "room", "rooms", "session_id"})
     )
-    connector_defaults = _extract_defaults_block(raw, "connector_defaults", frozenset({"name"}))
+    connector_templates = _parse_templates_block(raw, "connector_templates", frozenset({"name"}))
 
     for agent_name, agent_raw in (raw.get("agents") or {}).items():
         if isinstance(agent_raw, dict):
             _lint_entry(
-                "agent", agent_name, agent_raw, "agent_defaults", agent_defaults,
+                "agent", agent_name, agent_raw, "agent_templates", agent_templates,
                 _AGENT_LINT_DEFAULTS, result,
             )
 
@@ -258,7 +263,7 @@ def _lint_config(raw: dict, result: ValidationResult) -> None:
         if isinstance(wc, dict):
             label = wc.get("name") or f"watchers[{i}]"
             _lint_entry(
-                "watcher", label, wc, "watcher_defaults", watcher_defaults,
+                "watcher", label, wc, "watcher_templates", watcher_templates,
                 _WATCHER_LINT_DEFAULTS, result,
             )
 
@@ -267,7 +272,7 @@ def _lint_config(raw: dict, result: ValidationResult) -> None:
             continue
         name = cc.get("name") or "?"
         _lint_entry(
-            "connector", name, cc, "connector_defaults", connector_defaults,
+            "connector", name, cc, "connector_templates", connector_templates,
             _CONNECTOR_LINT_DEFAULTS, result,
         )
         attach = cc.get("attachments")
@@ -296,12 +301,18 @@ def _lint_entry(
     entity_kind: Literal["connector", "agent", "watcher"],
     entity_name: str,
     entry: dict,
-    defaults_block_name: str,
-    defaults_block: dict,
+    templates_key: str,
+    templates: dict[str, dict],
     default_table: list[tuple[str, object]],
     result: ValidationResult,
 ) -> None:
+    """Per-entry now, not per-kind: an entry only has an inherited-value to
+    compare against if it actually sets `inherits:` — with the old single
+    global `*_defaults` block gone, there's no implicit shared value every
+    entry of a kind was checked against regardless."""
     label = f"{entity_kind}s.{entity_name}"
+    template_name = entry.get("inherits")
+    template = templates.get(template_name, {}) if template_name else {}
     for key, default_value in default_table:
         if key not in entry:
             continue
@@ -312,10 +323,11 @@ def _lint_entry(
             )
             result.lint_findings.append(msg)
             result.findings.append(Finding("lint", entity_kind, entity_name, key, msg))
-        elif key in defaults_block and entry[key] == defaults_block[key]:
+        elif template_name and key in template and entry[key] == template[key]:
             msg = (
-                f"{label}.{key}: matches the inherited {defaults_block_name}.{key} "
-                f"value ({entry[key]!r}) — can be omitted from this entry."
+                f"{label}.{key}: matches the value inherited from "
+                f"{templates_key}['{template_name}'].{key} ({entry[key]!r}) — "
+                "can be omitted from this entry."
             )
             result.lint_findings.append(msg)
             result.findings.append(Finding("lint", entity_kind, entity_name, key, msg))

@@ -1,5 +1,11 @@
 # Migrating to the v0.2 config format
 
+> **Note:** v0.3 removes the `connector_defaults:`/`agent_defaults:`/
+> `watcher_defaults:` blocks this doc introduces, entirely, in favor of named
+> `*_templates:` + a per-entry `inherits:` field — see
+> [docs/migration-0.3.md](migration-0.3.md). Everything else on this page
+> (`tool_presets:`, `rooms:`, `description:`) is still current.
+
 v0.2 adds a compact config format on top of what already worked: top-level
 `connector_defaults:` / `agent_defaults:` / `watcher_defaults:` blocks that
 deep-merge into every entry, named `tool_presets:` you can reference from any
