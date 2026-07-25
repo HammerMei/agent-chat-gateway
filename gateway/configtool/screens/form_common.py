@@ -57,7 +57,7 @@ from .base import DetailScreen
 @dataclass(frozen=True)
 class FieldSpec:
     key: str  # dotted for a one-level-nested sub-field, e.g. "server.password"
-    kind: Literal["str", "int", "bool", "list", "enum"]
+    kind: Literal["str", "int", "float", "bool", "list", "enum"]
     label: str
     options: tuple[str, ...] | None = None
     # Masks the widget's display (Input(password=True)). docs/design/
@@ -137,6 +137,14 @@ def read_widget_value(spec: FieldSpec, widget: object) -> object:
             return int(text)
         except ValueError:
             raise ValueError(f"{spec.label}: must be a whole number, got {text!r}") from None
+    if spec.kind == "float":
+        text = widget.value.strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            raise ValueError(f"{spec.label}: must be a number, got {text!r}") from None
     text = widget.value.strip()
     return text or None
 
@@ -470,10 +478,11 @@ class FormScreen(DetailScreen):
             # semantically wrong explicit null onto an untouched field) and
             # to _field_has_override() (a false-positive "you'll lose this
             # edit" confirm when switching inherits: with nothing actually
-            # touched). "int" is deliberately excluded: an explicit `0`
-            # renders as the text "0" (non-empty), which reads back as the
-            # int `0` again — no mismatch there, and normalizing it away
-            # would introduce the exact same false positive in reverse.
+            # touched). "int"/"float" are deliberately excluded: an explicit
+            # `0`/`0.0` renders as the text "0" (non-empty), which reads back
+            # as the same number again — no mismatch there, and normalizing
+            # it away would introduce the exact same false positive in
+            # reverse.
             if spec.kind in ("str", "list") and value is not None and not value:
                 value = None
             self._initial_values[spec.key] = value

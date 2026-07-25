@@ -67,10 +67,27 @@ class DetailScreen(Screen):
     depending on terminal font metrics, visually overlapping) the text with
     no breathing room. Fixed width + `content-align: center` centers the
     name within a consistent-looking column regardless of how long it is;
-    `margin-right` is the actual gap before the Button. */
+    `margin-right` is the actual gap before the Button.
+    User-reported (2nd round, with a screenshot): the name still rendered
+    flush against the row's top edge, visibly above the button's own label.
+    Root cause, confirmed by instrumenting `render_line()` directly: this
+    widget's `height: auto` only grows to fit its own 1-line content, so a
+    plain `content-align: middle` has no extra vertical space to center
+    into — and a `padding-top` large enough to add that space gets
+    re-absorbed by `content-align: middle` (which centers within the
+    padded box too, splitting the odd row of slack toward the bottom and
+    landing back on row 0). `Button`'s own label — despite also declaring
+    `content-align: center middle` — empirically renders on row 0 of its
+    (taller, border-driven) box too, not its middle row; confirmed by
+    dumping both widgets' `render_line()` output side by side. So: give
+    this Static the SAME explicit height as the button (3: border-top +
+    content + border-bottom) and align `top` rather than `middle` — that
+    puts both labels on the exact same absolute row instead of fighting
+    Button's actual (not its documented) vertical behavior. */
     DetailScreen .field-value {
         width: 30;
-        content-align: center middle;
+        height: 3;
+        content-align: center top;
         margin-right: 2;
     }
     DetailScreen Checkbox {

@@ -39,6 +39,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   precomputes the weekday (e.g. `day: Sun`) alongside `ts:` so agents don't
   have to infer it from a bare date, which was unreliable and could cause
   scheduled weekday tasks to be silently skipped (#53).
+- **Config TUI: `agent_chain.*` fields for Rocket.Chat/Mattermost connectors
+  and their templates.** `agent_usernames`/`max_turns`/`ttl_seconds`
+  (`docs/agent-chain.md`) previously had to be hand-edited into config.yaml —
+  a plain gap, since both connectors already supported it. Also a Select-
+  driven "Auth method" picker for Mattermost connectors (`token` /
+  `username + password`) replacing the old plain warning text: only the
+  relevant credential fields show, and switching modes clears the other
+  group so the two can no longer collide by accident.
 
 ### Changed
 - **BREAKING: `online_notification`/`offline_notification` default to quiet

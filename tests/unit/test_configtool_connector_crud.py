@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 import yaml
-from textual.widgets import Checkbox, DataTable, Input, Static
+from textual.widgets import Checkbox, DataTable, Input, Select, Static
 
 from gateway.configtool.app import ConfigToolApp
 from gateway.configtool.modals import (
@@ -204,12 +204,126 @@ class TestCreateConnector:
             assert isinstance(app.screen, ConnectorDetailScreen)
             assert app.screen.mode == "create"
 
-    async def test_mattermost_auth_xor_violation_fails_save_and_rolls_back(
+    async def test_mattermost_auth_method_select_defaults_to_token_with_userpass_hidden(
         self, tmp_path, work_dir
     ):
-        """Configuring BOTH token and username/password violates
-        MattermostConfig.__post_init__ — validate_config() (run by save())
-        is the real enforcement; the form doesn't reimplement it."""
+        """A brand-new mattermost connector has neither credential set yet —
+        _compute_mm_auth_method() defaults to 'token' (the simpler, no-
+        expiry option MattermostConfig's own docstring lists first)."""
+        config_path = _write_config(tmp_path, _config_with_one_rocketchat_connector(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_type_picker_for_connectors(pilot, app)
+            await pilot.press("down", "enter")  # mattermost
+            await pilot.pause()
+
+            select = app.screen.query_one("#mm-auth-method-select", Select)
+            assert select.value == "token"
+            assert app.screen.query_one("#mm-auth-token-group").display is True
+            assert app.screen.query_one("#mm-auth-userpass-group").display is False
+
+    async def test_switching_auth_method_clears_the_other_groups_fields_on_save(
+        self, tmp_path, work_dir
+    ):
+        """The Auth method Select (not what's still sitting in a hidden
+        Input) is the single source of truth for which credential group is
+        active — user-reported request: a dropdown that shows only the
+        relevant fields so the 'not both, not neither' validation message
+        is never needed in the common case. Typing a token, then switching
+        to username+password, must not silently save the stale token
+        alongside the new credentials."""
+        config_path = _write_config(tmp_path, _config_with_one_rocketchat_connector(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_type_picker_for_connectors(pilot, app)
+            await pilot.press("down", "enter")  # mattermost
+            await pilot.pause()
+
+            app.screen.query_one("#field-name", Input).value = "mm-new"
+            app.screen.query_one("#field-server-url", Input).value = "http://mm.local"
+            app.screen.query_one("#field-server-team", Input).value = "team"
+            app.screen.query_one("#field-server-token", Input).value = "stale-token"
+            await pilot.pause()
+
+            select = app.screen.query_one("#mm-auth-method-select", Select)
+            select.value = "username_password"
+            await pilot.pause()
+            assert app.screen.query_one("#mm-auth-token-group").display is False
+            assert app.screen.query_one("#mm-auth-userpass-group").display is True
+
+            app.screen.query_one("#field-server-username", Input).value = "u"
+            app.screen.query_one("#field-server-password", Input).value = "p"
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            raw = yaml.safe_load(Path(config_path).read_text())
+            server = next(c for c in raw["connectors"] if c["name"] == "mm-new")["server"]
+            assert server == {"url": "http://mm.local", "team": "team", "username": "u", "password": "p"}
+            assert "token" not in server
+
+    async def test_saving_an_unrelated_field_never_touches_auth_fields_the_user_didnt_edit(
+        self, tmp_path, work_dir
+    ):
+        """Regression, found by an independent review pass: a pre-existing
+        (already-invalid) entry with BOTH 'token' and 'username'+'password'
+        set (e.g. hand-edited, or a half-finished migration between modes)
+        opens with the Auth method Select defaulting to 'token' (the
+        ambiguous-case tie-break) and the username/password group hidden —
+        but still holding its real values underneath. Saving an UNRELATED
+        change (never touching the Select) must NOT force-clear the hidden
+        group: _apply_mm_auth_method_exclusivity() only runs when the user
+        has actually picked a mode this session, precisely to avoid a
+        first-cut version of this feature silently deleting credentials
+        nobody asked to change."""
+        config_path = _write_config(
+            tmp_path,
+            f"""\
+            agents:
+              default:
+                type: claude
+                working_directory: {work_dir}
+            connectors:
+              - name: mm-both
+                type: mattermost
+                server: {{url: "http://mm.local", team: t, token: "old-stale-token",
+                          username: bob, password: pw123}}
+            watchers:
+              - connector: mm-both
+                agent: default
+                room: general
+            """,
+        )
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_connector_in_edit_mode(pilot, app)
+
+            select = app.screen.query_one("#mm-auth-method-select", Select)
+            assert select.value == "token"  # ambiguous-case tie-break
+
+            checkbox = app.screen.query_one("#field-reply_in_thread", Checkbox)
+            checkbox.value = not checkbox.value
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            raw = yaml.safe_load(Path(config_path).read_text())
+            server = raw["connectors"][0]["server"]
+            assert server["token"] == "old-stale-token"
+            assert server["username"] == "bob"
+            assert server["password"] == "pw123"
+
+    async def test_neither_auth_field_filled_still_fails_the_real_validation(
+        self, tmp_path, work_dir
+    ):
+        """The Select narrows the common case down to one valid shape, but
+        it can't force the user to actually fill the active group in —
+        validate_config() (MattermostConfig.__post_init__) remains the real
+        backstop for 'neither configured', exactly as before this Select
+        existed."""
         config_path = _write_config(tmp_path, _config_with_one_rocketchat_connector(work_dir))
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
@@ -221,9 +335,7 @@ class TestCreateConnector:
             app.screen.query_one("#field-name", Input).value = "mm-bad"
             app.screen.query_one("#field-server-url", Input).value = "http://mm.local"
             app.screen.query_one("#field-server-team", Input).value = "team"
-            app.screen.query_one("#field-server-token", Input).value = "tok"
-            app.screen.query_one("#field-server-username", Input).value = "u"
-            app.screen.query_one("#field-server-password", Input).value = "p"
+            # Auth method defaults to 'token', left blank — neither mode configured.
             await pilot.pause()
             await pilot.press("ctrl+s")
             await pilot.pause()

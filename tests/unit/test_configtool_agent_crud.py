@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 import yaml
-from textual.widgets import Checkbox, DataTable, Footer, Input, Select, Static
+from textual.widgets import Button, Checkbox, DataTable, Footer, Input, Select, Static
 from textual.widgets._footer import FooterKey
 
 from gateway.configtool.app import ConfigToolApp
@@ -1102,6 +1102,38 @@ class TestInheritsPicker:
 
             await _click_inherits_button(pilot, app)
             assert isinstance(app.screen, InheritsPickerModal)
+
+    async def test_inherits_value_text_vertically_aligns_with_the_change_button(
+        self, tmp_path, work_dir
+    ):
+        """Real layout bug, caught via a user screenshot: the "Change…"
+        button (border-top + content + border-bottom, 3 rows tall) is
+        taller than the value Static's own 1-line auto height, so a plain
+        `content-align: middle` had no extra space to center into — the
+        template name rendered flush against the row's top edge, visibly
+        above the button's own label. `.field-value` (base.py) now uses an
+        explicit `height: 3` to match, so both labels land on the exact
+        same absolute screen row. `.region` midpoints alone don't catch
+        this (both widgets ARE 3 rows tall either way) — this test finds
+        the actual row each widget's rendered TEXT occupies via
+        `render_line()`, the same way the bug was originally diagnosed."""
+        config_path = _write_config(tmp_path, _config_with_two_templates(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await _open_agent_in_edit_mode(pilot, app)
+
+            value = app.screen.query_one("#inherits-value", Static)
+            button = app.screen.query_one("#inherits-change-button", Button)
+
+            def text_row(widget) -> int:
+                for y in range(widget.region.height):
+                    strip = widget.render_line(y)
+                    if "".join(seg.text for seg in strip).strip():
+                        return widget.region.y + y
+                raise AssertionError(f"{widget!r} rendered no non-blank row")
+
+            assert text_row(value) == text_row(button)
 
     async def test_picking_a_different_template_recomputes_every_field(
         self, tmp_path, work_dir

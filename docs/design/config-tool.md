@@ -354,11 +354,33 @@ Phase 2 first cleared the Phase 1 code review's deferred items 7–10
   letting `type` change in place would mean the form reshaping itself
   around one of its own fields, and a `name` change would silently orphan
   any watcher referencing the old name. Mattermost's token-XOR-user/pass
-  constraint gets a plain informational `Static` line, not an interactive
-  RadioSet — `save()`'s `validate_config()` (which runs the real
-  `MattermostConfig.__post_init__`) is the actual enforcement either way,
-  so the simpler static hint was chosen over building a stateful widget for
-  guidance alone.
+  constraint originally got a plain informational `Static` line rather than
+  an interactive picker (`save()`'s `validate_config()`, which runs the
+  real `MattermostConfig.__post_init__`, was — and still is — the actual
+  enforcement either way). **Upgraded** (user-reported: wanted a dropdown
+  instead of a warning to read) to an actual "Auth method" `Select`
+  (`token` / `username_password`, `_compose_mm_auth_section()` in
+  `connector_detail.py`): both credential groups are always composed (so
+  the generic field-diff/blast-radius machinery keeps iterating
+  `_field_specs()` uniformly) but only the active one is shown, and
+  `_apply_mm_auth_method_exclusivity()` force-blanks the inactive group's
+  widgets right before `_collect_field_updates()` reads them at Save —
+  covers the common case with no message needed. `validate_config()`
+  remains the backstop for what this UI layer can't fully prevent (neither
+  group filled in; a credential coming only from an `inherits:` template
+  that the Select's own entry-level clear can't reach — see that method's
+  own docstring).
+- **Shipped: `agent_chain.*` fields for rocketchat/mattermost.**
+  User-reported gap: `agent_chain.agent_usernames`/`max_turns`/`ttl_seconds`
+  (`gateway/core/agent_chain.py`'s `AgentChainConfig`, embedded identically
+  by both connectors' own `*Config` dataclasses, documented in
+  `docs/agent-chain.md`) was a real first-class feature that had simply
+  never been added to either connector's `FieldSpec` list — not a
+  deliberate cut, just missed when the per-type field lists were first
+  written. `FieldSpec.kind` gained a `"float"` case (`ttl_seconds` is a
+  `float`; `read_widget_value()`/`form_common.py`) for this — the first
+  field needing it; `int`/`str`'s existing generic widget/display handling
+  already covered everything else.
 - **Shipped: the `.env` "store in .env" toggle.** A "Store in .env"
   `Checkbox` (default ON) next to every `secret=True` field
   (`FieldSpec.secret` already existed for masking; now also drives this).
