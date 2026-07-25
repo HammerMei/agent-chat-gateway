@@ -56,12 +56,12 @@ class DetailScreen(Screen):
         width: auto;
     }
     /* The Inherits row's current-value Static (agent_detail.py/
-    connector_detail.py's action_pick_inherits() rows) — a bare Static with
-    no width override defaults to 1fr (same as Input's own default, see the
-    comment below), which claims the rest of the row and pushes the trailing
-    "(press 'i' to change)" hint off past the terminal's right edge, exactly
-    the failure mode `.field-row Input`'s own `width: 1fr` override already
-    exists to prevent. */
+    connector_detail.py's Inherits rows, built by _open_inherits_picker())
+    — a bare Static with no width override defaults to 1fr (same as Input's
+    own default, see the comment below), which claims the rest of the row
+    and pushes the trailing "Change…" Button off past the terminal's right
+    edge, exactly the failure mode `.field-row Input`'s own `width: 1fr`
+    override already exists to prevent. */
     DetailScreen .field-value {
         width: auto;
     }

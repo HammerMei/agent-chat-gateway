@@ -30,17 +30,22 @@ from typing import Literal
 
 from textual import work
 from textual.app import ComposeResult
-from textual.binding import Binding
 from textual.containers import Horizontal, VerticalScroll
-from textual.widgets import Input, Static
+from textual.widgets import Button, Input, Static
 
 from ..formatting import mask_if_secret, provenance_label
-from ..modals import InheritsPickerModal, MessageModal, TextPromptModal, TypePickerModal
+from ..modals import (
+    ConfirmModal,
+    InheritsPickerModal,
+    MessageModal,
+    TextPromptModal,
+    TypePickerModal,
+)
 from ..model import EditableConfig
 from .form_common import FieldSpec, FormScreen, apply_update, find_referencing_watcher_labels
 
 # NOTE: TemplateDetailScreen (screens/template_detail.py) is deliberately
-# imported LOCALLY inside action_pick_inherits() below, not at module level —
+# imported LOCALLY inside _open_inherits_picker() below, not at module level —
 # template_detail.py itself imports FIELDS_BY_TYPE/DATACLASS_DEFAULTS_BY_TYPE
 # from this module, so a module-level import here would be circular.
 
@@ -112,10 +117,6 @@ DATACLASS_DEFAULTS_BY_TYPE: dict[str, dict[str, object]] = {
 class ConnectorDetailScreen(FormScreen):
     BODY_ID = "connector-detail-body"
 
-    BINDINGS = [
-        Binding("i", "pick_inherits", "Inherits", show=True),
-    ]
-
     def __init__(
         self,
         cfg: EditableConfig,
@@ -126,19 +127,15 @@ class ConnectorDetailScreen(FormScreen):
         self.cfg = cfg
         self.entry = entry
         self.mode = mode
-        # See action_pick_inherits()/action_save() below — snapshotted once
-        # at form-open time, like every other field, NOT live-recomputed
-        # when the picker changes it mid-edit.
+        # See _open_inherits_picker()/action_save() below. Unlike every
+        # other field, switching this one triggers a full
+        # _recompute_form() (form_common.py) rather than a snapshot-once-
+        # at-open value — see AgentDetailScreen's module docstring for why.
         self._inherits_initial: str | None = self.cfg.entry_template_name(self.entry)
         self._inherits_current: str | None = self._inherits_initial
         if self.mode != "view":
-            self._compute_initial_values(self.entry)
+            self._compute_initial_values(self._current_entry())
             self._populating = True
-
-    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        if action == "pick_inherits":
-            return self.mode != "view"
-        return super().check_action(action, parameters)
 
     def _entity_noun(self) -> str:
         return "connector"
@@ -147,7 +144,15 @@ class ConnectorDetailScreen(FormScreen):
         return self.entry.get("name", "?")
 
     def _current_entry(self) -> dict:
-        return self.entry
+        """The PROBE entry: `self.entry` with `inherits:` swapped to
+        whatever the Inherits picker currently has selected — see
+        AgentDetailScreen._current_entry()'s identical docstring for why."""
+        probe = dict(self.entry)
+        if self._inherits_current is None:
+            probe.pop("inherits", None)
+        else:
+            probe["inherits"] = self._inherits_current
+        return probe
 
     def _find_own_index(self) -> int:
         # Matched by object IDENTITY, not equality — connectors_raw is a
@@ -177,19 +182,22 @@ class ConnectorDetailScreen(FormScreen):
         return find_referencing_watcher_labels(self.cfg, connector_name=self._entity_label())
 
     def _on_enter_edit_mode(self) -> None:
-        self._compute_initial_values(self.entry)
         self._inherits_initial = self.cfg.entry_template_name(self.entry)
         self._inherits_current = self._inherits_initial
+        self._compute_initial_values(self._current_entry())
 
     def _connector_type(self) -> str:
-        # Reads the MERGED type, not the raw entry directly — a connector
-        # whose 'type' comes only from its inherits: template (never set on
-        # the entry itself) still needs to select the right per-type field
-        # list/dataclass-defaults below.
+        # Reads the MERGED type against the LIVE probe (self._current_entry()),
+        # not self.entry directly — a connector whose 'type' comes only from
+        # its inherits: template (never set on the entry itself) still needs
+        # to select the right per-type field list/dataclass-defaults below,
+        # and switching to a DIFFERENT template with a different type must
+        # reshape the form to match (part of the same full _recompute_form()
+        # this whole picker redesign already does for every other field).
         try:
-            merged = self.cfg.merged_entry("connector", self.entry)
+            merged = self.cfg.merged_entry("connector", self._current_entry())
         except (ValueError, FileNotFoundError):
-            merged = self.entry
+            merged = self._current_entry()
         return merged.get("type", "rocketchat")
 
     def _field_specs(self) -> tuple[FieldSpec, ...]:
@@ -278,7 +286,7 @@ class ConnectorDetailScreen(FormScreen):
                     id="inherits-value",
                     classes="field-value",
                 )
-                yield Static("[dim](press 'i' to change)[/dim]", classes="field-provenance")
+                yield Button("Change…", id="inherits-change-button")
 
             if conn_type == "mattermost":
                 # UX guidance only — save()'s validate_config() (which runs
@@ -297,12 +305,16 @@ class ConnectorDetailScreen(FormScreen):
                 )
 
             for spec in self._field_specs():
-                yield from self._compose_field_row(spec, self.entry)
+                yield from self._compose_field_row(spec, self._current_entry())
 
     # ── inherits: picker ─────────────────────────────────────────────────────
 
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if (event.button.id or "") == "inherits-change-button":
+            self._open_inherits_picker()
+
     @work
-    async def action_pick_inherits(self) -> None:
+    async def _open_inherits_picker(self) -> None:
         if self.mode == "view":
             return
         template_names = sorted(self.cfg.templates("connector"))
@@ -314,12 +326,12 @@ class ConnectorDetailScreen(FormScreen):
         kind, name = choice
 
         if kind == "template":
-            self._inherits_current = name
+            new_value = name
         elif kind == "none":
-            self._inherits_current = None
+            new_value = None
         elif kind == "new_template":
             # One-way detour, not a return-with-result flow — same precedent
-            # as AgentDetailScreen.action_pick_inherits()'s "new_template"
+            # as AgentDetailScreen._open_inherits_picker()'s "new_template"
             # branch. Connector templates always pick a type up front (this
             # screen has no generic tree editor — see module docstring), so
             # prompt for one before the name, same order
@@ -354,8 +366,24 @@ class ConnectorDetailScreen(FormScreen):
         else:
             return
 
+        if new_value == self._inherits_current:
+            return  # no actual change — nothing to warn about or recompute
+
+        if self._any_field_overridden():
+            confirmed = await self.app.push_screen_wait(
+                ConfirmModal(
+                    "Switching templates will reset any unsaved edits to "
+                    "the fields below back to the new template's values. "
+                    "Continue?",
+                    confirm_label="Switch",
+                )
+            )
+            if not confirmed:
+                return
+
+        self._inherits_current = new_value
+        await self._recompute_form()
         self._form_dirty = True
-        self.query_one("#inherits-value", Static).update(self._inherits_current or "(none)")
 
     # ── save ─────────────────────────────────────────────────────────────────
 

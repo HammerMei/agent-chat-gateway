@@ -39,7 +39,7 @@ three of `FormScreen`'s hooks that would otherwise try to merge against one:
 
 Connector templates require picking a `type` up front, exactly like a brand
 new connector does (`OverviewScreen.action_new_entity()`/
-`ConnectorDetailScreen.action_pick_inherits()`'s "new_template" branch both
+`ConnectorDetailScreen._open_inherits_picker()`'s "new_template" branch both
 already do this before ever constructing this screen) — `type` itself is
 never a `_field_specs()` row (immutable, shown as a banner only), matching
 `ConnectorDetailScreen`'s own type-immutability precedent. This screen has

@@ -15,10 +15,15 @@ from pathlib import Path
 
 import pytest
 import yaml
-from textual.widgets import DataTable, Input
+from textual.widgets import Checkbox, DataTable, Input, Static
 
 from gateway.configtool.app import ConfigToolApp
-from gateway.configtool.modals import ConfirmModal, MessageModal, TypePickerModal
+from gateway.configtool.modals import (
+    ConfirmModal,
+    InheritsPickerModal,
+    MessageModal,
+    TypePickerModal,
+)
 from gateway.configtool.screens.connector_detail import ConnectorDetailScreen
 from gateway.configtool.screens.overview import OverviewScreen
 
@@ -643,3 +648,93 @@ class TestPasswordVisibilityToggle:
             await pilot.press("ctrl+t")  # must not raise
             await pilot.pause()
             assert url_input.password is False
+
+
+def _config_with_two_connector_templates(work_dir: Path) -> str:
+    """'standard' (rocketchat) and 'other' (mattermost) — sorted order is
+    'other' before 'standard', so InheritsPickerModal's ListView is:
+    0=(none), 1=other, 2=standard, 3=(new template)."""
+    return f"""\
+        connector_templates:
+          standard:
+            type: rocketchat
+            require_mention: false
+          other:
+            type: mattermost
+            require_mention: true
+        agents:
+          default:
+            type: claude
+            working_directory: {work_dir}
+        connectors:
+          - name: rc-existing
+            inherits: standard
+            server: {{url: "http://localhost:3000", username: bot, password: pw}}
+        watchers:
+          - connector: rc-existing
+            agent: default
+            room: general
+    """
+
+
+async def _click_inherits_button(pilot, app) -> None:
+    button = app.screen.query_one("#inherits-change-button")
+    button.scroll_visible(animate=False)
+    await pilot.pause()
+    await pilot.click("#inherits-change-button")
+    await pilot.pause()
+
+
+class TestConnectorInheritsPicker:
+    """Same Inherits-button redesign as AgentDetailScreen (see its own
+    TestInheritsPicker for the fuller coverage) — this class only pins the
+    connector-specific wrinkle: switching to a template with a DIFFERENT
+    `type` must reshape the form to that type's own field list."""
+
+    async def test_inherits_button_opens_the_picker(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _config_with_two_connector_templates(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_connector_in_edit_mode(pilot, app)
+            assert str(app.screen.query_one("#inherits-value", Static).render()) == "standard"
+
+            await _click_inherits_button(pilot, app)
+            assert isinstance(app.screen, InheritsPickerModal)
+
+    async def test_switching_to_a_different_type_template_reshapes_the_form(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _config_with_two_connector_templates(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_connector_in_edit_mode(pilot, app)
+            assert app.screen.query_one("#field-require_mention")
+            assert not app.screen.query("#field-server-team")  # rocketchat has no 'team'
+
+            await _click_inherits_button(pilot, app)
+            await pilot.press("down", "enter")  # 'other' (mattermost)
+            await pilot.pause()
+
+            assert isinstance(app.screen, ConnectorDetailScreen)  # no confirm — nothing overridden
+            assert str(app.screen.query_one("#inherits-value", Static).render()) == "other"
+            # mattermost-only field now present — the form reshaped to match.
+            assert app.screen.query_one("#field-server-team")
+            assert app.screen.query_one("#field-require_mention", Checkbox).value is True
+
+    async def test_switching_with_an_overridden_field_confirms_first(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _config_with_two_connector_templates(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_connector_in_edit_mode(pilot, app)
+
+            app.screen.query_one("#field-timezone", Input).value = "America/Los_Angeles"
+            await pilot.pause()
+
+            await _click_inherits_button(pilot, app)
+            await pilot.press("down", "enter")  # 'other'
+            await pilot.pause()
+
+            assert isinstance(app.screen, ConfirmModal)

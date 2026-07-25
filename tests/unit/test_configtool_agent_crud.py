@@ -19,7 +19,12 @@ from textual.widgets import Checkbox, DataTable, Footer, Input, Select, Static
 from textual.widgets._footer import FooterKey
 
 from gateway.configtool.app import ConfigToolApp
-from gateway.configtool.modals import ConfirmModal, MessageModal, TypePickerModal
+from gateway.configtool.modals import (
+    ConfirmModal,
+    InheritsPickerModal,
+    MessageModal,
+    TypePickerModal,
+)
 from gateway.configtool.screens.agent_detail import AgentDetailScreen
 from gateway.configtool.screens.overview import OverviewScreen
 
@@ -35,6 +40,41 @@ def work_dir(tmp_path: Path) -> Path:
     d = tmp_path / "work"
     d.mkdir()
     return d
+
+
+def _config_with_two_templates(work_dir: Path) -> str:
+    """'standard' (claude, timeout 1800) and 'other' (opencode, timeout 300)
+    — sorted order is 'other' before 'standard', so InheritsPickerModal's
+    ListView is: 0=(none), 1=other, 2=standard, 3=(new template)."""
+    return f"""\
+        agent_templates:
+          standard:
+            type: claude
+            timeout: 1800
+          other:
+            type: opencode
+            timeout: 300
+        agents:
+          existing-agent:
+            inherits: standard
+            working_directory: {work_dir}
+        connectors:
+          - name: rc
+            type: rocketchat
+            server: {{url: "http://localhost:3000", username: bot, password: pw}}
+        watchers:
+          - connector: rc
+            agent: existing-agent
+            room: general
+    """
+
+
+async def _click_inherits_button(pilot, app) -> None:
+    button = app.screen.query_one("#inherits-change-button")
+    button.scroll_visible(animate=False)
+    await pilot.pause()
+    await pilot.click("#inherits-change-button")
+    await pilot.pause()
 
 
 def _config_with_one_agent(work_dir: Path, agent_extra: str = "") -> str:
@@ -976,6 +1016,34 @@ class TestResetFieldToInherited:
             entry = app.editable_config.agents_raw["existing-agent"]
             assert entry["lazy_instruction_loading"] is False  # explicit, not reverted
 
+    async def test_ctrl_r_flips_the_provenance_label_back_from_explicit(
+        self, tmp_path, work_dir
+    ):
+        """Regression: the provenance label beside a ctrl+r'd field used to
+        keep computing against the entry's own (unmodified-until-Save) raw
+        dict, which still had the key present — so a field that WAS
+        explicit stayed labeled "(explicit)" forever after ctrl+r, even
+        though Save will actually revert it to inherited/default."""
+        config_path = _write_config(
+            tmp_path, _config_with_one_agent(work_dir, "session_prefix: custom-prefix\n")
+        )
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_in_edit_mode(pilot, app)
+
+            field = app.screen.query_one("#field-session_prefix", Input)
+            prov = app.screen.query_one("#prov-field-session_prefix", Static)
+            assert "explicit" in str(prov.render())
+
+            field.focus()
+            await pilot.pause()
+            await pilot.press("ctrl+r")
+            await pilot.pause()
+
+            assert "explicit" not in str(prov.render())
+            assert "default" in str(prov.render())
+
     async def test_ctrl_r_on_a_non_field_widget_is_a_safe_no_op(self, tmp_path, work_dir):
         """Name/Description inputs aren't tagged with field_key (no
         *_defaults concept) — pressing ctrl+r while focused there must do
@@ -1013,3 +1081,145 @@ class TestResetFieldToInherited:
             await pilot.pause()
             keys = {k.key for k in app.screen.query_one(Footer).query(FooterKey)}
             assert "ctrl+r" in keys
+
+
+class TestInheritsPicker:
+    """User-reported: the old 'i' single-key binding silently typed 'i' into
+    whatever Input had focus instead of opening the picker, and picking a
+    new template never refreshed the rest of the form (other fields kept
+    showing stale values/labels from the OLD template, easy to
+    misinterpret and save wrong). Covers the Button-based redesign: no key
+    conflict, full recompute on pick, confirm-before-discarding-unsaved-
+    edits, and live provenance-label refresh on a subsequent edit."""
+
+    async def test_inherits_button_opens_the_picker(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _config_with_two_templates(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_in_edit_mode(pilot, app)
+            assert str(app.screen.query_one("#inherits-value", Static).render()) == "standard"
+
+            await _click_inherits_button(pilot, app)
+            assert isinstance(app.screen, InheritsPickerModal)
+
+    async def test_picking_a_different_template_recomputes_every_field(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _config_with_two_templates(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_in_edit_mode(pilot, app)
+            assert app.screen.query_one("#field-timeout", Input).value == "1800"
+            assert app.screen.query_one("#field-type", Select).value == "claude"
+
+            await _click_inherits_button(pilot, app)
+            await pilot.press("down", "enter")  # 'other' (index 1)
+            await pilot.pause()
+
+            assert isinstance(app.screen, AgentDetailScreen)  # no confirm — nothing overridden
+            assert str(app.screen.query_one("#inherits-value", Static).render()) == "other"
+            assert app.screen.query_one("#field-timeout", Input).value == "300"
+            assert app.screen.query_one("#field-type", Select).value == "opencode"
+
+    async def test_switching_with_an_overridden_field_confirms_and_resets_on_accept(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _config_with_two_templates(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_in_edit_mode(pilot, app)
+
+            app.screen.query_one("#field-timeout", Input).value = "999"
+            await pilot.pause()
+
+            await _click_inherits_button(pilot, app)
+            await pilot.press("down", "enter")  # 'other'
+            await pilot.pause()
+
+            assert isinstance(app.screen, ConfirmModal)
+            await pilot.press("tab", "enter")  # confirm 'Switch'
+            await pilot.pause()
+
+            assert isinstance(app.screen, AgentDetailScreen)
+            # Recompute discards the unsaved '999' and shows 'other's own value.
+            assert app.screen.query_one("#field-timeout", Input).value == "300"
+            assert str(app.screen.query_one("#inherits-value", Static).render()) == "other"
+
+    async def test_declining_the_switch_confirm_keeps_the_typed_value_and_template(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _config_with_two_templates(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_in_edit_mode(pilot, app)
+
+            app.screen.query_one("#field-timeout", Input).value = "999"
+            await pilot.pause()
+
+            await _click_inherits_button(pilot, app)
+            await pilot.press("down", "enter")  # 'other'
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmModal)
+
+            await pilot.press("enter")  # Cancel is focused by default
+            await pilot.pause()
+
+            assert isinstance(app.screen, AgentDetailScreen)
+            assert app.screen.query_one("#field-timeout", Input).value == "999"  # untouched
+            assert str(app.screen.query_one("#inherits-value", Static).render()) == "standard"
+
+    async def test_picking_none_clears_inherits_and_recomputes_to_dataclass_defaults(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _config_with_two_templates(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_in_edit_mode(pilot, app)
+
+            await _click_inherits_button(pilot, app)
+            await pilot.press("enter")  # '(none)' (index 0)
+            await pilot.pause()
+
+            assert isinstance(app.screen, AgentDetailScreen)  # nothing was overridden
+            assert str(app.screen.query_one("#inherits-value", Static).render()) == "(none)"
+            assert app.screen.query_one("#field-timeout", Input).value == "360"  # dataclass default
+
+            # This agent's ONLY source of 'type:' was the template just
+            # cleared — Save correctly refuses, same "type is required"
+            # validation the real loader always enforces (not bypassed by
+            # the Inherits picker/recompute). Explicitly setting 'type' is
+            # covered by test_picking_a_different_template_recomputes_every_field
+            # elsewhere in this class; this test's own point is that
+            # clearing inherits: doesn't silently fall back to a fixed
+            # 'claude' the way a pre-v0.3 config once did.
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+            assert isinstance(app.screen, MessageModal)
+            assert "type is required" in str(app.screen.query_one("#message-body").render())
+
+    async def test_editing_a_field_after_switching_shows_explicit_live(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _config_with_two_templates(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_in_edit_mode(pilot, app)
+
+            await _click_inherits_button(pilot, app)
+            await pilot.press("down", "enter")  # 'other'
+            await pilot.pause()
+
+            timeout_input = app.screen.query_one("#field-timeout", Input)
+            prov = app.screen.query_one("#prov-field-timeout", Static)
+            assert "other" in str(prov.render())
+
+            timeout_input.focus()
+            timeout_input.value = "42"
+            await pilot.pause()
+            assert "explicit" in str(prov.render())

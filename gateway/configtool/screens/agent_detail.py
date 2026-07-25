@@ -13,17 +13,37 @@ form doesn't know about sneaking in.
 
 Tool lists (`owner_allowed_tools`/`guest_allowed_tools`) render read-only in
 view mode (`_body_text()`), but are directly editable in edit/create mode via
-two `ListView`s ('a' adds — `PresetOrInlineModal` — 'x' removes the focused
-item). They live OUTSIDE the `FieldSpec`/`apply_update()` diffing pipeline
-(that machinery is scalar-field-shaped; a list of preset-references/inline-
-rule-dicts doesn't fit it) — `_tool_list_state()` snapshots the MERGED
-starting value (same "what's currently in effect" semantics
-`_compute_initial_values()` uses for every other field) and `action_save()`
-diffs the FINAL local list against that snapshot itself, writing an explicit
-override only if it actually changed (matching decision 2: "editing an
-inherited field always writes an explicit per-entry override" — untouched
-stays untouched, exactly as `_collect_field_updates()` already does for
-every scalar field).
+two `ListView`s with dedicated "+ Add"/"- Remove" `Button`s beside each list
+(user-reported: the previous 'a'/'x' single-key bindings silently typed
+those letters into whatever Input happened to have focus instead of
+triggering the action — a real risk of quietly corrupting an unrelated
+field's value; buttons have no such conflict). They live OUTSIDE the
+`FieldSpec`/`apply_update()` diffing pipeline (that machinery is scalar-
+field-shaped; a list of preset-references/inline-rule-dicts doesn't fit it)
+— `_tool_list_state()` snapshots the MERGED starting value (same "what's
+currently in effect" semantics `_compute_initial_values()` uses for every
+other field) and `action_save()` diffs the FINAL local list against that
+snapshot itself, writing an explicit override only if it actually changed
+(matching decision 2: "editing an inherited field always writes an explicit
+per-entry override" — untouched stays untouched, exactly as
+`_collect_field_updates()` already does for every scalar field).
+
+The Inherits row is likewise a `Button` (same 'i'-key-conflict reasoning),
+not a `FieldSpec`-pipeline field — picking a new template affects the
+EFFECTIVE value of every OTHER field (unlike any single scalar field, which
+only affects itself), so unlike every other field's "snapshot once at open,
+diff at Save" semantics, picking a new template triggers a full
+`_recompute_form()` (form_common.py): every field's prefilled value and
+provenance label are recomputed against the NEWLY selected template and the
+form is recomposed from scratch. If the user had already typed unsaved
+edits into OTHER fields before switching, those would be silently discarded
+by that recompute — `_any_field_overridden()` is checked first and, if
+true, a `ConfirmModal` warns before proceeding. `_current_entry()` below
+returns a PROBE entry (`self.entry` with `inherits:` swapped to whatever the
+picker currently has selected, not yet saved) — every live-display
+computation (compose, provenance labels, ctrl+r, tool-list prefill) reads
+through this probe, not `self.entry` directly, so they all reflect the
+picker's current state rather than only updating after Save.
 
 Edit/create + Save/dirty/navigation machinery lives in `.form_common`
 (`FormScreen`) — shared with `ConnectorDetailScreen`. This module supplies
@@ -37,14 +57,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
-from textual import work
+from textual import events, work
 from textual.app import ComposeResult
-from textual.binding import Binding
 from textual.containers import Horizontal, VerticalScroll
-from textual.widgets import Input, Label, ListItem, ListView, Static
+from textual.widgets import Button, Input, Label, ListItem, ListView, Static
 
 from ..formatting import format_value, provenance_label
 from ..modals import (
+    ConfirmModal,
     InheritsPickerModal,
     InlineToolRuleModal,
     MessageModal,
@@ -56,7 +76,7 @@ from .form_common import FieldSpec, FormScreen, apply_update, find_referencing_w
 from .tool_presets import ToolPresetsScreen
 
 # NOTE: TemplateDetailScreen (screens/template_detail.py) is deliberately
-# imported LOCALLY inside action_pick_inherits() below, not at module level —
+# imported LOCALLY inside _open_inherits_picker() below, not at module level —
 # template_detail.py itself imports AGENT_FORM_FIELDS/AGENT_DATACLASS_DEFAULTS
 # from this module, so a module-level import here would be circular.
 
@@ -165,17 +185,18 @@ def _working_directory_warning(config_path: Path, raw_value: str) -> str:
 class AgentDetailScreen(FormScreen):
     BODY_ID = "agent-detail-body"
 
-    BINDINGS = [
-        Binding("a", "add_tool_rule", "Add tool rule", show=True),
-        Binding("x", "remove_tool_rule", "Remove tool rule", show=True),
-        Binding("i", "pick_inherits", "Inherits", show=True),
-    ]
-
     DEFAULT_CSS = """
     AgentDetailScreen #owner-tools-list, AgentDetailScreen #guest-tools-list {
         height: auto;
         max-height: 8;
         margin-bottom: 1;
+    }
+    AgentDetailScreen .tool-list-buttons {
+        height: auto;
+        margin-bottom: 1;
+    }
+    AgentDetailScreen .tool-list-buttons Button {
+        margin-right: 1;
     }
     """
 
@@ -193,21 +214,25 @@ class AgentDetailScreen(FormScreen):
         self.mode = mode
         self._tool_lists: dict[str, list] = {}
         self._tool_lists_initial: dict[str, list] = {}
-        # See action_pick_inherits()/action_save() below — snapshotted once
-        # at form-open time, like every other field (module docstring's
-        # decision 2), NOT live-recomputed when the picker changes it mid-
-        # edit; re-enter edit mode after saving to see new effective values.
+        # Real-Bug-fixed: ListView's own `.index` reactive defaults to 0 the
+        # INSTANT it mounts with any children — not None — so "index is not
+        # None" cannot distinguish "the user actually selected an item" from
+        # "nobody has touched this list yet." Tracked here instead, per list,
+        # set True only by a genuine on_list_view_highlighted() event (see
+        # below) while NOT `_populating` — the same guard on_input_changed()
+        # already uses to ignore the initial mount-time burst of Changed
+        # events, reused here for the identical reason.
+        self._tool_list_ever_selected: dict[str, bool] = dict.fromkeys(_TOOL_LIST_WIDGET_IDS, False)
+        # See _open_inherits_picker()/action_save() below. Unlike every
+        # other field, switching this one triggers a full
+        # _recompute_form() (form_common.py) rather than a snapshot-once-
+        # at-open value — see module docstring for why.
         self._inherits_initial: str | None = self.cfg.entry_template_name(self.entry)
         self._inherits_current: str | None = self._inherits_initial
         if self.mode != "view":
-            self._compute_initial_values(self.entry)
+            self._compute_initial_values(self._current_entry())
             self._tool_list_state()
             self._populating = True
-
-    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        if action in ("add_tool_rule", "remove_tool_rule", "pick_inherits"):
-            return self.mode != "view"
-        return super().check_action(action, parameters)
 
     def _entity_noun(self) -> str:
         return "agent"
@@ -216,7 +241,30 @@ class AgentDetailScreen(FormScreen):
         return self.agent_name
 
     def _current_entry(self) -> dict:
-        return self.entry
+        """The PROBE entry: `self.entry` (the on-disk explicit fields) with
+        `inherits:` swapped to whatever the Inherits picker currently has
+        selected — NOT necessarily what's saved yet. Every live-display
+        computation (compose, provenance labels, ctrl+r, tool-list prefill)
+        reads through this, not `self.entry` directly, so switching
+        templates is reflected immediately rather than only after Save."""
+        probe = dict(self.entry)
+        if self._inherits_current is None:
+            probe.pop("inherits", None)
+        else:
+            probe["inherits"] = self._inherits_current
+        return probe
+
+    def _any_field_overridden(self) -> bool:
+        # Tool lists live outside the FieldSpec pipeline (see module
+        # docstring) — FormScreen's own check only covers _field_specs(),
+        # so this also counts an in-progress, unsaved tool-list edit as an
+        # override the Inherits-switch confirm needs to warn about.
+        if super()._any_field_overridden():
+            return True
+        return any(
+            self._tool_lists[key] != self._tool_lists_initial[key]
+            for key in _TOOL_LIST_WIDGET_IDS
+        )
 
     def _remove_entry_from_document(self) -> None:
         del self.cfg.document["agents"][self.agent_name]
@@ -234,10 +282,11 @@ class AgentDetailScreen(FormScreen):
         self.cfg.document.setdefault("agents", {})[self.agent_name] = self.entry
 
     def _on_enter_edit_mode(self) -> None:
-        self._compute_initial_values(self.entry)
-        self._tool_list_state()
         self._inherits_initial = self.cfg.entry_template_name(self.entry)
         self._inherits_current = self._inherits_initial
+        self._compute_initial_values(self._current_entry())
+        self._tool_list_state()
+        self._tool_list_ever_selected = dict.fromkeys(_TOOL_LIST_WIDGET_IDS, False)
 
     def _field_specs(self) -> tuple[FieldSpec, ...]:
         return AGENT_FORM_FIELDS
@@ -254,13 +303,15 @@ class AgentDetailScreen(FormScreen):
         """(Re)snapshot both tool lists to their MERGED (effective) value —
         same semantics `_compute_initial_values()` uses for every scalar
         field: the form shows what's ACTUALLY in effect right now (inherited
-        from the agent's own `inherits:` template or explicit on this
-        entry), and `action_save()` below only writes an explicit override
-        if the final list actually differs from this snapshot."""
+        from the agent's own `inherits:` template — or whichever template
+        the Inherits picker currently has selected, see `_current_entry()`
+        — or explicit on this entry), and `action_save()` below only writes
+        an explicit override if the final list actually differs from this
+        snapshot."""
         try:
-            merged = self.cfg.merged_entry(self._template_kind(), self.entry)
+            merged = self.cfg.merged_entry(self._template_kind(), self._current_entry())
         except (ValueError, FileNotFoundError):
-            merged = dict(self.entry)
+            merged = dict(self._current_entry())
         self._tool_lists = {
             key: list(merged.get(key) or []) for key in _TOOL_LIST_WIDGET_IDS
         }
@@ -278,16 +329,48 @@ class AgentDetailScreen(FormScreen):
         for i, item in enumerate(self._tool_lists[key]):
             list_view.append(ListItem(Label(_format_tool_rule(item)), name=str(i)))
 
-    def _focused_tool_list_key(self) -> str | None:
-        return getattr(self.focused, "tool_list_key", None)
+    def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
+        """Real-Bug-fixed: `ListView.index` defaults to 0 (not None) the
+        instant the list mounts with any children — it cannot by itself
+        distinguish "the user selected an item" from "nobody has touched
+        this list yet." This event ALSO fires for that automatic mount-time
+        highlight, so it's gated by `_populating` (the same guard
+        `on_input_changed()` already uses to ignore its own mount-time
+        burst) — only a highlight change that happens AFTER the initial
+        populate counts as a real, user-driven selection.
+
+        This alone isn't enough, though: clicking an item that's ALREADY
+        the highlighted one (e.g. the only item in a 1-item list, or simply
+        the default index-0 item) changes no reactive value, so this event
+        never fires at all for that click — see `on_descendant_focus()`
+        below for the other half of this fix."""
+        if self._populating:
+            return
+        key = getattr(event.list_view, "tool_list_key", None)
+        if key is not None:
+            self._tool_list_ever_selected[key] = True
+
+    def on_descendant_focus(self, event: events.DescendantFocus) -> None:
+        """A ListView gaining real DOM focus (click, or Tab) is ALSO a
+        genuine "the user is interacting with this list" signal, independent
+        of on_list_view_highlighted() above — clicking an item that's
+        already highlighted (common: the only item in a 1-item list) gives
+        the ListView focus without changing `.index`, so that event alone
+        would never fire. `DescendantFocus` bubbles up to the screen
+        regardless, and isn't gated by `_populating` — focus during the
+        initial populate never lands on a ListView in the first place
+        (Textual doesn't auto-focus a freshly mounted, non-default widget)."""
+        if not self._populating:
+            key = getattr(event.widget, "tool_list_key", None)
+            if key is not None:
+                self._tool_list_ever_selected[key] = True
 
     @work
-    async def action_add_tool_rule(self) -> None:
-        if self.mode == "view":
-            return
-        key = self._focused_tool_list_key()
-        if key is None:
-            self.notify("Focus the owner or guest tool list first.", severity="warning")
+    async def _add_tool_rule(self, key: str) -> None:
+        """Triggered by the "+ Add" button beside the owner/guest list —
+        `key` comes straight from the button's own id (`add-tool-<key>`,
+        see `on_button_pressed()`), not from focus/keybinding guessing."""
+        if self.mode == "view" or key not in _TOOL_LIST_WIDGET_IDS:
             return
 
         preset_names = sorted(self.cfg.tool_presets_raw.keys())
@@ -325,16 +408,22 @@ class AgentDetailScreen(FormScreen):
         self._form_dirty = True
         self._refresh_tool_list(key)
 
-    def action_remove_tool_rule(self) -> None:
-        if self.mode == "view":
+    def _remove_tool_rule(self, key: str) -> None:
+        """Triggered by the "- Remove" button beside the owner/guest list —
+        removes whichever item THAT list's own ListView cursor is
+        currently on (click/arrow-key to select first).
+
+        `_tool_list_ever_selected[key]` — NOT just `list_view.index is None`
+        — gates this: ListView's `.index` is already `0` the instant it
+        mounts with any children, with zero user interaction, so "index is
+        not None" alone can't tell a real selection apart from that
+        automatic default. Without this check, clicking Remove as the very
+        first action after opening the form silently deleted item 0."""
+        if self.mode == "view" or key not in _TOOL_LIST_WIDGET_IDS:
             return
-        key = self._focused_tool_list_key()
-        if key is None:
-            self.notify("Focus the owner or guest tool list first.", severity="warning")
-            return
-        list_view = self.focused
-        if list_view.index is None:
-            self.notify("No item selected.", severity="warning")
+        list_view = self.query_one(f"#{_TOOL_LIST_WIDGET_IDS[key]}", ListView)
+        if not self._tool_list_ever_selected.get(key) or list_view.index is None:
+            self.notify("Select an item in the list first.", severity="warning")
             return
         idx = list_view.index
         if idx >= len(self._tool_lists[key]):
@@ -345,8 +434,17 @@ class AgentDetailScreen(FormScreen):
 
     # ── inherits: picker ─────────────────────────────────────────────────────
 
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        button_id = event.button.id or ""
+        if button_id == "inherits-change-button":
+            self._open_inherits_picker()
+        elif button_id.startswith("add-tool-"):
+            self._add_tool_rule(button_id.removeprefix("add-tool-"))
+        elif button_id.startswith("remove-tool-"):
+            self._remove_tool_rule(button_id.removeprefix("remove-tool-"))
+
     @work
-    async def action_pick_inherits(self) -> None:
+    async def _open_inherits_picker(self) -> None:
         if self.mode == "view":
             return
         template_names = sorted(self.cfg.templates("agent"))
@@ -358,9 +456,9 @@ class AgentDetailScreen(FormScreen):
         kind, name = choice
 
         if kind == "template":
-            self._inherits_current = name
+            new_value = name
         elif kind == "none":
-            self._inherits_current = None
+            new_value = None
         elif kind == "new_template":
             new_name = await self.app.push_screen_wait(
                 TextPromptModal("New agent template — name")
@@ -378,7 +476,7 @@ class AgentDetailScreen(FormScreen):
             # One-way detour, not a return-with-result flow (see
             # InheritsPickerModal's docstring): the user fills in the new
             # template over there, presses Escape to come back HERE, then
-            # re-invokes 'i' to actually reference it.
+            # clicks the Inherits button again to actually reference it.
             from .template_detail import TemplateDetailScreen
 
             self.app.push_screen(TemplateDetailScreen(self.cfg, "agent", new_name, {}, mode="create"))
@@ -386,8 +484,26 @@ class AgentDetailScreen(FormScreen):
         else:
             return
 
+        if new_value == self._inherits_current:
+            return  # no actual change — nothing to warn about or recompute
+
+        if self._any_field_overridden():
+            confirmed = await self.app.push_screen_wait(
+                ConfirmModal(
+                    "Switching templates will reset any unsaved edits to "
+                    "the fields below back to the new template's values. "
+                    "Continue?",
+                    confirm_label="Switch",
+                )
+            )
+            if not confirmed:
+                return
+
+        self._inherits_current = new_value
+        self._tool_list_state()
+        self._tool_list_ever_selected = dict.fromkeys(_TOOL_LIST_WIDGET_IDS, False)
+        await self._recompute_form()
         self._form_dirty = True
-        self.query_one("#inherits-value", Static).update(self._inherits_current or "(none)")
 
     # ── view mode ────────────────────────────────────────────────────────────
 
@@ -460,10 +576,10 @@ class AgentDetailScreen(FormScreen):
                     id="inherits-value",
                     classes="field-value",
                 )
-                yield Static("[dim](press 'i' to change)[/dim]", classes="field-provenance")
+                yield Button("Change…", id="inherits-change-button")
 
             for spec in _FORM_FIELDS:
-                yield from self._compose_field_row(spec, self.entry)
+                yield from self._compose_field_row(spec, self._current_entry())
                 if spec.key == "working_directory":
                     yield Static(
                         _working_directory_warning(
@@ -474,21 +590,22 @@ class AgentDetailScreen(FormScreen):
 
             yield Static("[bold]Permissions[/bold]")
             for spec in _PERMISSIONS_FORM_FIELDS:
-                yield from self._compose_field_row(spec, self.entry)
+                yield from self._compose_field_row(spec, self._current_entry())
 
             for key, label in (
                 ("owner_allowed_tools", "Owner allowed tools"),
                 ("guest_allowed_tools", "Guest allowed tools"),
             ):
-                yield Static(f"[bold]{label}[/bold]  [dim]('a' add / 'x' remove)[/dim]")
+                yield Static(f"[bold]{label}[/bold]")
                 list_view = ListView(*self._tool_list_items(key), id=_TOOL_LIST_WIDGET_IDS[key])
-                # Tagged so _focused_tool_list_key() can map the currently
-                # focused widget back to which of the two lists it is,
-                # without unmunging the widget id — same pattern
-                # _compose_field_row() uses to tag an Input with its
-                # FieldSpec via `.field_key`.
+                # Tagged so on_list_view_highlighted() below can map the
+                # event back to which of the two lists it is, without
+                # unmunging the widget id.
                 list_view.tool_list_key = key
                 yield list_view
+                with Horizontal(classes="tool-list-buttons"):
+                    yield Button("+ Add", id=f"add-tool-{key}")
+                    yield Button("- Remove", id=f"remove-tool-{key}")
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "field-working_directory":

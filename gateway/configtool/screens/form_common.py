@@ -45,6 +45,7 @@ from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, VerticalScroll
+from textual.css.query import NoMatches
 from textual.widgets import Checkbox, Footer, Header, Input, Select, Static
 
 from ..formatting import provenance_label
@@ -456,6 +457,25 @@ class FormScreen(DetailScreen):
             value = get_nested(merged, spec.key)
             if value is None:
                 value = dataclass_defaults.get(spec.key)
+            # read_widget_value() normalizes an untouched "str"/"list"-kind
+            # box that renders as EMPTY TEXT back to None — text_to_list("")
+            # or None for list, text.strip() or None for str — regardless of
+            # whether the effective value is None, "", or []. Without this
+            # same normalization here, a field whose true effective value is
+            # "" or [] (explicit, or absent and defaulting to one of those)
+            # would store that falsy-but-not-None value as its "initial"
+            # value, compare unequal to the widget's real untouched readback
+            # of None, and look spuriously "changed" — both to
+            # _collect_field_updates() (Save would write a no-op-shaped but
+            # semantically wrong explicit null onto an untouched field) and
+            # to _field_has_override() (a false-positive "you'll lose this
+            # edit" confirm when switching inherits: with nothing actually
+            # touched). "int" is deliberately excluded: an explicit `0`
+            # renders as the text "0" (non-empty), which reads back as the
+            # int `0` again — no mismatch there, and normalizing it away
+            # would introduce the exact same false positive in reverse.
+            if spec.kind in ("str", "list") and value is not None and not value:
+                value = None
             self._initial_values[spec.key] = value
         self._initial_values["description"] = entry.get("description")
 
@@ -499,7 +519,10 @@ class FormScreen(DetailScreen):
             # future field key containing a literal dash.
             widget.field_key = spec.key
             yield widget
-            yield Static(prov_text, classes="field-provenance")
+            # Stable id (not just the shared .field-provenance class) so
+            # _refresh_provenance_display() below can update THIS ONE row's
+            # label live, without touching any other row's.
+            yield Static(prov_text, id=f"prov-{widget_id(spec.key)}", classes="field-provenance")
 
     # ── dirty tracking (per-screen, not EditableConfig.dirty — nothing is
     # written to `document` until Save, so cfg.dirty stays False the whole
@@ -509,16 +532,87 @@ class FormScreen(DetailScreen):
         if self._populating:
             return
         self._form_dirty = True
+        self._refresh_provenance_display(getattr(event.input, "field_key", None))
 
     def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
         if self._populating:
             return
         self._form_dirty = True
+        self._refresh_provenance_display(getattr(event.checkbox, "field_key", None))
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if self._populating:
             return
         self._form_dirty = True
+        self._refresh_provenance_display(getattr(event.select, "field_key", None))
+
+    def _field_has_override(self, spec: FieldSpec) -> bool:
+        """Has THIS field's widget been changed from the value it was
+        prefilled with? Used both by the live provenance-label refresh
+        below and by the Inherits-switch confirm (agent_detail.py/
+        connector_detail.py): "would switching templates silently discard
+        something I already typed?" A field whose value fails to parse
+        (e.g. mid-typing a bad int) counts as overridden — safer to over-
+        warn than to silently treat unparseable input as untouched."""
+        try:
+            widget = self.query_one("#" + widget_id(spec.key))
+        except NoMatches:
+            return False
+        try:
+            current = read_widget_value(spec, widget)
+        except ValueError:
+            return True
+        return current != self._initial_values.get(spec.key)
+
+    def _any_field_overridden(self) -> bool:
+        return any(self._field_has_override(spec) for spec in self._field_specs())
+
+    def _refresh_provenance_display(self, field_key: str | None) -> None:
+        """Keep the changed field's provenance label truthful to what Save
+        would actually do with it RIGHT NOW — user-reported: picking a new
+        inherits: template, then typing into a field, left its label
+        showing the OLD "(from '<template>')"/"(default)" text even though
+        the field is now explicit (about to be written as an override on
+        Save). Mirrors _collect_field_updates()'s own reset-vs-changed
+        logic exactly, so the label is never wrong relative to Save: a
+        field ctrl+r'd back to its reset value shows what it WOULD BECOME
+        on Save (Save pops the key entirely — computed against a probe with
+        this field removed, not against `self._current_entry()` as-is,
+        which still has the key and would otherwise keep reporting EXPLICIT
+        forever after a ctrl+r); any other value that differs from the
+        snapshot shows EXPLICIT; unchanged shows the ORIGINAL provenance
+        unchanged. A no-op if `field_key` isn't a real field (the Name/
+        Description inputs) or the row wasn't actually composed with a
+        label (TemplateDetailScreen's _field_provenance() always returns
+        None, so its rows have no label text to touch)."""
+        if field_key is None:
+            return
+        spec = next((s for s in self._field_specs() if s.key == field_key), None)
+        if spec is None:
+            return
+        try:
+            prov_widget = self.query_one(f"#prov-{widget_id(spec.key)}", Static)
+            widget = self.query_one("#" + widget_id(spec.key))
+        except NoMatches:
+            return
+        try:
+            current = read_widget_value(spec, widget)
+        except ValueError:
+            return  # mid-typing an invalid value — leave the label as-is
+
+        entry = self._current_entry()
+        if field_key in self._reset_keys and current == self._reset_keys[field_key]:
+            top_key = spec.key.split(".", 1)[0]
+            reverted_probe = dict(entry)
+            reverted_probe.pop(top_key, None)
+            provenance = self._field_provenance(spec, reverted_probe)
+        elif current != self._initial_values.get(field_key):
+            provenance = Provenance.EXPLICIT
+        else:
+            provenance = self._field_provenance(spec, entry)
+        template_name = self.cfg.entry_template_name(entry)
+        text = f"[dim]({provenance_label(provenance, template_name)})[/dim]" if provenance else ""
+        prov_widget.update(text)
 
     def action_reset_field(self) -> None:
         """ctrl+r: reset the FOCUSED field to its pure-template/dataclass
@@ -572,6 +666,23 @@ class FormScreen(DetailScreen):
         if spec is None or not spec.secret:
             return
         widget.password = not widget.password
+
+    async def _recompute_form(self) -> None:
+        """Rebuild every field's prefilled value AND provenance label from
+        scratch against `self._current_entry()` — used when something
+        changes that affects EVERY other field's effective value (an
+        `inherits:` template switch, in `agent_detail.py`/
+        `connector_detail.py`), unlike a normal single-field edit (which
+        only ever affects itself, handled by `_refresh_provenance_display()`
+        above). Discards any of the user's own not-yet-saved edits to OTHER
+        fields made earlier in this same session — callers are expected to
+        confirm that with the user first (`_any_field_overridden()`) before
+        calling this."""
+        self._compute_initial_values(self._current_entry())
+        self._populating = True
+        await self.recompose()
+        self.call_after_refresh(self._stop_populating)
+        self.refresh_bindings()
 
     # ── navigation ───────────────────────────────────────────────────────────
 
