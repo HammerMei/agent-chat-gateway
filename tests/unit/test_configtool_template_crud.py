@@ -50,6 +50,7 @@ def _config_text(work_dir: Path) -> str:
     return f"""\
         agent_templates:
           standard:
+            description: Our standard claude profile
             type: claude
             timeout: 1800
           other:
@@ -121,6 +122,39 @@ class TestTemplateEditVisibility:
             assert app.screen.query_one("#field-timeout", Input).value == "1800"
             assert app.screen.query_one("#field-type", Select).value == "claude"
 
+    async def test_description_is_prefilled_in_edit_mode_and_shown_in_view_mode(
+        self, tmp_path, work_dir
+    ):
+        """PR review finding: OverviewScreen used to construct
+        TemplateDetailScreen with cfg.templates(kind).get(name) — a dict
+        with 'description' already stripped (EditableConfig.templates()'s
+        own docstring: stripped so it never deep-merges into an inheriting
+        entry) — so a template's description never displayed anywhere in
+        this screen, view or edit. Fixed via EditableConfig.raw_template(),
+        used at both of OverviewScreen's TemplateDetailScreen call sites."""
+        config_path = _write_config(tmp_path, _config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.screen.query_one("TabbedContent").active = "tab-templates"
+            await pilot.pause()
+            table = app.screen.query_one("#templates-table", DataTable)
+            table.focus()
+            table.move_cursor(row=0)  # agent:standard
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert isinstance(app.screen, TemplateDetailScreen)
+            assert app.screen.mode == "view"
+            assert "Our standard claude profile" in app.screen._body_text()
+
+            await pilot.press("e")
+            await pilot.pause()
+            assert (
+                app.screen.query_one("#field-description", Input).value
+                == "Our standard claude profile"
+            )
+
 
 class TestTemplateSaveDiffing:
     async def test_untouched_fields_save_with_their_original_values_intact(
@@ -148,6 +182,81 @@ class TestTemplateSaveDiffing:
             raw = yaml.safe_load(Path(config_path).read_text())
             assert raw["agent_templates"]["standard"]["timeout"] == 1800
             assert raw["agent_templates"]["standard"]["type"] == "claude"
+            # PR review finding: EditableConfig.templates() deliberately
+            # strips 'description' (it must never deep-merge into an
+            # inheriting entry) — but TemplateDetailScreen used to be
+            # constructed FROM that stripped dict as its own self.entry, so
+            # action_save()'s target_entry = dict(self.entry) + updates had
+            # no description to carry, and its wholesale overwrite of
+            # document["agent_templates"]["standard"] silently deleted the
+            # on-disk description on every save, even this untouched one.
+            assert raw["agent_templates"]["standard"]["description"] == (
+                "Our standard claude profile"
+            )
+
+    async def test_changing_a_nested_field_excludes_entries_that_already_override_it(
+        self, tmp_path, work_dir
+    ):
+        """PR review finding: the blast-radius confirm checked the raw
+        dotted FieldSpec.key ("permissions.timeout") for membership in each
+        referencing entry's raw dict — but a dict never has a literal
+        top-level key equal to that dotted string, only the nested group
+        itself ("permissions"). Without splitting to the top-level key
+        (matching _compose_field_row()'s own top_key = spec.key.split(".",
+        1)[0] a few lines below in the same file), EVERY referencing entry
+        was listed as affected, even agent-b here, which already overrides
+        the whole 'permissions' group and is genuinely unaffected by an
+        edit to the template's permissions.timeout."""
+        config_path = _write_config(
+            tmp_path,
+            f"""\
+            agent_templates:
+              nested-std:
+                type: claude
+                permissions: {{enabled: true, timeout: 300}}
+            agents:
+              agent-a:
+                inherits: nested-std
+                working_directory: {work_dir}
+              agent-b:
+                inherits: nested-std
+                working_directory: {work_dir}
+                permissions: {{enabled: true, timeout: 999}}
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            watchers:
+              - connector: rc
+                agent: agent-a
+                room: general
+              - connector: rc
+                agent: agent-b
+                room: dev
+            """,
+        )
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.screen.query_one("TabbedContent").active = "tab-templates"
+            await pilot.pause()
+            table = app.screen.query_one("#templates-table", DataTable)
+            table.focus()
+            table.move_cursor(row=0)  # only agent template: nested-std
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("e")
+            await pilot.pause()
+
+            app.screen.query_one("#field-permissions-timeout", Input).value = "60"
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            assert isinstance(app.screen, ConfirmModal)
+            body = str(app.screen.query_one("#confirm-message", Static).render())
+            assert "agent-a" in body  # inherits nested-std, no own permissions — affected
+            assert "agent-b" not in body  # already overrides the whole permissions group
 
     async def test_changing_a_field_requires_confirm_scoped_to_this_template_only(
         self, tmp_path, work_dir

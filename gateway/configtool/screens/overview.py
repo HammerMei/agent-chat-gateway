@@ -253,7 +253,11 @@ class OverviewScreen(Screen):
             if row_key is None:
                 return
             kind, name = row_key.split(":", 1)
-            entry = cfg.templates(kind).get(name)
+            # raw_template(), NOT templates() — the latter strips
+            # `description` (see its own docstring); TemplateDetailScreen
+            # needs the raw entry so description survives edit/Save
+            # round-trips (PR review finding).
+            entry = cfg.raw_template(kind, name)
             if entry is None:
                 return
             screen = TemplateDetailScreen(cfg, kind, name, entry, mode="edit")
@@ -692,7 +696,9 @@ class OverviewScreen(Screen):
                 self.app.push_screen(WatcherDetailScreen(cfg, ew, mode="view"))
         elif table_id == "templates-table":
             kind, name = key.split(":", 1)
-            entry = cfg.templates(kind).get(name)
+            # raw_template(), NOT templates() — see action_edit_row()'s
+            # identical comment.
+            entry = cfg.raw_template(kind, name)
             if entry is not None:
                 self.app.push_screen(TemplateDetailScreen(cfg, kind, name, entry, mode="view"))
         elif table_id == "presets-table":

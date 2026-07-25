@@ -360,7 +360,19 @@ class TemplateDetailScreen(FormScreen):
         for key in updates:
             if key == "description":
                 continue
-            names = [n for n, e in referencing if key not in e]
+            # PR review finding: `key` can be a dotted FieldSpec.key
+            # (e.g. "permissions.timeout", "agent_chain.max_turns") for a
+            # one-level-nested field, but a referencing entry's raw dict
+            # never has a literal top-level key equal to that dotted
+            # string — only `top_key` (the nested group itself). Without
+            # this split, `key not in e` was unconditionally True for every
+            # nested field, so every referencing entry was listed as
+            # "affected" even when it already overrides the whole nested
+            # group — matching `_compose_field_row()`'s own
+            # `top_key = spec.key.split(".", 1)[0]` a few lines below, which
+            # got this right.
+            top_key = key.split(".", 1)[0]
+            names = [n for n, e in referencing if top_key not in e]
             if names:
                 affected[key] = names
 

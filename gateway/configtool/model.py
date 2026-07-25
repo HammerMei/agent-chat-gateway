@@ -265,6 +265,27 @@ class EditableConfig:
             )
         return self._templates_cache[kind]
 
+    def raw_template(self, kind: str, name: str) -> dict | None:
+        """The named template's RAW entry straight from `document` — unlike
+        `templates()` above, `description` is NOT stripped here.
+
+        PR review finding: `TemplateDetailScreen` used to be constructed
+        with `templates(kind).get(name)` (the stripped dict) as its OWN
+        `self.entry`, then `action_save()` did `target_entry = dict(self.entry)`
+        + updates and wrote THAT wholesale over `document[...][name]` —
+        silently deleting any on-disk `description` on every save of an
+        existing template, even a no-op edit, since the stripped dict never
+        had it to begin with. `TemplateDetailScreen` needs its own source of
+        truth to carry `description` through the round-trip (exactly like
+        `DefaultsScreen`, this screen's predecessor, read directly from the
+        raw block instead of a merged/stripped view) — this accessor is
+        that source of truth, used by `OverviewScreen` at both of its
+        TemplateDetailScreen call sites for view/edit (create mode has no
+        existing raw entry to read, so it isn't needed there)."""
+        block = self.document.get(_TEMPLATES_KEY[kind]) or {}
+        entry = block.get(name)
+        return entry if isinstance(entry, dict) else None
+
     def entry_template_name(self, entry_raw: dict) -> str | None:
         """The entry's own `inherits:` value, or None if unset. A tiny
         accessor so callers building display labels (provenance text, the

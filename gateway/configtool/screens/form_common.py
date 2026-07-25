@@ -611,9 +611,25 @@ class FormScreen(DetailScreen):
 
         entry = self._current_entry()
         if field_key in self._reset_keys and current == self._reset_keys[field_key]:
-            top_key = spec.key.split(".", 1)[0]
+            # PR review finding: for a dotted (one-level-nested) spec.key
+            # like "permissions.timeout", popping the WHOLE top-level
+            # parent (as a previous version of this did) diverges from
+            # what Save actually does — apply_update() only removes the
+            # one sub-key, keeping the parent dict (and its still-explicit
+            # sibling sub-keys) if anything remains in it. Mirrored here so
+            # a reset field's live label matches what Save would really
+            # produce instead of contradicting its own explicit siblings.
             reverted_probe = dict(entry)
-            reverted_probe.pop(top_key, None)
+            if "." in spec.key:
+                parent_key, sub_key = spec.key.split(".", 1)
+                parent = dict(entry.get(parent_key) or {})
+                parent.pop(sub_key, None)
+                if parent:
+                    reverted_probe[parent_key] = parent
+                else:
+                    reverted_probe.pop(parent_key, None)
+            else:
+                reverted_probe.pop(spec.key, None)
             provenance = self._field_provenance(spec, reverted_probe)
         elif current != self._initial_values.get(field_key):
             provenance = Provenance.EXPLICIT

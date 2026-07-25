@@ -1044,6 +1044,41 @@ class TestResetFieldToInherited:
             assert "explicit" not in str(prov.render())
             assert "default" in str(prov.render())
 
+    async def test_ctrl_r_on_a_nested_field_leaves_explicit_sibling_subkeys_alone(
+        self, tmp_path, work_dir
+    ):
+        """PR review finding: for a dotted spec.key like "permissions.timeout",
+        the ctrl+r live-provenance probe used to pop the WHOLE "permissions"
+        dict out of the entry, diverging from what apply_update() actually
+        does at Save (only remove the one sub-key, keep the parent dict —
+        and its still-explicit sibling sub-keys — if anything remains).
+        With 'enabled'/'skip_owner_approval' left explicit, resetting only
+        'timeout' must NOT flip the label to inherited/default — the
+        'permissions' dict survives the reset (siblings keep it non-empty),
+        so it's still explicit, exactly like Save would leave it."""
+        config_path = _write_config(
+            tmp_path,
+            _config_with_one_agent(
+                work_dir,
+                "permissions: {enabled: true, timeout: 300, skip_owner_approval: false}\n",
+            ),
+        )
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_in_edit_mode(pilot, app)
+
+            field = app.screen.query_one("#field-permissions-timeout", Input)
+            prov = app.screen.query_one("#prov-field-permissions-timeout", Static)
+            assert "explicit" in str(prov.render())
+
+            field.focus()
+            await pilot.pause()
+            await pilot.press("ctrl+r")
+            await pilot.pause()
+
+            assert "explicit" in str(prov.render())
+
     async def test_ctrl_r_on_a_non_field_widget_is_a_safe_no_op(self, tmp_path, work_dir):
         """Name/Description inputs aren't tagged with field_key (no
         *_defaults concept) — pressing ctrl+r while focused there must do
