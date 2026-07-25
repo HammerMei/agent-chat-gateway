@@ -152,8 +152,8 @@ def main():
     )
     config_p.add_argument(
         "--lint", dest="lint_for_tui", action="store_true",
-        help="Also flag values that just restate a built-in default or duplicate "
-             "a *_defaults entry",
+        help="Also flag values that just restate a built-in default or "
+             "duplicate a value inherited from a *_templates entry",
     )
     config_sub = config_p.add_subparsers(dest="config_cmd", help="Config subcommands")
 
@@ -167,8 +167,8 @@ def main():
     )
     config_validate_p.add_argument(
         "--lint", action="store_true",
-        help="Also flag values that just restate a built-in default or duplicate "
-             "a *_defaults entry",
+        help="Also flag values that just restate a built-in default or "
+             "duplicate a value inherited from a *_templates entry",
     )
 
     config_migrate_env_p = config_sub.add_parser(

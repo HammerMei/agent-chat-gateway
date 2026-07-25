@@ -324,15 +324,17 @@ agent-chat-gateway start
 | `agents` | dict | Yes | (none) | AI agent backend definitions |
 | `watchers` | list | Yes | (none) | Room→agent mappings |
 | `tool_presets` | dict | No | `{}` | Named, reusable tool-rule lists — see [Tool Allow-Lists](#tool-allow-lists) |
-| `connector_defaults` | dict | No | `{}` | Deep-merged into every entry under `connectors:` |
-| `agent_defaults` | dict | No | `{}` | Deep-merged into every entry under `agents:` |
-| `watcher_defaults` | dict | No | `{}` | Deep-merged into every entry under `watchers:` |
+| `connector_templates` | dict | No | `{}` | Named, reusable field blocks for connectors — each entry opts in via its own `inherits: <name>` |
+| `agent_templates` | dict | No | `{}` | Named, reusable field blocks for agents — each entry opts in via its own `inherits: <name>` |
+| `watcher_templates` | dict | No | `{}` | Named, reusable field blocks for watchers — each entry opts in via its own `inherits: <name>` |
 
-None of the four defaults/preset fields above are required — a single
+None of the four templates/preset fields above are required — a single
 connector/agent/watcher setup rarely needs them. They exist to avoid
 repeating the same block across many connectors/agents/watchers in larger
-deployments. See `config.example.yaml` for a worked example and
-`docs/migration-0.2.md` if you're upgrading a config.yaml that predates them.
+deployments — see `docs/migration-0.3.md` for the reasoning and before/after
+recipes. `config.example.yaml` has a worked example. A leftover
+`connector_defaults:`/`agent_defaults:`/`watcher_defaults:` key (the pre-v0.3
+mechanism) is a hard load-time error, not silently ignored.
 Check your config any time with `agent-chat-gateway config validate --lint`.
 
 ### Connectors

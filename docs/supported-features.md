@@ -300,8 +300,11 @@ watchers:
 - ✅ Multi-agent setup (different agents per watcher)
 - ✅ Cross-field validation (e.g., agent timeout > permission timeout)
 - ✅ Relative path resolution (relative to config file location)
-- ✅ `connector_defaults` / `agent_defaults` / `watcher_defaults` — deep-merge
-  shared fields into every entry of the matching kind
+- ✅ `connector_templates` / `agent_templates` / `watcher_templates` — named,
+  reusable field blocks; an entry opts in via its own `inherits: <name>`
+  field (v0.3; see `docs/migration-0.3.md`). A leftover pre-v0.3
+  `connector_defaults:`/`agent_defaults:`/`watcher_defaults:` key is a hard
+  load-time error, not silently ignored
 - ✅ `tool_presets` — named, reusable tool-rule lists referenced by name from
   `owner_allowed_tools` / `guest_allowed_tools`
 - ✅ Watcher `rooms: [a, b, ...]` — one connector+agent pair expands into one

@@ -538,7 +538,7 @@ opencode run -s <session-id> --format json [-f <file> ...]
 ```
 config.yaml (user-editable)
     ├─ tool_presets: {name: [ToolRule, ...]}              # named, reusable tool-rule lists
-    ├─ connector_defaults / agent_defaults / watcher_defaults  # deep-merged into entries below
+    ├─ connector_templates / agent_templates / watcher_templates  # named; opted into per-entry via inherits:
     ├─ connectors: [ConnectorConfig, ...]                 # room="a" | rooms=[a,b,...] on watchers
     ├─ agents: {name: AgentConfig, ...}
     ├─ default_agent: "my-agent"

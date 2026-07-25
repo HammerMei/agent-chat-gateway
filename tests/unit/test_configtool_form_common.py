@@ -83,13 +83,18 @@ class TestFindReferencingWatcherLabels(unittest.TestCase):
         self.assertEqual(find_referencing_watcher_labels(cfg, connector_name="unrelated"), [])
         self.assertEqual(find_referencing_watcher_labels(cfg, agent_name="unrelated"), [])
 
-    def test_finds_a_watcher_that_only_inherits_its_connector_from_watcher_defaults(self):
-        """watcher_defaults may set connector/agent (unlike name/room/rooms/
-        session_id) — a watcher entry with no explicit 'connector:' still
-        counts as referencing it."""
+    def test_finds_a_watcher_that_only_inherits_its_connector_from_a_template(self):
+        """A watcher_templates: entry may set connector/agent (unlike
+        name/room/rooms/session_id) — a watcher entry with no explicit
+        'connector:' of its own, only inheriting one via 'inherits:', still
+        counts as referencing it. Goes through the real loader
+        (expanded_watchers() -> GatewayConfig.from_file()), which resolves
+        inherits: templates just like it resolves anything else — this is
+        NOT one of the TUI's own stale *_defaults-display concerns."""
         cfg = self._cfg(f"""\
-            watcher_defaults:
-              connector: rc
+            watcher_templates:
+              standard:
+                connector: rc
             agents:
               default:
                 type: claude
@@ -100,6 +105,7 @@ class TestFindReferencingWatcherLabels(unittest.TestCase):
                 server: {{url: http://localhost:3000, username: bot, password: pw}}
             watchers:
               - name: my-watcher
+                inherits: standard
                 agent: default
                 room: general
         """)

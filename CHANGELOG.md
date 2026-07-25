@@ -48,6 +48,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behavior globally with `watcher_defaults: {online_notification: "✅ _Agent
   online_", offline_notification: "❌ _Agent offline_"}`. See
   `docs/migration-0.2.md`.
+- **BREAKING (v0.3 config format): `connector_defaults:`/`agent_defaults:`/
+  `watcher_defaults:` removed entirely**, replaced by named
+  `connector_templates:`/`agent_templates:`/`watcher_templates:` blocks + a
+  per-entry `inherits: <name>` field. The old blocks merged flatly and
+  unconditionally into *every* entry of a kind regardless of type — setting
+  `command`/`type` in `agent_defaults` to give claude agents a custom
+  wrapper silently broke any opencode agent that didn't override it
+  (`OpenCodeBackend` execs the configured `command` directly as the sidecar
+  binary). Named templates only apply to entries that explicitly opt in, so
+  type-specific fields are finally safe to share, and different groups of
+  agents/connectors/watchers can each have their own template instead of
+  fighting over one global block. A leftover `*_defaults:` key is a hard,
+  immediate load-time error (not a silent no-op) naming the replacement key.
+  No automated migration — see `docs/migration-0.3.md` for the reasoning and
+  before/after recipes. **Known gap:** the config TUI's own
+  `*_defaults`-editing screens have not yet been updated to understand the
+  new mechanism — see the note at the top of `docs/design/config-tool.md`.
 
 ### Fixed
 - **Scheduled-task messages now carry a usable `ts:`/`day:` timestamp.**

@@ -53,6 +53,7 @@ def _config_text(work_dir: Path) -> str:
             - tool: WebFetch
         agents:
           agent-a:
+            type: claude
             working_directory: {work_dir}
             owner_allowed_tools: [preset-a]
         connectors:

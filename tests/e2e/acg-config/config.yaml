@@ -32,20 +32,24 @@ connectors:
 
 # All four agents below share the same working_directory/timeout/permissions/
 # guest_allowed_tools — only type/command/session_prefix/owner_allowed_tools differ.
-agent_defaults:
-  new_session_args: []
-  context_inject_files: []
-  working_directory: /root/.agent-chat-gateway/work
-  guest_allowed_tools: []
-  timeout: 180
-  permissions:
-    enabled: true
-    timeout: 60
-    skip_owner_approval: false
+# (v0.3: agent_defaults: -> a named agent_templates: entry, opted into via
+# each agent's own inherits: field — see docs/migration-0.3.md.)
+agent_templates:
+  e2e-default:
+    new_session_args: []
+    context_inject_files: []
+    working_directory: /root/.agent-chat-gateway/work
+    guest_allowed_tools: []
+    timeout: 180
+    permissions:
+      enabled: true
+      timeout: 60
+      skip_owner_approval: false
 
 agents:
   # ── OpenCode — bound to DM ────────────────────────────────────────────────
   e2e-opencode:
+    inherits: e2e-default
     type: opencode
     command: opencode
     session_prefix: e2e-oc
@@ -59,6 +63,7 @@ agents:
 
   # ── Claude Code — bound to team channel ───────────────────────────────────
   e2e-claude:
+    inherits: e2e-default
     type: claude
     command: claude
     session_prefix: e2e-cc
@@ -71,12 +76,14 @@ agents:
 
   # ── Claude Code — permission test only (empty allowlist) ──────────────────
   e2e-claude-permission:
+    inherits: e2e-default
     type: claude
     command: claude
     session_prefix: e2e-perm
 
   # ── OpenCode — permission test only (empty allowlist) ─────────────────────
   e2e-opencode-permission:
+    inherits: e2e-default
     type: opencode
     command: opencode
     session_prefix: e2e-oc-perm
@@ -87,27 +94,34 @@ agents:
 # Explicit 'name:' is kept on every entry (rather than relying on rooms:
 # auto-naming) because tests/e2e/test_schedule_e2e.py references watcher names
 # 'e2e-dm' and 'e2e-claude-channel' literally.
-watcher_defaults:
-  connector: rc-e2e
-  context_inject_files: []
+# (v0.3: watcher_defaults: -> a named watcher_templates: entry, opted into via
+# each watcher's own inherits: field — see docs/migration-0.3.md.)
+watcher_templates:
+  e2e-default:
+    connector: rc-e2e
+    context_inject_files: []
 
 watchers:
   # DM: test_user ↔ acg_bot → OpenCode
   - name: e2e-dm
+    inherits: e2e-default
     room: "@test_user"
     agent: e2e-opencode
 
   # Team channel → Claude Code
   - name: e2e-claude-channel
+    inherits: e2e-default
     room: "acg-e2e-claude"
     agent: e2e-claude
 
   # Permission test channel → Claude Code (empty allowlist)
   - name: e2e-permission
+    inherits: e2e-default
     room: "acg-e2e-permission"
     agent: e2e-claude-permission
 
   # Permission test channel → OpenCode (empty allowlist)
   - name: e2e-opencode-permission
+    inherits: e2e-default
     room: "acg-e2e-opencode-permission"
     agent: e2e-opencode-permission

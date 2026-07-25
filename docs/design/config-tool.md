@@ -21,6 +21,25 @@ blocks alongside Phase 1, specifically so annotations survive a future
 TUI-driven save without needing YAML-comment preservation (see "YAML I/O"
 below).
 
+> **⚠️ Known gap (v0.3):** the real config loader (`gateway/config.py`) has
+> since removed `connector_defaults`/`agent_defaults`/`watcher_defaults`
+> entirely, replacing them with named `connector_templates`/`agent_templates`/
+> `watcher_templates` + a per-entry `inherits: <name>` field — see
+> `docs/migration-0.3.md`. Everything below this note, and the shipped
+> `DefaultsScreen`/`AgentDetailScreen`/`ConnectorDetailScreen`/
+> `WatcherDetailScreen` code it describes, still reads/writes/displays
+> against the OLD `*_defaults` kind strings — a deliberate, explicit choice
+> made when the engine change shipped, not an oversight. Concretely: a
+> config.yaml that has adopted `*_templates:`/`inherits:` will show the TUI's
+> own "inherited"/"blast radius" computations as empty or wrong (they're
+> still looking for a global `agent_defaults:` block that no longer
+> exists/applies), and a config.yaml still using the OLD `*_defaults:` keys
+> will fail to load AT ALL (the engine now hard-errors on them) the moment
+> anything in the TUI calls `GatewayConfig.from_file()` (e.g.
+> `EditableConfig.save()`'s validate-before-write step). Reconciling the TUI
+> with the new mechanism is tracked as its own future pass, not part of this
+> document's Phase 2/3 plan as written.
+
 Reached via `agent-chat-gateway config` (no subcommand). `agent-chat-gateway
 config validate` stays a separate, scriptable command backed by
 `gateway/config_validate.py` — never touched by anything below.
