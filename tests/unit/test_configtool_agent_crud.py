@@ -10,12 +10,13 @@ a field must revert it to inherited rather than writing an explicit null.
 
 from __future__ import annotations
 
+import re
 import textwrap
 from pathlib import Path
 
 import pytest
 import yaml
-from textual.widgets import Button, Checkbox, DataTable, Footer, Input, Select, Static
+from textual.widgets import Checkbox, DataTable, Footer, Input, Select, Static
 from textual.widgets._footer import FooterKey
 
 from gateway.configtool.app import ConfigToolApp
@@ -1141,34 +1142,45 @@ class TestInheritsPicker:
     async def test_inherits_value_text_vertically_aligns_with_the_change_button(
         self, tmp_path, work_dir
     ):
-        """Real layout bug, caught via a user screenshot: the "Change…"
-        button (border-top + content + border-bottom, 3 rows tall) is
-        taller than the value Static's own 1-line auto height, so a plain
-        `content-align: middle` had no extra space to center into — the
-        template name rendered flush against the row's top edge, visibly
-        above the button's own label. `.field-value` (base.py) now uses an
-        explicit `height: 3` to match, so both labels land on the exact
-        same absolute screen row. `.region` midpoints alone don't catch
-        this (both widgets ARE 3 rows tall either way) — this test finds
-        the actual row each widget's rendered TEXT occupies via
-        `render_line()`, the same way the bug was originally diagnosed."""
+        """Real layout bug, caught via a user screenshot (twice): the
+        "Change…" button (border-top + content + border-bottom, 3 rows
+        tall) is taller than the value Static's own 1-line content, so a
+        plain `content-align: middle` had no extra space to center into —
+        the template name rendered flush against the row's top edge,
+        visibly above the button's own label.
+
+        A first attempt at fixing this compared each widget's OWN
+        `render_line()` output directly and concluded they matched — WRONG:
+        `render_line()` operates in each widget's CONTENT-only coordinate
+        space, which excludes border rows (composited separately), so
+        "render_line row 0" for a bordered Button and a border-less Static
+        are NOT the same absolute screen row; that first fix's `height: 3`
+        + `content-align: center top` actually left the value text ONE ROW
+        ABOVE the button/label row, confirmed by the user's second
+        screenshot. This test uses `App.export_screenshot()` instead — a
+        real compositor pass, in the same SVG-element form the earlier
+        false-pass would have needed to be measured in to catch this — and
+        asserts the "Inherits" label, the template-name value, and
+        "Change…" all land on the exact same SVG y-coordinate (row)."""
         config_path = _write_config(tmp_path, _config_with_two_templates(work_dir))
         app = ConfigToolApp(config_path)
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.pause()
             await _open_agent_in_edit_mode(pilot, app)
 
-            value = app.screen.query_one("#inherits-value", Static)
-            button = app.screen.query_one("#inherits-change-button", Button)
+            svg = app.export_screenshot()
 
-            def text_row(widget) -> int:
-                for y in range(widget.region.height):
-                    strip = widget.render_line(y)
-                    if "".join(seg.text for seg in strip).strip():
-                        return widget.region.y + y
-                raise AssertionError(f"{widget!r} rendered no non-blank row")
+            def text_row_y(needle: str) -> str:
+                match = re.search(
+                    rf'y="([\d.]+)"[^>]*>[^<]*{re.escape(needle)}', svg
+                )
+                assert match, f"{needle!r} not found in exported screenshot"
+                return match.group(1)
 
-            assert text_row(value) == text_row(button)
+            label_y = text_row_y("Inherits")
+            value_y = text_row_y("standard")  # the template name shown as the value
+            button_y = text_row_y("Change")
+            assert label_y == value_y == button_y
 
     async def test_picking_a_different_template_recomputes_every_field(
         self, tmp_path, work_dir

@@ -70,23 +70,30 @@ class DetailScreen(Screen):
     `margin-right` is the actual gap before the Button.
     User-reported (2nd round, with a screenshot): the name still rendered
     flush against the row's top edge, visibly above the button's own label.
-    Root cause, confirmed by instrumenting `render_line()` directly: this
-    widget's `height: auto` only grows to fit its own 1-line content, so a
-    plain `content-align: middle` has no extra vertical space to center
-    into — and a `padding-top` large enough to add that space gets
-    re-absorbed by `content-align: middle` (which centers within the
-    padded box too, splitting the odd row of slack toward the bottom and
-    landing back on row 0). `Button`'s own label — despite also declaring
-    `content-align: center middle` — empirically renders on row 0 of its
-    (taller, border-driven) box too, not its middle row; confirmed by
-    dumping both widgets' `render_line()` output side by side. So: give
-    this Static the SAME explicit height as the button (3: border-top +
-    content + border-bottom) and align `top` rather than `middle` — that
-    puts both labels on the exact same absolute row instead of fighting
-    Button's actual (not its documented) vertical behavior. */
+    A prior fix here tried `height: 3; content-align: center top` based on
+    comparing both widgets' own `render_line()` output directly — WRONG
+    methodology: `render_line()` operates in each widget's own CONTENT-only
+    coordinate space, which excludes border rows entirely (those are
+    composited on separately), so "both widgets' text is on render_line
+    row 0" does NOT mean they land on the same absolute screen row once
+    Button's border compositing shifts its content down. Confirmed via
+    `App.export_screenshot()` (real compositing, not per-widget
+    introspection): with the old height:3 + top-align rule, the value text
+    rendered exactly ONE ROW ABOVE "Inherits"/"Change…" (verified by
+    comparing each `<text>` element's SVG y-coordinate — a `padding-top: 1`
+    row is ~24.4 SVG units on this test's font metrics). `.field-label`
+    (right above) already gets this right — `padding-top: 1`, no explicit
+    height, height computed as auto (padding + 1 content line = 2) — so
+    mirroring that exactly (not inventing a parallel height:3 scheme) is
+    what actually lines up: `padding-top: 1` pushes the text down into the
+    row Button/label both use; `content-align: center top` keeps the
+    horizontal centering without `middle` re-absorbing the padding (the
+    ORIGINAL bug from the 1st round of this fix). Re-verified via
+    `export_screenshot()`: "Inherits", the value text, and "Change…" all
+    now share the identical SVG y-coordinate. */
     DetailScreen .field-value {
         width: 30;
-        height: 3;
+        padding-top: 1;
         content-align: center top;
         margin-right: 2;
     }
