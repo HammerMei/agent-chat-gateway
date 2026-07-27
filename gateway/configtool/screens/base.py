@@ -110,6 +110,25 @@ class DetailScreen(Screen):
     DetailScreen .field-row Input {
         width: 1fr;
     }
+    /* Tool-list editor (owner_allowed_tools/guest_allowed_tools —
+    tool_list_editor.py's ToolListEditorMixin) widget ids/classes are
+    globally unique (only one screen ever has them mounted at a time), so
+    this lives here rather than duplicated per host screen — originally
+    only on AgentDetailScreen, moved here once TemplateDetailScreen became
+    a second concrete user (agent templates can set these two fields too).
+    */
+    DetailScreen #owner-tools-list, DetailScreen #guest-tools-list {
+        height: auto;
+        max-height: 8;
+        margin-bottom: 1;
+    }
+    DetailScreen .tool-list-buttons {
+        height: auto;
+        margin-bottom: 1;
+    }
+    DetailScreen .tool-list-buttons Button {
+        margin-right: 1;
+    }
     """
 
     def compose(self) -> ComposeResult:

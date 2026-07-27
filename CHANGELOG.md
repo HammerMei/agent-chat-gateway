@@ -47,6 +47,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `username + password`) replacing the old plain warning text: only the
   relevant credential fields show, and switching modes clears the other
   group so the two can no longer collide by accident.
+- **Config TUI: agent templates can now edit `owner_allowed_tools`/
+  `guest_allowed_tools`.** Both fields were already legal on an
+  `agent_templates:` entry (nothing in `gateway/config.py` forbids them
+  there) but the TUI's template screen never had an editor for them —
+  user-reported gap. The existing per-agent tool-list editor (`ListView` +
+  "+ Add"/"- Remove" buttons, referencing a `tool_presets:` entry or
+  writing an inline rule) was extracted into a shared
+  `ToolListEditorMixin` and is now available on agent templates too, with
+  its own blast-radius-scoped confirm before saving a change that affects
+  other entries.
 
 ### Changed
 - **BREAKING: `online_notification`/`offline_notification` default to quiet

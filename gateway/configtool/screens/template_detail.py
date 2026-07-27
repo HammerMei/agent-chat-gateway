@@ -56,7 +56,7 @@ from typing import Literal
 from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, VerticalScroll
-from textual.widgets import Checkbox, Input, Select, Static
+from textual.widgets import Button, Checkbox, Input, Select, Static
 
 from ..modals import ConfirmModal, MessageModal
 from ..model import EditableConfig
@@ -73,6 +73,7 @@ from .form_common import (
     set_widget_value,
     widget_id,
 )
+from .tool_list_editor import TOOL_LIST_WIDGET_IDS, ToolListEditorMixin, format_tool_rule
 from .watcher_detail import WATCHER_TEMPLATE_DATACLASS_DEFAULTS, WATCHER_TEMPLATE_FIELDS
 
 # kind -> (field specs, dataclass-defaults fallback). Connector is a
@@ -86,7 +87,7 @@ _STATIC_FIELDS_BY_KIND: dict[str, tuple[tuple[FieldSpec, ...], dict[str, object]
 TEMPLATE_KINDS = ("agent", "connector", "watcher")
 
 
-class TemplateDetailScreen(FormScreen):
+class TemplateDetailScreen(ToolListEditorMixin, FormScreen):
     BODY_ID = "template-detail-body"
 
     def __init__(
@@ -103,12 +104,15 @@ class TemplateDetailScreen(FormScreen):
         self.template_name = template_name
         self.entry = entry
         self.mode = mode
+        self._init_tool_lists()
         if self.mode != "view":
             self._compute_initial_values(self.entry)
+            self._tool_list_state()
             self._populating = True
 
     def _on_enter_edit_mode(self) -> None:
         self._compute_initial_values(self.entry)
+        self._tool_list_state()
 
     def _entity_noun(self) -> str:
         return f"{self.kind} template"
@@ -141,6 +145,16 @@ class TemplateDetailScreen(FormScreen):
         if self.kind == "connector":
             return DATACLASS_DEFAULTS_BY_TYPE.get(self._connector_type(), {})
         return _STATIC_FIELDS_BY_KIND[self.kind][1]
+
+    def _tool_list_starting_values(self) -> dict[str, list]:
+        # No merge (a template has nothing to merge against, unlike
+        # AgentDetailScreen's own version of this hook) — the template's
+        # OWN raw value directly, same "read straight off entry" philosophy
+        # as _compute_initial_values() above. A no-op for connector/watcher
+        # templates (neither key is ever set on those, so this is just
+        # {key: []} for both — harmless; _compose_form() below only
+        # actually renders the tool-list rows for kind == "agent").
+        return {key: self.entry.get(key) or [] for key in TOOL_LIST_WIDGET_IDS}
 
     # ── no inherits: concept for a template's own fields ─────────────────────
 
@@ -269,10 +283,15 @@ class TemplateDetailScreen(FormScreen):
             shown_any = True
             inherit_count = sum(1 for _, e in referencing if key not in e)
             override_count = len(referencing) - inherit_count
-            lines.append(
-                f"{key}: {value}  "
-                f"[dim]({inherit_count} entries inherit, {override_count} override)[/dim]"
-            )
+            blast_text = f"[dim]({inherit_count} entries inherit, {override_count} override)[/dim]"
+            if key in TOOL_LIST_WIDGET_IDS:
+                # Same one-rule-per-line style AgentDetailScreen's own view
+                # mode uses (format_tool_rule()), not a raw Python list dump.
+                lines.append(f"{key}:  {blast_text}")
+                for item in value or []:
+                    lines.append(f"  {format_tool_rule(item)}")
+            else:
+                lines.append(f"{key}: {value}  {blast_text}")
         if not shown_any:
             lines.append("(empty — this template sets no fields yet)")
 
@@ -313,6 +332,25 @@ class TemplateDetailScreen(FormScreen):
             for spec in self._field_specs():
                 yield from self._compose_field_row(spec, self.entry)
 
+            if self.kind == "agent":
+                referencing = find_entries_referencing_template(
+                    self.cfg, self.kind, self.template_name
+                )
+                for key, label in (
+                    ("owner_allowed_tools", "Owner allowed tools"),
+                    ("guest_allowed_tools", "Guest allowed tools"),
+                ):
+                    inherit_count = sum(1 for _, e in referencing if key not in e)
+                    override_count = len(referencing) - inherit_count
+                    yield Static(
+                        f"[bold]{label}[/bold]  "
+                        f"[dim]({inherit_count} inherit, {override_count} override)[/dim]"
+                    )
+                    yield from self._compose_tool_list_widget(key)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self._dispatch_tool_list_button(event.button.id or "")
+
     # ── save ─────────────────────────────────────────────────────────────────
 
     @work
@@ -348,6 +386,16 @@ class TemplateDetailScreen(FormScreen):
         for key, value in updates.items():
             apply_update(target_entry, key, value)
 
+        # Tool lists (owner_allowed_tools/guest_allowed_tools, agent
+        # templates only) live outside the FieldSpec/apply_update()
+        # pipeline (see tool_list_editor.py) — diffed directly against the
+        # snapshot _tool_list_state() took when the form opened.
+        self._collect_tool_list_updates(target_entry)
+        changed_tool_list_keys = [
+            key for key in TOOL_LIST_WIDGET_IDS
+            if self._tool_lists[key] != self._tool_lists_initial[key]
+        ]
+
         # Blast-radius confirm (the actual regression test this whole
         # redesign exists for): scoped to entries that inherit THIS specific
         # template (find_entries_referencing_template), not "every entry in
@@ -357,7 +405,7 @@ class TemplateDetailScreen(FormScreen):
         # true in create mode) needs no confirmation.
         referencing = find_entries_referencing_template(self.cfg, self.kind, self.template_name)
         affected: dict[str, list[str]] = {}
-        for key in updates:
+        for key in (*updates, *changed_tool_list_keys):
             if key == "description":
                 continue
             # PR review finding: `key` can be a dotted FieldSpec.key
@@ -370,7 +418,8 @@ class TemplateDetailScreen(FormScreen):
             # "affected" even when it already overrides the whole nested
             # group — matching `_compose_field_row()`'s own
             # `top_key = spec.key.split(".", 1)[0]` a few lines below, which
-            # got this right.
+            # got this right. (Tool-list keys are already top-level, so the
+            # split is a no-op for them — same expression covers both.)
             top_key = key.split(".", 1)[0]
             names = [n for n, e in referencing if top_key not in e]
             if names:

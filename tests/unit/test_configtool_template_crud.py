@@ -21,7 +21,14 @@ import yaml
 from textual.widgets import DataTable, Input, Select, Static
 
 from gateway.configtool.app import ConfigToolApp
-from gateway.configtool.modals import ConfirmModal, MessageModal, TextPromptModal, TypePickerModal
+from gateway.configtool.modals import (
+    ConfirmModal,
+    InlineToolRuleModal,
+    MessageModal,
+    PresetOrInlineModal,
+    TextPromptModal,
+    TypePickerModal,
+)
 from gateway.configtool.screens.overview import OverviewScreen
 from gateway.configtool.screens.template_detail import TemplateDetailScreen
 
@@ -627,3 +634,187 @@ class TestTemplateDelete:
             assert isinstance(app.screen, OverviewScreen)
             raw = yaml.safe_load(Path(config_path).read_text())
             assert "unused" not in raw["agent_templates"]
+
+
+def _config_with_agent_template_tools(work_dir: Path) -> str:
+    """'standard' sets owner_allowed_tools: [preset-a] — agent-a inherits it
+    without overriding (genuinely affected by an edit to it), agent-b
+    inherits it but already overrides its own owner_allowed_tools (should
+    NOT show up in a blast-radius confirm)."""
+    return f"""\
+        tool_presets:
+          preset-a:
+            - tool: Bash
+          preset-b:
+            - tool: WebFetch
+        agent_templates:
+          standard:
+            type: claude
+            owner_allowed_tools: [preset-a]
+        agents:
+          agent-a:
+            inherits: standard
+            working_directory: {work_dir}
+          agent-b:
+            inherits: standard
+            working_directory: {work_dir}
+            owner_allowed_tools: [preset-b]
+        connectors:
+          - name: rc
+            type: rocketchat
+            server: {{url: "http://localhost:3000", username: bot, password: pw}}
+        watchers:
+          - connector: rc
+            agent: agent-a
+            room: general
+          - connector: rc
+            agent: agent-b
+            room: dev
+    """
+
+
+async def _click_template_tool_button(pilot, app, action: str, key: str = "owner_allowed_tools") -> None:
+    button = app.screen.query_one(f"#{action}-tool-{key}")
+    button.scroll_visible(animate=False)
+    await pilot.pause()
+    await pilot.click(f"#{action}-tool-{key}")
+    await pilot.pause()
+
+
+class TestTemplateToolListEditor:
+    """User-reported: 'agent template does not have ways to edit
+    owner_allowed_tools and guest_allowed_tools' — a real gap
+    (gateway/config.py's agent_templates forbidden-keys is frozenset(), so
+    both fields are already legal on a template; the config TUI's
+    TemplateDetailScreen simply never grew an editor for them). Fixed by
+    extracting AgentDetailScreen's own tool-list editor into
+    ToolListEditorMixin (tool_list_editor.py) and reusing it here."""
+
+    async def test_view_mode_shows_the_tool_rule_with_blast_radius(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _config_with_agent_template_tools(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.screen.query_one("TabbedContent").active = "tab-templates"
+            await pilot.pause()
+            table = app.screen.query_one("#templates-table", DataTable)
+            table.focus()
+            table.move_cursor(row=0)  # agent:standard
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert isinstance(app.screen, TemplateDetailScreen)
+            body = app.screen._body_text()
+            assert "preset-a" in body
+            assert "1 entries inherit, 1 override" in body  # agent-a / agent-b
+
+    async def test_edit_mode_prefills_the_owner_tools_list(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _config_with_agent_template_tools(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_template_edit(pilot, app, row=0)
+
+            list_view = app.screen.query_one("#owner-tools-list")
+            assert len(list_view.children) == 1
+
+    async def test_adding_an_inline_rule_and_saving_confirms_and_writes_it(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _config_with_agent_template_tools(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_template_edit(pilot, app, row=0)
+
+            await _click_template_tool_button(pilot, app, "add")
+            assert isinstance(app.screen, PresetOrInlineModal)
+            # preset-a (0, already referenced), preset-b (1), inline (2), new_preset (3).
+            await pilot.press("down", "down", "enter")
+            await pilot.pause()
+            assert isinstance(app.screen, InlineToolRuleModal)
+            app.screen.query_one("#rule-tool", Input).value = "Edit"
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert isinstance(app.screen, TemplateDetailScreen)
+            list_view = app.screen.query_one("#owner-tools-list")
+            assert len(list_view.children) == 2
+
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            # Blast-radius confirm: agent-a inherits and doesn't override —
+            # affected; agent-b already overrides owner_allowed_tools —
+            # must NOT appear.
+            assert isinstance(app.screen, ConfirmModal)
+            body = str(app.screen.query_one("#confirm-message", Static).render())
+            assert "agent-a" in body
+            assert "agent-b" not in body
+            await pilot.press("tab", "enter")
+            await pilot.pause()
+
+            assert isinstance(app.screen, OverviewScreen)
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert raw["agent_templates"]["standard"]["owner_allowed_tools"] == [
+                "preset-a",
+                {"tool": "Edit"},
+            ]
+
+    async def test_untouched_tool_list_saves_without_a_blast_radius_confirm(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _config_with_agent_template_tools(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_template_edit(pilot, app, row=0)
+
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            assert isinstance(app.screen, OverviewScreen)  # no confirm at all
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert raw["agent_templates"]["standard"]["owner_allowed_tools"] == ["preset-a"]
+
+    async def test_removing_the_only_item_writes_an_explicit_empty_list(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _config_with_agent_template_tools(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_template_edit(pilot, app, row=0)
+
+            list_view = app.screen.query_one("#owner-tools-list")
+            list_view.scroll_visible(animate=False)
+            await pilot.pause()
+            await pilot.click(list_view.children[0])
+            await pilot.pause()
+            await _click_template_tool_button(pilot, app, "remove")
+            assert len(list_view.children) == 0
+
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmModal)  # agent-a is affected
+            await pilot.press("tab", "enter")
+            await pilot.pause()
+
+            assert isinstance(app.screen, OverviewScreen)
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert raw["agent_templates"]["standard"]["owner_allowed_tools"] == []
+
+    async def test_connector_and_watcher_templates_have_no_tool_list_section(
+        self, tmp_path, work_dir
+    ):
+        """owner_allowed_tools/guest_allowed_tools are agent-only concepts —
+        connector/watcher templates must not render the section at all."""
+        config_path = _write_config(tmp_path, _config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_template_edit(pilot, app, row=3)  # watcher:wstd
+
+            assert not app.screen.query("#owner-tools-list")
+            assert not app.screen.query("#add-tool-owner_allowed_tools")
