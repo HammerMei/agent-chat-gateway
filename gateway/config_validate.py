@@ -33,7 +33,7 @@ from urllib.parse import urlparse
 
 import yaml
 
-from .config import GatewayConfig, _parse_templates_block
+from .config import GatewayConfig, _parse_templates_block, collect_config
 from .connectors.mattermost.config import MattermostConfig
 from .connectors.rocketchat.config import RocketChatConfig
 from .connectors.voice.config import VoiceConfig
@@ -110,22 +110,36 @@ class ValidationResult:
 
 
 def validate_config(config_path: str, lint: bool = False) -> ValidationResult:
-    """Validate config.yaml without starting the daemon. See module docstring."""
+    """Validate config.yaml without starting the daemon. See module docstring.
+
+    Uses `gateway/config.py`'s `collect_config()` — the fault-tolerant
+    counterpart to `GatewayConfig.from_file()` — instead of catching a
+    single exception from `from_file()` directly. This means a config with
+    MULTIPLE independent problems (e.g. two connectors each missing a
+    required field, or an agent with a bad `working_directory` alongside an
+    unrelated connector issue) reports EVERY one, each correctly attributed
+    to entity_kind="connector"/"agent"/"watcher" — not just whichever one
+    `from_file()` would have hit first, collapsed into one
+    entity_kind="global" finding that never marks a specific row in the
+    config TUI's Overview. A structural failure (e.g. `connectors:` isn't
+    even a list) is still exactly one global finding — collect_config()
+    itself only fans out across genuinely independent per-entity problems."""
     result = ValidationResult(config_path=config_path)
 
-    try:
-        config = GatewayConfig.from_file(config_path)
-    except (ValueError, FileNotFoundError) as exc:
-        result.errors.append(str(exc))
+    config, issues = collect_config(config_path)
+    for issue in issues:
+        result.errors.append(issue.message)
         result.findings.append(
             Finding(
                 severity="error",
-                entity_kind="global",
-                entity_name=None,
+                entity_kind=issue.entity_kind,
+                entity_name=issue.entity_name,
                 field=None,
-                message=str(exc),
+                message=issue.message,
             )
         )
+
+    if config is None:
         return result
 
     result.watcher_count = len(config.watchers)
@@ -241,16 +255,27 @@ def _check_state_orphans(config: GatewayConfig, result: ValidationResult) -> Non
 
 
 def _lint_config(raw: dict, result: ValidationResult) -> None:
-    # Safe to re-parse here without try/except: _lint_config only ever runs
-    # after validate_config()'s own GatewayConfig.from_file() call already
-    # succeeded (the early `return result` on the ValueError/FileNotFoundError
-    # path above), so every entry's `inherits:` (if any) is already known to
-    # resolve — these calls cannot raise.
-    agent_templates = _parse_templates_block(raw, "agent_templates", frozenset())
-    watcher_templates = _parse_templates_block(
-        raw, "watcher_templates", frozenset({"name", "room", "rooms", "session_id"})
+    # PR review finding: this used to assume re-parsing these blocks "cannot
+    # raise" because validate_config() only reached here after a successful
+    # GatewayConfig.from_file() call. That's no longer true now that
+    # validate_config() uses collect_config() — a `*_templates:` block can
+    # itself be malformed while collect_config() still returns a usable
+    # partial config (that failure is already recorded as its own Finding
+    # via collect_config()'s issues, same as from_file() would have caught
+    # it). Falling back to {} here — instead of re-raising the identical
+    # ValueError a second time, uncaught — mirrors collect_config()'s own
+    # "record the issue once, keep going with a safe default" behavior.
+    def _templates_or_empty(key: str, forbidden_keys: frozenset[str]) -> dict[str, dict]:
+        try:
+            return _parse_templates_block(raw, key, forbidden_keys)
+        except ValueError:
+            return {}
+
+    agent_templates = _templates_or_empty("agent_templates", frozenset())
+    watcher_templates = _templates_or_empty(
+        "watcher_templates", frozenset({"name", "room", "rooms", "session_id"})
     )
-    connector_templates = _parse_templates_block(raw, "connector_templates", frozenset({"name"}))
+    connector_templates = _templates_or_empty("connector_templates", frozenset({"name"}))
 
     for agent_name, agent_raw in (raw.get("agents") or {}).items():
         if isinstance(agent_raw, dict):

@@ -560,5 +560,128 @@ class TestEditableConfigSave(_EditableConfigTestBase):
             cfg.save()
 
 
+class TestEditableConfigScopedSaveGate(_EditableConfigTestBase):
+    """User-reported: the previous all-or-nothing gate meant a config with
+    TWO independently-broken connectors could never be fixed (or even
+    deleted) through the TUI — saving a fix to connector1 was rejected
+    because connector2 was still broken, and vice versa. save() now only
+    blocks on a genuinely NEW problem (gateway/config.py's collect_config(),
+    which — unlike a single caught GatewayConfig.from_file() exception —
+    surfaces every independently-broken connector/agent/watcher, not just
+    whichever one from_file() would have hit first)."""
+
+    def _two_broken_connectors_text(self) -> str:
+        return f"""\
+            connectors:
+              - name: conn1
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: "", password: ""}}
+              - name: conn2
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: "", password: ""}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - connector: conn1
+                agent: default
+                room: general
+              - connector: conn2
+                agent: default
+                room: dev
+        """
+
+    def test_fixing_one_connector_saves_despite_the_others_pre_existing_error(self):
+        path = self._write(self._two_broken_connectors_text())
+        cfg = EditableConfig.load(path)
+        conn1 = next(c for c in cfg.document["connectors"] if c["name"] == "conn1")
+        conn1["server"]["username"] = "bot1"
+        conn1["server"]["password"] = "pw1"
+        cfg.mark_dirty()
+
+        cfg.save()  # must not raise
+
+        raw = yaml.safe_load(path.read_text())
+        fixed = next(c for c in raw["connectors"] if c["name"] == "conn1")
+        still_broken = next(c for c in raw["connectors"] if c["name"] == "conn2")
+        self.assertEqual(fixed["server"]["username"], "bot1")
+        # conn2's pre-existing, untouched problem survives exactly as it was.
+        self.assertEqual(still_broken["server"]["username"], "")
+        self.assertEqual(still_broken["server"]["password"], "")
+
+    def test_deleting_the_fixed_connector_succeeds_despite_the_others_error(self):
+        path = self._write(self._two_broken_connectors_text())
+        cfg = EditableConfig.load(path)
+        cfg.document["connectors"] = [
+            c for c in cfg.document["connectors"] if c["name"] != "conn1"
+        ]
+        cfg.document["watchers"] = [
+            w for w in cfg.document["watchers"] if w["connector"] != "conn1"
+        ]
+        cfg.mark_dirty()
+
+        cfg.save()  # must not raise
+
+        raw = yaml.safe_load(path.read_text())
+        names = {c["name"] for c in raw["connectors"]}
+        self.assertEqual(names, {"conn2"})
+
+    def test_a_genuinely_new_error_is_still_blocked_even_on_an_already_broken_config(self):
+        """The scoped gate narrows what's IGNORED — it must not become a
+        blanket pass. Introducing a brand-new problem (here: breaking the
+        agent) while conn2 is already broken must still be refused."""
+        path = self._write(self._two_broken_connectors_text())
+        cfg = EditableConfig.load(path)
+        del cfg.document["agents"]["default"]["working_directory"]
+        cfg.mark_dirty()
+
+        with self.assertRaises(ValueError) as ctx:
+            cfg.save()
+        self.assertIn("working_directory is required", str(ctx.exception))
+
+        # Disk must be untouched — same guarantee the existing
+        # "refuses an invalid document" test already pins.
+        raw = yaml.safe_load(path.read_text())
+        self.assertIn("working_directory", raw["agents"]["default"])
+
+    def test_fixing_an_unrelated_agent_does_not_reveal_a_hidden_connector_error(self):
+        """PR review finding, chained from a bug in collect_config() itself:
+        an invalid `default_agent` used to make collect_config() discard
+        EVERY already-parsed connector/agent — so `before`'s findings never
+        included a completely unrelated connector's own, already-real empty-
+        credentials problem. Fixing the (unrelated) default_agent problem
+        made that connector problem appear for the FIRST time in `after`,
+        misclassifying an old, silent problem as "new" and blocking a
+        perfectly good, unrelated fix."""
+        path = self._write(f"""\
+            connectors:
+              - name: rc1
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: "", password: ""}}
+            agents:
+              broken_default:
+                type: claude
+              other_agent:
+                type: claude
+                working_directory: {self.agent_dir}
+            default_agent: broken_default
+            watchers:
+              - connector: rc1
+                agent: other_agent
+                room: general
+        """)
+        cfg = EditableConfig.load(path)
+        cfg.document["agents"]["broken_default"]["working_directory"] = str(self.agent_dir)
+        cfg.mark_dirty()
+
+        cfg.save()  # must not raise
+
+        raw = yaml.safe_load(path.read_text())
+        # rc1's pre-existing (untouched, unrelated) empty credentials survive
+        # exactly as they were — this save neither fixed nor was blocked by them.
+        self.assertEqual(raw["connectors"][0]["server"]["username"], "")
+
+
 if __name__ == "__main__":
     unittest.main()

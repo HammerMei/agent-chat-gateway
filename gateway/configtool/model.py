@@ -40,8 +40,15 @@ from pathlib import Path
 
 import yaml
 
-from ..config import GatewayConfig, WatcherConfig, _parse_templates_block, _resolve_inherits
-from ..config_validate import Finding, validate_config
+from ..config import (
+    GatewayConfig,
+    WatcherConfig,
+    _parse_one_watcher_entry,
+    _parse_templates_block,
+    _resolve_inherits,
+    collect_config,
+)
+from ..config_validate import Finding, ValidationResult, validate_config
 
 # kind -> the top-level *_templates: key it reads, and the forbidden-key set
 # _parse_templates_block enforces for a named template of that kind. Mirrors
@@ -165,8 +172,15 @@ class EditableConfig:
            elsewhere would validate paths that don't mean the same thing
            once moved).
         2. Run the real `validate_config()` against that temp file. If it
-           doesn't validate, delete the temp file and raise ValueError with
-           the errors — the real config on disk is never touched.
+           doesn't validate, compare its findings against `validate_config()`
+           run on the CURRENT on-disk file — a pre-existing problem
+           belonging to some OTHER, untouched entity does not block this
+           save; only a genuinely NEW problem does (see
+           `_new_errors_introduced_by_this_save()` below). User-reported:
+           the previous all-or-nothing gate meant a config with two
+           independently-broken connectors could never be fixed (or even
+           deleted) through the TUI at all — saving a fix to connector1 was
+           rejected because connector2 was still broken, and vice versa.
         3. Only on success: copy the real file to a timestamped backup under
            `<config_dir>/.config-backups/` (`config.yaml.bak.<unix-ts>`,
            matching gateway/onboard.py's own backup step, which writes to
@@ -208,12 +222,18 @@ class EditableConfig:
             with open(tmp_path, "w") as f:
                 yaml.dump(self.document, f, sort_keys=False, allow_unicode=True)
 
-            result = validate_config(str(tmp_path))
-            if not result.ok:
-                raise ValueError(
-                    "Refusing to save — the result would no longer be a "
-                    "valid config:\n" + "\n".join(result.errors)
-                )
+            after = validate_config(str(tmp_path))
+            if not after.ok:
+                new_errors = self._new_errors_introduced_by_this_save(after)
+                if new_errors:
+                    raise ValueError(
+                        "Refusing to save — this change introduces a new "
+                        "problem:\n" + "\n".join(f.message for f in new_errors)
+                    )
+                # else: every error in `after` already existed on disk before
+                # this edit (or there are strictly fewer now) — allow the
+                # save. The pre-existing problem(s) stay exactly as they
+                # were; this save just doesn't ALSO fix them.
 
             backup_dir = self.path.parent / ".config-backups"
             backup_dir.mkdir(parents=True, exist_ok=True)
@@ -230,6 +250,44 @@ class EditableConfig:
             tmp_path.unlink(missing_ok=True)
 
         self.dirty = False
+
+    def _new_errors_introduced_by_this_save(self, after: ValidationResult) -> list[Finding]:
+        """Which of `after`'s errors are genuinely NEW — not present when
+        `validate_config()` runs against the CURRENT on-disk file (i.e. the
+        state right before this save). Compares structured
+        `(entity_kind, entity_name, message)` tuples, not raw strings and
+        not "same entity therefore ignore" — an error only counts as
+        "pre-existing, therefore ignorable" if the EXACT same problem
+        already existed on disk; a different, new problem on an
+        already-broken entity still blocks the save. `self.path` reflects
+        whatever was last successfully saved (or originally loaded) —
+        nothing else is expected to touch it mid-session.
+
+        Known, accepted limitation (PR review): `entity_name` is the raw
+        `name` field, so RENAMING an entity (e.g. a connector's `name:`)
+        that ALSO has an unrelated pre-existing problem makes that problem
+        look "new" under the new name and blocks the save — the old and new
+        names never match as the same tuple key. Safe (never silently loses
+        data — the save is refused, not silently allowed with the old
+        problem intact under a new label) but can be surprising: the fix is
+        to resolve the pre-existing problem in the SAME save as the rename,
+        or rename in a separate save before/after fixing it. Not fixed here:
+        doing so would need a stable per-entity identity that survives a
+        rename (e.g. list position for connectors — but agents are
+        inherently name-keyed in `agents:`, where a rename IS
+        indistinguishable from delete+create), which is a bigger design
+        question than this fix's scope."""
+        before = validate_config(str(self.path))
+        before_keys = {
+            (f.entity_kind, f.entity_name, f.message)
+            for f in before.findings
+            if f.severity == "error"
+        }
+        return [
+            f
+            for f in after.findings
+            if f.severity == "error" and (f.entity_kind, f.entity_name, f.message) not in before_keys
+        ]
 
     # ── Raw entry accessors (pre-merge, as-authored) ─────────────────────────
 
@@ -345,60 +403,93 @@ class EditableConfig:
         return GatewayConfig.from_file(self.path)
 
     def expanded_watchers(self) -> list["ExpandedWatcher"]:
-        """Pair each of validated_view()'s expanded WatcherConfig objects with
-        the raw `watchers:` entry (and sibling-room count) it came from.
+        """Pair each expanded WatcherConfig with the raw `watchers:` entry
+        (and sibling-room count) it came from.
 
         Per docs/design/config-tool.md, the Watchers table shows EXPANDED
         rows (what `agent-chat-gateway list/pause/resume/reset` operate on),
         but a watcher's detail screen still needs to know whether it's part
-        of a shared `rooms:` group. This is computed by replaying the same
-        room/rooms-counting order gateway/config.py's loader uses (each raw
-        entry contributes exactly `len(rooms or [room])` consecutive expanded
-        watchers, in order) — without reimplementing name generation or
-        defaults-merging, both of which stay owned by the real loader via
-        validated_view().
+        of a shared `rooms:` group.
 
-        Only call this when validated_view() would not raise (i.e. after
-        confirming the config loads) — a raw watcher entry's `room`/`rooms`
-        keys are never touched by any `*_defaults` merge (both are forbidden
-        there), so reading them directly off the raw entry is safe once the
-        document is known to be schema-valid.
+        Uses `collect_config()` (the fault-tolerant counterpart to
+        `GatewayConfig.from_file()`, gateway/config.py) for connectors/agents,
+        then calls `_parse_one_watcher_entry()` — the SAME per-entity
+        function `collect_config()` itself uses, never a second
+        implementation — directly, once per raw `watchers:` entry, so ONE
+        broken entry (or one whose `agent:`/`connector:` reference failed to
+        parse) only drops THAT entry's rows from the table; every other
+        watcher still expands and displays normally. (A broken entry's own
+        explanation is still available — as a `Finding` — via
+        `gateway/config_validate.py`'s `validate_config()`, which the config
+        TUI's Overview banner's 'v' details view already surfaces.)
 
-        `validated_view()` re-reads config.yaml from disk on every call;
-        `self.watchers_raw` reads the in-memory `document` (only refreshed by
-        `load()`/`reload()`). If the file changes on disk without an
-        intervening `reload()` on this instance, the two can disagree on how
-        many watchers exist — raises ValueError in that case (never a raw
-        IndexError) so callers' existing `except (ValueError, FileNotFoundError)`
+        Re-reads config.yaml fresh from disk (both for `collect_config()`
+        and for the entry-by-entry comparison below) and cross-checks it
+        against `self.watchers_raw` (the in-memory `document`, only
+        refreshed by `load()`/`reload()`): if the file changed on disk
+        without an intervening `reload()` on this instance, this raises
+        ValueError (never silently using the wrong raw entry, or a stale
+        one) so callers' existing `except (ValueError, FileNotFoundError)`
         guards catch it like any other "can't compute this right now" case.
+
+        Known, narrow race (PR review, accepted): `collect_config()` reads
+        the file once internally, then this method does a SECOND,
+        independent read for the entry-by-entry comparison — if some OTHER
+        process rewrites config.yaml in the gap between those two reads,
+        in a way that happens to leave `watchers:` looking identical but
+        changes something else (e.g. `agents:`), this could mix connectors/
+        agents from the first read with `watcher_templates` from the
+        second. Requires a real concurrent external writer racing the TUI
+        on the same file — narrow, and this is a read-only display
+        computation (nothing is ever written incorrectly as a result) —
+        not addressed here.
         """
-        expanded = self.validated_view().watchers
-        result: list[ExpandedWatcher] = []
-        idx = 0
-        for entry in self.watchers_raw:
-            rooms = entry.get("rooms")
-            if rooms is None:
-                rooms = [entry.get("room")]
-            count = len(rooms)
-            for _ in range(count):
-                if idx >= len(expanded):
-                    raise ValueError(
-                        "expanded_watchers(): the in-memory document and the "
-                        "freshly-loaded config disagree on watcher count — "
-                        "config.yaml likely changed on disk since this was "
-                        "last loaded; call reload() first."
-                    )
-                result.append(
-                    ExpandedWatcher(watcher=expanded[idx], raw_entry=entry, group_size=count)
-                )
-                idx += 1
-        if idx != len(expanded):
+        config, issues = collect_config(str(self.path))
+        if config is None:
+            raise ValueError(
+                "expanded_watchers(): config does not currently load: "
+                + "; ".join(i.message for i in issues)
+            )
+
+        with open(self.path) as f:
+            disk_raw = yaml.safe_load(f) or {}
+        disk_watchers_raw = [w for w in (disk_raw.get("watchers") or []) if isinstance(w, dict)]
+        mem_watchers_raw = self.watchers_raw
+
+        # Desync guard: a raw entry added/removed OR edited in place (e.g. a
+        # room added to/removed from `rooms:`) on disk without an
+        # intervening reload() must be caught loudly here — never silently
+        # expanded against the WRONG (stale, in-memory) entry.
+        if len(disk_watchers_raw) != len(mem_watchers_raw) or any(
+            mem_entry != disk_entry
+            for mem_entry, disk_entry in zip(mem_watchers_raw, disk_watchers_raw)
+        ):
             raise ValueError(
                 "expanded_watchers(): the in-memory document and the "
                 "freshly-loaded config disagree on watcher count — "
                 "config.yaml likely changed on disk since this was last "
                 "loaded; call reload() first."
             )
+
+        connector_names = {c.name for c in config.connectors}
+        watcher_templates = _parse_templates_block(
+            disk_raw, "watcher_templates",
+            frozenset({"name", "room", "rooms", "session_id"}),
+        )
+        seen_watcher_names: set[str] = set()
+        result: list[ExpandedWatcher] = []
+        for entry in mem_watchers_raw:
+            try:
+                expanded = _parse_one_watcher_entry(
+                    entry, 0, watcher_templates, connector_names, config.connectors,
+                    config.agents, config.default_agent, self.path.parent,
+                    seen_watcher_names,
+                )
+            except ValueError:
+                continue  # this entry's own Finding (via validate_config()) explains why
+            count = len(expanded)
+            for wc in expanded:
+                result.append(ExpandedWatcher(watcher=wc, raw_entry=entry, group_size=count))
         return result
 
 
