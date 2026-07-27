@@ -28,14 +28,16 @@ class DetailScreen(Screen):
 
     BODY_ID: str = "detail-body"
 
-    # Field-row layout shared by every screen with an actual edit FORM
-    # (FormScreen — AgentDetailScreen/ConnectorDetailScreen — and
-    # DefaultsScreen, which intentionally does NOT extend FormScreen — see
-    # its own module docstring for why). Lives here, on the common ancestor
-    # both reach, rather than duplicated in each: Textual's CSS type
-    # selectors below match by ancestry, not literal class name, so
-    # `DetailScreen .field-row` applies equally inside a FormScreen
-    # subclass's composed tree and a DefaultsScreen's.
+    # Field-row layout shared by every screen with an actual edit FORM —
+    # all of them FormScreen subclasses now (AgentDetailScreen/
+    # ConnectorDetailScreen/TemplateDetailScreen). Historically also shared
+    # with the old DefaultsScreen (deleted in the v0.3 templates/inherits
+    # redesign — see template_detail.py), which deliberately did NOT extend
+    # FormScreen; kept here on the common ancestor rather than on FormScreen
+    # itself since that was true at the time. Textual's CSS type selectors
+    # below match by ancestry, not literal class name, so `DetailScreen
+    # .field-row` applies equally inside any FormScreen subclass's composed
+    # tree.
     DEFAULT_CSS = """
     DetailScreen .entity-form {
         padding: 1 2;
@@ -53,6 +55,48 @@ class DetailScreen(Screen):
         margin-left: 2;
         width: auto;
     }
+    /* The Inherits row's current-value Static (agent_detail.py/
+    connector_detail.py's Inherits rows, built by _open_inherits_picker())
+    — a bare Static with no width override defaults to 1fr (same as Input's
+    own default, see the comment below), which claims the rest of the row
+    and pushes the trailing "Change…" Button off past the terminal's right
+    edge, exactly the failure mode `.field-row Input`'s own `width: 1fr`
+    override already exists to prevent. A FIXED width (not `auto`) is used
+    here specifically — user-reported: `auto` sizes the box exactly to the
+    template name's own length, which puts the Button flush against (or,
+    depending on terminal font metrics, visually overlapping) the text with
+    no breathing room. Fixed width + `content-align: center` centers the
+    name within a consistent-looking column regardless of how long it is;
+    `margin-right` is the actual gap before the Button.
+    User-reported (2nd round, with a screenshot): the name still rendered
+    flush against the row's top edge, visibly above the button's own label.
+    A prior fix here tried `height: 3; content-align: center top` based on
+    comparing both widgets' own `render_line()` output directly — WRONG
+    methodology: `render_line()` operates in each widget's own CONTENT-only
+    coordinate space, which excludes border rows entirely (those are
+    composited on separately), so "both widgets' text is on render_line
+    row 0" does NOT mean they land on the same absolute screen row once
+    Button's border compositing shifts its content down. Confirmed via
+    `App.export_screenshot()` (real compositing, not per-widget
+    introspection): with the old height:3 + top-align rule, the value text
+    rendered exactly ONE ROW ABOVE "Inherits"/"Change…" (verified by
+    comparing each `<text>` element's SVG y-coordinate — a `padding-top: 1`
+    row is ~24.4 SVG units on this test's font metrics). `.field-label`
+    (right above) already gets this right — `padding-top: 1`, no explicit
+    height, height computed as auto (padding + 1 content line = 2) — so
+    mirroring that exactly (not inventing a parallel height:3 scheme) is
+    what actually lines up: `padding-top: 1` pushes the text down into the
+    row Button/label both use; `content-align: center top` keeps the
+    horizontal centering without `middle` re-absorbing the padding (the
+    ORIGINAL bug from the 1st round of this fix). Re-verified via
+    `export_screenshot()`: "Inherits", the value text, and "Change…" all
+    now share the identical SVG y-coordinate. */
+    DetailScreen .field-value {
+        width: 30;
+        padding-top: 1;
+        content-align: center top;
+        margin-right: 2;
+    }
     DetailScreen Checkbox {
         width: auto;
     }
@@ -65,6 +109,25 @@ class DetailScreen(Screen):
     claiming all of it. */
     DetailScreen .field-row Input {
         width: 1fr;
+    }
+    /* Tool-list editor (owner_allowed_tools/guest_allowed_tools —
+    tool_list_editor.py's ToolListEditorMixin) widget ids/classes are
+    globally unique (only one screen ever has them mounted at a time), so
+    this lives here rather than duplicated per host screen — originally
+    only on AgentDetailScreen, moved here once TemplateDetailScreen became
+    a second concrete user (agent templates can set these two fields too).
+    */
+    DetailScreen #owner-tools-list, DetailScreen #guest-tools-list {
+        height: auto;
+        max-height: 8;
+        margin-bottom: 1;
+    }
+    DetailScreen .tool-list-buttons {
+        height: auto;
+        margin-bottom: 1;
+    }
+    DetailScreen .tool-list-buttons Button {
+        margin-right: 1;
     }
     """
 

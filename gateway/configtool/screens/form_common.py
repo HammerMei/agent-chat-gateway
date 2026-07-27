@@ -18,12 +18,13 @@ explicit null — see `apply_update()`.
 A subclass provides:
   - `_field_specs() -> tuple[FieldSpec, ...]` — which fields this form shows
     right now (may depend on entity-specific state, e.g. connector `type`).
-  - `_defaults_kind() -> str` — the `*_defaults` block this entry merges
-    against (`"agent_defaults"` / `"connector_defaults"` / ...).
+  - `_template_kind() -> str` — the `*_templates:` block this entry's own
+    `inherits:` field (if set) is resolved against (`"agent"` /
+    `"connector"` / `"watcher"`).
   - `_dataclass_defaults() -> dict[str, object]` — the true effective value
-    for a field set by neither the entry nor its `*_defaults` block (a form
-    needs to show what a field would actually evaluate to; view mode gets
-    away with just omitting the line).
+    for a field set by neither the entry nor its `inherits:` template (a
+    form needs to show what a field would actually evaluate to; view mode
+    gets away with just omitting the line).
   - `_compose_form() -> ComposeResult` — the form body (typically a
     `VerticalScroll` wrapping `_compose_field_row()` calls plus whatever
     entity-specific chrome — a name Input for create mode, etc.).
@@ -44,6 +45,7 @@ from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, VerticalScroll
+from textual.css.query import NoMatches
 from textual.widgets import Checkbox, Footer, Header, Input, Select, Static
 
 from ..formatting import provenance_label
@@ -55,7 +57,7 @@ from .base import DetailScreen
 @dataclass(frozen=True)
 class FieldSpec:
     key: str  # dotted for a one-level-nested sub-field, e.g. "server.password"
-    kind: Literal["str", "int", "bool", "list", "enum"]
+    kind: Literal["str", "int", "float", "bool", "list", "enum"]
     label: str
     options: tuple[str, ...] | None = None
     # Masks the widget's display (Input(password=True)). docs/design/
@@ -135,6 +137,14 @@ def read_widget_value(spec: FieldSpec, widget: object) -> object:
             return int(text)
         except ValueError:
             raise ValueError(f"{spec.label}: must be a whole number, got {text!r}") from None
+    if spec.kind == "float":
+        text = widget.value.strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            raise ValueError(f"{spec.label}: must be a number, got {text!r}") from None
     text = widget.value.strip()
     return text or None
 
@@ -191,22 +201,22 @@ def find_referencing_watcher_labels(
 def find_agents_referencing_preset(cfg: EditableConfig, preset_name: str) -> list[str]:
     """Which agents currently reference the given `tool_presets` entry, via
     either `owner_allowed_tools` or `guest_allowed_tools` — checked against
-    the MERGED view (`agent_defaults` + entry), not the raw entry alone, so
-    a preset referenced only via `agent_defaults` (common: shared across
-    every agent that doesn't override its own tool list) still shows up as
-    "used by" that agent. Used by both `ToolPresetsScreen` (its own
-    used-by display) and `OverviewScreen`'s direct-delete-a-preset flow
-    (blocks the delete with this list, same pre-check pattern
-    `find_referencing_watcher_labels()` above uses for connectors/agents).
-    If the config doesn't currently load, returns [] — same reasoning as
-    that function: a delete pre-check has nothing useful to say about a
-    config that doesn't parse; `save()`'s own validation remains the
-    backstop.
+    the MERGED view (entry resolved against its own `inherits:` template, if
+    any), not the raw entry alone, so a preset referenced only via an
+    agent's `inherits:` template (common: shared across every agent that
+    doesn't override its own tool list) still shows up as "used by" that
+    agent. Used by both `ToolPresetsScreen` (its own used-by display) and
+    `OverviewScreen`'s direct-delete-a-preset flow (blocks the delete with
+    this list, same pre-check pattern `find_referencing_watcher_labels()`
+    above uses for connectors/agents). If the config doesn't currently load,
+    returns [] — same reasoning as that function: a delete pre-check has
+    nothing useful to say about a config that doesn't parse; `save()`'s own
+    validation remains the backstop.
     """
     used_by = []
     for name, entry in cfg.agents_raw.items():
         try:
-            merged = cfg.merged_entry("agent_defaults", entry)
+            merged = cfg.merged_entry("agent", entry)
         except (ValueError, FileNotFoundError):
             merged = entry
         owner_tools = merged.get("owner_allowed_tools") or []
@@ -214,6 +224,48 @@ def find_agents_referencing_preset(cfg: EditableConfig, preset_name: str) -> lis
         if preset_name in owner_tools or preset_name in guest_tools:
             used_by.append(name)
     return used_by
+
+
+def find_entries_referencing_template(
+    cfg: EditableConfig, kind: str, template_name: str
+) -> list[tuple[str, dict]]:
+    """Which entries of `kind` ('agent' | 'connector' | 'watcher') currently
+    have `inherits: == template_name` — the blast-radius / delete-precheck
+    primitive for a NAMED template, scoped to just that one template (unlike
+    the old global `*_defaults` blocks, where "who's affected" meant "every
+    entry in the config" — the whole point of named templates is that
+    different entries can inherit different templates, so blast radius must
+    be scoped accordingly). Direct analogue of
+    `find_agents_referencing_preset()` above, generalized across kinds.
+
+    Returns `(label, raw_entry)` pairs, not just labels — `TemplateDetailScreen`
+    needs each entry's own dict too (to check "does this entry already
+    override the field being changed"), not merely a count/name list. Callers
+    that only need labels do `[name for name, _ in ...]`.
+    """
+    if kind == "agent":
+        entries = list(cfg.agents_raw.items())
+    elif kind == "connector":
+        entries = [(e.get("name", "?"), e) for e in cfg.connectors_raw]
+    else:
+        # Label with the REAL expanded watcher name(s) (matching
+        # `find_referencing_watcher_labels()`'s own naming, and the
+        # Watchers tab), not a synthetic "<connector>/<room>" guess — a raw
+        # entry with a `rooms:` group expands into several real watchers,
+        # matched back to this raw entry by identity (same pattern
+        # `ConnectorDetailScreen._find_own_index()` uses). Falls back to
+        # "?" only if the config doesn't currently load at all (blast-radius
+        # display has nothing better to say in that case either).
+        try:
+            expanded = cfg.expanded_watchers()
+        except (ValueError, FileNotFoundError):
+            expanded = []
+        entries = []
+        for w in cfg.watchers_raw:
+            names = [ew.watcher.name for ew in expanded if ew.raw_entry is w]
+            label = ", ".join(names) if names else (w.get("name") or "?")
+            entries.append((label, w))
+    return [(name, entry) for name, entry in entries if entry.get("inherits") == template_name]
 
 
 class FormScreen(DetailScreen):
@@ -297,6 +349,24 @@ class FormScreen(DetailScreen):
         # call_after_refresh, which runs after that initial burst of Changed
         # messages has already been processed.
         self._populating = False
+        # Name/Description are entry-level fields NEVER set by a template
+        # (no *_templates: block has a name or description of its own that
+        # would deep-merge into an entry) — unlike every other field, an
+        # inherits: switch's _recompute_form() must NOT touch them. Tracked
+        # here (updated live by on_input_changed() below) rather than
+        # re-derived from `_initial_values`/`entry` at every compose, since
+        # `_recompute_form()` calls `_compute_initial_values(self._current_entry())`
+        # — which only knows about `self.entry`, never about whatever the
+        # user has typed into these two boxes but not yet saved — and
+        # `_compose_form()` used to source both Inputs' `value=` from that
+        # stale, recomputed state, silently discarding an in-progress Name/
+        # Description edit the instant a template was picked. Seeded once at
+        # the two legitimate "fresh start" points (`__init__`/
+        # `_on_enter_edit_mode()`), deliberately untouched by
+        # `_recompute_form()` so they survive any number of template
+        # switches in between.
+        self._description_live: str = ""
+        self._name_live: str = ""
 
     def on_mount(self) -> None:
         if self._populating:
@@ -321,7 +391,7 @@ class FormScreen(DetailScreen):
     def _field_specs(self) -> tuple[FieldSpec, ...]:
         raise NotImplementedError
 
-    def _defaults_kind(self) -> str:
+    def _template_kind(self) -> str:
         raise NotImplementedError
 
     def _dataclass_defaults(self) -> dict[str, object]:
@@ -333,6 +403,13 @@ class FormScreen(DetailScreen):
     def _entity_label(self) -> str:
         """Used in the delete-confirmation message and the post-delete
         notification (e.g. an agent/connector's name)."""
+        raise NotImplementedError
+
+    def _current_entry(self) -> dict:
+        """This screen's own raw entry dict (`self.entry` on every concrete
+        subclass) — used by `action_reset_field()`, which has no natural
+        parameter-passing path (it's a key-binding handler, not called from
+        `_compose_form()` the way `_compose_field_row()` is)."""
         raise NotImplementedError
 
     def _remove_entry_from_document(self) -> None:
@@ -372,6 +449,14 @@ class FormScreen(DetailScreen):
         with their own kind of name."""
         raise NotImplementedError
 
+    def _delete_blocker_noun(self) -> str:
+        """The noun used in the delete-blocked message ("still used by
+        {noun}(s): ..."). Unchanged default for Agent/ConnectorDetailScreen
+        (blocked by referencing watchers); `TemplateDetailScreen` overrides
+        this to its own `kind` (blocked by referencing agents/connectors/
+        watchers instead)."""
+        return "watcher"
+
     async def action_save(self) -> None:
         raise NotImplementedError
 
@@ -390,7 +475,7 @@ class FormScreen(DetailScreen):
     def _compute_initial_values(self, entry: dict) -> None:
         self._reset_keys = {}  # fresh edit session — no lingering reset markers
         try:
-            merged = self.cfg.merged_entry(self._defaults_kind(), entry)
+            merged = self.cfg.merged_entry(self._template_kind(), entry)
         except (ValueError, FileNotFoundError):
             merged = dict(entry)
         dataclass_defaults = self._dataclass_defaults()
@@ -398,19 +483,42 @@ class FormScreen(DetailScreen):
             value = get_nested(merged, spec.key)
             if value is None:
                 value = dataclass_defaults.get(spec.key)
+            # read_widget_value() normalizes an untouched "str"/"list"-kind
+            # box that renders as EMPTY TEXT back to None — text_to_list("")
+            # or None for list, text.strip() or None for str — regardless of
+            # whether the effective value is None, "", or []. Without this
+            # same normalization here, a field whose true effective value is
+            # "" or [] (explicit, or absent and defaulting to one of those)
+            # would store that falsy-but-not-None value as its "initial"
+            # value, compare unequal to the widget's real untouched readback
+            # of None, and look spuriously "changed" — both to
+            # _collect_field_updates() (Save would write a no-op-shaped but
+            # semantically wrong explicit null onto an untouched field) and
+            # to _field_has_override() (a false-positive "you'll lose this
+            # edit" confirm when switching inherits: with nothing actually
+            # touched). "int"/"float" are deliberately excluded: an explicit
+            # `0`/`0.0` renders as the text "0" (non-empty), which reads back
+            # as the same number again — no mismatch there, and normalizing
+            # it away would introduce the exact same false positive in
+            # reverse.
+            if spec.kind in ("str", "list") and value is not None and not value:
+                value = None
             self._initial_values[spec.key] = value
         self._initial_values["description"] = entry.get("description")
 
     def _field_provenance(self, spec: FieldSpec, entry: dict) -> Provenance | None:
         top_key = spec.key.split(".", 1)[0]
         try:
-            return self.cfg.field_provenance(self._defaults_kind(), entry, top_key)
+            return self.cfg.field_provenance(self._template_kind(), entry, top_key)
         except (ValueError, FileNotFoundError):
             return None
 
     def _compose_field_row(self, spec: FieldSpec, entry: dict) -> ComposeResult:
         provenance = self._field_provenance(spec, entry)
-        prov_text = f"[dim]({provenance_label(provenance)})[/dim]" if provenance else ""
+        template_name = self.cfg.entry_template_name(entry)
+        prov_text = (
+            f"[dim]({provenance_label(provenance, template_name)})[/dim]" if provenance else ""
+        )
         initial = self._initial_values.get(spec.key)
         with Horizontal(classes="field-row"):
             yield Static(spec.label, classes="field-label")
@@ -438,7 +546,10 @@ class FormScreen(DetailScreen):
             # future field key containing a literal dash.
             widget.field_key = spec.key
             yield widget
-            yield Static(prov_text, classes="field-provenance")
+            # Stable id (not just the shared .field-provenance class) so
+            # _refresh_provenance_display() below can update THIS ONE row's
+            # label live, without touching any other row's.
+            yield Static(prov_text, id=f"prov-{widget_id(spec.key)}", classes="field-provenance")
 
     # ── dirty tracking (per-screen, not EditableConfig.dirty — nothing is
     # written to `document` until Save, so cfg.dirty stays False the whole
@@ -447,25 +558,124 @@ class FormScreen(DetailScreen):
     def on_input_changed(self, event: Input.Changed) -> None:
         if self._populating:
             return
+        if event.input.id == "field-description":
+            self._description_live = event.input.value
+        elif event.input.id == "field-name":
+            self._name_live = event.input.value
         self._form_dirty = True
+        self._refresh_provenance_display(getattr(event.input, "field_key", None))
 
     def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
         if self._populating:
             return
         self._form_dirty = True
+        self._refresh_provenance_display(getattr(event.checkbox, "field_key", None))
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if self._populating:
             return
         self._form_dirty = True
+        self._refresh_provenance_display(getattr(event.select, "field_key", None))
+
+    def _field_has_override(self, spec: FieldSpec) -> bool:
+        """Has THIS field's widget been changed from the value it was
+        prefilled with? Used both by the live provenance-label refresh
+        below and by the Inherits-switch confirm (agent_detail.py/
+        connector_detail.py): "would switching templates silently discard
+        something I already typed?" A field whose value fails to parse
+        (e.g. mid-typing a bad int) counts as overridden — safer to over-
+        warn than to silently treat unparseable input as untouched."""
+        try:
+            widget = self.query_one("#" + widget_id(spec.key))
+        except NoMatches:
+            return False
+        try:
+            current = read_widget_value(spec, widget)
+        except ValueError:
+            return True
+        return current != self._initial_values.get(spec.key)
+
+    def _any_field_overridden(self) -> bool:
+        return any(self._field_has_override(spec) for spec in self._field_specs())
+
+    def _refresh_provenance_display(self, field_key: str | None) -> None:
+        """Keep the changed field's provenance label truthful to what Save
+        would actually do with it RIGHT NOW — user-reported: picking a new
+        inherits: template, then typing into a field, left its label
+        showing the OLD "(from '<template>')"/"(default)" text even though
+        the field is now explicit (about to be written as an override on
+        Save). Mirrors _collect_field_updates()'s own reset-vs-changed
+        logic exactly, so the label is never wrong relative to Save: a
+        field ctrl+r'd back to its reset value shows what it WOULD BECOME
+        on Save (Save pops the key entirely — computed against a probe with
+        this field removed, not against `self._current_entry()` as-is,
+        which still has the key and would otherwise keep reporting EXPLICIT
+        forever after a ctrl+r); any other value that differs from the
+        snapshot shows EXPLICIT; unchanged shows the ORIGINAL provenance
+        unchanged. A no-op if `field_key` isn't a real field (the Name/
+        Description inputs) or the row wasn't actually composed with a
+        label (TemplateDetailScreen's _field_provenance() always returns
+        None, so its rows have no label text to touch)."""
+        if field_key is None:
+            return
+        spec = next((s for s in self._field_specs() if s.key == field_key), None)
+        if spec is None:
+            return
+        try:
+            prov_widget = self.query_one(f"#prov-{widget_id(spec.key)}", Static)
+            widget = self.query_one("#" + widget_id(spec.key))
+        except NoMatches:
+            return
+        try:
+            current = read_widget_value(spec, widget)
+        except ValueError:
+            return  # mid-typing an invalid value — leave the label as-is
+
+        entry = self._current_entry()
+        if field_key in self._reset_keys and current == self._reset_keys[field_key]:
+            # PR review finding: for a dotted (one-level-nested) spec.key
+            # like "permissions.timeout", popping the WHOLE top-level
+            # parent (as a previous version of this did) diverges from
+            # what Save actually does — apply_update() only removes the
+            # one sub-key, keeping the parent dict (and its still-explicit
+            # sibling sub-keys) if anything remains in it. Mirrored here so
+            # a reset field's live label matches what Save would really
+            # produce instead of contradicting its own explicit siblings.
+            reverted_probe = dict(entry)
+            if "." in spec.key:
+                parent_key, sub_key = spec.key.split(".", 1)
+                parent = dict(entry.get(parent_key) or {})
+                parent.pop(sub_key, None)
+                if parent:
+                    reverted_probe[parent_key] = parent
+                else:
+                    reverted_probe.pop(parent_key, None)
+            else:
+                reverted_probe.pop(spec.key, None)
+            provenance = self._field_provenance(spec, reverted_probe)
+        elif current != self._initial_values.get(field_key):
+            provenance = Provenance.EXPLICIT
+        else:
+            provenance = self._field_provenance(spec, entry)
+        template_name = self.cfg.entry_template_name(entry)
+        text = f"[dim]({provenance_label(provenance, template_name)})[/dim]" if provenance else ""
+        prov_widget.update(text)
 
     def action_reset_field(self) -> None:
-        """ctrl+r: reset the FOCUSED field to its pure-defaults value (no
-        explicit override) — see the `_reset_keys` field comment for how
-        this becomes an actual "revert to inherited" on Save, regardless of
-        field kind. A no-op if focus isn't on a resettable field (e.g. the
-        Name/Description inputs, which aren't tagged with `field_key` — see
-        `_compose_field_row()` — since neither has a `*_defaults` concept)."""
+        """ctrl+r: reset the FOCUSED field to its pure-template/dataclass
+        value (no explicit override on THIS entry) — see the `_reset_keys`
+        field comment for how this becomes an actual "revert to inherited"
+        on Save, regardless of field kind. A no-op if focus isn't on a
+        resettable field (e.g. the Name/Description inputs, which aren't
+        tagged with `field_key` — see `_compose_field_row()` — since neither
+        has an `inherits:` concept).
+
+        Resolves against the entry's OWN `inherits:` name (if any) — NOT
+        against an empty entry — so resetting one field doesn't lose the
+        entry's other fields' effective values from whichever template it
+        actually opted into (an empty-entry probe would silently behave as
+        "no inherits: at all," which is only correct for the field being
+        reset itself, not a valid stand-in for the whole entry)."""
         widget = self.focused
         field_key = getattr(widget, "field_key", None)
         if field_key is None:
@@ -474,8 +684,10 @@ class FormScreen(DetailScreen):
         if spec is None:
             return
 
+        inherits_name = self._current_entry().get("inherits")
+        probe = {"inherits": inherits_name} if inherits_name is not None else {}
         try:
-            defaults_only = self.cfg.merged_entry(self._defaults_kind(), {})
+            defaults_only = self.cfg.merged_entry(self._template_kind(), probe)
         except (ValueError, FileNotFoundError):
             defaults_only = {}
         value = get_nested(defaults_only, spec.key)
@@ -501,6 +713,23 @@ class FormScreen(DetailScreen):
         if spec is None or not spec.secret:
             return
         widget.password = not widget.password
+
+    async def _recompute_form(self) -> None:
+        """Rebuild every field's prefilled value AND provenance label from
+        scratch against `self._current_entry()` — used when something
+        changes that affects EVERY other field's effective value (an
+        `inherits:` template switch, in `agent_detail.py`/
+        `connector_detail.py`), unlike a normal single-field edit (which
+        only ever affects itself, handled by `_refresh_provenance_display()`
+        above). Discards any of the user's own not-yet-saved edits to OTHER
+        fields made earlier in this same session — callers are expected to
+        confirm that with the user first (`_any_field_overridden()`) before
+        calling this."""
+        self._compute_initial_values(self._current_entry())
+        self._populating = True
+        await self.recompose()
+        self.call_after_refresh(self._stop_populating)
+        self.refresh_bindings()
 
     # ── navigation ───────────────────────────────────────────────────────────
 
@@ -603,8 +832,8 @@ class FormScreen(DetailScreen):
             await self.app.push_screen_wait(
                 MessageModal(
                     f"Cannot delete {self._entity_noun()} "
-                    f"'{self._entity_label()}' — still used by watcher(s): "
-                    f"{', '.join(blockers)}.",
+                    f"'{self._entity_label()}' — still used by "
+                    f"{self._delete_blocker_noun()}(s): {', '.join(blockers)}.",
                     title="Cannot delete",
                 )
             )

@@ -175,36 +175,39 @@ class TestExpandedWatchersDesync(_EditableConfigTestBase):
         self.assertEqual(len(expanded), 2)
 
 
-class TestEditableConfigDefaultsBlock(_EditableConfigTestBase):
-    def test_defaults_block_strips_description(self):
+class TestEditableConfigTemplates(_EditableConfigTestBase):
+    def test_templates_strips_description(self):
         path = self._write(f"""\
             connectors:
               - name: rc
                 type: rocketchat
                 server: {{url: "$RC_URL", username: bot, password: pw}}
-            agent_defaults:
-              description: "Shared claude settings"
-              type: claude
-              working_directory: {self.agent_dir}
+            agent_templates:
+              standard:
+                description: "Shared claude settings"
+                type: claude
+                working_directory: {self.agent_dir}
             agents:
-              default: {{}}
+              default:
+                inherits: standard
             watchers:
               - name: w1
                 room: general
         """)
         cfg = EditableConfig.load(path)
-        defaults = cfg.defaults_block("agent_defaults")
-        self.assertNotIn("description", defaults)
-        self.assertEqual(defaults["type"], "claude")
+        standard = cfg.templates("agent")["standard"]
+        self.assertNotIn("description", standard)
+        self.assertEqual(standard["type"], "claude")
 
-    def test_defaults_block_enforces_forbidden_keys_like_the_real_loader(self):
+    def test_templates_enforces_forbidden_keys_like_the_real_loader(self):
         path = self._write("""\
             connectors:
               - name: rc
                 type: rocketchat
                 server: {url: "$RC_URL", username: bot, password: pw}
-            watcher_defaults:
-              session_id: not-allowed
+            watcher_templates:
+              standard:
+                session_id: not-allowed
             agents:
               default:
                 type: claude
@@ -215,13 +218,13 @@ class TestEditableConfigDefaultsBlock(_EditableConfigTestBase):
         """)
         cfg = EditableConfig.load(path)
         with self.assertRaises(ValueError):
-            cfg.defaults_block("watcher_defaults")
+            cfg.templates("watcher")
 
 
-class TestEditableConfigDefaultsBlockCaching(_EditableConfigTestBase):
-    """Code review item 8: defaults_block() is cached per kind (see
-    EditableConfig._defaults_cache) instead of re-running
-    _extract_defaults_block on every call. These tests pin the two things
+class TestEditableConfigTemplatesCaching(_EditableConfigTestBase):
+    """Code review item 8: templates() is cached per kind (see
+    EditableConfig._templates_cache) instead of re-running
+    _parse_templates_block on every call. These tests pin the two things
     that matter about a cache: repeated calls return the equivalent value,
     and load()/reload() — the only ways `document` changes — invalidate it."""
 
@@ -231,11 +234,13 @@ class TestEditableConfigDefaultsBlockCaching(_EditableConfigTestBase):
               - name: rc
                 type: rocketchat
                 server: {{url: "$RC_URL", username: bot, password: pw}}
-            agent_defaults:
-              type: claude
-              working_directory: {self.agent_dir}
+            agent_templates:
+              standard:
+                type: claude
+                working_directory: {self.agent_dir}
             agents:
-              default: {{}}
+              default:
+                inherits: standard
             watchers:
               - name: w1
                 room: general
@@ -244,21 +249,21 @@ class TestEditableConfigDefaultsBlockCaching(_EditableConfigTestBase):
 
     def test_repeated_calls_return_the_same_cached_object(self):
         cfg, _ = self._cfg()
-        first = cfg.defaults_block("agent_defaults")
-        second = cfg.defaults_block("agent_defaults")
+        first = cfg.templates("agent")
+        second = cfg.templates("agent")
         self.assertIs(first, second)
 
     def test_reload_invalidates_the_cache(self):
         cfg, path = self._cfg()
-        first = cfg.defaults_block("agent_defaults")
-        self.assertEqual(first["type"], "claude")
+        first = cfg.templates("agent")
+        self.assertEqual(first["standard"]["type"], "claude")
 
         path.write_text(
             path.read_text().replace("type: claude", "type: opencode")
         )
         cfg.reload()
-        second = cfg.defaults_block("agent_defaults")
-        self.assertEqual(second["type"], "opencode")
+        second = cfg.templates("agent")
+        self.assertEqual(second["standard"]["type"], "opencode")
         self.assertIsNot(first, second)
 
     def test_a_failed_lookup_is_not_cached_as_a_false_success(self):
@@ -267,8 +272,9 @@ class TestEditableConfigDefaultsBlockCaching(_EditableConfigTestBase):
               - name: rc
                 type: rocketchat
                 server: {url: "$RC_URL", username: bot, password: pw}
-            watcher_defaults:
-              session_id: not-allowed
+            watcher_templates:
+              standard:
+                session_id: not-allowed
             agents:
               default:
                 type: claude
@@ -279,11 +285,11 @@ class TestEditableConfigDefaultsBlockCaching(_EditableConfigTestBase):
         """)
         cfg = EditableConfig.load(path)
         with self.assertRaises(ValueError):
-            cfg.defaults_block("watcher_defaults")
+            cfg.templates("watcher")
         # Calling again must still raise — a cache bug could swallow this
         # into a stale/absent cached value instead of re-validating.
         with self.assertRaises(ValueError):
-            cfg.defaults_block("watcher_defaults")
+            cfg.templates("watcher")
 
 
 class TestEditableConfigProvenance(_EditableConfigTestBase):
@@ -293,17 +299,24 @@ class TestEditableConfigProvenance(_EditableConfigTestBase):
               - name: rc
                 type: rocketchat
                 server: {{url: "$RC_URL", username: bot, password: pw}}
-            agent_defaults:
-              type: claude
-              working_directory: {self.agent_dir}
-              timeout: 1800
-              permissions: {{enabled: true, timeout: 300}}
+            agent_templates:
+              standard:
+                type: claude
+                working_directory: {self.agent_dir}
+                timeout: 1800
+                permissions: {{enabled: true, timeout: 300}}
             agents:
-              inherits-everything: {{}}
+              inherits-everything:
+                inherits: standard
               overrides-timeout:
+                inherits: standard
                 timeout: 500
               suppresses-timeout:
+                inherits: standard
                 timeout: null
+              no-template-at-all:
+                type: claude
+                working_directory: {self.agent_dir}
             watchers:
               - name: w1
                 room: general
@@ -314,7 +327,7 @@ class TestEditableConfigProvenance(_EditableConfigTestBase):
         cfg = self._cfg()
         entry = cfg.agents_raw["inherits-everything"]
         self.assertEqual(
-            cfg.field_provenance("agent_defaults", entry, "timeout"),
+            cfg.field_provenance("agent", entry, "timeout"),
             Provenance.INHERITED,
         )
 
@@ -322,35 +335,48 @@ class TestEditableConfigProvenance(_EditableConfigTestBase):
         cfg = self._cfg()
         entry = cfg.agents_raw["overrides-timeout"]
         self.assertEqual(
-            cfg.field_provenance("agent_defaults", entry, "timeout"),
+            cfg.field_provenance("agent", entry, "timeout"),
             Provenance.EXPLICIT,
         )
 
-    def test_explicit_null_over_a_default_is_suppressing(self):
+    def test_explicit_null_over_a_template_value_is_suppressing(self):
         cfg = self._cfg()
         entry = cfg.agents_raw["suppresses-timeout"]
         self.assertEqual(
-            cfg.field_provenance("agent_defaults", entry, "timeout"),
+            cfg.field_provenance("agent", entry, "timeout"),
             Provenance.EXPLICIT_SUPPRESSING,
         )
 
-    def test_explicit_field_with_no_matching_default_is_still_explicit_not_suppressing(self):
+    def test_field_absent_and_template_doesnt_set_it_is_default(self):
         cfg = self._cfg()
         entry = cfg.agents_raw["suppresses-timeout"]
-        # 'session_prefix' has no entry in agent_defaults here, so even if it
-        # were null on the entry, there's nothing to "suppress" — this test
-        # uses a field that's simply absent from defaults entirely.
+        # 'session_prefix' has no entry in the 'standard' template here, so
+        # even though this entry DOES have inherits: standard, that template
+        # doesn't cover this field — falls through to the code-level
+        # dataclass default. Distinct from genuinely inheriting a value
+        # (Provenance.DEFAULT, not INHERITED).
         self.assertEqual(
-            cfg.field_provenance("agent_defaults", entry, "session_prefix"),
-            Provenance.INHERITED,
+            cfg.field_provenance("agent", entry, "session_prefix"),
+            Provenance.DEFAULT,
         )
 
-    def test_merged_entry_reflects_real_deep_merge(self):
+    def test_field_absent_with_no_inherits_at_all_is_also_default(self):
         cfg = self._cfg()
-        merged = cfg.merged_entry("agent_defaults", cfg.agents_raw["overrides-timeout"])
+        entry = cfg.agents_raw["no-template-at-all"]
+        # No inherits: key at all — the OTHER way to land on
+        # Provenance.DEFAULT, collapsed into the same enum value as the case
+        # above (see Provenance's own docstring in model.py).
+        self.assertEqual(
+            cfg.field_provenance("agent", entry, "timeout"),
+            Provenance.DEFAULT,
+        )
+
+    def test_merged_entry_reflects_real_resolve_inherits(self):
+        cfg = self._cfg()
+        merged = cfg.merged_entry("agent", cfg.agents_raw["overrides-timeout"])
         self.assertEqual(merged["timeout"], 500)  # entry's own override wins
-        self.assertEqual(merged["type"], "claude")  # inherited from defaults
-        # nested dict merges too (permissions comes from defaults wholesale)
+        self.assertEqual(merged["type"], "claude")  # inherited from the template
+        # nested dict merges too (permissions comes from the template wholesale)
         self.assertEqual(merged["permissions"], {"enabled": True, "timeout": 300})
 
 
@@ -414,14 +440,14 @@ class TestEditableConfigDirtyTracking(_EditableConfigTestBase):
         cfg = self._cfg()
         self.assertFalse(cfg.dirty)
 
-    def test_mark_dirty_sets_the_flag_and_clears_the_defaults_cache(self):
+    def test_mark_dirty_sets_the_flag_and_clears_the_templates_cache(self):
         cfg = self._cfg()
-        cached = cfg.defaults_block("agent_defaults")  # populate the cache
-        cfg.document["agent_defaults"] = {"type": "opencode"}
+        cached = cfg.templates("agent")  # populate the cache (empty here)
+        cfg.document["agent_templates"] = {"standard": {"type": "opencode"}}
         cfg.mark_dirty()
         self.assertTrue(cfg.dirty)
-        self.assertIsNot(cfg.defaults_block("agent_defaults"), cached)
-        self.assertEqual(cfg.defaults_block("agent_defaults")["type"], "opencode")
+        self.assertIsNot(cfg.templates("agent"), cached)
+        self.assertEqual(cfg.templates("agent")["standard"]["type"], "opencode")
 
     def test_reload_clears_dirty(self):
         cfg = self._cfg()

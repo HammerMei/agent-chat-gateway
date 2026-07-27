@@ -3,7 +3,8 @@
 Unlike connectors, the agent schema is complete (additionalProperties:
 false in gateway/schema/config.schema.json's $defs/agent), so this shows a
 fixed field list with a provenance marker per field (explicit / inherited
-from agent_defaults / explicit-null-suppressing) instead of a generic dump.
+from the agent's own `inherits:` template / explicit-null-suppressing)
+instead of a generic dump.
 `_FORM_FIELDS`/`_PERMISSIONS_FORM_FIELDS` below are a manually-maintained
 mirror of that schema (matching Phase 1's `_KNOWN_FIELDS`, not a runtime
 JSON-schema interpreter) — safe because the schema is closed
@@ -12,17 +13,41 @@ form doesn't know about sneaking in.
 
 Tool lists (`owner_allowed_tools`/`guest_allowed_tools`) render read-only in
 view mode (`_body_text()`), but are directly editable in edit/create mode via
-two `ListView`s ('a' adds — `PresetOrInlineModal` — 'x' removes the focused
-item). They live OUTSIDE the `FieldSpec`/`apply_update()` diffing pipeline
-(that machinery is scalar-field-shaped; a list of preset-references/inline-
-rule-dicts doesn't fit it) — `_tool_list_state()` snapshots the MERGED
-starting value (same "what's currently in effect" semantics
-`_compute_initial_values()` uses for every other field) and `action_save()`
-diffs the FINAL local list against that snapshot itself, writing an explicit
-override only if it actually changed (matching decision 2: "editing an
-inherited field always writes an explicit per-entry override" — untouched
-stays untouched, exactly as `_collect_field_updates()` already does for
-every scalar field).
+two `ListView`s with dedicated "+ Add"/"- Remove" `Button`s beside each list
+(user-reported: the previous 'a'/'x' single-key bindings silently typed
+those letters into whatever Input happened to have focus instead of
+triggering the action — a real risk of quietly corrupting an unrelated
+field's value; buttons have no such conflict). They live OUTSIDE the
+`FieldSpec`/`apply_update()` diffing pipeline (that machinery is scalar-
+field-shaped; a list of preset-references/inline-rule-dicts doesn't fit it)
+— the actual widget/state machinery lives in `.tool_list_editor`
+(`ToolListEditorMixin`), extracted there once `TemplateDetailScreen` became
+a second concrete user (agent templates can set these two fields too).
+`_tool_list_starting_values()` below returns the MERGED starting value
+(same "what's currently in effect" semantics `_compute_initial_values()`
+uses for every other field), and the mixin's `action_save()` hook diffs the
+FINAL local list against that snapshot itself, writing an explicit override
+only if it actually changed (matching decision 2: "editing an inherited
+field always writes an explicit per-entry override" — untouched stays
+untouched, exactly as `_collect_field_updates()` already does for every
+scalar field).
+
+The Inherits row is likewise a `Button` (same 'i'-key-conflict reasoning),
+not a `FieldSpec`-pipeline field — picking a new template affects the
+EFFECTIVE value of every OTHER field (unlike any single scalar field, which
+only affects itself), so unlike every other field's "snapshot once at open,
+diff at Save" semantics, picking a new template triggers a full
+`_recompute_form()` (form_common.py): every field's prefilled value and
+provenance label are recomputed against the NEWLY selected template and the
+form is recomposed from scratch. If the user had already typed unsaved
+edits into OTHER fields before switching, those would be silently discarded
+by that recompute — `_any_field_overridden()` is checked first and, if
+true, a `ConfirmModal` warns before proceeding. `_current_entry()` below
+returns a PROBE entry (`self.entry` with `inherits:` swapped to whatever the
+picker currently has selected, not yet saved) — every live-display
+computation (compose, provenance labels, ctrl+r, tool-list prefill) reads
+through this probe, not `self.entry` directly, so they all reflect the
+picker's current state rather than only updating after Save.
 
 Edit/create + Save/dirty/navigation machinery lives in `.form_common`
 (`FormScreen`) — shared with `ConnectorDetailScreen`. This module supplies
@@ -38,36 +63,22 @@ from typing import TYPE_CHECKING, Literal
 
 from textual import work
 from textual.app import ComposeResult
-from textual.binding import Binding
 from textual.containers import Horizontal, VerticalScroll
-from textual.widgets import Input, Label, ListItem, ListView, Static
+from textual.widgets import Button, Input, Static
 
 from ..formatting import format_value, provenance_label
-from ..modals import InlineToolRuleModal, MessageModal, PresetOrInlineModal, TextPromptModal
+from ..modals import ConfirmModal, InheritsPickerModal, MessageModal, TextPromptModal
 from ..model import EditableConfig
 from .form_common import FieldSpec, FormScreen, apply_update, find_referencing_watcher_labels
-from .tool_presets import ToolPresetsScreen
+from .tool_list_editor import TOOL_LIST_WIDGET_IDS, ToolListEditorMixin, format_tool_rule
+
+# NOTE: TemplateDetailScreen (screens/template_detail.py) is deliberately
+# imported LOCALLY inside _open_inherits_picker() below, not at module level —
+# template_detail.py itself imports AGENT_FORM_FIELDS/AGENT_DATACLASS_DEFAULTS
+# from this module, so a module-level import here would be circular.
 
 if TYPE_CHECKING:
     from ..app import ConfigToolApp
-
-# The two agent tool-list keys the editor below handles, and the ListView
-# widget id each renders into (kept as one dict, not two, so the shared
-# code below never has to enumerate them separately from their ids).
-_TOOL_LIST_WIDGET_IDS: dict[str, str] = {
-    "owner_allowed_tools": "owner-tools-list",
-    "guest_allowed_tools": "guest-tools-list",
-}
-
-
-def _format_tool_rule(item: object) -> str:
-    if isinstance(item, str):
-        return f"→ preset: {item}"
-    if isinstance(item, dict):
-        tool = item.get("tool", "?")
-        params = item.get("params")
-        return f"{tool} / {params or '(any)'}"
-    return str(item)
 
 # Top-level agent fields worth a dedicated provenance-annotated line, in the
 # same order as AgentConfig's own fields (gateway/core/config.py). View mode
@@ -80,11 +91,12 @@ _KNOWN_FIELDS = [
 
 # AgentConfig/PermissionConfig's own dataclass defaults (gateway/core/
 # config.py) — used ONLY to prefill the form with the true effective value
-# when a field is set by neither the entry nor agent_defaults. Unlike view
-# mode (which simply omits a line for an absent field), a form editing that
-# field needs to show what it would actually evaluate to right now. Public
-# (no leading underscore): DefaultsScreen reuses this dict too, as the
-# "no shared default set" fallback value for editing agent_defaults itself.
+# when a field is set by neither the entry nor its inherits: template.
+# Unlike view mode (which simply omits a line for an absent field), a form
+# editing that field needs to show what it would actually evaluate to right
+# now. Public (no leading underscore): TemplateDetailScreen reuses this dict
+# too, as the "no dataclass default" fallback value for editing an agent
+# template's own fields.
 AGENT_DATACLASS_DEFAULTS: dict[str, object] = {
     "type": "claude",
     "command": "claude",
@@ -114,11 +126,11 @@ _PERMISSIONS_FORM_FIELDS: list[FieldSpec] = [
     FieldSpec("permissions.timeout", "int", "Permissions timeout (seconds)"),
     FieldSpec("permissions.skip_owner_approval", "bool", "Skip owner approval"),
 ]
-# Public (no leading underscore): also reused by DefaultsScreen to edit
-# agent_defaults with the exact same field set, schema-derived-so-zero-
-# drift-risk reasoning applies just as much there — every one of these keys
-# is legal in agent_defaults too (gateway/config.py's forbidden-keys set for
-# agent_defaults is empty).
+# Public (no leading underscore): also reused by TemplateDetailScreen to
+# edit an agent template with the exact same field set, schema-derived-so-
+# zero-drift-risk reasoning applies just as much there — every one of these
+# keys is legal in an agent template too (gateway/config.py's forbidden-keys
+# set for agent_templates is empty).
 AGENT_FORM_FIELDS = (*_FORM_FIELDS, *_PERMISSIONS_FORM_FIELDS)
 
 
@@ -149,21 +161,8 @@ def _working_directory_warning(config_path: Path, raw_value: str) -> str:
     return ""
 
 
-class AgentDetailScreen(FormScreen):
+class AgentDetailScreen(ToolListEditorMixin, FormScreen):
     BODY_ID = "agent-detail-body"
-
-    BINDINGS = [
-        Binding("a", "add_tool_rule", "Add tool rule", show=True),
-        Binding("x", "remove_tool_rule", "Remove tool rule", show=True),
-    ]
-
-    DEFAULT_CSS = """
-    AgentDetailScreen #owner-tools-list, AgentDetailScreen #guest-tools-list {
-        height: auto;
-        max-height: 8;
-        margin-bottom: 1;
-    }
-    """
 
     def __init__(
         self,
@@ -177,23 +176,45 @@ class AgentDetailScreen(FormScreen):
         self.agent_name = name
         self.entry = entry
         self.mode = mode
-        self._tool_lists: dict[str, list] = {}
-        self._tool_lists_initial: dict[str, list] = {}
+        self._init_tool_lists()
+        # See _open_inherits_picker()/action_save() below. Unlike every
+        # other field, switching this one triggers a full
+        # _recompute_form() (form_common.py) rather than a snapshot-once-
+        # at-open value — see module docstring for why.
+        self._inherits_initial: str | None = self.cfg.entry_template_name(self.entry)
+        self._inherits_current: str | None = self._inherits_initial
         if self.mode != "view":
-            self._compute_initial_values(self.entry)
+            self._compute_initial_values(self._current_entry())
+            self._description_live = self._initial_values.get("description") or ""
             self._tool_list_state()
             self._populating = True
-
-    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        if action in ("add_tool_rule", "remove_tool_rule"):
-            return self.mode != "view"
-        return super().check_action(action, parameters)
 
     def _entity_noun(self) -> str:
         return "agent"
 
     def _entity_label(self) -> str:
         return self.agent_name
+
+    def _current_entry(self) -> dict:
+        """The PROBE entry: `self.entry` (the on-disk explicit fields) with
+        `inherits:` swapped to whatever the Inherits picker currently has
+        selected — NOT necessarily what's saved yet. Every live-display
+        computation (compose, provenance labels, ctrl+r, tool-list prefill)
+        reads through this, not `self.entry` directly, so switching
+        templates is reflected immediately rather than only after Save."""
+        probe = dict(self.entry)
+        if self._inherits_current is None:
+            probe.pop("inherits", None)
+        else:
+            probe["inherits"] = self._inherits_current
+        return probe
+
+    def _any_field_overridden(self) -> bool:
+        # Tool lists live outside the FieldSpec pipeline (see module
+        # docstring) — FormScreen's own check only covers _field_specs(),
+        # so this also counts an in-progress, unsaved tool-list edit as an
+        # override the Inherits-switch confirm needs to warn about.
+        return super()._any_field_overridden() or self._any_tool_list_overridden()
 
     def _remove_entry_from_document(self) -> None:
         del self.cfg.document["agents"][self.agent_name]
@@ -211,112 +232,105 @@ class AgentDetailScreen(FormScreen):
         self.cfg.document.setdefault("agents", {})[self.agent_name] = self.entry
 
     def _on_enter_edit_mode(self) -> None:
-        self._compute_initial_values(self.entry)
+        self._inherits_initial = self.cfg.entry_template_name(self.entry)
+        self._inherits_current = self._inherits_initial
+        self._compute_initial_values(self._current_entry())
+        self._description_live = self._initial_values.get("description") or ""
         self._tool_list_state()
+        self._tool_list_ever_selected = dict.fromkeys(TOOL_LIST_WIDGET_IDS, False)
 
     def _field_specs(self) -> tuple[FieldSpec, ...]:
         return AGENT_FORM_FIELDS
 
-    def _defaults_kind(self) -> str:
-        return "agent_defaults"
+    def _template_kind(self) -> str:
+        return "agent"
 
     def _dataclass_defaults(self) -> dict[str, object]:
         return AGENT_DATACLASS_DEFAULTS
 
-    # ── tool-list editor (owner_allowed_tools / guest_allowed_tools) ────────
-
-    def _tool_list_state(self) -> None:
-        """(Re)snapshot both tool lists to their MERGED (effective) value —
-        same semantics `_compute_initial_values()` uses for every scalar
-        field: the form shows what's ACTUALLY in effect right now (inherited
-        from agent_defaults or explicit on this entry), and `action_save()`
-        below only writes an explicit override if the final list actually
-        differs from this snapshot."""
+    def _tool_list_starting_values(self) -> dict[str, list]:
+        """The MERGED (effective) value of both tool-list keys — same
+        semantics `_compute_initial_values()` uses for every scalar field:
+        the form shows what's ACTUALLY in effect right now (inherited from
+        the agent's own `inherits:` template — or whichever template the
+        Inherits picker currently has selected, see `_current_entry()` — or
+        explicit on this entry)."""
         try:
-            merged = self.cfg.merged_entry(self._defaults_kind(), self.entry)
+            merged = self.cfg.merged_entry(self._template_kind(), self._current_entry())
         except (ValueError, FileNotFoundError):
-            merged = dict(self.entry)
-        self._tool_lists = {
-            key: list(merged.get(key) or []) for key in _TOOL_LIST_WIDGET_IDS
-        }
-        self._tool_lists_initial = {k: list(v) for k, v in self._tool_lists.items()}
+            merged = dict(self._current_entry())
+        return {key: merged.get(key) or [] for key in TOOL_LIST_WIDGET_IDS}
 
-    def _tool_list_items(self, key: str) -> list[ListItem]:
-        return [
-            ListItem(Label(_format_tool_rule(item)), name=str(i))
-            for i, item in enumerate(self._tool_lists[key])
-        ]
+    # ── inherits: picker ─────────────────────────────────────────────────────
 
-    def _refresh_tool_list(self, key: str) -> None:
-        list_view = self.query_one(f"#{_TOOL_LIST_WIDGET_IDS[key]}", ListView)
-        list_view.clear()
-        for i, item in enumerate(self._tool_lists[key]):
-            list_view.append(ListItem(Label(_format_tool_rule(item)), name=str(i)))
-
-    def _focused_tool_list_key(self) -> str | None:
-        return getattr(self.focused, "tool_list_key", None)
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        button_id = event.button.id or ""
+        if button_id == "inherits-change-button":
+            self._open_inherits_picker()
+        else:
+            self._dispatch_tool_list_button(button_id)
 
     @work
-    async def action_add_tool_rule(self) -> None:
+    async def _open_inherits_picker(self) -> None:
         if self.mode == "view":
             return
-        key = self._focused_tool_list_key()
-        if key is None:
-            self.notify("Focus the owner or guest tool list first.", severity="warning")
-            return
-
-        preset_names = sorted(self.cfg.tool_presets_raw.keys())
-        choice = await self.app.push_screen_wait(PresetOrInlineModal(preset_names))
+        template_names = sorted(self.cfg.templates("agent"))
+        choice = await self.app.push_screen_wait(
+            InheritsPickerModal(template_names, self._inherits_current)
+        )
         if choice is None:
             return
-        kind, preset_name = choice
+        kind, name = choice
 
-        if kind == "preset":
-            item: object = preset_name
-        elif kind == "inline":
-            rule = await self.app.push_screen_wait(InlineToolRuleModal())
-            if rule is None:
+        if kind == "template":
+            new_value = name
+        elif kind == "none":
+            new_value = None
+        elif kind == "new_template":
+            new_name = await self.app.push_screen_wait(
+                TextPromptModal("New agent template — name")
+            )
+            if new_name is None:
                 return
-            item = rule
-        elif kind == "new_preset":
-            name = await self.app.push_screen_wait(TextPromptModal("New tool preset — name"))
-            if name is None:
-                return
-            if name in self.cfg.tool_presets_raw:
+            if new_name in self.cfg.templates("agent"):
                 await self.app.push_screen_wait(
-                    MessageModal(f"A tool preset named '{name}' already exists.", title="Could not create")
+                    MessageModal(
+                        f"An agent template named '{new_name}' already exists.",
+                        title="Could not create",
+                    )
                 )
                 return
-            # A one-way detour, not a return-with-result flow (see
-            # PresetOrInlineModal's docstring): the user adds rules to the
-            # new preset over there, then presses Escape to come back HERE
-            # and reference it via "preset" like any other existing preset.
-            self.app.push_screen(ToolPresetsScreen(self.cfg, name))
+            # One-way detour, not a return-with-result flow (see
+            # InheritsPickerModal's docstring): the user fills in the new
+            # template over there, presses Escape to come back HERE, then
+            # clicks the Inherits button again to actually reference it.
+            from .template_detail import TemplateDetailScreen
+
+            self.app.push_screen(TemplateDetailScreen(self.cfg, "agent", new_name, {}, mode="create"))
             return
         else:
             return
 
-        self._tool_lists[key].append(item)
-        self._form_dirty = True
-        self._refresh_tool_list(key)
+        if new_value == self._inherits_current:
+            return  # no actual change — nothing to warn about or recompute
 
-    def action_remove_tool_rule(self) -> None:
-        if self.mode == "view":
-            return
-        key = self._focused_tool_list_key()
-        if key is None:
-            self.notify("Focus the owner or guest tool list first.", severity="warning")
-            return
-        list_view = self.focused
-        if list_view.index is None:
-            self.notify("No item selected.", severity="warning")
-            return
-        idx = list_view.index
-        if idx >= len(self._tool_lists[key]):
-            return
-        del self._tool_lists[key][idx]
+        if self._any_field_overridden():
+            confirmed = await self.app.push_screen_wait(
+                ConfirmModal(
+                    "Switching templates will reset any unsaved edits to "
+                    "the fields below back to the new template's values. "
+                    "Continue?",
+                    confirm_label="Switch",
+                )
+            )
+            if not confirmed:
+                return
+
+        self._inherits_current = new_value
+        self._tool_list_state()
+        self._tool_list_ever_selected = dict.fromkeys(TOOL_LIST_WIDGET_IDS, False)
+        await self._recompute_form()
         self._form_dirty = True
-        self._refresh_tool_list(key)
 
     # ── view mode ────────────────────────────────────────────────────────────
 
@@ -325,10 +339,12 @@ class AgentDetailScreen(FormScreen):
         lines = [f"[bold]{self.agent_name}[/bold]"]
         if description:
             lines.append(f"[dim]{description}[/dim]")
+        template_name = self.cfg.entry_template_name(self.entry)
+        lines.append(f"inherits: {template_name if template_name else '(none)'}")
         lines.append("")
 
         try:
-            merged = self.cfg.merged_entry("agent_defaults", self.entry)
+            merged = self.cfg.merged_entry("agent", self.entry)
         except (ValueError, FileNotFoundError) as exc:
             lines.append(f"[red]Could not compute effective values: {exc}[/red]")
             return "\n".join(lines)
@@ -336,10 +352,10 @@ class AgentDetailScreen(FormScreen):
         for key in _KNOWN_FIELDS:
             if key not in merged:
                 continue
-            provenance = self.cfg.field_provenance("agent_defaults", self.entry, key)
+            provenance = self.cfg.field_provenance("agent", self.entry, key)
             lines.append(
                 f"{key}: {format_value(merged[key])}  "
-                f"[dim]({provenance_label(provenance)})[/dim]"
+                f"[dim]({provenance_label(provenance, template_name)})[/dim]"
             )
 
         for label, field_key in (
@@ -348,11 +364,11 @@ class AgentDetailScreen(FormScreen):
         ):
             if field_key not in merged:
                 continue
-            provenance = self.cfg.field_provenance("agent_defaults", self.entry, field_key)
+            provenance = self.cfg.field_provenance("agent", self.entry, field_key)
             lines.append("")
-            lines.append(f"{label}:  [dim]({provenance_label(provenance)})[/dim]")
+            lines.append(f"{label}:  [dim]({provenance_label(provenance, template_name)})[/dim]")
             for item in merged.get(field_key) or []:
-                lines.append(f"  {_format_tool_rule(item)}")
+                lines.append(f"  {format_tool_rule(item)}")
 
         return "\n".join(lines)
 
@@ -369,7 +385,7 @@ class AgentDetailScreen(FormScreen):
                 yield Static("[bold]New agent[/bold]")
                 with Horizontal(classes="field-row"):
                     yield Static("Name", classes="field-label")
-                    yield Input(id="field-name", placeholder="agent name")
+                    yield Input(id="field-name", value=self._name_live, placeholder="agent name")
             else:
                 yield Static(f"[bold]{self.agent_name}[/bold]  (editing)")
 
@@ -377,11 +393,20 @@ class AgentDetailScreen(FormScreen):
                 yield Static("Description", classes="field-label")
                 yield Input(
                     id="field-description",
-                    value=self._initial_values.get("description") or "",
+                    value=self._description_live,
                 )
 
+            with Horizontal(classes="field-row"):
+                yield Static("Inherits", classes="field-label")
+                yield Static(
+                    self._inherits_current or "(none)",
+                    id="inherits-value",
+                    classes="field-value",
+                )
+                yield Button("Change…", id="inherits-change-button")
+
             for spec in _FORM_FIELDS:
-                yield from self._compose_field_row(spec, self.entry)
+                yield from self._compose_field_row(spec, self._current_entry())
                 if spec.key == "working_directory":
                     yield Static(
                         _working_directory_warning(
@@ -392,21 +417,14 @@ class AgentDetailScreen(FormScreen):
 
             yield Static("[bold]Permissions[/bold]")
             for spec in _PERMISSIONS_FORM_FIELDS:
-                yield from self._compose_field_row(spec, self.entry)
+                yield from self._compose_field_row(spec, self._current_entry())
 
             for key, label in (
                 ("owner_allowed_tools", "Owner allowed tools"),
                 ("guest_allowed_tools", "Guest allowed tools"),
             ):
-                yield Static(f"[bold]{label}[/bold]  [dim]('a' add / 'x' remove)[/dim]")
-                list_view = ListView(*self._tool_list_items(key), id=_TOOL_LIST_WIDGET_IDS[key])
-                # Tagged so _focused_tool_list_key() can map the currently
-                # focused widget back to which of the two lists it is,
-                # without unmunging the widget id — same pattern
-                # _compose_field_row() uses to tag an Input with its
-                # FieldSpec via `.field_key`.
-                list_view.tool_list_key = key
-                yield list_view
+                yield Static(f"[bold]{label}[/bold]")
+                yield from self._compose_tool_list_widget(key)
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "field-working_directory":
@@ -454,19 +472,18 @@ class AgentDetailScreen(FormScreen):
         for key, value in updates.items():
             apply_update(target_entry, key, value)
 
+        # inherits: lives outside the FieldSpec/apply_update() pipeline too
+        # (it's driven by InheritsPickerModal, not an Input/Checkbox/Select
+        # widget) — diffed here directly against the snapshot taken when the
+        # form opened (or last re-entered edit mode), same "only write what
+        # actually changed" semantics as every other field.
+        if self._inherits_current != self._inherits_initial:
+            apply_update(target_entry, "inherits", self._inherits_current)
+
         # Tool lists live outside the FieldSpec/apply_update() pipeline (see
-        # module docstring) — diffed here, directly, against the MERGED
-        # snapshot _tool_list_state() took when the form opened. Untouched
-        # stays untouched (no key written at all, preserving whatever
-        # explicit/inherited state the entry already had); a genuinely
-        # changed list is always written in full, as an explicit override
-        # (never popped back to "inherited" on empty — an agent explicitly
-        # narrowing itself to zero allowed tools is meaningfully different
-        # from never having set the key at all, so this never silently
-        # reinterprets "cleared the list" as "revert to defaults").
-        for key in _TOOL_LIST_WIDGET_IDS:
-            if self._tool_lists[key] != self._tool_lists_initial[key]:
-                target_entry[key] = list(self._tool_lists[key])
+        # module docstring / tool_list_editor.py) — diffed directly against
+        # the MERGED snapshot _tool_list_state() took when the form opened.
+        self._collect_tool_list_updates(target_entry)
 
         if self.mode == "create":
             self.cfg.document.setdefault("agents", {})[name] = target_entry

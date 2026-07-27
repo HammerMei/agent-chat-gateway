@@ -32,21 +32,6 @@ def _write_config(tmp_path: Path, yaml_text: str) -> str:
     return str(path)
 
 
-# v0.3 removed the global agent_defaults: block from the real loader (see
-# docs/migration-0.3.md) in favor of named agent_templates:/inherits:. The
-# config TUI's own AgentDetailScreen._tool_list_state() still resolves the
-# "effective/inherited tool list" against the OLD hardcoded "agent_defaults"
-# kind string by design (see docs/design/config-tool.md) — a test whose
-# whole premise is "an INHERITED (not explicit) tool list stays inherited
-# when untouched" has no way to set up a genuinely inherited starting point
-# anymore, so it's skipped with this reason rather than given a fixture that
-# would silently test something else.
-_STALE_DEFAULTS_SKIP_REASON = (
-    "TUI *_defaults display deferred -- config engine moved to "
-    "*_templates/inherits, see docs/design/config-tool.md"
-)
-
-
 @pytest.fixture
 def work_dir(tmp_path: Path) -> Path:
     d = tmp_path / "work"
@@ -55,14 +40,14 @@ def work_dir(tmp_path: Path) -> Path:
 
 
 def _config_text(work_dir: Path) -> str:
-    """agent-a starts with an explicit owner_allowed_tools: [preset-a] on its
-    own entry (kept explicit rather than via agent_templates: since the
-    config TUI's own tool-list prefill still resolves against the OLD
-    "agent_defaults" kind string by design — see docs/design/config-tool.md
-    — a template-inherited value here would show as an empty starting list,
-    which isn't what these tests are actually about). preset-b exists but
-    is unreferenced by anyone, available for the "reference an existing
-    preset" tests."""
+    """agent-a's owner_allowed_tools: [preset-a] comes purely from its
+    inherits: template (nothing explicit on the agent entry itself) — the
+    config TUI's tool-list prefill correctly resolves this via the real
+    agent_templates:/inherits: mechanism (EditableConfig.merged_entry()),
+    so an inherited starting list is exactly what these tests exercise:
+    "untouched" must mean it stays inherited, not that it gets rewritten
+    explicitly onto the agent. preset-b exists but is unreferenced by
+    anyone, available for the "reference an existing preset" tests."""
     return f"""\
         tool_presets:
           preset-a:
@@ -72,11 +57,11 @@ def _config_text(work_dir: Path) -> str:
         agent_templates:
           standard:
             type: claude
+            owner_allowed_tools: [preset-a]
         agents:
           agent-a:
             inherits: standard
             working_directory: {work_dir}
-            owner_allowed_tools: [preset-a]
         connectors:
           - name: rc
             type: rocketchat
@@ -100,6 +85,18 @@ async def _open_agent_edit(pilot, app, row: int = 0) -> None:
     await pilot.pause()
 
 
+async def _click_tool_button(pilot, app, action: str, key: str = "owner_allowed_tools") -> None:
+    """Click the "+ Add"/"- Remove" button beside a tool list — `action` is
+    "add" or "remove". Scrolls the button into view first: the form can be
+    taller than the (headless) test terminal, and Pilot.click() raises
+    OutOfBounds for a widget that's currently scrolled off-screen."""
+    button = app.screen.query_one(f"#{action}-tool-{key}")
+    button.scroll_visible(animate=False)
+    await pilot.pause()
+    await pilot.click(f"#{action}-tool-{key}")
+    await pilot.pause()
+
+
 class TestAgentToolListDisplay:
     async def test_edit_mode_prefills_owner_tools_with_the_effective_value(
         self, tmp_path, work_dir
@@ -115,7 +112,11 @@ class TestAgentToolListDisplay:
             label_text = str(list_view.children[0].query_one(Label).render())
             assert "preset-a" in label_text
 
-    async def test_a_and_x_are_no_ops_in_view_mode(self, tmp_path, work_dir):
+    async def test_add_remove_buttons_do_not_exist_in_view_mode(self, tmp_path, work_dir):
+        """View mode only ever composes body text (`_body_text()`), never
+        the form — so the Add/Remove buttons (and the whole tool-list
+        editor) simply don't exist there at all, rather than existing but
+        being disabled/no-op."""
         config_path = _write_config(tmp_path, _config_text(work_dir))
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
@@ -130,14 +131,11 @@ class TestAgentToolListDisplay:
 
             assert isinstance(app.screen, AgentDetailScreen)
             assert app.screen.mode == "view"
-            await pilot.press("a")
-            await pilot.pause()
-            assert isinstance(app.screen, AgentDetailScreen)  # no modal pushed
-            assert app.screen.mode == "view"
+            assert not app.screen.query("#add-tool-owner_allowed_tools")
+            assert not app.screen.query("#owner-tools-list")
 
 
 class TestAgentToolListSave:
-    @pytest.mark.skip(reason=_STALE_DEFAULTS_SKIP_REASON)
     async def test_untouched_tool_list_writes_no_explicit_override(self, tmp_path, work_dir):
         config_path = _write_config(tmp_path, _config_text(work_dir))
         app = ConfigToolApp(config_path)
@@ -151,6 +149,24 @@ class TestAgentToolListSave:
             raw = yaml.safe_load(Path(config_path).read_text())
             assert "owner_allowed_tools" not in raw["agents"]["agent-a"]
 
+    async def test_remove_without_ever_selecting_an_item_is_a_no_op(self, tmp_path, work_dir):
+        """Regression: ListView's own `.index` reactive defaults to 0 the
+        instant it mounts with children — not None — so clicking "- Remove"
+        as the very first action (before ever clicking/arrow-keying into
+        the list) used to silently delete item 0 with no warning."""
+        config_path = _write_config(tmp_path, _config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_edit(pilot, app)
+
+            list_view = app.screen.query_one("#owner-tools-list", ListView)
+            assert len(list_view.children) == 1
+
+            await _click_tool_button(pilot, app, "remove")
+
+            assert len(list_view.children) == 1  # untouched
+
     async def test_removing_the_only_item_writes_an_explicit_empty_override(
         self, tmp_path, work_dir
     ):
@@ -161,11 +177,16 @@ class TestAgentToolListSave:
             await _open_agent_edit(pilot, app)
 
             list_view = app.screen.query_one("#owner-tools-list", ListView)
-            list_view.focus()
-            list_view.index = 0
+            # A real click (not just setting .index programmatically) — the
+            # item is already highlighted by default, so this is exactly
+            # the "click the already-highlighted item" case
+            # on_descendant_focus() (agent_detail.py) exists to still count
+            # as a genuine selection.
+            list_view.scroll_visible(animate=False)
             await pilot.pause()
-            await pilot.press("x")
+            await pilot.click(list_view.children[0])
             await pilot.pause()
+            await _click_tool_button(pilot, app, "remove")
             assert len(list_view.children) == 0
 
             await pilot.press("ctrl+s")
@@ -183,12 +204,7 @@ class TestAgentToolListSave:
             await pilot.pause()
             await _open_agent_edit(pilot, app)
 
-            list_view = app.screen.query_one("#owner-tools-list", ListView)
-            list_view.focus()
-            await pilot.pause()
-
-            await pilot.press("a")
-            await pilot.pause()
+            await _click_tool_button(pilot, app, "add")
             assert isinstance(app.screen, PresetOrInlineModal)
             # Sorted preset names: preset-a (0, already referenced),
             # preset-b (1), then the two fixed actions.
@@ -209,12 +225,7 @@ class TestAgentToolListSave:
             await pilot.pause()
             await _open_agent_edit(pilot, app)
 
-            list_view = app.screen.query_one("#owner-tools-list", ListView)
-            list_view.focus()
-            await pilot.pause()
-
-            await pilot.press("a")
-            await pilot.pause()
+            await _click_tool_button(pilot, app, "add")
             # preset-a (0), preset-b (1), inline (2), new_preset (3).
             await pilot.press("down", "down", "enter")
             await pilot.pause()
@@ -243,11 +254,8 @@ class TestAgentToolListSave:
             await _open_agent_edit(pilot, app)
 
             list_view = app.screen.query_one("#owner-tools-list", ListView)
-            list_view.focus()
-            await pilot.pause()
 
-            await pilot.press("a")
-            await pilot.pause()
+            await _click_tool_button(pilot, app, "add")
             await pilot.press("escape")
             await pilot.pause()
 
@@ -257,9 +265,10 @@ class TestAgentToolListSave:
             await pilot.press("ctrl+s")
             await pilot.pause()
             raw = yaml.safe_load(Path(config_path).read_text())
-            # Untouched means exactly that -- the pre-existing explicit value
-            # is neither cleared nor changed.
-            assert raw["agents"]["agent-a"]["owner_allowed_tools"] == ["preset-a"]
+            # Untouched means exactly that -- the inherited value (from
+            # agent_templates.standard) is neither cleared nor written
+            # explicitly onto the agent.
+            assert "owner_allowed_tools" not in raw["agents"]["agent-a"]
 
     async def test_creating_a_new_preset_detours_to_tool_presets_screen(self, tmp_path, work_dir):
         config_path = _write_config(tmp_path, _config_text(work_dir))
@@ -269,11 +278,8 @@ class TestAgentToolListSave:
             await _open_agent_edit(pilot, app)
 
             list_view = app.screen.query_one("#owner-tools-list", ListView)
-            list_view.focus()
-            await pilot.pause()
 
-            await pilot.press("a")
-            await pilot.pause()
+            await _click_tool_button(pilot, app, "add")
             # preset-a (0), preset-b (1), inline (2), new_preset (3).
             await pilot.press("down", "down", "down", "enter")
             await pilot.pause()

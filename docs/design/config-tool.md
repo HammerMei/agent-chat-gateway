@@ -21,24 +21,24 @@ blocks alongside Phase 1, specifically so annotations survive a future
 TUI-driven save without needing YAML-comment preservation (see "YAML I/O"
 below).
 
-> **⚠️ Known gap (v0.3):** the real config loader (`gateway/config.py`) has
-> since removed `connector_defaults`/`agent_defaults`/`watcher_defaults`
-> entirely, replacing them with named `connector_templates`/`agent_templates`/
-> `watcher_templates` + a per-entry `inherits: <name>` field — see
-> `docs/migration-0.3.md`. Everything below this note, and the shipped
-> `DefaultsScreen`/`AgentDetailScreen`/`ConnectorDetailScreen`/
-> `WatcherDetailScreen` code it describes, still reads/writes/displays
-> against the OLD `*_defaults` kind strings — a deliberate, explicit choice
-> made when the engine change shipped, not an oversight. Concretely: a
-> config.yaml that has adopted `*_templates:`/`inherits:` will show the TUI's
-> own "inherited"/"blast radius" computations as empty or wrong (they're
-> still looking for a global `agent_defaults:` block that no longer
-> exists/applies), and a config.yaml still using the OLD `*_defaults:` keys
-> will fail to load AT ALL (the engine now hard-errors on them) the moment
-> anything in the TUI calls `GatewayConfig.from_file()` (e.g.
-> `EditableConfig.save()`'s validate-before-write step). Reconciling the TUI
-> with the new mechanism is tracked as its own future pass, not part of this
-> document's Phase 2/3 plan as written.
+> **v0.3 reconciliation (done):** the real config loader (`gateway/config.py`)
+> removed `connector_defaults`/`agent_defaults`/`watcher_defaults` entirely in
+> favor of named `connector_templates`/`agent_templates`/`watcher_templates` +
+> a per-entry `inherits: <name>` field (see `docs/migration-0.3.md`). This was
+> shipped to the config engine ahead of the TUI, leaving a real gap
+> (`DefaultsScreen` could no longer save at all; every provenance/blast-radius
+> computation looked at the wrong, now-nonexistent document keys) — the TUI
+> has since caught up: `EditableConfig.templates()`/`merged_entry()`/
+> `field_provenance()` resolve against the real `*_templates:`/`inherits:`
+> mechanism (never reimplemented — they wrap `_parse_templates_block`/
+> `_resolve_inherits` from `gateway/config.py` directly), and the old
+> `DefaultsScreen` (a fixed, per-kind global-block editor) was replaced by
+> `TemplateDetailScreen` — a full create/edit/delete CRUD screen over NAMED
+> templates, listed on the Overview's "Templates" tab, modeled on the
+> already-shipped `ToolPresetsScreen` pattern. Most of the historical design
+> log below (the `DefaultsScreen`-specific sections) describes the pre-v0.3
+> implementation as it was actually built at the time — kept as an accurate
+> record of that phase, not a description of the current screen.
 
 Reached via `agent-chat-gateway config` (no subcommand). `agent-chat-gateway
 config validate` stays a separate, scriptable command backed by
@@ -86,10 +86,15 @@ saving) through that path would write **resolved secrets** into config.yaml.
 EditableConfig
 ├── document: dict            (yaml.safe_load directly — never GatewayConfig.from_file)
 ├── path: Path
-├── provenance(kind, entry, field) -> EXPLICIT | INHERITED | EXPLICIT_SUPPRESSING
-│     replays the REAL _deep_merge / _extract_defaults_block imported from
-│     gateway/config.py (never reimplemented)
-├── merged_entry(kind, entry) -> dict   (real _deep_merge; the effective value)
+├── templates(kind) -> dict[str, dict]   (kind: "agent" | "connector" | "watcher")
+│     replays the REAL _parse_templates_block imported from gateway/config.py
+│     (never reimplemented) — the parsed `<kind>_templates:` block
+├── entry_template_name(entry) -> str | None   (the entry's own `inherits:` value)
+├── field_provenance(kind, entry, field) -> EXPLICIT | INHERITED |
+│     EXPLICIT_SUPPRESSING | DEFAULT — resolved against the entry's OWN
+│     `inherits:` template (v0.3 templates/inherits; see docs/migration-0.3.md)
+├── merged_entry(kind, entry) -> dict
+│     replays the REAL _resolve_inherits (never reimplemented; the effective value)
 ├── expanded_watchers() -> list[ExpandedWatcher]
 │     pairs each validated_view() WatcherConfig with the raw `rooms:` entry
 │     (and sibling-room count) it came from, by replaying the loader's own
@@ -97,7 +102,7 @@ EditableConfig
 ├── validated_view() -> GatewayConfig   (read-only; display/cross-ref only)
 ├── dirty: bool / mark_dirty()   # Phase 2 foundation, shipped
 │     the ONE sanctioned seam after any in-place edit to `document` — clears
-│     the defaults_block() cache and flips `dirty`. There is deliberately no
+│     the templates() cache and flips `dirty`. There is deliberately no
 │     per-field mutation API (no `set_entry_field()`) on EditableConfig
 │     itself: each Phase 2/3 edit screen mutates `document` (or a raw dict
 │     reachable from it) in whatever shape that screen's form needs, then
@@ -106,6 +111,11 @@ EditableConfig
 │     the answer is that there isn't one, only the invalidation seam.
 └── save()   # Phase 2 foundation, shipped — see decision 5 below
 ```
+
+(Phase 1 originally shipped this as `defaults_block(kind)`/`_extract_defaults_block`
+against the single global `*_defaults:` blocks — replaced by the above when the
+config engine moved to named `*_templates:`/`inherits:` in v0.3; see
+docs/migration-0.3.md and the reconciliation note near the top of this document.)
 
 Shipped in Phase 1: `document`, `provenance`/`field_provenance`,
 `merged_entry`, `expanded_watchers`, `validated_view`, plus a `StatusIndex`
@@ -206,16 +216,17 @@ per-row status lookups.
 
 | Screen | Kind | Status |
 |---|---|---|
-| `OverviewScreen` | root | **Shipped.** 5 tabs: Connectors, Agents, Watchers, Defaults, Tool Presets |
-| `AgentDetailScreen` | pushed | **Shipped, all 3 modes.** view/edit/create. Form fields are a manually-maintained mirror of `$defs/agent` (not a runtime schema interpreter — safe since the schema is closed). Nothing is written to `document` until Save; Save diffs every field against its value-at-open and writes only what changed (docs/design/config-tool.md decision 2). Tool-list fields (`owner_allowed_tools`/`guest_allowed_tools`) are **shipped, editable** — two `ListView`s ('a' add via `PresetOrInlineModal`, 'x' remove), diffed the same way (against the MERGED value at open) but OUTSIDE the `FieldSpec` pipeline, since a list of preset-refs/inline-rule-dicts doesn't fit it. Escape with unsaved changes routes through `ConfirmModal` |
-| `ConnectorDetailScreen` | pushed | **Shipped, all 3 modes.** Per-type fixed field lists (tree editor deferred — see Part 3). `type`/`name` immutable in edit mode |
+| `OverviewScreen` | root | **Shipped.** 5 tabs: Connectors, Agents, Watchers, Templates, Tool Presets |
+| `AgentDetailScreen` | pushed | **Shipped, all 3 modes.** view/edit/create. Form fields are a manually-maintained mirror of `$defs/agent` (not a runtime schema interpreter — safe since the schema is closed). Nothing is written to `document` until Save; Save diffs every field against its value-at-open and writes only what changed (docs/design/config-tool.md decision 2). Tool-list fields (`owner_allowed_tools`/`guest_allowed_tools`) are **shipped, editable** — two `ListView`s with dedicated "+ Add"/"- Remove" `Button`s beside each (not key bindings — single-key 'a'/'x' bindings were tried first and dropped after user-reported conflicts with Input focus). This machinery lives in `gateway/configtool/screens/tool_list_editor.py`'s `ToolListEditorMixin`, extracted once `TemplateDetailScreen` became a second concrete user — diffed the same way (against the MERGED value at open) but OUTSIDE the `FieldSpec` pipeline, since a list of preset-refs/inline-rule-dicts doesn't fit it. An Inherits row (a "Change…" `Button` opens `InheritsPickerModal`, same button-not-keybinding reasoning) lets `inherits:` be set/cleared/changed — UNLIKE every other field, this triggers a full `_recompute_form()` (`form_common.py`) rather than a snapshot-once-at-open value, since switching templates changes every OTHER field's effective value too; a `ConfirmModal` warns first if any field was already overridden in this session (`_any_field_overridden()`). Escape with unsaved changes routes through `ConfirmModal` |
+| `ConnectorDetailScreen` | pushed | **Shipped, all 3 modes.** Per-type fixed field lists (tree editor deferred — see Part 3). `type`/`name` immutable in edit mode. Same Inherits row/picker/recompute as `AgentDetailScreen` |
 | `WatcherDetailScreen` | pushed | **Shipped**, `mode="view"` only still — Phase 3. Already takes a `mode: Literal["view","edit","create"]` param — no screen-class rework needed when its turn comes |
-| `DefaultsScreen` | pushed | **Shipped, editable** for `agent_defaults`/`watcher_defaults` (reusing `AgentDetailScreen`'s own field list for the former; a small dedicated field list for the latter). `connector_defaults` stays view-only — deferred, see its own entry further down. Shows blast radius per key in both view and edit mode; Save blocks behind a `ConfirmModal` naming every entry that would see its effective value change, whenever that list is non-empty |
+| `TemplateDetailScreen` | pushed | **Shipped, all 3 modes** — replaced the old `DefaultsScreen` in the v0.3 templates/inherits reconciliation. Full CRUD over NAMED `agent_templates`/`connector_templates`/`watcher_templates` entries (create/edit/delete, unlike the old fixed 3-row-per-kind block), extending `FormScreen` directly (unlike `DefaultsScreen`, which deliberately didn't — see its own history further down). Blast radius (per field, "N inherit, M override") is scoped to entries whose `inherits:` names THIS specific template, not "every entry in the config" the way the old global block worked. Connector templates pick a `type` up front via `TypePickerModal`, same as connector creation. For agent templates: also mixes in `ToolListEditorMixin` (user-reported gap: "agent template does not have ways to edit owner_allowed_tools and guest_allowed_tools" — legal on a template per `gateway/config.py`'s empty `agent_templates` forbidden-keys set, just never had an editor built for it), reading `self.entry` directly with no merge (a template has nothing to merge against) and folding any changed tool-list key into the same blast-radius confirm scalar fields already get |
 | `ToolPresetsScreen` | pushed | **Shipped, editable.** Rule list + "used by" (checked against the MERGED per-agent tool list, not the raw entry — see gotchas below). 'a' adds a rule (`InlineToolRuleModal`) / 'd' removes the selected one — both save immediately (no separate edit mode; a bare list of rules has no provenance/blast-radius concept to protect). Deleting the WHOLE preset happens from `OverviewScreen`'s Tool Presets tab instead (`d` on the row), not from inside this screen |
 | `ConfirmModal` | modal | **Shipped** (`gateway/configtool/modals.py`) — yes/no dialog, Cancel focused by default. Gates `ConfigToolApp.action_quit()` on `EditableConfig.dirty`, and `AgentDetailScreen`'s own per-screen form-dirty flag on Escape |
 | `MessageModal` | modal | **Shipped** (`gateway/configtool/modals.py`) — dismiss-only error/info dialog; replaces `notify(severity="error")` for anything worth blocking on (validation/save/delete failures) — user-reported that toasts vanish before a multi-line error can be read |
 | `TypePickerModal` | modal | **Shipped** (`gateway/configtool/modals.py`) — generic list-of-strings picker (`ListView`-based), reused as-is for both the agent-type picker (claude/opencode) and the connector-type picker (rocketchat/mattermost/voice/script) |
 | `PresetOrInlineModal`, `InlineToolRuleModal` | modals | **Shipped** (`gateway/configtool/modals.py`) — the tool-list editor's "add a rule" flow: reference an existing preset / write an inline rule (live regex validation, same compile flags `ToolRule.from_config()` uses) / detour to create a brand-new preset |
+| `InheritsPickerModal` | modal | **Shipped** (`gateway/configtool/modals.py`) — the per-entry `inherits:` picker, same shape as `PresetOrInlineModal`: pick an existing named template / clear to none / detour to `TemplateDetailScreen` to create a brand-new one |
 | `TextPromptModal` | modal | **Shipped** (`gateway/configtool/modals.py`) — free-text equivalent of `TypePickerModal`, added for the "new tool preset — name" prompt (preset names aren't a fixed enum) |
 | `EntityPickerModal` | modal | Not yet built (phase 3 — watcher creation's connector/agent picker) |
 | `RoomListEditorScreen` | pushed (2nd level) | Not yet built (phase 3) |
@@ -281,6 +292,19 @@ never dropped from `result.lint_findings` overall — only from the per-row
 index). Not worth fixing until a phase where lint findings need field-level
 attribution on expanded watchers specifically.
 
+**Gap closed later (`OverviewScreen`'s `'v'` binding):** the banner above
+originally showed only a bare count (`✗ 1 error(s)`) — `result.errors`/
+`warnings`/`lint_findings`' actual message text was computed but never
+displayed anywhere, so a `GatewayConfig.from_file` failure with
+`entity_kind="global"` (e.g. a required field like `working_directory`
+removed by hand-editing the raw config) gave the user no way to find out
+what to fix short of running `agent-chat-gateway config validate`
+separately — user-reported. `action_view_validation_details()` opens a
+`MessageModal` with the full text of all three lists, and the banner
+itself grows a `(press 'v' to view details)` hint only when there's
+actually something to show (per the user's own request, over a permanent
+footer entry for a key that's usually a no-op).
+
 ## Part 3 — Phase 2/3 order (owner decision — swapped from the original M2/M3)
 
 **Phase 2: Agent/connector CRUD + shared resources** (moved ahead of watcher
@@ -343,11 +367,33 @@ Phase 2 first cleared the Phase 1 code review's deferred items 7–10
   letting `type` change in place would mean the form reshaping itself
   around one of its own fields, and a `name` change would silently orphan
   any watcher referencing the old name. Mattermost's token-XOR-user/pass
-  constraint gets a plain informational `Static` line, not an interactive
-  RadioSet — `save()`'s `validate_config()` (which runs the real
-  `MattermostConfig.__post_init__`) is the actual enforcement either way,
-  so the simpler static hint was chosen over building a stateful widget for
-  guidance alone.
+  constraint originally got a plain informational `Static` line rather than
+  an interactive picker (`save()`'s `validate_config()`, which runs the
+  real `MattermostConfig.__post_init__`, was — and still is — the actual
+  enforcement either way). **Upgraded** (user-reported: wanted a dropdown
+  instead of a warning to read) to an actual "Auth method" `Select`
+  (`token` / `username_password`, `_compose_mm_auth_section()` in
+  `connector_detail.py`): both credential groups are always composed (so
+  the generic field-diff/blast-radius machinery keeps iterating
+  `_field_specs()` uniformly) but only the active one is shown, and
+  `_apply_mm_auth_method_exclusivity()` force-blanks the inactive group's
+  widgets right before `_collect_field_updates()` reads them at Save —
+  covers the common case with no message needed. `validate_config()`
+  remains the backstop for what this UI layer can't fully prevent (neither
+  group filled in; a credential coming only from an `inherits:` template
+  that the Select's own entry-level clear can't reach — see that method's
+  own docstring).
+- **Shipped: `agent_chain.*` fields for rocketchat/mattermost.**
+  User-reported gap: `agent_chain.agent_usernames`/`max_turns`/`ttl_seconds`
+  (`gateway/core/agent_chain.py`'s `AgentChainConfig`, embedded identically
+  by both connectors' own `*Config` dataclasses, documented in
+  `docs/agent-chain.md`) was a real first-class feature that had simply
+  never been added to either connector's `FieldSpec` list — not a
+  deliberate cut, just missed when the per-type field lists were first
+  written. `FieldSpec.kind` gained a `"float"` case (`ttl_seconds` is a
+  `float`; `read_widget_value()`/`form_common.py`) for this — the first
+  field needing it; `int`/`str`'s existing generic widget/display handling
+  already covered everything else.
 - **Shipped: the `.env` "store in .env" toggle.** A "Store in .env"
   `Checkbox` (default ON) next to every `secret=True` field
   (`FieldSpec.secret` already existed for masking; now also drives this).

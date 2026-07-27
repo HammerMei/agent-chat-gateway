@@ -7,7 +7,8 @@ post-merge ``GatewayConfig``. That's the only place two things the TUI needs
 are still visible:
 
   1. Provenance — whether a field on an entry is explicit, inherited from a
-     ``*_defaults`` block, or an explicit ``null`` suppressing a default.
+     named ``*_templates:`` block via the entry's own ``inherits:`` field, or
+     an explicit ``null`` suppressing a template's value.
      ``GatewayConfig.from_file`` already applied the merge by the time it
      returns; the distinction is gone.
   2. Raw ``rooms:`` groupings — by the time ``GatewayConfig.from_file``
@@ -39,17 +40,24 @@ from pathlib import Path
 
 import yaml
 
-from ..config import GatewayConfig, WatcherConfig, _deep_merge, _extract_defaults_block
+from ..config import GatewayConfig, WatcherConfig, _parse_templates_block, _resolve_inherits
 from ..config_validate import Finding, validate_config
 
-# Mirrors the forbidden-key sets GatewayConfig.from_file enforces for each
-# *_defaults block (gateway/config.py's calls to _extract_defaults_block) —
-# kept in sync by the unit tests importing both from the same source, not by
-# hand.
-_DEFAULTS_FORBIDDEN_KEYS: dict[str, frozenset[str]] = {
-    "connector_defaults": frozenset({"name"}),
-    "agent_defaults": frozenset(),
-    "watcher_defaults": frozenset({"name", "room", "rooms", "session_id"}),
+# kind -> the top-level *_templates: key it reads, and the forbidden-key set
+# _parse_templates_block enforces for a named template of that kind. Mirrors
+# gateway/config.py's own three call sites exactly (kept in sync by unit
+# tests importing both from the same source, not by hand). Kind strings here
+# are plain ("agent"/"connector"/"watcher") — not "agent_defaults" etc. —
+# since these are template kinds, not defaults-block kinds.
+_TEMPLATES_KEY: dict[str, str] = {
+    "connector": "connector_templates",
+    "agent": "agent_templates",
+    "watcher": "watcher_templates",
+}
+_TEMPLATES_FORBIDDEN_KEYS: dict[str, frozenset[str]] = {
+    "connector": frozenset({"name"}),
+    "agent": frozenset(),
+    "watcher": frozenset({"name", "room", "rooms", "session_id"}),
 }
 
 
@@ -57,17 +65,26 @@ class Provenance(Enum):
     """Where a top-level field's value on an entry actually comes from.
 
     Computed at whole-field granularity (not per-nested-sub-key) — matches
-    how ``_deep_merge`` treats nested dicts as a single mergeable unit and
-    lists/scalars as replaced wholesale. A field that is itself a dict (e.g.
-    ``permissions``) is EXPLICIT or INHERITED as a whole; this does not
-    (yet) distinguish "this one sub-key of permissions is overridden while
-    the rest is inherited" — that finer grain isn't needed until a phase
-    that edits nested fields individually exists.
+    how ``_resolve_inherits``/``_deep_merge`` treat nested dicts as a single
+    mergeable unit and lists/scalars as replaced wholesale. A field that is
+    itself a dict (e.g. ``permissions``) is EXPLICIT or INHERITED as a
+    whole; this does not (yet) distinguish "this one sub-key of permissions
+    is overridden while the rest is inherited" — that finer grain isn't
+    needed until a phase that edits nested fields individually exists.
+
+    DEFAULT collapses two distinct cases into one enum member: the entry has
+    no ``inherits:`` at all, and the entry has ``inherits:`` set but the
+    named template doesn't set this particular field. Both fall through to
+    the code-level dataclass default; they're distinguished at display time
+    (the label composer takes the entry's template name, if any) rather than
+    as separate enum values, since no caller needs to branch on which case it
+    is — only on whether to mention a template name in the label.
     """
 
     EXPLICIT = "explicit"
     INHERITED = "inherited"
     EXPLICIT_SUPPRESSING = "explicit_suppressing"
+    DEFAULT = "default"
 
 
 @dataclass
@@ -75,21 +92,21 @@ class EditableConfig:
     """The raw config.yaml document, kept in its pre-merge, as-authored form.
 
     ``document`` is the literal top-level mapping from ``yaml.safe_load`` —
-    keys like ``connectors``, ``agents``, ``watchers``, ``connector_defaults``,
+    keys like ``connectors``, ``agents``, ``watchers``, ``connector_templates``,
     ``tool_presets``, etc. Phase 1 only reads it; later phases mutate it and
     call ``save()``.
     """
 
     document: dict
     path: Path
-    # Code review item 8: defaults_block() (and, transitively, merged_entry()/
-    # field_provenance()) re-ran _extract_defaults_block from scratch on
+    # Code review item 8: templates() (and, transitively, merged_entry()/
+    # field_provenance()) re-ran _parse_templates_block from scratch on
     # every single call — repaint_from_memory() alone calls it once per
-    # connector/agent/watcher row PLUS once per defaults-table row, all for
+    # connector/agent/watcher row PLUS once per templates-table row, all for
     # the same 3 blocks. Cached here, keyed by kind, invalidated by
     # load()/reload()/mark_dirty() (the only ways `document` changes). Not
     # part of equality/repr — it's a memoization detail, not observable state.
-    _defaults_cache: dict[str, dict] = field(
+    _templates_cache: dict[str, dict] = field(
         default_factory=dict, init=False, repr=False, compare=False
     )
     # Code review item 7: whether `document` has unsaved changes since the
@@ -128,14 +145,14 @@ class EditableConfig:
         round-trip, or a manual 'refresh' action)."""
         fresh = EditableConfig.load(self.path)
         self.document = fresh.document
-        self._defaults_cache.clear()
+        self._templates_cache.clear()
         self.dirty = False
 
     def mark_dirty(self) -> None:
         """Call this after mutating `document` (or any raw dict reachable
-        from it) directly. See the `dirty`/`_defaults_cache` field comments
+        from it) directly. See the `dirty`/`_templates_cache` field comments
         above — this is the one required step after any in-place edit."""
-        self._defaults_cache.clear()
+        self._templates_cache.clear()
         self.dirty = True
 
     def save(self) -> None:
@@ -233,44 +250,90 @@ class EditableConfig:
     def tool_presets_raw(self) -> dict[str, list]:
         return dict(self.document.get("tool_presets") or {})
 
-    def defaults_block(self, kind: str) -> dict:
-        """Return the named `*_defaults:` block (description stripped, same
-        as the real loader) — 'connector_defaults' | 'agent_defaults' |
-        'watcher_defaults'. Cached per kind (see `_defaults_cache`); the
-        underlying `document` never changes except via load()/reload(),
-        both of which invalidate the cache."""
-        if kind not in self._defaults_cache:
-            forbidden = _DEFAULTS_FORBIDDEN_KEYS[kind]
-            self._defaults_cache[kind] = _extract_defaults_block(self.document, kind, forbidden)
-        return self._defaults_cache[kind]
+    def templates(self, kind: str) -> dict[str, dict]:
+        """Return the parsed `<kind>_templates:` block — name -> field dict,
+        `description` stripped, same validation the real loader applies
+        (mapping-ness, no forbidden identity keys, no nested `inherits:`) —
+        'connector' | 'agent' | 'watcher'. Cached per kind (see
+        `_templates_cache`); the underlying `document` never changes except
+        via load()/reload()/mark_dirty(), all of which invalidate the cache.
+        Reuses the real `_parse_templates_block` verbatim — never
+        reimplemented."""
+        if kind not in self._templates_cache:
+            self._templates_cache[kind] = _parse_templates_block(
+                self.document, _TEMPLATES_KEY[kind], _TEMPLATES_FORBIDDEN_KEYS[kind]
+            )
+        return self._templates_cache[kind]
+
+    def raw_template(self, kind: str, name: str) -> dict | None:
+        """The named template's RAW entry straight from `document` — unlike
+        `templates()` above, `description` is NOT stripped here.
+
+        PR review finding: `TemplateDetailScreen` used to be constructed
+        with `templates(kind).get(name)` (the stripped dict) as its OWN
+        `self.entry`, then `action_save()` did `target_entry = dict(self.entry)`
+        + updates and wrote THAT wholesale over `document[...][name]` —
+        silently deleting any on-disk `description` on every save of an
+        existing template, even a no-op edit, since the stripped dict never
+        had it to begin with. `TemplateDetailScreen` needs its own source of
+        truth to carry `description` through the round-trip (exactly like
+        `DefaultsScreen`, this screen's predecessor, read directly from the
+        raw block instead of a merged/stripped view) — this accessor is
+        that source of truth, used by `OverviewScreen` at both of its
+        TemplateDetailScreen call sites for view/edit (create mode has no
+        existing raw entry to read, so it isn't needed there)."""
+        block = self.document.get(_TEMPLATES_KEY[kind]) or {}
+        entry = block.get(name)
+        return entry if isinstance(entry, dict) else None
+
+    def entry_template_name(self, entry_raw: dict) -> str | None:
+        """The entry's own `inherits:` value, or None if unset. A tiny
+        accessor so callers building display labels (provenance text, the
+        inherits-picker's current selection) don't reach into raw dicts
+        directly."""
+        name = entry_raw.get("inherits")
+        return name if isinstance(name, str) and name else None
 
     # ── Provenance / effective value (reuses the real merge, never reimplemented) ──
 
     def merged_entry(self, kind: str, entry_raw: dict) -> dict:
-        """`entry_raw` deep-merged against its matching *_defaults block —
-        the exact value GatewayConfig.from_file would compute for this one
-        entry before its own further per-entry processing (path resolution,
-        tool-preset resolution, etc). Uses the real _deep_merge.
+        """`entry_raw` resolved against its own `inherits:` template (if
+        set) — the exact value GatewayConfig.from_file would compute for
+        this one entry before its own further per-entry processing (path
+        resolution, tool-preset resolution, etc). Uses the real
+        `_resolve_inherits` (which pops `inherits` and deep-merges the named
+        template with the entry, the entry winning on conflict) — never
+        reimplemented. `entity_kind`/`entity_label` are cosmetic (only used
+        in `_resolve_inherits`'s own ValueError messages); every caller here
+        already wraps this in `try/except (ValueError, FileNotFoundError)`,
+        so generic placeholders are fine.
 
-        Deliberately NOT cached (unlike defaults_block() above): _deep_merge
-        already deep-copies on every call, so it's cheap; caching it would
-        need a key derived from entry_raw's identity, which stops being safe
-        the moment a later phase starts mutating entries in place for
-        editing. defaults_block() is document-scoped and only invalidated by
-        load()/reload(), which is a much simpler invariant to keep correct."""
-        return _deep_merge(self.defaults_block(kind), entry_raw)
+        Deliberately NOT cached (unlike templates() above): the merge is
+        cheap (a couple of dict copies), and caching it would need a key
+        derived from entry_raw's identity, which stops being safe the moment
+        a later phase starts mutating entries in place for editing.
+        templates() is document-scoped and only invalidated by
+        load()/reload()/mark_dirty(), a much simpler invariant to keep
+        correct."""
+        return _resolve_inherits(
+            entry_raw, self.templates(kind), _TEMPLATES_KEY[kind], "entry", "?"
+        )
 
     def field_provenance(self, kind: str, entry_raw: dict, field: str) -> Provenance:
         """Where `entry_raw[field]` (or its absence) actually comes from.
 
-        kind: 'connector_defaults' | 'agent_defaults' | 'watcher_defaults'
-        (selects which defaults block this entry inherits from).
+        kind: 'connector' | 'agent' | 'watcher' (selects which `*_templates:`
+        block the entry's own `inherits:` name is looked up against).
         """
+        template_name = self.entry_template_name(entry_raw)
+        template = self.templates(kind).get(template_name, {}) if template_name else {}
         if field in entry_raw:
-            if entry_raw[field] is None and field in self.defaults_block(kind):
+            if entry_raw[field] is None and field in template:
                 return Provenance.EXPLICIT_SUPPRESSING
             return Provenance.EXPLICIT
-        return Provenance.INHERITED
+        if field in template:
+            return Provenance.INHERITED
+        return Provenance.DEFAULT
 
     # ── Read-only validated view ─────────────────────────────────────────────
 
