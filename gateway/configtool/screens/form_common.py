@@ -349,6 +349,24 @@ class FormScreen(DetailScreen):
         # call_after_refresh, which runs after that initial burst of Changed
         # messages has already been processed.
         self._populating = False
+        # Name/Description are entry-level fields NEVER set by a template
+        # (no *_templates: block has a name or description of its own that
+        # would deep-merge into an entry) — unlike every other field, an
+        # inherits: switch's _recompute_form() must NOT touch them. Tracked
+        # here (updated live by on_input_changed() below) rather than
+        # re-derived from `_initial_values`/`entry` at every compose, since
+        # `_recompute_form()` calls `_compute_initial_values(self._current_entry())`
+        # — which only knows about `self.entry`, never about whatever the
+        # user has typed into these two boxes but not yet saved — and
+        # `_compose_form()` used to source both Inputs' `value=` from that
+        # stale, recomputed state, silently discarding an in-progress Name/
+        # Description edit the instant a template was picked. Seeded once at
+        # the two legitimate "fresh start" points (`__init__`/
+        # `_on_enter_edit_mode()`), deliberately untouched by
+        # `_recompute_form()` so they survive any number of template
+        # switches in between.
+        self._description_live: str = ""
+        self._name_live: str = ""
 
     def on_mount(self) -> None:
         if self._populating:
@@ -540,6 +558,10 @@ class FormScreen(DetailScreen):
     def on_input_changed(self, event: Input.Changed) -> None:
         if self._populating:
             return
+        if event.input.id == "field-description":
+            self._description_live = event.input.value
+        elif event.input.id == "field-name":
+            self._name_live = event.input.value
         self._form_dirty = True
         self._refresh_provenance_display(getattr(event.input, "field_key", None))
 

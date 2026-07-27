@@ -1202,6 +1202,58 @@ class TestInheritsPicker:
             assert app.screen.query_one("#field-timeout", Input).value == "300"
             assert app.screen.query_one("#field-type", Select).value == "opencode"
 
+    async def test_picking_a_template_does_not_clear_name_or_description(
+        self, tmp_path, work_dir
+    ):
+        """User-reported: typing a Name + Description while creating a new
+        agent, then picking a template via the Inherits button, cleared
+        BOTH fields. Neither is ever set by a template (no `*_templates:`
+        block has a name or description of its own to deep-merge in) —
+        _recompute_form() rebuilding the whole form around the newly
+        selected template must not touch them."""
+        config_path = _write_config(tmp_path, _config_with_two_templates(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.screen.query_one("TabbedContent").active = "tab-agents"
+            await pilot.pause()
+            await pilot.press("n")
+            await pilot.pause()
+            await pilot.press("enter")  # claude
+            await pilot.pause()
+
+            app.screen.query_one("#field-name", Input).value = "new-agent"
+            await pilot.pause()
+            app.screen.query_one("#field-description", Input).value = "a fresh agent"
+            await pilot.pause()
+
+            await _click_inherits_button(pilot, app)
+            await pilot.press("down", "enter")  # 'standard'
+            await pilot.pause()
+
+            assert isinstance(app.screen, AgentDetailScreen)
+            assert app.screen.query_one("#field-name", Input).value == "new-agent"
+            assert app.screen.query_one("#field-description", Input).value == "a fresh agent"
+
+    async def test_picking_a_template_does_not_clear_an_existing_agents_description(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _config_with_two_templates(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_in_edit_mode(pilot, app)
+
+            app.screen.query_one("#field-description", Input).value = "edited description"
+            await pilot.pause()
+
+            await _click_inherits_button(pilot, app)
+            await pilot.press("down", "enter")  # 'other'
+            await pilot.pause()
+
+            assert isinstance(app.screen, AgentDetailScreen)
+            assert app.screen.query_one("#field-description", Input).value == "edited description"
+
     async def test_switching_with_an_overridden_field_confirms_and_resets_on_accept(
         self, tmp_path, work_dir
     ):

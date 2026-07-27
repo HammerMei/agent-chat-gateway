@@ -91,6 +91,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   timestamp that the Rocket.Chat header formatter couldn't parse, so
   `ts:`/`day:` were silently omitted from every scheduled-task prompt —
   exactly the case (e.g. scheduled stock reports) that motivated #53.
+- **Config TUI: picking an Inherits template no longer clears an agent's/
+  connector's Name or Description.** User-reported: typing a Name +
+  Description while creating a new agent, then picking a template via the
+  Inherits button, silently cleared both. Neither field is ever set by a
+  template, but the Inherits-switch's full-form recompute rebuilt the
+  Description Input from the (stale, not-yet-saved) entry and the Name
+  Input from a permanently blank default — now tracked separately from
+  that recompute so they survive any number of template switches.
 
 ---
 

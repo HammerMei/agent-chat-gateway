@@ -185,6 +185,7 @@ class AgentDetailScreen(ToolListEditorMixin, FormScreen):
         self._inherits_current: str | None = self._inherits_initial
         if self.mode != "view":
             self._compute_initial_values(self._current_entry())
+            self._description_live = self._initial_values.get("description") or ""
             self._tool_list_state()
             self._populating = True
 
@@ -234,6 +235,7 @@ class AgentDetailScreen(ToolListEditorMixin, FormScreen):
         self._inherits_initial = self.cfg.entry_template_name(self.entry)
         self._inherits_current = self._inherits_initial
         self._compute_initial_values(self._current_entry())
+        self._description_live = self._initial_values.get("description") or ""
         self._tool_list_state()
         self._tool_list_ever_selected = dict.fromkeys(TOOL_LIST_WIDGET_IDS, False)
 
@@ -383,7 +385,7 @@ class AgentDetailScreen(ToolListEditorMixin, FormScreen):
                 yield Static("[bold]New agent[/bold]")
                 with Horizontal(classes="field-row"):
                     yield Static("Name", classes="field-label")
-                    yield Input(id="field-name", placeholder="agent name")
+                    yield Input(id="field-name", value=self._name_live, placeholder="agent name")
             else:
                 yield Static(f"[bold]{self.agent_name}[/bold]  (editing)")
 
@@ -391,7 +393,7 @@ class AgentDetailScreen(ToolListEditorMixin, FormScreen):
                 yield Static("Description", classes="field-label")
                 yield Input(
                     id="field-description",
-                    value=self._initial_values.get("description") or "",
+                    value=self._description_live,
                 )
 
             with Horizontal(classes="field-row"):

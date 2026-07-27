@@ -877,6 +877,29 @@ class TestConnectorInheritsPicker:
             assert app.screen.query_one("#field-server-team")
             assert app.screen.query_one("#field-require_mention", Checkbox).value is True
 
+    async def test_picking_a_template_does_not_clear_the_description(self, tmp_path, work_dir):
+        """User-reported (same bug as AgentDetailScreen's own version of
+        this test): typing a Description then picking a template via the
+        Inherits button cleared it. No `*_templates:` block has a
+        description of its own to deep-merge in, so _recompute_form()
+        rebuilding the whole form around the newly selected template must
+        not touch it."""
+        config_path = _write_config(tmp_path, _config_with_two_connector_templates(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_connector_in_edit_mode(pilot, app)
+
+            app.screen.query_one("#field-description", Input).value = "edited description"
+            await pilot.pause()
+
+            await _click_inherits_button(pilot, app)
+            await pilot.press("down", "enter")  # 'other'
+            await pilot.pause()
+
+            assert isinstance(app.screen, ConnectorDetailScreen)
+            assert app.screen.query_one("#field-description", Input).value == "edited description"
+
     async def test_switching_with_an_overridden_field_confirms_first(self, tmp_path, work_dir):
         config_path = _write_config(tmp_path, _config_with_two_connector_templates(work_dir))
         app = ConfigToolApp(config_path)

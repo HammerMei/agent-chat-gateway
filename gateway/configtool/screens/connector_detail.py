@@ -203,6 +203,7 @@ class ConnectorDetailScreen(FormScreen):
         self._mm_auth_method_touched = False
         if self.mode != "view":
             self._compute_initial_values(self._current_entry())
+            self._description_live = self._initial_values.get("description") or ""
             self._populating = True
 
     def _entity_noun(self) -> str:
@@ -255,6 +256,7 @@ class ConnectorDetailScreen(FormScreen):
         self._mm_auth_method = self._compute_mm_auth_method()
         self._mm_auth_method_touched = False
         self._compute_initial_values(self._current_entry())
+        self._description_live = self._initial_values.get("description") or ""
 
     def _connector_type(self) -> str:
         # Reads the MERGED type against the LIVE probe (self._current_entry()),
@@ -354,7 +356,9 @@ class ConnectorDetailScreen(FormScreen):
                 yield Static(f"[bold]New {conn_type} connector[/bold]")
                 with Horizontal(classes="field-row"):
                     yield Static("Name", classes="field-label")
-                    yield Input(id="field-name", placeholder="connector name")
+                    yield Input(
+                        id="field-name", value=self._name_live, placeholder="connector name"
+                    )
             else:
                 name = self.entry.get("name", "?")
                 yield Static(f"[bold]{name}[/bold]  (type: {conn_type}, editing)")
@@ -363,7 +367,7 @@ class ConnectorDetailScreen(FormScreen):
                 yield Static("Description", classes="field-label")
                 yield Input(
                     id="field-description",
-                    value=self._initial_values.get("description") or "",
+                    value=self._description_live,
                 )
 
             with Horizontal(classes="field-row"):
