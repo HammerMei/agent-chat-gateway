@@ -26,7 +26,7 @@ import pytest
 from textual.widgets import DataTable, Static
 
 from gateway.configtool.app import ConfigToolApp
-from gateway.configtool.modals import ConfirmModal
+from gateway.configtool.modals import ConfirmModal, MessageModal
 from gateway.configtool.screens.agent_detail import AgentDetailScreen
 from gateway.configtool.screens.connector_detail import ConnectorDetailScreen
 from gateway.configtool.screens.overview import OverviewScreen
@@ -302,6 +302,100 @@ class TestOverviewRender:
             await pilot.pause()
             banner = str(app_lint.screen.query_one("#banner", Static).render())
             assert "lint finding" in banner
+
+
+class TestValidationDetailsModal:
+    """User-reported: the banner only ever showed a bare count ("✗ 1
+    error(s)") — the actual message text (e.g. "Agent 'x': working_directory
+    is required") was computed by validate_config() but never surfaced
+    anywhere, leaving no way to find out what to fix short of running
+    `agent-chat-gateway config validate` in a separate terminal. 'v' opens a
+    MessageModal with the full text; the banner only advertises it (in the
+    banner text itself, per the user's own request — not a permanent
+    footer entry) when there's actually something to view."""
+
+    async def test_missing_working_directory_shows_the_real_message_via_v(
+        self, tmp_path
+    ):
+        config_path = _write_config(tmp_path, """\
+            agents:
+              broken-agent:
+                type: claude
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: "http://localhost:3000", username: bot, password: pw}
+            watchers:
+              - connector: rc
+                agent: broken-agent
+                room: general
+        """)
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            banner = str(app.screen.query_one("#banner", Static).render())
+            assert "1 error(s)" in banner
+            assert "press 'v' to view details" in banner
+
+            await pilot.press("v")
+            await pilot.pause()
+
+            assert isinstance(app.screen, MessageModal)
+            body = str(app.screen.query_one("#message-body").render())
+            assert "broken-agent" in body
+            assert "working_directory is required" in body
+
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, OverviewScreen)
+
+    async def test_valid_config_banner_gives_no_view_details_hint(
+        self, tmp_path, work_dir
+    ):
+        # A connector name unlikely to collide with any real
+        # state.<name>.json left on this machine from an unrelated run —
+        # _check_state_orphans() (gateway/config_validate.py) reads from a
+        # fixed runtime dir, not one scoped to this test's tmp_path, so a
+        # reused/common connector name here could spuriously pick up a
+        # warning having nothing to do with this test.
+        config_path = _write_config(tmp_path, f"""\
+            agents:
+              clean-agent:
+                type: claude
+                working_directory: {work_dir}
+            connectors:
+              - name: view-details-hint-test-conn-9f3a1c
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            watchers:
+              - connector: view-details-hint-test-conn-9f3a1c
+                agent: clean-agent
+                room: general
+        """)
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            banner = str(app.screen.query_one("#banner", Static).render())
+            assert "press 'v' to view details" not in banner
+
+            await pilot.press("v")
+            await pilot.pause()
+            assert isinstance(app.screen, OverviewScreen)  # no-op, nothing to show
+
+    async def test_v_is_a_no_op_right_after_a_load_error(self, tmp_path):
+        """The load_error banner already shows its full message inline —
+        _last_validate_result is reset to None in that branch so 'v' can't
+        pop up a stale modal from a PREVIOUS successful validate."""
+        config_path = str(tmp_path / "does-not-exist.yaml")
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            banner = str(app.screen.query_one("#banner", Static).render())
+            assert "does not currently load" in banner
+
+            await pilot.press("v")
+            await pilot.pause()
+            assert isinstance(app.screen, OverviewScreen)  # no-op, no crash
 
 
 class TestArrowKeyTabSwitching:

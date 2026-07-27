@@ -292,6 +292,19 @@ never dropped from `result.lint_findings` overall — only from the per-row
 index). Not worth fixing until a phase where lint findings need field-level
 attribution on expanded watchers specifically.
 
+**Gap closed later (`OverviewScreen`'s `'v'` binding):** the banner above
+originally showed only a bare count (`✗ 1 error(s)`) — `result.errors`/
+`warnings`/`lint_findings`' actual message text was computed but never
+displayed anywhere, so a `GatewayConfig.from_file` failure with
+`entity_kind="global"` (e.g. a required field like `working_directory`
+removed by hand-editing the raw config) gave the user no way to find out
+what to fix short of running `agent-chat-gateway config validate`
+separately — user-reported. `action_view_validation_details()` opens a
+`MessageModal` with the full text of all three lists, and the banner
+itself grows a `(press 'v' to view details)` hint only when there's
+actually something to show (per the user's own request, over a permanent
+footer entry for a key that's usually a no-op).
+
 ## Part 3 — Phase 2/3 order (owner decision — swapped from the original M2/M3)
 
 **Phase 2: Agent/connector CRUD + shared resources** (moved ahead of watcher

@@ -38,6 +38,7 @@ from textual.coordinate import Coordinate
 from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Static, TabbedContent, TabPane
 
+from ...config_validate import ValidationResult
 from ..formatting import status_badge
 from ..modals import ConfirmModal, MessageModal, TextPromptModal, TypePickerModal
 from ..model import StatusIndex
@@ -90,6 +91,16 @@ class OverviewScreen(Screen):
         # must not quit the app.
         Binding("q", "app.quit", "Quit", show=True),
         Binding("n", "new_entity", "New", show=True),
+        # User-reported: the banner only ever showed a bare count ("✗ 1
+        # error(s)") — result.errors/warnings/lint_findings (the actual
+        # message text, e.g. "Agent 'x': working_directory is required")
+        # were computed but never surfaced anywhere, leaving the user no
+        # way to find out what to fix short of running `agent-chat-gateway
+        # config validate` in a separate terminal. show=False (per the
+        # user's own request) — the banner text itself says "press 'v' to
+        # view details" only when there's actually something to show,
+        # rather than permanently advertising a key that's usually a no-op.
+        Binding("v", "view_validation_details", "View details", show=False),
         # Direct edit/delete on the row under the cursor (Connectors/Agents
         # tabs only — the only ones with a real detail-screen mode="edit"/
         # delete flow) — user-requested, to skip "select row -> view page ->
@@ -133,6 +144,10 @@ class OverviewScreen(Screen):
         yield Footer()
 
     def on_mount(self) -> None:
+        # Populated by repaint_from_memory(); action_view_validation_details()
+        # reads it back so the 'v' keybinding doesn't have to recompute
+        # validate_config() a second time.
+        self._last_validate_result: ValidationResult | None = None
         for table_id in (
             "#connectors-table", "#agents-table", "#watchers-table",
             "#templates-table", "#presets-table",
@@ -519,6 +534,39 @@ class OverviewScreen(Screen):
         app: "ConfigToolApp" = self.app  # type: ignore[assignment]
         app.reload_config()
 
+    @work
+    async def action_view_validation_details(self) -> None:
+        """'v' — the actual message text behind the banner's bare count
+        (user-reported: no way to find out WHAT to fix without running
+        `agent-chat-gateway config validate` in a separate terminal). A
+        no-op if there's nothing to show (result is None — e.g. right after
+        an app.load_error, which already shows its full message inline —
+        or a clean validate with lint off)."""
+        result = self._last_validate_result
+        if result is None:
+            return
+        app: "ConfigToolApp" = self.app  # type: ignore[assignment]
+        sections: list[str] = []
+        if result.errors:
+            sections.append(
+                "[bold red]Errors:[/bold red]\n" + "\n".join(f"  • {e}" for e in result.errors)
+            )
+        if result.warnings:
+            sections.append(
+                "[bold yellow]Warnings:[/bold yellow]\n"
+                + "\n".join(f"  • {w}" for w in result.warnings)
+            )
+        if app.lint and result.lint_findings:
+            sections.append(
+                "[bold cyan]Lint findings:[/bold cyan]\n"
+                + "\n".join(f"  • {lf}" for lf in result.lint_findings)
+            )
+        if not sections:
+            return
+        await self.app.push_screen_wait(
+            MessageModal("\n\n".join(sections), title="Validation details")
+        )
+
     # ── Core refresh logic (the one testable seam per docs/design) ──────────
 
     def repaint_from_memory(self) -> None:
@@ -540,6 +588,7 @@ class OverviewScreen(Screen):
             table.clear(columns=True)
 
         if app.load_error is not None:
+            self._last_validate_result = None
             banner.update(
                 f"[red]✗ config.yaml does not currently load:[/red] {app.load_error}"
             )
@@ -547,6 +596,7 @@ class OverviewScreen(Screen):
 
         cfg = app.editable_config
         result = app.run_validate()
+        self._last_validate_result = result
 
         if result.ok:
             summary = f"[green]✓ valid[/green] — {result.watcher_count} watcher(s)"
@@ -556,8 +606,18 @@ class OverviewScreen(Screen):
             summary = f"[red]✗ {len(result.errors)} error(s)[/red]"
         if result.warnings:
             summary += f", {len(result.warnings)} warning(s)"
-        if app.lint and result.lint_findings:
+        has_lint = app.lint and result.lint_findings
+        if has_lint:
             summary += f", {len(result.lint_findings)} lint finding(s)"
+        # User-reported: the count alone gave no way to find out WHAT to
+        # fix short of running `agent-chat-gateway config validate`
+        # separately — the actual message text (result.errors/warnings/
+        # lint_findings) was computed but never shown anywhere. Only
+        # advertised inline, in the banner itself, when there's actually
+        # something to view — not a permanent footer entry for a key
+        # that's usually a no-op (see the 'v' Binding's own comment).
+        if not result.ok or result.warnings or has_lint:
+            summary += "  [dim](press 'v' to view details)[/dim]"
         banner.update(summary)
 
         status = StatusIndex(result.findings)

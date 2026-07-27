@@ -57,6 +57,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ToolListEditorMixin` and is now available on agent templates too, with
   its own blast-radius-scoped confirm before saving a change that affects
   other entries.
+- **Config TUI: `'v'` shows the actual validation error/warning text.**
+  The Overview banner previously showed only a bare count (`✗ 1
+  error(s)`) — the real message (e.g. "Agent 'x': working_directory is
+  required", surfaced after hand-editing a required field away and
+  refreshing) was computed by `validate_config()` but never displayed
+  anywhere, leaving no way to find out what to fix short of running
+  `agent-chat-gateway config validate` in a separate terminal —
+  user-reported. The banner now grows a `(press 'v' to view details)`
+  hint whenever there's something to show.
 
 ### Changed
 - **BREAKING: `online_notification`/`offline_notification` default to quiet
