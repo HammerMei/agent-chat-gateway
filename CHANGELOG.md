@@ -39,6 +39,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   precomputes the weekday (e.g. `day: Sun`) alongside `ts:` so agents don't
   have to infer it from a bare date, which was unreliable and could cause
   scheduled weekday tasks to be silently skipped (#53).
+- **Config TUI: `agent_chain.*` fields for Rocket.Chat/Mattermost connectors
+  and their templates.** `agent_usernames`/`max_turns`/`ttl_seconds`
+  (`docs/agent-chain.md`) previously had to be hand-edited into config.yaml —
+  a plain gap, since both connectors already supported it. Also a Select-
+  driven "Auth method" picker for Mattermost connectors (`token` /
+  `username + password`) replacing the old plain warning text: only the
+  relevant credential fields show, and switching modes clears the other
+  group so the two can no longer collide by accident.
+- **Config TUI: agent templates can now edit `owner_allowed_tools`/
+  `guest_allowed_tools`.** Both fields were already legal on an
+  `agent_templates:` entry (nothing in `gateway/config.py` forbids them
+  there) but the TUI's template screen never had an editor for them —
+  user-reported gap. The existing per-agent tool-list editor (`ListView` +
+  "+ Add"/"- Remove" buttons, referencing a `tool_presets:` entry or
+  writing an inline rule) was extracted into a shared
+  `ToolListEditorMixin` and is now available on agent templates too, with
+  its own blast-radius-scoped confirm before saving a change that affects
+  other entries.
+- **Config TUI: `'v'` shows the actual validation error/warning text.**
+  The Overview banner previously showed only a bare count (`✗ 1
+  error(s)`) — the real message (e.g. "Agent 'x': working_directory is
+  required", surfaced after hand-editing a required field away and
+  refreshing) was computed by `validate_config()` but never displayed
+  anywhere, leaving no way to find out what to fix short of running
+  `agent-chat-gateway config validate` in a separate terminal —
+  user-reported. The banner now grows a `(press 'v' to view details)`
+  hint whenever there's something to show.
 
 ### Changed
 - **BREAKING: `online_notification`/`offline_notification` default to quiet
@@ -62,9 +89,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fighting over one global block. A leftover `*_defaults:` key is a hard,
   immediate load-time error (not a silent no-op) naming the replacement key.
   No automated migration — see `docs/migration-0.3.md` for the reasoning and
-  before/after recipes. **Known gap:** the config TUI's own
-  `*_defaults`-editing screens have not yet been updated to understand the
-  new mechanism — see the note at the top of `docs/design/config-tool.md`.
+  before/after recipes. The config TUI (`agent-chat-gateway config`) fully
+  understands the new mechanism: a "Templates" tab lists/creates/edits/
+  deletes named templates across all three kinds, and every agent/connector
+  entry has an Inherits picker.
 
 ### Fixed
 - **Scheduled-task messages now carry a usable `ts:`/`day:` timestamp.**
@@ -72,6 +100,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   timestamp that the Rocket.Chat header formatter couldn't parse, so
   `ts:`/`day:` were silently omitted from every scheduled-task prompt —
   exactly the case (e.g. scheduled stock reports) that motivated #53.
+- **Config TUI: picking an Inherits template no longer clears an agent's/
+  connector's Name or Description.** User-reported: typing a Name +
+  Description while creating a new agent, then picking a template via the
+  Inherits button, silently cleared both. Neither field is ever set by a
+  template, but the Inherits-switch's full-form recompute rebuilt the
+  Description Input from the (stale, not-yet-saved) entry and the Name
+  Input from a permanently blank default — now tracked separately from
+  that recompute so they survive any number of template switches.
 
 ---
 

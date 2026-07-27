@@ -1,23 +1,29 @@
 """OverviewScreen — the config TUI's root screen.
 
-Five tabs: Connectors, Agents, Watchers, Defaults, Tool Presets — the latter
-two are first-class per docs/design/config-tool.md (shared resources, not
-footnotes). Selecting a row (Enter) pushes a *DetailScreen in view mode.
-'e'/'d' on the Connectors/Agents/Defaults tabs act directly on the row
-under the cursor — edit opens straight into edit mode (no view detour;
-Defaults added once agent_defaults/watcher_defaults editing shipped —
-user-requested, for the same consistency the other tabs already have;
-connector_defaults specifically has nothing editable yet, so 'e' there
-just notifies rather than opening an empty form), delete runs the same
-confirm/referencing-watcher-check/save flow FormScreen.action_delete()
-already has, without requiring a screen push first (user-reported: 'e'
-used to be shadowed by this screen's OWN 'e' binding for the $EDITOR
-escape hatch — see action_edit_config() below, now on ctrl+e). 'n'
-(new_entity) creates an entry on the active tab — Agents/Connectors/Tool
-Presets support it; Watchers still notifies rather than doing nothing or
-crashing (Phase 3). 'd' additionally deletes the whole preset under the
-cursor on the Tool Presets tab (there's no separate "edit mode" to give
-'e' a meaning there — see tool_presets.py).
+Five tabs: Connectors, Agents, Watchers, Templates, Tool Presets — the
+latter two are first-class per docs/design/config-tool.md (shared
+resources, not footnotes). Selecting a row (Enter) pushes a *DetailScreen in
+view mode. 'e'/'d' on the Connectors/Agents/Templates tabs act directly on
+the row under the cursor — edit opens straight into edit mode (no view
+detour), delete runs the same confirm/referencing-watcher-check/save flow
+FormScreen.action_delete() already has, without requiring a screen push
+first (user-reported: 'e' used to be shadowed by this screen's OWN 'e'
+binding for the $EDITOR escape hatch — see action_edit_config() below, now
+on ctrl+e). 'n' (new_entity) creates an entry on the active tab — Agents/
+Connectors/Templates/Tool Presets support it; Watchers still notifies
+rather than doing nothing or crashing (Phase 3). 'd' additionally deletes
+the whole preset under the cursor on the Tool Presets tab (there's no
+separate "edit mode" to give 'e' a meaning there — see tool_presets.py), and
+the whole template under the cursor on the Templates tab (same reasoning —
+a template has no separate "edit mode" distinct from "edit this named
+entity," see template_detail.py).
+
+The Templates tab (v0.3 redesign) replaced the old Defaults tab (a fixed,
+un-creatable, 3-row-per-kind global-block view) — it's now a flat list of
+NAMED templates across all three kinds (Kind/Name/Fields set/Used by
+columns, mirroring the Tool Presets tab being one flat list), fully
+create/edit/delete-able like every other tab, since the whole point of the
+templates/inherits redesign is that multiple templates can coexist per kind.
 """
 
 from __future__ import annotations
@@ -32,13 +38,14 @@ from textual.coordinate import Coordinate
 from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Static, TabbedContent, TabPane
 
+from ...config_validate import ValidationResult
 from ..formatting import status_badge
 from ..modals import ConfirmModal, MessageModal, TextPromptModal, TypePickerModal
 from ..model import StatusIndex
 from .agent_detail import AgentDetailScreen
 from .connector_detail import CONNECTOR_TYPES, ConnectorDetailScreen
-from .defaults import DefaultsScreen, is_editable_kind
-from .form_common import find_agents_referencing_preset
+from .form_common import find_agents_referencing_preset, find_entries_referencing_template
+from .template_detail import TEMPLATE_KINDS, TemplateDetailScreen
 from .tool_presets import ToolPresetsScreen
 from .watcher_detail import WatcherDetailScreen
 
@@ -46,12 +53,12 @@ _AGENT_TYPES = ("claude", "opencode")
 
 # Tab IDs in display order — used by action_previous_tab()/action_next_tab()
 # to wrap around, and to look up each tab's own DataTable id for focusing.
-_TAB_ORDER = ("tab-connectors", "tab-agents", "tab-watchers", "tab-defaults", "tab-presets")
+_TAB_ORDER = ("tab-connectors", "tab-agents", "tab-watchers", "tab-templates", "tab-presets")
 _TABLE_ID_FOR_TAB = {
     "tab-connectors": "connectors-table",
     "tab-agents": "agents-table",
     "tab-watchers": "watchers-table",
-    "tab-defaults": "defaults-table",
+    "tab-templates": "templates-table",
     "tab-presets": "presets-table",
 }
 
@@ -84,6 +91,16 @@ class OverviewScreen(Screen):
         # must not quit the app.
         Binding("q", "app.quit", "Quit", show=True),
         Binding("n", "new_entity", "New", show=True),
+        # User-reported: the banner only ever showed a bare count ("✗ 1
+        # error(s)") — result.errors/warnings/lint_findings (the actual
+        # message text, e.g. "Agent 'x': working_directory is required")
+        # were computed but never surfaced anywhere, leaving the user no
+        # way to find out what to fix short of running `agent-chat-gateway
+        # config validate` in a separate terminal. show=False (per the
+        # user's own request) — the banner text itself says "press 'v' to
+        # view details" only when there's actually something to show,
+        # rather than permanently advertising a key that's usually a no-op.
+        Binding("v", "view_validation_details", "View details", show=False),
         # Direct edit/delete on the row under the cursor (Connectors/Agents
         # tabs only — the only ones with a real detail-screen mode="edit"/
         # delete flow) — user-requested, to skip "select row -> view page ->
@@ -120,16 +137,20 @@ class OverviewScreen(Screen):
                     yield DataTable(id="agents-table", cursor_type="row")
                 with TabPane("Watchers", id="tab-watchers"):
                     yield DataTable(id="watchers-table", cursor_type="row")
-                with TabPane("Defaults", id="tab-defaults"):
-                    yield DataTable(id="defaults-table", cursor_type="row")
+                with TabPane("Templates", id="tab-templates"):
+                    yield DataTable(id="templates-table", cursor_type="row")
                 with TabPane("Tool Presets", id="tab-presets"):
                     yield DataTable(id="presets-table", cursor_type="row")
         yield Footer()
 
     def on_mount(self) -> None:
+        # Populated by repaint_from_memory(); action_view_validation_details()
+        # reads it back so the 'v' keybinding doesn't have to recompute
+        # validate_config() a second time.
+        self._last_validate_result: ValidationResult | None = None
         for table_id in (
             "#connectors-table", "#agents-table", "#watchers-table",
-            "#defaults-table", "#presets-table",
+            "#templates-table", "#presets-table",
         ):
             self.query_one(table_id, DataTable).cursor_type = "row"
         self.repaint_from_memory()
@@ -172,21 +193,19 @@ class OverviewScreen(Screen):
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         """Hide 'Edit' from the footer on tabs that don't support it at all
         (Watchers — Phase 3; Tool Presets has no separate "edit mode" to
-        enter, see tool_presets.py). Defaults is included even though
-        connector_defaults specifically has nothing to edit — same
-        notify-instead-of-hiding precedent action_new_entity() already uses
-        for tabs it doesn't support at all (user-requested, matching the
-        Connectors/Agents/Tool-Presets convention for consistency, once
-        agent_defaults/watcher_defaults editing shipped — see
-        action_edit_row() below for the per-row check). 'Delete'
-        additionally supports Tool Presets (deletes the whole preset, not a
-        rule — see action_delete_row() below) so the footer never
-        advertises a key that would just notify "not supported yet"."""
+        enter, see tool_presets.py). Templates is fully editable/deletable
+        now (every kind is a real, named, creatable entity — no more
+        per-kind "nothing editable yet" gate the old Defaults tab needed for
+        connector_defaults). 'Delete' additionally supports Tool Presets
+        (deletes the whole preset, not a rule) and Templates (deletes the
+        whole template, not a field — see action_delete_row() below) so the
+        footer never advertises a key that would just notify "not supported
+        yet"."""
         active_tab = self.query_one(TabbedContent).active
         if action == "edit_row":
-            return active_tab in ("tab-connectors", "tab-agents", "tab-defaults")
+            return active_tab in ("tab-connectors", "tab-agents", "tab-templates")
         if action == "delete_row":
-            return active_tab in ("tab-connectors", "tab-agents", "tab-presets")
+            return active_tab in ("tab-connectors", "tab-agents", "tab-templates", "tab-presets")
         return True
 
     def action_edit_config(self) -> None:
@@ -244,18 +263,19 @@ class OverviewScreen(Screen):
             if entry is None:
                 return
             screen = AgentDetailScreen(cfg, key, entry, mode="edit")
-        elif active_tab == "tab-defaults":
-            key = self._cursor_row_key("defaults-table")
-            if key is None:
+        elif active_tab == "tab-templates":
+            row_key = self._cursor_row_key("templates-table")
+            if row_key is None:
                 return
-            if not is_editable_kind(key):
-                # connector_defaults specifically — nothing editable yet
-                # (see defaults.py's module docstring). Notify rather than
-                # silently doing nothing or crashing, same precedent
-                # action_new_entity() already uses for unsupported tabs.
-                self.notify(f"'{key}' has nothing editable yet.", severity="warning")
+            kind, name = row_key.split(":", 1)
+            # raw_template(), NOT templates() — the latter strips
+            # `description` (see its own docstring); TemplateDetailScreen
+            # needs the raw entry so description survives edit/Save
+            # round-trips (PR review finding).
+            entry = cfg.raw_template(kind, name)
+            if entry is None:
                 return
-            screen = DefaultsScreen(cfg, key, mode="edit")
+            screen = TemplateDetailScreen(cfg, kind, name, entry, mode="edit")
         else:
             return
         screen._started_in_edit_mode = True
@@ -295,6 +315,9 @@ class OverviewScreen(Screen):
         active_tab = self.query_one(TabbedContent).active
         if active_tab == "tab-presets":
             await self._delete_preset_row(cfg)
+            return
+        if active_tab == "tab-templates":
+            await self._delete_template_row(cfg)
             return
         if active_tab == "tab-connectors":
             key = self._cursor_row_key("connectors-table")
@@ -381,6 +404,56 @@ class OverviewScreen(Screen):
         app: "ConfigToolApp" = self.app  # type: ignore[assignment]
         app.reload_config()
 
+    async def _delete_template_row(self, cfg) -> None:
+        """Delete the WHOLE named template under the cursor on the Templates
+        tab — direct analogue of _delete_preset_row() above (a template has
+        no separate "edit mode" distinct from "edit this named entity," same
+        as a preset). Checks find_entries_referencing_template() FIRST, same
+        pre-check-before-destructive-confirm pattern used everywhere else in
+        this screen — a blocked delete gets a clear, specific reason instead
+        of a generic validator error."""
+        row_key = self._cursor_row_key("templates-table")
+        if row_key is None:
+            return
+        kind, name = row_key.split(":", 1)
+        if name not in cfg.templates(kind):
+            return
+
+        used_by = [n for n, _ in find_entries_referencing_template(cfg, kind, name)]
+        if used_by:
+            await self.app.push_screen_wait(
+                MessageModal(
+                    f"Cannot delete {kind} template '{name}' — still used by "
+                    f"{kind}(s): {', '.join(used_by)}.",
+                    title="Cannot delete",
+                )
+            )
+            return
+
+        confirmed = await self.app.push_screen_wait(
+            ConfirmModal(
+                f"Delete {kind} template '{name}'? This cannot be undone.",
+                confirm_label="Delete",
+            )
+        )
+        if not confirmed:
+            return
+
+        templates = cfg.document.get(f"{kind}_templates", {})
+        removed = templates.pop(name, None)
+        cfg.mark_dirty()
+        try:
+            cfg.save()
+        except (ValueError, FileNotFoundError) as exc:
+            if removed is not None:
+                templates[name] = removed
+            await self.app.push_screen_wait(MessageModal(str(exc), title="Could not delete"))
+            return
+
+        self.notify(f"Deleted {kind} template '{name}'.", severity="information")
+        app: "ConfigToolApp" = self.app  # type: ignore[assignment]
+        app.reload_config()
+
     @work
     async def action_new_entity(self) -> None:
         """'n' — scoped to whichever tab is active. Agents, Connectors, and
@@ -423,6 +496,32 @@ class OverviewScreen(Screen):
                 self.notify(f"A tool preset named '{name}' already exists.", severity="error")
                 return
             self.app.push_screen(ToolPresetsScreen(app.editable_config, name))
+        elif active_tab == "tab-templates":
+            kind = await self.app.push_screen_wait(
+                TypePickerModal("New template — pick a kind", list(TEMPLATE_KINDS))
+            )
+            if kind is None:
+                return
+            entry: dict = {}
+            if kind == "connector":
+                connector_type = await self.app.push_screen_wait(
+                    TypePickerModal("New connector template — pick a type", list(CONNECTOR_TYPES))
+                )
+                if connector_type is None:
+                    return
+                entry = {"type": connector_type}
+            name = await self.app.push_screen_wait(TextPromptModal(f"New {kind} template — name"))
+            if name is None:
+                return
+            if name in app.editable_config.templates(kind):
+                self.notify(f"A {kind} template named '{name}' already exists.", severity="error")
+                return
+            # No document/disk write here either — same precedent as Agent/
+            # ConnectorDetailScreen's own create mode: nothing materializes
+            # until the form actually saves.
+            self.app.push_screen(
+                TemplateDetailScreen(app.editable_config, kind, name, entry, mode="create")
+            )
         else:
             self.notify("Creating a new entry isn't supported on this tab yet.", severity="warning")
 
@@ -434,6 +533,39 @@ class OverviewScreen(Screen):
         # disagree with once the file has changed on disk since app startup.
         app: "ConfigToolApp" = self.app  # type: ignore[assignment]
         app.reload_config()
+
+    @work
+    async def action_view_validation_details(self) -> None:
+        """'v' — the actual message text behind the banner's bare count
+        (user-reported: no way to find out WHAT to fix without running
+        `agent-chat-gateway config validate` in a separate terminal). A
+        no-op if there's nothing to show (result is None — e.g. right after
+        an app.load_error, which already shows its full message inline —
+        or a clean validate with lint off)."""
+        result = self._last_validate_result
+        if result is None:
+            return
+        app: "ConfigToolApp" = self.app  # type: ignore[assignment]
+        sections: list[str] = []
+        if result.errors:
+            sections.append(
+                "[bold red]Errors:[/bold red]\n" + "\n".join(f"  • {e}" for e in result.errors)
+            )
+        if result.warnings:
+            sections.append(
+                "[bold yellow]Warnings:[/bold yellow]\n"
+                + "\n".join(f"  • {w}" for w in result.warnings)
+            )
+        if app.lint and result.lint_findings:
+            sections.append(
+                "[bold cyan]Lint findings:[/bold cyan]\n"
+                + "\n".join(f"  • {lf}" for lf in result.lint_findings)
+            )
+        if not sections:
+            return
+        await self.app.push_screen_wait(
+            MessageModal("\n\n".join(sections), title="Validation details")
+        )
 
     # ── Core refresh logic (the one testable seam per docs/design) ──────────
 
@@ -450,12 +582,13 @@ class OverviewScreen(Screen):
         connectors_table = self.query_one("#connectors-table", DataTable)
         agents_table = self.query_one("#agents-table", DataTable)
         watchers_table = self.query_one("#watchers-table", DataTable)
-        defaults_table = self.query_one("#defaults-table", DataTable)
+        templates_table = self.query_one("#templates-table", DataTable)
         presets_table = self.query_one("#presets-table", DataTable)
-        for table in (connectors_table, agents_table, watchers_table, defaults_table, presets_table):
+        for table in (connectors_table, agents_table, watchers_table, templates_table, presets_table):
             table.clear(columns=True)
 
         if app.load_error is not None:
+            self._last_validate_result = None
             banner.update(
                 f"[red]✗ config.yaml does not currently load:[/red] {app.load_error}"
             )
@@ -463,6 +596,7 @@ class OverviewScreen(Screen):
 
         cfg = app.editable_config
         result = app.run_validate()
+        self._last_validate_result = result
 
         if result.ok:
             summary = f"[green]✓ valid[/green] — {result.watcher_count} watcher(s)"
@@ -472,8 +606,18 @@ class OverviewScreen(Screen):
             summary = f"[red]✗ {len(result.errors)} error(s)[/red]"
         if result.warnings:
             summary += f", {len(result.warnings)} warning(s)"
-        if app.lint and result.lint_findings:
+        has_lint = app.lint and result.lint_findings
+        if has_lint:
             summary += f", {len(result.lint_findings)} lint finding(s)"
+        # User-reported: the count alone gave no way to find out WHAT to
+        # fix short of running `agent-chat-gateway config validate`
+        # separately — the actual message text (result.errors/warnings/
+        # lint_findings) was computed but never shown anywhere. Only
+        # advertised inline, in the banner itself, when there's actually
+        # something to view — not a permanent footer entry for a key
+        # that's usually a no-op (see the 'v' Binding's own comment).
+        if not result.ok or result.warnings or has_lint:
+            summary += "  [dim](press 'v' to view details)[/dim]"
         banner.update(summary)
 
         status = StatusIndex(result.findings)
@@ -481,13 +625,13 @@ class OverviewScreen(Screen):
         # Each table is populated defensively: run_validate() already caught
         # any GatewayConfig.from_file failure into `result` (shown in the
         # banner above), but several accessors here call the real loader
-        # AGAIN independently (merged_entry/defaults_block/expanded_watchers
-        # all replay _extract_defaults_block, and expanded_watchers() calls
-        # validated_view() -> GatewayConfig.from_file() directly) — the exact
-        # same failure would otherwise raise a second, unhandled time here.
-        # A table that can't be computed shows one row saying so rather than
-        # crashing the whole overview; the banner above already has the
-        # actual error text.
+        # AGAIN independently (merged_entry/templates/expanded_watchers all
+        # replay _parse_templates_block/_resolve_inherits, and
+        # expanded_watchers() calls validated_view() ->
+        # GatewayConfig.from_file() directly) — the exact same failure would
+        # otherwise raise a second, unhandled time here. A table that can't
+        # be computed shows one row saying so rather than crashing the whole
+        # overview; the banner above already has the actual error text.
 
         # Keyed by list POSITION, not by name — unlike agents_raw (a dict,
         # inherently-unique keys) or watchers (names GatewayConfig.from_file
@@ -500,7 +644,7 @@ class OverviewScreen(Screen):
         for i, c in enumerate(cfg.connectors_raw):
             name = c.get("name", "?")
             try:
-                merged = cfg.merged_entry("connector_defaults", c)
+                merged = cfg.merged_entry("connector", c)
             except (ValueError, FileNotFoundError):
                 merged = c
             connectors_table.add_row(
@@ -511,7 +655,7 @@ class OverviewScreen(Screen):
         agents_table.add_columns("Name", "Type", "Command", "Status")
         for name, entry in cfg.agents_raw.items():
             try:
-                merged = cfg.merged_entry("agent_defaults", entry)
+                merged = cfg.merged_entry("agent", entry)
             except (ValueError, FileNotFoundError):
                 merged = entry
             agents_table.add_row(
@@ -538,13 +682,17 @@ class OverviewScreen(Screen):
                     key=w.name,
                 )
 
-        defaults_table.add_columns("Block", "Keys set")
-        for kind in ("connector_defaults", "agent_defaults", "watcher_defaults"):
+        templates_table.add_columns("Kind", "Name", "Fields set", "Used by")
+        for kind in TEMPLATE_KINDS:
             try:
-                block = cfg.defaults_block(kind)
+                templates = cfg.templates(kind)
             except (ValueError, FileNotFoundError):
-                block = {}
-            defaults_table.add_row(kind, str(len(block)), key=kind)
+                templates = {}
+            for name, block in templates.items():
+                used_by = [n for n, _ in find_entries_referencing_template(cfg, kind, name)]
+                templates_table.add_row(
+                    kind, name, str(len(block)), str(len(used_by)), key=f"{kind}:{name}"
+                )
 
         presets_table.add_columns("Name", "Rules")
         for name, rules in cfg.tool_presets_raw.items():
@@ -606,7 +754,12 @@ class OverviewScreen(Screen):
             ew = next((e for e in expanded if e.watcher.name == key), None)
             if ew is not None:
                 self.app.push_screen(WatcherDetailScreen(cfg, ew, mode="view"))
-        elif table_id == "defaults-table":
-            self.app.push_screen(DefaultsScreen(cfg, key, mode="view"))
+        elif table_id == "templates-table":
+            kind, name = key.split(":", 1)
+            # raw_template(), NOT templates() — see action_edit_row()'s
+            # identical comment.
+            entry = cfg.raw_template(kind, name)
+            if entry is not None:
+                self.app.push_screen(TemplateDetailScreen(cfg, kind, name, entry, mode="view"))
         elif table_id == "presets-table":
             self.app.push_screen(ToolPresetsScreen(cfg, key))

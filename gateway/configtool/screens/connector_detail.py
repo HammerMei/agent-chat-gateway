@@ -5,7 +5,7 @@ Connector `raw` is deliberately type-flexible in the schema
 `additionalProperties: false`) — unlike Agent/WatcherDetailScreen, there's
 no single closed field list. The design originally called for a generic
 recursive tree editor to handle arbitrary/unknown keys; **deferred** here in
-favor of per-type fixed field lists (`_FIELDS_BY_TYPE` below), one level of
+favor of per-type fixed field lists (`FIELDS_BY_TYPE` below), one level of
 nesting matching every real connector type's actual raw shape exactly
 (`server.url`, `allowed_users.owners`, etc. — verified against all 4 types'
 own `from_connector_config()` before choosing this). The generic tree editor
@@ -30,15 +30,46 @@ from typing import Literal
 
 from textual import work
 from textual.app import ComposeResult
-from textual.containers import Horizontal, VerticalScroll
-from textual.widgets import Input, Static
+from textual.containers import Container, Horizontal, VerticalScroll
+from textual.css.query import NoMatches
+from textual.widgets import Button, Input, Select, Static
 
 from ..formatting import mask_if_secret, provenance_label
-from ..modals import MessageModal
+from ..modals import (
+    ConfirmModal,
+    InheritsPickerModal,
+    MessageModal,
+    TextPromptModal,
+    TypePickerModal,
+)
 from ..model import EditableConfig
-from .form_common import FieldSpec, FormScreen, apply_update, find_referencing_watcher_labels
+from .form_common import (
+    FieldSpec,
+    FormScreen,
+    apply_update,
+    find_referencing_watcher_labels,
+    widget_id,
+)
+
+# NOTE: TemplateDetailScreen (screens/template_detail.py) is deliberately
+# imported LOCALLY inside _open_inherits_picker() below, not at module level —
+# template_detail.py itself imports FIELDS_BY_TYPE/DATACLASS_DEFAULTS_BY_TYPE
+# from this module, so a module-level import here would be circular.
 
 CONNECTOR_TYPES = ("rocketchat", "mattermost", "voice", "script")
+
+# Shared by both rocketchat and mattermost — gateway/core/agent_chain.py's
+# AgentChainConfig is platform-agnostic and both connectors' *Config
+# dataclasses embed it identically (raw.get("agent_chain", {})). Previously
+# missing from both field lists entirely (user-reported: "I do not see agent
+# chain can be configured in connector template or connector") — a plain
+# gap, not a deliberate cut (docs/agent-chain.md documents it as a first-
+# class, hand-edit-only feature until now).
+_AGENT_CHAIN_FIELDS: tuple[FieldSpec, ...] = (
+    FieldSpec("agent_chain.agent_usernames", "list", "Agent-chain usernames (comma-separated)"),
+    FieldSpec("agent_chain.max_turns", "int", "Agent-chain max turns"),
+    FieldSpec("agent_chain.ttl_seconds", "float", "Agent-chain TTL (seconds)"),
+)
 
 _ROCKETCHAT_FIELDS: tuple[FieldSpec, ...] = (
     FieldSpec("server.url", "str", "Server URL"),
@@ -46,6 +77,7 @@ _ROCKETCHAT_FIELDS: tuple[FieldSpec, ...] = (
     FieldSpec("server.password", "str", "Bot password", secret=True),
     FieldSpec("allowed_users.owners", "list", "Owners (comma-separated)"),
     FieldSpec("allowed_users.guests", "list", "Guests (comma-separated)"),
+    *_AGENT_CHAIN_FIELDS,
     FieldSpec("reply_in_thread", "bool", "Reply in thread"),
     FieldSpec("permission_reply_in_thread", "bool", "Permission replies in thread"),
     FieldSpec("require_mention", "bool", "Require @mention"),
@@ -60,6 +92,7 @@ _MATTERMOST_FIELDS: tuple[FieldSpec, ...] = (
     FieldSpec("server.password", "str", "Bot password", secret=True),
     FieldSpec("allowed_users.owners", "list", "Owners (comma-separated)"),
     FieldSpec("allowed_users.guests", "list", "Guests (comma-separated)"),
+    *_AGENT_CHAIN_FIELDS,
     FieldSpec("reply_in_thread", "bool", "Reply in thread"),
     FieldSpec("permission_reply_in_thread", "bool", "Permission replies in thread"),
     FieldSpec("require_mention", "bool", "Require @mention"),
@@ -74,20 +107,38 @@ _VOICE_FIELDS: tuple[FieldSpec, ...] = (
 )
 _SCRIPT_FIELDS: tuple[FieldSpec, ...] = ()  # ScriptConnector never reads raw
 
-_FIELDS_BY_TYPE: dict[str, tuple[FieldSpec, ...]] = {
+FIELDS_BY_TYPE: dict[str, tuple[FieldSpec, ...]] = {
     "rocketchat": _ROCKETCHAT_FIELDS,
     "mattermost": _MATTERMOST_FIELDS,
     "voice": _VOICE_FIELDS,
     "script": _SCRIPT_FIELDS,
 }
 
+# Mattermost's dual-mode auth (MattermostConfig.__post_init__: exactly one of
+# 'token' or 'username'+'password') used to surface as a plain informational
+# Static line, with the real enforcement left entirely to save()'s
+# validate_config() — user-reported, with the actual error message quoted:
+# "I wonder if we can have a dropdown that select Auth method: token or
+# username... If we can do this, we do not need to add this extra message."
+# _compose_mm_auth_section()/on_select_changed()/_apply_mm_auth_method_exclusivity()
+# below implement that: these 3 fields are pulled out of the uniform
+# _compose_form() loop and rendered under an "Auth method" Select instead,
+# which shows only the active group and force-blanks the inactive one at
+# Save time so the two modes can't collide in the common case. The real
+# validate_config() remains the backstop for edge cases this UI layer can't
+# fully prevent (e.g. a value coming from an inherits: template rather than
+# this entry — see _apply_mm_auth_method_exclusivity()'s docstring).
+_MM_AUTH_FIELD_KEYS = frozenset({"server.token", "server.username", "server.password"})
+
 # Each connector type's own dataclass defaults (gateway/connectors/*/config.py)
 # — used ONLY to prefill the form with the true effective value when a field
-# is set by neither the entry nor connector_defaults.
-_DATACLASS_DEFAULTS_BY_TYPE: dict[str, dict[str, object]] = {
+# is set by neither the entry nor its own inherits: template.
+DATACLASS_DEFAULTS_BY_TYPE: dict[str, dict[str, object]] = {
     "rocketchat": {
         "server.url": "", "server.username": "", "server.password": "",
         "allowed_users.owners": [], "allowed_users.guests": [],
+        "agent_chain.agent_usernames": [], "agent_chain.max_turns": 5,
+        "agent_chain.ttl_seconds": 3600.0,
         "reply_in_thread": False, "permission_reply_in_thread": True,
         "require_mention": True, "filter_sender": True, "timezone": "",
     },
@@ -95,6 +146,8 @@ _DATACLASS_DEFAULTS_BY_TYPE: dict[str, dict[str, object]] = {
         "server.url": "", "server.team": "", "server.token": "",
         "server.username": "", "server.password": "",
         "allowed_users.owners": [], "allowed_users.guests": [],
+        "agent_chain.agent_usernames": [], "agent_chain.max_turns": 5,
+        "agent_chain.ttl_seconds": 3600.0,
         "reply_in_thread": False, "permission_reply_in_thread": True,
         "require_mention": True, "filter_sender": True, "timezone": "",
     },
@@ -106,6 +159,24 @@ _DATACLASS_DEFAULTS_BY_TYPE: dict[str, dict[str, object]] = {
 class ConnectorDetailScreen(FormScreen):
     BODY_ID = "connector-detail-body"
 
+    DEFAULT_CSS = """
+    ConnectorDetailScreen .hidden {
+        display: none;
+    }
+    /* Container's own DEFAULT_CSS is `height: 1fr` (fill available space),
+    not `auto` — user-reported, with a screenshot: the mattermost auth
+    groups' field rows rendered squished/overlapping the row after them,
+    since #mm-auth-token-group/#mm-auth-userpass-group were competing for a
+    FRACTION of the VerticalScroll's space instead of sizing to their own
+    1-2 field rows. Same failure family as `.field-row Input`'s width:1fr
+    override above (a Textual default meant for filling a viewport, wrong
+    for a wrapper around a fixed few rows of content). */
+    ConnectorDetailScreen #mm-auth-token-group,
+    ConnectorDetailScreen #mm-auth-userpass-group {
+        height: auto;
+    }
+    """
+
     def __init__(
         self,
         cfg: EditableConfig,
@@ -116,8 +187,23 @@ class ConnectorDetailScreen(FormScreen):
         self.cfg = cfg
         self.entry = entry
         self.mode = mode
+        # See _open_inherits_picker()/action_save() below. Unlike every
+        # other field, switching this one triggers a full
+        # _recompute_form() (form_common.py) rather than a snapshot-once-
+        # at-open value — see AgentDetailScreen's module docstring for why.
+        self._inherits_initial: str | None = self.cfg.entry_template_name(self.entry)
+        self._inherits_current: str | None = self._inherits_initial
+        # Mattermost-only (see _MM_AUTH_FIELD_KEYS above) — harmless no-op
+        # for every other connector type, which never reads this attribute.
+        self._mm_auth_method: str = self._compute_mm_auth_method()
+        # Whether the user has actually picked a mode THIS session (vs. it
+        # just being whatever _compute_mm_auth_method() inferred from the
+        # existing entry) — see _apply_mm_auth_method_exclusivity()'s
+        # docstring for why this gates the force-clear at Save.
+        self._mm_auth_method_touched = False
         if self.mode != "view":
-            self._compute_initial_values(self.entry)
+            self._compute_initial_values(self._current_entry())
+            self._description_live = self._initial_values.get("description") or ""
             self._populating = True
 
     def _entity_noun(self) -> str:
@@ -125,6 +211,17 @@ class ConnectorDetailScreen(FormScreen):
 
     def _entity_label(self) -> str:
         return self.entry.get("name", "?")
+
+    def _current_entry(self) -> dict:
+        """The PROBE entry: `self.entry` with `inherits:` swapped to
+        whatever the Inherits picker currently has selected — see
+        AgentDetailScreen._current_entry()'s identical docstring for why."""
+        probe = dict(self.entry)
+        if self._inherits_current is None:
+            probe.pop("inherits", None)
+        else:
+            probe["inherits"] = self._inherits_current
+        return probe
 
     def _find_own_index(self) -> int:
         # Matched by object IDENTITY, not equality — connectors_raw is a
@@ -154,49 +251,86 @@ class ConnectorDetailScreen(FormScreen):
         return find_referencing_watcher_labels(self.cfg, connector_name=self._entity_label())
 
     def _on_enter_edit_mode(self) -> None:
-        self._compute_initial_values(self.entry)
+        self._inherits_initial = self.cfg.entry_template_name(self.entry)
+        self._inherits_current = self._inherits_initial
+        self._mm_auth_method = self._compute_mm_auth_method()
+        self._mm_auth_method_touched = False
+        self._compute_initial_values(self._current_entry())
+        self._description_live = self._initial_values.get("description") or ""
 
     def _connector_type(self) -> str:
-        return self.entry.get("type", "rocketchat")
+        # Reads the MERGED type against the LIVE probe (self._current_entry()),
+        # not self.entry directly — a connector whose 'type' comes only from
+        # its inherits: template (never set on the entry itself) still needs
+        # to select the right per-type field list/dataclass-defaults below,
+        # and switching to a DIFFERENT template with a different type must
+        # reshape the form to match (part of the same full _recompute_form()
+        # this whole picker redesign already does for every other field).
+        try:
+            merged = self.cfg.merged_entry("connector", self._current_entry())
+        except (ValueError, FileNotFoundError):
+            merged = self._current_entry()
+        return merged.get("type", "rocketchat")
+
+    def _compute_mm_auth_method(self) -> str:
+        """Which of the two mutually-exclusive credential groups the Auth
+        method Select should show — derived from the MERGED (not raw) entry,
+        same reasoning as `_connector_type()`: a connector whose credentials
+        come only from its `inherits:` template still needs the right group
+        selected. 'token' wins the ambiguous case (both or neither set) —
+        the simpler, no-expiry option `MattermostConfig`'s own docstring
+        lists first."""
+        try:
+            merged = self.cfg.merged_entry("connector", self._current_entry())
+        except (ValueError, FileNotFoundError):
+            merged = self._current_entry()
+        server = merged.get("server") or {}
+        if not server.get("token") and server.get("username") and server.get("password"):
+            return "username_password"
+        return "token"
 
     def _field_specs(self) -> tuple[FieldSpec, ...]:
-        return _FIELDS_BY_TYPE.get(self._connector_type(), ())
+        return FIELDS_BY_TYPE.get(self._connector_type(), ())
 
-    def _defaults_kind(self) -> str:
-        return "connector_defaults"
+    def _template_kind(self) -> str:
+        return "connector"
 
     def _dataclass_defaults(self) -> dict[str, object]:
-        return _DATACLASS_DEFAULTS_BY_TYPE.get(self._connector_type(), {})
+        return DATACLASS_DEFAULTS_BY_TYPE.get(self._connector_type(), {})
 
     # ── view mode ────────────────────────────────────────────────────────────
 
     def _body_text(self) -> str:
         name = self.entry.get("name", "?")
         description = self.entry.get("description")
+        template_name = self.cfg.entry_template_name(self.entry)
         try:
-            merged = self.cfg.merged_entry("connector_defaults", self.entry)
-            type_provenance = self.cfg.field_provenance(
-                "connector_defaults", self.entry, "type"
-            )
+            merged = self.cfg.merged_entry("connector", self.entry)
+            type_provenance = self.cfg.field_provenance("connector", self.entry, "type")
         except (ValueError, FileNotFoundError):
             merged = self.entry
             type_provenance = None
         conn_type = merged.get("type", "?")
 
-        type_suffix = f"  [dim]({provenance_label(type_provenance)})[/dim]" if type_provenance else ""
+        type_suffix = (
+            f"  [dim]({provenance_label(type_provenance, template_name)})[/dim]"
+            if type_provenance
+            else ""
+        )
         lines = [f"[bold]{name}[/bold]  (type: {conn_type}){type_suffix}"]
         if description:
             lines.append(f"[dim]{description}[/dim]")
+        lines.append(f"inherits: {template_name if template_name else '(none)'}")
         lines.append("")
 
         # 'type' itself is shown in the header above (with its own provenance
         # marker); everything else is a plain dump of this entry's OWN raw
-        # fields — connector_defaults values that this entry simply inherits
+        # fields — inherits: template values that this entry simply inherits
         # (and never overrides) are intentionally not repeated here, since
         # raw is type-flexible and there's no fixed field list to merge
         # against field-by-field the way agent/watcher detail screens do.
         for key, value in self.entry.items():
-            if key in ("name", "type", "description"):
+            if key in ("name", "type", "description", "inherits"):
                 continue
             lines.append(self._render_field(key, value, indent=0))
         return "\n".join(lines)
@@ -222,7 +356,9 @@ class ConnectorDetailScreen(FormScreen):
                 yield Static(f"[bold]New {conn_type} connector[/bold]")
                 with Horizontal(classes="field-row"):
                     yield Static("Name", classes="field-label")
-                    yield Input(id="field-name", placeholder="connector name")
+                    yield Input(
+                        id="field-name", value=self._name_live, placeholder="connector name"
+                    )
             else:
                 name = self.entry.get("name", "?")
                 yield Static(f"[bold]{name}[/bold]  (type: {conn_type}, editing)")
@@ -231,18 +367,17 @@ class ConnectorDetailScreen(FormScreen):
                 yield Static("Description", classes="field-label")
                 yield Input(
                     id="field-description",
-                    value=self._initial_values.get("description") or "",
+                    value=self._description_live,
                 )
 
-            if conn_type == "mattermost":
-                # UX guidance only — save()'s validate_config() (which runs
-                # the real MattermostConfig.__post_init__) is the actual
-                # enforcement, not reimplemented here.
+            with Horizontal(classes="field-row"):
+                yield Static("Inherits", classes="field-label")
                 yield Static(
-                    "[yellow]Configure EITHER 'API token' OR 'username' + "
-                    "'password' below — not both, not neither. Saving with "
-                    "the wrong combination shows a validation error.[/yellow]"
+                    self._inherits_current or "(none)",
+                    id="inherits-value",
+                    classes="field-value",
                 )
+                yield Button("Change…", id="inherits-change-button")
 
             if not self._field_specs():
                 yield Static(
@@ -251,7 +386,196 @@ class ConnectorDetailScreen(FormScreen):
                 )
 
             for spec in self._field_specs():
-                yield from self._compose_field_row(spec, self.entry)
+                if conn_type == "mattermost" and spec.key in _MM_AUTH_FIELD_KEYS:
+                    continue  # composed specially by _compose_mm_auth_section() below
+                yield from self._compose_field_row(spec, self._current_entry())
+                if conn_type == "mattermost" and spec.key == "server.team":
+                    yield from self._compose_mm_auth_section()
+
+    def _compose_mm_auth_section(self) -> ComposeResult:
+        """Mattermost's dual-mode auth (token XOR username+password) — see
+        _MM_AUTH_FIELD_KEYS's module-level comment for the full rationale.
+        Both credential groups are always composed (so _collect_field_updates()/
+        _any_field_overridden(), which iterate _field_specs() uniformly, keep
+        working unmodified) but only the ACTIVE one is visible; the inactive
+        one is hidden via the `.hidden` CSS class, not skipped entirely."""
+        with Horizontal(classes="field-row"):
+            yield Static("Auth method", classes="field-label")
+            yield Select(
+                [("API token", "token"), ("Username + password", "username_password")],
+                value=self._mm_auth_method,
+                allow_blank=False,
+                id="mm-auth-method-select",
+            )
+        specs_by_key = {spec.key: spec for spec in self._field_specs()}
+        with Container(
+            id="mm-auth-token-group",
+            classes="" if self._mm_auth_method == "token" else "hidden",
+        ):
+            yield from self._compose_field_row(specs_by_key["server.token"], self._current_entry())
+        with Container(
+            id="mm-auth-userpass-group",
+            classes="" if self._mm_auth_method == "username_password" else "hidden",
+        ):
+            yield from self._compose_field_row(
+                specs_by_key["server.username"], self._current_entry()
+            )
+            yield from self._compose_field_row(
+                specs_by_key["server.password"], self._current_entry()
+            )
+
+    # ── mattermost auth-method toggle ────────────────────────────────────────
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if (event.select.id or "") == "mm-auth-method-select":
+            # Select fires Changed once at initial mount too (module
+            # docstring's "Textual gotcha") — guarded the same way every
+            # other field's on_*_changed handler already is, so opening the
+            # form doesn't spuriously mark it dirty.
+            if self._populating:
+                return
+            self._mm_auth_method = event.value
+            self._mm_auth_method_touched = True
+            self._update_mm_auth_visibility()
+            self._form_dirty = True
+            return
+        super().on_select_changed(event)
+
+    def _update_mm_auth_visibility(self) -> None:
+        try:
+            token_group = self.query_one("#mm-auth-token-group")
+            userpass_group = self.query_one("#mm-auth-userpass-group")
+        except NoMatches:
+            return
+        token_group.display = self._mm_auth_method == "token"
+        userpass_group.display = self._mm_auth_method == "username_password"
+
+    def _apply_mm_auth_method_exclusivity(self) -> None:
+        """Called at the top of action_save() when the user has actually
+        picked a mode THIS session (`self._mm_auth_method_touched` — see
+        action_save()'s guard): force-blank the now-INACTIVE group's Input
+        widgets before _collect_field_updates() reads them, so a value left
+        over from BEFORE the switch never gets silently saved alongside the
+        newly-active group.
+
+        Gated on `_mm_auth_method_touched` specifically to avoid a real,
+        found-via-review data-loss bug: a hidden field's widget can ONLY
+        hold a non-blank value the user never typed if it was already there
+        when the form opened (Textual's focus chain skips `display: none`
+        widgets, so the inactive group literally cannot be edited through
+        this UI). If a pre-existing, already-invalid entry has BOTH token
+        AND username+password set (e.g. hand-edited, or a half-finished
+        migration between modes — `_compute_mm_auth_method()` picks 'token'
+        for that ambiguous case), saving an UNRELATED field with this method
+        unconditionally applied would silently delete the username/password
+        the user never touched or even necessarily knew was still there.
+        Only force-clearing after a deliberate Select change confines the
+        blast radius to what the user actually asked to happen. Blanking
+        writes an explicit "revert to inherited" (see apply_update()'s
+        docstring), not an explicit empty override — if the INACTIVE
+        group's effective value actually comes from an inherits: template
+        rather than this entry, that template value stays in effect and
+        save()'s validate_config() (the real MattermostConfig.__post_init__)
+        remains the backstop, exactly as it already was before this Select
+        existed."""
+        try:
+            token_input = self.query_one("#" + widget_id("server.token"), Input)
+            username_input = self.query_one("#" + widget_id("server.username"), Input)
+            password_input = self.query_one("#" + widget_id("server.password"), Input)
+        except NoMatches:
+            return
+        if self._mm_auth_method == "token":
+            username_input.value = ""
+            password_input.value = ""
+        else:
+            token_input.value = ""
+
+    # ── inherits: picker ─────────────────────────────────────────────────────
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if (event.button.id or "") == "inherits-change-button":
+            self._open_inherits_picker()
+
+    @work
+    async def _open_inherits_picker(self) -> None:
+        if self.mode == "view":
+            return
+        template_names = sorted(self.cfg.templates("connector"))
+        choice = await self.app.push_screen_wait(
+            InheritsPickerModal(template_names, self._inherits_current)
+        )
+        if choice is None:
+            return
+        kind, name = choice
+
+        if kind == "template":
+            new_value = name
+        elif kind == "none":
+            new_value = None
+        elif kind == "new_template":
+            # One-way detour, not a return-with-result flow — same precedent
+            # as AgentDetailScreen._open_inherits_picker()'s "new_template"
+            # branch. Connector templates always pick a type up front (this
+            # screen has no generic tree editor — see module docstring), so
+            # prompt for one before the name, same order
+            # OverviewScreen.action_new_entity() uses for a brand-new
+            # connector.
+            new_type = await self.app.push_screen_wait(
+                TypePickerModal("New connector template — pick a type", list(CONNECTOR_TYPES))
+            )
+            if new_type is None:
+                return
+            new_name = await self.app.push_screen_wait(
+                TextPromptModal("New connector template — name")
+            )
+            if new_name is None:
+                return
+            if new_name in self.cfg.templates("connector"):
+                await self.app.push_screen_wait(
+                    MessageModal(
+                        f"A connector template named '{new_name}' already exists.",
+                        title="Could not create",
+                    )
+                )
+                return
+            from .template_detail import TemplateDetailScreen
+
+            self.app.push_screen(
+                TemplateDetailScreen(
+                    self.cfg, "connector", new_name, {"type": new_type}, mode="create"
+                )
+            )
+            return
+        else:
+            return
+
+        if new_value == self._inherits_current:
+            return  # no actual change — nothing to warn about or recompute
+
+        if self._any_field_overridden():
+            confirmed = await self.app.push_screen_wait(
+                ConfirmModal(
+                    "Switching templates will reset any unsaved edits to "
+                    "the fields below back to the new template's values. "
+                    "Continue?",
+                    confirm_label="Switch",
+                )
+            )
+            if not confirmed:
+                return
+
+        self._inherits_current = new_value
+        # A different template can change 'type' entirely (rocketchat has no
+        # dual-auth concept at all) or bring its own token/username/password
+        # values — recompute which auth-method group should show BEFORE
+        # _recompute_form() rebuilds the form around the new merged entry.
+        # Also resets the "touched" flag: this is a fresh baseline reflecting
+        # the NEW template, not a deliberate in-session exclusivity choice —
+        # see _apply_mm_auth_method_exclusivity()'s docstring.
+        self._mm_auth_method = self._compute_mm_auth_method()
+        self._mm_auth_method_touched = False
+        await self._recompute_form()
+        self._form_dirty = True
 
     # ── save ─────────────────────────────────────────────────────────────────
 
@@ -259,6 +583,9 @@ class ConnectorDetailScreen(FormScreen):
     async def action_save(self) -> None:
         if self.mode == "view":
             return
+
+        if self._connector_type() == "mattermost" and self._mm_auth_method_touched:
+            self._apply_mm_auth_method_exclusivity()
 
         updates = self._collect_field_updates()
         if updates is None:
@@ -294,6 +621,13 @@ class ConnectorDetailScreen(FormScreen):
         target_entry = dict(self.entry)
         for key, value in updates.items():
             apply_update(target_entry, key, value)
+
+        # inherits: lives outside the FieldSpec/apply_update() pipeline (it's
+        # driven by InheritsPickerModal, not an Input/Checkbox/Select widget)
+        # — diffed here directly against the snapshot taken when the form
+        # opened (or last re-entered edit mode).
+        if self._inherits_current != self._inherits_initial:
+            apply_update(target_entry, "inherits", self._inherits_current)
 
         inserted_index: int | None = None
         if self.mode == "create":

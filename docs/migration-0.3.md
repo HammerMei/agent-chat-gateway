@@ -169,9 +169,10 @@ watchers:
   per-agent); "is everything required actually present" is still checked
   only once, on the fully-resolved (template ∪ entry) value.
 - `tool_presets:`, `rooms:`, and everything else from v0.2 is unchanged.
-- **The config TUI** (`agent-chat-gateway config`) has a known, deliberate
-  gap here: its own `agent_defaults`/`connector_defaults`/`watcher_defaults`
-  editing screens have not yet been updated to understand
-  `*_templates:`/`inherits:` — reconciling them is tracked separately. Until
-  then, prefer `agent-chat-gateway config validate` or hand-editing
-  config.yaml directly for anything involving templates.
+- **The config TUI** (`agent-chat-gateway config`) fully understands
+  `*_templates:`/`inherits:` — a "Templates" tab lists named templates
+  across all three kinds with full create/edit/delete, and every agent/
+  connector entry has an Inherits picker to set/change/clear which template
+  it opts into. (This was a real, temporary gap right after the engine
+  change above shipped — see `docs/design/config-tool.md` for how it was
+  closed.)

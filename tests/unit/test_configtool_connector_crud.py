@@ -15,10 +15,15 @@ from pathlib import Path
 
 import pytest
 import yaml
-from textual.widgets import DataTable, Input
+from textual.widgets import Checkbox, DataTable, Input, Select, Static
 
 from gateway.configtool.app import ConfigToolApp
-from gateway.configtool.modals import ConfirmModal, MessageModal, TypePickerModal
+from gateway.configtool.modals import (
+    ConfirmModal,
+    InheritsPickerModal,
+    MessageModal,
+    TypePickerModal,
+)
 from gateway.configtool.screens.connector_detail import ConnectorDetailScreen
 from gateway.configtool.screens.overview import OverviewScreen
 
@@ -27,21 +32,6 @@ def _write_config(tmp_path: Path, yaml_text: str) -> str:
     path = tmp_path / "config.yaml"
     path.write_text(textwrap.dedent(yaml_text))
     return str(path)
-
-
-# v0.3 removed the global connector_defaults: block from the real loader (see
-# docs/migration-0.3.md) in favor of named connector_templates:/inherits:.
-# The config TUI's own ConnectorDetailScreen still resolves the "effective/
-# inherited value" against the OLD hardcoded "connector_defaults" kind string
-# by design (see docs/design/config-tool.md) — a test whose whole premise is
-# "a field INHERITED (not explicit) from a shared default stays inherited
-# when untouched" has no way to set up a genuinely inherited starting point
-# anymore, so it's skipped with this reason rather than given a fixture that
-# would silently test something else.
-_STALE_DEFAULTS_SKIP_REASON = (
-    "TUI *_defaults display deferred -- config engine moved to "
-    "*_templates/inherits, see docs/design/config-tool.md"
-)
 
 
 @pytest.fixture
@@ -214,12 +204,168 @@ class TestCreateConnector:
             assert isinstance(app.screen, ConnectorDetailScreen)
             assert app.screen.mode == "create"
 
-    async def test_mattermost_auth_xor_violation_fails_save_and_rolls_back(
+    async def test_mattermost_auth_method_select_defaults_to_token_with_userpass_hidden(
         self, tmp_path, work_dir
     ):
-        """Configuring BOTH token and username/password violates
-        MattermostConfig.__post_init__ — validate_config() (run by save())
-        is the real enforcement; the form doesn't reimplement it."""
+        """A brand-new mattermost connector has neither credential set yet —
+        _compute_mm_auth_method() defaults to 'token' (the simpler, no-
+        expiry option MattermostConfig's own docstring lists first)."""
+        config_path = _write_config(tmp_path, _config_with_one_rocketchat_connector(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_type_picker_for_connectors(pilot, app)
+            await pilot.press("down", "enter")  # mattermost
+            await pilot.pause()
+
+            select = app.screen.query_one("#mm-auth-method-select", Select)
+            assert select.value == "token"
+            assert app.screen.query_one("#mm-auth-token-group").display is True
+            assert app.screen.query_one("#mm-auth-userpass-group").display is False
+
+    async def test_mm_auth_groups_dont_overlap_the_field_after_them(self, tmp_path, work_dir):
+        """Real layout bug, caught via a user screenshot: Container's own
+        DEFAULT_CSS is `height: 1fr` (fill available space), not `auto` —
+        #mm-auth-token-group/#mm-auth-userpass-group were competing for a
+        FRACTION of the VerticalScroll's space instead of sizing to their
+        own 1-2 field rows, squishing/overlapping the row that comes right
+        after (Owners). Fixed with an explicit `height: auto` override on
+        both groups in ConnectorDetailScreen.DEFAULT_CSS."""
+        config_path = _write_config(
+            tmp_path,
+            f"""\
+            agents:
+              default:
+                type: claude
+                working_directory: {work_dir}
+            connectors:
+              - name: mm
+                type: mattermost
+                server: {{url: "http://mm.local", team: t, username: glin, password: pw}}
+                allowed_users: {{owners: [glin, josie]}}
+            watchers:
+              - connector: mm
+                agent: default
+                room: general
+            """,
+        )
+        app = ConfigToolApp(config_path)
+        async with app.run_test(size=(120, 50)) as pilot:
+            await pilot.pause()
+            await _open_connector_in_edit_mode(pilot, app)
+
+            password_input = app.screen.query_one("#field-server-password", Input)
+            owners_label = next(
+                w
+                for w in app.screen.query(".field-label")
+                if str(w.render()).strip().startswith("Owners")
+            )
+            assert (
+                password_input.region.y + password_input.region.height
+                <= owners_label.region.y
+            )
+
+    async def test_switching_auth_method_clears_the_other_groups_fields_on_save(
+        self, tmp_path, work_dir
+    ):
+        """The Auth method Select (not what's still sitting in a hidden
+        Input) is the single source of truth for which credential group is
+        active — user-reported request: a dropdown that shows only the
+        relevant fields so the 'not both, not neither' validation message
+        is never needed in the common case. Typing a token, then switching
+        to username+password, must not silently save the stale token
+        alongside the new credentials."""
+        config_path = _write_config(tmp_path, _config_with_one_rocketchat_connector(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_type_picker_for_connectors(pilot, app)
+            await pilot.press("down", "enter")  # mattermost
+            await pilot.pause()
+
+            app.screen.query_one("#field-name", Input).value = "mm-new"
+            app.screen.query_one("#field-server-url", Input).value = "http://mm.local"
+            app.screen.query_one("#field-server-team", Input).value = "team"
+            app.screen.query_one("#field-server-token", Input).value = "stale-token"
+            await pilot.pause()
+
+            select = app.screen.query_one("#mm-auth-method-select", Select)
+            select.value = "username_password"
+            await pilot.pause()
+            assert app.screen.query_one("#mm-auth-token-group").display is False
+            assert app.screen.query_one("#mm-auth-userpass-group").display is True
+
+            app.screen.query_one("#field-server-username", Input).value = "u"
+            app.screen.query_one("#field-server-password", Input).value = "p"
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            raw = yaml.safe_load(Path(config_path).read_text())
+            server = next(c for c in raw["connectors"] if c["name"] == "mm-new")["server"]
+            assert server == {"url": "http://mm.local", "team": "team", "username": "u", "password": "p"}
+            assert "token" not in server
+
+    async def test_saving_an_unrelated_field_never_touches_auth_fields_the_user_didnt_edit(
+        self, tmp_path, work_dir
+    ):
+        """Regression, found by an independent review pass: a pre-existing
+        (already-invalid) entry with BOTH 'token' and 'username'+'password'
+        set (e.g. hand-edited, or a half-finished migration between modes)
+        opens with the Auth method Select defaulting to 'token' (the
+        ambiguous-case tie-break) and the username/password group hidden —
+        but still holding its real values underneath. Saving an UNRELATED
+        change (never touching the Select) must NOT force-clear the hidden
+        group: _apply_mm_auth_method_exclusivity() only runs when the user
+        has actually picked a mode this session, precisely to avoid a
+        first-cut version of this feature silently deleting credentials
+        nobody asked to change."""
+        config_path = _write_config(
+            tmp_path,
+            f"""\
+            agents:
+              default:
+                type: claude
+                working_directory: {work_dir}
+            connectors:
+              - name: mm-both
+                type: mattermost
+                server: {{url: "http://mm.local", team: t, token: "old-stale-token",
+                          username: bob, password: pw123}}
+            watchers:
+              - connector: mm-both
+                agent: default
+                room: general
+            """,
+        )
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_connector_in_edit_mode(pilot, app)
+
+            select = app.screen.query_one("#mm-auth-method-select", Select)
+            assert select.value == "token"  # ambiguous-case tie-break
+
+            checkbox = app.screen.query_one("#field-reply_in_thread", Checkbox)
+            checkbox.value = not checkbox.value
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            raw = yaml.safe_load(Path(config_path).read_text())
+            server = raw["connectors"][0]["server"]
+            assert server["token"] == "old-stale-token"
+            assert server["username"] == "bob"
+            assert server["password"] == "pw123"
+
+    async def test_neither_auth_field_filled_still_fails_the_real_validation(
+        self, tmp_path, work_dir
+    ):
+        """The Select narrows the common case down to one valid shape, but
+        it can't force the user to actually fill the active group in —
+        validate_config() (MattermostConfig.__post_init__) remains the real
+        backstop for 'neither configured', exactly as before this Select
+        existed."""
         config_path = _write_config(tmp_path, _config_with_one_rocketchat_connector(work_dir))
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
@@ -231,9 +377,7 @@ class TestCreateConnector:
             app.screen.query_one("#field-name", Input).value = "mm-bad"
             app.screen.query_one("#field-server-url", Input).value = "http://mm.local"
             app.screen.query_one("#field-server-team", Input).value = "team"
-            app.screen.query_one("#field-server-token", Input).value = "tok"
-            app.screen.query_one("#field-server-username", Input).value = "u"
-            app.screen.query_one("#field-server-password", Input).value = "p"
+            # Auth method defaults to 'token', left blank — neither mode configured.
             await pilot.pause()
             await pilot.press("ctrl+s")
             await pilot.pause()
@@ -340,23 +484,24 @@ class TestEditConnector:
             raw = yaml.safe_load(Path(config_path).read_text())
             assert raw["connectors"][0]["allowed_users"]["owners"] == ["alice", "bob"]
 
-    @pytest.mark.skip(reason=_STALE_DEFAULTS_SKIP_REASON)
     async def test_untouched_fields_are_not_written_as_explicit(self, tmp_path, work_dir):
-        """Regression for decision 2: connector_defaults-inherited fields
-        must stay inherited if the form is opened and something ELSE is
-        changed — displaying a merged/effective value must not itself count
-        as "explicit"."""
+        """Regression for decision 2: inherits:-template fields must stay
+        inherited if the form is opened and something ELSE is changed —
+        displaying a merged/effective value must not itself count as
+        "explicit"."""
         config_path = _write_config(
             tmp_path,
             f"""\
-                connector_defaults:
-                  require_mention: false
+                connector_templates:
+                  standard:
+                    require_mention: false
                 agents:
                   default:
                     type: claude
                     working_directory: {work_dir}
                 connectors:
                   - name: rc-existing
+                    inherits: standard
                     type: rocketchat
                     server: {{url: "http://localhost:3000", username: bot, password: pw}}
                 watchers:
@@ -371,7 +516,7 @@ class TestEditConnector:
             await _open_connector_in_edit_mode(pilot, app)
 
             require_mention = app.screen.query_one("#field-require_mention")
-            assert require_mention.value is False  # inherited from connector_defaults
+            assert require_mention.value is False  # inherited from connector_templates.standard
 
             app.screen.query_one("#field-timezone", Input).value = "America/Los_Angeles"
             await pilot.pause()
@@ -383,6 +528,46 @@ class TestEditConnector:
             assert connector["timezone"] == "America/Los_Angeles"
             assert "require_mention" not in connector  # still inherited, not explicit
 
+    async def test_type_from_template_only_still_shows_the_right_type_specific_fields(
+        self, tmp_path, work_dir
+    ):
+        """Regression for `_connector_type()`'s merge fix: a connector whose
+        `type` is set ONLY via its `inherits:` template (never on the raw
+        entry itself) must still pick the correct per-type field list in
+        edit mode — before the fix, `_connector_type()` read the RAW entry
+        directly and fell back to the wrong type ('rocketchat' regardless),
+        picking `rocketchat`'s fields even for a mattermost connector."""
+        config_path = _write_config(
+            tmp_path,
+            f"""\
+                connector_templates:
+                  standard:
+                    type: mattermost
+                agents:
+                  default:
+                    type: claude
+                    working_directory: {work_dir}
+                connectors:
+                  - name: mm-existing
+                    inherits: standard
+                    server: {{url: "http://localhost:3000", team: t, username: bot, password: pw}}
+                watchers:
+                  - connector: mm-existing
+                    agent: default
+                    room: general
+            """,
+        )
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_connector_in_edit_mode(pilot, app)
+
+            assert isinstance(app.screen, ConnectorDetailScreen)
+            # 'server.team' is mattermost-only (never in rocketchat's field
+            # list) — its presence here proves the merged (not raw) type
+            # was used to pick the field list.
+            assert app.screen.query_one("#field-server-team", Input).value == "t"
+
     async def test_a_save_that_fails_validate_config_does_not_mutate_the_live_entry(
         self, tmp_path, work_dir
     ):
@@ -391,11 +576,11 @@ class TestEditConnector:
         object already living in cfg.document), so a rejected save still
         left the invalid data sitting in memory (and, if Back was pressed
         without a further successful save, visibly shown). Clearing the
-        password field reverts it to inherited (empty, since no
-        connector_defaults sets it) — _check_connectors then rejects the
-        empty password, and BOTH the password clear AND the unrelated
-        username change made in the same edit session must roll back
-        together, atomically."""
+        password field reverts it to inherited (empty, since this connector
+        has no inherits: template setting it) — _check_connectors then
+        rejects the empty password, and BOTH the password clear AND the
+        unrelated username change made in the same edit session must roll
+        back together, atomically."""
         config_path = _write_config(tmp_path, _config_with_one_rocketchat_connector(work_dir))
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
@@ -617,3 +802,116 @@ class TestPasswordVisibilityToggle:
             await pilot.press("ctrl+t")  # must not raise
             await pilot.pause()
             assert url_input.password is False
+
+
+def _config_with_two_connector_templates(work_dir: Path) -> str:
+    """'standard' (rocketchat) and 'other' (mattermost) — sorted order is
+    'other' before 'standard', so InheritsPickerModal's ListView is:
+    0=(none), 1=other, 2=standard, 3=(new template)."""
+    return f"""\
+        connector_templates:
+          standard:
+            type: rocketchat
+            require_mention: false
+          other:
+            type: mattermost
+            require_mention: true
+        agents:
+          default:
+            type: claude
+            working_directory: {work_dir}
+        connectors:
+          - name: rc-existing
+            inherits: standard
+            server: {{url: "http://localhost:3000", username: bot, password: pw}}
+        watchers:
+          - connector: rc-existing
+            agent: default
+            room: general
+    """
+
+
+async def _click_inherits_button(pilot, app) -> None:
+    button = app.screen.query_one("#inherits-change-button")
+    button.scroll_visible(animate=False)
+    await pilot.pause()
+    await pilot.click("#inherits-change-button")
+    await pilot.pause()
+
+
+class TestConnectorInheritsPicker:
+    """Same Inherits-button redesign as AgentDetailScreen (see its own
+    TestInheritsPicker for the fuller coverage) — this class only pins the
+    connector-specific wrinkle: switching to a template with a DIFFERENT
+    `type` must reshape the form to that type's own field list."""
+
+    async def test_inherits_button_opens_the_picker(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _config_with_two_connector_templates(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_connector_in_edit_mode(pilot, app)
+            assert str(app.screen.query_one("#inherits-value", Static).render()) == "standard"
+
+            await _click_inherits_button(pilot, app)
+            assert isinstance(app.screen, InheritsPickerModal)
+
+    async def test_switching_to_a_different_type_template_reshapes_the_form(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _config_with_two_connector_templates(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_connector_in_edit_mode(pilot, app)
+            assert app.screen.query_one("#field-require_mention")
+            assert not app.screen.query("#field-server-team")  # rocketchat has no 'team'
+
+            await _click_inherits_button(pilot, app)
+            await pilot.press("down", "enter")  # 'other' (mattermost)
+            await pilot.pause()
+
+            assert isinstance(app.screen, ConnectorDetailScreen)  # no confirm — nothing overridden
+            assert str(app.screen.query_one("#inherits-value", Static).render()) == "other"
+            # mattermost-only field now present — the form reshaped to match.
+            assert app.screen.query_one("#field-server-team")
+            assert app.screen.query_one("#field-require_mention", Checkbox).value is True
+
+    async def test_picking_a_template_does_not_clear_the_description(self, tmp_path, work_dir):
+        """User-reported (same bug as AgentDetailScreen's own version of
+        this test): typing a Description then picking a template via the
+        Inherits button cleared it. No `*_templates:` block has a
+        description of its own to deep-merge in, so _recompute_form()
+        rebuilding the whole form around the newly selected template must
+        not touch it."""
+        config_path = _write_config(tmp_path, _config_with_two_connector_templates(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_connector_in_edit_mode(pilot, app)
+
+            app.screen.query_one("#field-description", Input).value = "edited description"
+            await pilot.pause()
+
+            await _click_inherits_button(pilot, app)
+            await pilot.press("down", "enter")  # 'other'
+            await pilot.pause()
+
+            assert isinstance(app.screen, ConnectorDetailScreen)
+            assert app.screen.query_one("#field-description", Input).value == "edited description"
+
+    async def test_switching_with_an_overridden_field_confirms_first(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _config_with_two_connector_templates(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_connector_in_edit_mode(pilot, app)
+
+            app.screen.query_one("#field-timezone", Input).value = "America/Los_Angeles"
+            await pilot.pause()
+
+            await _click_inherits_button(pilot, app)
+            await pilot.press("down", "enter")  # 'other'
+            await pilot.pause()
+
+            assert isinstance(app.screen, ConfirmModal)
