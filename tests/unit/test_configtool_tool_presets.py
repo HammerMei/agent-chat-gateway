@@ -91,6 +91,80 @@ class TestToolPresetsScreenView:
             header = str(app.screen.query_one("#preset-detail-body", Static).render())
             assert "agent-a" in header
 
+    async def test_the_rules_list_is_focused_on_mount_with_no_tab_needed(
+        self, tmp_path, work_dir
+    ):
+        """User-reported: landing here required an explicit Tab press
+        before 'a'/'e'/'d' or the arrow keys did anything — DOM focus
+        started on nothing in particular. Covers BOTH a preset with rules
+        already in it and a brand-new, still-empty one (pushed via
+        OverviewScreen.action_new_entity()'s "new preset" flow) — a
+        focused, empty ListView is still a valid, useful state ('a' adds
+        the first rule)."""
+        config_path = _write_config(tmp_path, _config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_preset_detail(pilot, app, row=0)  # preset-a, has 1 rule
+
+            list_view = app.screen.query_one("#preset-rules-list", ListView)
+            assert list_view.has_focus
+
+            # No Tab press — 'd' should act immediately.
+            await pilot.press("d")
+            await pilot.pause()
+            assert len(list_view.children) == 0
+
+    async def test_selection_survives_a_refresh_not_just_initial_mount(
+        self, tmp_path, work_dir
+    ):
+        """PR review finding: the row-0 auto-select must live in
+        _refresh_rules() itself, not just on_mount() — `ListView.clear()`
+        (called by every add/edit/delete, via _refresh_rules()) resets
+        `.index` back to None, and re-appending items afterward does NOT
+        restore an auto-selection. Fixing this only in on_mount() made the
+        FIRST entry into this screen work, but the exact same "nothing
+        selected, 'd'/'e' silently no-op" bug reappeared after the very
+        first mutation — reproduced here by adding a rule, then deleting
+        immediately with no navigation keypress in between."""
+        config_path = _write_config(tmp_path, _config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_preset_detail(pilot, app, row=0)  # preset-a, has 1 rule
+
+            await pilot.press("a")
+            await pilot.pause()
+            app.screen.query_one("#rule-tool", Input).value = "Edit"
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+
+            list_view = app.screen.query_one("#preset-rules-list", ListView)
+            assert len(list_view.children) == 2
+
+            # No manual navigation — 'd' should still act immediately,
+            # matching what test_the_rules_list_is_focused_on_mount_with_no_
+            # tab_needed already pins for the very first entry.
+            await pilot.press("d")
+            await pilot.pause()
+            assert len(list_view.children) == 1
+
+    async def test_the_rules_list_is_focused_on_mount_when_empty(self, tmp_path, work_dir):
+        text = _config_text(work_dir).replace(
+            "tool_presets:\n          preset-a:\n            - tool: Bash\n"
+            '              params: "ls .*"\n',
+            "tool_presets:\n          preset-a: []\n",
+        )
+        config_path = _write_config(tmp_path, text)
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_preset_detail(pilot, app, row=0)  # preset-a, empty
+
+            list_view = app.screen.query_one("#preset-rules-list", ListView)
+            assert list_view.has_focus
+
 
 class TestToolPresetsScreenAddRule:
     async def test_add_rule_persists_to_disk_and_shows_in_the_list(self, tmp_path, work_dir):

@@ -22,6 +22,7 @@ from gateway.configtool.modals import ConfirmModal, MessageModal
 from gateway.configtool.screens.agent_detail import AgentDetailScreen
 from gateway.configtool.screens.connector_detail import ConnectorDetailScreen
 from gateway.configtool.screens.overview import OverviewScreen
+from gateway.configtool.screens.tool_presets import ToolPresetsScreen
 
 
 def _write_config(tmp_path: Path, yaml_text: str) -> str:
@@ -75,6 +76,26 @@ def _config_with_two_agents(work_dir: Path) -> str:
         watchers:
           - connector: rc
             agent: existing-agent
+            room: general
+    """
+
+
+def _config_with_a_preset(work_dir: Path) -> str:
+    return f"""\
+        tool_presets:
+          preset-a:
+            - tool: Bash
+        agents:
+          default:
+            type: claude
+            working_directory: {work_dir}
+        connectors:
+          - name: rc
+            type: rocketchat
+            server: {{url: "http://localhost:3000", username: bot, password: pw}}
+        watchers:
+          - connector: rc
+            agent: default
             room: general
     """
 
@@ -170,6 +191,31 @@ class TestDirectEditFromAgentsList:
             assert app.screen.agent_name == "unused-agent"
 
 
+class TestDirectEditFromPresetsList:
+    """User-requested, for consistency with every other tab having an 'e'
+    shortcut: ToolPresetsScreen has no separate view/edit mode at all (see
+    its own module docstring), so 'e' here is just an alias for Enter —
+    unlike the Connectors/Agents tabs' 'e', which skips a real view-mode
+    detour."""
+
+    async def test_e_on_presets_tab_opens_the_same_screen_as_enter(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _config_with_a_preset(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.screen.query_one("TabbedContent").active = "tab-presets"
+            await pilot.pause()
+            table = app.screen.query_one("#presets-table", DataTable)
+            table.focus()
+            table.move_cursor(row=0)
+
+            await pilot.press("e")
+            await pilot.pause()
+
+            assert isinstance(app.screen, ToolPresetsScreen)
+            assert app.screen.preset_name == "preset-a"
+
+
 class TestEditDeleteHiddenOnUnsupportedTabs:
     async def test_e_and_d_are_hidden_from_the_footer_on_watchers_tab(self, tmp_path, work_dir):
         config_path = _write_config(tmp_path, _config_with_two_connectors(work_dir))
@@ -187,6 +233,17 @@ class TestEditDeleteHiddenOnUnsupportedTabs:
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
+            assert app.screen.check_action("edit_row", ()) is True
+            assert app.screen.check_action("delete_row", ()) is True
+
+    async def test_e_and_d_are_visible_on_presets_tab(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _config_with_a_preset(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.screen.query_one("TabbedContent").active = "tab-presets"
+            await pilot.pause()
+
             assert app.screen.check_action("edit_row", ()) is True
             assert app.screen.check_action("delete_row", ()) is True
 

@@ -192,18 +192,20 @@ class OverviewScreen(Screen):
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         """Hide 'Edit' from the footer on tabs that don't support it at all
-        (Watchers — Phase 3; Tool Presets has no separate "edit mode" to
-        enter, see tool_presets.py). Templates is fully editable/deletable
-        now (every kind is a real, named, creatable entity — no more
-        per-kind "nothing editable yet" gate the old Defaults tab needed for
-        connector_defaults). 'Delete' additionally supports Tool Presets
-        (deletes the whole preset, not a rule) and Templates (deletes the
-        whole template, not a field — see action_delete_row() below) so the
-        footer never advertises a key that would just notify "not supported
-        yet"."""
+        (Watchers — Phase 3). Templates is fully editable/deletable now
+        (every kind is a real, named, creatable entity — no more per-kind
+        "nothing editable yet" gate the old Defaults tab needed for
+        connector_defaults). Tool Presets: user-requested, for consistency
+        with every other tab — 'e' here is just an alias for Enter (see
+        action_edit_row()'s own docstring; ToolPresetsScreen still has no
+        separate "edit mode" to enter, see tool_presets.py). 'Delete'
+        additionally supports Tool Presets (deletes the whole preset, not a
+        rule) and Templates (deletes the whole template, not a field — see
+        action_delete_row() below) so the footer never advertises a key
+        that would just notify "not supported yet"."""
         active_tab = self.query_one(TabbedContent).active
         if action == "edit_row":
-            return active_tab in ("tab-connectors", "tab-agents", "tab-templates")
+            return active_tab in ("tab-connectors", "tab-agents", "tab-templates", "tab-presets")
         if action == "delete_row":
             return active_tab in ("tab-connectors", "tab-agents", "tab-templates", "tab-presets")
         return True
@@ -239,7 +241,15 @@ class OverviewScreen(Screen):
         select it, land on a read-only page, then press 'e' again was an
         extra, pointless step for that case. (Selecting a row via Enter into
         a read-only view first is still available and unchanged, e.g. for
-        just double-checking a value.)"""
+        just double-checking a value.)
+
+        Tool Presets: user-requested, for consistency with every other
+        tab having an 'e' shortcut — but ToolPresetsScreen has no
+        view/edit-mode distinction at all (its own module docstring: "there
+        is no separate edit mode... every add/edit/remove is a direct,
+        immediately-saved mutation"), so 'e' here is just an alias for
+        Enter (same push as on_data_table_row_selected()'s own
+        "presets-table" branch), not a mode-skip like the other tabs."""
         app: "ConfigToolApp" = self.app  # type: ignore[assignment]
         cfg = app.editable_config
         if cfg is None:
@@ -247,6 +257,12 @@ class OverviewScreen(Screen):
             return
 
         active_tab = self.query_one(TabbedContent).active
+        if active_tab == "tab-presets":
+            key = self._cursor_row_key("presets-table")
+            if key is None:
+                return
+            self.app.push_screen(ToolPresetsScreen(cfg, key))
+            return
         if active_tab == "tab-connectors":
             key = self._cursor_row_key("connectors-table")
             if key is None:

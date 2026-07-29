@@ -89,6 +89,16 @@ class ToolPresetsScreen(DetailScreen):
 
     def on_mount(self) -> None:
         self._refresh_rules()
+        # User-reported: landing here required an explicit Tab press before
+        # 'e'/'d' (or arrow keys) did anything, since DOM focus starts on
+        # nothing in particular — Header/Footer aren't focusable and the
+        # ListView doesn't auto-focus itself just by existing. Focusing it
+        # directly is harmless even when the preset has zero rules yet (a
+        # focused, empty ListView is a normal, valid state — 'a' still
+        # works to add the first one). The row-0 selection itself (the
+        # OTHER half of this fix) lives in `_refresh_rules()` below, not
+        # here — see its own comment for why.
+        self.query_one("#preset-rules-list", ListView).focus()
 
     def _refresh_rules(self) -> None:
         rules = self.cfg.tool_presets_raw.get(self.preset_name, [])
@@ -97,6 +107,18 @@ class ToolPresetsScreen(DetailScreen):
         for i, rule in enumerate(rules):
             list_view.append(ListItem(Label(_format_tool_rule(rule)), name=str(i)))
         self.query_one(f"#{self.BODY_ID}", Static).update(self._header_text())
+        # PR review finding: this must be done HERE, every time — not just
+        # once in on_mount() — because `list_view.clear()` above resets
+        # `.index` back to `None`, and re-`.append()`ing items afterward
+        # does not restore an auto-selection the way a `ListView` composed
+        # WITH its children up front would get once, at ITS OWN mount (see
+        # tool_list_editor.py's own comment on that distinction). Since
+        # every mutation (add/edit/delete) calls this same method
+        # afterward, doing this only in on_mount() fixed the FIRST entry
+        # into this screen but let the exact same "nothing selected, 'e'/'d'
+        # silently no-op" bug reappear after the very first add/edit/delete.
+        if list_view.index is None and list_view.children:
+            list_view.index = 0
 
     @work
     async def action_add_rule(self) -> None:
