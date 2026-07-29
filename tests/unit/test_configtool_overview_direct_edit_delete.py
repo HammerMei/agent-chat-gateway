@@ -216,8 +216,13 @@ class TestDirectEditFromPresetsList:
             assert app.screen.preset_name == "preset-a"
 
 
-class TestEditDeleteHiddenOnUnsupportedTabs:
-    async def test_e_and_d_are_hidden_from_the_footer_on_watchers_tab(self, tmp_path, work_dir):
+class TestEditDeleteVisibleOnAllTabs:
+    """Config TUI Phase 3: watcher edit/delete are now supported too — every
+    tab (Connectors/Agents/Watchers/Templates/Tool Presets) advertises 'e'/
+    'd' in the footer. There is no longer an "unsupported tab" for either
+    action."""
+
+    async def test_e_and_d_are_visible_on_watchers_tab(self, tmp_path, work_dir):
         config_path = _write_config(tmp_path, _config_with_two_connectors(work_dir))
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
@@ -225,8 +230,8 @@ class TestEditDeleteHiddenOnUnsupportedTabs:
             app.screen.query_one("TabbedContent").active = "tab-watchers"
             await pilot.pause()
 
-            assert app.screen.check_action("edit_row", ()) is False
-            assert app.screen.check_action("delete_row", ()) is False
+            assert app.screen.check_action("edit_row", ()) is True
+            assert app.screen.check_action("delete_row", ()) is True
 
     async def test_e_and_d_are_visible_on_connectors_tab(self, tmp_path, work_dir):
         config_path = _write_config(tmp_path, _config_with_two_connectors(work_dir))
