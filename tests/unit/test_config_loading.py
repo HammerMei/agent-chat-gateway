@@ -268,6 +268,120 @@ class TestConfigValidationHardening(unittest.TestCase):
             GatewayConfig.from_file(path)
         self.assertIn("Watcher entry at index 0 must be a mapping", str(ctx.exception))
 
+    def test_non_string_connector_type_raises_value_error_not_type_error(self):
+        """PR review finding: a truthy-but-non-string 'type' (e.g. a YAML
+        list) used to reach `_CONNECTOR_VALIDATORS.get(connector.type)`
+        (gateway/config_validate.py) unchecked — an uncaught
+        TypeError: unhashable type on every validate_config() call, not
+        just --lint. Same class of bug as the 'name' check right above it
+        in _parse_one_connector() — _parse_one_agent()'s own 'type' check
+        already had this guard; this one was simply missed in that sweep."""
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: [rocketchat]
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watchers:
+              - name: w1
+                room: general
+        """)
+        with self.assertRaisesRegex(ValueError, "'type' must be a string"):
+            GatewayConfig.from_file(path)
+
+    def test_non_string_watcher_connector_raises_value_error_not_type_error(self):
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watchers:
+              - room: general
+                connector: [rc]
+        """)
+        with self.assertRaisesRegex(ValueError, "'connector' must be a string"):
+            GatewayConfig.from_file(path)
+
+    def test_non_string_watcher_agent_raises_value_error_not_type_error(self):
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watchers:
+              - room: general
+                connector: rc
+                agent: [default]
+        """)
+        with self.assertRaisesRegex(ValueError, "'agent' must be a string"):
+            GatewayConfig.from_file(path)
+
+    def test_non_string_watcher_room_raises_value_error_not_attribute_error(self):
+        """The plural 'rooms:' form validates each element already; this
+        singular alias didn't — a non-string 'room' (e.g. an int) reached
+        _sanitize_room_for_name()'s `room.startswith("@")` unchecked."""
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watchers:
+              - room: 12345
+                connector: rc
+        """)
+        with self.assertRaisesRegex(ValueError, "'room' must be a string"):
+            GatewayConfig.from_file(path)
+
+    def test_non_string_watcher_session_id_raises_value_error_not_type_error(self):
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watchers:
+              - room: general
+                connector: rc
+                session_id: [abc]
+        """)
+        with self.assertRaisesRegex(ValueError, "'session_id' must be a string"):
+            GatewayConfig.from_file(path)
+
+    def test_non_string_default_agent_raises_value_error_not_type_error(self):
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            default_agent: [prod]
+            watchers:
+              - name: w1
+                room: general
+        """)
+        with self.assertRaisesRegex(ValueError, "'default_agent' must be a string"):
+            GatewayConfig.from_file(path)
+
 
 # ── Tests: cache_dir_global path resolution ───────────────────────────────────
 

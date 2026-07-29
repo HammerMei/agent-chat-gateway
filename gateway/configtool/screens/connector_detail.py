@@ -266,11 +266,27 @@ class ConnectorDetailScreen(FormScreen):
         # and switching to a DIFFERENT template with a different type must
         # reshape the form to match (part of the same full _recompute_form()
         # this whole picker redesign already does for every other field).
+        #
+        # PR review finding: same misleading-fallback bug
+        # AgentDetailScreen._agent_type() was fixed for — a connector whose
+        # ONLY type source was an inherits: template (a normal, supported
+        # shape — see _open_inherits_picker()'s own comment above) can end
+        # up with NO resolvable type at all if that template is cleared via
+        # the picker's "(none)" option. Falling back to a real type name
+        # ("rocketchat") here doesn't just mislabel a header — it's also
+        # what _field_specs()/_dataclass_defaults() key off of, so the form
+        # would silently RESHAPE to the wrong type's fields (losing any
+        # already-typed values for fields the wrong type doesn't have, e.g.
+        # a mattermost connector's own 'server.token'). "(unset)" matches
+        # no real FIELDS_BY_TYPE/DATACLASS_DEFAULTS_BY_TYPE key, so both
+        # correctly degrade to empty (show nothing) rather than the wrong
+        # thing — Save is blocked either way by the "must have a 'type'
+        # field" check, same as it always was.
         try:
             merged = self.cfg.merged_entry("connector", self._current_entry())
         except (ValueError, FileNotFoundError):
             merged = self._current_entry()
-        return merged.get("type", "rocketchat")
+        return merged.get("type") or "(unset)"
 
     def _compute_mm_auth_method(self) -> str:
         """Which of the two mutually-exclusive credential groups the Auth

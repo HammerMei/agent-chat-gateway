@@ -204,6 +204,16 @@ class GatewayConfig:
 
         if not default_agent:
             default_agent = next(iter(agents))
+        elif not isinstance(default_agent, str):
+            # PR review finding: same class of bug as the per-entity 'name'/
+            # 'type'/'connector'/'agent'/'session_id' checks elsewhere in
+            # this module — a truthy-but-non-string top-level
+            # 'default_agent:' (e.g. a YAML list) reached
+            # `default_agent not in agents` (a dict) unchecked, crashing
+            # with an uncaught TypeError instead of a clean ValueError.
+            raise ValueError(
+                f"config.yaml 'default_agent' must be a string (got {type(default_agent).__name__})."
+            )
         elif default_agent not in agents:
             raise ValueError(
                 f"default_agent '{default_agent}' not found in agents: {list(agents)}"
@@ -624,6 +634,18 @@ def _parse_one_connector(
         )
     if not connector_type:
         raise ValueError(f"Connector '{name}' must have a 'type' field")
+    if not isinstance(connector_type, str):
+        # PR review finding: same class of bug as the 'name' check above,
+        # on the field one line down — a truthy-but-non-string 'type'
+        # (e.g. a YAML list) reached ConnectorConfig.type unchecked, later
+        # crashing gateway/config_validate.py's
+        # `_CONNECTOR_VALIDATORS.get(connector.type)` with
+        # `TypeError: unhashable type` on every validate_config() call, not
+        # just --lint. _parse_one_agent()'s equivalent 'type' check already
+        # does this; this one was simply missed in the same sweep.
+        raise ValueError(
+            f"Connector '{name}': 'type' must be a string (got {type(connector_type).__name__})."
+        )
     if name in seen_connector_names:
         raise ValueError(
             f"Duplicate connector name '{name}' found. "
@@ -866,6 +888,17 @@ def _parse_one_watcher_entry(
             )
         rooms_list = list(raw_rooms)
     elif raw_room:
+        if not isinstance(raw_room, str):
+            # PR review finding: the plural 'rooms:' form validates each
+            # element (`isinstance(r, str) and r`, above) but this singular
+            # alias didn't — a truthy-but-non-string 'room' (e.g. an int)
+            # reached _sanitize_room_for_name()'s `room.startswith("@")`
+            # unchecked (via _auto_watcher_name()), crashing with
+            # AttributeError instead of a clean ValueError.
+            raise ValueError(
+                f"Watcher entry at index {index}: 'room' must be a string "
+                f"(got {type(raw_room).__name__})."
+            )
         rooms_list = [raw_room]
     else:
         raise ValueError(
@@ -888,6 +921,16 @@ def _parse_one_watcher_entry(
             f"(got {type(explicit_name).__name__})."
         )
     explicit_session_id = wc.get("session_id") or None
+    if explicit_session_id is not None and not isinstance(explicit_session_id, str):
+        # PR review finding: same class of bug as 'name' above — a
+        # truthy-but-non-string 'session_id' (e.g. a YAML list) reached
+        # `wc.session_id in seen_session_ids` (a set, in both from_file()'s
+        # and collect_config()'s post-loop duplicate check) unchecked,
+        # crashing with an uncaught TypeError.
+        raise ValueError(
+            f"Watcher entry at index {index}: 'session_id' must be a string "
+            f"(got {type(explicit_session_id).__name__})."
+        )
     if len(rooms_list) > 1:
         if explicit_name:
             raise ValueError(
@@ -904,6 +947,15 @@ def _parse_one_watcher_entry(
             )
 
     watcher_connector = wc.get("connector", "")
+    if watcher_connector and not isinstance(watcher_connector, str):
+        # PR review finding: same class of bug as 'name'/'session_id' above
+        # — a truthy-but-non-string 'connector' (e.g. a YAML list) reached
+        # `watcher_connector not in connector_names` (a set) unchecked,
+        # crashing with an uncaught TypeError instead of a clean ValueError.
+        raise ValueError(
+            f"Watcher entry at index {index}: 'connector' must be a string "
+            f"(got {type(watcher_connector).__name__})."
+        )
     if watcher_connector and watcher_connector not in connector_names:
         raise ValueError(
             f"Watcher entry at index {index} references unknown connector "
@@ -927,6 +979,15 @@ def _parse_one_watcher_entry(
     resolved_connector = watcher_connector or connectors[0].name
 
     watcher_agent = wc.get("agent", default_agent)
+    if not isinstance(watcher_agent, str):
+        # PR review finding: same class of bug as 'connector' above — a
+        # truthy-but-non-string 'agent' (e.g. a YAML list) reached
+        # `watcher_agent not in agents` (a dict) unchecked, crashing with
+        # an uncaught TypeError instead of a clean ValueError.
+        raise ValueError(
+            f"Watcher entry at index {index}: 'agent' must be a string "
+            f"(got {type(watcher_agent).__name__})."
+        )
     if watcher_agent not in agents:
         raise ValueError(
             f"Watcher entry at index {index} references unknown agent "
@@ -1288,7 +1349,7 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
 
     if not default_agent:
         default_agent = next(iter(agents))
-    elif default_agent not in agents:
+    elif not isinstance(default_agent, str) or default_agent not in agents:
         # PR review finding: this used to `return None, issues` here,
         # discarding every connector/agent that DID parse successfully —
         # meaning validate_config()'s _check_connectors()/_check_state_orphans()
@@ -1301,12 +1362,29 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
         # default_agent to fall back an entry's implicit `agent:` field to,
         # so watchers are skipped (empty) — but every connector/agent that
         # DID parse is still returned, so their own checks keep running.
-        issues.append(
-            ConfigIssue(
-                "global", None,
-                f"default_agent '{default_agent}' not found in agents: {list(agents)}",
+        #
+        # PR review finding (round 6): a truthy-but-non-string
+        # default_agent (e.g. a YAML list) reached `default_agent not in
+        # agents` (a dict) unchecked, crashing with an uncaught TypeError
+        # instead of a clean, collected ConfigIssue — same class of bug as
+        # the per-entity 'name'/'type'/'connector'/'agent' checks elsewhere
+        # in this module, folded into the same branch here rather than
+        # duplicating the partial-config return a third time.
+        if not isinstance(default_agent, str):
+            issues.append(
+                ConfigIssue(
+                    "global", None,
+                    f"config.yaml 'default_agent' must be a string "
+                    f"(got {type(default_agent).__name__}).",
+                )
             )
-        )
+        else:
+            issues.append(
+                ConfigIssue(
+                    "global", None,
+                    f"default_agent '{default_agent}' not found in agents: {list(agents)}",
+                )
+            )
         mqd, sched = _max_queue_depth_and_scheduler_or_defaults(raw, issues)
         return (
             GatewayConfig(

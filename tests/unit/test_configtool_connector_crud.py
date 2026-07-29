@@ -877,6 +877,37 @@ class TestConnectorInheritsPicker:
             assert app.screen.query_one("#field-server-team")
             assert app.screen.query_one("#field-require_mention", Checkbox).value is True
 
+    async def test_clearing_the_only_type_source_shows_unset_not_a_fabricated_type(
+        self, tmp_path, work_dir
+    ):
+        """PR review finding: same misleading-fallback bug
+        AgentDetailScreen._agent_type() was fixed for — a connector whose
+        ONLY type source is an inherits: template (rc-existing here, see
+        _config_with_two_connector_templates) has no resolvable type at all
+        once that template is cleared via the picker's "(none)" option.
+        _connector_type()'s fallback used to return a real type name
+        ("rocketchat") — not just misleading in the header, but also what
+        _field_specs()/_dataclass_defaults() key off of, silently reshaping
+        the form to the WRONG type's fields."""
+        config_path = _write_config(tmp_path, _config_with_two_connector_templates(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_connector_in_edit_mode(pilot, app)
+            assert app.screen.query_one("#field-require_mention")  # rocketchat field present
+
+            await _click_inherits_button(pilot, app)
+            await pilot.press("enter")  # '(none)' (index 0)
+            await pilot.pause()
+
+            assert isinstance(app.screen, ConnectorDetailScreen)  # no confirm — nothing overridden
+            assert str(app.screen.query_one("#inherits-value", Static).render()) == "(none)"
+            form_texts = [str(s.render()) for s in app.screen.query(".entity-form Static")]
+            assert any("(unset)" in t for t in form_texts)
+            assert not any("type: rocketchat" in t for t in form_texts)
+            # No per-type fields shown at all — never the wrong type's fields.
+            assert not app.screen.query("#field-require_mention")
+
     async def test_picker_excludes_a_conflicting_type_template_when_entry_has_its_own_type(
         self, tmp_path, work_dir
     ):

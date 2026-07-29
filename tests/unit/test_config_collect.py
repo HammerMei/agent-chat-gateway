@@ -184,6 +184,125 @@ class TestCollectConfigPartialProgressPreserved(_CollectConfigTestBase):
         self.assertEqual(config.scheduler.completed_job_ttl_days, 30)
 
 
+class TestCollectConfigNonStringScalarFields(_CollectConfigTestBase):
+    """PR review finding (round 6): the same class of bug round 5 fixed for
+    a non-string 'name'/'inherits' (a truthy-but-wrong-type raw value
+    slipping past a bare `if not x` check into a hash-based `in`/`.get()`,
+    or a string method) was also live on five other raw scalar reference
+    fields — connector 'type', watcher 'connector'/'agent'/'room'/
+    'session_id', and the top-level 'default_agent' — reachable via BOTH
+    from_file() (see test_config_loading.py's
+    TestConfigValidationHardening for the strict-path pins) and
+    collect_config(). Each must surface as a collected, per-entity/global
+    ConfigIssue — never an uncaught TypeError/AttributeError that would
+    abort collect_config() (or crash gateway/config_validate.py's
+    validate_config() a layer up) for the WHOLE file."""
+
+    def test_non_string_connector_type_is_a_collected_issue(self):
+        config_path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: [rocketchat]
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+        """)
+        config, issues = collect_config(config_path)
+        self.assertIsNotNone(config)
+        self.assertTrue(any("'type' must be a string" in i.message for i in issues))
+
+    def test_non_string_watcher_connector_is_a_collected_issue(self):
+        config_path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - room: general
+                connector: [rc]
+        """)
+        config, issues = collect_config(config_path)
+        self.assertIsNotNone(config)
+        self.assertTrue(any("'connector' must be a string" in i.message for i in issues))
+
+    def test_non_string_watcher_agent_is_a_collected_issue(self):
+        config_path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - room: general
+                connector: rc
+                agent: [default]
+        """)
+        config, issues = collect_config(config_path)
+        self.assertIsNotNone(config)
+        self.assertTrue(any("'agent' must be a string" in i.message for i in issues))
+
+    def test_non_string_watcher_room_is_a_collected_issue(self):
+        config_path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - room: 12345
+                connector: rc
+        """)
+        config, issues = collect_config(config_path)
+        self.assertIsNotNone(config)
+        self.assertTrue(any("'room' must be a string" in i.message for i in issues))
+
+    def test_non_string_watcher_session_id_is_a_collected_issue(self):
+        config_path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - room: general
+                connector: rc
+                session_id: [abc]
+        """)
+        config, issues = collect_config(config_path)
+        self.assertIsNotNone(config)
+        self.assertTrue(any("'session_id' must be a string" in i.message for i in issues))
+
+    def test_non_string_default_agent_is_a_collected_issue(self):
+        config_path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            default_agent: [prod]
+        """)
+        config, issues = collect_config(config_path)
+        self.assertIsNotNone(config)
+        self.assertTrue(any("'default_agent' must be a string" in i.message for i in issues))
+
+
 class TestCollectConfigNonStringNameHint(_CollectConfigTestBase):
     """PR review finding: a connector/watcher entry's own `name:` might
     itself be malformed (e.g. a list instead of a string) on an entry that
