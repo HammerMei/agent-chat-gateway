@@ -831,5 +831,176 @@ class TestStatusIndexNonStringEntityName(_EditableConfigTestBase):
         StatusIndex(result.findings)  # must not raise TypeError
 
 
+class TestWatcherCrudPrimitives(_EditableConfigTestBase):
+    """Config TUI Phase 3 (watcher CRUD): EditableConfig.add_watcher_rooms()/
+    find_mergeable_watcher_entry()/remove_watcher_room() — the only two
+    mutation primitives everything else (create, split-on-edit, room
+    rename/move, delete) composes from. See docs/design/config-tool.md's
+    Phase 3 section for the full merge/split design."""
+
+    def _base_config(self, watchers_yaml: str = "") -> Path:
+        return self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+{watchers_yaml}
+        """)
+
+    def test_add_watcher_rooms_creates_a_new_entry_when_nothing_matches(self):
+        path = self._base_config()
+        cfg = EditableConfig.load(path)
+        added = cfg.add_watcher_rooms("rc", "default", ["general"], {})
+        self.assertEqual(added, ["general"])
+        self.assertEqual(
+            cfg.document["watchers"],
+            [{"connector": "rc", "agent": "default", "room": "general"}],
+        )
+        self.assertTrue(cfg.dirty)
+
+    def test_add_watcher_rooms_merges_multiple_rooms_into_one_group(self):
+        """Creating 3 rooms in a single call (the new-watcher form's
+        comma-separated room field) must produce ONE rooms: group, not 3
+        separate near-duplicate entries."""
+        path = self._base_config()
+        cfg = EditableConfig.load(path)
+        added = cfg.add_watcher_rooms("rc", "default", ["general", "dev", "ops"], {})
+        self.assertEqual(added, ["general", "dev", "ops"])
+        self.assertEqual(len(cfg.document["watchers"]), 1)
+        self.assertEqual(cfg.document["watchers"][0]["rooms"], ["general", "dev", "ops"])
+
+    def test_add_watcher_rooms_merges_into_an_existing_matching_entry(self):
+        path = self._base_config("""\
+              - connector: rc
+                agent: default
+                room: general
+        """)
+        cfg = EditableConfig.load(path)
+        added = cfg.add_watcher_rooms("rc", "default", ["dev"], {})
+        self.assertEqual(added, ["dev"])
+        self.assertEqual(len(cfg.document["watchers"]), 1)
+        self.assertEqual(cfg.document["watchers"][0]["rooms"], ["general", "dev"])
+
+    def test_add_watcher_rooms_does_not_merge_when_shared_fields_differ(self):
+        path = self._base_config("""\
+              - connector: rc
+                agent: default
+                room: general
+                online_notification: "hi"
+        """)
+        cfg = EditableConfig.load(path)
+        added = cfg.add_watcher_rooms("rc", "default", ["dev"], {})
+        self.assertEqual(added, ["dev"])
+        self.assertEqual(len(cfg.document["watchers"]), 2)
+
+    def test_add_watcher_rooms_does_not_merge_into_an_entry_with_its_own_name(self):
+        """An entry with an explicit name:/session_id: can never legally
+        become multi-room (gateway/config.py forbids it) — never a merge
+        target, even if every other shared field matches."""
+        path = self._base_config("""\
+              - connector: rc
+                agent: default
+                room: general
+                name: my-watcher
+        """)
+        cfg = EditableConfig.load(path)
+        added = cfg.add_watcher_rooms("rc", "default", ["dev"], {})
+        self.assertEqual(added, ["dev"])
+        self.assertEqual(len(cfg.document["watchers"]), 2)
+
+    def test_add_watcher_rooms_skips_a_room_already_in_the_merge_target(self):
+        """User-requested: typing a room that's already present in the
+        entry it would merge into is a silent no-op, not an error — the
+        end state is identical either way."""
+        path = self._base_config("""\
+              - connector: rc
+                agent: default
+                rooms: [general, dev]
+        """)
+        cfg = EditableConfig.load(path)
+        added = cfg.add_watcher_rooms("rc", "default", ["general", "ops"], {})
+        self.assertEqual(added, ["ops"])  # 'general' silently skipped
+        self.assertEqual(cfg.document["watchers"][0]["rooms"], ["general", "dev", "ops"])
+
+    def test_add_watcher_rooms_deep_copies_shared_nested_values(self):
+        """Regression: `shared`'s nested list/dict values (e.g.
+        context_inject_files) must never alias into a newly-created entry —
+        mutating one entry's nested value later must not silently affect
+        another."""
+        path = self._base_config()
+        cfg = EditableConfig.load(path)
+        shared = {"context_inject_files": ["a.md"]}
+        cfg.add_watcher_rooms("rc", "default", ["general"], shared)
+        cfg.document["watchers"][0]["context_inject_files"].append("b.md")
+        self.assertEqual(shared["context_inject_files"], ["a.md"])  # untouched
+
+    def test_find_mergeable_watcher_entry_ignores_connector_agent_defaults(self):
+        """An entry relying on the implicit connector[0]/default_agent
+        fallback (no explicit connector:/agent: of its own) is never a
+        merge candidate — the fallback could shift later if connectors/
+        agents are added or reordered."""
+        path = self._base_config("""\
+              - room: general
+        """)
+        cfg = EditableConfig.load(path)
+        target = cfg.find_mergeable_watcher_entry("rc", "default", {})
+        self.assertIsNone(target)
+
+    def test_remove_watcher_room_normalizes_rooms_list_to_singular(self):
+        path = self._base_config("""\
+              - connector: rc
+                agent: default
+                rooms: [general, dev]
+        """)
+        cfg = EditableConfig.load(path)
+        entry = cfg.document["watchers"][0]
+        cfg.remove_watcher_room(entry, "dev")
+        self.assertEqual(cfg.document["watchers"], [{"connector": "rc", "agent": "default", "room": "general"}])
+
+    def test_remove_watcher_room_deletes_the_whole_entry_when_empty(self):
+        path = self._base_config("""\
+              - connector: rc
+                agent: default
+                room: general
+        """)
+        cfg = EditableConfig.load(path)
+        entry = cfg.document["watchers"][0]
+        cfg.remove_watcher_room(entry, "general")
+        self.assertEqual(cfg.document["watchers"], [])
+
+    def test_remove_watcher_room_is_a_no_op_for_an_unrelated_room(self):
+        path = self._base_config("""\
+              - connector: rc
+                agent: default
+                room: general
+        """)
+        cfg = EditableConfig.load(path)
+        entry = cfg.document["watchers"][0]
+        self.assertFalse(cfg.dirty)
+        cfg.remove_watcher_room(entry, "does-not-exist")
+        self.assertEqual(cfg.document["watchers"], [{"connector": "rc", "agent": "default", "room": "general"}])
+        self.assertFalse(cfg.dirty)  # genuinely nothing changed — no spurious mark_dirty()
+
+    def test_remove_watcher_room_is_a_no_op_for_a_room_not_in_the_group(self):
+        """Same no-op guarantee as the singular-room case above, but for a
+        multi-room `rooms:` list — a room that was never actually a member
+        must not spuriously mark the config dirty or touch the list."""
+        path = self._base_config("""\
+              - connector: rc
+                agent: default
+                rooms: [general, dev]
+        """)
+        cfg = EditableConfig.load(path)
+        entry = cfg.document["watchers"][0]
+        cfg.remove_watcher_room(entry, "does-not-exist")
+        self.assertEqual(entry["rooms"], ["general", "dev"])
+        self.assertFalse(cfg.dirty)
+
+
 if __name__ == "__main__":
     unittest.main()

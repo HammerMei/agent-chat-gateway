@@ -41,7 +41,7 @@ from textual.widgets import DataTable, Footer, Header, Static, TabbedContent, Ta
 from ...config_validate import ValidationResult
 from ..formatting import status_badge
 from ..modals import ConfirmModal, MessageModal, TextPromptModal, TypePickerModal
-from ..model import StatusIndex
+from ..model import ExpandedWatcher, StatusIndex
 from .agent_detail import AgentDetailScreen
 from .connector_detail import CONNECTOR_TYPES, ConnectorDetailScreen
 from .form_common import find_agents_referencing_preset, find_entries_referencing_template
@@ -191,23 +191,26 @@ class OverviewScreen(Screen):
     # ── Actions ──────────────────────────────────────────────────────────────
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        """Hide 'Edit' from the footer on tabs that don't support it at all
-        (Watchers — Phase 3). Templates is fully editable/deletable now
-        (every kind is a real, named, creatable entity — no more per-kind
-        "nothing editable yet" gate the old Defaults tab needed for
-        connector_defaults). Tool Presets: user-requested, for consistency
-        with every other tab — 'e' here is just an alias for Enter (see
-        action_edit_row()'s own docstring; ToolPresetsScreen still has no
-        separate "edit mode" to enter, see tool_presets.py). 'Delete'
-        additionally supports Tool Presets (deletes the whole preset, not a
-        rule) and Templates (deletes the whole template, not a field — see
-        action_delete_row() below) so the footer never advertises a key
-        that would just notify "not supported yet"."""
+        """Templates is fully editable/deletable now (every kind is a real,
+        named, creatable entity — no more per-kind "nothing editable yet"
+        gate the old Defaults tab needed for connector_defaults). Tool
+        Presets: user-requested, for consistency with every other tab —
+        'e' here is just an alias for Enter (see action_edit_row()'s own
+        docstring; ToolPresetsScreen still has no separate "edit mode" to
+        enter, see tool_presets.py). Watchers (Phase 3): 'e'/'d' edit/delete
+        the row's own single expanded watcher directly — see
+        action_edit_row()/action_delete_row()'s watchers-tab branches for
+        exactly what that means for a watcher that's part of a shared
+        rooms: group."""
         active_tab = self.query_one(TabbedContent).active
         if action == "edit_row":
-            return active_tab in ("tab-connectors", "tab-agents", "tab-templates", "tab-presets")
+            return active_tab in (
+                "tab-connectors", "tab-agents", "tab-watchers", "tab-templates", "tab-presets",
+            )
         if action == "delete_row":
-            return active_tab in ("tab-connectors", "tab-agents", "tab-templates", "tab-presets")
+            return active_tab in (
+                "tab-connectors", "tab-agents", "tab-watchers", "tab-templates", "tab-presets",
+            )
         return True
 
     def action_edit_config(self) -> None:
@@ -279,6 +282,14 @@ class OverviewScreen(Screen):
             if entry is None:
                 return
             screen = AgentDetailScreen(cfg, key, entry, mode="edit")
+        elif active_tab == "tab-watchers":
+            key = self._cursor_row_key("watchers-table")
+            if key is None:
+                return
+            ew = self._expanded_watcher_for_key(cfg, key)
+            if ew is None:
+                return
+            screen = WatcherDetailScreen(cfg, ew, mode="edit")
         elif active_tab == "tab-templates":
             row_key = self._cursor_row_key("templates-table")
             if row_key is None:
@@ -351,6 +362,14 @@ class OverviewScreen(Screen):
             if entry is None:
                 return
             screen = AgentDetailScreen(cfg, key, entry, mode="view")
+        elif active_tab == "tab-watchers":
+            key = self._cursor_row_key("watchers-table")
+            if key is None:
+                return
+            ew = self._expanded_watcher_for_key(cfg, key)
+            if ew is None:
+                return
+            screen = WatcherDetailScreen(cfg, ew, mode="view")
         else:
             return
 
@@ -472,10 +491,9 @@ class OverviewScreen(Screen):
 
     @work
     async def action_new_entity(self) -> None:
-        """'n' — scoped to whichever tab is active. Agents, Connectors, and
-        Tool Presets support creation; Watchers/Defaults don't yet
-        (Phase 3). Unsupported tabs just notify, rather than doing nothing
-        silently or crashing."""
+        """'n' — scoped to whichever tab is active. Agents, Connectors,
+        Watchers, and Tool Presets support creation. Unsupported tabs just
+        notify, rather than doing nothing silently or crashing."""
         app: "ConfigToolApp" = self.app  # type: ignore[assignment]
         if app.editable_config is None:
             self.notify("Config does not currently load — nothing to add to.", severity="error")
@@ -500,6 +518,12 @@ class OverviewScreen(Screen):
             self.app.push_screen(
                 ConnectorDetailScreen(app.editable_config, {"type": connector_type}, mode="create")
             )
+        elif active_tab == "tab-watchers":
+            # No type picker, no EntityPickerModal detour — connector/agent
+            # are two plain Select dropdowns directly in the create form
+            # itself (docs/design/config-tool.md's Phase 3 owner decision),
+            # same as everything else this screen needs to know.
+            self.app.push_screen(WatcherDetailScreen(app.editable_config, None, mode="create"))
         elif active_tab == "tab-presets":
             # No document/disk write here — a brand-new preset only
             # actually materializes once the first rule is added inside
@@ -742,6 +766,20 @@ class OverviewScreen(Screen):
             return connectors[index]
         return None
 
+    def _expanded_watcher_for_key(self, cfg, key: str) -> ExpandedWatcher | None:
+        """The EXPANDED watcher matching a watchers-table row key (its real,
+        loader-derived name) — same lookup on_data_table_row_selected()'s
+        own "watchers-table" branch already does, shared here for
+        action_edit_row()/action_delete_row()'s direct-from-list shortcuts.
+        Guarded the same way: a config that's become invalid on disk since
+        the table was painted must not crash selecting/editing/deleting a
+        row, just silently find nothing."""
+        try:
+            expanded = cfg.expanded_watchers()
+        except (ValueError, FileNotFoundError):
+            return None
+        return next((e for e in expanded if e.watcher.name == key), None)
+
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         app: "ConfigToolApp" = self.app  # type: ignore[assignment]
         cfg = app.editable_config
@@ -765,12 +803,8 @@ class OverviewScreen(Screen):
             # painted (e.g. an external edit), selecting ANY row (including
             # the keyless "(unavailable...)" placeholder row shown in that
             # case) crashed the whole app. Guarded the same way
-            # repaint_from_memory() already is.
-            try:
-                expanded = cfg.expanded_watchers()
-            except (ValueError, FileNotFoundError):
-                return
-            ew = next((e for e in expanded if e.watcher.name == key), None)
+            # repaint_from_memory() already is (via _expanded_watcher_for_key()).
+            ew = self._expanded_watcher_for_key(cfg, key)
             if ew is not None:
                 self.app.push_screen(WatcherDetailScreen(cfg, ew, mode="view"))
         elif table_id == "templates-table":
