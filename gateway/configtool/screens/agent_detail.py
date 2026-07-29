@@ -13,7 +13,7 @@ form doesn't know about sneaking in.
 
 Tool lists (`owner_allowed_tools`/`guest_allowed_tools`) render read-only in
 view mode (`_body_text()`), but are directly editable in edit/create mode via
-two `ListView`s with dedicated "+ Add"/"- Remove" `Button`s beside each list
+two `ListView`s with dedicated "+ Add"/"Edit"/"- Remove" `Button`s beside each list
 (user-reported: the previous 'a'/'x' single-key bindings silently typed
 those letters into whatever Input happened to have focus instead of
 triggering the action — a real risk of quietly corrupting an unrelated
@@ -130,8 +130,23 @@ _PERMISSIONS_FORM_FIELDS: list[FieldSpec] = [
 # edit an agent template with the exact same field set, schema-derived-so-
 # zero-drift-risk reasoning applies just as much there — every one of these
 # keys is legal in an agent template too (gateway/config.py's forbidden-keys
-# set for agent_templates is empty).
+# set for agent_templates is empty). Deliberately still includes 'type':
+# unlike an actual agent (see _ENTITY_FORM_FIELDS below), a TEMPLATE has no
+# TypePickerModal-driven creation step of its own and no immutability
+# precedent — it's just an ordinary optional field a template may or may not
+# set (mirrors agent_templates' forbidden-keys set being empty, on purpose).
 AGENT_FORM_FIELDS = (*_FORM_FIELDS, *_PERMISSIONS_FORM_FIELDS)
+
+# AgentDetailScreen only (see its _field_specs()/_compose_form() overrides):
+# 'type' is immutable once an agent exists — chosen via TypePickerModal at
+# creation (OverviewScreen.action_new_entity(), baked into the entry before
+# this screen ever opens), same precedent as
+# ConnectorDetailScreen/`type is immutable once a connector exists`. Shown as
+# a read-only header suffix instead, matching connector's own `(type: ...)`
+# treatment. AGENT_FORM_FIELDS above (used by TemplateDetailScreen for agent
+# TEMPLATES) is untouched — templates keep 'type' as an ordinary editable
+# field.
+_ENTITY_FORM_FIELDS: list[FieldSpec] = [f for f in _FORM_FIELDS if f.key != "type"]
 
 
 def _resolve_working_directory(config_path: Path, raw_value: str) -> Path:
@@ -240,7 +255,32 @@ class AgentDetailScreen(ToolListEditorMixin, FormScreen):
         self._tool_list_ever_selected = dict.fromkeys(TOOL_LIST_WIDGET_IDS, False)
 
     def _field_specs(self) -> tuple[FieldSpec, ...]:
-        return AGENT_FORM_FIELDS
+        return (*_ENTITY_FORM_FIELDS, *_PERMISSIONS_FORM_FIELDS)
+
+    def _agent_type(self) -> str:
+        # Reads the MERGED type against the LIVE probe (self._current_entry()),
+        # same reasoning as ConnectorDetailScreen._connector_type(): an agent
+        # whose 'type' comes only from its inherits: template still needs the
+        # right value shown in the read-only header suffix, and kept in sync
+        # if the Inherits picker switches to a different template.
+        #
+        # PR review finding: unlike a connector (whose 'type' is ALWAYS
+        # present — immutable, chosen at creation via TypePickerModal, see
+        # ConnectorDetailScreen._connector_type()'s identical-looking
+        # fallback), an agent can legitimately have NO type at all — its
+        # only source might be an inherits: template that's since been
+        # cleared (test_picking_none_clears_inherits_and_recomputes_to_
+        # dataclass_defaults). Defaulting to a real type name ("claude")
+        # here actively LIES about the agent's state in exactly that
+        # scenario: 'type' is no longer shown as an editable field anywhere
+        # in this form, so this header is the ONLY indicator of it, right
+        # as Save is about to fail with "type is required". "(unset)" is
+        # never itself a valid type, so it can't be confused with one.
+        try:
+            merged = self.cfg.merged_entry("agent", self._current_entry())
+        except (ValueError, FileNotFoundError):
+            merged = self._current_entry()
+        return merged.get("type") or "(unset)"
 
     def _template_kind(self) -> str:
         return "agent"
@@ -274,7 +314,30 @@ class AgentDetailScreen(ToolListEditorMixin, FormScreen):
     async def _open_inherits_picker(self) -> None:
         if self.mode == "view":
             return
-        template_names = sorted(self.cfg.templates("agent"))
+        # User-reported: this used to list EVERY agent template regardless
+        # of type, letting a claude agent pick an opencode-typed template
+        # (or vice versa) straight from the picker — gateway/config.py's
+        # _resolve_inherits() now rejects that combination outright at save
+        # time, but filtering it out of the picker here catches the mistake
+        # before the user fills in the rest of the form.
+        #
+        # Filtered against `self.entry.get("type")` — the entry's OWN raw
+        # type — NOT `self._agent_type()` (the merged/current EFFECTIVE
+        # type), mirroring ConnectorDetailScreen._open_inherits_picker()'s
+        # identical reasoning: an agent may have no own 'type' at all,
+        # relying entirely on whichever template it currently inherits from
+        # (test_agent_inherits_template's `default: {inherits: standard}` is
+        # exactly this) — such an agent must still be free to switch to ANY
+        # template. The mismatch this filter exists to prevent only arises
+        # when the entry ITSELF pins an explicit type that a candidate
+        # template's own explicit type would then contradict.
+        all_templates = self.cfg.templates("agent")
+        entry_type = self.entry.get("type")
+        template_names = sorted(
+            name
+            for name, template in all_templates.items()
+            if not entry_type or not template.get("type") or template.get("type") == entry_type
+        )
         choice = await self.app.push_screen_wait(
             InheritsPickerModal(template_names, self._inherits_current)
         )
@@ -380,14 +443,15 @@ class AgentDetailScreen(ToolListEditorMixin, FormScreen):
         # first real field — once to focus this container, once to move
         # past it). The container isn't meant to be focused on its own;
         # scrolling still works via the mouse wheel/PageUp/PageDown.
+        agent_type = self._agent_type()
         with VerticalScroll(classes="entity-form", can_focus=False):
             if self.mode == "create":
-                yield Static("[bold]New agent[/bold]")
+                yield Static(f"[bold]New agent[/bold]  (type: {agent_type})")
                 with Horizontal(classes="field-row"):
                     yield Static("Name", classes="field-label")
                     yield Input(id="field-name", value=self._name_live, placeholder="agent name")
             else:
-                yield Static(f"[bold]{self.agent_name}[/bold]  (editing)")
+                yield Static(f"[bold]{self.agent_name}[/bold]  (type: {agent_type}, editing)")
 
             with Horizontal(classes="field-row"):
                 yield Static("Description", classes="field-label")
@@ -405,7 +469,7 @@ class AgentDetailScreen(ToolListEditorMixin, FormScreen):
                 )
                 yield Button("Change…", id="inherits-change-button")
 
-            for spec in _FORM_FIELDS:
+            for spec in _ENTITY_FORM_FIELDS:
                 yield from self._compose_field_row(spec, self._current_entry())
                 if spec.key == "working_directory":
                     yield Static(

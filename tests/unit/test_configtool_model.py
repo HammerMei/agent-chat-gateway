@@ -17,7 +17,8 @@ from pathlib import Path
 import yaml
 
 from gateway.config import GatewayConfig
-from gateway.configtool.model import EditableConfig, Provenance
+from gateway.config_validate import validate_config
+from gateway.configtool.model import EditableConfig, Provenance, StatusIndex
 
 
 class _EditableConfigTestBase(unittest.TestCase):
@@ -173,6 +174,69 @@ class TestExpandedWatchersDesync(_EditableConfigTestBase):
         cfg.reload()
         expanded = cfg.expanded_watchers()  # must not raise
         self.assertEqual(len(expanded), 2)
+
+
+class TestExpandedWatchersMalformedWatcherTemplates(_EditableConfigTestBase):
+    """PR review finding: expanded_watchers() re-parses `watcher_templates:`
+    straight off disk, independently of collect_config() (which already
+    tolerates this same failure internally, falling back to watchers=[]
+    plus its own ConfigIssue). Without an equivalent fallback here, a
+    malformed `watcher_templates:` block used to make this method's
+    ValueError propagate all the way up through OverviewScreen's
+    `except (ValueError, FileNotFoundError): expanded = None`, collapsing
+    the ENTIRE watchers table to the "(unavailable)" placeholder — the
+    exact all-or-nothing failure mode this whole method exists to avoid —
+    even though every watcher entry itself was perfectly fine."""
+
+    def test_malformed_watcher_templates_block_does_not_take_down_every_watcher(self):
+        path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watcher_templates: not-a-mapping
+            watchers:
+              - name: w1
+                connector: rc
+                agent: default
+                room: general
+        """)
+        cfg = EditableConfig.load(path)
+        expanded = cfg.expanded_watchers()  # must not raise
+        self.assertEqual([ew.watcher.name for ew in expanded], ["w1"])
+
+    def test_a_watcher_that_actually_needs_the_broken_template_still_drops_its_own_row(self):
+        path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watcher_templates: not-a-mapping
+            watchers:
+              - name: w1
+                connector: rc
+                agent: default
+                room: general
+              - name: w2
+                connector: rc
+                agent: default
+                room: dev
+                inherits: standard
+        """)
+        cfg = EditableConfig.load(path)
+        expanded = cfg.expanded_watchers()  # must not raise
+        # w2 references a template that can't be resolved at all (the whole
+        # block is malformed) — its own row drops, same as any other
+        # independent per-entry failure; w1 (unaffected) still displays.
+        self.assertEqual([ew.watcher.name for ew in expanded], ["w1"])
 
 
 class TestEditableConfigTemplates(_EditableConfigTestBase):
@@ -558,6 +622,213 @@ class TestEditableConfigSave(_EditableConfigTestBase):
         path.unlink()
         with self.assertRaises(FileNotFoundError):
             cfg.save()
+
+
+class TestEditableConfigScopedSaveGate(_EditableConfigTestBase):
+    """User-reported: the previous all-or-nothing gate meant a config with
+    TWO independently-broken connectors could never be fixed (or even
+    deleted) through the TUI — saving a fix to connector1 was rejected
+    because connector2 was still broken, and vice versa. save() now only
+    blocks on a genuinely NEW problem (gateway/config.py's collect_config(),
+    which — unlike a single caught GatewayConfig.from_file() exception —
+    surfaces every independently-broken connector/agent/watcher, not just
+    whichever one from_file() would have hit first)."""
+
+    def _two_broken_connectors_text(self) -> str:
+        return f"""\
+            connectors:
+              - name: conn1
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: "", password: ""}}
+              - name: conn2
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: "", password: ""}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - connector: conn1
+                agent: default
+                room: general
+              - connector: conn2
+                agent: default
+                room: dev
+        """
+
+    def test_fixing_one_connector_saves_despite_the_others_pre_existing_error(self):
+        path = self._write(self._two_broken_connectors_text())
+        cfg = EditableConfig.load(path)
+        conn1 = next(c for c in cfg.document["connectors"] if c["name"] == "conn1")
+        conn1["server"]["username"] = "bot1"
+        conn1["server"]["password"] = "pw1"
+        cfg.mark_dirty()
+
+        cfg.save()  # must not raise
+
+        raw = yaml.safe_load(path.read_text())
+        fixed = next(c for c in raw["connectors"] if c["name"] == "conn1")
+        still_broken = next(c for c in raw["connectors"] if c["name"] == "conn2")
+        self.assertEqual(fixed["server"]["username"], "bot1")
+        # conn2's pre-existing, untouched problem survives exactly as it was.
+        self.assertEqual(still_broken["server"]["username"], "")
+        self.assertEqual(still_broken["server"]["password"], "")
+
+    def test_deleting_the_fixed_connector_succeeds_despite_the_others_error(self):
+        path = self._write(self._two_broken_connectors_text())
+        cfg = EditableConfig.load(path)
+        cfg.document["connectors"] = [
+            c for c in cfg.document["connectors"] if c["name"] != "conn1"
+        ]
+        cfg.document["watchers"] = [
+            w for w in cfg.document["watchers"] if w["connector"] != "conn1"
+        ]
+        cfg.mark_dirty()
+
+        cfg.save()  # must not raise
+
+        raw = yaml.safe_load(path.read_text())
+        names = {c["name"] for c in raw["connectors"]}
+        self.assertEqual(names, {"conn2"})
+
+    def test_a_genuinely_new_error_is_still_blocked_even_on_an_already_broken_config(self):
+        """The scoped gate narrows what's IGNORED — it must not become a
+        blanket pass. Introducing a brand-new problem (here: breaking the
+        agent) while conn2 is already broken must still be refused."""
+        path = self._write(self._two_broken_connectors_text())
+        cfg = EditableConfig.load(path)
+        del cfg.document["agents"]["default"]["working_directory"]
+        cfg.mark_dirty()
+
+        with self.assertRaises(ValueError) as ctx:
+            cfg.save()
+        self.assertIn("working_directory is required", str(ctx.exception))
+
+        # Disk must be untouched — same guarantee the existing
+        # "refuses an invalid document" test already pins.
+        raw = yaml.safe_load(path.read_text())
+        self.assertIn("working_directory", raw["agents"]["default"])
+
+    def test_fixing_an_unrelated_agent_does_not_reveal_a_hidden_connector_error(self):
+        """PR review finding, chained from a bug in collect_config() itself:
+        an invalid `default_agent` used to make collect_config() discard
+        EVERY already-parsed connector/agent — so `before`'s findings never
+        included a completely unrelated connector's own, already-real empty-
+        credentials problem. Fixing the (unrelated) default_agent problem
+        made that connector problem appear for the FIRST time in `after`,
+        misclassifying an old, silent problem as "new" and blocking a
+        perfectly good, unrelated fix."""
+        path = self._write(f"""\
+            connectors:
+              - name: rc1
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: "", password: ""}}
+            agents:
+              broken_default:
+                type: claude
+              other_agent:
+                type: claude
+                working_directory: {self.agent_dir}
+            default_agent: broken_default
+            watchers:
+              - connector: rc1
+                agent: other_agent
+                room: general
+        """)
+        cfg = EditableConfig.load(path)
+        cfg.document["agents"]["broken_default"]["working_directory"] = str(self.agent_dir)
+        cfg.mark_dirty()
+
+        cfg.save()  # must not raise
+
+        raw = yaml.safe_load(path.read_text())
+        # rc1's pre-existing (untouched, unrelated) empty credentials survive
+        # exactly as they were — this save neither fixed nor was blocked by them.
+        self.assertEqual(raw["connectors"][0]["server"]["username"], "")
+
+    def test_save_does_not_crash_when_a_broken_entry_has_a_non_string_name(self):
+        """PR review finding: a watcher's own `name:` might itself be
+        malformed (e.g. a list) on an entry that ALSO fails for an unrelated
+        reason (here: no `room`/`rooms`) — gateway/config.py's
+        collect_config() used to pass that malformed value straight through
+        as ConfigIssue.entity_name, which _new_errors_introduced_by_this_save()
+        above then puts into a set of tuples, raising an uncaught
+        `TypeError: unhashable type: 'list'` instead of the clean ValueError
+        every caller expects."""
+        path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+              - name: rc2
+                type: rocketchat
+                server: {{url: "http://localhost:3001", username: bot2, password: pw2}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: [a, b]
+                connector: rc
+        """)
+        cfg = EditableConfig.load(path)
+        # An entirely unrelated, otherwise-harmless edit — must not trip
+        # over the pre-existing malformed watcher name while diffing
+        # before/after findings.
+        cfg.document["connectors"][1]["server"]["username"] = "bot2-renamed"
+        cfg.mark_dirty()
+
+        cfg.save()  # must not raise TypeError
+
+        raw = yaml.safe_load(path.read_text())
+        assert raw["connectors"][1]["server"]["username"] == "bot2-renamed"
+
+
+class TestStatusIndexNonStringEntityName(_EditableConfigTestBase):
+    """PR review finding: StatusIndex.__init__() groups findings by
+    `(entity_kind, entity_name)` — a dict key that must be hashable.
+    gateway/config_validate.py's _lint_config() used to attach a
+    truthy-but-non-string 'name'/'inherits' value (e.g. a YAML list)
+    straight onto a Finding.entity_name unchecked, which crashed HERE with
+    an uncaught TypeError: unhashable type the first time the config TUI
+    tried to build a StatusIndex from --lint findings — not at
+    validate_config() itself (dataclass construction doesn't type-check),
+    which is why this needs its own test beyond test_config_validate.py's
+    Finding-shape assertions."""
+
+    def test_a_non_string_connector_name_does_not_crash_status_index(self):
+        path = self._write(f"""\
+            connectors:
+              - name: [a, b]
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+                reply_in_thread: false
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+        """)
+        result = validate_config(str(path), lint=True)
+        StatusIndex(result.findings)  # must not raise TypeError
+
+    def test_a_non_string_watcher_name_does_not_crash_status_index(self):
+        path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: [a, b]
+                connector: rc
+                room: general
+                session_id: null
+        """)
+        result = validate_config(str(path), lint=True)
+        StatusIndex(result.findings)  # must not raise TypeError
 
 
 if __name__ == "__main__":

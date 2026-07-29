@@ -268,6 +268,120 @@ class TestConfigValidationHardening(unittest.TestCase):
             GatewayConfig.from_file(path)
         self.assertIn("Watcher entry at index 0 must be a mapping", str(ctx.exception))
 
+    def test_non_string_connector_type_raises_value_error_not_type_error(self):
+        """PR review finding: a truthy-but-non-string 'type' (e.g. a YAML
+        list) used to reach `_CONNECTOR_VALIDATORS.get(connector.type)`
+        (gateway/config_validate.py) unchecked — an uncaught
+        TypeError: unhashable type on every validate_config() call, not
+        just --lint. Same class of bug as the 'name' check right above it
+        in _parse_one_connector() — _parse_one_agent()'s own 'type' check
+        already had this guard; this one was simply missed in that sweep."""
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: [rocketchat]
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watchers:
+              - name: w1
+                room: general
+        """)
+        with self.assertRaisesRegex(ValueError, "'type' must be a string"):
+            GatewayConfig.from_file(path)
+
+    def test_non_string_watcher_connector_raises_value_error_not_type_error(self):
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watchers:
+              - room: general
+                connector: [rc]
+        """)
+        with self.assertRaisesRegex(ValueError, "'connector' must be a string"):
+            GatewayConfig.from_file(path)
+
+    def test_non_string_watcher_agent_raises_value_error_not_type_error(self):
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watchers:
+              - room: general
+                connector: rc
+                agent: [default]
+        """)
+        with self.assertRaisesRegex(ValueError, "'agent' must be a string"):
+            GatewayConfig.from_file(path)
+
+    def test_non_string_watcher_room_raises_value_error_not_attribute_error(self):
+        """The plural 'rooms:' form validates each element already; this
+        singular alias didn't — a non-string 'room' (e.g. an int) reached
+        _sanitize_room_for_name()'s `room.startswith("@")` unchecked."""
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watchers:
+              - room: 12345
+                connector: rc
+        """)
+        with self.assertRaisesRegex(ValueError, "'room' must be a string"):
+            GatewayConfig.from_file(path)
+
+    def test_non_string_watcher_session_id_raises_value_error_not_type_error(self):
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watchers:
+              - room: general
+                connector: rc
+                session_id: [abc]
+        """)
+        with self.assertRaisesRegex(ValueError, "'session_id' must be a string"):
+            GatewayConfig.from_file(path)
+
+    def test_non_string_default_agent_raises_value_error_not_type_error(self):
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            default_agent: [prod]
+            watchers:
+              - name: w1
+                room: general
+        """)
+        with self.assertRaisesRegex(ValueError, "'default_agent' must be a string"):
+            GatewayConfig.from_file(path)
+
 
 # ── Tests: cache_dir_global path resolution ───────────────────────────────────
 
@@ -1129,6 +1243,60 @@ class TestConnectorTemplates(unittest.TestCase):
             GatewayConfig.from_file(path)
         self.assertIn("connector_templates", str(ctx.exception))
 
+    def test_connector_type_conflicting_with_inherited_template_type_raises(self):
+        """User-reported: a connector explicitly declaring its own 'type'
+        while inheriting a template written for a DIFFERENT type used to
+        silently keep the entry's own type — with the rest of the
+        template's (wrong-protocol) fields merged in regardless. Only a
+        genuine contradiction (both sides set, and different) is an error;
+        inheriting the type FROM a template with no own-type override is
+        the normal, intended usage (tested elsewhere)."""
+        path = self._write_config("""\
+            connector_templates:
+              mm-standard:
+                type: mattermost
+                server: {url: http://localhost:8065, token: t, team: main}
+            connectors:
+              - name: rc1
+                type: rocketchat
+                inherits: mm-standard
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watchers:
+              - name: w1
+                room: general
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        msg = str(ctx.exception)
+        self.assertIn("rocketchat", msg)
+        self.assertIn("mattermost", msg)
+
+    def test_connector_type_matching_inherited_template_type_is_fine(self):
+        """Same explicit type on both sides is not a conflict — this must
+        keep working exactly as before."""
+        path = self._write_config("""\
+            connector_templates:
+              standard:
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            connectors:
+              - name: rc1
+                type: rocketchat
+                inherits: standard
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watchers:
+              - name: w1
+                room: general
+        """)
+        config = GatewayConfig.from_file(path)
+        self.assertEqual(config.connectors[0].type, "rocketchat")
+
     def test_attachments_cache_dir_global_template_not_aliased_across_connectors(self):
         """Regression: cache_dir_global resolution mutates the connector's raw dict
         in place. Without a deep-copying merge, two connectors sharing the same
@@ -1195,6 +1363,38 @@ class TestAgentTemplates(unittest.TestCase):
         # 'other' overrides timeout but still inherits working_directory/type.
         self.assertEqual(config.agents["other"].timeout, 42)
         self.assertEqual(config.agents["other"].working_directory, "/tmp")
+
+    def test_agent_type_conflicting_with_inherited_template_type_raises(self):
+        """User-reported: an agent explicitly declaring its own 'type'
+        (e.g. claude) while inheriting a template written for a DIFFERENT
+        type (e.g. opencode) used to silently keep the agent's own type —
+        with the rest of that template's (wrong-backend) fields, like
+        `command`, merged in regardless. Only a genuine contradiction (both
+        sides set, and different) is an error."""
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agent_templates:
+              opencode-standard:
+                type: opencode
+                command: opencode
+            agents:
+              agent-a:
+                type: claude
+                inherits: opencode-standard
+                working_directory: /tmp
+            watchers:
+              - name: w1
+                agent: agent-a
+                room: general
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        msg = str(ctx.exception)
+        self.assertIn("claude", msg)
+        self.assertIn("opencode", msg)
 
     def test_agent_template_can_set_type_and_command_independently(self):
         """The motivating regression test for this whole redesign: a template
@@ -1478,6 +1678,45 @@ class TestWatcherTemplates(unittest.TestCase):
                     GatewayConfig.from_file(path)
                 self.assertIn("watcher_templates", str(ctx.exception))
                 self.assertIn(key, str(ctx.exception))
+
+    def test_watcher_type_field_is_not_special_but_the_shared_mismatch_check_still_applies(self):
+        """PR review finding/clarification: the type-mismatch check in
+        _resolve_inherits() (added for connectors/agents — see
+        TestConnectorTemplates/TestAgentTemplates) is a single, generic
+        implementation shared by ALL THREE entity kinds, including watchers
+        — even though WatcherConfig has no real 'type' field at all and
+        never reads one. A watcher entry setting 'type:' is just an inert,
+        unused extra key; but if BOTH the entry and its inherited template
+        happen to set one, with different values, the same shared check
+        still fires. This is an accepted, harmless side effect of reusing
+        one implementation for all three kinds (matching this codebase's
+        own "never duplicate a rule" principle) rather than a real feature
+        — nothing legitimate ever sets 'type:' on a watcher."""
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watcher_templates:
+              standard:
+                connector: rc
+                agent: default
+                type: bar
+            watchers:
+              - name: w1
+                inherits: standard
+                type: foo
+                room: general
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        msg = str(ctx.exception)
+        self.assertIn("foo", msg)
+        self.assertIn("bar", msg)
 
     def test_watcher_inherits_resolved_before_rooms_expansion(self):
         """inherits: must resolve before the room/rooms expansion below it in

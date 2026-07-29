@@ -399,13 +399,139 @@ class TestValidateConfigLint(_ValidateConfigTestBase):
         joined = " ".join(result.lint_findings)
         self.assertNotIn("description", joined)
 
+    def test_lint_does_not_crash_when_a_templates_block_itself_is_malformed(self):
+        """PR review finding: _lint_config() used to assume re-parsing
+        agent_templates/watcher_templates/connector_templates "cannot
+        raise" since it only ran after a fully successful load. That
+        stopped being true once validate_config() switched to
+        collect_config() (fault-tolerant) — a malformed `agent_templates:`
+        block is caught and reported as its own error by collect_config(),
+        but connectors/agents/watchers can still parse fine independently.
+        --lint must not re-raise that same error uncaught."""
+        cfg = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agent_templates: not-a-mapping
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                room: general
+        """)
+        result = self._validate(cfg, lint=True)  # must not raise
+        self.assertFalse(result.ok)
+        self.assertTrue(any("agent_templates" in e for e in result.errors))
+
+    def test_lint_does_not_attach_a_non_string_connector_name_to_a_finding(self):
+        """PR review finding: _lint_config()'s `name = cc.get("name") or
+        "?"` used the raw value verbatim — a truthy-but-non-string name
+        (e.g. a YAML list) reached Finding.entity_name (typed str | None)
+        unchecked. validate_config() itself doesn't crash on this (dataclass
+        construction doesn't type-check), but the config TUI's StatusIndex
+        does, the first time it tries to use (entity_kind, entity_name) as a
+        dict key (see test_configtool_model.py's
+        TestStatusIndexNonStringEntityName for the actual crash repro) —
+        pinned here at the source instead: every Finding this produces must
+        have a STRING entity_name, never the raw malformed value. Requires
+        'reply_in_thread: false' below (restating a built-in default) so
+        _lint_entry() actually appends a Finding for this connector at all —
+        without a lint-worthy field, entity_name is never even read."""
+        cfg = self._write(f"""\
+            connectors:
+              - name: [a, b]
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+                reply_in_thread: false
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+        """)
+        result = self._validate(cfg, lint=True)  # must not raise
+        connector_findings = [f for f in result.findings if f.entity_kind == "connector"]
+        self.assertTrue(connector_findings)
+        for f in connector_findings:
+            self.assertIsInstance(f.entity_name, str)
+
+    def test_lint_does_not_attach_a_non_string_watcher_name_to_a_finding(self):
+        cfg = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: [a, b]
+                connector: rc
+                room: general
+                session_id: null
+        """)
+        result = self._validate(cfg, lint=True)  # must not raise
+        watcher_findings = [f for f in result.findings if f.entity_kind == "watcher"]
+        self.assertTrue(watcher_findings)
+        for f in watcher_findings:
+            self.assertIsInstance(f.entity_name, str)
+
+    def test_lint_does_not_crash_on_a_non_hashable_inherits_value(self):
+        """PR review finding: _lint_entry()'s `templates.get(template_name,
+        {})` requires template_name to be hashable — a malformed
+        'inherits:' (e.g. a YAML list) raised an uncaught
+        TypeError: unhashable type straight out of --lint, aborting the
+        whole pass and discarding every already-collected finding."""
+        cfg = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+                inherits: [a, b]
+        """)
+        result = self._validate(cfg, lint=True)  # must not raise
+        self.assertFalse(result.ok)
+
+    def test_lint_does_not_crash_when_agents_block_is_not_a_mapping(self):
+        """PR review finding: `(raw.get("agents") or {}).items()` assumed
+        `agents:` is always a dict by the time --lint runs — already-false
+        for collect_config()'s own structural check, which reports this as
+        a clean issue elsewhere and returns a partial config with agents={}
+        rather than raising. --lint must not re-crash on the same raw,
+        unvalidated value with an uncaught AttributeError."""
+        cfg = self._write("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agents: [1, 2, 3]
+        """)
+        result = self._validate(cfg, lint=True)  # must not raise
+        self.assertFalse(result.ok)
+
 
 class TestFindingsExtension(_ValidateConfigTestBase):
     """`findings: list[Finding]` is additive alongside the flat string lists —
     every append to errors/warnings/lint_findings must have a matching
     Finding, and the flat lists (CLI output) must stay unaffected."""
 
-    def test_load_failure_produces_one_global_finding(self):
+    def test_agent_load_failure_is_attributed_to_that_agent_not_global(self):
+        """Fault-tolerant collect_config() (gateway/config.py), not a single
+        caught GatewayConfig.from_file() exception: a per-agent problem is
+        now attributed to entity_kind="agent"/entity_name="default", not
+        entity_kind="global" — this is what lets the config TUI's Overview
+        mark the RIGHT row, instead of a global banner nothing points at.
+        This specific fixture's only agent fails, so `agents` ends up empty
+        too — a second, genuinely global finding ("must define at least one
+        agent") is expected alongside the per-agent one; both are real and
+        independently true."""
         cfg = self._write("""\
             connectors:
               - name: rc
@@ -419,12 +545,82 @@ class TestFindingsExtension(_ValidateConfigTestBase):
                 room: general
         """)
         result = self._validate(cfg)
+        self.assertEqual(len(result.findings), 2)
+        agent_finding = next(f for f in result.findings if f.entity_kind == "agent")
+        self.assertEqual(agent_finding.severity, "error")
+        self.assertEqual(agent_finding.entity_name, "default")
+        self.assertIn("working_directory is required", agent_finding.message)
+        global_finding = next(f for f in result.findings if f.entity_kind == "global")
+        self.assertIsNone(global_finding.entity_name)
+        self.assertIn("must define at least one agent", global_finding.message)
+
+    def test_two_independently_broken_agents_both_surface(self):
+        """The actual scenario this whole change exists for: TWO agents each
+        independently missing working_directory both produce their own
+        Finding in one pass — not just whichever one from_file() would have
+        hit first."""
+        cfg = self._write("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agents:
+              agent1:
+                type: claude
+              agent2:
+                type: claude
+            watchers:
+              - connector: rc
+                agent: agent1
+                room: general
+        """)
+        result = self._validate(cfg)
+        agent_findings = {
+            f.entity_name: f for f in result.findings if f.entity_kind == "agent"
+        }
+        self.assertEqual(set(agent_findings), {"agent1", "agent2"})
+        for f in agent_findings.values():
+            self.assertIn("working_directory is required", f.message)
+
+    def test_two_independently_broken_connectors_both_surface_structurally(self):
+        """Same as the agent case, but for a structural (not credential-
+        level) connector problem — each missing 'type' independently."""
+        cfg = self._write(f"""\
+            connectors:
+              - name: conn1
+              - name: conn2
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+        """)
+        result = self._validate(cfg)
+        connector_findings = {
+            f.entity_name: f for f in result.findings if f.entity_kind == "connector"
+        }
+        self.assertEqual(set(connector_findings), {"conn1", "conn2"})
+        for f in connector_findings.values():
+            self.assertIn("must have a 'type' field", f.message)
+
+    def test_malformed_top_level_structure_is_still_one_global_finding(self):
+        """A genuinely structural break (here: 'connectors:' is a mapping,
+        not a list) has no per-entity fallback — collect_config() can't
+        partially parse "some" connectors when the whole block's shape is
+        wrong, so this must still be exactly one global finding, same as
+        before this change."""
+        cfg = self._write("""\
+            connectors: {not: a-list}
+            agents:
+              default:
+                type: claude
+        """)
+        result = self._validate(cfg)
         self.assertEqual(len(result.findings), 1)
         finding = result.findings[0]
         self.assertEqual(finding.severity, "error")
         self.assertEqual(finding.entity_kind, "global")
         self.assertIsNone(finding.entity_name)
-        self.assertIn("working_directory is required", finding.message)
+        self.assertIn("'connectors:' must be a list", finding.message)
 
     def test_empty_connector_credentials_produce_per_field_findings(self):
         cfg = self._write(f"""\

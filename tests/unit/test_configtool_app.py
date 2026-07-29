@@ -234,10 +234,23 @@ class TestOverviewRender:
     async def test_invalid_config_from_file_failure_does_not_crash_watchers_table(
         self, tmp_path, work_dir
     ):
-        """Regression: a config that parses as YAML but fails
-        GatewayConfig.from_file (here: a missing working_directory) must
-        not crash while populating the watchers table via
-        expanded_watchers() -> validated_view()."""
+        """Regression: a config that parses as YAML but fails per-entity
+        validation (here: an agent missing working_directory) must not
+        crash while populating the watchers table via expanded_watchers().
+
+        Pre-collect_config(), this exact fixture used to collapse the WHOLE
+        watchers table to a single "(unavailable)" placeholder row, since
+        expanded_watchers() called the strict GatewayConfig.from_file()
+        internally and the first failure anywhere aborted the whole thing.
+        Now collect_config() is fault-tolerant: the broken agent doesn't
+        take connectors/other agents down with it — but it DOES mean
+        `agents={}`, so the only watcher's implicit `agent:` (falling back
+        to a now-empty default_agent) can't resolve, and that watcher's own
+        row is simply dropped — same "only the broken row disappears, no
+        crash, no blanket placeholder" behavior TestStatusColumnPerEntity
+        pins. The blanket "(unavailable)" placeholder still exists, but
+        only fires when collect_config() returns None entirely (see the
+        does-not-exist.yaml test above)."""
         config_path = _write_config(tmp_path, """\
             connectors:
               - name: rc
@@ -256,9 +269,7 @@ class TestOverviewRender:
             banner = app.screen.query_one("#banner", Static)
             assert "error" in str(banner.render()).lower()
             watchers_table = app.screen.query_one("#watchers-table", DataTable)
-            assert watchers_table.row_count == 1
-            row = watchers_table.get_row_at(0)
-            assert "unavailable" in row[0]
+            assert watchers_table.row_count == 0
 
     async def test_refresh_action_picks_up_on_disk_changes(self, tmp_path, work_dir):
         config_path = _write_config(tmp_path, _valid_config_text(work_dir))
@@ -304,6 +315,128 @@ class TestOverviewRender:
             assert "lint finding" in banner
 
 
+class TestStatusColumnPerEntity:
+    """User-reported: the per-row Status column (OK/WARN/ERROR) only ever
+    worked for connectors — agent/watcher rows always showed OK regardless
+    of real problems, since a GatewayConfig.from_file() failure used to
+    collapse into one entity_kind="global" Finding that StatusIndex
+    (gateway/configtool/model.py) never attributes to any specific row.
+    Now backed by gateway/config.py's collect_config() (fault-tolerant,
+    per-entity), which validate_config() uses instead of catching a single
+    from_file() exception."""
+
+    async def test_agent_with_a_real_problem_shows_error_others_stay_ok(
+        self, tmp_path, work_dir
+    ):
+        broken_dir = tmp_path / "does-not-exist"
+        config_path = _write_config(tmp_path, f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              broken-agent:
+                type: claude
+                working_directory: {broken_dir}
+              working-agent:
+                type: claude
+                working_directory: {work_dir}
+            watchers:
+              - connector: rc
+                agent: working-agent
+                room: general
+        """)
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            # A real per-entity problem now populates the tables normally
+            # (not the global "unavailable" fallback) — confirms
+            # collect_config() returned a usable partial config.
+            table = app.screen.query_one("#agents-table", DataTable)
+            assert table.row_count == 2
+            rows = {table.get_row_at(i)[0]: table.get_row_at(i) for i in range(2)}
+            assert "ERROR" in rows["broken-agent"][3]
+            assert "OK" in rows["working-agent"][3]
+
+    async def test_watcher_with_a_real_problem_shows_error_others_still_display(
+        self, tmp_path, work_dir
+    ):
+        """EditableConfig.expanded_watchers() used to populate the Watchers
+        table via a SEPARATE, still-strict GatewayConfig.from_file() call —
+        a single broken watcher entry collapsed the WHOLE table to the
+        "(unavailable)" placeholder, same failure mode agents/connectors had
+        before this change. Now uses collect_config() + _parse_one_watcher_entry()
+        directly per raw entry, so only the broken entry's OWN rows are
+        dropped from the table (its explanation is still available via the
+        Overview banner's 'v' details view) — every other watcher still
+        expands and displays its real Status normally."""
+        config_path = _write_config(tmp_path, f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {work_dir}
+            watchers:
+              - name: good-watcher
+                connector: rc
+                agent: default
+                room: general
+              - name: bad-watcher
+                connector: rc
+                agent: nonexistent-agent
+                room: dev
+        """)
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.screen.query_one("#watchers-table", DataTable)
+            # bad-watcher's own entry failed to parse entirely — it never
+            # becomes a row at all (there's no WatcherConfig to attach a
+            # Status badge to); good-watcher is unaffected and shows OK.
+            assert table.row_count == 1
+            row = table.get_row_at(0)
+            assert row[0] == "good-watcher"
+            assert "OK" in row[4]
+
+            banner = str(app.screen.query_one("#banner", Static).render())
+            assert "1 error(s)" in banner
+
+    async def test_two_independently_broken_agents_both_show_error(
+        self, tmp_path
+    ):
+        """The actual point of this change: BOTH agents' rows show ERROR in
+        one pass, not just whichever one from_file() would have hit first."""
+        broken_dir_1 = tmp_path / "nope1"
+        broken_dir_2 = tmp_path / "nope2"
+        config_path = _write_config(tmp_path, f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              agent1:
+                type: claude
+                working_directory: {broken_dir_1}
+              agent2:
+                type: claude
+                working_directory: {broken_dir_2}
+            watchers:
+              - connector: rc
+                agent: agent1
+                room: general
+        """)
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.screen.query_one("#agents-table", DataTable)
+            assert table.row_count == 2
+            for i in range(2):
+                assert "ERROR" in table.get_row_at(i)[3]
+
+
 class TestValidationDetailsModal:
     """User-reported: the banner only ever showed a bare count ("✗ 1
     error(s)") — the actual message text (e.g. "Agent 'x': working_directory
@@ -315,19 +448,28 @@ class TestValidationDetailsModal:
     footer entry) when there's actually something to view."""
 
     async def test_missing_working_directory_shows_the_real_message_via_v(
-        self, tmp_path
+        self, tmp_path, work_dir
     ):
-        config_path = _write_config(tmp_path, """\
+        # A second, working agent alongside 'broken-agent' — keeps this
+        # test's assertion focused on "exactly one real error, and 'v' shows
+        # its message" rather than also exercising the (separately tested,
+        # tests/unit/test_config_validate.py) "the only agent fails -> zero
+        # agents left -> a SECOND, global 'must define at least one agent'
+        # finding too" edge case.
+        config_path = _write_config(tmp_path, f"""\
             agents:
               broken-agent:
                 type: claude
+              working-agent:
+                type: claude
+                working_directory: {work_dir}
             connectors:
               - name: rc
                 type: rocketchat
-                server: {url: "http://localhost:3000", username: bot, password: pw}
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
             watchers:
               - connector: rc
-                agent: broken-agent
+                agent: working-agent
                 room: general
         """)
         app = ConfigToolApp(config_path)
