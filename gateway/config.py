@@ -402,6 +402,27 @@ def _resolve_inherits(
             f"{entity_kind} '{entity_label}': unknown {templates_key} "
             f"'{template_name}'. Available templates: {available}"
         )
+    # User-reported: nothing stopped an entry from declaring its own 'type'
+    # (e.g. a rocketchat connector, or a claude agent) while `inherits:`
+    # pointed at a template written for a DIFFERENT type (e.g. a mattermost
+    # connector template, or an opencode agent template) — the entry's own
+    # type silently won the merge, but the rest of that template's fields
+    # were written for the wrong protocol/backend entirely. Only an actual
+    # CONTRADICTION is an error: a template with no 'type' opinion of its
+    # own (a genuinely generic, shared field set) is still a legitimate
+    # thing to inherit regardless of the entry's type, and an entry with no
+    # 'type' of its own is meant to inherit the template's type outright
+    # (the config TUI's "switch template to switch type" feature relies on
+    # exactly that case).
+    entry_type = entry.get("type")
+    template_type = template.get("type")
+    if entry_type and template_type and entry_type != template_type:
+        raise ValueError(
+            f"{entity_kind} '{entity_label}': type '{entry_type}' does not "
+            f"match {templates_key}['{template_name}']'s own type "
+            f"'{template_type}' — an entry cannot inherit a template "
+            "written for a different type."
+        )
     return _deep_merge(template, entry)
 
 

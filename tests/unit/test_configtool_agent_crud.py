@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 import yaml
-from textual.widgets import Checkbox, DataTable, Footer, Input, Select, Static
+from textual.widgets import Checkbox, DataTable, Footer, Input, Static
 from textual.widgets._footer import FooterKey
 
 from gateway.configtool.app import ConfigToolApp
@@ -539,22 +539,32 @@ class TestEditAgent:
             warning = str(app.screen.query_one("#wd-warning", Static).render())
             assert "does not exist yet" not in warning
 
-    async def test_type_select_supports_switching_and_persists(self, tmp_path, work_dir):
+    async def test_type_is_immutable_once_an_agent_exists(self, tmp_path, work_dir):
+        """User-reported: unlike connectors (whose 'type' is immutable once
+        created — only chosen via TypePickerModal at creation, see
+        ConnectorDetailScreen's own module docstring), an agent's 'type' was
+        still a live, editable Select even in edit mode — letting an
+        existing agent silently switch its whole backend (claude <->
+        opencode) after creation. Now shown as a read-only header suffix,
+        matching connector's precedent exactly — no '#field-type' widget at
+        all in the form, in either create or edit mode."""
         config_path = _write_config(tmp_path, _config_with_one_agent(work_dir))
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
             await _open_agent_in_edit_mode(pilot, app)
 
-            select = app.screen.query_one("#field-type", Select)
-            assert select.value == "claude"
-            select.value = "opencode"
-            await pilot.pause()
-            await pilot.press("ctrl+s")
-            await pilot.pause()
+            assert not app.screen.query("#field-type")
+            form_texts = [str(s.render()) for s in app.screen.query(".entity-form Static")]
+            assert any("type: claude" in t for t in form_texts)
 
+            # Untouched — nothing to have changed it. This agent's own raw
+            # entry never set 'type' at all (only inherits: standard, which
+            # sets it) — the "claude" shown above is the MERGED effective
+            # value, exactly what test_agent_inherits_template
+            # (test_config_loading.py) pins at the loader level.
             entry = app.editable_config.agents_raw["existing-agent"]
-            assert entry["type"] == "opencode"
+            assert "type" not in entry
 
 
 class TestEscapeConfirmation:
@@ -1191,7 +1201,8 @@ class TestInheritsPicker:
             await pilot.pause()
             await _open_agent_in_edit_mode(pilot, app)
             assert app.screen.query_one("#field-timeout", Input).value == "1800"
-            assert app.screen.query_one("#field-type", Select).value == "claude"
+            form_texts = [str(s.render()) for s in app.screen.query(".entity-form Static")]
+            assert any("type: claude" in t for t in form_texts)
 
             await _click_inherits_button(pilot, app)
             await pilot.press("down", "enter")  # 'other' (index 1)
@@ -1200,7 +1211,13 @@ class TestInheritsPicker:
             assert isinstance(app.screen, AgentDetailScreen)  # no confirm — nothing overridden
             assert str(app.screen.query_one("#inherits-value", Static).render()) == "other"
             assert app.screen.query_one("#field-timeout", Input).value == "300"
-            assert app.screen.query_one("#field-type", Select).value == "opencode"
+            # 'type' has no own explicit value on this agent (see
+            # _config_with_two_templates below) — it's immutable in the form
+            # (test_type_is_immutable_once_an_agent_exists), so switching
+            # templates changes the EFFECTIVE type shown in the read-only
+            # header, exactly like ConnectorDetailScreen's own precedent.
+            form_texts = [str(s.render()) for s in app.screen.query(".entity-form Static")]
+            assert any("type: opencode" in t for t in form_texts)
 
     async def test_picking_a_template_does_not_clear_name_or_description(
         self, tmp_path, work_dir
@@ -1323,11 +1340,13 @@ class TestInheritsPicker:
             # This agent's ONLY source of 'type:' was the template just
             # cleared — Save correctly refuses, same "type is required"
             # validation the real loader always enforces (not bypassed by
-            # the Inherits picker/recompute). Explicitly setting 'type' is
-            # covered by test_picking_a_different_template_recomputes_every_field
-            # elsewhere in this class; this test's own point is that
-            # clearing inherits: doesn't silently fall back to a fixed
-            # 'claude' the way a pre-v0.3 config once did.
+            # the Inherits picker/recompute). Unlike before 'type' became
+            # immutable in this form (test_type_is_immutable_once_an_agent_exists),
+            # there is no '#field-type' widget left to fix this from here —
+            # same documented escape hatch ConnectorDetailScreen's own
+            # type-immutability precedent relies on: $EDITOR. This test's
+            # own point is that clearing inherits: doesn't silently fall
+            # back to a fixed 'claude' the way a pre-v0.3 config once did.
             await pilot.press("ctrl+s")
             await pilot.pause()
             assert isinstance(app.screen, MessageModal)

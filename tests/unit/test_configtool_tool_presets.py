@@ -156,6 +156,89 @@ class TestToolPresetsScreenAddRule:
             assert len(raw["tool_presets"]["preset-a"]) == 1
 
 
+class TestToolPresetsScreenEditRule:
+    """User-reported gap: only Add/Delete existed for an individual rule —
+    no way to edit one in place short of deleting and re-adding it."""
+
+    async def test_edit_rule_persists_the_change_and_prefills_the_modal(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_preset_detail(pilot, app, row=0)
+
+            list_view = app.screen.query_one("#preset-rules-list", ListView)
+            list_view.focus()
+            list_view.index = 0
+            await pilot.pause()
+
+            await pilot.press("e")
+            await pilot.pause()
+            assert isinstance(app.screen, InlineToolRuleModal)
+            # Pre-filled from the existing rule (preset-a's only rule:
+            # {tool: Bash, params: "ls .*"}), not blank.
+            assert app.screen.query_one("#rule-tool", Input).value == "Bash"
+            assert app.screen.query_one("#rule-params", Input).value == "ls .*"
+
+            app.screen.query_one("#rule-tool", Input).value = "Bash2"
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert isinstance(app.screen, ToolPresetsScreen)
+            list_view = app.screen.query_one("#preset-rules-list", ListView)
+            assert len(list_view.children) == 1  # replaced in place, not appended
+
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert raw["tool_presets"]["preset-a"] == [{"tool": "Bash2", "params": "ls .*"}]
+
+    async def test_edit_with_nothing_selected_notifies_instead_of_crashing(
+        self, tmp_path, work_dir
+    ):
+        # Same setup as the sibling delete-rule test: ListView.index
+        # defaults to 0 (not None) the instant it mounts with any children,
+        # so "nothing selected" can only be forced with a genuinely EMPTY
+        # rule list.
+        text = _config_text(work_dir).replace(
+            "tool_presets:\n          preset-a:\n            - tool: Bash\n"
+            '              params: "ls .*"\n',
+            "tool_presets:\n          preset-a: []\n",
+        )
+        config_path = _write_config(tmp_path, text)
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_preset_detail(pilot, app, row=0)
+
+            await pilot.press("e")
+            await pilot.pause()
+
+            assert isinstance(app.screen, ToolPresetsScreen)  # no crash
+
+    async def test_cancelling_the_edit_modal_leaves_the_rule_untouched(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_preset_detail(pilot, app, row=0)
+
+            list_view = app.screen.query_one("#preset-rules-list", ListView)
+            list_view.focus()
+            list_view.index = 0
+            await pilot.pause()
+
+            await pilot.press("e")
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+
+            assert isinstance(app.screen, ToolPresetsScreen)
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert raw["tool_presets"]["preset-a"] == [{"tool": "Bash", "params": "ls .*"}]
+
+
 class TestToolPresetsScreenDeleteRule:
     async def test_delete_rule_persists_the_removal(self, tmp_path, work_dir):
         config_path = _write_config(tmp_path, _config_text(work_dir))

@@ -299,3 +299,78 @@ class TestAgentToolListSave:
             await pilot.pause()
             assert isinstance(app.screen, AgentDetailScreen)
             assert len(list_view.children) == 1
+
+
+class TestAgentToolListEdit:
+    """User-reported gap: only Add/Remove existed for an individual
+    owner/guest_allowed_tools rule — no way to edit an inline rule in place
+    short of removing and re-adding it."""
+
+    async def test_editing_an_inline_rule_replaces_it_in_place(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_edit(pilot, app)
+
+            # Add an inline rule first (preset-a (0) is a preset reference,
+            # not editable here) — same flow as test_writing_an_inline_rule.
+            await _click_tool_button(pilot, app, "add")
+            await pilot.press("down", "down", "enter")  # inline (index 2)
+            await pilot.pause()
+            app.screen.query_one("#rule-tool", Input).value = "Edit"
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+
+            list_view = app.screen.query_one("#owner-tools-list", ListView)
+            list_view.focus()
+            list_view.index = 1  # the just-added {tool: Edit} inline rule
+            await pilot.pause()
+
+            await _click_tool_button(pilot, app, "edit")
+            await pilot.pause()
+            assert isinstance(app.screen, InlineToolRuleModal)
+            assert app.screen.query_one("#rule-tool", Input).value == "Edit"  # pre-filled
+            app.screen.query_one("#rule-tool", Input).value = "Read"
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert isinstance(app.screen, AgentDetailScreen)
+            assert len(list_view.children) == 2  # replaced, not appended
+
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert raw["agents"]["agent-a"]["owner_allowed_tools"] == [
+                "preset-a",
+                {"tool": "Read"},
+            ]
+
+    async def test_editing_a_preset_reference_notifies_instead_of_crashing(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_edit(pilot, app)
+
+            list_view = app.screen.query_one("#owner-tools-list", ListView)
+            # A real click (not just setting .index programmatically) — the
+            # item is already highlighted by default (index 0), so this is
+            # exactly the "click the already-highlighted item" case
+            # on_descendant_focus() exists to still count as a genuine
+            # selection (see test_removing_the_only_item_writes_an_explicit_
+            # empty_override's identical comment).
+            list_view.scroll_visible(animate=False)
+            await pilot.pause()
+            await pilot.click(list_view.children[0])  # 'preset-a' — a bare string reference
+            await pilot.pause()
+
+            await _click_tool_button(pilot, app, "edit")
+            await pilot.pause()
+
+            assert isinstance(app.screen, AgentDetailScreen)  # no crash
+            assert len(list_view.children) == 1  # untouched

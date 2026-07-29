@@ -500,7 +500,33 @@ class ConnectorDetailScreen(FormScreen):
     async def _open_inherits_picker(self) -> None:
         if self.mode == "view":
             return
-        template_names = sorted(self.cfg.templates("connector"))
+        # User-reported: this used to list EVERY connector template
+        # regardless of type, letting a rocketchat connector pick a
+        # mattermost-typed template (or vice versa) straight from the
+        # picker — gateway/config.py's _resolve_inherits() now rejects that
+        # combination outright at save time, but filtering it out of the
+        # picker here catches the mistake before the user even fills in the
+        # rest of the form.
+        #
+        # Filtered against `self.entry.get("type")` — the entry's OWN raw
+        # type — NOT `self._connector_type()` (the merged/current EFFECTIVE
+        # type). This connector may have no own 'type' at all, relying
+        # entirely on whichever template it currently inherits from (a
+        # perfectly normal way to write one — see
+        # test_switching_to_a_different_type_template_reshapes_the_form):
+        # such a connector must still be free to switch to ANY template,
+        # including one of a different type (that's the whole point of the
+        # "switch template to switch type entirely" feature this same
+        # picker supports). The mismatch this filter exists to prevent only
+        # arises when the entry ITSELF pins an explicit type that a
+        # candidate template's own explicit type would then contradict.
+        all_templates = self.cfg.templates("connector")
+        entry_type = self.entry.get("type")
+        template_names = sorted(
+            name
+            for name, template in all_templates.items()
+            if not entry_type or not template.get("type") or template.get("type") == entry_type
+        )
         choice = await self.app.push_screen_wait(
             InheritsPickerModal(template_names, self._inherits_current)
         )

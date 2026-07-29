@@ -1129,6 +1129,60 @@ class TestConnectorTemplates(unittest.TestCase):
             GatewayConfig.from_file(path)
         self.assertIn("connector_templates", str(ctx.exception))
 
+    def test_connector_type_conflicting_with_inherited_template_type_raises(self):
+        """User-reported: a connector explicitly declaring its own 'type'
+        while inheriting a template written for a DIFFERENT type used to
+        silently keep the entry's own type — with the rest of the
+        template's (wrong-protocol) fields merged in regardless. Only a
+        genuine contradiction (both sides set, and different) is an error;
+        inheriting the type FROM a template with no own-type override is
+        the normal, intended usage (tested elsewhere)."""
+        path = self._write_config("""\
+            connector_templates:
+              mm-standard:
+                type: mattermost
+                server: {url: http://localhost:8065, token: t, team: main}
+            connectors:
+              - name: rc1
+                type: rocketchat
+                inherits: mm-standard
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watchers:
+              - name: w1
+                room: general
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        msg = str(ctx.exception)
+        self.assertIn("rocketchat", msg)
+        self.assertIn("mattermost", msg)
+
+    def test_connector_type_matching_inherited_template_type_is_fine(self):
+        """Same explicit type on both sides is not a conflict — this must
+        keep working exactly as before."""
+        path = self._write_config("""\
+            connector_templates:
+              standard:
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            connectors:
+              - name: rc1
+                type: rocketchat
+                inherits: standard
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watchers:
+              - name: w1
+                room: general
+        """)
+        config = GatewayConfig.from_file(path)
+        self.assertEqual(config.connectors[0].type, "rocketchat")
+
     def test_attachments_cache_dir_global_template_not_aliased_across_connectors(self):
         """Regression: cache_dir_global resolution mutates the connector's raw dict
         in place. Without a deep-copying merge, two connectors sharing the same
@@ -1195,6 +1249,38 @@ class TestAgentTemplates(unittest.TestCase):
         # 'other' overrides timeout but still inherits working_directory/type.
         self.assertEqual(config.agents["other"].timeout, 42)
         self.assertEqual(config.agents["other"].working_directory, "/tmp")
+
+    def test_agent_type_conflicting_with_inherited_template_type_raises(self):
+        """User-reported: an agent explicitly declaring its own 'type'
+        (e.g. claude) while inheriting a template written for a DIFFERENT
+        type (e.g. opencode) used to silently keep the agent's own type —
+        with the rest of that template's (wrong-backend) fields, like
+        `command`, merged in regardless. Only a genuine contradiction (both
+        sides set, and different) is an error."""
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agent_templates:
+              opencode-standard:
+                type: opencode
+                command: opencode
+            agents:
+              agent-a:
+                type: claude
+                inherits: opencode-standard
+                working_directory: /tmp
+            watchers:
+              - name: w1
+                agent: agent-a
+                room: general
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        msg = str(ctx.exception)
+        self.assertIn("claude", msg)
+        self.assertIn("opencode", msg)
 
     def test_agent_template_can_set_type_and_command_independently(self):
         """The motivating regression test for this whole redesign: a template
