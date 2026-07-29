@@ -348,6 +348,41 @@ class TestAgentToolListEdit:
                 {"tool": "Read"},
             ]
 
+    async def test_selection_survives_a_refresh_not_just_initial_selection(
+        self, tmp_path, work_dir
+    ):
+        """PR review finding: `_refresh_tool_list()` (called by every Add/
+        Edit/Remove) does `ListView.clear()`, which resets `.index` back to
+        `None` — re-`.append()`ing items afterward does NOT restore an
+        auto-selection. Without a fix inside `_refresh_tool_list()` itself
+        (mirroring the identical fix in tool_presets.py's
+        `_refresh_rules()`), the FIRST mutation left the list permanently
+        unselected: the very next Remove/Edit would silently no-op on
+        `list_view.index is None`, even with an item still visibly present.
+        Reproduced here with NO manual `list_view.index = ...` in between —
+        exactly the gap a prior version of this fix missed."""
+        config_path = _write_config(tmp_path, _config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_edit(pilot, app)
+
+            await _click_tool_button(pilot, app, "add")
+            await pilot.press("down", "down", "enter")  # inline (index 2)
+            await pilot.pause()
+            app.screen.query_one("#rule-tool", Input).value = "Edit"
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+
+            list_view = app.screen.query_one("#owner-tools-list", ListView)
+            assert len(list_view.children) == 2
+
+            # No manual reselect — Remove should still act, not silently
+            # no-op with "Select an item in the list first."
+            await _click_tool_button(pilot, app, "remove")
+            assert len(list_view.children) == 1
+
     async def test_editing_a_preset_reference_notifies_instead_of_crashing(
         self, tmp_path, work_dir
     ):

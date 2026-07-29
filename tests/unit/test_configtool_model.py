@@ -175,6 +175,69 @@ class TestExpandedWatchersDesync(_EditableConfigTestBase):
         self.assertEqual(len(expanded), 2)
 
 
+class TestExpandedWatchersMalformedWatcherTemplates(_EditableConfigTestBase):
+    """PR review finding: expanded_watchers() re-parses `watcher_templates:`
+    straight off disk, independently of collect_config() (which already
+    tolerates this same failure internally, falling back to watchers=[]
+    plus its own ConfigIssue). Without an equivalent fallback here, a
+    malformed `watcher_templates:` block used to make this method's
+    ValueError propagate all the way up through OverviewScreen's
+    `except (ValueError, FileNotFoundError): expanded = None`, collapsing
+    the ENTIRE watchers table to the "(unavailable)" placeholder — the
+    exact all-or-nothing failure mode this whole method exists to avoid —
+    even though every watcher entry itself was perfectly fine."""
+
+    def test_malformed_watcher_templates_block_does_not_take_down_every_watcher(self):
+        path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watcher_templates: not-a-mapping
+            watchers:
+              - name: w1
+                connector: rc
+                agent: default
+                room: general
+        """)
+        cfg = EditableConfig.load(path)
+        expanded = cfg.expanded_watchers()  # must not raise
+        self.assertEqual([ew.watcher.name for ew in expanded], ["w1"])
+
+    def test_a_watcher_that_actually_needs_the_broken_template_still_drops_its_own_row(self):
+        path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watcher_templates: not-a-mapping
+            watchers:
+              - name: w1
+                connector: rc
+                agent: default
+                room: general
+              - name: w2
+                connector: rc
+                agent: default
+                room: dev
+                inherits: standard
+        """)
+        cfg = EditableConfig.load(path)
+        expanded = cfg.expanded_watchers()  # must not raise
+        # w2 references a template that can't be resolved at all (the whole
+        # block is malformed) — its own row drops, same as any other
+        # independent per-entry failure; w1 (unaffected) still displays.
+        self.assertEqual([ew.watcher.name for ew in expanded], ["w1"])
+
+
 class TestEditableConfigTemplates(_EditableConfigTestBase):
     def test_templates_strips_description(self):
         path = self._write(f"""\
@@ -681,6 +744,43 @@ class TestEditableConfigScopedSaveGate(_EditableConfigTestBase):
         # rc1's pre-existing (untouched, unrelated) empty credentials survive
         # exactly as they were — this save neither fixed nor was blocked by them.
         self.assertEqual(raw["connectors"][0]["server"]["username"], "")
+
+    def test_save_does_not_crash_when_a_broken_entry_has_a_non_string_name(self):
+        """PR review finding: a watcher's own `name:` might itself be
+        malformed (e.g. a list) on an entry that ALSO fails for an unrelated
+        reason (here: no `room`/`rooms`) — gateway/config.py's
+        collect_config() used to pass that malformed value straight through
+        as ConfigIssue.entity_name, which _new_errors_introduced_by_this_save()
+        above then puts into a set of tuples, raising an uncaught
+        `TypeError: unhashable type: 'list'` instead of the clean ValueError
+        every caller expects."""
+        path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+              - name: rc2
+                type: rocketchat
+                server: {{url: "http://localhost:3001", username: bot2, password: pw2}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: [a, b]
+                connector: rc
+        """)
+        cfg = EditableConfig.load(path)
+        # An entirely unrelated, otherwise-harmless edit — must not trip
+        # over the pre-existing malformed watcher name while diffing
+        # before/after findings.
+        cfg.document["connectors"][1]["server"]["username"] = "bot2-renamed"
+        cfg.mark_dirty()
+
+        cfg.save()  # must not raise TypeError
+
+        raw = yaml.safe_load(path.read_text())
+        assert raw["connectors"][1]["server"]["username"] == "bot2-renamed"
 
 
 if __name__ == "__main__":

@@ -1149,6 +1149,54 @@ class TestInheritsPicker:
             await _click_inherits_button(pilot, app)
             assert isinstance(app.screen, InheritsPickerModal)
 
+    async def test_picker_excludes_a_conflicting_type_template_when_entry_has_its_own_type(
+        self, tmp_path, work_dir
+    ):
+        """User-reported: nothing stopped an agent from picking an
+        inherits: template written for a DIFFERENT type — gateway/config.py's
+        _resolve_inherits() now rejects that combination at save time when
+        the entry has its OWN explicit type, but the picker should catch the
+        mistake earlier by not offering the conflicting template at all.
+        Filtered against the entry's own RAW type ('claude' here, set
+        explicitly alongside inherits:) — NOT the merged/effective type,
+        which would wrongly also exclude templates for an entry with no own
+        type (see test_picking_a_different_template_recomputes_every_field,
+        which pins that case must still offer every template)."""
+        config_path = _write_config(
+            tmp_path,
+            f"""\
+            agent_templates:
+              standard:
+                type: claude
+                timeout: 1800
+              other:
+                type: opencode
+                timeout: 300
+            agents:
+              existing-agent:
+                type: claude
+                inherits: standard
+                working_directory: {work_dir}
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            watchers:
+              - connector: rc
+                agent: existing-agent
+                room: general
+            """,
+        )
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_in_edit_mode(pilot, app)
+
+            await _click_inherits_button(pilot, app)
+            assert isinstance(app.screen, InheritsPickerModal)
+            assert "other" not in app.screen.template_names
+            assert "standard" in app.screen.template_names
+
     async def test_inherits_value_text_vertically_aligns_with_the_change_button(
         self, tmp_path, work_dir
     ):

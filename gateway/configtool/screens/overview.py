@@ -642,11 +642,14 @@ class OverviewScreen(Screen):
         # any GatewayConfig.from_file failure into `result` (shown in the
         # banner above), but several accessors here call the real loader
         # AGAIN independently (merged_entry/templates/expanded_watchers all
-        # replay _parse_templates_block/_resolve_inherits, and
-        # expanded_watchers() calls validated_view() ->
-        # GatewayConfig.from_file() directly) — the exact same failure would
-        # otherwise raise a second, unhandled time here. A table that can't
-        # be computed shows one row saying so rather than crashing the whole
+        # replay _parse_templates_block/_resolve_inherits — expanded_watchers()
+        # itself uses collect_config() + direct per-entry
+        # _parse_one_watcher_entry() calls, not GatewayConfig.from_file(), so
+        # a broken watcher's own row just disappears rather than raising —
+        # but a STRUCTURAL failure, e.g. `config.yaml` disappearing between
+        # calls, still can) — the exact same failure would otherwise raise a
+        # second, unhandled time here. A table that can't be computed shows
+        # one row saying so rather than crashing the whole
         # overview; the banner above already has the actual error text.
 
         # Keyed by list POSITION, not by name — unlike agents_raw (a dict,

@@ -877,6 +877,54 @@ class TestConnectorInheritsPicker:
             assert app.screen.query_one("#field-server-team")
             assert app.screen.query_one("#field-require_mention", Checkbox).value is True
 
+    async def test_picker_excludes_a_conflicting_type_template_when_entry_has_its_own_type(
+        self, tmp_path, work_dir
+    ):
+        """User-reported: nothing stopped a connector from picking an
+        inherits: template written for a DIFFERENT type — gateway/config.py's
+        _resolve_inherits() now rejects that combination at save time when
+        the entry has its OWN explicit type, but the picker should catch the
+        mistake earlier by not offering the conflicting template at all.
+        Filtered against the entry's own RAW type ('rocketchat' here, set
+        explicitly alongside inherits:) — NOT the merged/effective type,
+        which would wrongly also exclude templates for an entry with no own
+        type (see test_switching_to_a_different_type_template_reshapes_the_form,
+        which pins that case must still offer every template)."""
+        config_path = _write_config(
+            tmp_path,
+            f"""\
+            connector_templates:
+              standard:
+                type: rocketchat
+                require_mention: false
+              other:
+                type: mattermost
+                require_mention: true
+            agents:
+              default:
+                type: claude
+                working_directory: {work_dir}
+            connectors:
+              - name: rc-existing
+                type: rocketchat
+                inherits: standard
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            watchers:
+              - connector: rc-existing
+                agent: default
+                room: general
+            """,
+        )
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_connector_in_edit_mode(pilot, app)
+
+            await _click_inherits_button(pilot, app)
+            assert isinstance(app.screen, InheritsPickerModal)
+            assert "other" not in app.screen.template_names
+            assert "standard" in app.screen.template_names
+
     async def test_picking_a_template_does_not_clear_the_description(self, tmp_path, work_dir):
         """User-reported (same bug as AgentDetailScreen's own version of
         this test): typing a Description then picking a template via the

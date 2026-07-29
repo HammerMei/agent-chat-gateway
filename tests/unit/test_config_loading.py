@@ -1565,6 +1565,45 @@ class TestWatcherTemplates(unittest.TestCase):
                 self.assertIn("watcher_templates", str(ctx.exception))
                 self.assertIn(key, str(ctx.exception))
 
+    def test_watcher_type_field_is_not_special_but_the_shared_mismatch_check_still_applies(self):
+        """PR review finding/clarification: the type-mismatch check in
+        _resolve_inherits() (added for connectors/agents — see
+        TestConnectorTemplates/TestAgentTemplates) is a single, generic
+        implementation shared by ALL THREE entity kinds, including watchers
+        — even though WatcherConfig has no real 'type' field at all and
+        never reads one. A watcher entry setting 'type:' is just an inert,
+        unused extra key; but if BOTH the entry and its inherited template
+        happen to set one, with different values, the same shared check
+        still fires. This is an accepted, harmless side effect of reusing
+        one implementation for all three kinds (matching this codebase's
+        own "never duplicate a rule" principle) rather than a real feature
+        — nothing legitimate ever sets 'type:' on a watcher."""
+        path = self._write_config("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watcher_templates:
+              standard:
+                connector: rc
+                agent: default
+                type: bar
+            watchers:
+              - name: w1
+                inherits: standard
+                type: foo
+                room: general
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        msg = str(ctx.exception)
+        self.assertIn("foo", msg)
+        self.assertIn("bar", msg)
+
     def test_watcher_inherits_resolved_before_rooms_expansion(self):
         """inherits: must resolve before the room/rooms expansion below it in
         from_file — otherwise a rooms: group's expanded watchers wouldn't see

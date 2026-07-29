@@ -109,6 +109,20 @@ class ToolListEditorMixin:
         list_view.clear()
         for i, item in enumerate(self._tool_lists[key]):
             list_view.append(ListItem(Label(format_tool_rule(item)), name=str(i)))
+        # PR review finding: `ListView.clear()` above resets `.index` back
+        # to `None`, and re-`.append()`ing items afterward does NOT restore
+        # an auto-selection the way a `ListView` composed WITH its children
+        # up front does (see `on_list_view_highlighted()`'s own comment on
+        # that distinction — and `tool_presets.py`'s `_refresh_rules()`,
+        # which has the exact same fix for the exact same reason). Every
+        # Add/Edit/Remove calls this method afterward, so without this, the
+        # very first mutation left the list permanently unselected —
+        # `_edit_tool_rule()`/`_remove_tool_rule()`'s own `list_view.index is
+        # None` guard then silently no-ops on the NEXT action, even though
+        # an item is still visibly present, until the user manually
+        # arrows/clicks back into the list.
+        if list_view.index is None and list_view.children:
+            list_view.index = 0
 
     def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
         """Real-Bug-fixed: `ListView.index` defaults to 0 (not None) the

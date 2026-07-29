@@ -13,7 +13,7 @@ form doesn't know about sneaking in.
 
 Tool lists (`owner_allowed_tools`/`guest_allowed_tools`) render read-only in
 view mode (`_body_text()`), but are directly editable in edit/create mode via
-two `ListView`s with dedicated "+ Add"/"- Remove" `Button`s beside each list
+two `ListView`s with dedicated "+ Add"/"Edit"/"- Remove" `Button`s beside each list
 (user-reported: the previous 'a'/'x' single-key bindings silently typed
 those letters into whatever Input happened to have focus instead of
 triggering the action — a real risk of quietly corrupting an unrelated

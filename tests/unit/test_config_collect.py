@@ -156,6 +156,62 @@ class TestCollectConfigPartialProgressPreserved(_CollectConfigTestBase):
         self.assertEqual(config.watchers, [])
 
 
+class TestCollectConfigNonStringNameHint(_CollectConfigTestBase):
+    """PR review finding: a connector/watcher entry's own `name:` might
+    itself be malformed (e.g. a list instead of a string) on an entry that
+    ALSO fails for some unrelated reason — ConfigIssue.entity_name is typed
+    `str | None` everywhere downstream, and EditableConfig's save-gate
+    (model.py's _new_errors_introduced_by_this_save()) puts this value
+    straight into a set of tuples, which raises an uncaught
+    `TypeError: unhashable type` for anything non-hashable (a list).
+    collect_config() must fall back to the same "(index i)" label an
+    absent name already gets, rather than using the malformed value
+    verbatim."""
+
+    def test_non_string_connector_name_falls_back_to_index_label(self):
+        config_path = self._write(f"""\
+            connectors:
+              - name: [a, b]
+                type: rocketchat
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                room: general
+        """)
+        config, issues = collect_config(config_path)
+        self.assertIsNotNone(config)
+        connector_issues = [i for i in issues if i.entity_kind == "connector"]
+        self.assertEqual(len(connector_issues), 1)
+        self.assertEqual(connector_issues[0].entity_name, "(index 0)")
+        # Never crashes building a set of these — the actual failure mode
+        # PR review caught (EditableConfig._new_errors_introduced_by_this_save()).
+        {(i.entity_kind, i.entity_name, i.message) for i in issues}
+
+    def test_non_string_watcher_name_falls_back_to_index_label(self):
+        config_path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: [a, b]
+                connector: rc
+        """)
+        config, issues = collect_config(config_path)
+        self.assertIsNotNone(config)
+        watcher_issues = [i for i in issues if i.entity_kind == "watcher"]
+        self.assertEqual(len(watcher_issues), 1)
+        self.assertEqual(watcher_issues[0].entity_name, "(index 0)")
+        {(i.entity_kind, i.entity_name, i.message) for i in issues}
+
+
 class TestParseOneWatcherEntryEmptyConnectors(_CollectConfigTestBase):
     """PR review finding: GatewayConfig.from_file() can never call
     _parse_one_watcher_entry() with an empty `connectors` list — an earlier
@@ -182,6 +238,84 @@ class TestParseOneWatcherEntryEmptyConnectors(_CollectConfigTestBase):
                 config_dir=Path(self.tmp),
                 seen_watcher_names=set(),
             )
+
+
+class TestCollectConfigQueueSchedulerSessionId(_CollectConfigTestBase):
+    """PR review finding: collect_config()'s max_queue_depth/scheduler:/
+    duplicate-session_id branches (unlike connectors/agents/watchers) had no
+    dedicated test directly against collect_config() itself — only
+    indirectly, via test_config_validate.py's lint regression test. Also
+    pins that max_queue_depth and scheduler: are validated INDEPENDENTLY: a
+    bad one falls back to its own default without discarding the other's
+    genuinely valid value."""
+
+    def _base_config(self, extra: str) -> str:
+        # `extra` is interpolated into an already-dedented block below, so
+        # it needs the SAME 12-space indentation as every other line here —
+        # otherwise textwrap.dedent() (in _write()) sees an inconsistent
+        # common prefix across lines and no-ops, breaking the YAML entirely.
+        indented_extra = textwrap.indent(extra, " " * 12)
+        return self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                connector: rc
+                agent: default
+                room: general
+{indented_extra}
+        """)
+
+    def test_invalid_max_queue_depth_falls_back_to_default_and_keeps_a_valid_scheduler(self):
+        config_path = self._base_config(
+            "max_queue_depth: -1\nscheduler: {completed_job_ttl_days: 30}"
+        )
+        config, issues = collect_config(config_path)
+        self.assertIsNotNone(config)
+        self.assertEqual(config.max_queue_depth, 100)
+        self.assertEqual(config.scheduler.completed_job_ttl_days, 30)
+        self.assertTrue(any("max_queue_depth" in i.message for i in issues))
+
+    def test_invalid_scheduler_falls_back_to_default_and_keeps_a_valid_max_queue_depth(self):
+        config_path = self._base_config("max_queue_depth: 42\nscheduler: not-a-mapping")
+        config, issues = collect_config(config_path)
+        self.assertIsNotNone(config)
+        self.assertEqual(config.max_queue_depth, 42)
+        self.assertEqual(config.scheduler.completed_job_ttl_days, 7)  # dataclass default
+        self.assertTrue(any("scheduler" in i.message for i in issues))
+
+    def test_duplicate_session_id_across_watchers_is_an_issue_not_a_discard(self):
+        config_path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                connector: rc
+                agent: default
+                room: general
+                session_id: sticky-1
+              - name: w2
+                connector: rc
+                agent: default
+                room: dev
+                session_id: sticky-1
+        """)
+        config, issues = collect_config(config_path)
+        self.assertIsNotNone(config)
+        self.assertEqual([w.name for w in config.watchers], ["w1", "w2"])
+        self.assertTrue(any("Duplicate sticky session_id" in i.message for i in issues))
 
 
 if __name__ == "__main__":

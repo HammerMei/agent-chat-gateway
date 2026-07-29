@@ -245,29 +245,11 @@ class GatewayConfig:
                     )
                 seen_session_ids.add(wc.session_id)
 
-        max_queue_depth = raw.get("max_queue_depth", 100)
-        if not isinstance(max_queue_depth, int):
-            raise ValueError(
-                f"config.yaml 'max_queue_depth' must be an integer (got {type(max_queue_depth).__name__})."
-            )
-        if max_queue_depth < 0:
-            raise ValueError("config.yaml 'max_queue_depth' must be >= 0")
+        max_queue_depth = _parse_max_queue_depth(raw)
 
         # ── Scheduler ─────────────────────────────────────────────────────────
 
-        scheduler_raw = raw.get("scheduler", {}) or {}
-        if not isinstance(scheduler_raw, Mapping):
-            raise ValueError(
-                f"config.yaml 'scheduler:' must be a mapping (got {type(scheduler_raw).__name__})."
-            )
-        scheduler_ttl = scheduler_raw.get("completed_job_ttl_days", 7)
-        if not isinstance(scheduler_ttl, int) or scheduler_ttl < 0:
-            raise ValueError(
-                "config.yaml 'scheduler.completed_job_ttl_days' must be a non-negative integer."
-            )
-        scheduler_cfg = SchedulerConfig(
-            completed_job_ttl_days=scheduler_ttl,
-        )
+        scheduler_cfg = _parse_scheduler(raw)
 
         return GatewayConfig(
             connectors=connectors,
@@ -624,6 +606,22 @@ def _parse_one_connector(
     connector_type = cc.get("type", "")
     if not name:
         raise ValueError("Each connector entry must have a 'name' field")
+    if not isinstance(name, str):
+        # PR review finding: a truthy-but-non-string 'name' (e.g. a YAML
+        # list) is technically not caught by `not name` above, and used to
+        # reach `name in seen_connector_names` below unchecked — an
+        # uncaught `TypeError: unhashable type` (for a list/dict) instead
+        # of a clean ValueError every caller expects. Pre-existing in
+        # from_file() too (this function is extracted verbatim from it),
+        # not something this session's collect_config() work introduced —
+        # just never exercised until collect_config()'s own per-entity
+        # attribution (gateway/config_validate.py's ConfigIssue.entity_name)
+        # started reading a NAME off of every connector, whether or not it
+        # goes on to parse successfully.
+        raise ValueError(
+            f"Connector entry at index {index}: 'name' must be a string "
+            f"(got {type(name).__name__})."
+        )
     if not connector_type:
         raise ValueError(f"Connector '{name}' must have a 'type' field")
     if name in seen_connector_names:
@@ -878,6 +876,17 @@ def _parse_one_watcher_entry(
     # 'name' / 'session_id' pin a single sticky identity — only meaningful
     # when the entry expands to exactly one watcher.
     explicit_name = wc.get("name") or None
+    if explicit_name is not None and not isinstance(explicit_name, str):
+        # PR review finding: a truthy-but-non-string 'name' (e.g. a YAML
+        # list) used to reach `watcher_name in seen_watcher_names` below
+        # unchecked — an uncaught `TypeError: unhashable type` instead of a
+        # clean ValueError every caller expects. Same class of bug as
+        # _parse_one_connector()'s identical fix, and equally pre-existing
+        # in from_file() (this function is extracted verbatim from it).
+        raise ValueError(
+            f"Watcher entry at index {index}: 'name' must be a string "
+            f"(got {type(explicit_name).__name__})."
+        )
     explicit_session_id = wc.get("session_id") or None
     if len(rooms_list) > 1:
         if explicit_name:
@@ -991,6 +1000,41 @@ def _parse_one_watcher_entry(
         )
     seen_watcher_names.update(staged_names)
     return result
+
+
+def _parse_max_queue_depth(raw: dict) -> int:
+    """Parses and validates the top-level `max_queue_depth:` field. Shared
+    by from_file() (lets a ValueError propagate immediately) and
+    collect_config() (catches it, records a ConfigIssue, falls back to the
+    default 100) — PR review finding: this was pasted twice, byte-identical,
+    before this extraction; unlike connectors/agents/watchers, there was no
+    single shared implementation for from_file()/collect_config() to drift
+    apart from."""
+    max_queue_depth = raw.get("max_queue_depth", 100)
+    if not isinstance(max_queue_depth, int):
+        raise ValueError(
+            f"config.yaml 'max_queue_depth' must be an integer (got {type(max_queue_depth).__name__})."
+        )
+    if max_queue_depth < 0:
+        raise ValueError("config.yaml 'max_queue_depth' must be >= 0")
+    return max_queue_depth
+
+
+def _parse_scheduler(raw: dict) -> "SchedulerConfig":
+    """Parses and validates the top-level `scheduler:` block. Shared by
+    from_file()/collect_config() — see _parse_max_queue_depth()'s docstring
+    for why this extraction exists."""
+    scheduler_raw = raw.get("scheduler", {}) or {}
+    if not isinstance(scheduler_raw, Mapping):
+        raise ValueError(
+            f"config.yaml 'scheduler:' must be a mapping (got {type(scheduler_raw).__name__})."
+        )
+    scheduler_ttl = scheduler_raw.get("completed_job_ttl_days", 7)
+    if not isinstance(scheduler_ttl, int) or scheduler_ttl < 0:
+        raise ValueError(
+            "config.yaml 'scheduler.completed_job_ttl_days' must be a non-negative integer."
+        )
+    return SchedulerConfig(completed_job_ttl_days=scheduler_ttl)
 
 
 @dataclass(frozen=True)
@@ -1122,7 +1166,19 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
     connectors: list[ConnectorConfig] = []
     seen_connector_names: set[str] = set()
     for i, cc_raw in enumerate(connectors_raw):
+        # PR review finding: `name:` itself might be malformed (e.g. a list
+        # instead of a string) on an entry that ALSO fails for some other
+        # reason — ConfigIssue.entity_name/Finding.entity_name are typed
+        # `str | None` everywhere downstream, and EditableConfig's save-gate
+        # (model.py's _new_errors_introduced_by_this_save()) puts this value
+        # straight into a set of tuples, which raises an uncaught
+        # `TypeError: unhashable type` for anything non-hashable (e.g. a
+        # list). Only ever use name_hint when it's genuinely a usable
+        # string; anything else falls back to the same "(index i)" label an
+        # absent name already gets.
         name_hint = cc_raw.get("name") if isinstance(cc_raw, Mapping) else None
+        if not isinstance(name_hint, str) or not name_hint:
+            name_hint = None
         try:
             connectors.append(
                 _parse_one_connector(cc_raw, i, connector_templates, config_dir, seen_connector_names)
@@ -1293,7 +1349,11 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
 
     seen_watcher_names: set[str] = set()
     for i, wc_raw in enumerate(watchers_raw):
+        # See the identical connector-loop comment above: only ever use
+        # name_hint when it's genuinely a usable string.
         name_hint = wc_raw.get("name") if isinstance(wc_raw, Mapping) else None
+        if not isinstance(name_hint, str) or not name_hint:
+            name_hint = None
         try:
             watchers.extend(
                 _parse_one_watcher_entry(
@@ -1323,45 +1383,21 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
     # max_queue_depth/scheduler: don't gate any single entity's validity —
     # collected as issues, falling back to safe defaults for the returned
     # config, rather than discarding all connector/agent/watcher progress.
-    max_queue_depth = raw.get("max_queue_depth", 100)
-    if not isinstance(max_queue_depth, int):
-        issues.append(
-            ConfigIssue(
-                "global", None,
-                f"config.yaml 'max_queue_depth' must be an integer "
-                f"(got {type(max_queue_depth).__name__}).",
-            )
-        )
-        max_queue_depth = 100
-    elif max_queue_depth < 0:
-        issues.append(
-            ConfigIssue("global", None, "config.yaml 'max_queue_depth' must be >= 0")
-        )
+    # Each validated independently (not one combined try/except) so a bad
+    # max_queue_depth doesn't also discard an otherwise-valid scheduler:,
+    # and vice versa — same reasoning as every other partial-progress branch
+    # in this function.
+    try:
+        max_queue_depth = _parse_max_queue_depth(raw)
+    except ValueError as exc:
+        issues.append(ConfigIssue("global", None, str(exc)))
         max_queue_depth = 100
 
-    scheduler_raw = raw.get("scheduler", {}) or {}
-    if not isinstance(scheduler_raw, Mapping):
-        issues.append(
-            ConfigIssue(
-                "global", None,
-                f"config.yaml 'scheduler:' must be a mapping "
-                f"(got {type(scheduler_raw).__name__}).",
-            )
-        )
+    try:
+        scheduler_cfg = _parse_scheduler(raw)
+    except ValueError as exc:
+        issues.append(ConfigIssue("global", None, str(exc)))
         scheduler_cfg = SchedulerConfig()
-    else:
-        scheduler_ttl = scheduler_raw.get("completed_job_ttl_days", 7)
-        if not isinstance(scheduler_ttl, int) or scheduler_ttl < 0:
-            issues.append(
-                ConfigIssue(
-                    "global", None,
-                    "config.yaml 'scheduler.completed_job_ttl_days' must be a "
-                    "non-negative integer.",
-                )
-            )
-            scheduler_cfg = SchedulerConfig()
-        else:
-            scheduler_cfg = SchedulerConfig(completed_job_ttl_days=scheduler_ttl)
 
     config = GatewayConfig(
         connectors=connectors,

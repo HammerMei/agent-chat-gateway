@@ -472,10 +472,28 @@ class EditableConfig:
             )
 
         connector_names = {c.name for c in config.connectors}
-        watcher_templates = _parse_templates_block(
-            disk_raw, "watcher_templates",
-            frozenset({"name", "room", "rooms", "session_id"}),
-        )
+        try:
+            watcher_templates = _parse_templates_block(
+                disk_raw, "watcher_templates",
+                frozenset({"name", "room", "rooms", "session_id"}),
+            )
+        except ValueError:
+            # PR review finding: a malformed `watcher_templates:` block is
+            # exactly the kind of unrelated, independent problem this whole
+            # method exists to NOT let take down every other watcher's row
+            # (collect_config() above already tolerates this internally,
+            # returning watchers=[] plus its own ConfigIssue — but this is a
+            # SEPARATE re-parse, straight off disk, with no fallback of its
+            # own). Falling back to {} — same "record the issue once
+            # elsewhere, keep going with a safe default" idiom
+            # gateway/config_validate.py's _lint_config() uses for the
+            # identical situation — means a watcher with no `inherits:` of
+            # its own still expands and displays normally; only an entry
+            # that actually needed this block (fails inside
+            # _parse_one_watcher_entry() below) drops its own row, exactly
+            # as already happens for any other independent per-entry
+            # failure.
+            watcher_templates = {}
         seen_watcher_names: set[str] = set()
         result: list[ExpandedWatcher] = []
         for entry in mem_watchers_raw:
