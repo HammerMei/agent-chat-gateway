@@ -106,9 +106,31 @@ class ToolListEditorMixin:
 
     def _refresh_tool_list(self, key: str) -> None:
         list_view = self.query_one(f"#{TOOL_LIST_WIDGET_IDS[key]}", ListView)
+        # PR review finding: captured BEFORE .clear() below (which always
+        # resets `.index` to None) so a mutation at some row N > 0 doesn't
+        # silently snap the cursor back to row 0 — a user editing/removing
+        # several rows in a row, expecting the cursor to roughly track
+        # position, would otherwise have every subsequent action land on
+        # the WRONG row with no error or visual cue.
+        prev_index = list_view.index
         list_view.clear()
         for i, item in enumerate(self._tool_lists[key]):
             list_view.append(ListItem(Label(format_tool_rule(item)), name=str(i)))
+        # Re-`.append()`ing items after `.clear()` does NOT restore an
+        # auto-selection the way a `ListView` composed WITH its children up
+        # front does (see `on_list_view_highlighted()`'s own comment on
+        # that distinction — and `tool_presets.py`'s `_refresh_rules()`,
+        # which has the exact same fix for the exact same reason). Every
+        # Add/Edit/Remove calls this method afterward, so without this, the
+        # very first mutation left the list permanently unselected —
+        # `_edit_tool_rule()`/`_remove_tool_rule()`'s own `list_view.index is
+        # None` guard then silently no-ops on the NEXT action, even though
+        # an item is still visibly present, until the user manually
+        # arrows/clicks back into the list. Clamped to the new last index
+        # when a removal shrank the list out from under the old position;
+        # falls back to 0 only when nothing was ever selected to begin with.
+        if list_view.children:
+            list_view.index = min(prev_index, len(list_view.children) - 1) if prev_index is not None else 0
 
     def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
         """Real-Bug-fixed: `ListView.index` defaults to 0 (not None) the
@@ -147,12 +169,15 @@ class ToolListEditorMixin:
                 self._tool_list_ever_selected[key] = True
 
     def _dispatch_tool_list_button(self, button_id: str) -> bool:
-        """Returns True if `button_id` was a tool-list Add/Remove button
-        (and has been handled) — False otherwise, so the host screen's own
-        `on_button_pressed()` can fall through to whatever else it
-        recognizes (e.g. an Inherits "Change…" button)."""
+        """Returns True if `button_id` was a tool-list Add/Edit/Remove
+        button (and has been handled) — False otherwise, so the host
+        screen's own `on_button_pressed()` can fall through to whatever
+        else it recognizes (e.g. an Inherits "Change…" button)."""
         if button_id.startswith("add-tool-"):
             self._add_tool_rule(button_id.removeprefix("add-tool-"))
+            return True
+        if button_id.startswith("edit-tool-"):
+            self._edit_tool_rule(button_id.removeprefix("edit-tool-"))
             return True
         if button_id.startswith("remove-tool-"):
             self._remove_tool_rule(button_id.removeprefix("remove-tool-"))
@@ -205,6 +230,40 @@ class ToolListEditorMixin:
         self._form_dirty = True
         self._refresh_tool_list(key)
 
+    @work
+    async def _edit_tool_rule(self, key: str) -> None:
+        """Triggered by the "Edit" button beside the owner/guest list —
+        user-reported gap: InlineToolRuleModal already accepted an
+        `initial:` dict to pre-fill the form (used nowhere until now), but
+        there was no way to actually invoke it for an EXISTING rule — only
+        Add (always blank) and Remove existed. Only meaningful for an
+        inline rule (a dict); a preset reference (a bare string) has
+        nothing to edit here — remove and re-add to point at a different
+        preset instead."""
+        if self.mode == "view" or key not in TOOL_LIST_WIDGET_IDS:
+            return
+        list_view = self.query_one(f"#{TOOL_LIST_WIDGET_IDS[key]}", ListView)
+        if not self._tool_list_ever_selected.get(key) or list_view.index is None:
+            self.notify("Select an item in the list first.", severity="warning")
+            return
+        idx = list_view.index
+        if idx >= len(self._tool_lists[key]):
+            return
+        item = self._tool_lists[key][idx]
+        if not isinstance(item, dict):
+            self.notify(
+                "Preset references aren't edited here — remove and re-add to "
+                "point at a different preset.",
+                severity="warning",
+            )
+            return
+        edited = await self.app.push_screen_wait(InlineToolRuleModal(initial=item))
+        if edited is None:
+            return
+        self._tool_lists[key][idx] = edited
+        self._form_dirty = True
+        self._refresh_tool_list(key)
+
     def _remove_tool_rule(self, key: str) -> None:
         """Triggered by the "- Remove" button beside the owner/guest list —
         removes whichever item THAT list's own ListView cursor is
@@ -242,6 +301,7 @@ class ToolListEditorMixin:
         yield list_view
         with Horizontal(classes="tool-list-buttons"):
             yield Button("+ Add", id=f"add-tool-{key}")
+            yield Button("Edit", id=f"edit-tool-{key}")
             yield Button("- Remove", id=f"remove-tool-{key}")
 
     def _collect_tool_list_updates(self, target_entry: dict) -> None:

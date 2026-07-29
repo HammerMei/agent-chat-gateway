@@ -33,7 +33,7 @@ from urllib.parse import urlparse
 
 import yaml
 
-from .config import GatewayConfig, _parse_templates_block
+from .config import GatewayConfig, _parse_templates_block, collect_config
 from .connectors.mattermost.config import MattermostConfig
 from .connectors.rocketchat.config import RocketChatConfig
 from .connectors.voice.config import VoiceConfig
@@ -110,22 +110,36 @@ class ValidationResult:
 
 
 def validate_config(config_path: str, lint: bool = False) -> ValidationResult:
-    """Validate config.yaml without starting the daemon. See module docstring."""
+    """Validate config.yaml without starting the daemon. See module docstring.
+
+    Uses `gateway/config.py`'s `collect_config()` — the fault-tolerant
+    counterpart to `GatewayConfig.from_file()` — instead of catching a
+    single exception from `from_file()` directly. This means a config with
+    MULTIPLE independent problems (e.g. two connectors each missing a
+    required field, or an agent with a bad `working_directory` alongside an
+    unrelated connector issue) reports EVERY one, each correctly attributed
+    to entity_kind="connector"/"agent"/"watcher" — not just whichever one
+    `from_file()` would have hit first, collapsed into one
+    entity_kind="global" finding that never marks a specific row in the
+    config TUI's Overview. A structural failure (e.g. `connectors:` isn't
+    even a list) is still exactly one global finding — collect_config()
+    itself only fans out across genuinely independent per-entity problems."""
     result = ValidationResult(config_path=config_path)
 
-    try:
-        config = GatewayConfig.from_file(config_path)
-    except (ValueError, FileNotFoundError) as exc:
-        result.errors.append(str(exc))
+    config, issues = collect_config(config_path)
+    for issue in issues:
+        result.errors.append(issue.message)
         result.findings.append(
             Finding(
                 severity="error",
-                entity_kind="global",
-                entity_name=None,
+                entity_kind=issue.entity_kind,
+                entity_name=issue.entity_name,
                 field=None,
-                message=str(exc),
+                message=issue.message,
             )
         )
+
+    if config is None:
         return result
 
     result.watcher_count = len(config.watchers)
@@ -241,27 +255,53 @@ def _check_state_orphans(config: GatewayConfig, result: ValidationResult) -> Non
 
 
 def _lint_config(raw: dict, result: ValidationResult) -> None:
-    # Safe to re-parse here without try/except: _lint_config only ever runs
-    # after validate_config()'s own GatewayConfig.from_file() call already
-    # succeeded (the early `return result` on the ValueError/FileNotFoundError
-    # path above), so every entry's `inherits:` (if any) is already known to
-    # resolve — these calls cannot raise.
-    agent_templates = _parse_templates_block(raw, "agent_templates", frozenset())
-    watcher_templates = _parse_templates_block(
-        raw, "watcher_templates", frozenset({"name", "room", "rooms", "session_id"})
-    )
-    connector_templates = _parse_templates_block(raw, "connector_templates", frozenset({"name"}))
+    # PR review finding: this used to assume re-parsing these blocks "cannot
+    # raise" because validate_config() only reached here after a successful
+    # GatewayConfig.from_file() call. That's no longer true now that
+    # validate_config() uses collect_config() — a `*_templates:` block can
+    # itself be malformed while collect_config() still returns a usable
+    # partial config (that failure is already recorded as its own Finding
+    # via collect_config()'s issues, same as from_file() would have caught
+    # it). Falling back to {} here — instead of re-raising the identical
+    # ValueError a second time, uncaught — mirrors collect_config()'s own
+    # "record the issue once, keep going with a safe default" behavior.
+    def _templates_or_empty(key: str, forbidden_keys: frozenset[str]) -> dict[str, dict]:
+        try:
+            return _parse_templates_block(raw, key, forbidden_keys)
+        except ValueError:
+            return {}
 
-    for agent_name, agent_raw in (raw.get("agents") or {}).items():
-        if isinstance(agent_raw, dict):
-            _lint_entry(
-                "agent", agent_name, agent_raw, "agent_templates", agent_templates,
-                _AGENT_LINT_DEFAULTS, result,
-            )
+    agent_templates = _templates_or_empty("agent_templates", frozenset())
+    watcher_templates = _templates_or_empty(
+        "watcher_templates", frozenset({"name", "room", "rooms", "session_id"})
+    )
+    connector_templates = _templates_or_empty("connector_templates", frozenset({"name"}))
+
+    # PR review finding: the guards below (isinstance(agents_raw, dict),
+    # the isinstance(str) checks on name/label) exist for the exact same
+    # reason _templates_or_empty() above does — collect_config() can return
+    # a usable partial config even when `agents:` itself isn't a mapping,
+    # or when an individual entry's own 'name:'/'inherits:' is malformed
+    # (e.g. a YAML list) — cases that were UNREACHABLE here before this
+    # branch (from_file()'s fail-fast behavior meant _lint_config() only
+    # ever ran on already-fully-valid data). Without these, `.items()` on a
+    # non-dict raises AttributeError, and a non-string name/label reaching
+    # Finding.entity_name (typed str | None) crashes
+    # gateway/configtool/model.py's StatusIndex with
+    # TypeError: unhashable type — both confirmed via direct repro.
+    agents_raw = raw.get("agents")
+    if isinstance(agents_raw, dict):
+        for agent_name, agent_raw in agents_raw.items():
+            if isinstance(agent_raw, dict):
+                _lint_entry(
+                    "agent", agent_name, agent_raw, "agent_templates", agent_templates,
+                    _AGENT_LINT_DEFAULTS, result,
+                )
 
     for i, wc in enumerate(raw.get("watchers") or []):
         if isinstance(wc, dict):
-            label = wc.get("name") or f"watchers[{i}]"
+            name_hint = wc.get("name")
+            label = name_hint if isinstance(name_hint, str) and name_hint else f"watchers[{i}]"
             _lint_entry(
                 "watcher", label, wc, "watcher_templates", watcher_templates,
                 _WATCHER_LINT_DEFAULTS, result,
@@ -270,7 +310,8 @@ def _lint_config(raw: dict, result: ValidationResult) -> None:
     for cc in raw.get("connectors") or []:
         if not isinstance(cc, dict):
             continue
-        name = cc.get("name") or "?"
+        name_hint = cc.get("name")
+        name = name_hint if isinstance(name_hint, str) and name_hint else "?"
         _lint_entry(
             "connector", name, cc, "connector_templates", connector_templates,
             _CONNECTOR_LINT_DEFAULTS, result,
@@ -312,6 +353,14 @@ def _lint_entry(
     entry of a kind was checked against regardless."""
     label = f"{entity_kind}s.{entity_name}"
     template_name = entry.get("inherits")
+    # PR review finding: a malformed 'inherits:' (e.g. a YAML list) is a
+    # real, already-reported ConfigIssue/Finding elsewhere (collect_config()
+    # itself rejects it) — but `dict.get()` requires a hashable key, so
+    # using template_name here unchecked raised an uncaught
+    # `TypeError: unhashable type` straight out of --lint, aborting the
+    # whole pass and discarding every already-collected finding.
+    if not isinstance(template_name, str) or not template_name:
+        template_name = None
     template = templates.get(template_name, {}) if template_name else {}
     for key, default_value in default_table:
         if key not in entry:

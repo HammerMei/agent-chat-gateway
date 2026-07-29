@@ -91,6 +91,80 @@ class TestToolPresetsScreenView:
             header = str(app.screen.query_one("#preset-detail-body", Static).render())
             assert "agent-a" in header
 
+    async def test_the_rules_list_is_focused_on_mount_with_no_tab_needed(
+        self, tmp_path, work_dir
+    ):
+        """User-reported: landing here required an explicit Tab press
+        before 'a'/'e'/'d' or the arrow keys did anything — DOM focus
+        started on nothing in particular. Covers BOTH a preset with rules
+        already in it and a brand-new, still-empty one (pushed via
+        OverviewScreen.action_new_entity()'s "new preset" flow) — a
+        focused, empty ListView is still a valid, useful state ('a' adds
+        the first rule)."""
+        config_path = _write_config(tmp_path, _config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_preset_detail(pilot, app, row=0)  # preset-a, has 1 rule
+
+            list_view = app.screen.query_one("#preset-rules-list", ListView)
+            assert list_view.has_focus
+
+            # No Tab press — 'd' should act immediately.
+            await pilot.press("d")
+            await pilot.pause()
+            assert len(list_view.children) == 0
+
+    async def test_selection_survives_a_refresh_not_just_initial_mount(
+        self, tmp_path, work_dir
+    ):
+        """PR review finding: the row-0 auto-select must live in
+        _refresh_rules() itself, not just on_mount() — `ListView.clear()`
+        (called by every add/edit/delete, via _refresh_rules()) resets
+        `.index` back to None, and re-appending items afterward does NOT
+        restore an auto-selection. Fixing this only in on_mount() made the
+        FIRST entry into this screen work, but the exact same "nothing
+        selected, 'd'/'e' silently no-op" bug reappeared after the very
+        first mutation — reproduced here by adding a rule, then deleting
+        immediately with no navigation keypress in between."""
+        config_path = _write_config(tmp_path, _config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_preset_detail(pilot, app, row=0)  # preset-a, has 1 rule
+
+            await pilot.press("a")
+            await pilot.pause()
+            app.screen.query_one("#rule-tool", Input).value = "Edit"
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+
+            list_view = app.screen.query_one("#preset-rules-list", ListView)
+            assert len(list_view.children) == 2
+
+            # No manual navigation — 'd' should still act immediately,
+            # matching what test_the_rules_list_is_focused_on_mount_with_no_
+            # tab_needed already pins for the very first entry.
+            await pilot.press("d")
+            await pilot.pause()
+            assert len(list_view.children) == 1
+
+    async def test_the_rules_list_is_focused_on_mount_when_empty(self, tmp_path, work_dir):
+        text = _config_text(work_dir).replace(
+            "tool_presets:\n          preset-a:\n            - tool: Bash\n"
+            '              params: "ls .*"\n',
+            "tool_presets:\n          preset-a: []\n",
+        )
+        config_path = _write_config(tmp_path, text)
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_preset_detail(pilot, app, row=0)  # preset-a, empty
+
+            list_view = app.screen.query_one("#preset-rules-list", ListView)
+            assert list_view.has_focus
+
 
 class TestToolPresetsScreenAddRule:
     async def test_add_rule_persists_to_disk_and_shows_in_the_list(self, tmp_path, work_dir):
@@ -154,6 +228,154 @@ class TestToolPresetsScreenAddRule:
             assert isinstance(app.screen, ToolPresetsScreen)
             raw = yaml.safe_load(Path(config_path).read_text())
             assert len(raw["tool_presets"]["preset-a"]) == 1
+
+
+class TestToolPresetsScreenEditRule:
+    """User-reported gap: only Add/Delete existed for an individual rule —
+    no way to edit one in place short of deleting and re-adding it."""
+
+    async def test_edit_rule_persists_the_change_and_prefills_the_modal(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_preset_detail(pilot, app, row=0)
+
+            list_view = app.screen.query_one("#preset-rules-list", ListView)
+            list_view.focus()
+            list_view.index = 0
+            await pilot.pause()
+
+            await pilot.press("e")
+            await pilot.pause()
+            assert isinstance(app.screen, InlineToolRuleModal)
+            # Pre-filled from the existing rule (preset-a's only rule:
+            # {tool: Bash, params: "ls .*"}), not blank.
+            assert app.screen.query_one("#rule-tool", Input).value == "Bash"
+            assert app.screen.query_one("#rule-params", Input).value == "ls .*"
+
+            app.screen.query_one("#rule-tool", Input).value = "Bash2"
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert isinstance(app.screen, ToolPresetsScreen)
+            list_view = app.screen.query_one("#preset-rules-list", ListView)
+            assert len(list_view.children) == 1  # replaced in place, not appended
+
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert raw["tool_presets"]["preset-a"] == [{"tool": "Bash2", "params": "ls .*"}]
+
+    async def test_edit_with_nothing_selected_notifies_instead_of_crashing(
+        self, tmp_path, work_dir
+    ):
+        # Same setup as the sibling delete-rule test: ListView.index
+        # defaults to 0 (not None) the instant it mounts with any children,
+        # so "nothing selected" can only be forced with a genuinely EMPTY
+        # rule list.
+        text = _config_text(work_dir).replace(
+            "tool_presets:\n          preset-a:\n            - tool: Bash\n"
+            '              params: "ls .*"\n',
+            "tool_presets:\n          preset-a: []\n",
+        )
+        config_path = _write_config(tmp_path, text)
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_preset_detail(pilot, app, row=0)
+
+            await pilot.press("e")
+            await pilot.pause()
+
+            assert isinstance(app.screen, ToolPresetsScreen)  # no crash
+
+    async def test_cancelling_the_edit_modal_leaves_the_rule_untouched(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_preset_detail(pilot, app, row=0)
+
+            list_view = app.screen.query_one("#preset-rules-list", ListView)
+            list_view.focus()
+            list_view.index = 0
+            await pilot.pause()
+
+            await pilot.press("e")
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+
+            assert isinstance(app.screen, ToolPresetsScreen)
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert raw["tool_presets"]["preset-a"] == [{"tool": "Bash", "params": "ls .*"}]
+
+
+class TestToolPresetsScreenCursorPositionAfterMutation:
+    """PR review finding: the row-0 auto-select fix (in _refresh_rules(),
+    see TestToolPresetsScreenView's own tests) used to fire unconditionally
+    on EVERY refresh — not just when nothing was selected — silently
+    snapping the cursor back to row 0 after every single mutation. A user
+    editing/deleting several rows in sequence, expecting the cursor to
+    roughly track position, would have every subsequent action land on the
+    WRONG row with no error or visual cue."""
+
+    async def _preset_with_three_rules(self, tmp_path, work_dir):
+        text = _config_text(work_dir).replace(
+            "tool_presets:\n          preset-a:\n            - tool: Bash\n"
+            '              params: "ls .*"\n',
+            "tool_presets:\n          preset-a:\n            - tool: Bash\n"
+            '              params: "ls .*"\n'
+            "            - tool: Read\n"
+            "            - tool: Write\n",
+        )
+        return _write_config(tmp_path, text)
+
+    async def test_editing_the_last_row_keeps_the_cursor_on_it(self, tmp_path, work_dir):
+        config_path = await self._preset_with_three_rules(tmp_path, work_dir)
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_preset_detail(pilot, app, row=0)
+
+            list_view = app.screen.query_one("#preset-rules-list", ListView)
+            list_view.focus()
+            list_view.index = 2  # 'Write', the last row
+            await pilot.pause()
+
+            await pilot.press("e")
+            await pilot.pause()
+            app.screen.query_one("#rule-tool", Input).value = "Write2"
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+
+            list_view = app.screen.query_one("#preset-rules-list", ListView)
+            assert len(list_view.children) == 3  # not appended/removed
+            assert list_view.index == 2  # cursor stayed put, not reset to 0
+
+    async def test_deleting_a_middle_row_clamps_the_cursor_sensibly(self, tmp_path, work_dir):
+        config_path = await self._preset_with_three_rules(tmp_path, work_dir)
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_preset_detail(pilot, app, row=0)
+
+            list_view = app.screen.query_one("#preset-rules-list", ListView)
+            list_view.focus()
+            list_view.index = 1  # 'Read', the middle row
+            await pilot.pause()
+
+            await pilot.press("d")
+            await pilot.pause()
+
+            list_view = app.screen.query_one("#preset-rules-list", ListView)
+            assert len(list_view.children) == 2  # 'Bash' and 'Write' remain
+            # index 1 is still a valid position (now 'Write', which slid up
+            # into the deleted row's slot) — not reset to 0.
+            assert list_view.index == 1
 
 
 class TestToolPresetsScreenDeleteRule:
