@@ -426,6 +426,96 @@ class TestValidateConfigLint(_ValidateConfigTestBase):
         self.assertFalse(result.ok)
         self.assertTrue(any("agent_templates" in e for e in result.errors))
 
+    def test_lint_does_not_attach_a_non_string_connector_name_to_a_finding(self):
+        """PR review finding: _lint_config()'s `name = cc.get("name") or
+        "?"` used the raw value verbatim — a truthy-but-non-string name
+        (e.g. a YAML list) reached Finding.entity_name (typed str | None)
+        unchecked. validate_config() itself doesn't crash on this (dataclass
+        construction doesn't type-check), but the config TUI's StatusIndex
+        does, the first time it tries to use (entity_kind, entity_name) as a
+        dict key (see test_configtool_model.py's
+        TestStatusIndexNonStringEntityName for the actual crash repro) —
+        pinned here at the source instead: every Finding this produces must
+        have a STRING entity_name, never the raw malformed value. Requires
+        'reply_in_thread: false' below (restating a built-in default) so
+        _lint_entry() actually appends a Finding for this connector at all —
+        without a lint-worthy field, entity_name is never even read."""
+        cfg = self._write(f"""\
+            connectors:
+              - name: [a, b]
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+                reply_in_thread: false
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+        """)
+        result = self._validate(cfg, lint=True)  # must not raise
+        connector_findings = [f for f in result.findings if f.entity_kind == "connector"]
+        self.assertTrue(connector_findings)
+        for f in connector_findings:
+            self.assertIsInstance(f.entity_name, str)
+
+    def test_lint_does_not_attach_a_non_string_watcher_name_to_a_finding(self):
+        cfg = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: [a, b]
+                connector: rc
+                room: general
+                session_id: null
+        """)
+        result = self._validate(cfg, lint=True)  # must not raise
+        watcher_findings = [f for f in result.findings if f.entity_kind == "watcher"]
+        self.assertTrue(watcher_findings)
+        for f in watcher_findings:
+            self.assertIsInstance(f.entity_name, str)
+
+    def test_lint_does_not_crash_on_a_non_hashable_inherits_value(self):
+        """PR review finding: _lint_entry()'s `templates.get(template_name,
+        {})` requires template_name to be hashable — a malformed
+        'inherits:' (e.g. a YAML list) raised an uncaught
+        TypeError: unhashable type straight out of --lint, aborting the
+        whole pass and discarding every already-collected finding."""
+        cfg = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+                inherits: [a, b]
+        """)
+        result = self._validate(cfg, lint=True)  # must not raise
+        self.assertFalse(result.ok)
+
+    def test_lint_does_not_crash_when_agents_block_is_not_a_mapping(self):
+        """PR review finding: `(raw.get("agents") or {}).items()` assumed
+        `agents:` is always a dict by the time --lint runs — already-false
+        for collect_config()'s own structural check, which reports this as
+        a clean issue elsewhere and returns a partial config with agents={}
+        rather than raising. --lint must not re-crash on the same raw,
+        unvalidated value with an uncaught AttributeError."""
+        cfg = self._write("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agents: [1, 2, 3]
+        """)
+        result = self._validate(cfg, lint=True)  # must not raise
+        self.assertFalse(result.ok)
+
 
 class TestFindingsExtension(_ValidateConfigTestBase):
     """`findings: list[Finding]` is additive alongside the flat string lists —

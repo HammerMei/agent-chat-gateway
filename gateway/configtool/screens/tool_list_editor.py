@@ -106,13 +106,19 @@ class ToolListEditorMixin:
 
     def _refresh_tool_list(self, key: str) -> None:
         list_view = self.query_one(f"#{TOOL_LIST_WIDGET_IDS[key]}", ListView)
+        # PR review finding: captured BEFORE .clear() below (which always
+        # resets `.index` to None) so a mutation at some row N > 0 doesn't
+        # silently snap the cursor back to row 0 — a user editing/removing
+        # several rows in a row, expecting the cursor to roughly track
+        # position, would otherwise have every subsequent action land on
+        # the WRONG row with no error or visual cue.
+        prev_index = list_view.index
         list_view.clear()
         for i, item in enumerate(self._tool_lists[key]):
             list_view.append(ListItem(Label(format_tool_rule(item)), name=str(i)))
-        # PR review finding: `ListView.clear()` above resets `.index` back
-        # to `None`, and re-`.append()`ing items afterward does NOT restore
-        # an auto-selection the way a `ListView` composed WITH its children
-        # up front does (see `on_list_view_highlighted()`'s own comment on
+        # Re-`.append()`ing items after `.clear()` does NOT restore an
+        # auto-selection the way a `ListView` composed WITH its children up
+        # front does (see `on_list_view_highlighted()`'s own comment on
         # that distinction — and `tool_presets.py`'s `_refresh_rules()`,
         # which has the exact same fix for the exact same reason). Every
         # Add/Edit/Remove calls this method afterward, so without this, the
@@ -120,9 +126,11 @@ class ToolListEditorMixin:
         # `_edit_tool_rule()`/`_remove_tool_rule()`'s own `list_view.index is
         # None` guard then silently no-ops on the NEXT action, even though
         # an item is still visibly present, until the user manually
-        # arrows/clicks back into the list.
-        if list_view.index is None and list_view.children:
-            list_view.index = 0
+        # arrows/clicks back into the list. Clamped to the new last index
+        # when a removal shrank the list out from under the old position;
+        # falls back to 0 only when nothing was ever selected to begin with.
+        if list_view.children:
+            list_view.index = min(prev_index, len(list_view.children) - 1) if prev_index is not None else 0
 
     def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
         """Real-Bug-fixed: `ListView.index` defaults to 0 (not None) the

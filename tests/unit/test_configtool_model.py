@@ -17,7 +17,8 @@ from pathlib import Path
 import yaml
 
 from gateway.config import GatewayConfig
-from gateway.configtool.model import EditableConfig, Provenance
+from gateway.config_validate import validate_config
+from gateway.configtool.model import EditableConfig, Provenance, StatusIndex
 
 
 class _EditableConfigTestBase(unittest.TestCase):
@@ -781,6 +782,53 @@ class TestEditableConfigScopedSaveGate(_EditableConfigTestBase):
 
         raw = yaml.safe_load(path.read_text())
         assert raw["connectors"][1]["server"]["username"] == "bot2-renamed"
+
+
+class TestStatusIndexNonStringEntityName(_EditableConfigTestBase):
+    """PR review finding: StatusIndex.__init__() groups findings by
+    `(entity_kind, entity_name)` — a dict key that must be hashable.
+    gateway/config_validate.py's _lint_config() used to attach a
+    truthy-but-non-string 'name'/'inherits' value (e.g. a YAML list)
+    straight onto a Finding.entity_name unchecked, which crashed HERE with
+    an uncaught TypeError: unhashable type the first time the config TUI
+    tried to build a StatusIndex from --lint findings — not at
+    validate_config() itself (dataclass construction doesn't type-check),
+    which is why this needs its own test beyond test_config_validate.py's
+    Finding-shape assertions."""
+
+    def test_a_non_string_connector_name_does_not_crash_status_index(self):
+        path = self._write(f"""\
+            connectors:
+              - name: [a, b]
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+                reply_in_thread: false
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+        """)
+        result = validate_config(str(path), lint=True)
+        StatusIndex(result.findings)  # must not raise TypeError
+
+    def test_a_non_string_watcher_name_does_not_crash_status_index(self):
+        path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: [a, b]
+                connector: rc
+                room: general
+                session_id: null
+        """)
+        result = validate_config(str(path), lint=True)
+        StatusIndex(result.findings)  # must not raise TypeError
 
 
 if __name__ == "__main__":

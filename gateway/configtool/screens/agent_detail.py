@@ -263,11 +263,24 @@ class AgentDetailScreen(ToolListEditorMixin, FormScreen):
         # whose 'type' comes only from its inherits: template still needs the
         # right value shown in the read-only header suffix, and kept in sync
         # if the Inherits picker switches to a different template.
+        #
+        # PR review finding: unlike a connector (whose 'type' is ALWAYS
+        # present — immutable, chosen at creation via TypePickerModal, see
+        # ConnectorDetailScreen._connector_type()'s identical-looking
+        # fallback), an agent can legitimately have NO type at all — its
+        # only source might be an inherits: template that's since been
+        # cleared (test_picking_none_clears_inherits_and_recomputes_to_
+        # dataclass_defaults). Defaulting to a real type name ("claude")
+        # here actively LIES about the agent's state in exactly that
+        # scenario: 'type' is no longer shown as an editable field anywhere
+        # in this form, so this header is the ONLY indicator of it, right
+        # as Save is about to fail with "type is required". "(unset)" is
+        # never itself a valid type, so it can't be confused with one.
         try:
             merged = self.cfg.merged_entry("agent", self._current_entry())
         except (ValueError, FileNotFoundError):
             merged = self._current_entry()
-        return merged.get("type", "claude")
+        return merged.get("type") or "(unset)"
 
     def _template_kind(self) -> str:
         return "agent"

@@ -1037,6 +1037,37 @@ def _parse_scheduler(raw: dict) -> "SchedulerConfig":
     return SchedulerConfig(completed_job_ttl_days=scheduler_ttl)
 
 
+def _max_queue_depth_and_scheduler_or_defaults(
+    raw: dict, issues: list["ConfigIssue"]
+) -> tuple[int, "SchedulerConfig"]:
+    """Best-effort max_queue_depth/scheduler parse, appending a ConfigIssue
+    and falling back per-field (independently) on failure — same behavior
+    collect_config()'s own final section already gives these two fields on
+    its happy path. PR review finding: collect_config()'s several EARLIER
+    structural early-return branches used to hardcode
+    `max_queue_depth=100, scheduler=SchedulerConfig()` instead of calling
+    this — silently discarding an otherwise-valid max_queue_depth/scheduler:
+    value behind a completely unrelated structural problem elsewhere (e.g.
+    a malformed `watchers:` block), the exact "don't hide an unrelated,
+    already-successful value's own state behind a different issue" bug this
+    whole function exists to avoid for connectors/agents/watchers. These
+    two fields have no entity dependency at all, so there's no reason they
+    couldn't always be parsed this way, everywhere collect_config() returns."""
+    try:
+        max_queue_depth = _parse_max_queue_depth(raw)
+    except ValueError as exc:
+        issues.append(ConfigIssue("global", None, str(exc)))
+        max_queue_depth = 100
+
+    try:
+        scheduler_cfg = _parse_scheduler(raw)
+    except ValueError as exc:
+        issues.append(ConfigIssue("global", None, str(exc)))
+        scheduler_cfg = SchedulerConfig()
+
+    return max_queue_depth, scheduler_cfg
+
+
 @dataclass(frozen=True)
 class ConfigIssue:
     """One structural/per-entity problem discovered by collect_config()'s
@@ -1202,10 +1233,11 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
                 f"Expected a dict of agent names to config blocks.",
             )
         )
+        mqd, sched = _max_queue_depth_and_scheduler_or_defaults(raw, issues)
         return (
             GatewayConfig(
                 connectors=connectors, agents={}, default_agent="", watchers=[],
-                max_queue_depth=100, scheduler=SchedulerConfig(),
+                max_queue_depth=mqd, scheduler=sched,
             ),
             issues,
         )
@@ -1216,10 +1248,11 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
         tool_presets = _parse_tool_presets(raw)
     except ValueError as exc:
         issues.append(ConfigIssue("global", None, str(exc)))
+        mqd, sched = _max_queue_depth_and_scheduler_or_defaults(raw, issues)
         return (
             GatewayConfig(
                 connectors=connectors, agents={}, default_agent="", watchers=[],
-                max_queue_depth=100, scheduler=SchedulerConfig(),
+                max_queue_depth=mqd, scheduler=sched,
             ),
             issues,
         )
@@ -1244,10 +1277,11 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
                 "config.yaml must define at least one agent under 'agents:'",
             )
         )
+        mqd, sched = _max_queue_depth_and_scheduler_or_defaults(raw, issues)
         return (
             GatewayConfig(
                 connectors=connectors, agents={}, default_agent="", watchers=[],
-                max_queue_depth=100, scheduler=SchedulerConfig(),
+                max_queue_depth=mqd, scheduler=sched,
             ),
             issues,
         )
@@ -1273,14 +1307,15 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
                 f"default_agent '{default_agent}' not found in agents: {list(agents)}",
             )
         )
+        mqd, sched = _max_queue_depth_and_scheduler_or_defaults(raw, issues)
         return (
             GatewayConfig(
                 connectors=connectors,
                 agents=agents,
                 default_agent=next(iter(agents)),
                 watchers=[],
-                max_queue_depth=100,
-                scheduler=SchedulerConfig(),
+                max_queue_depth=mqd,
+                scheduler=sched,
             ),
             issues,
         )
@@ -1301,14 +1336,15 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
                 "No connectors parsed successfully — cannot resolve watcher entries.",
             )
         )
+        mqd, sched = _max_queue_depth_and_scheduler_or_defaults(raw, issues)
         return (
             GatewayConfig(
                 connectors=[],
                 agents=agents,
                 default_agent=default_agent,
                 watchers=[],
-                max_queue_depth=100,
-                scheduler=SchedulerConfig(),
+                max_queue_depth=mqd,
+                scheduler=sched,
             ),
             issues,
         )
@@ -1325,10 +1361,11 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
                 f"config.yaml 'watchers:' must be a list (got {type(watchers_raw).__name__}).",
             )
         )
+        mqd, sched = _max_queue_depth_and_scheduler_or_defaults(raw, issues)
         return (
             GatewayConfig(
                 connectors=connectors, agents=agents, default_agent=default_agent,
-                watchers=[], max_queue_depth=100, scheduler=SchedulerConfig(),
+                watchers=[], max_queue_depth=mqd, scheduler=sched,
             ),
             issues,
         )
@@ -1339,10 +1376,11 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
         )
     except ValueError as exc:
         issues.append(ConfigIssue("global", None, str(exc)))
+        mqd, sched = _max_queue_depth_and_scheduler_or_defaults(raw, issues)
         return (
             GatewayConfig(
                 connectors=connectors, agents=agents, default_agent=default_agent,
-                watchers=[], max_queue_depth=100, scheduler=SchedulerConfig(),
+                watchers=[], max_queue_depth=mqd, scheduler=sched,
             ),
             issues,
         )
@@ -1383,21 +1421,12 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
     # max_queue_depth/scheduler: don't gate any single entity's validity —
     # collected as issues, falling back to safe defaults for the returned
     # config, rather than discarding all connector/agent/watcher progress.
-    # Each validated independently (not one combined try/except) so a bad
-    # max_queue_depth doesn't also discard an otherwise-valid scheduler:,
-    # and vice versa — same reasoning as every other partial-progress branch
-    # in this function.
-    try:
-        max_queue_depth = _parse_max_queue_depth(raw)
-    except ValueError as exc:
-        issues.append(ConfigIssue("global", None, str(exc)))
-        max_queue_depth = 100
-
-    try:
-        scheduler_cfg = _parse_scheduler(raw)
-    except ValueError as exc:
-        issues.append(ConfigIssue("global", None, str(exc)))
-        scheduler_cfg = SchedulerConfig()
+    # Same helper every earlier structural early-return in this function
+    # now also uses (PR review finding) — max_queue_depth/scheduler have no
+    # entity dependency at all, so there's no reason an early return
+    # elsewhere should ever have hardcoded these to their defaults instead
+    # of actually parsing them.
+    max_queue_depth, scheduler_cfg = _max_queue_depth_and_scheduler_or_defaults(raw, issues)
 
     config = GatewayConfig(
         connectors=connectors,

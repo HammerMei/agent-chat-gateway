@@ -155,6 +155,34 @@ class TestCollectConfigPartialProgressPreserved(_CollectConfigTestBase):
         self.assertEqual(list(config.agents), ["default"])
         self.assertEqual(config.watchers, [])
 
+    def test_malformed_watchers_block_still_keeps_a_valid_max_queue_depth_and_scheduler(self):
+        """PR review finding: every structural early-return branch above
+        used to hardcode max_queue_depth=100/scheduler=SchedulerConfig()
+        instead of actually parsing them — silently discarding an
+        otherwise-valid value behind a completely unrelated structural
+        issue elsewhere in the file (the exact "don't hide an unrelated,
+        already-successful value behind a different issue" bug this whole
+        function exists to avoid for connectors/agents/watchers). These two
+        fields have no entity dependency on watchers: at all."""
+        config_path = self._write(f"""\
+            connectors:
+              - name: rc1
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: "", password: ""}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers: {{not: a-list}}
+            max_queue_depth: 42
+            scheduler:
+              completed_job_ttl_days: 30
+        """)
+        config, issues = collect_config(config_path)
+        self.assertIsNotNone(config)
+        self.assertEqual(config.max_queue_depth, 42)
+        self.assertEqual(config.scheduler.completed_job_ttl_days, 30)
+
 
 class TestCollectConfigNonStringNameHint(_CollectConfigTestBase):
     """PR review finding: a connector/watcher entry's own `name:` might

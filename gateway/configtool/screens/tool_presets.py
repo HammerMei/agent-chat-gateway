@@ -103,22 +103,31 @@ class ToolPresetsScreen(DetailScreen):
     def _refresh_rules(self) -> None:
         rules = self.cfg.tool_presets_raw.get(self.preset_name, [])
         list_view = self.query_one("#preset-rules-list", ListView)
+        # PR review finding: captured BEFORE .clear() below (which always
+        # resets `.index` to None) so a mutation at some row N > 0 doesn't
+        # silently snap the cursor back to row 0 — a user editing/deleting
+        # several rules in a row, expecting the cursor to roughly track
+        # position, would otherwise have every subsequent action land on
+        # the WRONG row with no error or visual cue.
+        prev_index = list_view.index
         list_view.clear()
         for i, rule in enumerate(rules):
             list_view.append(ListItem(Label(_format_tool_rule(rule)), name=str(i)))
         self.query_one(f"#{self.BODY_ID}", Static).update(self._header_text())
-        # PR review finding: this must be done HERE, every time — not just
-        # once in on_mount() — because `list_view.clear()` above resets
-        # `.index` back to `None`, and re-`.append()`ing items afterward
-        # does not restore an auto-selection the way a `ListView` composed
-        # WITH its children up front would get once, at ITS OWN mount (see
-        # tool_list_editor.py's own comment on that distinction). Since
-        # every mutation (add/edit/delete) calls this same method
-        # afterward, doing this only in on_mount() fixed the FIRST entry
-        # into this screen but let the exact same "nothing selected, 'e'/'d'
-        # silently no-op" bug reappear after the very first add/edit/delete.
-        if list_view.index is None and list_view.children:
-            list_view.index = 0
+        # This must be done HERE, every time — not just once in on_mount()
+        # — because `list_view.clear()` above resets `.index` back to
+        # `None`, and re-`.append()`ing items afterward does not restore an
+        # auto-selection the way a `ListView` composed WITH its children up
+        # front would get once, at ITS OWN mount (see tool_list_editor.py's
+        # own comment on that distinction). Since every mutation (add/edit/
+        # delete) calls this same method afterward, doing this only in
+        # on_mount() fixed the FIRST entry into this screen but let the
+        # exact same "nothing selected, 'e'/'d' silently no-op" bug
+        # reappear after the very first add/edit/delete. Clamped to the new
+        # last index when a delete shrank the list out from under the old
+        # position; falls back to 0 only when nothing was ever selected.
+        if list_view.children:
+            list_view.index = min(prev_index, len(list_view.children) - 1) if prev_index is not None else 0
 
     @work
     async def action_add_rule(self) -> None:

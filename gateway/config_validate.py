@@ -277,16 +277,31 @@ def _lint_config(raw: dict, result: ValidationResult) -> None:
     )
     connector_templates = _templates_or_empty("connector_templates", frozenset({"name"}))
 
-    for agent_name, agent_raw in (raw.get("agents") or {}).items():
-        if isinstance(agent_raw, dict):
-            _lint_entry(
-                "agent", agent_name, agent_raw, "agent_templates", agent_templates,
-                _AGENT_LINT_DEFAULTS, result,
-            )
+    # PR review finding: the guards below (isinstance(agents_raw, dict),
+    # the isinstance(str) checks on name/label) exist for the exact same
+    # reason _templates_or_empty() above does — collect_config() can return
+    # a usable partial config even when `agents:` itself isn't a mapping,
+    # or when an individual entry's own 'name:'/'inherits:' is malformed
+    # (e.g. a YAML list) — cases that were UNREACHABLE here before this
+    # branch (from_file()'s fail-fast behavior meant _lint_config() only
+    # ever ran on already-fully-valid data). Without these, `.items()` on a
+    # non-dict raises AttributeError, and a non-string name/label reaching
+    # Finding.entity_name (typed str | None) crashes
+    # gateway/configtool/model.py's StatusIndex with
+    # TypeError: unhashable type — both confirmed via direct repro.
+    agents_raw = raw.get("agents")
+    if isinstance(agents_raw, dict):
+        for agent_name, agent_raw in agents_raw.items():
+            if isinstance(agent_raw, dict):
+                _lint_entry(
+                    "agent", agent_name, agent_raw, "agent_templates", agent_templates,
+                    _AGENT_LINT_DEFAULTS, result,
+                )
 
     for i, wc in enumerate(raw.get("watchers") or []):
         if isinstance(wc, dict):
-            label = wc.get("name") or f"watchers[{i}]"
+            name_hint = wc.get("name")
+            label = name_hint if isinstance(name_hint, str) and name_hint else f"watchers[{i}]"
             _lint_entry(
                 "watcher", label, wc, "watcher_templates", watcher_templates,
                 _WATCHER_LINT_DEFAULTS, result,
@@ -295,7 +310,8 @@ def _lint_config(raw: dict, result: ValidationResult) -> None:
     for cc in raw.get("connectors") or []:
         if not isinstance(cc, dict):
             continue
-        name = cc.get("name") or "?"
+        name_hint = cc.get("name")
+        name = name_hint if isinstance(name_hint, str) and name_hint else "?"
         _lint_entry(
             "connector", name, cc, "connector_templates", connector_templates,
             _CONNECTOR_LINT_DEFAULTS, result,
@@ -337,6 +353,14 @@ def _lint_entry(
     entry of a kind was checked against regardless."""
     label = f"{entity_kind}s.{entity_name}"
     template_name = entry.get("inherits")
+    # PR review finding: a malformed 'inherits:' (e.g. a YAML list) is a
+    # real, already-reported ConfigIssue/Finding elsewhere (collect_config()
+    # itself rejects it) — but `dict.get()` requires a hashable key, so
+    # using template_name here unchecked raised an uncaught
+    # `TypeError: unhashable type` straight out of --lint, aborting the
+    # whole pass and discarding every already-collected finding.
+    if not isinstance(template_name, str) or not template_name:
+        template_name = None
     template = templates.get(template_name, {}) if template_name else {}
     for key, default_value in default_table:
         if key not in entry:

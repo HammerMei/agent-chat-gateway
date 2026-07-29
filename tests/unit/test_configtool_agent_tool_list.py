@@ -409,3 +409,71 @@ class TestAgentToolListEdit:
 
             assert isinstance(app.screen, AgentDetailScreen)  # no crash
             assert len(list_view.children) == 1  # untouched
+
+
+class TestAgentToolListCursorPositionAfterMutation:
+    """PR review finding: the row-0 auto-select fix (in _refresh_tool_list(),
+    see test_selection_survives_a_refresh_not_just_initial_selection) used
+    to fire unconditionally on EVERY refresh — not just when nothing was
+    selected — silently snapping the cursor back to row 0 after every
+    single mutation. A user editing/removing several rows in sequence,
+    expecting the cursor to roughly track position, would have every
+    subsequent action land on the WRONG row with no error or visual cue."""
+
+    async def _add_inline_rule(self, pilot, app, tool_name: str) -> None:
+        await _click_tool_button(pilot, app, "add")
+        await pilot.press("down", "down", "enter")  # inline (index 2)
+        await pilot.pause()
+        app.screen.query_one("#rule-tool", Input).value = tool_name
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+
+    async def test_editing_the_last_row_keeps_the_cursor_on_it(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_edit(pilot, app)
+
+            # preset-a (0) is already there; add two more inline rules.
+            await self._add_inline_rule(pilot, app, "Read")
+            await self._add_inline_rule(pilot, app, "Write")
+
+            list_view = app.screen.query_one("#owner-tools-list", ListView)
+            assert len(list_view.children) == 3
+            list_view.index = 2  # 'Write', the last row
+
+            await _click_tool_button(pilot, app, "edit")
+            await pilot.pause()
+            app.screen.query_one("#rule-tool", Input).value = "Write2"
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+
+            list_view = app.screen.query_one("#owner-tools-list", ListView)
+            assert len(list_view.children) == 3  # not appended/removed
+            assert list_view.index == 2  # cursor stayed put, not reset to 0
+
+    async def test_removing_a_middle_row_clamps_the_cursor_sensibly(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_edit(pilot, app)
+
+            # preset-a (0) is already there; add two more inline rules.
+            await self._add_inline_rule(pilot, app, "Read")
+            await self._add_inline_rule(pilot, app, "Write")
+
+            list_view = app.screen.query_one("#owner-tools-list", ListView)
+            assert len(list_view.children) == 3
+            list_view.index = 1  # 'Read', the middle row
+
+            await _click_tool_button(pilot, app, "remove")
+
+            list_view = app.screen.query_one("#owner-tools-list", ListView)
+            assert len(list_view.children) == 2  # 'preset-a' and 'Write' remain
+            # index 1 is still a valid position (now 'Write', which slid up
+            # into the removed row's slot) — not reset to 0.
+            assert list_view.index == 1

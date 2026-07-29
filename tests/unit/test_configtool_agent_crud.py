@@ -1385,6 +1385,15 @@ class TestInheritsPicker:
             assert str(app.screen.query_one("#inherits-value", Static).render()) == "(none)"
             assert app.screen.query_one("#field-timeout", Input).value == "360"  # dataclass default
 
+            # PR review finding: with 'type' no longer an editable field
+            # anywhere in this form, the read-only header suffix is the
+            # ONLY indicator of it — it must not lie and show a real type
+            # name ("claude", AGENT_DATACLASS_DEFAULTS' fallback) now that
+            # this agent genuinely has none.
+            form_texts = [str(s.render()) for s in app.screen.query(".entity-form Static")]
+            assert any("type: (unset)" in t for t in form_texts)
+            assert not any("type: claude" in t for t in form_texts)
+
             # This agent's ONLY source of 'type:' was the template just
             # cleared — Save correctly refuses, same "type is required"
             # validation the real loader always enforces (not bypassed by

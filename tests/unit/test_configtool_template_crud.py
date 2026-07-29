@@ -805,6 +805,39 @@ class TestTemplateToolListEditor:
             raw = yaml.safe_load(Path(config_path).read_text())
             assert raw["agent_templates"]["standard"]["owner_allowed_tools"] == []
 
+    async def test_selection_survives_a_refresh_not_just_initial_selection(
+        self, tmp_path, work_dir
+    ):
+        """PR review finding, coverage gap: TemplateDetailScreen mixes in
+        the same ToolListEditorMixin AgentDetailScreen uses, and so shares
+        the exact fix
+        test_configtool_agent_tool_list.py's own
+        test_selection_survives_a_refresh_not_just_initial_selection pins —
+        but had no dedicated regression test of its own. Reproduced here
+        with NO manual list_view.index = ... reselect between the Add and
+        the Remove."""
+        config_path = _write_config(tmp_path, _config_with_agent_template_tools(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_template_edit(pilot, app, row=0)
+
+            await _click_template_tool_button(pilot, app, "add")
+            await pilot.press("down", "down", "enter")  # inline (index 2)
+            await pilot.pause()
+            app.screen.query_one("#rule-tool", Input).value = "Edit"
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+
+            list_view = app.screen.query_one("#owner-tools-list")
+            assert len(list_view.children) == 2
+
+            # No manual reselect — Remove should still act, not silently
+            # no-op with "Select an item in the list first."
+            await _click_template_tool_button(pilot, app, "remove")
+            assert len(list_view.children) == 1
+
     async def test_connector_and_watcher_templates_have_no_tool_list_section(
         self, tmp_path, work_dir
     ):
