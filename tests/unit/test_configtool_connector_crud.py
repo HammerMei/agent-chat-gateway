@@ -85,7 +85,16 @@ class TestNewConnectorEntryPoint:
             await pilot.pause()
             await _open_type_picker_for_connectors(pilot, app)
             assert isinstance(app.screen, TypePickerModal)
-            assert app.screen.options == ["rocketchat", "mattermost", "voice", "script"]
+            # (value, label) pairs — user-requested: 'voice'/'script' are
+            # flagged "(experimental)" in the picker's displayed label, but
+            # the VALUE half (what actually gets written as `type:`) stays
+            # the bare type name.
+            assert app.screen.options == [
+                ("rocketchat", "rocketchat"),
+                ("mattermost", "mattermost"),
+                ("voice", "voice (experimental)"),
+                ("script", "script (experimental)"),
+            ]
 
 
 class TestCreateConnector:
