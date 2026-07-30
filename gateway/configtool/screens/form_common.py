@@ -167,6 +167,19 @@ def set_widget_value(spec: FieldSpec, widget: object, value: object) -> None:
         widget.value = "" if value is None else str(value)
 
 
+def sort_required_first(
+    specs: tuple[FieldSpec, ...], required_keys: frozenset[str]
+) -> tuple[FieldSpec, ...]:
+    """Stable-sort `specs` so every key in `required_keys` comes first,
+    preserving each group's own relative order — user-requested: required
+    fields up front make it obvious at a glance which ones can't be left
+    blank. A subclass's `_field_specs()` calls this with its own
+    `_required_field_keys()`; a no-op (original order preserved) when
+    `required_keys` is empty, e.g. `TemplateDetailScreen`, which never
+    overrides `_required_field_keys()`."""
+    return tuple(sorted(specs, key=lambda s: s.key not in required_keys))
+
+
 def find_referencing_watcher_labels(
     cfg: EditableConfig, *, connector_name: str | None = None, agent_name: str | None = None
 ) -> list[str]:
@@ -397,6 +410,17 @@ class FormScreen(DetailScreen):
     def _dataclass_defaults(self) -> dict[str, object]:
         raise NotImplementedError
 
+    def _required_field_keys(self) -> frozenset[str]:
+        """Which of _field_specs()'s own keys are genuinely required to Save
+        right now (may depend on entity-specific state, e.g. connector
+        `type` — mirrors `_field_specs()` itself). Used by
+        `_compose_field_row()` to append a trailing '*' to the label, and by
+        subclasses' own `_field_specs()` to sort required fields first
+        (`sort_required_first()` below). Empty by default: TemplateDetailScreen
+        never overrides this — nothing in a template is truly "required," it's
+        an optional override layer merged into whatever entry inherits it."""
+        return frozenset()
+
     def _compose_form(self) -> ComposeResult:
         raise NotImplementedError
 
@@ -520,8 +544,12 @@ class FormScreen(DetailScreen):
             f"[dim]({provenance_label(provenance, template_name)})[/dim]" if provenance else ""
         )
         initial = self._initial_values.get(spec.key)
+        # User-requested: a trailing '*' marks a field that's actually
+        # required to Save right now — not obvious otherwise which fields
+        # can be safely left blank.
+        label = spec.label + " *" if spec.key in self._required_field_keys() else spec.label
         with Horizontal(classes="field-row"):
-            yield Static(spec.label, classes="field-label")
+            yield Static(label, classes="field-label")
             if spec.kind == "bool":
                 widget = Checkbox(value=bool(initial), id=widget_id(spec.key))
             elif spec.kind == "enum":

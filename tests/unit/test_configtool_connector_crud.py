@@ -687,7 +687,7 @@ class TestDeleteConnector:
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            await _open_connector_in_view_mode(pilot, app, row=1)  # rc-orphan
+            await _open_connector_in_view_mode(pilot, app, row=0)  # rc-orphan (sorted before rc-referenced)
 
             await pilot.press("d")
             await pilot.pause()
@@ -698,7 +698,7 @@ class TestDeleteConnector:
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            await _open_connector_in_view_mode(pilot, app, row=1)  # rc-orphan
+            await _open_connector_in_view_mode(pilot, app, row=0)  # rc-orphan (sorted before rc-referenced)
 
             await pilot.press("d")
             await pilot.pause()
@@ -716,7 +716,7 @@ class TestDeleteConnector:
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            await _open_connector_in_view_mode(pilot, app, row=1)  # rc-orphan
+            await _open_connector_in_view_mode(pilot, app, row=0)  # rc-orphan (sorted before rc-referenced)
 
             await pilot.press("d")
             await pilot.pause()
@@ -741,7 +741,7 @@ class TestDeleteConnector:
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            await _open_connector_in_view_mode(pilot, app, row=0)  # rc-referenced
+            await _open_connector_in_view_mode(pilot, app, row=1)  # rc-referenced (sorted after rc-orphan)
 
             await pilot.press("d")
             await pilot.pause()

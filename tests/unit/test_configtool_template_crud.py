@@ -100,8 +100,9 @@ def _config_text(work_dir: Path) -> str:
 
 
 # Row order in the flat Templates tab: TEMPLATE_KINDS = (agent, connector,
-# watcher); within a kind, dict insertion order from the YAML above.
-# row0=agent:standard row1=agent:other row2=agent:unused row3=watcher:wstd
+# watcher); within a kind, sorted BY NAME (user-requested — see
+# OverviewScreen.repaint_from_memory()), not dict insertion order.
+# row0=agent:other row1=agent:standard row2=agent:unused row3=watcher:wstd
 # (no connector_templates in this fixture).
 
 
@@ -123,7 +124,7 @@ class TestTemplateEditVisibility:
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            await _open_template_edit(pilot, app, row=0)  # agent:standard
+            await _open_template_edit(pilot, app, row=1)  # agent:standard
             assert isinstance(app.screen, TemplateDetailScreen)
             assert app.screen.mode == "edit"
             assert app.screen.query_one("#field-timeout", Input).value == "1800"
@@ -147,7 +148,7 @@ class TestTemplateEditVisibility:
             await pilot.pause()
             table = app.screen.query_one("#templates-table", DataTable)
             table.focus()
-            table.move_cursor(row=0)  # agent:standard
+            table.move_cursor(row=1)  # agent:standard
             await pilot.press("enter")
             await pilot.pause()
 
@@ -180,7 +181,7 @@ class TestTemplateSaveDiffing:
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            await _open_template_edit(pilot, app, row=0)
+            await _open_template_edit(pilot, app, row=1)
 
             await pilot.press("ctrl+s")
             await pilot.pause()
@@ -273,7 +274,7 @@ class TestTemplateSaveDiffing:
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            await _open_template_edit(pilot, app, row=0)  # agent:standard
+            await _open_template_edit(pilot, app, row=1)  # agent:standard
 
             app.screen.query_one("#field-timeout", Input).value = "900"
             await pilot.pause()
@@ -299,7 +300,7 @@ class TestTemplateSaveDiffing:
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            await _open_template_edit(pilot, app, row=0)
+            await _open_template_edit(pilot, app, row=1)
 
             app.screen.query_one("#field-timeout", Input).value = "900"
             await pilot.pause()
@@ -328,7 +329,7 @@ class TestTemplateSaveDiffing:
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            await _open_template_edit(pilot, app, row=1)  # agent:other
+            await _open_template_edit(pilot, app, row=0)  # agent:other
 
             app.screen.query_one("#field-timeout", Input).value = "900"
             await pilot.pause()
@@ -346,7 +347,7 @@ class TestTemplateSaveDiffing:
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            await _open_template_edit(pilot, app, row=0)  # agent:standard
+            await _open_template_edit(pilot, app, row=1)  # agent:standard
 
             app.screen.query_one("#field-timeout", Input).focus()
             await pilot.pause()
@@ -368,7 +369,7 @@ class TestTemplateSaveDiffing:
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            await _open_template_edit(pilot, app, row=0)
+            await _open_template_edit(pilot, app, row=1)
 
             app.screen.query_one("#field-timeout", Input).value = "not-a-number"
             await pilot.pause()
@@ -411,7 +412,7 @@ class TestTemplateEditDiscard:
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            await _open_template_edit(pilot, app, row=0)
+            await _open_template_edit(pilot, app, row=1)
 
             app.screen.query_one("#field-timeout", Input).value = "42"
             await pilot.pause()
@@ -432,7 +433,7 @@ class TestTemplateEditDiscard:
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            await _open_template_edit(pilot, app, row=0)
+            await _open_template_edit(pilot, app, row=1)
 
             await pilot.press("escape")
             await pilot.pause()
@@ -454,7 +455,7 @@ class TestDirectEditFromList:
             await pilot.pause()
             table = app.screen.query_one("#templates-table", DataTable)
             table.focus()
-            table.move_cursor(row=0)
+            table.move_cursor(row=1)
             await pilot.pause()
 
             await pilot.press("e")
@@ -475,7 +476,7 @@ class TestDirectEditFromList:
             await pilot.pause()
             table = app.screen.query_one("#templates-table", DataTable)
             table.focus()
-            table.move_cursor(row=0)
+            table.move_cursor(row=1)
             await pilot.pause()
             await pilot.press("e")
             await pilot.pause()
@@ -499,7 +500,7 @@ class TestDirectEditFromList:
             await pilot.pause()
             table = app.screen.query_one("#templates-table", DataTable)
             table.focus()
-            table.move_cursor(row=0)
+            table.move_cursor(row=1)
             await pilot.pause()
             await pilot.press("e")
             await pilot.pause()
@@ -602,7 +603,7 @@ class TestTemplateDelete:
             await pilot.pause()
             table = app.screen.query_one("#templates-table", DataTable)
             table.focus()
-            table.move_cursor(row=0)  # agent:standard — used by agent-a/agent-b
+            table.move_cursor(row=1)  # agent:standard — used by agent-a/agent-b
             await pilot.pause()
 
             await pilot.press("d")

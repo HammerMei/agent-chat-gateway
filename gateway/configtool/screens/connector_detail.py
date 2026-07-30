@@ -48,6 +48,7 @@ from .form_common import (
     FormScreen,
     apply_update,
     find_referencing_watcher_labels,
+    sort_required_first,
     widget_id,
 )
 
@@ -153,6 +154,23 @@ DATACLASS_DEFAULTS_BY_TYPE: dict[str, dict[str, object]] = {
     },
     "voice": {"port": 8765, "host": "0.0.0.0", "secret": "", "timeout": 45},
     "script": {},
+}
+
+# Which fields have no default and MUST be set for a valid connector of each
+# type (gateway/connectors/*/config.py's own dataclass fields with no
+# default — RocketChatConfig.server_url/username/password,
+# MattermostConfig.server_url/team; voice/script have none). Deliberately
+# excludes mattermost's server.token/server.username/server.password: those
+# are dual-mode/mutually-exclusive (exactly one of 'token' or
+# 'username'+'password' is required, never all three) — marking all three
+# '*' would misleadingly suggest every one of them is mandatory. The "Auth
+# method" row's own label is marked '*' by hand instead (_compose_mm_auth_section()
+# below), since SOME auth method is always required.
+REQUIRED_FIELD_KEYS_BY_TYPE: dict[str, frozenset[str]] = {
+    "rocketchat": frozenset({"server.url", "server.username", "server.password"}),
+    "mattermost": frozenset({"server.url", "server.team"}),
+    "voice": frozenset(),
+    "script": frozenset(),
 }
 
 
@@ -305,8 +323,13 @@ class ConnectorDetailScreen(FormScreen):
             return "username_password"
         return "token"
 
+    def _required_field_keys(self) -> frozenset[str]:
+        return REQUIRED_FIELD_KEYS_BY_TYPE.get(self._connector_type(), frozenset())
+
     def _field_specs(self) -> tuple[FieldSpec, ...]:
-        return FIELDS_BY_TYPE.get(self._connector_type(), ())
+        return sort_required_first(
+            FIELDS_BY_TYPE.get(self._connector_type(), ()), self._required_field_keys()
+        )
 
     def _template_kind(self) -> str:
         return "connector"
@@ -371,7 +394,7 @@ class ConnectorDetailScreen(FormScreen):
             if self.mode == "create":
                 yield Static(f"[bold]New {conn_type} connector[/bold]")
                 with Horizontal(classes="field-row"):
-                    yield Static("Name", classes="field-label")
+                    yield Static("Name *", classes="field-label")
                     yield Input(
                         id="field-name", value=self._name_live, placeholder="connector name"
                     )
@@ -416,7 +439,7 @@ class ConnectorDetailScreen(FormScreen):
         working unmodified) but only the ACTIVE one is visible; the inactive
         one is hidden via the `.hidden` CSS class, not skipped entirely."""
         with Horizontal(classes="field-row"):
-            yield Static("Auth method", classes="field-label")
+            yield Static("Auth method *", classes="field-label")
             yield Select(
                 [("API token", "token"), ("Username + password", "username_password")],
                 value=self._mm_auth_method,

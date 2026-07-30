@@ -113,15 +113,25 @@ async def _open_watcher_row(pilot, app, row: int, key: str) -> None:
 
 
 class TestWatcherEditSharedField:
-    async def test_editing_connector_moves_the_whole_group_in_place(
+    async def test_editing_connector_splits_this_room_out_of_the_group(
         self, tmp_path, work_dir
     ):
+        """User-reported bug, fixed: connector/agent used to be classified
+        as GROUP-SHARED ("move the whole group in place") — editing one
+        room's connector silently reassigned every SIBLING room in the
+        group too (2 watchers sharing 'rc', editing one to 'rc2' moved
+        BOTH — never the intent when the user is looking at one specific
+        room). connector/agent are stored as a single value on the shared
+        raw entry, exactly like online_notification etc. (already
+        correctly per-room) — reassigning one room's connector must split
+        it out, not drag its siblings along."""
         config_path = _write_config(tmp_path, _config_with_a_group(work_dir))
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            await _open_watcher_row(pilot, app, row=0, key="e")
+            await _open_watcher_row(pilot, app, row=1, key="e")  # row0=rc-dev, row1=rc-general
             assert isinstance(app.screen, WatcherDetailScreen)
+            assert app.screen.room == "general"
 
             app.screen.query_one("#field-connector", Select).value = "rc2"
             await pilot.pause()
@@ -130,10 +140,47 @@ class TestWatcherEditSharedField:
 
             assert isinstance(app.screen, OverviewScreen)
             raw = yaml.safe_load(Path(config_path).read_text())
-            # Still ONE group entry, both rooms intact, now under rc2.
-            assert raw["watchers"] == [
-                {"connector": "rc2", "agent": "default", "rooms": ["general", "dev"]}
-            ]
+            # 'general' split out onto rc2 in its own entry; 'dev' stays
+            # behind on the original connector, untouched.
+            watchers = {
+                (w.get("connector"), w.get("room") or tuple(w.get("rooms", [])))
+                for w in raw["watchers"]
+            }
+            assert watchers == {("rc2", "general"), ("rc", "dev")}
+
+    async def test_editing_connector_and_room_together_does_not_collide_with_the_sibling(
+        self, tmp_path, work_dir
+    ):
+        """User-reported: this exact combination used to fail with
+        "Room 'general' already exists under this connector/agent" — a pure
+        side effect of the bug fixed above. Before the fix, changing
+        connector moved the WHOLE group (including the sibling room, still
+        named 'general') onto rc2 first; renaming THIS room 'dev' -> 'general'
+        then collided with that just-relocated sibling. With connector
+        correctly treated as per-room, the sibling never moves — it stays
+        behind on the original connector, so renaming 'dev' to 'general' on
+        rc2 doesn't collide with anything (same room NAME on a DIFFERENT
+        connector is not a conflict)."""
+        config_path = _write_config(tmp_path, _config_with_a_group(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_watcher_row(pilot, app, row=0, key="e")  # row0=rc-dev
+            assert app.screen.room == "dev"
+
+            app.screen.query_one("#field-connector", Select).value = "rc2"
+            app.screen.query_one("#field-room", Input).value = "general"
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            assert isinstance(app.screen, OverviewScreen)  # no "already exists" error
+            raw = yaml.safe_load(Path(config_path).read_text())
+            watchers = {
+                (w.get("connector"), w.get("room") or tuple(w.get("rooms", [])))
+                for w in raw["watchers"]
+            }
+            assert watchers == {("rc2", "general"), ("rc", "general")}
 
     async def test_editing_description_in_place_does_not_split_or_lose_the_edit(
         self, tmp_path, work_dir
@@ -746,7 +793,7 @@ class TestWatcherCloneForRooms:
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            await _open_watcher_row(pilot, app, row=0, key="enter")
+            await _open_watcher_row(pilot, app, row=1, key="enter")  # row0=rc-dev, row1=rc-general (sorted by name)
             assert app.screen.room == "general"
 
             await pilot.press("c")
@@ -809,7 +856,7 @@ class TestWatcherCloneForRooms:
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            await _open_watcher_row(pilot, app, row=0, key="enter")
+            await _open_watcher_row(pilot, app, row=1, key="enter")  # row0=rc-dev, row1=rc-general (sorted by name)
             assert app.screen.room == "general"
 
             # Rejected clone: 'dev' has different shared fields, not mergeable.
