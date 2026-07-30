@@ -109,6 +109,12 @@ class OverviewScreen(Screen):
         # the footer doesn't advertise a no-op.
         Binding("e", "edit_row", "Edit", show=True),
         Binding("d", "delete_row", "Delete", show=True),
+        # Watchers tab only (see check_action() below) — user-requested:
+        # WatcherDetailScreen's own "Clone for rooms" action ('c') used to
+        # only be reachable after opening a specific watcher first; this
+        # lets the row under the cursor be cloned directly from the list,
+        # same shortcut precedent as edit_row/delete_row above.
+        Binding("c", "clone_for_rooms", "Clone for rooms", show=True),
         # User-requested: focus starts on the list itself (see on_mount()),
         # not the tab bar, so left/right must be able to switch tabs WITHOUT
         # the user first moving focus off the list. priority=True is
@@ -211,6 +217,8 @@ class OverviewScreen(Screen):
             return active_tab in (
                 "tab-connectors", "tab-agents", "tab-watchers", "tab-templates", "tab-presets",
             )
+        if action == "clone_for_rooms":
+            return active_tab == "tab-watchers"
         return True
 
     def action_edit_config(self) -> None:
@@ -389,6 +397,40 @@ class OverviewScreen(Screen):
             # point). Reached from the list directly, staying here would
             # strand the user on a screen they never asked to see — send
             # them back to the list instead, same as Escape would.
+            self.app.pop_screen()
+
+    @work
+    async def action_clone_for_rooms(self) -> None:
+        """'c' on the Watchers tab: run the row under the cursor's own
+        "Clone for rooms" bulk-add directly, no "open the watcher first"
+        detour. Pushes WatcherDetailScreen in view mode SILENTLY (mirroring
+        action_delete_row()'s identical shape immediately above), invokes
+        its own _do_clone_for_rooms() as a plain coroutine (same
+        nested-@work-worker fragility reasoning as _do_delete()'s call site),
+        then pops back to the list regardless of outcome — a successful
+        clone already pops itself (WatcherDetailScreen.action_clone_for_rooms()'s
+        own success path), so the extra pop_screen() below only fires for
+        the cancelled/no-op/blocked paths, where staying on a screen the
+        user never asked to see would strand them."""
+        app: "ConfigToolApp" = self.app  # type: ignore[assignment]
+        cfg = app.editable_config
+        if cfg is None:
+            self.notify("Config does not currently load.", severity="error")
+            return
+
+        if self.query_one(TabbedContent).active != "tab-watchers":
+            return
+        key = self._cursor_row_key("watchers-table")
+        if key is None:
+            return
+        ew = self._expanded_watcher_for_key(cfg, key)
+        if ew is None:
+            return
+
+        screen = WatcherDetailScreen(cfg, ew, mode="view")
+        self.app.push_screen(screen)
+        await screen._do_clone_for_rooms()
+        if self.app.screen is screen:
             self.app.pop_screen()
 
     async def _delete_preset_row(self, cfg) -> None:
@@ -683,8 +725,16 @@ class OverviewScreen(Screen):
         # missing one (falling back to "?"), and Textual's DataTable.add_row
         # raises DuplicateKey on a repeated key — exactly the kind of config
         # mistake this tool exists to surface gracefully, not crash on.
+        # Every table below is sorted by name (user-requested — the create/
+        # merge-on-add flow can insert a new row anywhere in the underlying
+        # list/dict, making a row hard to spot again by scrolling; sorting
+        # display order makes it easy to find regardless of where it landed
+        # in the raw document). The row `key=` a cursor's action resolves
+        # against stays the entry's own stable identity (list index for
+        # connectors, its own name for everything else) — sorting here only
+        # changes DISPLAY order, never what a key refers back to.
         connectors_table.add_columns("Name", "Type", "Status")
-        for i, c in enumerate(cfg.connectors_raw):
+        for i, c in sorted(enumerate(cfg.connectors_raw), key=lambda pair: pair[1].get("name", "?")):
             name = c.get("name", "?")
             try:
                 merged = cfg.merged_entry("connector", c)
@@ -696,7 +746,7 @@ class OverviewScreen(Screen):
             )
 
         agents_table.add_columns("Name", "Type", "Command", "Status")
-        for name, entry in cfg.agents_raw.items():
+        for name, entry in sorted(cfg.agents_raw.items()):
             try:
                 merged = cfg.merged_entry("agent", entry)
             except (ValueError, FileNotFoundError):
@@ -717,7 +767,7 @@ class OverviewScreen(Screen):
         if expanded is None:
             watchers_table.add_row("(unavailable — config does not currently load)", "", "", "", "")
         else:
-            for ew in expanded:
+            for ew in sorted(expanded, key=lambda e: e.watcher.name):
                 w = ew.watcher
                 watchers_table.add_row(
                     w.name, w.connector, w.room, w.agent,
@@ -731,14 +781,14 @@ class OverviewScreen(Screen):
                 templates = cfg.templates(kind)
             except (ValueError, FileNotFoundError):
                 templates = {}
-            for name, block in templates.items():
+            for name, block in sorted(templates.items()):
                 used_by = [n for n, _ in find_entries_referencing_template(cfg, kind, name)]
                 templates_table.add_row(
                     kind, name, str(len(block)), str(len(used_by)), key=f"{kind}:{name}"
                 )
 
         presets_table.add_columns("Name", "Rules")
-        for name, rules in cfg.tool_presets_raw.items():
+        for name, rules in sorted(cfg.tool_presets_raw.items()):
             presets_table.add_row(name, str(len(rules)), key=name)
 
     # ── Row selection → push detail screens ──────────────────────────────────

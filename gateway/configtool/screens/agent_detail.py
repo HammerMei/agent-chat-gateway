@@ -69,7 +69,13 @@ from textual.widgets import Button, Input, Static
 from ..formatting import format_value, provenance_label
 from ..modals import ConfirmModal, InheritsPickerModal, MessageModal, TextPromptModal
 from ..model import EditableConfig
-from .form_common import FieldSpec, FormScreen, apply_update, find_referencing_watcher_labels
+from .form_common import (
+    FieldSpec,
+    FormScreen,
+    apply_update,
+    find_referencing_watcher_labels,
+    sort_required_first,
+)
 from .tool_list_editor import TOOL_LIST_WIDGET_IDS, ToolListEditorMixin, format_tool_rule
 
 # NOTE: TemplateDetailScreen (screens/template_detail.py) is deliberately
@@ -147,6 +153,12 @@ AGENT_FORM_FIELDS = (*_FORM_FIELDS, *_PERMISSIONS_FORM_FIELDS)
 # TEMPLATES) is untouched — templates keep 'type' as an ordinary editable
 # field.
 _ENTITY_FORM_FIELDS: list[FieldSpec] = [f for f in _FORM_FIELDS if f.key != "type"]
+
+# 'type' is required too (gateway/config.py: "type is required (directly or
+# via an inherits: agent_templates entry)") but never a _field_specs() row at
+# all (immutable, shown as a read-only header suffix instead — see
+# _agent_type()) — nothing left to mark '*' or sort for it here.
+_AGENT_REQUIRED_FIELD_KEYS = frozenset({"working_directory"})
 
 
 def _resolve_working_directory(config_path: Path, raw_value: str) -> Path:
@@ -254,8 +266,13 @@ class AgentDetailScreen(ToolListEditorMixin, FormScreen):
         self._tool_list_state()
         self._tool_list_ever_selected = dict.fromkeys(TOOL_LIST_WIDGET_IDS, False)
 
+    def _required_field_keys(self) -> frozenset[str]:
+        return _AGENT_REQUIRED_FIELD_KEYS
+
     def _field_specs(self) -> tuple[FieldSpec, ...]:
-        return (*_ENTITY_FORM_FIELDS, *_PERMISSIONS_FORM_FIELDS)
+        return sort_required_first(
+            (*_ENTITY_FORM_FIELDS, *_PERMISSIONS_FORM_FIELDS), _AGENT_REQUIRED_FIELD_KEYS
+        )
 
     def _agent_type(self) -> str:
         # Reads the MERGED type against the LIVE probe (self._current_entry()),
@@ -448,7 +465,7 @@ class AgentDetailScreen(ToolListEditorMixin, FormScreen):
             if self.mode == "create":
                 yield Static(f"[bold]New agent[/bold]  (type: {agent_type})")
                 with Horizontal(classes="field-row"):
-                    yield Static("Name", classes="field-label")
+                    yield Static("Name *", classes="field-label")
                     yield Input(id="field-name", value=self._name_live, placeholder="agent name")
             else:
                 yield Static(f"[bold]{self.agent_name}[/bold]  (type: {agent_type}, editing)")
@@ -469,7 +486,18 @@ class AgentDetailScreen(ToolListEditorMixin, FormScreen):
                 )
                 yield Button("Change…", id="inherits-change-button")
 
-            for spec in _ENTITY_FORM_FIELDS:
+            # self._field_specs() (NOT the raw _ENTITY_FORM_FIELDS/
+            # _PERMISSIONS_FORM_FIELDS module lists) — required fields
+            # (working_directory) sorted first, per sort_required_first().
+            # The "Permissions" header is inserted right before the first
+            # permissions.* field rather than as a separate loop, so it stays
+            # correctly placed regardless of where the required-first sort
+            # puts the ordinary agent fields relative to it.
+            in_permissions = False
+            for spec in self._field_specs():
+                if spec.key.startswith("permissions.") and not in_permissions:
+                    yield Static("[bold]Permissions[/bold]")
+                    in_permissions = True
                 yield from self._compose_field_row(spec, self._current_entry())
                 if spec.key == "working_directory":
                     yield Static(
@@ -478,10 +506,6 @@ class AgentDetailScreen(ToolListEditorMixin, FormScreen):
                         ),
                         id="wd-warning",
                     )
-
-            yield Static("[bold]Permissions[/bold]")
-            for spec in _PERMISSIONS_FORM_FIELDS:
-                yield from self._compose_field_row(spec, self._current_entry())
 
             for key, label in (
                 ("owner_allowed_tools", "Owner allowed tools"),

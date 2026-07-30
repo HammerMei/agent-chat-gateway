@@ -16,15 +16,24 @@ since `action_save()` is fully custom here, same as every other subclass's
 docstring).
 
 docs/design/config-tool.md's Phase 3 "two-tier rule" (decision 3):
-  - Editing a GROUP-SHARED field (`connector`/`agent`/`inherits`/
-    `description`) edits the shared raw entry in place — the whole group
-    moves together.
+  - Editing a GROUP-SHARED field (`description` — a free-text annotation
+    with no bearing on which connector/agent/room is actually watched)
+    edits the shared raw entry in place — the whole group moves together.
   - Editing a PER-ROOM field (`room` itself, `name`, `session_id`,
-    `online_notification`, `offline_notification`, `context_inject_files`,
-    `history_handoff.*`) auto-splits this one room out of its group into
-    its own entry (`remove_watcher_room()` + `add_watcher_rooms()` — the
-    same primitive pair used for a plain rename/move, and for new-watcher
-    creation).
+    `connector`, `agent`, `inherits`, `online_notification`,
+    `offline_notification`, `context_inject_files`, `history_handoff.*`)
+    auto-splits this one room out of its group into its own entry
+    (`remove_watcher_room()` + `add_watcher_rooms()` — the same primitive
+    pair used for a plain rename/move, and for new-watcher creation).
+    User-reported bug, fixed: `connector`/`agent` used to be treated as
+    GROUP-SHARED ("move the whole group in place") — every one of these
+    fields is stored as a SINGLE value on the shared raw entry (exactly
+    like `online_notification` etc., already correctly per-room), so
+    there's no way to give one room in a group a divergent value without
+    splitting; treating connector/agent as an exception silently moved an
+    ENTIRE group to a different connector when the user only meant to
+    redirect the one room they had open. `inherits` gets the same
+    treatment for the same reason (also a single shared value).
 
 Two owner decisions supersede the original design doc's still-unbuilt
 `EntityPickerModal`/`RoomListEditorScreen`:
@@ -59,6 +68,7 @@ from .form_common import (
     FormScreen,
     apply_update,
     get_nested,
+    sort_required_first,
     text_to_list,
     widget_id,
 )
@@ -103,21 +113,37 @@ WATCHER_TEMPLATE_DATACLASS_DEFAULTS: dict[str, object] = {
     "history_handoff.verbatim_tail": 15,
 }
 
-# Keys _resolve_inherits()/_parse_one_watcher_entry() (gateway/config.py)
-# treat as entry-level, shared across every room in a rooms: group — editing
-# one of these edits the shared raw entry in place, per the two-tier rule.
-# 'inherits' is handled outside the FieldSpec pipeline entirely (picker-
-# driven, like agent/connector) but is conceptually the same category.
-# 'description' is likewise entry-level (a free-text annotation for the
-# whole entry, never read by _parse_one_watcher_entry() at all) — PR review
-# finding: this was originally missing from this set, so
-# `_collect_field_updates()`'s own hardcoded separate "description" diff
-# (form_common.py) fell into per_room_updates below instead, which (a)
-# needlessly triggered a group split for an edit that never needed one, and
-# (b) silently LOST the edit entirely, since split_entry's own field loop
-# never copies "description" (it's not one of name/session_id/
-# WATCHER_TEMPLATE_FIELDS).
-_SHARED_FIELD_KEYS = frozenset({"connector", "agent", "description"})
+# The ONE key that's truly safe to edit in place across a whole rooms:
+# group: 'description' is a free-text annotation _parse_one_watcher_entry()
+# never even reads — it has no bearing on which connector/agent/room is
+# actually being watched, unlike every other entry-level field (connector,
+# agent, inherits, online_notification, ...), which — despite ALSO being
+# stored as a single value on the shared raw entry — identifies or
+# configures the watching itself and therefore can't legitimately apply to
+# one room without splitting it out first (see module docstring's two-tier
+# rule). PR review finding: 'description' was originally missing from this
+# set entirely, so `_collect_field_updates()`'s own hardcoded separate
+# "description" diff (form_common.py) fell into per_room_updates below
+# instead, which (a) needlessly triggered a group split for an edit that
+# never needed one, and (b) silently LOST the edit entirely, since
+# split_entry's own field loop never copies "description" (it's not one of
+# name/session_id/WATCHER_TEMPLATE_FIELDS).
+#
+# User-reported bug, fixed: 'connector'/'agent' used to ALSO be in this set
+# ("group-shared, move the whole group in place") — that's wrong for the
+# same reason online_notification etc. are already NOT in this set:
+# reassigning one room's connector/agent must split it out, not silently
+# drag every sibling room in the group along with it.
+_SHARED_FIELD_KEYS = frozenset({"description"})
+
+# connector/agent/room can never actually be saved blank — Select widgets
+# (connector/agent) have allow_blank=False, and _save_create()/_save_edit()
+# both explicitly reject an empty room. User-requested: mark them '*' and
+# keep them sorted first (already true today via _field_specs()'s own
+# declared order, but routed through sort_required_first() too, for
+# consistency with agent/connector and to stay correct if that order ever
+# changes).
+_WATCHER_REQUIRED_FIELD_KEYS = frozenset({"connector", "agent", "room"})
 
 
 class WatcherDetailScreen(FormScreen):
@@ -257,6 +283,9 @@ class WatcherDetailScreen(FormScreen):
     def _rollback_trial_entry(self) -> None:
         raise NotImplementedError  # action_save() below never calls this
 
+    def _required_field_keys(self) -> frozenset[str]:
+        return _WATCHER_REQUIRED_FIELD_KEYS
+
     def _field_specs(self) -> tuple[FieldSpec, ...]:
         connector_names = tuple(sorted(c.get("name", "?") for c in self.cfg.connectors_raw))
         agent_names = tuple(sorted(self.cfg.agents_raw))
@@ -269,13 +298,16 @@ class WatcherDetailScreen(FormScreen):
             if self.mode == "create"
             else FieldSpec("room", "str", "Room")
         )
-        return (
-            FieldSpec("connector", "enum", "Connector", options=connector_names),
-            FieldSpec("agent", "enum", "Agent", options=agent_names),
-            room_spec,
-            FieldSpec("name", "str", "Name"),
-            FieldSpec("session_id", "str", "Session ID"),
-            *WATCHER_TEMPLATE_FIELDS,
+        return sort_required_first(
+            (
+                FieldSpec("connector", "enum", "Connector", options=connector_names),
+                FieldSpec("agent", "enum", "Agent", options=agent_names),
+                room_spec,
+                FieldSpec("name", "str", "Name"),
+                FieldSpec("session_id", "str", "Session ID"),
+                *WATCHER_TEMPLATE_FIELDS,
+            ),
+            _WATCHER_REQUIRED_FIELD_KEYS,
         )
 
     def _template_kind(self) -> str:
@@ -390,6 +422,15 @@ class WatcherDetailScreen(FormScreen):
 
     @work
     async def action_clone_for_rooms(self) -> None:
+        """'c', view/edit mode of an EXISTING watcher (see check_action()).
+        Thin @work wrapper around _do_clone_for_rooms() — kept separate so
+        OverviewScreen's direct-clone-from-the-list shortcut
+        (action_clone_for_rooms()) can call _do_clone_for_rooms() directly as
+        a plain coroutine instead of nesting one @work worker inside another,
+        same reasoning as action_delete()/_do_delete()."""
+        await self._do_clone_for_rooms()
+
+    async def _do_clone_for_rooms(self) -> None:
         """Bulk-add rooms sharing this watcher's connector/agent/inherits/
         shared fields — the owner-requested alternative to adding rooms one
         at a time. Only meaningful for an EXISTING watcher (create mode has
@@ -493,9 +534,9 @@ class WatcherDetailScreen(FormScreen):
                 yield Static(f"[bold]{self._entity_label()}[/bold]  (editing)")
                 if self.group_size > 1:
                     yield Static(
-                        "[yellow]Part of a shared rooms: group — editing 'Room', "
-                        "'Name', 'Session ID', or any field below 'Agent' will "
-                        "split this room out into its own entry.[/yellow]"
+                        "[yellow]Part of a shared rooms: group — editing any "
+                        "field below except Description will split this room "
+                        "out into its own entry.[/yellow]"
                     )
 
             with Horizontal(classes="field-row"):
@@ -513,6 +554,20 @@ class WatcherDetailScreen(FormScreen):
 
             for spec in self._field_specs():
                 yield from self._compose_field_row(spec, self._current_entry())
+                if spec.key == "name":
+                    # User-requested: it's not obvious that leaving this
+                    # blank is the recommended default — an explicit name
+                    # pins this room to its own single-room entry forever,
+                    # opting it out of add_watcher_rooms()'s merge-on-add
+                    # optimization (only worth it for the rare case of two
+                    # DIFFERENT agents watching the same connector+room, an
+                    # edge case, not the common one).
+                    yield Static(
+                        "[dim]Leave blank unless you need to avoid a name "
+                        "conflict — an explicit name opts this room out of "
+                        "merging with others that share the same "
+                        "settings.[/dim]"
+                    )
 
     # ── save ─────────────────────────────────────────────────────────────────
 
@@ -595,19 +650,20 @@ class WatcherDetailScreen(FormScreen):
         shared_updates = {k: v for k, v in updates.items() if k in _SHARED_FIELD_KEYS}
         per_room_updates = {k: v for k, v in updates.items() if k not in _SHARED_FIELD_KEYS}
 
-        # Group-shared fields (connector/agent/inherits) edit the shared raw
-        # entry IN PLACE first — the whole group moves together, including
-        # whichever room is about to split out below (it should see the
-        # group's LATEST shared state, not the pre-edit one).
+        # 'description' (the only genuinely group-shared field — see
+        # _SHARED_FIELD_KEYS's own comment) edits the shared raw entry IN
+        # PLACE — the whole group moves together for this one, regardless of
+        # whether anything else below also splits this room out.
         for key, value in shared_updates.items():
             apply_update(self.raw_entry, key, value)
-        if inherits_changed:
-            apply_update(self.raw_entry, "inherits", self._inherits_current)
 
-        if per_room_updates:
-            # A per-room field changed (room/name/session_id/online_notification/
-            # offline_notification/context_inject_files/history_handoff.*) —
-            # split this one room out, per the two-tier rule. Composed from
+        if per_room_updates or inherits_changed:
+            # A per-room field changed (room/name/session_id/connector/agent/
+            # online_notification/offline_notification/context_inject_files/
+            # history_handoff.*) OR inherits changed — every one of these
+            # identifies or configures the room being watched, so there's no
+            # way to give just THIS room a divergent value without splitting
+            # it out of its group first, per the two-tier rule. Composed from
             # the exact same add/remove primitives new-watcher creation and
             # Clone-for-rooms use — a split-out room can itself merge into
             # some OTHER pre-existing matching entry, symmetric with creation.
@@ -619,8 +675,18 @@ class WatcherDetailScreen(FormScreen):
                 self.cfg.document["watchers"] = watchers_snapshot
                 self._resync_raw_entry()
                 return
-            new_connector = self.raw_entry.get("connector") or self._dataclass_defaults()["connector"]
-            new_agent = self.raw_entry.get("agent") or self._dataclass_defaults()["agent"]
+            # NOT self.raw_entry.get(...) alone — connector/agent are no
+            # longer applied in place before this point (see above), so a
+            # JUST-CHANGED value only lives in per_room_updates until the
+            # split below actually writes it into the new entry.
+            new_connector = (
+                per_room_updates.get("connector", self.raw_entry.get("connector"))
+                or self._dataclass_defaults()["connector"]
+            )
+            new_agent = (
+                per_room_updates.get("agent", self.raw_entry.get("agent"))
+                or self._dataclass_defaults()["agent"]
+            )
 
             split_entry: dict = {}
             for key in ("name", "session_id", *(f.key for f in WATCHER_TEMPLATE_FIELDS)):

@@ -15,10 +15,10 @@ from pathlib import Path
 
 import pytest
 import yaml
-from textual.widgets import DataTable
+from textual.widgets import DataTable, Input
 
 from gateway.configtool.app import ConfigToolApp
-from gateway.configtool.modals import ConfirmModal, MessageModal
+from gateway.configtool.modals import ConfirmModal, MessageModal, TextPromptModal
 from gateway.configtool.screens.agent_detail import AgentDetailScreen
 from gateway.configtool.screens.connector_detail import ConnectorDetailScreen
 from gateway.configtool.screens.overview import OverviewScreen
@@ -108,7 +108,7 @@ class TestDirectEditFromConnectorsList:
             await pilot.pause()
             table = app.screen.query_one("#connectors-table", DataTable)
             table.focus()
-            table.move_cursor(row=1)  # rc-orphan
+            table.move_cursor(row=0)  # rc-orphan (sorted before rc-referenced)
 
             await pilot.press("e")
             await pilot.pause()
@@ -127,7 +127,7 @@ class TestDirectEditFromConnectorsList:
             await pilot.pause()
             table = app.screen.query_one("#connectors-table", DataTable)
             table.focus()
-            table.move_cursor(row=1)
+            table.move_cursor(row=0)  # rc-orphan (sorted before rc-referenced)
             await pilot.press("e")
             await pilot.pause()
             assert isinstance(app.screen, ConnectorDetailScreen)
@@ -144,7 +144,7 @@ class TestDirectEditFromConnectorsList:
             await pilot.pause()
             table = app.screen.query_one("#connectors-table", DataTable)
             table.focus()
-            table.move_cursor(row=1)
+            table.move_cursor(row=0)  # rc-orphan (sorted before rc-referenced)
             await pilot.press("e")
             await pilot.pause()
 
@@ -261,7 +261,7 @@ class TestDirectDeleteFromConnectorsList:
             await pilot.pause()
             table = app.screen.query_one("#connectors-table", DataTable)
             table.focus()
-            table.move_cursor(row=1)  # rc-orphan
+            table.move_cursor(row=0)  # rc-orphan (sorted before rc-referenced)
 
             await pilot.press("d")
             await pilot.pause()
@@ -275,7 +275,7 @@ class TestDirectDeleteFromConnectorsList:
             await pilot.pause()
             table = app.screen.query_one("#connectors-table", DataTable)
             table.focus()
-            table.move_cursor(row=1)
+            table.move_cursor(row=0)  # rc-orphan (sorted before rc-referenced)
 
             await pilot.press("d")
             await pilot.pause()
@@ -295,7 +295,7 @@ class TestDirectDeleteFromConnectorsList:
             await pilot.pause()
             table = app.screen.query_one("#connectors-table", DataTable)
             table.focus()
-            table.move_cursor(row=1)
+            table.move_cursor(row=0)  # rc-orphan (sorted before rc-referenced)
 
             await pilot.press("d")
             await pilot.pause()
@@ -322,7 +322,7 @@ class TestDirectDeleteFromConnectorsList:
             await pilot.pause()
             table = app.screen.query_one("#connectors-table", DataTable)
             table.focus()
-            table.move_cursor(row=0)  # rc-referenced
+            table.move_cursor(row=1)  # rc-referenced (sorted after rc-orphan)
 
             await pilot.press("d")
             await pilot.pause()
@@ -361,3 +361,80 @@ class TestDirectDeleteFromAgentsList:
             raw = yaml.safe_load(Path(config_path).read_text())
             assert "unused-agent" not in raw["agents"]
             assert "existing-agent" in raw["agents"]
+
+
+class TestDirectCloneFromWatchersList:
+    """'c' on the Watchers tab: run the row under the cursor's own "Clone
+    for rooms" bulk-add directly, no "open the watcher first" detour —
+    user-requested, code-review finding: this shortcut shipped with no
+    dedicated test of its own (only WatcherDetailScreen's own 'c' binding,
+    reached after already opening a watcher, was covered)."""
+
+    async def test_cloning_directly_from_the_list_adds_rooms_without_opening_the_watcher(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _config_with_two_connectors(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.screen.query_one("TabbedContent").active = "tab-watchers"
+            await pilot.pause()
+            table = app.screen.query_one("#watchers-table", DataTable)
+            table.focus()
+            table.move_cursor(row=0)  # only one watcher: rc-referenced/general
+
+            await pilot.press("c")
+            await pilot.pause()
+            assert isinstance(app.screen, TextPromptModal)
+            app.screen.query_one("#prompt-input", Input).value = "dev, ops"
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert isinstance(app.screen, OverviewScreen)
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert raw["watchers"] == [
+                {
+                    "connector": "rc-referenced", "agent": "default",
+                    "rooms": ["general", "dev", "ops"],
+                }
+            ]
+
+    async def test_cancelling_the_clone_prompt_leaves_the_list_untouched(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _config_with_two_connectors(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.screen.query_one("TabbedContent").active = "tab-watchers"
+            await pilot.pause()
+            table = app.screen.query_one("#watchers-table", DataTable)
+            table.focus()
+            table.move_cursor(row=0)
+
+            await pilot.press("c")
+            await pilot.pause()
+            assert isinstance(app.screen, TextPromptModal)
+            await pilot.press("escape")
+            await pilot.pause()
+
+            # Cancelled at the prompt — WatcherDetailScreen (pushed silently
+            # underneath) never asked-for by the user; back to the list.
+            assert isinstance(app.screen, OverviewScreen)
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert raw["watchers"] == [
+                {"connector": "rc-referenced", "agent": "default", "room": "general"}
+            ]
+
+    async def test_clone_hidden_on_a_non_watchers_tab(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _config_with_two_connectors(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.screen.query_one("TabbedContent").active == "tab-connectors"
+            assert app.screen.check_action("clone_for_rooms", ()) is False
+
+            app.screen.query_one("TabbedContent").active = "tab-watchers"
+            await pilot.pause()
+            assert app.screen.check_action("clone_for_rooms", ()) is True
