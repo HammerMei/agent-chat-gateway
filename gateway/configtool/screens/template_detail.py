@@ -113,6 +113,17 @@ class TemplateDetailScreen(ToolListEditorMixin, FormScreen):
     def _on_enter_edit_mode(self) -> None:
         self._compute_initial_values(self.entry)
         self._tool_list_state()
+        # Defensive, matching AgentDetailScreen._on_enter_edit_mode()'s own
+        # reset — code-review finding: this screen has no _recompute_form()/
+        # recompose() call anywhere today (unlike AgentDetailScreen's
+        # inherits-switch path), so _compose_tool_list_widget() currently
+        # only ever runs once per screen instance with this always freshly
+        # False already, making this reset a no-op in practice. Kept anyway
+        # so a future second call into edit mode on the same instance
+        # doesn't leave the "Edit" tool-list button stuck disabled from a
+        # stale prior selection, with nothing left to fire a fresh
+        # Highlighted/DescendantFocus event to un-stick it.
+        self._tool_list_ever_selected = dict.fromkeys(TOOL_LIST_WIDGET_IDS, False)
 
     def _entity_noun(self) -> str:
         return f"{self.kind} template"

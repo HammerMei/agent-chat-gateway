@@ -149,6 +149,25 @@ class TestOverviewRender:
             await pilot.pause()
             assert app.is_running is False
 
+    async def test_escape_is_a_hidden_quit_alias_on_the_overview(self, tmp_path, work_dir):
+        """User-requested: every detail/form screen already uses Escape to
+        go back, and OverviewScreen is the one screen with nowhere further
+        "back" to go — Escape here quits (same as 'q'), matching the habit
+        those other screens train. show=False since 'q' remains the one
+        documented, visible quit key (same treatment ctrl+q already gets)."""
+        config_path = _write_config(tmp_path, _valid_config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            bound = app.screen.active_bindings.get("escape")
+            assert bound is not None
+            assert bound.binding.show is False
+            assert bound.binding.action == "app.quit"
+
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app.is_running is False
+
     async def test_duplicate_connector_names_do_not_crash_the_table(self, tmp_path, work_dir):
         """Regression: connectors_raw is the raw, pre-validation list — two
         connectors sharing a name used to crash repaint_from_memory() with
