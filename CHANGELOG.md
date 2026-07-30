@@ -9,7 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-30
+
 ### Added
+- **Config TUI (`agent-chat-gateway config`)** — a new full-screen,
+  keyboard-driven editor for `config.yaml`, replacing hand-editing YAML for
+  day-to-day changes. Full create/edit/delete for Connectors, Agents,
+  Watchers, Templates, and Tool Presets, with per-field provenance labels
+  (explicit / inherited from a template / built-in default), required-field
+  markers, blast-radius confirms before a template edit affects other
+  entries, and validate-before-write saves (every save is checked against a
+  temp file first, with an automatic timestamped backup) — a bad edit never
+  reaches your real config.yaml. `ctrl+e` opens `$EDITOR` on the raw file
+  for anything the forms don't cover. See `docs/config-tool.md`.
+- **Config TUI: full watcher CRUD**, including the `rooms:` group
+  merge/split rules: creating or editing a room whose connector, agent, and
+  other settings match an existing entry merges it into that entry's
+  `rooms:` list instead of creating a near-duplicate; editing a per-room
+  setting (room, name, session ID, notifications, connector, agent,
+  inherits, ...) on one room in a group splits it out into its own entry
+  without touching its siblings — only `description` (a free-text
+  annotation) edits the whole group in place. A "Clone for rooms" action
+  bulk-adds several rooms sharing a watcher's settings in one step,
+  reachable both from inside a watcher and directly from the Watchers list.
+- **Config TUI: Tool Presets tab** — create, edit, and delete named
+  `tool_presets:` entries (add/edit/remove individual rules, each either an
+  inline rule or a reference to another preset by name) directly in the
+  TUI; deleting a preset still referenced by an agent is blocked with a
+  clear reason.
+- **Fault-tolerant config validation with per-entity save gate and status**
+  (#73). `GatewayConfig.from_file()`'s per-entity parsing is now shared with
+  a new `collect_config()` that keeps going past independent per-entity
+  failures, rather than failing the whole file on the first bad entry. This
+  lets the config TUI save or delete an entity as long as the edit doesn't
+  introduce a *new* problem, instead of being blocked by an unrelated,
+  pre-existing error elsewhere in the file, and shows real per-row ERROR
+  status for agents and watchers (not just connectors), including when
+  multiple entities are independently broken.
 - **Compact config.yaml format (v0.2)**: top-level `connector_defaults:` /
   `agent_defaults:` / `watcher_defaults:` blocks deep-merge into every entry
   of the matching kind; named `tool_presets:` can be referenced by name from
