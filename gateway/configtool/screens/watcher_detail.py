@@ -19,7 +19,7 @@ docs/design/config-tool.md's Phase 3 "two-tier rule" (decision 3):
   - Editing a GROUP-SHARED field (`description` — a free-text annotation
     with no bearing on which connector/agent/room is actually watched)
     edits the shared raw entry in place — the whole group moves together.
-  - Editing a PER-ROOM field (`room` itself, `name`, `session_id`,
+  - Editing a PER-ROOM field (`room` itself, `name` — see below, `session_id`,
     `connector`, `agent`, `inherits`, `online_notification`,
     `offline_notification`, `context_inject_files`, `history_handoff.*`)
     auto-splits this one room out of its group into its own entry
@@ -34,6 +34,17 @@ docs/design/config-tool.md's Phase 3 "two-tier rule" (decision 3):
     ENTIRE group to a different connector when the user only meant to
     redirect the one room they had open. `inherits` gets the same
     treatment for the same reason (also a single shared value).
+
+`name` is conceptually per-room too (an explicit sticky identity
+overriding the auto-generated `"<connector>-<room>"`), but user-reported:
+it's genuinely rare and a "leave blank" note trying to explain it in the
+form was confusing, doubly so sitting ambiguously between it and Session
+ID. It's therefore NOT a `_field_specs()` row at all — this screen never
+lets you set one. An existing entry that already has one (e.g.
+hand-edited) keeps it: `_save_edit()`'s split-entry logic still carries it
+forward, and `find_mergeable_watcher_entry()` still excludes it from
+merge consideration — this form just can't create or clear it. `$EDITOR`
+(ctrl+e on the Overview) remains available for that rare case.
 
 Two owner decisions supersede the original design doc's still-unbuilt
 `EntityPickerModal`/`RoomListEditorScreen`:
@@ -298,12 +309,24 @@ class WatcherDetailScreen(FormScreen):
             if self.mode == "create"
             else FieldSpec("room", "str", "Room")
         )
+        # 'name' (an explicit sticky identity overriding the auto-generated
+        # "<connector>-<room>") is deliberately NOT a row here — user-
+        # reported: a "leave blank" note trying to explain when to use it
+        # was confusing on its own, and doubly so sitting between this and
+        # the Session ID field with no clear indication which field it was
+        # about. Its real use case (two DIFFERENT agents watching the same
+        # connector+room) is genuinely rare and already distinguishable by
+        # `agent` alone for merge-on-add purposes — an existing watcher that
+        # already has an explicit `name:` (e.g. hand-edited) keeps it as-is
+        # (still carried forward by the split-entry logic in _save_edit()
+        # below, and still excluded from merge consideration by
+        # find_mergeable_watcher_entry()); this form just never lets you SET
+        # one. Use $EDITOR (ctrl+e on the Overview) for that rare case.
         return sort_required_first(
             (
                 FieldSpec("connector", "enum", "Connector", options=connector_names),
                 FieldSpec("agent", "enum", "Agent", options=agent_names),
                 room_spec,
-                FieldSpec("name", "str", "Name"),
                 FieldSpec("session_id", "str", "Session ID"),
                 *WATCHER_TEMPLATE_FIELDS,
             ),
@@ -329,7 +352,6 @@ class WatcherDetailScreen(FormScreen):
             self.cfg.connectors_raw[0].get("name", "") if self.cfg.connectors_raw else ""
         )
         defaults["agent"] = next(iter(self.cfg.agents_raw), "")
-        defaults["name"] = None
         defaults["session_id"] = None
         defaults["room"] = None
         return defaults
@@ -554,20 +576,6 @@ class WatcherDetailScreen(FormScreen):
 
             for spec in self._field_specs():
                 yield from self._compose_field_row(spec, self._current_entry())
-                if spec.key == "name":
-                    # User-requested: it's not obvious that leaving this
-                    # blank is the recommended default — an explicit name
-                    # pins this room to its own single-room entry forever,
-                    # opting it out of add_watcher_rooms()'s merge-on-add
-                    # optimization (only worth it for the rare case of two
-                    # DIFFERENT agents watching the same connector+room, an
-                    # edge case, not the common one).
-                    yield Static(
-                        "[dim]Leave blank unless you need to avoid a name "
-                        "conflict — an explicit name opts this room out of "
-                        "merging with others that share the same "
-                        "settings.[/dim]"
-                    )
 
     # ── save ─────────────────────────────────────────────────────────────────
 

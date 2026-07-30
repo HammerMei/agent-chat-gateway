@@ -386,6 +386,14 @@ class TestAgentToolListEdit:
     async def test_editing_a_preset_reference_notifies_instead_of_crashing(
         self, tmp_path, work_dir
     ):
+        """The "Edit" button is disabled for a preset-reference selection
+        (see TestAgentToolListEditButtonAvailability below) — clicking a
+        disabled button is a no-op in Textual, so this now exercises that
+        no-op path rather than _edit_tool_rule()'s own notify() guard
+        directly. Both still guarantee the same user-visible outcome this
+        test actually asserts: no crash, list untouched — kept as a
+        belt-and-suspenders regression in case the guard is ever reached
+        some other way (e.g. a future non-mouse trigger)."""
         config_path = _write_config(tmp_path, _config_text(work_dir))
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
@@ -409,6 +417,71 @@ class TestAgentToolListEdit:
 
             assert isinstance(app.screen, AgentDetailScreen)  # no crash
             assert len(list_view.children) == 1  # untouched
+
+
+class TestAgentToolListEditButtonAvailability:
+    """User-reported: the "Edit" button used to always be clickable but
+    only ever did something for an inline-rule item that's been explicitly
+    selected — every other click just produced a warning notification,
+    which read as "this button is broken" rather than "this specific item
+    isn't editable." Now it's disabled/enabled to make that visible up
+    front."""
+
+    async def test_edit_button_starts_disabled(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_edit(pilot, app)
+
+            button = app.screen.query_one("#edit-tool-owner_allowed_tools")
+            assert button.disabled is True
+
+    async def test_edit_button_stays_disabled_for_a_preset_reference(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, _config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_edit(pilot, app)
+
+            list_view = app.screen.query_one("#owner-tools-list", ListView)
+            list_view.scroll_visible(animate=False)
+            await pilot.pause()
+            await pilot.click(list_view.children[0])  # 'preset-a' — a bare string reference
+            await pilot.pause()
+
+            button = app.screen.query_one("#edit-tool-owner_allowed_tools")
+            assert button.disabled is True
+
+    async def test_edit_button_enables_for_a_selected_inline_rule(self, tmp_path, work_dir):
+        config_path = _write_config(tmp_path, _config_text(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_edit(pilot, app)
+
+            await _click_tool_button(pilot, app, "add")
+            await pilot.press("down", "down", "enter")  # inline (index 2)
+            await pilot.pause()
+            app.screen.query_one("#rule-tool", Input).value = "Edit"
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+
+            list_view = app.screen.query_one("#owner-tools-list", ListView)
+            list_view.focus()
+            list_view.index = 1  # the just-added {tool: Edit} inline rule
+            await pilot.pause()
+
+            button = app.screen.query_one("#edit-tool-owner_allowed_tools")
+            assert button.disabled is False
+
+            # And it actually works now — not just enabled cosmetically.
+            await _click_tool_button(pilot, app, "edit")
+            await pilot.pause()
+            assert isinstance(app.screen, InlineToolRuleModal)
 
 
 class TestAgentToolListCursorPositionAfterMutation:

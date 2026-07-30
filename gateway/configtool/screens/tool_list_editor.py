@@ -42,6 +42,7 @@ from __future__ import annotations
 from textual import events, work
 from textual.app import ComposeResult
 from textual.containers import Horizontal
+from textual.css.query import NoMatches
 from textual.widgets import Button, Label, ListItem, ListView
 
 from ..modals import InlineToolRuleModal, MessageModal, PresetOrInlineModal, TextPromptModal
@@ -131,6 +132,40 @@ class ToolListEditorMixin:
         # falls back to 0 only when nothing was ever selected to begin with.
         if list_view.children:
             list_view.index = min(prev_index, len(list_view.children) - 1) if prev_index is not None else 0
+        self._refresh_edit_button_state(key)
+
+    def _tool_list_edit_available(self, key: str) -> bool:
+        """Whether the "Edit" button beside this list would actually do
+        anything right now — mirrors `_edit_tool_rule()`'s own guard clauses
+        exactly (nothing selected yet, or the selected item is a preset
+        reference rather than an inline rule)."""
+        if not self._tool_list_ever_selected.get(key):
+            return False
+        try:
+            list_view = self.query_one(f"#{TOOL_LIST_WIDGET_IDS[key]}", ListView)
+        except NoMatches:
+            return False
+        idx = list_view.index
+        if idx is None or idx >= len(self._tool_lists[key]):
+            return False
+        return isinstance(self._tool_lists[key][idx], dict)
+
+    def _refresh_edit_button_state(self, key: str) -> None:
+        """User-reported: the "Edit" button was always clickable, but only
+        ever actually did something for an inline-rule item that's been
+        explicitly selected — every other click just showed a warning
+        notification ("Select an item in the list first." / "Preset
+        references aren't edited here..."), which read as "this button is
+        broken" rather than "this specific item isn't editable." Greying it
+        out makes availability visible up front instead of discovered by
+        clicking and reading a notification. Called after every selection
+        change AND after every list mutation (add/edit/remove can shift
+        which item sits at the current index, or turn the list empty)."""
+        try:
+            button = self.query_one(f"#edit-tool-{key}", Button)
+        except NoMatches:
+            return
+        button.disabled = not self._tool_list_edit_available(key)
 
     def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
         """Real-Bug-fixed: `ListView.index` defaults to 0 (not None) the
@@ -152,6 +187,7 @@ class ToolListEditorMixin:
         key = getattr(event.list_view, "tool_list_key", None)
         if key is not None:
             self._tool_list_ever_selected[key] = True
+            self._refresh_edit_button_state(key)
 
     def on_descendant_focus(self, event: events.DescendantFocus) -> None:
         """A ListView gaining real DOM focus (click, or Tab) is ALSO a
@@ -167,6 +203,7 @@ class ToolListEditorMixin:
             key = getattr(event.widget, "tool_list_key", None)
             if key is not None:
                 self._tool_list_ever_selected[key] = True
+                self._refresh_edit_button_state(key)
 
     def _dispatch_tool_list_button(self, button_id: str) -> bool:
         """Returns True if `button_id` was a tool-list Add/Edit/Remove
@@ -301,7 +338,26 @@ class ToolListEditorMixin:
         yield list_view
         with Horizontal(classes="tool-list-buttons"):
             yield Button("+ Add", id=f"add-tool-{key}")
-            yield Button("Edit", id=f"edit-tool-{key}")
+            # Starts disabled — user-reported: it used to always be
+            # clickable but only ever did something for an inline-rule item
+            # that's been explicitly selected, so most clicks just produced
+            # a warning notification that read as "this button is broken."
+            # _tool_list_ever_selected[key] is always freshly False at every
+            # point this composes, so hardcoding disabled here matches what
+            # _tool_list_edit_available() would compute anyway; it can't be
+            # called directly here since the ListView above hasn't mounted
+            # yet for it to query. Each of this mixin's two hosts keeps that
+            # invariant true for its own reason: AgentDetailScreen explicitly
+            # resets it in `_on_enter_edit_mode()`/`_open_inherits_picker()`
+            # (both real recompose paths); TemplateDetailScreen ALSO resets
+            # it defensively in its own `_on_enter_edit_mode()`, though today
+            # it has no second entry-into-edit-mode path at all (no
+            # `_recompute_form()`/`recompose()` call anywhere in that file),
+            # so the reset there is currently a no-op belt-and-suspenders,
+            # not a load-bearing fix. on_list_view_highlighted()/
+            # on_descendant_focus()/_refresh_tool_list() keep it in sync
+            # from here on.
+            yield Button("Edit", id=f"edit-tool-{key}", disabled=True)
             yield Button("- Remove", id=f"remove-tool-{key}")
 
     def _collect_tool_list_updates(self, target_entry: dict) -> None:
