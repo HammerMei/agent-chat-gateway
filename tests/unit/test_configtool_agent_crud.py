@@ -28,6 +28,7 @@ from gateway.configtool.modals import (
 )
 from gateway.configtool.screens.agent_detail import AgentDetailScreen
 from gateway.configtool.screens.overview import OverviewScreen
+from gateway.configtool.screens.watcher_detail import WatcherDetailScreen
 
 
 def _write_config(tmp_path: Path, yaml_text: str) -> str:
@@ -123,12 +124,10 @@ class TestNewAgentEntryPoint:
             await pilot.pause()
             assert isinstance(app.screen, TypePickerModal)
 
-    async def test_n_key_on_watchers_tab_notifies_instead_of_crashing(
-        self, tmp_path, work_dir
-    ):
-        """Watcher creation is Phase 3, not built yet — pressing 'n' on that
-        tab must be a friendly no-op, not a crash or silent no-op. (Connector
-        creation, tested elsewhere, now IS supported on tab-connectors.)"""
+    async def test_n_key_on_watchers_tab_opens_the_create_form(self, tmp_path, work_dir):
+        """Config TUI Phase 3: watcher creation is now supported — 'n' opens
+        WatcherDetailScreen directly in create mode, no type picker/detour
+        (connector/agent are plain Select dropdowns in that same form)."""
         config_path = _write_config(tmp_path, _config_with_one_agent(work_dir))
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
@@ -138,7 +137,8 @@ class TestNewAgentEntryPoint:
 
             await pilot.press("n")
             await pilot.pause()
-            assert isinstance(app.screen, OverviewScreen)  # did not navigate anywhere
+            assert isinstance(app.screen, WatcherDetailScreen)
+            assert app.screen.mode == "create"
 
     async def test_cancelling_the_type_picker_returns_to_overview(self, tmp_path, work_dir):
         config_path = _write_config(tmp_path, _config_with_one_agent(work_dir))

@@ -31,6 +31,7 @@ important for the two reasons that remain.
 
 from __future__ import annotations
 
+import copy
 import os
 import shutil
 import time
@@ -509,6 +510,174 @@ class EditableConfig:
             for wc in expanded:
                 result.append(ExpandedWatcher(watcher=wc, raw_entry=entry, group_size=count))
         return result
+
+    # ── Watcher CRUD (Phase 3) — merge-on-add / split-on-edit primitives ────
+    #
+    # Everything below composes from exactly two primitives:
+    #   add_watcher_rooms()    — merge a room into a matching existing entry,
+    #                             or create a new one
+    #   remove_watcher_room()  — remove a room from whichever entry has it
+    #
+    # A "rename/move" is remove + add; a "split one per-room field out of a
+    # shared group" is remove + add (with the new field value folded into
+    # `shared`); a "delete" is remove alone. No separate code path for any
+    # of those — see WatcherDetailScreen.action_save()/action_delete() for
+    # how they're actually composed. This mirrors gateway/config.py's own
+    # "one implementation, reused everywhere" principle: _watcher_shared_fields()
+    # here is the SAME grouping _parse_one_watcher_entry() uses (entry-level
+    # vs per-room), just expressed as a set of dict keys instead of parse
+    # logic, since this operates on the raw pre-load document, not a parsed
+    # WatcherConfig.
+
+    def find_mergeable_watcher_entry(self, connector: str, agent: str, shared: dict) -> dict | None:
+        """Find an existing raw `watchers:` entry whose OWN `connector`/
+        `agent` match exactly (not the resolved/defaulted value — an entry
+        relying on the implicit "first connector"/"default agent" fallback
+        is deliberately never a merge candidate, since that fallback can
+        shift if connectors/agents are later added or reordered) and whose
+        `_watcher_shared_fields()` deep-equal `shared`, AND that has no
+        explicit `name:`/`session_id:` of its own (those are only legal on
+        a single-room entry — gateway/config.py forbids them the moment an
+        entry becomes multi-room, so an entry that already has one can
+        never legally accept another room). Returns the matching raw dict
+        (by identity, live in `self.document["watchers"]`), or None."""
+        for entry in self.watchers_raw:
+            if entry.get("name") or entry.get("session_id"):
+                continue
+            if entry.get("connector") != connector or entry.get("agent") != agent:
+                continue
+            if _watcher_shared_fields(entry) == shared:
+                return entry
+        return None
+
+    def add_watcher_rooms(
+        self, connector: str, agent: str, rooms: list[str], shared: dict,
+        insert_at: int | None = None,
+    ) -> list[str]:
+        """Add each room in `rooms` under `connector`/`agent`, merging into
+        an existing matching entry (same connector/agent plus `shared`
+        fields) when one exists, creating a new single-room entry otherwise.
+        A room already present in the entry it would merge into is skipped
+        — silently, not an error — since the end state is identical either
+        way (user-requested: typing a room that's already in the group
+        you're cloning FROM shouldn't require editing your input first).
+        Rooms are added one at a time (re-searching for a merge target each
+        time), so a multi-room call — e.g. creating 3 rooms at once — makes
+        the SECOND and later rooms merge into whatever the first one just
+        created, ending up as a single `rooms:` group rather than 3
+        separate entries.
+
+        `insert_at`: when a genuinely NEW entry is created (no merge
+        target), insert it at this document index instead of appending to
+        the end — used by a split-on-edit caller that wants the new,
+        smaller entry to land where the room's old group used to be
+        (docs/design/config-tool.md decision 3: "inserted adjacent to the
+        source group"), rather than silently reordering it to the bottom
+        of the file. Ignored once a first room in this same call has
+        already created (and is now being merged into) a new entry, and
+        clamped to the current list length if the document has since
+        shrunk (e.g. this same call already removed the source entry).
+
+        Returns the rooms actually newly added (a subset of `rooms`, in
+        order) — callers use this to report "N added, M already present"
+        rather than a flat count. Calls `mark_dirty()` if anything changed;
+        callers still own calling `save()`."""
+        added: list[str] = []
+        for room in rooms:
+            target = self.find_mergeable_watcher_entry(connector, agent, shared)
+            if target is not None:
+                existing_rooms = (
+                    list(target["rooms"]) if "rooms" in target
+                    else [target["room"]] if "room" in target
+                    else []
+                )
+                if room in existing_rooms:
+                    continue  # already present — no-op, not an error
+                existing_rooms.append(room)
+                target.pop("room", None)
+                target["rooms"] = existing_rooms
+            else:
+                # deepcopy: `shared`'s values (e.g. context_inject_files,
+                # history_handoff) may be the SAME nested list/dict object
+                # `_watcher_shared_fields()` read straight off some other
+                # entry — without this, mutating one entry's nested value
+                # later would silently alias into this brand-new one too
+                # (the same class of bug _deep_merge() was once fixed for).
+                new_entry = {
+                    "connector": connector, "agent": agent, "room": room,
+                    **copy.deepcopy(shared),
+                }
+                # `setdefault("watchers", [])` alone isn't enough: a
+                # present-but-empty `watchers:` key parses to `None` (a key
+                # that EXISTS with value None isn't touched by setdefault,
+                # which only fills in a default for a key that's fully
+                # ABSENT), not an empty list.
+                if self.document.get("watchers") is None:
+                    self.document["watchers"] = []
+                watchers_list = self.document["watchers"]
+                if insert_at is not None and insert_at <= len(watchers_list):
+                    watchers_list.insert(insert_at, new_entry)
+                else:
+                    watchers_list.append(new_entry)
+                insert_at = None  # only the FIRST newly-created entry gets the hint
+            added.append(room)
+        if added:
+            self.mark_dirty()
+        return added
+
+    def remove_watcher_room(self, raw_entry: dict, room: str) -> int | None:
+        """Remove `room` from `raw_entry` (found by identity in
+        `self.document["watchers"]`) — normalizing `rooms: [x]` back to
+        `room: x`, or removing the whole entry if it has no rooms left.
+        Calls `mark_dirty()`. Returns the document index `raw_entry`
+        occupied (whether it shrank in place or was removed outright), or
+        None if `room` wasn't actually a member of it — callers that want
+        to reinsert a replacement near the same position (split-on-edit)
+        pass this straight through to `add_watcher_rooms(insert_at=...)`."""
+        watchers = self.document.get("watchers") or []
+        try:
+            index = next(i for i, w in enumerate(watchers) if w is raw_entry)
+        except StopIteration:
+            return None  # already gone — nothing to do
+        if "rooms" in raw_entry:
+            if room not in raw_entry["rooms"]:
+                remaining = None  # not actually in this entry — no-op
+            else:
+                remaining = [r for r in raw_entry["rooms"] if r != room]
+        elif raw_entry.get("room") == room:
+            remaining = []
+        else:
+            remaining = None  # this entry never had `room` to begin with
+        if remaining is None:
+            return None
+        if not remaining:
+            watchers.pop(index)
+        elif len(remaining) == 1:
+            raw_entry.pop("rooms", None)
+            raw_entry["room"] = remaining[0]
+        else:
+            raw_entry["rooms"] = remaining
+        self.mark_dirty()
+        return index
+
+
+def _watcher_shared_fields(entry: dict) -> dict:
+    """The subset of a raw watcher entry that `_parse_one_watcher_entry()`
+    (gateway/config.py) treats as entry-level — shared across every
+    expanded room in a `rooms:` group, never per-room. Two entries with
+    equal `_watcher_shared_fields()` (plus equal connector/agent) can
+    legally be merged into one `rooms:` group. Deliberately does NOT
+    include `name`/`session_id` — those are per-room, single-room-only,
+    and already excluded from merge-eligibility by
+    `find_mergeable_watcher_entry()`'s own separate check."""
+    return {
+        key: entry[key]
+        for key in (
+            "inherits", "context_inject_files", "online_notification",
+            "offline_notification", "history_handoff", "description",
+        )
+        if key in entry
+    }
 
 
 @dataclass

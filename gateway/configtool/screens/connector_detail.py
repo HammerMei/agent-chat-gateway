@@ -48,6 +48,7 @@ from .form_common import (
     FormScreen,
     apply_update,
     find_referencing_watcher_labels,
+    sort_required_first,
     widget_id,
 )
 
@@ -57,6 +58,25 @@ from .form_common import (
 # from this module, so a module-level import here would be circular.
 
 CONNECTOR_TYPES = ("rocketchat", "mattermost", "voice", "script")
+
+# Connector types flagged "(experimental)" in every TypePickerModal that
+# offers a connector type choice — user-requested. 'voice' matches
+# docs/supported-features.md's own "Experimental" status row (POC-quality,
+# known timeout race); 'script' is stable for AD-HOC scripting
+# (docs/architecture.md's "Testing and Scripting" section) but declaring
+# one as a CONFIGURED connector — the headless-scheduling use case
+# (docs/scheduling.md) — is comparatively undocumented/untested next to
+# rocketchat/mattermost, so it gets the same caveat here.
+_EXPERIMENTAL_CONNECTOR_TYPES = frozenset({"voice", "script"})
+
+# (value, display label) pairs for TypePickerModal — value is what actually
+# gets written as `type:` (see TypePickerModal.__init__()'s own docstring:
+# dismiss() always returns the VALUE half, never the label), label is what
+# the picker shows.
+CONNECTOR_TYPE_PICKER_OPTIONS: list[tuple[str, str]] = [
+    (t, f"{t} (experimental)" if t in _EXPERIMENTAL_CONNECTOR_TYPES else t)
+    for t in CONNECTOR_TYPES
+]
 
 # Shared by both rocketchat and mattermost — gateway/core/agent_chain.py's
 # AgentChainConfig is platform-agnostic and both connectors' *Config
@@ -153,6 +173,23 @@ DATACLASS_DEFAULTS_BY_TYPE: dict[str, dict[str, object]] = {
     },
     "voice": {"port": 8765, "host": "0.0.0.0", "secret": "", "timeout": 45},
     "script": {},
+}
+
+# Which fields have no default and MUST be set for a valid connector of each
+# type (gateway/connectors/*/config.py's own dataclass fields with no
+# default — RocketChatConfig.server_url/username/password,
+# MattermostConfig.server_url/team; voice/script have none). Deliberately
+# excludes mattermost's server.token/server.username/server.password: those
+# are dual-mode/mutually-exclusive (exactly one of 'token' or
+# 'username'+'password' is required, never all three) — marking all three
+# '*' would misleadingly suggest every one of them is mandatory. The "Auth
+# method" row's own label is marked '*' by hand instead (_compose_mm_auth_section()
+# below), since SOME auth method is always required.
+REQUIRED_FIELD_KEYS_BY_TYPE: dict[str, frozenset[str]] = {
+    "rocketchat": frozenset({"server.url", "server.username", "server.password"}),
+    "mattermost": frozenset({"server.url", "server.team"}),
+    "voice": frozenset(),
+    "script": frozenset(),
 }
 
 
@@ -305,8 +342,13 @@ class ConnectorDetailScreen(FormScreen):
             return "username_password"
         return "token"
 
+    def _required_field_keys(self) -> frozenset[str]:
+        return REQUIRED_FIELD_KEYS_BY_TYPE.get(self._connector_type(), frozenset())
+
     def _field_specs(self) -> tuple[FieldSpec, ...]:
-        return FIELDS_BY_TYPE.get(self._connector_type(), ())
+        return sort_required_first(
+            FIELDS_BY_TYPE.get(self._connector_type(), ()), self._required_field_keys()
+        )
 
     def _template_kind(self) -> str:
         return "connector"
@@ -371,7 +413,7 @@ class ConnectorDetailScreen(FormScreen):
             if self.mode == "create":
                 yield Static(f"[bold]New {conn_type} connector[/bold]")
                 with Horizontal(classes="field-row"):
-                    yield Static("Name", classes="field-label")
+                    yield Static("Name *", classes="field-label")
                     yield Input(
                         id="field-name", value=self._name_live, placeholder="connector name"
                     )
@@ -416,7 +458,7 @@ class ConnectorDetailScreen(FormScreen):
         working unmodified) but only the ACTIVE one is visible; the inactive
         one is hidden via the `.hidden` CSS class, not skipped entirely."""
         with Horizontal(classes="field-row"):
-            yield Static("Auth method", classes="field-label")
+            yield Static("Auth method *", classes="field-label")
             yield Select(
                 [("API token", "token"), ("Username + password", "username_password")],
                 value=self._mm_auth_method,
@@ -563,7 +605,9 @@ class ConnectorDetailScreen(FormScreen):
             # OverviewScreen.action_new_entity() uses for a brand-new
             # connector.
             new_type = await self.app.push_screen_wait(
-                TypePickerModal("New connector template — pick a type", list(CONNECTOR_TYPES))
+                TypePickerModal(
+                    "New connector template — pick a type", CONNECTOR_TYPE_PICKER_OPTIONS
+                )
             )
             if new_type is None:
                 return

@@ -175,16 +175,22 @@ class TypePickerModal(ModalScreen[str | None]):
     }
     """
 
-    def __init__(self, title: str, options: list[str]):
+    def __init__(self, title: str, options: list[str] | list[tuple[str, str]]):
+        """`options`: plain strings display as themselves (every existing
+        caller); a caller that needs the DISPLAYED label to differ from the
+        dismissed VALUE (user-requested: flag 'voice'/'script' connector
+        types as "(experimental)" in the picker without that suffix leaking
+        into the actual `type:` value written to config.yaml) passes
+        `(value, label)` tuples instead."""
         super().__init__()
         self.title_text = title
-        self.options = options
+        self.options = [(o, o) if isinstance(o, str) else o for o in options]
 
     def compose(self) -> ComposeResult:
         with Vertical(id="type-picker-dialog"):
             yield Static(self.title_text, id="type-picker-title")
             yield ListView(
-                *[ListItem(Label(option), name=option) for option in self.options],
+                *[ListItem(Label(label), name=value) for value, label in self.options],
                 id="type-picker-list",
             )
 

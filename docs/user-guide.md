@@ -652,6 +652,9 @@ agent-chat-gateway send <room> --connector rc-main "message"
 # Interactive setup wizard (creates config interactively)
 agent-chat-gateway onboard [--repo-path PATH]
 
+# Interactive config TUI — edit an existing config.yaml (see docs/config-tool.md)
+agent-chat-gateway config
+
 # Check for and install updates
 agent-chat-gateway upgrade
 ```

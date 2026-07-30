@@ -41,9 +41,9 @@ from textual.widgets import DataTable, Footer, Header, Static, TabbedContent, Ta
 from ...config_validate import ValidationResult
 from ..formatting import status_badge
 from ..modals import ConfirmModal, MessageModal, TextPromptModal, TypePickerModal
-from ..model import StatusIndex
+from ..model import ExpandedWatcher, StatusIndex
 from .agent_detail import AgentDetailScreen
-from .connector_detail import CONNECTOR_TYPES, ConnectorDetailScreen
+from .connector_detail import CONNECTOR_TYPE_PICKER_OPTIONS, ConnectorDetailScreen
 from .form_common import find_agents_referencing_preset, find_entries_referencing_template
 from .template_detail import TEMPLATE_KINDS, TemplateDetailScreen
 from .tool_presets import ToolPresetsScreen
@@ -90,6 +90,13 @@ class OverviewScreen(Screen):
         # Input widgets on those screens, where a bare 'q' typed into a field
         # must not quit the app.
         Binding("q", "app.quit", "Quit", show=True),
+        # User-requested: every detail/form screen already uses Escape to go
+        # back, and this is the one screen with nowhere further "back" to
+        # go — pressing Escape here to quit (same as 'q') matches the habit
+        # those other screens already train. show=False: 'q' above remains
+        # the one documented, visible quit key; this is a silent alias for
+        # it, same treatment ctrl+q already gets.
+        Binding("escape", "app.quit", "Quit", show=False),
         Binding("n", "new_entity", "New", show=True),
         # User-reported: the banner only ever showed a bare count ("✗ 1
         # error(s)") — result.errors/warnings/lint_findings (the actual
@@ -109,6 +116,12 @@ class OverviewScreen(Screen):
         # the footer doesn't advertise a no-op.
         Binding("e", "edit_row", "Edit", show=True),
         Binding("d", "delete_row", "Delete", show=True),
+        # Watchers tab only (see check_action() below) — user-requested:
+        # WatcherDetailScreen's own "Clone for rooms" action ('c') used to
+        # only be reachable after opening a specific watcher first; this
+        # lets the row under the cursor be cloned directly from the list,
+        # same shortcut precedent as edit_row/delete_row above.
+        Binding("c", "clone_for_rooms", "Clone for rooms", show=True),
         # User-requested: focus starts on the list itself (see on_mount()),
         # not the tab bar, so left/right must be able to switch tabs WITHOUT
         # the user first moving focus off the list. priority=True is
@@ -191,23 +204,28 @@ class OverviewScreen(Screen):
     # ── Actions ──────────────────────────────────────────────────────────────
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        """Hide 'Edit' from the footer on tabs that don't support it at all
-        (Watchers — Phase 3). Templates is fully editable/deletable now
-        (every kind is a real, named, creatable entity — no more per-kind
-        "nothing editable yet" gate the old Defaults tab needed for
-        connector_defaults). Tool Presets: user-requested, for consistency
-        with every other tab — 'e' here is just an alias for Enter (see
-        action_edit_row()'s own docstring; ToolPresetsScreen still has no
-        separate "edit mode" to enter, see tool_presets.py). 'Delete'
-        additionally supports Tool Presets (deletes the whole preset, not a
-        rule) and Templates (deletes the whole template, not a field — see
-        action_delete_row() below) so the footer never advertises a key
-        that would just notify "not supported yet"."""
+        """Templates is fully editable/deletable now (every kind is a real,
+        named, creatable entity — no more per-kind "nothing editable yet"
+        gate the old Defaults tab needed for connector_defaults). Tool
+        Presets: user-requested, for consistency with every other tab —
+        'e' here is just an alias for Enter (see action_edit_row()'s own
+        docstring; ToolPresetsScreen still has no separate "edit mode" to
+        enter, see tool_presets.py). Watchers (Phase 3): 'e'/'d' edit/delete
+        the row's own single expanded watcher directly — see
+        action_edit_row()/action_delete_row()'s watchers-tab branches for
+        exactly what that means for a watcher that's part of a shared
+        rooms: group."""
         active_tab = self.query_one(TabbedContent).active
         if action == "edit_row":
-            return active_tab in ("tab-connectors", "tab-agents", "tab-templates", "tab-presets")
+            return active_tab in (
+                "tab-connectors", "tab-agents", "tab-watchers", "tab-templates", "tab-presets",
+            )
         if action == "delete_row":
-            return active_tab in ("tab-connectors", "tab-agents", "tab-templates", "tab-presets")
+            return active_tab in (
+                "tab-connectors", "tab-agents", "tab-watchers", "tab-templates", "tab-presets",
+            )
+        if action == "clone_for_rooms":
+            return active_tab == "tab-watchers"
         return True
 
     def action_edit_config(self) -> None:
@@ -279,6 +297,14 @@ class OverviewScreen(Screen):
             if entry is None:
                 return
             screen = AgentDetailScreen(cfg, key, entry, mode="edit")
+        elif active_tab == "tab-watchers":
+            key = self._cursor_row_key("watchers-table")
+            if key is None:
+                return
+            ew = self._expanded_watcher_for_key(cfg, key)
+            if ew is None:
+                return
+            screen = WatcherDetailScreen(cfg, ew, mode="edit")
         elif active_tab == "tab-templates":
             row_key = self._cursor_row_key("templates-table")
             if row_key is None:
@@ -351,6 +377,14 @@ class OverviewScreen(Screen):
             if entry is None:
                 return
             screen = AgentDetailScreen(cfg, key, entry, mode="view")
+        elif active_tab == "tab-watchers":
+            key = self._cursor_row_key("watchers-table")
+            if key is None:
+                return
+            ew = self._expanded_watcher_for_key(cfg, key)
+            if ew is None:
+                return
+            screen = WatcherDetailScreen(cfg, ew, mode="view")
         else:
             return
 
@@ -370,6 +404,40 @@ class OverviewScreen(Screen):
             # point). Reached from the list directly, staying here would
             # strand the user on a screen they never asked to see — send
             # them back to the list instead, same as Escape would.
+            self.app.pop_screen()
+
+    @work
+    async def action_clone_for_rooms(self) -> None:
+        """'c' on the Watchers tab: run the row under the cursor's own
+        "Clone for rooms" bulk-add directly, no "open the watcher first"
+        detour. Pushes WatcherDetailScreen in view mode SILENTLY (mirroring
+        action_delete_row()'s identical shape immediately above), invokes
+        its own _do_clone_for_rooms() as a plain coroutine (same
+        nested-@work-worker fragility reasoning as _do_delete()'s call site),
+        then pops back to the list regardless of outcome — a successful
+        clone already pops itself (WatcherDetailScreen.action_clone_for_rooms()'s
+        own success path), so the extra pop_screen() below only fires for
+        the cancelled/no-op/blocked paths, where staying on a screen the
+        user never asked to see would strand them."""
+        app: "ConfigToolApp" = self.app  # type: ignore[assignment]
+        cfg = app.editable_config
+        if cfg is None:
+            self.notify("Config does not currently load.", severity="error")
+            return
+
+        if self.query_one(TabbedContent).active != "tab-watchers":
+            return
+        key = self._cursor_row_key("watchers-table")
+        if key is None:
+            return
+        ew = self._expanded_watcher_for_key(cfg, key)
+        if ew is None:
+            return
+
+        screen = WatcherDetailScreen(cfg, ew, mode="view")
+        self.app.push_screen(screen)
+        await screen._do_clone_for_rooms()
+        if self.app.screen is screen:
             self.app.pop_screen()
 
     async def _delete_preset_row(self, cfg) -> None:
@@ -472,10 +540,9 @@ class OverviewScreen(Screen):
 
     @work
     async def action_new_entity(self) -> None:
-        """'n' — scoped to whichever tab is active. Agents, Connectors, and
-        Tool Presets support creation; Watchers/Defaults don't yet
-        (Phase 3). Unsupported tabs just notify, rather than doing nothing
-        silently or crashing."""
+        """'n' — scoped to whichever tab is active. Agents, Connectors,
+        Watchers, and Tool Presets support creation. Unsupported tabs just
+        notify, rather than doing nothing silently or crashing."""
         app: "ConfigToolApp" = self.app  # type: ignore[assignment]
         if app.editable_config is None:
             self.notify("Config does not currently load — nothing to add to.", severity="error")
@@ -493,13 +560,19 @@ class OverviewScreen(Screen):
             )
         elif active_tab == "tab-connectors":
             connector_type = await self.app.push_screen_wait(
-                TypePickerModal("New connector — pick a type", list(CONNECTOR_TYPES))
+                TypePickerModal("New connector — pick a type", CONNECTOR_TYPE_PICKER_OPTIONS)
             )
             if connector_type is None:
                 return
             self.app.push_screen(
                 ConnectorDetailScreen(app.editable_config, {"type": connector_type}, mode="create")
             )
+        elif active_tab == "tab-watchers":
+            # No type picker, no EntityPickerModal detour — connector/agent
+            # are two plain Select dropdowns directly in the create form
+            # itself (docs/design/config-tool.md's Phase 3 owner decision),
+            # same as everything else this screen needs to know.
+            self.app.push_screen(WatcherDetailScreen(app.editable_config, None, mode="create"))
         elif active_tab == "tab-presets":
             # No document/disk write here — a brand-new preset only
             # actually materializes once the first rule is added inside
@@ -521,7 +594,9 @@ class OverviewScreen(Screen):
             entry: dict = {}
             if kind == "connector":
                 connector_type = await self.app.push_screen_wait(
-                    TypePickerModal("New connector template — pick a type", list(CONNECTOR_TYPES))
+                    TypePickerModal(
+                        "New connector template — pick a type", CONNECTOR_TYPE_PICKER_OPTIONS
+                    )
                 )
                 if connector_type is None:
                     return
@@ -659,8 +734,16 @@ class OverviewScreen(Screen):
         # missing one (falling back to "?"), and Textual's DataTable.add_row
         # raises DuplicateKey on a repeated key — exactly the kind of config
         # mistake this tool exists to surface gracefully, not crash on.
+        # Every table below is sorted by name (user-requested — the create/
+        # merge-on-add flow can insert a new row anywhere in the underlying
+        # list/dict, making a row hard to spot again by scrolling; sorting
+        # display order makes it easy to find regardless of where it landed
+        # in the raw document). The row `key=` a cursor's action resolves
+        # against stays the entry's own stable identity (list index for
+        # connectors, its own name for everything else) — sorting here only
+        # changes DISPLAY order, never what a key refers back to.
         connectors_table.add_columns("Name", "Type", "Status")
-        for i, c in enumerate(cfg.connectors_raw):
+        for i, c in sorted(enumerate(cfg.connectors_raw), key=lambda pair: pair[1].get("name", "?")):
             name = c.get("name", "?")
             try:
                 merged = cfg.merged_entry("connector", c)
@@ -672,7 +755,7 @@ class OverviewScreen(Screen):
             )
 
         agents_table.add_columns("Name", "Type", "Command", "Status")
-        for name, entry in cfg.agents_raw.items():
+        for name, entry in sorted(cfg.agents_raw.items()):
             try:
                 merged = cfg.merged_entry("agent", entry)
             except (ValueError, FileNotFoundError):
@@ -693,7 +776,7 @@ class OverviewScreen(Screen):
         if expanded is None:
             watchers_table.add_row("(unavailable — config does not currently load)", "", "", "", "")
         else:
-            for ew in expanded:
+            for ew in sorted(expanded, key=lambda e: e.watcher.name):
                 w = ew.watcher
                 watchers_table.add_row(
                     w.name, w.connector, w.room, w.agent,
@@ -707,14 +790,14 @@ class OverviewScreen(Screen):
                 templates = cfg.templates(kind)
             except (ValueError, FileNotFoundError):
                 templates = {}
-            for name, block in templates.items():
+            for name, block in sorted(templates.items()):
                 used_by = [n for n, _ in find_entries_referencing_template(cfg, kind, name)]
                 templates_table.add_row(
                     kind, name, str(len(block)), str(len(used_by)), key=f"{kind}:{name}"
                 )
 
         presets_table.add_columns("Name", "Rules")
-        for name, rules in cfg.tool_presets_raw.items():
+        for name, rules in sorted(cfg.tool_presets_raw.items()):
             presets_table.add_row(name, str(len(rules)), key=name)
 
     # ── Row selection → push detail screens ──────────────────────────────────
@@ -742,6 +825,20 @@ class OverviewScreen(Screen):
             return connectors[index]
         return None
 
+    def _expanded_watcher_for_key(self, cfg, key: str) -> ExpandedWatcher | None:
+        """The EXPANDED watcher matching a watchers-table row key (its real,
+        loader-derived name) — same lookup on_data_table_row_selected()'s
+        own "watchers-table" branch already does, shared here for
+        action_edit_row()/action_delete_row()'s direct-from-list shortcuts.
+        Guarded the same way: a config that's become invalid on disk since
+        the table was painted must not crash selecting/editing/deleting a
+        row, just silently find nothing."""
+        try:
+            expanded = cfg.expanded_watchers()
+        except (ValueError, FileNotFoundError):
+            return None
+        return next((e for e in expanded if e.watcher.name == key), None)
+
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         app: "ConfigToolApp" = self.app  # type: ignore[assignment]
         cfg = app.editable_config
@@ -765,12 +862,8 @@ class OverviewScreen(Screen):
             # painted (e.g. an external edit), selecting ANY row (including
             # the keyless "(unavailable...)" placeholder row shown in that
             # case) crashed the whole app. Guarded the same way
-            # repaint_from_memory() already is.
-            try:
-                expanded = cfg.expanded_watchers()
-            except (ValueError, FileNotFoundError):
-                return
-            ew = next((e for e in expanded if e.watcher.name == key), None)
+            # repaint_from_memory() already is (via _expanded_watcher_for_key()).
+            ew = self._expanded_watcher_for_key(cfg, key)
             if ew is not None:
                 self.app.push_screen(WatcherDetailScreen(cfg, ew, mode="view"))
         elif table_id == "templates-table":

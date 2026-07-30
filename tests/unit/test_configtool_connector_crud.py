@@ -85,7 +85,16 @@ class TestNewConnectorEntryPoint:
             await pilot.pause()
             await _open_type_picker_for_connectors(pilot, app)
             assert isinstance(app.screen, TypePickerModal)
-            assert app.screen.options == ["rocketchat", "mattermost", "voice", "script"]
+            # (value, label) pairs — user-requested: 'voice'/'script' are
+            # flagged "(experimental)" in the picker's displayed label, but
+            # the VALUE half (what actually gets written as `type:`) stays
+            # the bare type name.
+            assert app.screen.options == [
+                ("rocketchat", "rocketchat"),
+                ("mattermost", "mattermost"),
+                ("voice", "voice (experimental)"),
+                ("script", "script (experimental)"),
+            ]
 
 
 class TestCreateConnector:
@@ -687,7 +696,7 @@ class TestDeleteConnector:
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            await _open_connector_in_view_mode(pilot, app, row=1)  # rc-orphan
+            await _open_connector_in_view_mode(pilot, app, row=0)  # rc-orphan (sorted before rc-referenced)
 
             await pilot.press("d")
             await pilot.pause()
@@ -698,7 +707,7 @@ class TestDeleteConnector:
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            await _open_connector_in_view_mode(pilot, app, row=1)  # rc-orphan
+            await _open_connector_in_view_mode(pilot, app, row=0)  # rc-orphan (sorted before rc-referenced)
 
             await pilot.press("d")
             await pilot.pause()
@@ -716,7 +725,7 @@ class TestDeleteConnector:
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            await _open_connector_in_view_mode(pilot, app, row=1)  # rc-orphan
+            await _open_connector_in_view_mode(pilot, app, row=0)  # rc-orphan (sorted before rc-referenced)
 
             await pilot.press("d")
             await pilot.pause()
@@ -741,7 +750,7 @@ class TestDeleteConnector:
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            await _open_connector_in_view_mode(pilot, app, row=0)  # rc-referenced
+            await _open_connector_in_view_mode(pilot, app, row=1)  # rc-referenced (sorted after rc-orphan)
 
             await pilot.press("d")
             await pilot.pause()

@@ -132,6 +132,51 @@ Once the job fires, it is automatically marked `completed` and will not run agai
 
 ---
 
+## Headless Scheduling (No Chat Platform)
+
+Every example above targets a watcher bound to a real chat connector — the
+agent's reply actually posts to a Rocket.Chat/Mattermost room. If you want a
+scheduled job that runs an agent purely for its own sake (a background
+check, a periodic task whose effect is a file/API side effect rather than a
+chat message) with **no chat platform account needed at all**, bind the
+watcher to a `script` connector (`type: script`) instead of a real one.
+
+`script` is an in-process connector with no network I/O — see
+`docs/architecture.md`'s "Testing and Scripting" section for its other,
+unrelated use (calling it directly from your own Python code, bypassing
+`config.yaml` entirely). Declaring one in `config.yaml` instead gives the
+scheduler a named, no-platform identity to inject into:
+
+```yaml
+connectors:
+  - name: headless
+    type: script
+
+agents:
+  worker:
+    type: claude
+    working_directory: /path/to/project
+
+watchers:
+  - connector: headless
+    agent: worker
+    room: cron   # never a real room — the script connector has nowhere to post
+```
+
+```bash
+agent-chat-gateway schedule create cron "Check disk usage and log anything over 80%." --every 1h
+```
+
+The job fires exactly like any other — `SessionManager.inject_message()`
+runs the agent turn the same way regardless of connector type — but the
+reply is just queued in the script connector's in-memory buffer and never
+delivered anywhere. This only makes sense when you don't need the output
+visible in a chat room (e.g. the agent's own tool calls write to a file, a
+log, or an API as a side effect); if you want the result posted somewhere
+a human sees it, bind the watcher to a real connector instead.
+
+---
+
 ## Listing and Managing Jobs
 
 ### List all jobs
