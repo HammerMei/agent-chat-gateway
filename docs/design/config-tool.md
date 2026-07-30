@@ -175,7 +175,13 @@ per-row status lookups.
    silently reassigned an entire group's connector when the user only
    meant to redirect the one room they had open; moved to the per-room
    (split-triggering) side, consistent with how `online_notification` etc.
-   were already handled.
+   were already handled. `name` is conceptually per-room too, but the config
+   TUI's `WatcherDetailScreen` deliberately doesn't expose it as an editable
+   field at all (user-reported: a "leave blank unless..." note was
+   confusing, and its real use case — two different agents watching the
+   same connector+room — is rare enough that `$EDITOR` is the better fit);
+   an existing entry's explicit `name:` is still carried through
+   split/merge unchanged, this only affects what the FORM lets you set.
 4. **Entity creation: schema-driven where the schema is complete, per-type
    templates where it's deliberately open.** Agent + watcher forms generate
    from the JSON Schema (`$defs` are `additionalProperties: false` — zero

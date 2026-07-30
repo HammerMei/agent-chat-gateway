@@ -719,6 +719,23 @@ class TestTemplateToolListEditor:
             list_view = app.screen.query_one("#owner-tools-list")
             assert len(list_view.children) == 1
 
+    async def test_edit_tool_button_starts_disabled(self, tmp_path, work_dir):
+        """ToolListEditorMixin's "Edit" button starts disabled until a
+        genuine selection is made (see test_configtool_agent_tool_list.py's
+        TestAgentToolListEditButtonAvailability for the full regression
+        suite on AgentDetailScreen's side of this shared mixin) — this one
+        pins the same behavior for TemplateDetailScreen, the mixin's other
+        host, which resets `_tool_list_ever_selected` in its own
+        `_on_enter_edit_mode()` for the identical reason."""
+        config_path = _write_config(tmp_path, _config_with_agent_template_tools(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_template_edit(pilot, app, row=0)
+
+            button = app.screen.query_one("#edit-tool-owner_allowed_tools")
+            assert button.disabled is True
+
     async def test_adding_an_inline_rule_and_saving_confirms_and_writes_it(
         self, tmp_path, work_dir
     ):
