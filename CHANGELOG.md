@@ -131,6 +131,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entry has an Inherits picker.
 
 ### Fixed
+- **Identity/addressing header now delivered durably via the system
+  prompt, surviving Claude Code's auto-compact (closes #52).** Previously,
+  the watcher's identity + multi-agent addressing rules — including
+  RBAC/injection-defense rules from `context_inject_files` (e.g.
+  `contexts/rc-gateway-context.md`) — were sent as a one-time user message.
+  Claude Code's auto-compact summarizes conversation history but never
+  touches the system prompt, so this content was permanently lost after
+  the first compact: the agent would stop honoring the multi-agent
+  addressing guideline, causing massive message fan-out in a multi-agent
+  room. A second latent bug: this content was also gated behind having
+  `context_inject_files`/`history_context` configured, so a watcher with
+  neither never received it at all. Fix (Claude only — OpenCode's own fix
+  is deferred to a follow-up): `ClaudeBackend` now writes this content to a
+  durable per-watcher system-prompt file
+  (`~/.agent-chat-gateway/system-prompts/<watcher>.md`) and re-appends it
+  via `--append-system-prompt-file` on every turn, so it survives
+  compaction and session resume regardless of how long the conversation
+  runs (#58).
 - **Scheduled-task messages now carry a usable `ts:`/`day:` timestamp.**
   Previously, messages injected by the scheduler used an ISO-formatted
   timestamp that the Rocket.Chat header formatter couldn't parse, so
