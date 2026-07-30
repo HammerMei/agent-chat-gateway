@@ -90,6 +90,13 @@ class OverviewScreen(Screen):
         # Input widgets on those screens, where a bare 'q' typed into a field
         # must not quit the app.
         Binding("q", "app.quit", "Quit", show=True),
+        # User-requested: every detail/form screen already uses Escape to go
+        # back, and this is the one screen with nowhere further "back" to
+        # go — pressing Escape here to quit (same as 'q') matches the habit
+        # those other screens already train. show=False: 'q' above remains
+        # the one documented, visible quit key; this is a silent alias for
+        # it, same treatment ctrl+q already gets.
+        Binding("escape", "app.quit", "Quit", show=False),
         Binding("n", "new_entity", "New", show=True),
         # User-reported: the banner only ever showed a bare count ("✗ 1
         # error(s)") — result.errors/warnings/lint_findings (the actual
