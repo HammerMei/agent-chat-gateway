@@ -59,6 +59,25 @@ from .form_common import (
 
 CONNECTOR_TYPES = ("rocketchat", "mattermost", "voice", "script")
 
+# Connector types flagged "(experimental)" in every TypePickerModal that
+# offers a connector type choice — user-requested. 'voice' matches
+# docs/supported-features.md's own "Experimental" status row (POC-quality,
+# known timeout race); 'script' is stable for AD-HOC scripting
+# (docs/architecture.md's "Testing and Scripting" section) but declaring
+# one as a CONFIGURED connector — the headless-scheduling use case
+# (docs/scheduling.md) — is comparatively undocumented/untested next to
+# rocketchat/mattermost, so it gets the same caveat here.
+_EXPERIMENTAL_CONNECTOR_TYPES = frozenset({"voice", "script"})
+
+# (value, display label) pairs for TypePickerModal — value is what actually
+# gets written as `type:` (see TypePickerModal.__init__()'s own docstring:
+# dismiss() always returns the VALUE half, never the label), label is what
+# the picker shows.
+CONNECTOR_TYPE_PICKER_OPTIONS: list[tuple[str, str]] = [
+    (t, f"{t} (experimental)" if t in _EXPERIMENTAL_CONNECTOR_TYPES else t)
+    for t in CONNECTOR_TYPES
+]
+
 # Shared by both rocketchat and mattermost — gateway/core/agent_chain.py's
 # AgentChainConfig is platform-agnostic and both connectors' *Config
 # dataclasses embed it identically (raw.get("agent_chain", {})). Previously
@@ -586,7 +605,9 @@ class ConnectorDetailScreen(FormScreen):
             # OverviewScreen.action_new_entity() uses for a brand-new
             # connector.
             new_type = await self.app.push_screen_wait(
-                TypePickerModal("New connector template — pick a type", list(CONNECTOR_TYPES))
+                TypePickerModal(
+                    "New connector template — pick a type", CONNECTOR_TYPE_PICKER_OPTIONS
+                )
             )
             if new_type is None:
                 return

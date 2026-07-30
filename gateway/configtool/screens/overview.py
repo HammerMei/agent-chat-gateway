@@ -43,7 +43,7 @@ from ..formatting import status_badge
 from ..modals import ConfirmModal, MessageModal, TextPromptModal, TypePickerModal
 from ..model import ExpandedWatcher, StatusIndex
 from .agent_detail import AgentDetailScreen
-from .connector_detail import CONNECTOR_TYPES, ConnectorDetailScreen
+from .connector_detail import CONNECTOR_TYPE_PICKER_OPTIONS, ConnectorDetailScreen
 from .form_common import find_agents_referencing_preset, find_entries_referencing_template
 from .template_detail import TEMPLATE_KINDS, TemplateDetailScreen
 from .tool_presets import ToolPresetsScreen
@@ -560,7 +560,7 @@ class OverviewScreen(Screen):
             )
         elif active_tab == "tab-connectors":
             connector_type = await self.app.push_screen_wait(
-                TypePickerModal("New connector — pick a type", list(CONNECTOR_TYPES))
+                TypePickerModal("New connector — pick a type", CONNECTOR_TYPE_PICKER_OPTIONS)
             )
             if connector_type is None:
                 return
@@ -594,7 +594,9 @@ class OverviewScreen(Screen):
             entry: dict = {}
             if kind == "connector":
                 connector_type = await self.app.push_screen_wait(
-                    TypePickerModal("New connector template — pick a type", list(CONNECTOR_TYPES))
+                    TypePickerModal(
+                        "New connector template — pick a type", CONNECTOR_TYPE_PICKER_OPTIONS
+                    )
                 )
                 if connector_type is None:
                     return
