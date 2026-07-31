@@ -334,19 +334,27 @@ class RocketChatREST:
         if major_version is not None and major_version >= 8:
             await self._upload_file_v8_plus(room_id, path, mime_type, caption)
         else:
-            await self._upload_file_legacy(room_id, path, mime_type, caption)
+            await self._upload_file_legacy(
+                room_id, path, mime_type, caption,
+                version_undetected=major_version is None,
+            )
 
     async def _upload_file_legacy(
-        self, room_id: str, path: Path, mime_type: str, caption: str
+        self, room_id: str, path: Path, mime_type: str, caption: str,
+        *, version_undetected: bool,
     ) -> None:
         """Pre-8.0 one-step upload via ``POST rooms.upload/{rid}``.
 
-        Only reached when the server's major version is confirmed < 8, or
-        when it could not be determined at all (see _get_server_major_version).
-        In the latter case, a 404 here almost certainly means the server is
-        actually RC 8.0+ and version detection itself failed — surfaced as a
-        distinct error so it's not confused with an unrelated 404 (bad room ID,
-        reverse-proxy misconfiguration, etc). See issue #56.
+        Reached when the server's major version is confirmed < 8, or when it
+        could not be determined at all (see _get_server_major_version).
+
+        ``version_undetected`` distinguishes those two cases so a 404 is
+        translated into the "likely RC 8.0+" error message *only* when we
+        genuinely don't know the server's version. When the version was
+        positively confirmed < 8, a 404 is an unrelated, genuine failure (bad
+        room ID, disabled route, reverse-proxy misconfiguration, etc.) and
+        must propagate as the real HTTPStatusError instead of being misreported
+        as a version mismatch that never happened. See issue #56.
         """
         url = f"{self.server_url}/api/v1/rooms.upload/{room_id}"
         data = {"msg": caption} if caption else {}
@@ -358,7 +366,7 @@ class RocketChatREST:
             files={"file": (path.name, file_bytes, mime_type)},
             data=data,
         )
-        if response.status_code == 404:
+        if response.status_code == 404 and version_undetected:
             raise RuntimeError(
                 f"rooms.upload/{room_id} returned 404. This endpoint was removed "
                 "in Rocket.Chat 8.0+; the server is likely running RC 8.0+ but "

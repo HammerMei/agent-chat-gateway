@@ -455,15 +455,15 @@ class TestUploadFile(unittest.IsolatedAsyncioTestCase):
             file_tuple = kwargs["files"]["file"]
             self.assertEqual(file_tuple[2], "application/octet-stream")
 
-    async def test_legacy_404_raises_clear_version_mismatch_error(self):
-        """When version detection fails/says pre-8.0 but the server is actually
-        RC 8.0+, rooms.upload 404s — that must not surface as a bare
+    async def test_legacy_404_with_undetected_version_raises_clear_error(self):
+        """When version detection genuinely fails (returns None) and
+        rooms.upload then 404s, that must not surface as a bare
         HTTPStatusError (issue #56's own acceptance criterion: a clear error
-        pointing at the version mismatch, not a generic 4xx)."""
+        pointing at the likely version mismatch, not a generic 4xx)."""
         rest = _make_rest()
         rest.auth_token = "tok"
         rest.user_id = "uid"
-        rest._server_major_version = 6  # detection said pre-8.0 (or was never confirmed)
+        rest._get_server_major_version = AsyncMock(return_value=None)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             fpath = Path(tmpdir) / "f.txt"
@@ -476,6 +476,27 @@ class TestUploadFile(unittest.IsolatedAsyncioTestCase):
                 await rest.upload_file("ROOM1", str(fpath))
             self.assertIn("8.0+", str(ctx.exception))
             self.assertIn("/api/info", str(ctx.exception))
+
+    async def test_legacy_404_with_confirmed_pre8_version_raises_real_error(self):
+        """Regression test for a Codex review finding on PR #75: when the
+        version is *positively confirmed* < 8 (not merely undetected), a
+        rooms.upload 404 is a genuine, unrelated failure (bad room ID,
+        disabled route, ...) and must propagate as the real HTTPStatusError —
+        NOT get misreported as a version mismatch that never happened."""
+        rest = _make_rest()
+        rest.auth_token = "tok"
+        rest.user_id = "uid"
+        rest._server_major_version = 6  # confirmed pre-8.0, not "undetected"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fpath = Path(tmpdir) / "f.txt"
+            fpath.write_bytes(b"data")
+
+            not_found = _make_response(404, {"success": False, "error": "not-found"})
+            rest._download_client.post = AsyncMock(return_value=not_found)
+
+            with self.assertRaises(httpx.HTTPStatusError):
+                await rest.upload_file("ROOM1", str(fpath))
 
 
 # ── _get_server_major_version ───────────────────────────────────────────────
