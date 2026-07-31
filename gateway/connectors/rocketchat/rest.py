@@ -5,7 +5,7 @@ import logging
 import mimetypes
 import secrets
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -31,6 +31,11 @@ class RocketChatREST:
         self.bot_username: str | None = None
         self._username: str | None = None
         self._password: str | None = None
+        # Cached result of _get_server_major_version(); None means "not yet
+        # fetched" (fetch is retried), NOT "detection failed" (that also
+        # returns None but does not populate this cache, so a transient
+        # failure doesn't stick for the connector's whole lifetime).
+        self._server_major_version: int | None = None
         self._client = httpx.AsyncClient(timeout=30.0)
         self._download_client = httpx.AsyncClient(timeout=60.0)
         # Serializes concurrent re-login attempts.  Without this lock, two
@@ -123,6 +128,38 @@ class RocketChatREST:
         self._username = username
         self._password = password
         logger.info("Logged in as %s (uid=%s)", username, self.user_id)
+
+    async def _get_server_major_version(self) -> int | None:
+        """Fetch and cache the RC server's major version via ``GET /api/info``.
+
+        RC registers this route with ``authRequired: false``, so it can be
+        called with no auth headers. For unauthenticated callers RC trims the
+        response's ``version`` field down to ``"<major>.<minor>"`` (patch
+        removed) — that's still enough to determine the major version, so no
+        auth token is sent here.
+
+        Returns:
+            The server's major version (e.g. ``8`` for "8.5.2" or "8.5"), or
+            ``None`` if it could not be determined (network error, or an
+            unexpected/missing ``version`` field). ``None`` is not cached, so
+            a transient failure is retried on the next call instead of
+            permanently falling back for the connector's whole lifetime.
+        """
+        if self._server_major_version is not None:
+            return self._server_major_version
+        try:
+            response = await self._client.get(f"{self.server_url}/api/info")
+            response.raise_for_status()
+            version_str = response.json().get("version", "")
+            major = int(version_str.split(".")[0])
+        except (httpx.HTTPError, ValueError, AttributeError) as e:
+            logger.warning(
+                "Could not determine Rocket.Chat server version via /api/info "
+                "(%s); assuming pre-8.0 API surface for file uploads.", e,
+            )
+            return None
+        self._server_major_version = major
+        return major
 
     async def post_message(
         self,
@@ -242,13 +279,48 @@ class RocketChatREST:
             raise
         logger.info("Downloaded attachment to %s", dest_path)
 
+    async def _post_with_reauth_retry(
+        self, url: str, *, headers: Callable[[], dict[str, str]], **request_kwargs
+    ) -> httpx.Response:
+        """POST to ``url``, retrying once after re-login if the first attempt 401s.
+
+        ``headers`` is a zero-arg callable (not a plain dict) so the retry
+        rebuilds it *after* login() has refreshed ``self.auth_token`` — the
+        same pattern ``upload_file()`` used inline before this was factored
+        out to be shared by the legacy and RC-8.0+ upload flows.
+        """
+        sent_token = self.auth_token  # capture before the request
+        response = await self._download_client.post(
+            url, headers=headers(), **request_kwargs
+        )
+        if response.status_code == 401 and self._username:
+            async with self._relogin_lock:
+                if self.auth_token == sent_token:
+                    logger.warning("Auth token expired during upload, re-logging in...")
+                    await self.login(self._username, self._password)
+            response = await self._download_client.post(
+                url, headers=headers(), **request_kwargs
+            )
+        return response
+
+    def _upload_auth_headers(self) -> dict[str, str]:
+        """Auth-only headers for multipart upload POSTs (no Content-Type —
+        httpx sets the multipart boundary Content-Type itself from `files=`)."""
+        return {
+            "X-Auth-Token": self.auth_token or "",
+            "X-User-Id": self.user_id or "",
+        }
+
     async def upload_file(
         self, room_id: str, file_path: str, caption: str = ""
     ) -> None:
         """Upload a file attachment to a room (requires room ID).
 
-        Opens the file as a handle rather than reading all bytes into memory,
-        reducing peak RAM for large files.
+        Dispatches to the RC-8.0+ two-step ``rooms.media`` + ``rooms.mediaConfirm``
+        flow or the legacy one-step ``rooms.upload`` flow based on the server's
+        detected major version (see ``_get_server_major_version``; undetectable
+        version falls back to legacy, matching ACG's behavior before this
+        version-detection capability existed). See issue #56.
         """
         path = Path(file_path)
         if not path.exists():
@@ -258,42 +330,93 @@ class RocketChatREST:
         if mime_type is None:
             mime_type = "application/octet-stream"
 
+        major_version = await self._get_server_major_version()
+        if major_version is not None and major_version >= 8:
+            await self._upload_file_v8_plus(room_id, path, mime_type, caption)
+        else:
+            await self._upload_file_legacy(room_id, path, mime_type, caption)
+
+    async def _upload_file_legacy(
+        self, room_id: str, path: Path, mime_type: str, caption: str
+    ) -> None:
+        """Pre-8.0 one-step upload via ``POST rooms.upload/{rid}``.
+
+        Only reached when the server's major version is confirmed < 8, or
+        when it could not be determined at all (see _get_server_major_version).
+        In the latter case, a 404 here almost certainly means the server is
+        actually RC 8.0+ and version detection itself failed — surfaced as a
+        distinct error so it's not confused with an unrelated 404 (bad room ID,
+        reverse-proxy misconfiguration, etc). See issue #56.
+        """
         url = f"{self.server_url}/api/v1/rooms.upload/{room_id}"
-        headers = {
-            "X-Auth-Token": self.auth_token or "",
-            "X-User-Id": self.user_id or "",
-        }
         data = {"msg": caption} if caption else {}
+        file_bytes = await asyncio.to_thread(path.read_bytes)
 
-        async def _do_upload() -> httpx.Response:
-            # open() is a blocking syscall — offload file reading to a thread to
-            # avoid stalling the event loop (especially for cold-cache or NFS files).
-            file_bytes = await asyncio.to_thread(path.read_bytes)
-            return await self._download_client.post(
-                url,
-                headers=headers,
-                files={"file": (path.name, file_bytes, mime_type)},
-                data=data,
+        response = await self._post_with_reauth_retry(
+            url,
+            headers=self._upload_auth_headers,
+            files={"file": (path.name, file_bytes, mime_type)},
+            data=data,
+        )
+        if response.status_code == 404:
+            raise RuntimeError(
+                f"rooms.upload/{room_id} returned 404. This endpoint was removed "
+                "in Rocket.Chat 8.0+; the server is likely running RC 8.0+ but "
+                "ACG's version detection via GET /api/info could not confirm it "
+                "(see warning logged above). If this server is RC 8.0+, check "
+                "that /api/info is reachable and returns a 'version' field."
             )
-
-        sent_token = self.auth_token  # capture before the request
-        response = await _do_upload()
-        if response.status_code == 401 and self._username:
-            async with self._relogin_lock:
-                if self.auth_token == sent_token:
-                    logger.warning("Auth token expired during upload, re-logging in...")
-                    await self.login(self._username, self._password)
-            headers = {
-                "X-Auth-Token": self.auth_token or "",
-                "X-User-Id": self.user_id or "",
-            }
-            response = await _do_upload()
         response.raise_for_status()
         result = response.json()
-
         if not result.get("success"):
             raise RuntimeError(f"upload_file failed: {result.get('error', result)}")
-        logger.info("Uploaded file %s to room %s", path.name, room_id)
+        logger.info("Uploaded file %s to room %s (legacy rooms.upload)", path.name, room_id)
+
+    async def _upload_file_v8_plus(
+        self, room_id: str, path: Path, mime_type: str, caption: str
+    ) -> None:
+        """RC 8.0+ two-step upload: ``rooms.media/{rid}`` then
+        ``rooms.mediaConfirm/{rid}/{fileId}``.
+
+        Step 1 uploads the file bytes and gets back a ``file._id``; step 2
+        confirms/sends it into the room with the caption. Both steps are
+        required — a file uploaded via rooms.media alone sits unconfirmed and
+        never appears in the room (confirmed against RC's own route handlers
+        in apps/meteor/server/api/v1/rooms.ts, not just its public API docs).
+        """
+        file_bytes = await asyncio.to_thread(path.read_bytes)
+
+        media_url = f"{self.server_url}/api/v1/rooms.media/{room_id}"
+        media_response = await self._post_with_reauth_retry(
+            media_url,
+            headers=self._upload_auth_headers,
+            files={"file": (path.name, file_bytes, mime_type)},
+        )
+        media_response.raise_for_status()
+        media_result = media_response.json()
+        if not media_result.get("success"):
+            raise RuntimeError(
+                f"rooms.media upload failed: {media_result.get('error', media_result)}"
+            )
+        file_id = (media_result.get("file") or {}).get("_id")
+        if not file_id:
+            raise RuntimeError(f"rooms.media response missing file._id: {media_result}")
+
+        confirm_url = f"{self.server_url}/api/v1/rooms.mediaConfirm/{room_id}/{file_id}"
+        confirm_body = {"msg": caption} if caption else {}
+        confirm_response = await self._post_with_reauth_retry(
+            confirm_url, headers=self._headers, json=confirm_body,
+        )
+        confirm_response.raise_for_status()
+        confirm_result = confirm_response.json()
+        if not confirm_result.get("success"):
+            raise RuntimeError(
+                f"rooms.mediaConfirm failed: {confirm_result.get('error', confirm_result)}"
+            )
+        logger.info(
+            "Uploaded file %s to room %s (rooms.media + rooms.mediaConfirm)",
+            path.name, room_id,
+        )
 
     async def get_room_history(
         self,
