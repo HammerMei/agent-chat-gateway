@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-07-30
+
+### Fixed
+- **`history_handoff` now actually defaults to enabled.** Commit `31f966d`
+  (2026-05-10) intended to make `history_handoff` opt-out instead of opt-in,
+  flipping `HistoryHandoffConfig`'s dataclass default to `enabled=True` — but
+  missed the watcher config loader (`gateway/config.py`), which kept its own
+  hardcoded `enabled=False` fallback whenever a watcher's config omitted the
+  `history_handoff:` block entirely. The loader now falls back to
+  `HistoryHandoffConfig`'s own field defaults instead of separately hardcoded
+  literals, so the two can't drift apart again; the config TUI's watcher
+  template preview (`gateway/configtool/screens/watcher_detail.py`) does the
+  same. No config changes are needed to pick this up — a watcher with no
+  `history_handoff:` block now gets history handoff on by default; add
+  `history_handoff: {enabled: false}` to opt back out.
+
 ## [0.5.0] - 2026-07-30
 
 ### Added
