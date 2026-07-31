@@ -56,6 +56,13 @@ _REMOVED_DEFAULTS_KEYS: dict[str, str] = {
     "watcher_defaults": "watcher_templates",
 }
 
+# Single source of truth for history_handoff's per-field defaults: read from
+# HistoryHandoffConfig's OWN dataclass field defaults below, not re-typed as
+# separate literals here. These two drifted apart once, for over two months
+# (commit 31f966d flipped only the dataclass default to enabled=True — opt-out,
+# not opt-in — and missed this loader, which stayed hardcoded at enabled=False).
+_HH_DEFAULTS = HistoryHandoffConfig()
+
 # Per-type fallback for `command` when an agent (or its template) sets `type`
 # but not `command`. Deliberately NOT a single hardcoded string (e.g. always
 # "claude") — that was the other half of the bug _REMOVED_DEFAULTS_KEYS above
@@ -998,11 +1005,12 @@ def _parse_one_watcher_entry(
     raw_ctx = wc.get("context_inject_files", [])
     ctx_files = _resolve_paths(raw_ctx, config_dir)
 
+    # Defaults sourced from module-level _HH_DEFAULTS — see its docstring above.
     hh_raw = wc.get("history_handoff", {}) or {}
     history_handoff = HistoryHandoffConfig(
-        enabled=hh_raw.get("enabled", False),
-        fetch_count=hh_raw.get("fetch_count", 50),
-        verbatim_tail=hh_raw.get("verbatim_tail", 15),
+        enabled=hh_raw.get("enabled", _HH_DEFAULTS.enabled),
+        fetch_count=hh_raw.get("fetch_count", _HH_DEFAULTS.fetch_count),
+        verbatim_tail=hh_raw.get("verbatim_tail", _HH_DEFAULTS.verbatim_tail),
     )
 
     # Names are staged here, NOT written into `seen_watcher_names` directly,
