@@ -71,6 +71,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, VerticalScroll
 from textual.widgets import Button, Input, Select, Static
 
+from ...config import HistoryHandoffConfig
 from ..formatting import format_value, provenance_label
 from ..modals import ConfirmModal, InheritsPickerModal, MessageModal, TextPromptModal
 from ..model import EditableConfig, ExpandedWatcher
@@ -109,19 +110,20 @@ WATCHER_TEMPLATE_FIELDS: tuple[FieldSpec, ...] = (
     FieldSpec("history_handoff.verbatim_tail", "int", "History handoff verbatim tail"),
 )
 # Mirrors gateway/config.py's OWN `.get(key, X)` calls at the watcher-parsing
-# site (NOT HistoryHandoffConfig's dataclass field defaults, which have
-# already drifted from them once — the dataclass itself defaults
-# history_handoff.enabled to True, but the loader's own
-# `hh_raw.get("enabled", False)` actually applies False whenever the key is
-# absent). Matching the LOADER, not the dataclass, is what makes this form an
-# honest "what would this evaluate to right now" preview.
+# site. The history_handoff.* values are pulled live from HistoryHandoffConfig
+# itself — both here AND in the loader's own fallback (gateway/config.py's
+# `_HH_DEFAULTS`) — rather than re-typed as separate literals in either place,
+# so this preview can never drift out of sync with the loader again — they
+# did once, for over two months (commit 31f966d flipped only the dataclass
+# default to enabled=True and missed the loader).
+_HH_DEFAULTS = HistoryHandoffConfig()
 WATCHER_TEMPLATE_DATACLASS_DEFAULTS: dict[str, object] = {
     "online_notification": None,
     "offline_notification": None,
     "context_inject_files": [],
-    "history_handoff.enabled": False,
-    "history_handoff.fetch_count": 50,
-    "history_handoff.verbatim_tail": 15,
+    "history_handoff.enabled": _HH_DEFAULTS.enabled,
+    "history_handoff.fetch_count": _HH_DEFAULTS.fetch_count,
+    "history_handoff.verbatim_tail": _HH_DEFAULTS.verbatim_tail,
 }
 
 # The ONE key that's truly safe to edit in place across a whole rooms:
