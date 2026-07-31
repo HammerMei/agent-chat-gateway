@@ -344,6 +344,13 @@ class TestDownloadFile(unittest.IsolatedAsyncioTestCase):
 
 
 class TestUploadFile(unittest.IsolatedAsyncioTestCase):
+    """Legacy (pre-8.0) rooms.upload flow.
+
+    Each test seeds ``_server_major_version = 6`` directly so upload_file()
+    dispatches to _upload_file_legacy() without making a real /api/info call
+    (this module's tests mock all network I/O — see module docstring).
+    """
+
     async def test_upload_missing_file_raises(self):
         rest = _make_rest()
         with self.assertRaises(FileNotFoundError):
@@ -353,6 +360,7 @@ class TestUploadFile(unittest.IsolatedAsyncioTestCase):
         rest = _make_rest()
         rest.auth_token = "tok"
         rest.user_id = "uid"
+        rest._server_major_version = 6
 
         with tempfile.TemporaryDirectory() as tmpdir:
             fpath = Path(tmpdir) / "report.txt"
@@ -370,6 +378,7 @@ class TestUploadFile(unittest.IsolatedAsyncioTestCase):
         rest = _make_rest()
         rest.auth_token = "tok"
         rest.user_id = "uid"
+        rest._server_major_version = 6
 
         with tempfile.TemporaryDirectory() as tmpdir:
             fpath = Path(tmpdir) / "img.png"
@@ -386,6 +395,7 @@ class TestUploadFile(unittest.IsolatedAsyncioTestCase):
         rest = _make_rest()
         rest.auth_token = "tok"
         rest.user_id = "uid"
+        rest._server_major_version = 6
 
         with tempfile.TemporaryDirectory() as tmpdir:
             fpath = Path(tmpdir) / "doc.pdf"
@@ -403,6 +413,7 @@ class TestUploadFile(unittest.IsolatedAsyncioTestCase):
         rest._password = "pass"
         rest.auth_token = "old_tok"
         rest.user_id = "uid"
+        rest._server_major_version = 6
 
         with tempfile.TemporaryDirectory() as tmpdir:
             fpath = Path(tmpdir) / "file.txt"
@@ -429,6 +440,7 @@ class TestUploadFile(unittest.IsolatedAsyncioTestCase):
         rest = _make_rest()
         rest.auth_token = "tok"
         rest.user_id = "uid"
+        rest._server_major_version = 6
 
         with tempfile.TemporaryDirectory() as tmpdir:
             fpath = Path(tmpdir) / "weirdfile.xyz123"
@@ -442,6 +454,308 @@ class TestUploadFile(unittest.IsolatedAsyncioTestCase):
             # mime type is embedded in the files tuple: (name, bytes, mime)
             file_tuple = kwargs["files"]["file"]
             self.assertEqual(file_tuple[2], "application/octet-stream")
+
+    async def test_legacy_404_with_undetected_version_raises_clear_error(self):
+        """When version detection genuinely fails (returns None) and
+        rooms.upload then 404s, that must not surface as a bare
+        HTTPStatusError (issue #56's own acceptance criterion: a clear error
+        pointing at the likely version mismatch, not a generic 4xx)."""
+        rest = _make_rest()
+        rest.auth_token = "tok"
+        rest.user_id = "uid"
+        rest._get_server_major_version = AsyncMock(return_value=None)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fpath = Path(tmpdir) / "f.txt"
+            fpath.write_bytes(b"data")
+
+            not_found = _make_response(404, {"success": False, "error": "not-found"})
+            rest._download_client.post = AsyncMock(return_value=not_found)
+
+            with self.assertRaises(RuntimeError) as ctx:
+                await rest.upload_file("ROOM1", str(fpath))
+            self.assertIn("8.0+", str(ctx.exception))
+            self.assertIn("/api/info", str(ctx.exception))
+
+    async def test_legacy_404_with_confirmed_pre8_version_raises_real_error(self):
+        """Regression test for a Codex review finding on PR #75: when the
+        version is *positively confirmed* < 8 (not merely undetected), a
+        rooms.upload 404 is a genuine, unrelated failure (bad room ID,
+        disabled route, ...) and must propagate as the real HTTPStatusError —
+        NOT get misreported as a version mismatch that never happened."""
+        rest = _make_rest()
+        rest.auth_token = "tok"
+        rest.user_id = "uid"
+        rest._server_major_version = 6  # confirmed pre-8.0, not "undetected"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fpath = Path(tmpdir) / "f.txt"
+            fpath.write_bytes(b"data")
+
+            not_found = _make_response(404, {"success": False, "error": "not-found"})
+            rest._download_client.post = AsyncMock(return_value=not_found)
+
+            with self.assertRaises(httpx.HTTPStatusError):
+                await rest.upload_file("ROOM1", str(fpath))
+
+
+# ── _get_server_major_version ───────────────────────────────────────────────
+
+
+class TestGetServerMajorVersion(unittest.IsolatedAsyncioTestCase):
+    async def test_parses_trimmed_unauthenticated_version(self):
+        """Unauthenticated /api/info trims to '<major>.<minor>' (no patch)."""
+        rest = _make_rest()
+        rest._client.get = AsyncMock(return_value=_make_response(200, {"success": True, "version": "8.5"}))
+        major = await rest._get_server_major_version()
+        self.assertEqual(major, 8)
+
+    async def test_parses_full_authenticated_version(self):
+        """Authenticated callers with view-statistics get the full patch version."""
+        rest = _make_rest()
+        rest._client.get = AsyncMock(return_value=_make_response(200, {"success": True, "version": "8.5.2"}))
+        major = await rest._get_server_major_version()
+        self.assertEqual(major, 8)
+
+    async def test_caches_result_does_not_refetch(self):
+        rest = _make_rest()
+        rest._client.get = AsyncMock(return_value=_make_response(200, {"success": True, "version": "8.0"}))
+        first = await rest._get_server_major_version()
+        second = await rest._get_server_major_version()
+        self.assertEqual(first, 8)
+        self.assertEqual(second, 8)
+        rest._client.get.assert_awaited_once()
+
+    async def test_http_error_returns_none_and_is_not_cached(self):
+        rest = _make_rest()
+        rest._client.get = AsyncMock(side_effect=httpx.ConnectError("connection refused"))
+        result = await rest._get_server_major_version()
+        self.assertIsNone(result)
+        self.assertIsNone(rest._server_major_version)
+        # A later successful call is retried, not permanently stuck at None.
+        rest._client.get = AsyncMock(return_value=_make_response(200, {"success": True, "version": "8.0"}))
+        result2 = await rest._get_server_major_version()
+        self.assertEqual(result2, 8)
+
+    async def test_missing_version_field_returns_none(self):
+        rest = _make_rest()
+        rest._client.get = AsyncMock(return_value=_make_response(200, {"success": True}))
+        result = await rest._get_server_major_version()
+        self.assertIsNone(result)
+
+    async def test_malformed_version_field_returns_none(self):
+        rest = _make_rest()
+        rest._client.get = AsyncMock(return_value=_make_response(200, {"success": True, "version": "not-a-version"}))
+        result = await rest._get_server_major_version()
+        self.assertIsNone(result)
+
+    async def test_pre_8_version_returns_correct_major(self):
+        rest = _make_rest()
+        rest._client.get = AsyncMock(return_value=_make_response(200, {"success": True, "version": "6.12.0"}))
+        result = await rest._get_server_major_version()
+        self.assertEqual(result, 6)
+
+
+# ── upload_file version dispatch ────────────────────────────────────────────
+
+
+class TestUploadFileVersionDispatch(unittest.IsolatedAsyncioTestCase):
+    """upload_file() must route to the legacy or v8+ flow based on detected version."""
+
+    async def test_version_8_or_above_uses_v8_plus_flow(self):
+        rest = _make_rest()
+        rest.auth_token = "tok"
+        rest.user_id = "uid"
+        rest._get_server_major_version = AsyncMock(return_value=8)
+        rest._upload_file_v8_plus = AsyncMock()
+        rest._upload_file_legacy = AsyncMock()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fpath = Path(tmpdir) / "f.txt"
+            fpath.write_bytes(b"data")
+            await rest.upload_file("ROOM1", str(fpath))
+
+        rest._upload_file_v8_plus.assert_awaited_once()
+        rest._upload_file_legacy.assert_not_called()
+
+    async def test_version_below_8_uses_legacy_flow(self):
+        rest = _make_rest()
+        rest.auth_token = "tok"
+        rest.user_id = "uid"
+        rest._get_server_major_version = AsyncMock(return_value=6)
+        rest._upload_file_v8_plus = AsyncMock()
+        rest._upload_file_legacy = AsyncMock()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fpath = Path(tmpdir) / "f.txt"
+            fpath.write_bytes(b"data")
+            await rest.upload_file("ROOM1", str(fpath))
+
+        rest._upload_file_legacy.assert_awaited_once()
+        rest._upload_file_v8_plus.assert_not_called()
+
+    async def test_undetectable_version_falls_back_to_legacy_flow(self):
+        """Matches pre-#56 behavior when the server's version can't be determined."""
+        rest = _make_rest()
+        rest.auth_token = "tok"
+        rest.user_id = "uid"
+        rest._get_server_major_version = AsyncMock(return_value=None)
+        rest._upload_file_v8_plus = AsyncMock()
+        rest._upload_file_legacy = AsyncMock()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fpath = Path(tmpdir) / "f.txt"
+            fpath.write_bytes(b"data")
+            await rest.upload_file("ROOM1", str(fpath))
+
+        rest._upload_file_legacy.assert_awaited_once()
+        rest._upload_file_v8_plus.assert_not_called()
+
+
+# ── upload_file RC 8.0+ (rooms.media + rooms.mediaConfirm) ─────────────────
+
+
+class TestUploadFileV8Plus(unittest.IsolatedAsyncioTestCase):
+    def _media_ok(self, file_id: str = "file123") -> httpx.Response:
+        return _make_response(200, {"success": True, "file": {"_id": file_id, "url": f"/file-upload/{file_id}/x"}})
+
+    def _confirm_ok(self) -> httpx.Response:
+        return _make_response(200, {"success": True, "message": {"_id": "msg1"}})
+
+    async def test_two_step_upload_success(self):
+        rest = _make_rest()
+        rest.auth_token = "tok"
+        rest.user_id = "uid"
+        rest._server_major_version = 8
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fpath = Path(tmpdir) / "report.txt"
+            fpath.write_bytes(b"hello world")
+
+            rest._download_client.post = AsyncMock(
+                side_effect=[self._media_ok("file123"), self._confirm_ok()]
+            )
+            await rest.upload_file("ROOM1", str(fpath), caption="my file")
+
+        self.assertEqual(rest._download_client.post.call_count, 2)
+        media_call, confirm_call = rest._download_client.post.call_args_list
+        self.assertIn("rooms.media/ROOM1", media_call.args[0])
+        self.assertIn("files", media_call.kwargs)
+        self.assertIn("rooms.mediaConfirm/ROOM1/file123", confirm_call.args[0])
+        self.assertEqual(confirm_call.kwargs["json"], {"msg": "my file"})
+
+    async def test_no_caption_omits_msg_in_confirm(self):
+        rest = _make_rest()
+        rest.auth_token = "tok"
+        rest.user_id = "uid"
+        rest._server_major_version = 8
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fpath = Path(tmpdir) / "img.png"
+            fpath.write_bytes(b"\x89PNG")
+
+            rest._download_client.post = AsyncMock(
+                side_effect=[self._media_ok(), self._confirm_ok()]
+            )
+            await rest.upload_file("ROOM1", str(fpath))
+
+        _, confirm_call = rest._download_client.post.call_args_list
+        self.assertEqual(confirm_call.kwargs["json"], {})
+
+    async def test_media_step_failure_raises_and_skips_confirm(self):
+        rest = _make_rest()
+        rest.auth_token = "tok"
+        rest.user_id = "uid"
+        rest._server_major_version = 8
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fpath = Path(tmpdir) / "f.txt"
+            fpath.write_bytes(b"data")
+
+            fail_resp = _make_response(200, {"success": False, "error": "too_large"})
+            rest._download_client.post = AsyncMock(return_value=fail_resp)
+
+            with self.assertRaises(RuntimeError):
+                await rest.upload_file("ROOM1", str(fpath))
+
+        rest._download_client.post.assert_called_once()
+
+    async def test_media_step_missing_file_id_raises(self):
+        rest = _make_rest()
+        rest.auth_token = "tok"
+        rest.user_id = "uid"
+        rest._server_major_version = 8
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fpath = Path(tmpdir) / "f.txt"
+            fpath.write_bytes(b"data")
+
+            malformed_resp = _make_response(200, {"success": True, "file": {}})
+            rest._download_client.post = AsyncMock(return_value=malformed_resp)
+
+            with self.assertRaises(RuntimeError):
+                await rest.upload_file("ROOM1", str(fpath))
+
+    async def test_media_step_null_file_field_raises_not_attributeerror(self):
+        """{"file": null} must raise RuntimeError, not AttributeError from
+        calling .get() on None (media_result.get("file") or {}).get("_id")."""
+        rest = _make_rest()
+        rest.auth_token = "tok"
+        rest.user_id = "uid"
+        rest._server_major_version = 8
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fpath = Path(tmpdir) / "f.txt"
+            fpath.write_bytes(b"data")
+
+            malformed_resp = _make_response(200, {"success": True, "file": None})
+            rest._download_client.post = AsyncMock(return_value=malformed_resp)
+
+            with self.assertRaises(RuntimeError):
+                await rest.upload_file("ROOM1", str(fpath))
+
+    async def test_confirm_step_failure_raises(self):
+        rest = _make_rest()
+        rest.auth_token = "tok"
+        rest.user_id = "uid"
+        rest._server_major_version = 8
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fpath = Path(tmpdir) / "f.txt"
+            fpath.write_bytes(b"data")
+
+            fail_confirm = _make_response(200, {"success": False, "error": "invalid-file"})
+            rest._download_client.post = AsyncMock(
+                side_effect=[self._media_ok(), fail_confirm]
+            )
+            with self.assertRaises(RuntimeError):
+                await rest.upload_file("ROOM1", str(fpath))
+
+    async def test_401_during_media_step_relogins_and_retries(self):
+        rest = _make_rest()
+        rest._username = "bot"
+        rest._password = "pass"
+        rest.auth_token = "old_tok"
+        rest.user_id = "uid"
+        rest._server_major_version = 8
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fpath = Path(tmpdir) / "f.txt"
+            fpath.write_bytes(b"data")
+
+            unauth = _make_response(401, {"message": "Unauthorized"})
+            rest._download_client.post = AsyncMock(
+                side_effect=[unauth, self._media_ok(), self._confirm_ok()]
+            )
+            login_resp = _make_response(
+                200, {"status": "success", "data": {"authToken": "new_tok", "userId": "uid"}}
+            )
+            rest._client.post = AsyncMock(return_value=login_resp)
+
+            await rest.upload_file("ROOM1", str(fpath))
+
+        self.assertEqual(rest.auth_token, "new_tok")
+        self.assertEqual(rest._download_client.post.call_count, 3)
 
 
 # ── resolve_room ──────────────────────────────────────────────────────────────
@@ -862,6 +1176,7 @@ class TestUploadFileNonBlocking(unittest.IsolatedAsyncioTestCase):
         rest.user_id = "uid"
         rest._username = "bot"
         rest._password = "pass"
+        rest._server_major_version = 6
 
         to_thread_fns: list = []
         original_to_thread = asyncio.to_thread
