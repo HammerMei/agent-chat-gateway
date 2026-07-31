@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **File attachment uploads restored on Rocket.Chat 8.0+.** RC 8.0 removed
+  the one-step `rooms.upload/{rid}` endpoint that `RocketChatREST.upload_file()`
+  relied on, silently breaking `send --attach` and agent-triggered uploads on
+  any RC 8.x server (closes #56). `RocketChatREST` now detects the server's
+  major version via the unauthenticated `GET /api/info` endpoint (cached after
+  first successful fetch) and dispatches to RC 8.0+'s two-step
+  `rooms.media` + `rooms.mediaConfirm` flow when appropriate, falling back to
+  the legacy one-step flow for pre-8.0 servers or when the version can't be
+  determined.
+
 ## [0.5.1] - 2026-07-30
 
 ### Fixed
