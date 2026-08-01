@@ -39,7 +39,9 @@ import json
 import logging
 import os
 import socket
+import tempfile
 from collections.abc import AsyncGenerator
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import httpx
@@ -62,6 +64,41 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger("agent-chat-gateway.agents.opencode")
+
+# ACG's own runtime state directory — same convention as
+# gateway/agents/claude/adapter.py's RUNTIME_DIR. Durable per-watcher
+# instructions files live under RUNTIME_DIR/system-prompts/<watcher_name>.md
+# for both backends; watcher names are globally unique and forbidden from
+# containing "/" (see gateway/config.py), so paths never collide, and each
+# watcher only ever uses one backend type, so there's no cross-backend clash
+# either. Defined locally (not imported from the claude adapter) to keep the
+# two backend modules independent of each other.
+RUNTIME_DIR = Path.home() / ".agent-chat-gateway"
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Write ``content`` to ``path`` atomically (temp file + ``os.replace``).
+
+    Without this, a concurrent read of this file (from send()/stream() on
+    another in-flight turn) while a write is in progress could see truncated
+    or corrupt content instead of either the old or the new version in full.
+    The temp file is created in the same directory so ``os.replace`` stays on
+    one filesystem (required for atomicity) and is cleaned up on any failure
+    before the replace. Mirrors gateway/agents/claude/adapter.py's helper of
+    the same name/behavior (see that module for the original rationale).
+    """
+    fd, tmp_path = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
 
 # Sentinel string placed in the SSE queue by _collect_sse() once the HTTP
 # streaming connection is established.  Using a module-level constant (rather
@@ -755,19 +792,66 @@ class OpenCodeBackend(AgentBackend):
         watcher_name: str,
         already_delivered: bool,
     ) -> str | None:
-        """Explicitly opt into the one-time-send fallback (see
-        AgentBackend.ensure_durable_instructions()'s docstring for why this
-        must be an explicit choice, not an inherited default).
+        """Write ``content`` to a stable per-watcher file for per-request resupply.
 
-        This deliberately preserves OpenCode's pre-issue-#52 behavior — a
-        one-time send into conversation history, NOT compaction-resistant.
-        A real, durable mechanism (writing to ``.opencode/opencode.json`` so
-        OpenCode's own instruction-file reload picks it up every turn) is
-        deferred to a follow-up PR.
+        Mirrors ``ClaudeBackend.ensure_durable_instructions()``'s contract
+        exactly: writes durable content to ``RUNTIME_DIR/system-prompts/<watcher_name>.md``
+        and returns that path as ``to_repeat``. ``message_processor.py`` already
+        resupplies whatever this returns via ``append_system_prompt_file`` on
+        every subsequent ``send()``/``stream()`` call for this watcher — see
+        that module's ``self._append_system_prompt_file`` plumbing, which is
+        backend-agnostic and required no changes for this to work.
+
+        Unlike Claude (which passes the path to the ``claude`` CLI as a flag),
+        OpenCode's ``send()``/``stream()`` read this file's *content* and
+        forward it as the ``system`` field on ``POST /session/{id}/message``
+        (or ``prompt_async``) — a genuine per-request API field (confirmed
+        against opencode's own source: ``PromptInput.system`` in
+        ``session/prompt.ts``, joined in last in ``session/llm/request.ts``).
+        That field travels with each individual API call, not with the
+        sidecar process, which matters here: a single OpenCode sidecar/agent
+        config can be shared by multiple ACG watchers (``WatcherConfig.agent``
+        is many-to-one), so a sidecar-global mechanism like ``config.instructions``
+        would leak one watcher's identity/addressing header into another's
+        session. The per-request ``system`` field is correctly scoped per
+        ``session_id`` instead, avoiding that cross-watcher leak entirely.
+
+        Writing is idempotent (overwrite with identical content) — no side
+        effect to avoid repeating, so ``already_delivered`` is irrelevant
+        here, same as Claude's implementation; always write fresh so a
+        resumed session after a gateway restart still gets a correct, current
+        file. The write itself is atomic (see ``_atomic_write_text``).
+
+        Deliberately written under ``RUNTIME_DIR`` (ACG's own state
+        directory), NOT under ``working_directory`` — same rationale as
+        Claude's implementation (avoids an accidental ``git add`` if
+        ``working_directory`` is a real user project under version control).
         """
-        return await self._send_once_as_durable_fallback(
-            session_id, working_directory, timeout, content, already_delivered,
-        )
+        acg_dir = RUNTIME_DIR / "system-prompts"
+        await asyncio.to_thread(acg_dir.mkdir, parents=True, exist_ok=True)
+        path = acg_dir / f"{watcher_name}.md"
+        await asyncio.to_thread(_atomic_write_text, path, content)
+        return str(path)
+
+    async def _read_durable_instructions(self, path: str) -> str | None:
+        """Read the content of a durable-instructions file written by
+        ``ensure_durable_instructions()``, for forwarding as the ``system``
+        field on a send()/stream() call.
+
+        Returns ``None`` (rather than raising) if the file is missing or
+        unreadable — a turn should still proceed without the durable header
+        rather than fail outright; the missing content is logged as a
+        warning so it's visible without silently degrading forever.
+        """
+        try:
+            return await asyncio.to_thread(Path(path).read_text, encoding="utf-8")
+        except OSError as e:
+            logger.warning(
+                "Could not read durable instructions file %s (%s) — "
+                "proceeding without system-prompt content for this turn.",
+                path, e,
+            )
+            return None
 
     async def send(
         self,
@@ -787,12 +871,12 @@ class OpenCodeBackend(AgentBackend):
         The ``env`` kwarg is a no-op: ACG_ROLE and other role vars must be set on the
         opencode server process at startup, not per-message.
 
-        The ``append_system_prompt_file`` kwarg is also a no-op for this backend:
-        OpenCode has no CLI/HTTP equivalent to Claude's --append-system-prompt-file.
-        A future PR will give OpenCode a real file-based mechanism via
-        ``.opencode/opencode.json``; until then this backend relies on the
-        AgentBackend default ``ensure_durable_instructions()`` (one-time send()),
-        so this parameter is always None in practice for this backend.
+        The ``append_system_prompt_file`` kwarg holds a path written by
+        ``ensure_durable_instructions()`` — its *content* (not the path
+        itself) is read fresh on every call and forwarded as the ``system``
+        field on ``POST /session/{id}/message``, so it survives OpenCode's
+        own context compaction the same way Claude's ``--append-system-prompt-file``
+        does (re-supplied per call, never stored in conversation history).
         """
         if attachments:
             logger.info(
@@ -807,15 +891,14 @@ class OpenCodeBackend(AgentBackend):
                 "env kwarg ignored by HTTP adapter (set on server at startup): %s",
                 list(env.keys()),
             )
+        system_content = None
         if append_system_prompt_file:
-            logger.debug(
-                "append_system_prompt_file kwarg ignored by HTTP adapter "
-                "(no equivalent mechanism): %s",
-                append_system_prompt_file,
-            )
+            system_content = await self._read_durable_instructions(append_system_prompt_file)
 
         await self._ensure_live_runtime()
-        raw = await self._post_message(session_id, prompt, timeout=timeout)
+        raw = await self._post_message(
+            session_id, prompt, timeout=timeout, system=system_content,
+        )
         return self._parse_http_response(raw, session_id)
 
     async def stream(
@@ -868,12 +951,9 @@ class OpenCodeBackend(AgentBackend):
                 "env kwarg ignored by HTTP adapter (set on server at startup): %s",
                 list(env.keys()),
             )
+        system_content = None
         if append_system_prompt_file:
-            logger.debug(
-                "append_system_prompt_file kwarg ignored by HTTP adapter "
-                "(no equivalent mechanism): %s",
-                append_system_prompt_file,
-            )
+            system_content = await self._read_durable_instructions(append_system_prompt_file)
 
         await self._ensure_live_runtime()
 
@@ -953,7 +1033,7 @@ class OpenCodeBackend(AgentBackend):
                 )
 
             # ── Phase 2: post the prompt (SSE is now listening) ───────────────
-            await self._post_message_async(session_id, prompt)
+            await self._post_message_async(session_id, prompt, system=system_content)
 
             # ── Phase 3: consume SSE events and yield AgentEvents ─────────────
             async for event in self._parse_sse_events(
@@ -966,7 +1046,7 @@ class OpenCodeBackend(AgentBackend):
             await asyncio.gather(sse_task, return_exceptions=True)
 
     async def _post_message_async(
-        self, session_id: str, text: str
+        self, session_id: str, text: str, *, system: str | None = None,
     ) -> None:
         """POST a prompt to the async endpoint — returns immediately (HTTP 202).
 
@@ -981,6 +1061,12 @@ class OpenCodeBackend(AgentBackend):
         Args:
             session_id: OpenCode session ID.
             text:       Prompt text to send.
+            system:     Optional durable system-prompt content for this call
+                        (see ``PromptInput.system`` — a per-request field,
+                        joined in last after AGENTS.md/env/agent-prompt on
+                        the server side). Not persisted on the session; must
+                        be resupplied on every call where it's wanted, same
+                        discipline as Claude's ``--append-system-prompt-file``.
 
         Raises:
             AgentExecutionError:   Server rejected the request (4xx/5xx, including 404).
@@ -991,7 +1077,9 @@ class OpenCodeBackend(AgentBackend):
             live opencode server if the API version changes.
         """
         url = f"{self._base_url}/session/{session_id}/prompt_async"
-        body = {"parts": [{"type": "text", "text": text}]}
+        body: dict = {"parts": [{"type": "text", "text": text}]}
+        if system:
+            body["system"] = system
         try:
             resp = await self._get_client().post(
                 url, json=body, timeout=_PROMPT_ASYNC_POST_TIMEOUT
@@ -1283,6 +1371,8 @@ class OpenCodeBackend(AgentBackend):
         session_id: str,
         text: str,
         timeout: int | None = None,
+        *,
+        system: str | None = None,
     ) -> dict:
         """POST a text message to an existing opencode session.
 
@@ -1294,9 +1384,15 @@ class OpenCodeBackend(AgentBackend):
 
         Callers must not silently catch 404 and create a new session — let the
         error propagate so the watcher fails loudly.
+
+        ``system``: optional durable system-prompt content for this call (see
+        ``PromptInput.system`` — a per-request field, not persisted on the
+        session; must be resupplied on every call where it's wanted).
         """
         url = f"{self._base_url}/session/{session_id}/message"
-        body = {"parts": [{"type": "text", "text": text}]}
+        body: dict = {"parts": [{"type": "text", "text": text}]}
+        if system:
+            body["system"] = system
         effective_timeout = timeout if timeout is not None else self.timeout
 
         try:
