@@ -19,6 +19,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rooms.media` + `rooms.mediaConfirm` flow when appropriate, falling back to
   the legacy one-step flow for pre-8.0 servers or when the version can't be
   determined.
+- **OpenCode agents no longer lose their identity/addressing header after context
+  compaction.** #52/#58 fixed this for Claude via `--append-system-prompt-file`;
+  OpenCode's `ensure_durable_instructions()` was left as a one-time send into
+  conversation history (not compaction-resistant) pending this follow-up.
+  `OpenCodeBackend` now writes durable content to a per-watcher file and
+  forwards its content fresh on every `send()`/`stream()` call via OpenCode's
+  per-request `system` field on `POST /session/{id}/message` — a per-request
+  mechanism, not a sidecar-wide config, since a single OpenCode agent config
+  (and its sidecar) can be shared by multiple ACG watchers that each need
+  distinct identity content.
 
 ## [0.5.1] - 2026-07-30
 
