@@ -232,52 +232,119 @@ class TestRequireBaseUrl(unittest.TestCase):
         b._require_base_url()  # should not raise
 
 
-# ── ensure_durable_instructions (issue #52) ──────────────────────────────────
+# ── ensure_durable_instructions (issue #56 follow-up: real durability) ───────
 
 
 class TestEnsureDurableInstructions(unittest.IsolatedAsyncioTestCase):
-    """OpenCodeBackend explicitly opts into the shared one-time-send fallback
-    (see AgentBackend._send_once_as_durable_fallback()) — a deliberate choice
-    preserving pre-#52 behavior, not an accidentally-inherited default (the
-    base AgentBackend.ensure_durable_instructions() has no default at all;
-    calling it unoverridden raises NotImplementedError)."""
+    """OpenCodeBackend writes durable content to a stable per-watcher file and
+    returns its path — mirroring ClaudeBackend's contract exactly, replacing
+    the old one-time-send-into-history fallback (pre-#52 behavior) which was
+    NOT compaction-resistant. send()/stream() read this file's content fresh
+    on every call and forward it as the per-request ``system`` field — see
+    TestSend/TestStream for that half of the mechanism.
+    """
 
-    async def test_delegates_to_shared_fallback_send_once(self):
+    async def test_writes_file_and_returns_path(self):
+        import tempfile
+        from pathlib import Path
+
         backend = _make_backend()
-        backend.send = AsyncMock(return_value=AgentResponse(text="ok"))
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("gateway.agents.opencode.adapter.RUNTIME_DIR", Path(tmp)):
+                path = await backend.ensure_durable_instructions(
+                    "ses_001", "/unused", 10, "identity header content",
+                    watcher_name="w1", already_delivered=False,
+                )
+            self.assertEqual(path, str(Path(tmp) / "system-prompts" / "w1.md"))
 
-        result = await backend.ensure_durable_instructions(
-            "ses_001", "/tmp", 10, "identity header content",
-            watcher_name="w1", already_delivered=False,
-        )
+    async def test_writes_file_content_correctly(self):
+        import tempfile
+        from pathlib import Path
 
+        backend = _make_backend()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("gateway.agents.opencode.adapter.RUNTIME_DIR", Path(tmp)):
+                content = "## ACG Session Identity\nhello world"
+                path = await backend.ensure_durable_instructions(
+                    "ses_001", "/unused", 10, content,
+                    watcher_name="w1", already_delivered=False,
+                )
+                self.assertEqual(Path(path).read_text(), content)
+
+    async def test_returns_non_none_path_when_already_delivered_true(self):
+        """Resumed session (already_delivered=True) must still get a fresh
+        path — writing is idempotent, no side effect to avoid repeating."""
+        import tempfile
+        from pathlib import Path
+
+        backend = _make_backend()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("gateway.agents.opencode.adapter.RUNTIME_DIR", Path(tmp)):
+                path = await backend.ensure_durable_instructions(
+                    "ses_001", "/unused", 10, "content",
+                    watcher_name="w1", already_delivered=True,
+                )
+            self.assertIsNotNone(path)
+
+    async def test_overwrites_existing_file_with_fresh_content(self):
+        """A second call with different content overwrites the first."""
+        import tempfile
+        from pathlib import Path
+
+        backend = _make_backend()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("gateway.agents.opencode.adapter.RUNTIME_DIR", Path(tmp)):
+                await backend.ensure_durable_instructions(
+                    "ses_001", "/unused", 10, "old content",
+                    watcher_name="w1", already_delivered=False,
+                )
+                path = await backend.ensure_durable_instructions(
+                    "ses_001", "/unused", 10, "new content",
+                    watcher_name="w1", already_delivered=False,
+                )
+                self.assertEqual(Path(path).read_text(), "new content")
+
+    async def test_different_watchers_get_different_files(self):
+        import tempfile
+        from pathlib import Path
+
+        backend = _make_backend()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("gateway.agents.opencode.adapter.RUNTIME_DIR", Path(tmp)):
+                path_a = await backend.ensure_durable_instructions(
+                    "ses_a", "/unused", 10, "content A",
+                    watcher_name="watcher-a", already_delivered=False,
+                )
+                path_b = await backend.ensure_durable_instructions(
+                    "ses_b", "/unused", 10, "content B",
+                    watcher_name="watcher-b", already_delivered=False,
+                )
+            self.assertNotEqual(path_a, path_b)
+            self.assertEqual(Path(path_a).read_text(), "content A")
+            self.assertEqual(Path(path_b).read_text(), "content B")
+
+
+class TestReadDurableInstructions(unittest.IsolatedAsyncioTestCase):
+    """_read_durable_instructions() reads back what ensure_durable_instructions()
+    wrote — used by send()/stream() to forward content as the ``system`` field."""
+
+    async def test_reads_existing_file(self):
+        import tempfile
+        from pathlib import Path
+
+        backend = _make_backend()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "w1.md"
+            path.write_text("some durable content")
+            result = await backend._read_durable_instructions(str(path))
+            self.assertEqual(result, "some durable content")
+
+    async def test_missing_file_returns_none_not_raise(self):
+        """A turn should proceed without the durable header rather than fail
+        outright if the file was somehow deleted between ensure() and send()."""
+        backend = _make_backend()
+        result = await backend._read_durable_instructions("/nonexistent/path/w1.md")
         self.assertIsNone(result)
-        backend.send.assert_awaited_once()
-        call_kwargs = backend.send.await_args.kwargs
-        self.assertEqual(call_kwargs["prompt"], "identity header content")
-        self.assertEqual(call_kwargs["session_id"], "ses_001")
-
-    async def test_skips_send_when_already_delivered(self):
-        backend = _make_backend()
-        backend.send = AsyncMock(return_value=AgentResponse(text="ok"))
-
-        result = await backend.ensure_durable_instructions(
-            "ses_001", "/tmp", 10, "content",
-            watcher_name="w1", already_delivered=True,
-        )
-
-        self.assertIsNone(result)
-        backend.send.assert_not_awaited()
-
-    async def test_raises_agent_execution_error_on_send_error_response(self):
-        backend = _make_backend()
-        backend.send = AsyncMock(return_value=AgentResponse(text="boom", is_error=True))
-
-        with self.assertRaises(AgentExecutionError):
-            await backend.ensure_durable_instructions(
-                "ses_001", "/tmp", 10, "content",
-                watcher_name="w1", already_delivered=False,
-            )
 
 
 # ── create_session ────────────────────────────────────────────────────────────
@@ -413,9 +480,14 @@ class TestSend(unittest.IsolatedAsyncioTestCase):
     def _make_http_response(self, parts: list, duration_ms: int = 1500) -> dict:
         return {"parts": parts, "info": {"duration": duration_ms}}
 
-    async def test_append_system_prompt_file_is_noop(self):
-        """append_system_prompt_file has no HTTP equivalent for this backend —
-        it must be silently ignored (logged, not applied) rather than raise."""
+    async def test_append_system_prompt_file_forwarded_as_system_field(self):
+        """send() reads append_system_prompt_file's *content* fresh and
+        forwards it as the per-request ``system`` field — this is how
+        durable instructions survive OpenCode's own compaction (see
+        ensure_durable_instructions())."""
+        import tempfile
+        from pathlib import Path
+
         b = _make_backend()
         b._base_url = "http://127.0.0.1:57000"
         b._ever_started = True
@@ -430,13 +502,70 @@ class TestSend(unittest.IsolatedAsyncioTestCase):
         mock_client = AsyncMock()
         mock_client.post = AsyncMock(return_value=mock_resp)
         b._client = mock_client
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "w.md"
+            path.write_text("## ACG Session Identity\nyou are watcher w")
+
+            result = await b.send(
+                "ses_abc", "Hello", "/workspace", timeout=60,
+                append_system_prompt_file=str(path),
+            )
+
+        self.assertIsInstance(result, AgentResponse)
+        body = mock_client.post.call_args.kwargs["json"]
+        self.assertEqual(body["system"], "## ACG Session Identity\nyou are watcher w")
+
+    async def test_missing_append_system_prompt_file_omits_system_field(self):
+        """If the durable-instructions file is missing, send() still proceeds
+        (no crash) and simply omits the ``system`` field rather than sending
+        an empty/broken one."""
+        b = _make_backend()
+        b._base_url = "http://127.0.0.1:57000"
+        b._ever_started = True
+
+        response_data = self._make_http_response(
+            [{"type": "text", "text": "Hello world"}]
+        )
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = response_data
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        b._client = mock_client
+
         result = await b.send(
             "ses_abc", "Hello", "/workspace", timeout=60,
-            append_system_prompt_file="/tmp/.acg-system-prompt/w.md",
+            append_system_prompt_file="/nonexistent/w.md",
         )
 
         self.assertIsInstance(result, AgentResponse)
-        self.assertEqual(result.text, "Hello world")
+        body = mock_client.post.call_args.kwargs["json"]
+        self.assertNotIn("system", body)
+
+    async def test_no_append_system_prompt_file_omits_system_field(self):
+        """The common case (no durable instructions configured at all) must
+        not add a ``system`` key to the request body."""
+        b = _make_backend()
+        b._base_url = "http://127.0.0.1:57000"
+        b._ever_started = True
+
+        response_data = self._make_http_response(
+            [{"type": "text", "text": "Hello world"}]
+        )
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = response_data
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        b._client = mock_client
+
+        await b.send("ses_abc", "Hello", "/workspace", timeout=60)
+
+        body = mock_client.post.call_args.kwargs["json"]
+        self.assertNotIn("system", body)
 
     async def test_basic_send_returns_text(self):
         b = _make_backend()
@@ -1750,6 +1879,31 @@ class TestPostMessageAsync(unittest.IsolatedAsyncioTestCase):
         body = b._client.post.call_args[1]["json"]
         self.assertEqual(body, {"parts": [{"type": "text", "text": "my prompt"}]})
 
+    async def test_system_kwarg_included_when_given(self):
+        b = _make_started_backend()
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        b._client.post = AsyncMock(return_value=mock_resp)
+
+        await b._post_message_async("sess-1", "my prompt", system="durable header")
+
+        body = b._client.post.call_args[1]["json"]
+        self.assertEqual(
+            body,
+            {"parts": [{"type": "text", "text": "my prompt"}], "system": "durable header"},
+        )
+
+    async def test_system_kwarg_omitted_when_none(self):
+        b = _make_started_backend()
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        b._client.post = AsyncMock(return_value=mock_resp)
+
+        await b._post_message_async("sess-1", "my prompt", system=None)
+
+        body = b._client.post.call_args[1]["json"]
+        self.assertNotIn("system", body)
+
     async def test_uses_internal_timeout_constant(self):
         """The internal _PROMPT_ASYNC_POST_TIMEOUT constant is used, not a caller-supplied value."""
         from gateway.agents.opencode.adapter import _PROMPT_ASYNC_POST_TIMEOUT
@@ -2422,8 +2576,45 @@ class TestStream(unittest.IsolatedAsyncioTestCase):
         final = events[-1]
         self.assertEqual(final.kind, "final")
         self.assertEqual(final.response.text, "Hi there!")
-        # Verify _post_message_async received the correct arguments
-        b._post_message_async.assert_awaited_once_with("sess-1", "hello")
+        # Verify _post_message_async received the correct arguments. system=None
+        # because this test doesn't pass append_system_prompt_file to stream().
+        b._post_message_async.assert_awaited_once_with("sess-1", "hello", system=None)
+
+    async def test_stream_reads_durable_instructions_and_forwards_as_system(self):
+        """append_system_prompt_file's *content* (read fresh) is forwarded to
+        _post_message_async as the system kwarg — the stream()-side half of
+        the durable-instructions mechanism (see ensure_durable_instructions())."""
+        import tempfile
+        from pathlib import Path
+
+        b = _make_started_backend()
+        b._ensure_live_runtime = AsyncMock()
+        b._post_message_async = AsyncMock()
+
+        sse_lines = [
+            _sse_line("sess-1", "session.status", status={"type": "idle"}),
+        ]
+        mock_sse_resp = self._make_sse_response(sse_lines)
+        mock_sse_client = AsyncMock()
+        mock_sse_client.stream = MagicMock(return_value=mock_sse_resp)
+        mock_sse_client.__aenter__ = AsyncMock(return_value=mock_sse_client)
+        mock_sse_client.__aexit__ = AsyncMock(return_value=False)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "w.md"
+            path.write_text("## ACG Session Identity\nyou are watcher w")
+
+            with patch("gateway.agents.opencode.adapter.httpx.AsyncClient",
+                       return_value=mock_sse_client):
+                async for _ in b.stream(
+                    "sess-1", "hello", "/tmp", timeout=30,
+                    append_system_prompt_file=str(path),
+                ):
+                    pass
+
+        b._post_message_async.assert_awaited_once_with(
+            "sess-1", "hello", system="## ACG Session Identity\nyou are watcher w",
+        )
 
     async def test_stream_cancels_sse_task_on_completion(self):
         """The SSE background task is cancelled after stream() completes."""
