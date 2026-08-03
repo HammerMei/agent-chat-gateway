@@ -152,16 +152,19 @@ newly-created processor once it's ready, rather than being dropped.
 - `agent-chat-gateway list --all` — also shows dormant watchers (state
   persisted, no runtime object) and rule-matched rooms with no watcher ever
   created yet.
-- New: `agent-chat-gateway expire <watcher>` — force-expire a watcher now.
-  **Exact semantics not yet decided — see "Open items" below.** The
-  original framing ("only permitted for dynamically-created/rule-matched
-  watchers, config-defined ones reject with a pointer to `pause`/manual
-  edit") assumed a structural static-vs-dynamic split that this design
-  otherwise removes (single-shot migration of all watchers to the rule
-  engine, retiring sticky `session_id`). That split needs to be
-  re-resolved — as either "recreatable-by-a-rule vs not" or "clear session
-  only, rule keeps matching" — before this command's behavior is
-  implemented.
+- New: `agent-chat-gateway expire <watcher>` — **resolved 2026-08-02.**
+  Manually forces a watcher straight to the same end-state it would
+  eventually reach on its own via `session_expire_days`: removes the
+  in-memory watcher/processor if one is currently active, and deletes the
+  persisted session ID from `state.json`. It does **not** touch rule
+  matching and does **not** prevent the watcher from coming back — this is
+  a cleanup/reset shortcut ("expire this now instead of waiting X days"),
+  not a removal or a block. If a new message arrives for that room
+  afterward, lazy creation kicks in exactly as it would for any other
+  matching room with no active watcher, and a fresh session is created (no
+  attempt to resume the just-deleted one). No static/dynamic distinction —
+  applies uniformly to every watcher, since post-migration there's no
+  structural boundary left to gate it on.
 
 ## Also removing, as part of this change
 
@@ -217,30 +220,6 @@ a one-time reminder.
   back-burner state entirely, which is silently confusing rather than
   useful. Reject at load time with a clear error, same posture as the
   breaking-change `ValueError`s elsewhere in this doc.
-- **`expire` CLI semantics post-migration — unresolved, needs a decision
-  before implementation starts (not an implementation detail):** the
-  original static-vs-dynamic distinction the `expire` command relied on
-  ("only dynamically-created watchers may be force-expired, config-defined
-  ones reject with a pointer to `pause`/manual edit") no longer has a clean
-  structural boundary once every watcher is rule-matched and `session_id`
-  pinning is gone. Two ways to resolve it:
-  1. Redefine the discriminator as "would a config rule recreate this
-     watcher on next restart" — a rule that happens to match exactly one
-     room is still recreatable, so `expire` on it is a temporary in-memory
-     drop (session state persists, next matching message recreates it),
-     while a room that no longer matches any rule can be dropped for good.
-     This makes `expire` behave almost the same for nearly every watcher —
-     effectively "force it into the idle/dormant state right now" — and
-     `pause`/`resume` mostly stop being the distinct tool they used to be.
-  2. Rescope `expire` narrowly to mean "clear the persisted session for this
-     room's watcher" (drop `state.json`'s session ID, keep the rule
-     matching as-is) — the rule keeps matching so the room gets a watcher
-     again on the next message, just with a fresh session instead of a
-     resumed one. This keeps `expire` doing one specific thing rather than
-     overlapping with `pause`.
-  Needs a decision from the repo owner before the CLI (or the underlying
-  watcher-lifecycle state machine it drives) gets built, since picking
-  wrong means rebuilding the CLI's behavior, not just its help text.
 - Whether ACG should attempt to read the *actual* configured
   `cleanupPeriodDays` from a target machine's `~/.claude/settings.json`
   (more accurate) vs. always assuming the documented default of 30
