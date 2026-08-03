@@ -465,5 +465,55 @@ class TestCollectConfigQueueSchedulerSessionId(_CollectConfigTestBase):
         self.assertTrue(any("Duplicate sticky session_id" in i.message for i in issues))
 
 
+class TestCollectConfigOnTheFlyWatcherFields(_CollectConfigTestBase):
+    """session_idle_days/session_expire_days (AgentConfig) and exclude_room/
+    room: "*" (WatcherConfig) — docs/design/on-the-fly-watchers.md. Same
+    class of requirement as the fields above: a bad value must surface as a
+    collected, per-entity ConfigIssue through collect_config(), never an
+    uncaught exception that aborts the whole file."""
+
+    def test_invalid_session_idle_expire_ordering_is_a_collected_agent_issue(self):
+        config_path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+                session_idle_days: 30
+                session_expire_days: 10
+            watchers:
+              - room: general
+        """)
+        config, issues = collect_config(config_path)
+        self.assertIsNotNone(config)
+        self.assertEqual(config.agents, {})
+        self.assertTrue(
+            any("must be strictly less than" in i.message for i in issues)
+        )
+
+    def test_wildcard_room_is_a_collected_watcher_issue(self):
+        config_path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - connector: rc
+                agent: default
+                room: "*"
+        """)
+        config, issues = collect_config(config_path)
+        self.assertIsNotNone(config)
+        self.assertEqual(config.watchers, [])
+        self.assertTrue(any("not implemented yet" in i.message for i in issues))
+
+
 if __name__ == "__main__":
     unittest.main()

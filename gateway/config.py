@@ -772,6 +772,53 @@ def _parse_one_agent(
         agent_type, ""
     )
 
+    # session_idle_days / session_expire_days: on-the-fly watcher lifecycle
+    # (docs/design/on-the-fly-watchers.md). Both optional; None means the
+    # idle/expire lifecycle is off. When both are set, idle must be strictly
+    # less than expire — otherwise a watcher jumps straight from active to
+    # gone, skipping the back-burner state entirely. This only covers the
+    # config-level half of that invariant: the effective expiry is actually
+    # min(session_expire_days, the agent backend's own
+    # typical_session_retention_days()), and that half can't be checked here
+    # since this loader only ever sees AgentConfig, never a live AgentBackend
+    # instance — the runtime code that consumes these values (not yet built)
+    # must re-check against the effective value.
+    session_idle_days = agent_raw.get("session_idle_days")
+    if session_idle_days is not None:
+        if isinstance(session_idle_days, bool) or not isinstance(session_idle_days, int):
+            raise ValueError(
+                f"Agent '{agent_name}': session_idle_days must be an integer "
+                f"(got {type(session_idle_days).__name__})."
+            )
+        if session_idle_days <= 0:
+            raise ValueError(
+                f"Agent '{agent_name}': session_idle_days must be a positive "
+                f"integer (got {session_idle_days})."
+            )
+    session_expire_days = agent_raw.get("session_expire_days")
+    if session_expire_days is not None:
+        if isinstance(session_expire_days, bool) or not isinstance(session_expire_days, int):
+            raise ValueError(
+                f"Agent '{agent_name}': session_expire_days must be an integer "
+                f"(got {type(session_expire_days).__name__})."
+            )
+        if session_expire_days <= 0:
+            raise ValueError(
+                f"Agent '{agent_name}': session_expire_days must be a positive "
+                f"integer (got {session_expire_days})."
+            )
+    if (
+        session_idle_days is not None
+        and session_expire_days is not None
+        and session_idle_days >= session_expire_days
+    ):
+        raise ValueError(
+            f"Agent '{agent_name}': session_idle_days ({session_idle_days}) must "
+            f"be strictly less than session_expire_days ({session_expire_days}) — "
+            "otherwise a watcher would jump straight from active to expired, "
+            "skipping the idle back-burner state entirely."
+        )
+
     agent_cfg = AgentConfig(
         name=agent_name,
         type=agent_type,
@@ -799,6 +846,8 @@ def _parse_one_agent(
             timeout=perm_raw.get("timeout", 300),
             skip_owner_approval=perm_raw.get("skip_owner_approval", False),
         ),
+        session_idle_days=session_idle_days,
+        session_expire_days=session_expire_days,
     )
 
     # Validate that agent.timeout > permissions.timeout when permissions are
@@ -911,6 +960,46 @@ def _parse_one_watcher_entry(
         raise ValueError(
             f"Watcher entry at index {index} must have a non-empty "
             "'room' or 'rooms' field"
+        )
+
+    # ── exclude_room: only meaningful alongside room: "*" ──────────────────
+    # (docs/design/on-the-fly-watchers.md). Shape is validated now so this
+    # field is test-covered ahead of the actual rule-matching engine, but
+    # room: "*" itself is rejected below — accepting it today would let a
+    # user configure a watcher the runtime has no way to act on correctly
+    # (there's no room literally named "*").
+    raw_exclude = wc.get("exclude_room")
+    if raw_exclude is not None:
+        if not isinstance(raw_exclude, list) or not raw_exclude:
+            raise ValueError(
+                f"Watcher entry at index {index}: 'exclude_room' must be a "
+                "non-empty list of room names."
+            )
+        if not all(isinstance(r, str) and r for r in raw_exclude):
+            raise ValueError(
+                f"Watcher entry at index {index}: 'exclude_room' entries "
+                "must be non-empty strings."
+            )
+        if len(set(raw_exclude)) != len(raw_exclude):
+            dupes = sorted({r for r in raw_exclude if raw_exclude.count(r) > 1})
+            raise ValueError(
+                f"Watcher entry at index {index}: 'exclude_room' contains "
+                f"duplicate room(s): {dupes}."
+            )
+
+    is_wildcard_room = rooms_list == ["*"]
+    if raw_exclude is not None and not is_wildcard_room:
+        raise ValueError(
+            f"Watcher entry at index {index}: 'exclude_room' is only valid "
+            "when 'room' is the wildcard \"*\" — it has no meaning against "
+            "an explicit room name or a 'rooms:' list."
+        )
+    if is_wildcard_room:
+        raise ValueError(
+            f"Watcher entry at index {index}: room: \"*\" (rule-based room "
+            "matching / on-the-fly watchers) is not implemented yet — use an "
+            "explicit 'room:' or 'rooms:' list for now. See "
+            "docs/design/on-the-fly-watchers.md."
         )
 
     # 'name' / 'session_id' pin a single sticky identity — only meaningful
