@@ -92,7 +92,7 @@ if TYPE_CHECKING:
 _KNOWN_FIELDS = [
     "type", "command", "working_directory", "session_prefix",
     "lazy_instruction_loading", "new_session_args", "context_inject_files",
-    "timeout", "permissions",
+    "timeout", "permissions", "session_idle_days", "session_expire_days",
 ]
 
 # AgentConfig/PermissionConfig's own dataclass defaults (gateway/core/
@@ -115,6 +115,8 @@ AGENT_DATACLASS_DEFAULTS: dict[str, object] = {
     "permissions.enabled": False,
     "permissions.timeout": 300,
     "permissions.skip_owner_approval": False,
+    "session_idle_days": None,
+    "session_expire_days": None,
 }
 
 _FORM_FIELDS: list[FieldSpec] = [
@@ -126,6 +128,12 @@ _FORM_FIELDS: list[FieldSpec] = [
     FieldSpec("new_session_args", "list", "New session args (comma-separated)"),
     FieldSpec("context_inject_files", "list", "Context inject files (comma-separated)"),
     FieldSpec("timeout", "int", "Timeout (seconds)"),
+    # On-the-fly watcher lifecycle (docs/design/on-the-fly-watchers.md) — the
+    # lazy-watcher runtime that actually acts on these isn't built yet, but
+    # the schema exists now (gateway/core/config.py's AgentConfig), so the
+    # form must be able to show/edit them like any other optional int field.
+    FieldSpec("session_idle_days", "int", "Session idle days (blank = never)"),
+    FieldSpec("session_expire_days", "int", "Session expire days (blank = never)"),
 ]
 _PERMISSIONS_FORM_FIELDS: list[FieldSpec] = [
     FieldSpec("permissions.enabled", "bool", "Permissions enabled"),
