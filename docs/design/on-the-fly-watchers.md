@@ -229,6 +229,24 @@ a one-time reminder.
   get wired in) — not yet designed at the code level.
 - Migration guide content for the `session_id`/`online_notification`/
   `offline_notification` removals — not yet written.
+- **Config-tool: no way to write an explicit `null` override for an
+  inherited scalar field (found during PR #77 review, 2026-08-04).**
+  `session_idle_days`/`session_expire_days` are inheritable via
+  `agent_templates:`, and the parser already correctly honors an explicit
+  `session_idle_days: null` in `config.yaml` as "disable the inherited
+  value for this one agent" (`_deep_merge()`'s existing explicit-null-
+  suppresses-base contract). But the config TUI's form has no way to
+  produce that state: blanking the input (or the generic `ctrl+r` reset)
+  both mean "revert to inherited," never "explicitly disable it." This is
+  a **pre-existing, general gap** — `online_notification`/
+  `offline_notification`/`session_id` have the identical limitation today
+  — not something introduced by these two fields, and not fixed as part of
+  this PR. A proper fix needs a new, distinct UI action ("set to null",
+  separate from "revert to inherited") applied consistently to every
+  nullable inheritable field, which is real product-design work, not a
+  quick patch — worth a dedicated follow-up rather than a one-off hack
+  scoped to just these two TTL fields. Until then, the workaround is
+  hand-editing `config.yaml` directly.
 
 ## Sources (2026-08-02 research)
 
