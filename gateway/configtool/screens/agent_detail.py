@@ -132,8 +132,26 @@ _FORM_FIELDS: list[FieldSpec] = [
     # lazy-watcher runtime that actually acts on these isn't built yet, but
     # the schema exists now (gateway/core/config.py's AgentConfig), so the
     # form must be able to show/edit them like any other optional int field.
-    FieldSpec("session_idle_days", "int", "Session idle days (blank = never)"),
-    FieldSpec("session_expire_days", "int", "Session expire days (blank = never)"),
+    #
+    # PR #77 review finding, deliberately NOT fixed here: blanking either
+    # input writes nothing (apply_update() pops the key), reverting to
+    # whatever this agent's `inherits:` template has — NOT to "never". When
+    # the template's own value is non-null, there is currently no way to
+    # write the explicit `null` override needed to actually disable an
+    # inherited TTL for one specific agent, anywhere in this form. This is a
+    # pre-existing, general limitation of the whole str/int FieldSpec
+    # contract (read_widget_value()/apply_update() in form_common.py), not
+    # something specific to these two fields — online_notification/
+    # offline_notification/session_id have the exact same gap today. Config-
+    # level, `session_idle_days: null` directly in config.yaml IS honored
+    # correctly (`_deep_merge()`'s explicit-null-suppresses-base contract,
+    # gateway/config.py) — this is a form-affordance gap, not a parser bug.
+    # Fixing it properly means a new UI pattern (a distinct "set to null"
+    # action, separate from "revert to inherited") applied consistently
+    # across every nullable inheritable field, not a one-off hack for just
+    # these two — scoped out of this PR; see the design doc's Open Items.
+    FieldSpec("session_idle_days", "int", "Session idle days (blank = inherited/default)"),
+    FieldSpec("session_expire_days", "int", "Session expire days (blank = inherited/default)"),
 ]
 _PERMISSIONS_FORM_FIELDS: list[FieldSpec] = [
     FieldSpec("permissions.enabled", "bool", "Permissions enabled"),

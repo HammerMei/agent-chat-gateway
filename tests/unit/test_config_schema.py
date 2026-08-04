@@ -120,3 +120,32 @@ class TestSchemaCatchesKnownMistakes:
         bad = copy.deepcopy(base_doc)
         bad["agent_templates"] = {"x": {"inherits": "y"}}
         assert list(validator.iter_errors(bad))
+
+    def test_session_idle_days_zero_is_rejected(self, validator, base_doc):
+        bad = copy.deepcopy(base_doc)
+        bad["agents"]["my-agent"]["session_idle_days"] = 0
+        assert list(validator.iter_errors(bad))
+
+
+class TestNullableTTLFields:
+    """docs/design/on-the-fly-watchers.md + PR #77 review: an explicit
+    `null` must validate even though the field is otherwise a positive
+    integer — this is the loader-supported way to suppress a non-null value
+    inherited from an agent_templates entry (_deep_merge()'s documented
+    "explicit null suppresses a base value" contract), not just "omit it"."""
+
+    @pytest.fixture
+    def base_doc(self) -> dict:
+        return _load_yaml(REPO_ROOT / "config.example.yaml")
+
+    def test_explicit_null_session_idle_days_is_schema_valid(self, validator, base_doc):
+        doc = copy.deepcopy(base_doc)
+        doc["agents"]["my-agent"]["session_idle_days"] = None
+        errors = list(validator.iter_errors(doc))
+        assert not errors, "\n".join(str(e) for e in errors)
+
+    def test_explicit_null_session_expire_days_is_schema_valid(self, validator, base_doc):
+        doc = copy.deepcopy(base_doc)
+        doc["agents"]["my-agent"]["session_expire_days"] = None
+        errors = list(validator.iter_errors(doc))
+        assert not errors, "\n".join(str(e) for e in errors)
