@@ -131,6 +131,11 @@ class AgentConfig:
     guest_allowed_tools: list[ToolRule] = field(default_factory=list)  # auto-approved for guests
     timeout: int = 360           # seconds to wait for the agent to respond; must be > permissions.timeout
     permissions: PermissionConfig = field(default_factory=PermissionConfig)
+    # On-the-fly watcher lifecycle (docs/design/on-the-fly-watchers.md).
+    # Both None = the idle/expire lifecycle is off for this agent's watchers;
+    # runtime consumers must treat None as "never idle"/"never expire", not 0.
+    session_idle_days: int | None = None    # days with no message before a watcher's runtime object is dropped (session kept)
+    session_expire_days: int | None = None  # days with no message before the session itself is dropped too
 
     def effective_owner_allowed_tools(self) -> "list[ToolRule]":
         """Return owner_allowed_tools with built-in gateway rules prepended.
@@ -211,6 +216,9 @@ class WatcherConfig:
     room: str                                        # room name or @username for DM
     agent: str                                       # must match an AgentConfig.name
     session_id: str | None = None                    # sticky session ID; None = auto-create
+    exclude_rooms: list[str] = field(default_factory=list)  # only meaningful once room == "*" is
+    # supported (docs/design/on-the-fly-watchers.md) — the config loader currently rejects
+    # room == "*" with a clear "not implemented yet" error, so this is always empty today.
     context_inject_files: list[str] = field(default_factory=list)  # watcher-level context (layer 3)
     online_notification: str | None = None   # message text on startup; None = suppress (default: quiet)
     offline_notification: str | None = None  # message text on shutdown; None = suppress (default: quiet)

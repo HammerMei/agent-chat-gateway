@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Config schema groundwork for on-the-fly watchers** (see
+  `docs/design/on-the-fly-watchers.md`) — purely additive, no runtime
+  behavior change yet:
+  - `AgentConfig.session_idle_days` / `session_expire_days` — optional TTL
+    settings for the upcoming idle/expire watcher lifecycle, inheritable via
+    `agent_templates:`. Both default to `None` (feature off). Validated at
+    load time: positive integers, and `session_idle_days` must be strictly
+    less than `session_expire_days` when both are set.
+  - `AgentBackend.typical_session_retention_days() -> int | None` — lets a
+    backend declare its own session-retention limit. `ClaudeBackend` returns
+    `30` (Claude Code's default `cleanupPeriodDays`); `OpenCodeBackend`
+    returns `None` (no automatic expiry).
+  - `WatcherConfig.exclude_rooms` — new field for the future `room: "*"` +
+    `exclude_room:` rule-matching mechanism. `room: "*"` itself is currently
+    rejected at config-load time with a clear "not implemented yet" error —
+    the rule-matching engine that would give it meaning hasn't landed yet.
+
 ### Fixed
 - **File attachment uploads restored on Rocket.Chat 8.0+.** RC 8.0 removed
   the one-step `rooms.upload/{rid}` endpoint that `RocketChatREST.upload_file()`

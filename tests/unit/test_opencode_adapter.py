@@ -3093,3 +3093,11 @@ class TestBuildSafeOpencodeConfig(unittest.TestCase):
         """__init__ raises ValueError immediately if OPENCODE_CONFIG_CONTENT is invalid JSON."""
         with self.assertRaises(ValueError):
             _make_backend(sidecar_env={"OPENCODE_CONFIG_CONTENT": "{bad json"})
+
+
+class TestOpenCodeBackendTypicalSessionRetentionDays(unittest.TestCase):
+    """docs/design/on-the-fly-watchers.md: OpenCode has no automatic session expiry."""
+
+    def test_returns_none(self):
+        backend = _make_backend()
+        self.assertIsNone(backend.typical_session_retention_days())

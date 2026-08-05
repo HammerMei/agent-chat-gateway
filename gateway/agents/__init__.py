@@ -63,6 +63,26 @@ class AgentBackend(ABC):
         """
         return True
 
+    # ── Session retention ────────────────────────────────────────────────────
+
+    def typical_session_retention_days(self) -> int | None:
+        """How many days this backend itself typically keeps a session alive
+        before its own cleanup mechanism (if any) would delete it, independent
+        of anything ACG configures.
+
+        Used by the on-the-fly-watcher idle/expire lifecycle
+        (docs/design/on-the-fly-watchers.md) to compute an effective
+        ``session_expire_days`` of ``min(configured value, this value)`` when
+        the agent declares one — there's no point in ACG holding onto a
+        session reference the backend has already thrown away.
+
+        Returns ``None`` (the default here) when the backend has no automatic
+        expiry of its own — ACG's own ``session_expire_days`` setting is then
+        the only limit in effect. Backends with a real, known limit should
+        override this rather than let callers assume unbounded retention.
+        """
+        return None
+
     # ── Optional lifecycle hooks (default: no-op) ─────────────────────────────
 
     async def start(self) -> None:

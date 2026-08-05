@@ -1620,6 +1620,130 @@ class TestAgentTemplates(unittest.TestCase):
         self.assertIn("must not set 'inherits'", msg)
 
 
+class TestAgentSessionLifecycleConfig(unittest.TestCase):
+    """session_idle_days / session_expire_days (docs/design/on-the-fly-watchers.md)."""
+
+    def _write_config(self, agent_block: str) -> str:
+        cfg = textwrap.dedent(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+{textwrap.indent(textwrap.dedent(agent_block), "                ")}
+            watchers:
+              - name: w1
+                room: general
+        """)
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(cfg)
+            return f.name
+
+    def test_defaults_are_none(self):
+        path = self._write_config("")
+        config = GatewayConfig.from_file(path)
+        self.assertIsNone(config.agents["default"].session_idle_days)
+        self.assertIsNone(config.agents["default"].session_expire_days)
+
+    def test_both_set_and_valid(self):
+        path = self._write_config("""\
+            session_idle_days: 7
+            session_expire_days: 30
+        """)
+        config = GatewayConfig.from_file(path)
+        self.assertEqual(config.agents["default"].session_idle_days, 7)
+        self.assertEqual(config.agents["default"].session_expire_days, 30)
+
+    def test_only_idle_set_is_valid(self):
+        path = self._write_config("session_idle_days: 7\n")
+        config = GatewayConfig.from_file(path)
+        self.assertEqual(config.agents["default"].session_idle_days, 7)
+        self.assertIsNone(config.agents["default"].session_expire_days)
+
+    def test_idle_must_be_strictly_less_than_expire(self):
+        path = self._write_config("""\
+            session_idle_days: 30
+            session_expire_days: 30
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        msg = str(ctx.exception)
+        self.assertIn("session_idle_days (30) must be strictly less than session_expire_days (30)", msg)
+
+    def test_idle_greater_than_expire_raises(self):
+        path = self._write_config("""\
+            session_idle_days: 45
+            session_expire_days: 30
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        self.assertIn("must be strictly less than", str(ctx.exception))
+
+    def test_non_integer_idle_days_raises(self):
+        path = self._write_config("session_idle_days: 'soon'\n")
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        self.assertIn("session_idle_days must be an integer", str(ctx.exception))
+
+    def test_non_integer_expire_days_raises(self):
+        path = self._write_config("session_expire_days: 3.5\n")
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        self.assertIn("session_expire_days must be an integer", str(ctx.exception))
+
+    def test_boolean_is_rejected_even_though_bool_is_an_int_subclass(self):
+        path = self._write_config("session_idle_days: true\n")
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        self.assertIn("session_idle_days must be an integer", str(ctx.exception))
+
+    def test_zero_idle_days_raises(self):
+        path = self._write_config("session_idle_days: 0\n")
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        self.assertIn("must be a positive integer", str(ctx.exception))
+
+    def test_negative_expire_days_raises(self):
+        path = self._write_config("session_expire_days: -1\n")
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        self.assertIn("must be a positive integer", str(ctx.exception))
+
+    def test_inherited_via_agent_templates(self):
+        cfg = textwrap.dedent("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agent_templates:
+              standard:
+                type: claude
+                working_directory: /tmp
+                session_idle_days: 7
+                session_expire_days: 30
+            agents:
+              default: {inherits: standard}
+              custom:
+                inherits: standard
+                session_expire_days: 14
+            watchers:
+              - name: w1
+                room: general
+        """)
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(cfg)
+            path = f.name
+        config = GatewayConfig.from_file(path)
+        self.assertEqual(config.agents["default"].session_idle_days, 7)
+        self.assertEqual(config.agents["default"].session_expire_days, 30)
+        # 'custom' overrides just session_expire_days, keeps inherited idle_days.
+        self.assertEqual(config.agents["custom"].session_idle_days, 7)
+        self.assertEqual(config.agents["custom"].session_expire_days, 14)
+
+
 class TestWatcherTemplates(unittest.TestCase):
     def _write_config(self, body: str) -> str:
         with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
@@ -2102,6 +2226,70 @@ class TestWatcherRoomsExpansion(unittest.TestCase):
                 self.assertEqual(
                     _auto_watcher_name("mm", room), f"mm-{expected_fragment}"
                 )
+
+    def test_wildcard_room_is_rejected_as_not_implemented_yet(self):
+        """room: "*" (on-the-fly / rule-based room matching,
+        docs/design/on-the-fly-watchers.md) parses shape-wise but is
+        rejected today — the runtime has no way to act on it yet."""
+        path = self._write_config("""\
+            - connector: rc-home
+              room: "*"
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        msg = str(ctx.exception)
+        self.assertIn('room: "*"', msg)
+        self.assertIn("not implemented yet", msg)
+
+    def test_exclude_room_without_wildcard_room_raises(self):
+        path = self._write_config("""\
+            - connector: rc-home
+              room: general
+              exclude_room: [dev]
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        self.assertIn("'exclude_room' is only valid when 'room' is the wildcard", str(ctx.exception))
+
+    def test_exclude_room_alongside_rooms_list_raises(self):
+        path = self._write_config("""\
+            - connector: rc-home
+              rooms: [general, dev]
+              exclude_room: [ops]
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        self.assertIn("'exclude_room' is only valid when 'room' is the wildcard", str(ctx.exception))
+
+    def test_exclude_room_must_be_non_empty_list(self):
+        path = self._write_config("""\
+            - connector: rc-home
+              room: "*"
+              exclude_room: []
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        self.assertIn("'exclude_room' must be a non-empty list", str(ctx.exception))
+
+    def test_exclude_room_entries_must_be_strings(self):
+        path = self._write_config("""\
+            - connector: rc-home
+              room: "*"
+              exclude_room: [1, 2]
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        self.assertIn("'exclude_room' entries must be non-empty strings", str(ctx.exception))
+
+    def test_exclude_room_with_duplicates_raises(self):
+        path = self._write_config("""\
+            - connector: rc-home
+              room: "*"
+              exclude_room: [dev, dev]
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        self.assertIn("'exclude_room' contains duplicate room(s)", str(ctx.exception))
 
 
 # ── Tests: quiet notification defaults ────────────────────────────────────────
