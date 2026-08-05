@@ -321,7 +321,10 @@ class TestGetChannelById(unittest.IsolatedAsyncioTestCase):
 
     async def test_resolves_public_channel(self):
         rest = _make_rest(token="tok")
-        rest._request = AsyncMock(return_value={"id": "chan-1", "name": "general", "type": "O"})
+        rest.team_id = "team-1"
+        rest._request = AsyncMock(
+            return_value={"id": "chan-1", "name": "general", "type": "O", "team_id": "team-1"}
+        )
 
         result = await rest.get_channel_by_id("chan-1")
 
@@ -330,13 +333,17 @@ class TestGetChannelById(unittest.IsolatedAsyncioTestCase):
 
     async def test_private_channel_type_mapped_to_group(self):
         rest = _make_rest(token="tok")
-        rest._request = AsyncMock(return_value={"id": "chan-1", "name": "priv", "type": "P"})
+        rest.team_id = "team-1"
+        rest._request = AsyncMock(
+            return_value={"id": "chan-1", "name": "priv", "type": "P", "team_id": "team-1"}
+        )
 
         result = await rest.get_channel_by_id("chan-1")
         self.assertEqual(result["type"], "group")
 
     async def test_direct_message_type_mapped_to_dm(self):
         rest = _make_rest(token="tok")
+        rest.team_id = "team-1"
         rest._request = AsyncMock(return_value={"id": "dm-1", "name": "dm-name", "type": "D"})
 
         result = await rest.get_channel_by_id("dm-1")
@@ -344,6 +351,7 @@ class TestGetChannelById(unittest.IsolatedAsyncioTestCase):
 
     async def test_group_direct_message_type_mapped_to_dm(self):
         rest = _make_rest(token="tok")
+        rest.team_id = "team-1"
         rest._request = AsyncMock(return_value={"id": "gdm-1", "name": "gdm-name", "type": "G"})
 
         result = await rest.get_channel_by_id("gdm-1")
@@ -351,6 +359,7 @@ class TestGetChannelById(unittest.IsolatedAsyncioTestCase):
 
     async def test_channel_not_found_raises(self):
         rest = _make_rest(token="tok")
+        rest.team_id = "team-1"
         rest._request = AsyncMock(
             side_effect=httpx.HTTPStatusError(
                 "404", request=httpx.Request("GET", "http://x"),
@@ -362,6 +371,7 @@ class TestGetChannelById(unittest.IsolatedAsyncioTestCase):
 
     async def test_non_404_http_error_propagates(self):
         rest = _make_rest(token="tok")
+        rest.team_id = "team-1"
         rest._request = AsyncMock(
             side_effect=httpx.HTTPStatusError(
                 "500", request=httpx.Request("GET", "http://x"),
@@ -370,6 +380,38 @@ class TestGetChannelById(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaises(httpx.HTTPStatusError):
             await rest.get_channel_by_id("chan-1")
+
+    async def test_channel_in_different_team_is_rejected(self):
+        """PR #79 review: a multi-team bot account's websocket delivers
+        posted events for every team it belongs to, not just the
+        configured one — an unscoped reverse lookup could otherwise let a
+        wildcard rule bind an agent to a room in the wrong team."""
+        rest = _make_rest(token="tok")
+        rest.team_id = "team-1"
+        rest._request = AsyncMock(
+            return_value={"id": "chan-1", "name": "general", "type": "O", "team_id": "team-2"}
+        )
+
+        with self.assertRaises(RoomNotFoundError):
+            await rest.get_channel_by_id("chan-1")
+
+    async def test_no_team_id_configured_raises_for_real_channel(self):
+        rest = _make_rest(token="tok")
+        rest._request = AsyncMock(
+            return_value={"id": "chan-1", "name": "general", "type": "O", "team_id": "team-2"}
+        )
+
+        with self.assertRaises(RuntimeError):
+            await rest.get_channel_by_id("chan-1")
+
+    async def test_dm_is_not_team_scope_checked(self):
+        """DMs have no meaningful team_id in Mattermost — the team check
+        must not apply to them, even when team_id isn't configured at all."""
+        rest = _make_rest(token="tok")
+        rest._request = AsyncMock(return_value={"id": "dm-1", "name": "dm-name", "type": "D"})
+
+        result = await rest.get_channel_by_id("dm-1")  # must not raise
+        self.assertEqual(result["type"], "dm")
 
 
 # ── 401 re-login behavior (login mode vs token mode) ─────────────────────────

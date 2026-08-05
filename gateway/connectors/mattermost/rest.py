@@ -414,6 +414,16 @@ class MattermostREST:
         "channel"/"group"; 'D' (direct message)/'G' (group direct message)
         -> "dm" — callers that want to exclude DMs from wildcard matching
         check for "dm" the same way they would from resolve_room().
+
+        Team-scoped for real channels (PR #79 review): the WebSocket
+        delivers `posted` events for every team a multi-team bot account
+        belongs to, not just the one configured here — an unscoped reverse
+        lookup could otherwise let a `room: "*"` rule lazily bind an agent
+        to a channel in the WRONG team. DMs/group-DMs are cross-team by
+        nature (Mattermost gives them no meaningful team_id) and are
+        excluded from wildcard matching anyway, by room type, in
+        WatcherLifecycle.try_lazy_create() — so only real channels are
+        scope-checked here.
         """
         try:
             result = await self._request("GET", f"channels/{channel_id}")
@@ -428,6 +438,16 @@ class MattermostREST:
             room_type = "group"
         else:
             room_type = "channel"
+        if room_type != "dm":
+            if not self.team_id:
+                raise RuntimeError(
+                    "get_channel_by_id: team_id not set — call resolve_team() first"
+                )
+            if result.get("team_id") != self.team_id:
+                raise RoomNotFoundError(
+                    f"Channel id '{channel_id}' belongs to a different team "
+                    f"(expected team_id={self.team_id!r})"
+                )
         return {
             "id": result["id"],
             "name": result.get("name", channel_id),

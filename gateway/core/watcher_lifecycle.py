@@ -162,10 +162,25 @@ class WatcherLifecycle:
         config_names = {wc.name for wc in self._watcher_configs}
         for name in list(persisted):
             if name not in config_names:
-                logger.debug(
-                    "Watcher '%s' not in current config — will be omitted from next state save",
-                    name,
-                )
+                if persisted[name].dynamically_created:
+                    # PR #79 review finding: a lazily-created watcher
+                    # (docs/design/on-the-fly-watchers.md) is NEVER in
+                    # `_watcher_configs` at boot — its WatcherConfig only
+                    # ever lived in memory during the run that created it.
+                    # Without this, the save() below (which only persists
+                    # self._states) would silently drop its entry on the
+                    # very first restart, breaking "resume a dormant
+                    # session" after exactly one restart. Carried forward
+                    # as-is (not started/pre-warmed here — that's a
+                    # separate, not-yet-built optimization, see the design
+                    # doc) so the NEXT message for that room can still find
+                    # and resume it via try_lazy_create().
+                    self._states[name] = persisted[name]
+                else:
+                    logger.debug(
+                        "Watcher '%s' not in current config — will be omitted from next state save",
+                        name,
+                    )
 
         self._state_store.save(self._states)
         return errors
@@ -225,12 +240,27 @@ class WatcherLifecycle:
         if room.name in rule.exclude_rooms:
             return False
 
+        # Fail-closed, same posture as sync_watchers()'s identical check
+        # before every static watcher start (PR #79 review): an agent whose
+        # backend or permission broker failed at startup must never get a
+        # watcher started for it via ANY path, lazy or static — otherwise
+        # tool calls in a lazily-created watcher would run with zero
+        # enforcement.
+        agent_name = self._resolve_agent_name(rule.agent)
+        if agent_name in self._blocked_agents:
+            logger.warning(
+                "try_lazy_create: agent '%s' is unavailable (backend or "
+                "permission broker failed to start) — refusing to lazily "
+                "create a watcher for room '%s'", agent_name, room.name,
+            )
+            return False
+
         watcher_name = auto_watcher_name(rule.connector, room.name)
 
         async with self._get_watcher_lock(watcher_name):
-            # Collision/idempotency check deliberately lives INSIDE the
-            # lock, not before it: two DIFFERENT rooms that sanitize to the
-            # SAME auto-generated name (e.g. differing only in punctuation
+            # Existing-watcher check deliberately lives INSIDE the lock, not
+            # before it: two DIFFERENT rooms that sanitize to the SAME
+            # auto-generated name (e.g. differing only in punctuation
             # stripped by sanitize_room_for_name()) arrive on Mattermost via
             # two INDEPENDENT per-channel worker queues (websocket.py's
             # _dispatch()) — they are not naturally serialized against each
@@ -238,19 +268,31 @@ class WatcherLifecycle:
             # before the lock would let both callers race past a "no
             # collision yet" read before either had registered anything.
             existing = self.get_watcher_config(watcher_name)
-            if existing is not None and existing.room != room.name:
-                logger.error(
-                    "try_lazy_create: auto-generated name '%s' for room "
-                    "'%s' collides with an existing watcher for a "
-                    "different room ('%s') — refusing to create.",
-                    watcher_name, room.name, existing.room,
-                )
+            if existing is not None:
+                if existing.room != room.name:
+                    logger.error(
+                        "try_lazy_create: auto-generated name '%s' for room "
+                        "'%s' collides with an existing watcher for a "
+                        "different room ('%s') — refusing to create.",
+                        watcher_name, room.name, existing.room,
+                    )
+                    return False
+                if watcher_name in self._processors:
+                    # Already running — either a concurrent caller for this
+                    # exact room won the race while we waited for the lock,
+                    # or a static watcher of the same name is already live.
+                    return True
+                # A WatcherConfig for this exact room already exists (a
+                # static config.yaml entry, or a previously lazily-created
+                # one) but has no running processor — paused, stopped, or
+                # never successfully started. PR #79 review finding: lazy
+                # creation must NEVER implicitly (re)start an
+                # already-known watcher — that would silently override an
+                # explicit pause, or race a legitimate pause/resume/reset
+                # call (which holds this same per-name lock). Only
+                # pause_watcher()/resume_watcher()/reset_watcher() may
+                # bring an already-known watcher back to life.
                 return False
-            if watcher_name in self._processors:
-                # Already running — either a concurrent caller for this
-                # exact room won the race while we waited for the lock, or
-                # (rare) a static watcher of the same name is already live.
-                return True
 
             wc = WatcherConfig(
                 name=watcher_name,
@@ -280,6 +322,11 @@ class WatcherLifecycle:
                 return False
 
             self._watcher_configs.append(wc)
+            # Flag so sync_watchers() preserves this entry across a restart
+            # even though `wc` only ever lives in memory, never in
+            # config.yaml (PR #79 review — see WatcherState.dynamically_created).
+            if watcher_name in self._states:
+                self._states[watcher_name].dynamically_created = True
             self._state_store.save(self._states)
             logger.info(
                 "Lazily created watcher '%s' for room '%s' (rule-matched, "

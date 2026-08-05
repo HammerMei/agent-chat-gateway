@@ -241,7 +241,47 @@ rather than assumed:
   reconstructed from `state.json` at boot — a restart means that room's
   *next* message re-triggers lazy creation from scratch, resuming the
   persisted session correctly, just without the eager-startup latency
-  optimization). Both are real gaps, not silently dropped — tracked here
+  optimization — **this "resuming correctly" half was a genuine bug until
+  the PR #79 review round below caught it; see `WatcherState.
+  dynamically_created`**). Both are real gaps, not silently dropped — tracked here
+
+### PR #79 review round (2026-08-05) — four real findings, all fixed
+
+Codex's review of the first Mattermost lazy-creation slice caught four
+issues that hand-tracing missed; all four are fixed in the same PR, not
+deferred:
+
+1. **Multi-team bot accounts weren't scoped.** Mattermost's websocket
+   delivers `posted` events for every team a bot account belongs to, not
+   just the configured one — `get_channel_by_id()` had no check against
+   `self.team_id`, so a wildcard rule could lazily bind an agent to a room
+   in the wrong team. Fixed: rejects a channel whose `team_id` doesn't
+   match (DMs exempted — Mattermost gives them no meaningful team scope,
+   and they're excluded from wildcard matching anyway by room type).
+2. **Fail-closed didn't cover the lazy path.** `sync_watchers()` refuses to
+   start a static watcher whose agent's backend/permission broker failed
+   at startup (`_blocked_agents`) — `try_lazy_create()` had no equivalent
+   check, so a wildcard rule could start a processor with zero permission
+   enforcement. Fixed: same check, same posture, before any lock/creation
+   work.
+3. **A paused (or otherwise not-running) watcher for the SAME room could
+   get silently resumed.** The original collision check only rejected a
+   name match against a *different* room — a same-room match (a paused
+   static watcher, or a previously lazy-created one with no running
+   processor) fell through to building and starting a brand-new
+   `WatcherConfig`, defeating an explicit `pause`. Fixed: any existing
+   config for the same room with no running processor now short-circuits
+   to `False` — only `pause_watcher()`/`resume_watcher()`/`reset_watcher()`
+   may bring an already-known watcher back to life.
+4. **A lazy watcher's state didn't actually survive a restart.**
+   `sync_watchers()`'s final `save()` only ever persists `self._states`,
+   built solely from `_watcher_configs` — since a lazily-created watcher's
+   `WatcherConfig` is never in that list at the next boot, its persisted
+   session was silently dropped by the very first restart's save, despite
+   the design (and the "Explicitly out of scope" bullet above, before this
+   fix) claiming resume-across-restart worked. Fixed: `WatcherState` gained
+   a `dynamically_created` flag; `sync_watchers()` now carries forward any
+   persisted entry with that flag set instead of treating it as removed.
   for a later pass, not assumed solved.
 
 ## Idle-expiry / auto-remove

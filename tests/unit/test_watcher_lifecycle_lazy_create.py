@@ -231,5 +231,118 @@ class TestTryLazyCreateMatch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(lifecycle._watcher_configs), 1)
 
 
+class TestTryLazyCreateFailClosedAndPause(unittest.IsolatedAsyncioTestCase):
+    """PR #79 review findings: lazy creation must respect the same
+    fail-closed-for-unavailable-agents posture as sync_watchers(), and must
+    never implicitly (re)start an already-known (e.g. paused) watcher."""
+
+    async def test_blocked_agent_refuses_to_create(self):
+        lifecycle, connector, agent, state_store = _make_lifecycle(rules=[_rule(agent="claude")])
+        lifecycle._blocked_agents = {"claude"}
+
+        result = await lifecycle.try_lazy_create("chan-1")
+
+        self.assertFalse(result)
+        connector.subscribe_room.assert_not_called()
+        agent.create_session.assert_not_called()
+        self.assertEqual(lifecycle._watcher_configs, [])
+
+    async def test_unblocked_agent_still_creates(self):
+        """Sanity check for the fail-closed test above — confirms the
+        refusal is actually gated on _blocked_agents, not some other bug."""
+        lifecycle, connector, agent, state_store = _make_lifecycle(rules=[_rule(agent="claude")])
+        lifecycle._blocked_agents = {"some-other-agent"}
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            result = await lifecycle.try_lazy_create("chan-1")
+
+        self.assertTrue(result)
+
+    async def test_paused_watcher_for_same_room_is_not_resumed(self):
+        lifecycle, connector, agent, state_store = _make_lifecycle(rules=[_rule()])
+        # A watcher config for this exact room already exists (could be
+        # static or a previous lazy creation) and is paused — no processor.
+        lifecycle._watcher_configs.append(
+            WatcherConfig(name="mm-home-general", connector="mm-home", room="general", agent="claude")
+        )
+        lifecycle._states["mm-home-general"] = WatcherState(
+            watcher_name="mm-home-general", session_id="sess-1", room_id="chan-1", paused=True,
+        )
+
+        result = await lifecycle.try_lazy_create("chan-1")
+
+        self.assertFalse(result)
+        agent.create_session.assert_not_called()
+        connector.subscribe_room.assert_not_called()
+
+    async def test_stopped_unpaused_watcher_for_same_room_is_not_restarted(self):
+        """Even without an explicit pause flag, a WatcherConfig for this
+        room with no running processor (e.g. it failed to start earlier)
+        must not be silently retried via the lazy path — only
+        pause_watcher()/resume_watcher()/reset_watcher() manage it."""
+        lifecycle, connector, agent, state_store = _make_lifecycle(rules=[_rule()])
+        lifecycle._watcher_configs.append(
+            WatcherConfig(name="mm-home-general", connector="mm-home", room="general", agent="claude")
+        )
+
+        result = await lifecycle.try_lazy_create("chan-1")
+
+        self.assertFalse(result)
+        agent.create_session.assert_not_called()
+
+    async def test_running_watcher_for_same_room_returns_true_without_recreating(self):
+        lifecycle, connector, agent, state_store = _make_lifecycle(rules=[_rule()])
+        wc = WatcherConfig(name="mm-home-general", connector="mm-home", room="general", agent="claude")
+        lifecycle._watcher_configs.append(wc)
+        lifecycle._processors["mm-home-general"] = MagicMock()
+
+        result = await lifecycle.try_lazy_create("chan-1")
+
+        self.assertTrue(result)
+        agent.create_session.assert_not_called()
+
+
+class TestSyncWatchersPreservesLazyState(unittest.IsolatedAsyncioTestCase):
+    """PR #79 review finding: sync_watchers()'s final save() only persists
+    self._states, built solely from _watcher_configs — a lazily-created
+    watcher's WatcherState (never in _watcher_configs, since its
+    WatcherConfig only ever lived in memory) would otherwise be silently
+    dropped on the very next restart, breaking dormant-session resume after
+    exactly one restart."""
+
+    async def test_dynamically_created_state_survives_a_sync_watchers_call(self):
+        lifecycle, connector, agent, state_store = _make_lifecycle(rules=None)
+        persisted_lazy_state = WatcherState(
+            watcher_name="mm-home-general",
+            session_id="old-sess-id",
+            room_id="chan-1",
+            dynamically_created=True,
+        )
+        state_store.load = MagicMock(return_value={"mm-home-general": persisted_lazy_state})
+
+        await lifecycle.sync_watchers()
+
+        saved_states = state_store.save.call_args.args[0]
+        self.assertIn("mm-home-general", saved_states)
+        self.assertEqual(saved_states["mm-home-general"].session_id, "old-sess-id")
+
+    async def test_non_dynamically_created_orphan_state_is_still_dropped(self):
+        """Unchanged pre-existing behavior: a genuinely-removed static
+        watcher's old state must still be pruned on the next save — only
+        dynamically-created entries get the preservation treatment."""
+        lifecycle, connector, agent, state_store = _make_lifecycle(rules=None)
+        persisted_orphan_state = WatcherState(
+            watcher_name="rc-old-watcher", session_id="old-sess-id", room_id="r1",
+            dynamically_created=False,
+        )
+        state_store.load = MagicMock(return_value={"rc-old-watcher": persisted_orphan_state})
+
+        await lifecycle.sync_watchers()
+
+        saved_states = state_store.save.call_args.args[0]
+        self.assertNotIn("rc-old-watcher", saved_states)
+
+
 if __name__ == "__main__":
     unittest.main()

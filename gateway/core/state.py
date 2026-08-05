@@ -44,6 +44,14 @@ class WatcherState:
     context_injected: bool = False  # True once all context files have been injected
     paused: bool = False            # True if paused via CLI
     last_processed_ts: str = ""     # ISO timestamp of last processed message
+    # True for a watcher created by WatcherLifecycle.try_lazy_create()
+    # (docs/design/on-the-fly-watchers.md) rather than a config.yaml entry.
+    # sync_watchers() preserves entries flagged True across a restart even
+    # though they're never in `_watcher_configs` at boot (PR #79 review) —
+    # without this, a lazy watcher's session would be silently dropped by
+    # the very next startup save, defeating the "resume a dormant session"
+    # behavior after exactly one restart.
+    dynamically_created: bool = False
 
 
 def ensure_runtime_dir() -> None:
@@ -76,6 +84,7 @@ def load_state(connector_name: str) -> list[WatcherState]:
                     context_injected=w.get("context_injected", False),
                     paused=w.get("paused", False),
                     last_processed_ts=w.get("last_processed_ts", ""),
+                    dynamically_created=w.get("dynamically_created", False),
                 ))
             elif "watcher_id" in w:
                 # Legacy format — migrate best-effort using room_name as watcher_name
