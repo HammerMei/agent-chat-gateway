@@ -624,3 +624,11 @@ class TestClaudeBackendEnsureDurableInstructions(unittest.IsolatedAsyncioTestCas
                 Path(path).resolve().is_relative_to(Path(fake_project).resolve()),
                 f"durable system-prompt file must not live under working_directory, got {path}",
             )
+
+
+class TestClaudeBackendTypicalSessionRetentionDays(unittest.TestCase):
+    """docs/design/on-the-fly-watchers.md: Claude Code's default cleanupPeriodDays."""
+
+    def test_returns_30(self):
+        backend = _make_backend()
+        self.assertEqual(backend.typical_session_retention_days(), 30)

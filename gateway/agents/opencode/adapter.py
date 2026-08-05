@@ -319,6 +319,16 @@ class OpenCodeBackend(AgentBackend):
         """OpenCode HTTP mode ignores per-message env — role is set at sidecar startup."""
         return False
 
+    def typical_session_retention_days(self) -> int | None:
+        """OpenCode has no automatic session expiry of its own — sessions persist
+        indefinitely in its SQLite store (confirmed via source, not just docs;
+        see docs/design/on-the-fly-watchers.md). Explicit override (rather than
+        relying on the AgentBackend default) so this is a visible, deliberate
+        statement about OpenCode specifically, not an inherited default that
+        happens to be correct.
+        """
+        return None
+
     def create_gateway_broker(
         self,
         registry: "PermissionRegistry",

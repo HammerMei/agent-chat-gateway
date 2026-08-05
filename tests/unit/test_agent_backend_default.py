@@ -137,5 +137,15 @@ class TestSendOnceAsDurableFallback(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result)
 
 
+class TestTypicalSessionRetentionDaysDefault(unittest.TestCase):
+    """docs/design/on-the-fly-watchers.md: a backend with no automatic expiry
+    of its own need not override typical_session_retention_days() — the
+    AgentBackend default is None ("unknown"/"no limit"), not 0 or an error."""
+
+    def test_returns_none_when_not_overridden(self):
+        backend = _RecordingBackend()
+        self.assertIsNone(backend.typical_session_retention_days())
+
+
 if __name__ == "__main__":
     unittest.main()

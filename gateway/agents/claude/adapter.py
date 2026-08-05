@@ -358,6 +358,15 @@ class ClaudeBackend(AgentBackend):
         )
         self._broker_config = broker_config
 
+    def typical_session_retention_days(self) -> int | None:
+        """Claude Code's default ``cleanupPeriodDays`` (settings.json) is 30 —
+        JSONL session transcripts older than this are deleted at CLI startup.
+        This is a documented default, not a guaranteed constant: a user can
+        change it per-machine, and ACG has no way to read the actual configured
+        value from here (see docs/design/on-the-fly-watchers.md's open items).
+        """
+        return 30
+
     def create_gateway_broker(
         self,
         registry: "PermissionRegistry",

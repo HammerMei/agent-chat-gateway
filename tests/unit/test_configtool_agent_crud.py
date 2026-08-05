@@ -380,6 +380,28 @@ class TestEditAgent:
             entry = app.editable_config.agents_raw["existing-agent"]
             assert "lazy_instruction_loading" not in entry
 
+    async def test_session_idle_and_expire_days_fields_are_editable_and_save(
+        self, tmp_path, work_dir
+    ):
+        """docs/design/on-the-fly-watchers.md: AgentConfig.session_idle_days/
+        session_expire_days must be reachable through the TUI form, not just
+        by hand-editing config.yaml — same as every other AgentConfig field."""
+        config_path = _write_config(tmp_path, _config_with_one_agent(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_agent_in_edit_mode(pilot, app)
+
+            app.screen.query_one("#field-session_idle_days", Input).value = "7"
+            app.screen.query_one("#field-session_expire_days", Input).value = "30"
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            entry = app.editable_config.agents_raw["existing-agent"]
+            assert entry["session_idle_days"] == 7
+            assert entry["session_expire_days"] == 30
+
     async def test_permissions_checkbox_subfield_write(self, tmp_path, work_dir):
         config_path = _write_config(tmp_path, _config_with_one_agent(work_dir))
         app = ConfigToolApp(config_path)

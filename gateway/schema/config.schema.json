@@ -214,7 +214,17 @@
           "minimum": 1,
           "description": "Must be greater than permissions.timeout."
         },
-        "permissions": { "$ref": "#/$defs/permissions" }
+        "permissions": { "$ref": "#/$defs/permissions" },
+        "session_idle_days": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Days with no message before a watcher's runtime object is dropped (session kept). Omit, or set explicitly to null to suppress an inherited value, for no idle lifecycle. Must be strictly less than session_expire_days when both are set. See docs/design/on-the-fly-watchers.md."
+        },
+        "session_expire_days": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Days with no message before the session itself is dropped too. Omit, or set explicitly to null to suppress an inherited value, for no expiry. See docs/design/on-the-fly-watchers.md."
+        }
       }
     },
     "watcher": {
@@ -254,6 +264,12 @@
           "minItems": 1,
           "items": { "type": "string" },
           "description": "Bind this connector+agent pair to several rooms at once; expands into one watcher per room."
+        },
+        "exclude_room": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" },
+          "description": "Only meaningful once room: \"*\" (rule-based room matching) is implemented; the loader currently rejects room: \"*\" outright with a 'not implemented yet' error regardless of this field. See docs/design/on-the-fly-watchers.md."
         },
         "agent": { "type": "string" },
         "session_id": {
