@@ -112,23 +112,120 @@ avoids adding first-message latency to rooms that are already in active
 use, which would otherwise be a real regression for something like the
 `#nest` room.
 
-**Trigger point in existing code:** `MessageDispatcher.dispatch()`
-(`gateway/core/dispatch.py`) currently does
-`self._room_processors.get(msg.room.id, [])` and, on a miss, just logs
-"No processor found for room_id=%s" and drops the message. That miss path
-*is* the lazy-create trigger going forward: instead of logging-and-dropping,
-check whether `room.id` matches an active rule and, if so, create the
-watcher there before proceeding.
+### 2026-08-05 revision: the real trigger point differs by connector, and is NOT `dispatch()`
 
-**Concurrency:** a miss on `_room_processors` can happen more than once for
-the same room before creation finishes — a burst of messages right after
-the room goes active, or a membership-event hook and a message arriving for
-the same room at nearly the same time. Creation needs a per-room lock so
-only one creation happens, with the same shape as the existing per-session
-lock in `injected_context_builder.py` (`self._locks: dict[str,
-asyncio.Lock]`, lazily created per key). Messages that arrive while creation
-is in flight for that room should wait on the lock and get dispatched to the
-newly-created processor once it's ready, rather than being dropped.
+Corrected after reading the actual connector code (an Explore-agent
+investigation, not assumption) while starting implementation: the original
+claim above — that `MessageDispatcher.dispatch()`'s `_room_processors.get()`
+miss is the lazy-create trigger point — is only true in the sense that
+`dispatch()` is never reached at all for an unwatched room on EITHER
+connector today. The real gate is earlier, and differs by transport:
+
+- **Mattermost**: no wire-protocol subscribe exists. The WebSocket already
+  streams `posted` events for every channel the bot is a member of,
+  regardless of whether ACG is watching it. `MattermostConnector.
+  _on_posted_event()` (`gateway/connectors/mattermost/connector.py:643-645`)
+  is what actually drops the event: `state = self._channels.get(channel_id);
+  if not state: return`. This is a **local, in-process filter on an
+  already-delivered event** — the data is right there, nothing further needs
+  to be fetched over the wire to see it. This is the correct, and only,
+  hook point for MM's lazy creation.
+- **RocketChat**: DDP requires an explicit per-room `sub` before the
+  **server** will ever emit a `stream-room-messages` "changed" event for
+  that room — confirmed via `websocket.py`'s `subscribe_room()`/DDP `sub`
+  frame and the RC server's own stream-scoping behavior. A room ACG never
+  subscribed to produces **no event at all**, not a filtered one — there is
+  nothing for a "miss" hook to react to. Reactive lazy creation is
+  therefore **not achievable for RC** without something else first causing
+  a subscribe call for that room's ID — which is exactly what the
+  `stream-notify-user`/`subscriptions-changed` membership-event hook
+  (documented below) is for. **This is why RC support is scoped to a
+  separate follow-up** (2026-08-04/05 discussion) — it isn't optional
+  polish, it's a different mechanism (event-hook-triggered subscribe, not
+  message-triggered creation) requiring its own design pass.
+
+**Concurrency (MM): already handled by existing architecture, verified —
+not something this feature needs to add.** `MattermostWebSocketClient.
+_dispatch()` (`websocket.py:198-216`) routes every decoded event into a
+**per-channel `asyncio.Queue`**, lazily spinning up one dedicated
+`_channel_worker` task per `channel_id` the first time it's ever seen —
+including a channel ACG has no state for yet. Each worker processes its
+own channel's queue strictly sequentially (`await self._handler(decoded)`
+before pulling the next item). Consequences, verified by reading the code
+rather than assumed:
+- A slow lazy-creation call inside `_on_posted_event` (a full watcher
+  start: agent session provisioning, history fetch, durable-context
+  delivery — realistically several seconds, potentially 30+) only delays
+  **that one new channel's own queue** — every other channel already has
+  its own independent worker and is completely unaffected. No global
+  connector stall.
+- Two messages arriving back-to-back for the same brand-new channel are
+  processed one at a time by the SAME worker — the second one is not even
+  dequeued until the first (which does the lazy creation) finishes. No
+  race is possible for the common case.
+- The one path that calls `_on_posted_event` outside this queue is
+  `_on_ws_reconnect`'s replay loop (`connector.py:223`) — but it only
+  replays **already-tracked** channels (`self._channels`), so it can never
+  hit the "no state yet" branch a genuinely new room takes. No race there
+  either.
+- A defensive per-room `asyncio.Lock` (same shape as
+  `injected_context_builder.py`'s `self._locks: dict[str, asyncio.Lock]`)
+  is still added in `WatcherLifecycle.try_lazy_create()` — cheap, and
+  removes any dependency on this connector-specific queuing behavior
+  continuing to hold, especially once RC (a different concurrency model)
+  reuses the same lazy-creation core logic later.
+
+### Scope decisions made while starting implementation (2026-08-05)
+
+- **`GatewayConfig` gets a new, separate `watcher_rules: list[WatcherConfig]`
+  field — not a flag on the existing `watchers` list.** A `room: "*"` entry
+  is parsed into this list instead of `watchers`. Reasoning: `sync_watchers()`
+  and `_start_watcher()` both operate on `watchers`/`_watcher_configs` and
+  call `resolve_room(wc.room)` — if a rule ever ended up in that list,
+  `"*"` would be resolved as a literal room name at every boot. A separate
+  list makes that failure impossible by construction instead of relying on
+  every call site remembering to filter on a flag.
+- **At most one `room: "*"` rule per connector** — enforced as a config-load
+  error. Kills the "which agent wins when two rules match the same room"
+  question by construction; trivially relaxable later if a real use case
+  needs it.
+- **`room: "*"` matches channels only, not DMs, by default.** A wildcard
+  binding an agent to every DM the bot account has is surprising and very
+  unlikely to be the intent of "listen to all rooms I have access to." A
+  DM is still reachable by naming it explicitly (`room: "@alice"`), same as
+  today.
+- **History-handoff double-delivery, fixed:** a lazily-created watcher's
+  history-handoff fetch (`hh.enabled`, default `True`) would otherwise
+  include the very message that triggered its own creation — that message
+  then also gets processed as the live prompt, so the agent sees it twice.
+  `_start_watcher()` gains an optional `exclude_msg_id` parameter (`None`
+  for the existing eager-startup path, the triggering post's ID for the
+  lazy path) that filters that one message out of the fetched history
+  before it's formatted into the handoff context.
+- **`_sanitize_room_for_name()`/`_auto_watcher_name()` move from
+  `gateway/config.py` to `gateway/core/config.py`**, re-exported from
+  `gateway/config.py` for existing callers/tests. `gateway/core/
+  watcher_lifecycle.py` (where the lazy-creation logic lives) is in the
+  `core` package, which does not import from the top-level `gateway.config`
+  module (that module imports *from* `core` and re-exports — the
+  dependency only ever goes one direction); the auto-naming helpers need to
+  be reachable from both sides.
+- **New `Connector` method, `resolve_room_by_id(room_id: str) -> Room`** —
+  the reverse of `resolve_room(name)`. Needed because the connector only
+  has a raw `channel_id` at the point a message arrives for an unwatched
+  room; matching it against `exclude_room:` (which is name-based, like
+  every other room field in this config) requires resolving the name
+  first. MM implements it via `GET /api/v4/channels/{channel_id}`; default
+  raises `NotImplementedError` (only MM needs it for now).
+- **Explicitly out of scope for this pass:** RC support (see above — a
+  different mechanism, own follow-up); startup pre-warming of a room that
+  got a lazily-created watcher in a PRIOR gateway run (its `WatcherConfig`
+  only lives in `WatcherLifecycle._watcher_configs` in-memory today, not
+  reconstructed from `state.json` at boot — a restart means that room's
+  *next* message re-triggers lazy creation from scratch, resuming the
+  persisted session correctly, just without the eager-startup latency
+  optimization). Both are real gaps, not silently dropped — tracked here
+  for a later pass, not assumed solved.
 
 ## Idle-expiry / auto-remove
 
