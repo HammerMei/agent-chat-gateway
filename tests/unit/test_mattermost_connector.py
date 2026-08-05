@@ -277,6 +277,34 @@ class TestSendToRoom(unittest.IsolatedAsyncioTestCase):
         connector._rest.post_message.assert_called_once_with("chan-raw-id", "hello")
 
 
+class TestResolveRoomById(unittest.IsolatedAsyncioTestCase):
+    """docs/design/on-the-fly-watchers.md: reverse of resolve_room(), used
+    by WatcherLifecycle.try_lazy_create() to learn a channel's name from a
+    raw channel_id before rule matching."""
+
+    async def test_resolves_to_a_room_object(self):
+        connector = _make_connector()
+        connector._rest.get_channel_by_id = AsyncMock(
+            return_value={"id": "chan-1", "name": "general", "type": "channel"}
+        )
+
+        room = await connector.resolve_room_by_id("chan-1")
+
+        self.assertEqual(room.id, "chan-1")
+        self.assertEqual(room.name, "general")
+        self.assertEqual(room.type, "channel")
+        connector._rest.get_channel_by_id.assert_called_once_with("chan-1")
+
+    async def test_propagates_room_not_found(self):
+        from gateway.connectors.mattermost.rest import RoomNotFoundError
+
+        connector = _make_connector()
+        connector._rest.get_channel_by_id = AsyncMock(side_effect=RoomNotFoundError("nope"))
+
+        with self.assertRaises(RoomNotFoundError):
+            await connector.resolve_room_by_id("nonexistent")
+
+
 # ── agent_username fallback ───────────────────────────────────────────────────
 
 
@@ -506,6 +534,116 @@ class TestOnPostedEvent(unittest.IsolatedAsyncioTestCase):
             len(sender_resolutions), 1,
             "sender identity must be resolved exactly once, not once per concurrent delivery",
         )
+
+
+# ── lazy creation hook (docs/design/on-the-fly-watchers.md) ──────────────────
+
+
+class TestLazyCreationHook(unittest.IsolatedAsyncioTestCase):
+    """_on_posted_event()'s gate for a channel with no local _ChannelState:
+    give a registered lazy-creation hook a chance before dropping."""
+
+    async def test_no_hook_registered_drops_as_before(self):
+        """Same as TestOnPostedEvent.test_ignores_unsubscribed_channel —
+        pinned again here for contrast with the hook-registered cases below."""
+        connector = _make_connector(owners=["alice"])
+        handler = AsyncMock(return_value=True)
+        connector.register_handler(handler)
+
+        await connector._on_posted_event({
+            "post": {"id": "p1", "channel_id": "unknown-chan", "user_id": "u1", "message": "@hammer.mei hi", "root_id": "", "type": "", "create_at": 1},
+            "mentions": ["bot-id-1"],
+        })
+
+        handler.assert_not_called()
+
+    async def test_hook_returning_true_and_populating_state_lets_message_through(self):
+        connector = _make_connector(owners=["alice"])
+        connector._rest.resolve_username = AsyncMock(return_value="alice")
+        received = []
+
+        async def handler(msg):
+            received.append(msg)
+            return True
+        connector.register_handler(handler)
+
+        async def hook(channel_id):
+            # Simulates what WatcherLifecycle.try_lazy_create() actually does
+            # on a match: create the watcher, which calls subscribe_room()
+            # (populating self._channels) as a side effect, before returning True.
+            room = Room(id=channel_id, name="new-room", type="channel")
+            connector._ws.register_channel = MagicMock()
+            await connector.subscribe_room(room, watcher_id="lazy-w1")
+            return True
+
+        connector.register_lazy_creation_hook(hook)
+
+        await connector._on_posted_event({
+            "post": {"id": "p1", "channel_id": "new-chan", "user_id": "u1", "message": "@hammer.mei hi", "root_id": "", "type": "", "create_at": 1},
+            "mentions": ["bot-id-1"],
+        })
+
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0].text, "hi")
+
+    async def test_hook_returning_false_still_drops(self):
+        connector = _make_connector(owners=["alice"])
+        handler = AsyncMock(return_value=True)
+        connector.register_handler(handler)
+        connector.register_lazy_creation_hook(AsyncMock(return_value=False))
+
+        await connector._on_posted_event({
+            "post": {"id": "p1", "channel_id": "no-match-chan", "user_id": "u1", "message": "@hammer.mei hi", "root_id": "", "type": "", "create_at": 1},
+            "mentions": ["bot-id-1"],
+        })
+
+        handler.assert_not_called()
+
+    async def test_hook_raising_is_swallowed_and_message_dropped(self):
+        connector = _make_connector(owners=["alice"])
+        handler = AsyncMock(return_value=True)
+        connector.register_handler(handler)
+        connector.register_lazy_creation_hook(AsyncMock(side_effect=RuntimeError("boom")))
+
+        await connector._on_posted_event({
+            "post": {"id": "p1", "channel_id": "chan-x", "user_id": "u1", "message": "@hammer.mei hi", "root_id": "", "type": "", "create_at": 1},
+            "mentions": ["bot-id-1"],
+        })
+
+        handler.assert_not_called()
+
+    async def test_hook_returning_true_but_state_still_absent_drops(self):
+        """Defensive: a hook that claims success (True) but didn't actually
+        populate _channels (e.g. a bug, or a race) must not crash — the
+        message is still dropped, exactly as if the hook had returned False."""
+        connector = _make_connector(owners=["alice"])
+        handler = AsyncMock(return_value=True)
+        connector.register_handler(handler)
+        connector.register_lazy_creation_hook(AsyncMock(return_value=True))
+
+        await connector._on_posted_event({
+            "post": {"id": "p1", "channel_id": "chan-x", "user_id": "u1", "message": "@hammer.mei hi", "root_id": "", "type": "", "create_at": 1},
+            "mentions": ["bot-id-1"],
+        })
+
+        handler.assert_not_called()
+
+    async def test_existing_channel_never_calls_the_hook(self):
+        connector = _make_connector(owners=["alice"])
+        connector._rest.resolve_username = AsyncMock(return_value="alice")
+        room = Room(id="chan1", name="general", type="channel")
+        connector._ws.register_channel = MagicMock()
+        await connector.subscribe_room(room, watcher_id="w1")
+        hook = AsyncMock(return_value=True)
+        connector.register_lazy_creation_hook(hook)
+        connector.register_handler(AsyncMock(return_value=True))
+
+        await connector._on_posted_event({
+            "post": {"id": "p1", "channel_id": "chan1", "user_id": "u1", "message": "@hammer.mei hi", "root_id": "", "type": "", "create_at": 1},
+            "mentions": ["bot-id-1"],
+        })
+
+        hook.assert_not_called()
 
 
 # ── _on_ws_reconnect (history replay) ─────────────────────────────────────────

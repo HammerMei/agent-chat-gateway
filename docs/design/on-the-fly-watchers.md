@@ -1,10 +1,12 @@
 # On-the-fly watchers: rule-based room matching + lazy watcher lifecycle
 
-Status: **design only — not yet implemented.** Captures a 2026-08-02 design
-discussion. Nothing in this doc has landed in code yet. Implementation
-requires coordinating a production test window with the repo owner first
-(see "Rollout" below) — do not schedule this on macbook-server without
-checking in.
+Status (updated 2026-08-05): **config schema landed (PR #77); rule-based
+room matching + lazy creation landed for Mattermost.** RocketChat support,
+`session_id`/`online_notification`/`offline_notification` retirement, and
+the `expire` CLI are still design-only. Coordinating a low-traffic
+production test window with the repo owner is still required before any of
+this touches macbook-server (see "Rollout" below) — nothing in this feature
+has been deployed to production yet, regardless of what has merged.
 
 ## Problem
 
@@ -194,14 +196,29 @@ rather than assumed:
   unlikely to be the intent of "listen to all rooms I have access to." A
   DM is still reachable by naming it explicitly (`room: "@alice"`), same as
   today.
-- **History-handoff double-delivery, fixed:** a lazily-created watcher's
-  history-handoff fetch (`hh.enabled`, default `True`) would otherwise
-  include the very message that triggered its own creation — that message
-  then also gets processed as the live prompt, so the agent sees it twice.
-  `_start_watcher()` gains an optional `exclude_msg_id` parameter (`None`
-  for the existing eager-startup path, the triggering post's ID for the
-  lazy path) that filters that one message out of the fetched history
-  before it's formatted into the handoff context.
+- **History-handoff double-delivery — investigated, deliberately NOT fixed
+  in this pass (revised 2026-08-05, reversing the earlier "fixed" plan
+  above).** A lazily-created watcher's history-handoff fetch (`hh.enabled`,
+  default `True`) will include the very message that triggered its own
+  creation, which then ALSO gets processed as the live prompt — the agent
+  sees it twice (once folded into the history summary, once as the live
+  turn). The original plan was an `exclude_msg_id` parameter on
+  `_start_watcher()`, but `Connector.fetch_room_history()`'s return shape
+  (`gateway/connectors/mattermost/connector.py`) is a platform-agnostic
+  `{ts, username, role, room_name, text}` dict with **no message ID at
+  all** — matching by `ts` instead would mean comparing independently-
+  computed timestamp strings (one from `ts_ms_to_iso_local()` in the
+  history path, one from `filter_mm_message()`'s `FilterResult.msg_ts` in
+  the live path) for exact equality, which is fragile: a silent mismatch
+  (rounding, timezone edge case) either leaves the duplicate in place
+  anyway or, worse, could over-match and drop an unrelated message that
+  happens to share a timestamp. Given the actual failure mode is cosmetic
+  (the agent sees one extra line of context, not incorrect behavior) and
+  every candidate fix touches a shared, platform-agnostic interface used
+  by both connectors' eager-startup path too, this is being left as a
+  known, accepted limitation rather than shipping a fragile heuristic.
+  Revisit if `fetch_room_history()` ever gains a real message ID field for
+  other reasons.
 - **`_sanitize_room_for_name()`/`_auto_watcher_name()` move from
   `gateway/config.py` to `gateway/core/config.py`**, re-exported from
   `gateway/config.py` for existing callers/tests. `gateway/core/
@@ -307,6 +324,34 @@ a one-time reminder.
 
 ## Open items / not yet resolved
 
+- **`gateway/config_validate.py`'s `_check_state_orphans()` doesn't know
+  about lazily-created watchers (found 2026-08-05, not fixed).** It builds
+  its "is this state.json entry still configured" set from `config.watchers`
+  only — a lazily-created watcher's `WatcherConfig` lives in
+  `WatcherLifecycle._watcher_configs` at runtime, never written back to
+  `config.yaml`, so its persisted state will always look like an orphan to
+  this check. The warning it prints is actively misleading for this case
+  ("its session/pause state will be dropped on next start" — it isn't; the
+  next message for that room re-triggers `try_lazy_create()`, which resumes
+  the persisted session exactly as it would for any dormant static
+  watcher). Same "TUI/tooling doesn't fully understand rules yet" scope
+  boundary as the `expanded_watchers()` item just below — not fixed in the
+  PR that added lazy creation, since it's config-tool-surface work, not
+  core lifecycle work; needs its own pass once rules have more general TUI
+  support.
+- **`gateway/configtool/model.py`'s `EditableConfig.expanded_watchers()`
+  (drives the config TUI's Watchers table) silently drops a `room: "*"`
+  rule's row.** It calls `_parse_one_watcher_entry()` directly, per raw
+  entry, bypassing the `from_file()`/`collect_config()` dispatch that
+  routes a wildcard entry to `_parse_one_watcher_rule()` instead — a rule
+  entry falls through to `_parse_one_watcher_entry()`'s defensive
+  "must be parsed by `_parse_one_watcher_rule()`" `ValueError`, which
+  `expanded_watchers()`'s per-entry `except ValueError: continue` then
+  silently swallows. Fails safely (no crash, no data corruption — the rule
+  still parses and works correctly for the actual gateway, only the TUI's
+  table is missing a row for it), but a rule is currently invisible in the
+  config TUI entirely. Not fixed here — needs a real "how does the TUI
+  represent/edit a rule" design, out of scope for the lazy-creation PR.
 - `session_idle_days`/`session_expire_days` exact default values — not yet
   chosen. **Invariant to validate at config-load time, not just a value to
   pick later:** `session_idle_days` must be strictly less than the

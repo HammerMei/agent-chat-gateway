@@ -10,9 +10,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Config schema groundwork for on-the-fly watchers** (see
-  `docs/design/on-the-fly-watchers.md`) — purely additive, no runtime
-  behavior change yet:
+- **On-the-fly watchers: `room: "*"` rule-based room matching + lazy
+  creation on Mattermost** (see `docs/design/on-the-fly-watchers.md`).
+  A `watchers:` entry with `room: "*"` (optionally with `exclude_room:
+  [...]`) is now a **rule**, not a concrete watcher — parsed into a new
+  `GatewayConfig.watcher_rules` list, never started eagerly. On Mattermost,
+  the first message that arrives for a channel with no existing watcher is
+  now checked against that connector's rule (channels only — DMs are
+  excluded from wildcard matching by default) and, on a match, a full
+  watcher is created on the spot (subscribe, session — resuming a dormant
+  persisted session if one exists for that room — durable context,
+  processor), then the triggering message is processed normally. At most
+  one `room: "*"` rule is allowed per connector (config-load error
+  otherwise), removing any ambiguity about which rule's agent would apply.
+  RocketChat is **not yet supported** — its DDP transport requires an
+  explicit per-room subscribe before the server will ever emit an event for
+  that room, so reactive "message triggers creation" isn't achievable there
+  without a separate membership-event-hook mechanism (tracked as a
+  follow-up in the design doc).
+- **Config schema groundwork for on-the-fly watchers** — purely additive,
+  no runtime behavior change on its own:
   - `AgentConfig.session_idle_days` / `session_expire_days` — optional TTL
     settings for the upcoming idle/expire watcher lifecycle, inheritable via
     `agent_templates:`. Both default to `None` (feature off). Validated at
@@ -22,10 +39,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     backend declare its own session-retention limit. `ClaudeBackend` returns
     `30` (Claude Code's default `cleanupPeriodDays`); `OpenCodeBackend`
     returns `None` (no automatic expiry).
-  - `WatcherConfig.exclude_rooms` — new field for the future `room: "*"` +
-    `exclude_room:` rule-matching mechanism. `room: "*"` itself is currently
-    rejected at config-load time with a clear "not implemented yet" error —
-    the rule-matching engine that would give it meaning hasn't landed yet.
 
 ### Fixed
 - **File attachment uploads restored on Rocket.Chat 8.0+.** RC 8.0 removed

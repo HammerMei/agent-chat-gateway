@@ -501,14 +501,48 @@ watcher's identity, which is ambiguous across an expanded multi-room entry.
 > `docs/migration-0.2.md` for the safe way to rename a watcher that already
 > has state you care about.
 
+**Rule-based room matching (`room: "*"`) — Mattermost only for now:**
+
+Instead of naming rooms up front, `room: "*"` binds an agent to every
+channel the bot is (or later becomes) a member of on that connector,
+minus anything listed in `exclude_room:`:
+
+```yaml
+watchers:
+  - connector: mm-main
+    agent: claude
+    room: "*"
+    exclude_room: [announcements]
+```
+
+- This is a **rule**, not a concrete watcher — nothing starts eagerly.
+  On Mattermost, the first message posted in a matching channel with no
+  existing watcher creates one on the spot (name auto-derived the same way
+  as `rooms:` above), resuming a prior session for that room if one was
+  persisted from an earlier run.
+- Matches **channels only** — DMs are never included, even without an
+  `exclude_room:` entry naming them. Watch a DM explicitly with `room:
+  "@username"` instead.
+- At most **one** `room: "*"` rule is allowed per connector — a config
+  with two is rejected at load time, so there's never ambiguity about
+  which rule's `agent:` would apply to a given room.
+- `name:` and `session_id:` cannot be set on a rule — a concrete name/
+  session only makes sense once a real room is known.
+- **RocketChat does not support this yet** — its transport requires an
+  explicit per-room subscribe before the server will ever deliver a
+  message for that room, so there's no message to react to for a room
+  ACG hasn't already subscribed to. See `docs/design/on-the-fly-watchers.md`
+  for the follow-up mechanism this needs.
+
 **Watcher Fields:**
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `name` | string | No | Watcher identifier used in CLI commands; auto-derived from `connector`+room if omitted. Only settable on a single-room entry. |
 | `connector` | string | Yes | Must match a connector name above |
-| `room` | string | One of `room`/`rooms` | Room/channel name (as known to the `connector` named above) or `@username` for DMs |
+| `room` | string | One of `room`/`rooms` | Room/channel name (as known to the `connector` named above), `@username` for DMs, or `"*"` for a rule matching every channel (Mattermost only — see above) |
 | `rooms` | list[string] | One of `room`/`rooms` | Bind this connector+agent pair to several rooms at once; expands into one watcher per room |
+| `exclude_room` | list[string] | No | Only valid alongside `room: "*"` — channel names to exclude from the wildcard match |
 | `agent` | string | No | Agent backend to use; falls back to `default_agent` if omitted |
 | `session_id` | string | No | Optional sticky session ID (e.g., `ses_abc123`); `null` = auto-create. Only settable on a single-room entry. |
 | `context_inject_files` | list | No | Watcher-specific context files |

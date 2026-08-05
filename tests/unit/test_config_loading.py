@@ -2227,19 +2227,112 @@ class TestWatcherRoomsExpansion(unittest.TestCase):
                     _auto_watcher_name("mm", room), f"mm-{expected_fragment}"
                 )
 
-    def test_wildcard_room_is_rejected_as_not_implemented_yet(self):
+    def test_wildcard_room_is_parsed_as_a_rule_not_a_watcher(self):
         """room: "*" (on-the-fly / rule-based room matching,
-        docs/design/on-the-fly-watchers.md) parses shape-wise but is
-        rejected today — the runtime has no way to act on it yet."""
+        docs/design/on-the-fly-watchers.md) is parsed into
+        GatewayConfig.watcher_rules, never into `watchers` — it is never
+        started directly."""
         path = self._write_config("""\
             - connector: rc-home
               room: "*"
         """)
+        config = GatewayConfig.from_file(path)
+        self.assertEqual(config.watchers, [])
+        self.assertEqual(len(config.watcher_rules), 1)
+        rule = config.watcher_rules[0]
+        self.assertEqual(rule.room, "*")
+        self.assertEqual(rule.connector, "rc-home")
+        self.assertEqual(rule.exclude_rooms, [])
+
+    def test_wildcard_rule_with_name_raises(self):
+        path = self._write_config("""\
+            - connector: rc-home
+              name: my-rule
+              room: "*"
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        self.assertIn("'name' cannot be set on a room: \"*\" rule", str(ctx.exception))
+
+    def test_wildcard_rule_with_session_id_raises(self):
+        path = self._write_config("""\
+            - connector: rc-home
+              session_id: sticky-1
+              room: "*"
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        self.assertIn("'session_id' cannot be set on", str(ctx.exception))
+
+    def test_wildcard_rule_with_exclude_room(self):
+        path = self._write_config("""\
+            - connector: rc-home
+              room: "*"
+              exclude_room: [general, dev]
+        """)
+        config = GatewayConfig.from_file(path)
+        self.assertEqual(config.watcher_rules[0].exclude_rooms, ["general", "dev"])
+
+    def test_two_wildcard_rules_same_connector_raises(self):
+        path = self._write_config("""\
+            - connector: rc-home
+              room: "*"
+            - connector: rc-home
+              room: "*"
+              exclude_room: [general]
+        """)
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(path)
         msg = str(ctx.exception)
-        self.assertIn('room: "*"', msg)
-        self.assertIn("not implemented yet", msg)
+        self.assertIn("Multiple room: \"*\" rules", msg)
+        self.assertIn("rc-home", msg)
+
+    def test_wildcard_rules_on_different_connectors_both_allowed(self):
+        cfg = textwrap.dedent("""\
+            connectors:
+              - name: rc-home
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+              - name: mm-home
+                type: mattermost
+                server: {url: http://localhost:8065, team: home, username: bot, password: pw}
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watchers:
+              - connector: rc-home
+                room: "*"
+              - connector: mm-home
+                room: "*"
+        """)
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(cfg)
+            path = f.name
+        config = GatewayConfig.from_file(path)
+        self.assertEqual(len(config.watcher_rules), 2)
+        self.assertEqual({r.connector for r in config.watcher_rules}, {"rc-home", "mm-home"})
+
+    def test_wildcard_rooms_plural_single_wildcard_is_also_a_rule(self):
+        path = self._write_config("""\
+            - connector: rc-home
+              rooms: ["*"]
+        """)
+        config = GatewayConfig.from_file(path)
+        self.assertEqual(config.watchers, [])
+        self.assertEqual(len(config.watcher_rules), 1)
+
+    def test_wildcard_mixed_with_real_room_in_rooms_list_is_not_a_rule(self):
+        """rooms: ["*", "general"] is NOT a meaningful rule shape — falls
+        through to ordinary per-room handling, which fails safely (not
+        silently) since "*" can't be sanitized into a real watcher name."""
+        path = self._write_config("""\
+            - connector: rc-home
+              rooms: ["*", "general"]
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        self.assertIn("Could not derive a safe watcher name", str(ctx.exception))
 
     def test_exclude_room_without_wildcard_room_raises(self):
         path = self._write_config("""\

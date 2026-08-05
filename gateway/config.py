@@ -41,6 +41,8 @@ from .core.config import (  # noqa: F401 — re-exports
     ToolRule,
     WatcherConfig,
 )
+from .core.config import auto_watcher_name as _auto_watcher_name  # noqa: F401 — re-export
+from .core.config import sanitize_room_for_name as _sanitize_room_for_name  # noqa: F401 — re-export
 
 # v0.2's global `*_defaults:` blocks (removed in v0.3 — see docs/migration-0.3.md) merged
 # flatly and unconditionally into EVERY entry of a kind, regardless of type: setting
@@ -104,6 +106,13 @@ class GatewayConfig:
     agents: dict[str, AgentConfig]
     default_agent: str
     watchers: list[WatcherConfig] = field(default_factory=list)
+    # Rule-based room-matching templates (room: "*" entries) — never started
+    # directly; consulted at runtime by WatcherLifecycle.try_lazy_create()
+    # (docs/design/on-the-fly-watchers.md). Deliberately a SEPARATE list from
+    # `watchers` (never a flag on a shared list) — sync_watchers()/
+    # _start_watcher() call resolve_room(wc.room) on every entry in
+    # `watchers`, and "*" is not a real room.
+    watcher_rules: list[WatcherConfig] = field(default_factory=list)
     max_queue_depth: int = 100  # max pending messages per room queue; 0 = unbounded
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
 
@@ -241,7 +250,16 @@ class GatewayConfig:
         )
 
         seen_watcher_names: set[str] = set()
+        watcher_rules: list[WatcherConfig] = []
         for i, wc_raw in enumerate(watchers_raw):
+            if _is_wildcard_room_entry(wc_raw):
+                watcher_rules.append(
+                    _parse_one_watcher_rule(
+                        wc_raw, i, watcher_templates, connector_names, connectors,
+                        agents, default_agent, config_dir,
+                    )
+                )
+                continue
             watchers.extend(
                 _parse_one_watcher_entry(
                     wc_raw, i, watcher_templates, connector_names, connectors, agents,
@@ -262,6 +280,19 @@ class GatewayConfig:
                     )
                 seen_session_ids.add(wc.session_id)
 
+        # At most one room: "*" rule per connector — kills the "which rule's
+        # agent wins when a room matches more than one" ambiguity by
+        # construction (docs/design/on-the-fly-watchers.md).
+        seen_rule_connectors: set[str] = set()
+        for rule in watcher_rules:
+            if rule.connector in seen_rule_connectors:
+                raise ValueError(
+                    f"Multiple room: \"*\" rules found for connector "
+                    f"'{rule.connector}' — at most one wildcard rule is "
+                    "allowed per connector today."
+                )
+            seen_rule_connectors.add(rule.connector)
+
         max_queue_depth = _parse_max_queue_depth(raw)
 
         # ── Scheduler ─────────────────────────────────────────────────────────
@@ -273,6 +304,7 @@ class GatewayConfig:
             agents=agents,
             default_agent=default_agent,
             watchers=watchers,
+            watcher_rules=watcher_rules,
             max_queue_depth=max_queue_depth,
             scheduler=scheduler_cfg,
         )
@@ -497,34 +529,6 @@ def _resolve_tool_entries(
                 f"{field_name}: {e}"
             ) from e
     return rules
-
-
-_NAME_SANITIZE_RE = re.compile(r"[^A-Za-z0-9._-]")
-_NAME_COLLAPSE_DASH_RE = re.compile(r"-{2,}")
-
-
-def _sanitize_room_for_name(room: str) -> str:
-    """Turn a room identifier into a filesystem/CLI-safe watcher-name fragment.
-
-    - A leading '@' (DM room, e.g. '@alice') becomes a 'dm-' prefix: '@alice' -> 'dm-alice'.
-    - Any character outside [A-Za-z0-9._-] (including '/') becomes '-'.
-    - Runs of '-' collapse to one; leading/trailing '-' and '.' are stripped.
-    """
-    prefix = "dm-" if room.startswith("@") else ""
-    body = room[1:] if room.startswith("@") else room
-    body = _NAME_SANITIZE_RE.sub("-", body)
-    sanitized = _NAME_COLLAPSE_DASH_RE.sub("-", prefix + body).strip("-.")
-    if not sanitized:
-        raise ValueError(
-            f"Could not derive a safe watcher name from room {room!r} — "
-            "set an explicit 'name:' for this entry."
-        )
-    return sanitized
-
-
-def _auto_watcher_name(connector: str, room: str) -> str:
-    """Deterministic watcher name for a (connector, room) pair: '<connector>-<room>'."""
-    return f"{connector}-{_sanitize_room_for_name(room)}"
 
 
 def _resolve_paths(paths: list, base_dir: Path) -> list[str]:
@@ -888,6 +892,197 @@ def _parse_one_agent(
     return agent_cfg
 
 
+def _resolve_watcher_connector(
+    wc: dict, index: int, connector_names: set[str], connectors: list[ConnectorConfig],
+) -> str:
+    """Shared by _parse_one_watcher_entry() and _parse_one_watcher_rule() —
+    identical resolution rules apply to a rule's 'connector' as to a
+    concrete watcher's."""
+    watcher_connector = wc.get("connector", "")
+    if watcher_connector and not isinstance(watcher_connector, str):
+        # PR review finding: a truthy-but-non-string 'connector' (e.g. a
+        # YAML list) reached `watcher_connector not in connector_names` (a
+        # set) unchecked, crashing with an uncaught TypeError instead of a
+        # clean ValueError.
+        raise ValueError(
+            f"Watcher entry at index {index}: 'connector' must be a string "
+            f"(got {type(watcher_connector).__name__})."
+        )
+    if watcher_connector and watcher_connector not in connector_names:
+        raise ValueError(
+            f"Watcher entry at index {index} references unknown connector "
+            f"'{watcher_connector}'"
+        )
+    if not watcher_connector and not connectors:
+        # from_file() can never reach this function with an empty
+        # `connectors` list (an earlier structural check already raised),
+        # and collect_config() guards against it too (its own "no connectors
+        # parsed successfully" branch returns before ever reaching the
+        # watcher loop) — but EditableConfig.expanded_watchers() calls this
+        # function directly, per raw watcher entry, against whatever partial
+        # `connectors` collect_config() returned, so an all-connectors-failed
+        # config CAN legitimately land here. Without this guard,
+        # `connectors[0].name` below raises an uncaught IndexError instead
+        # of the ValueError every caller's `except ValueError` expects.
+        raise ValueError(
+            f"Watcher entry at index {index} has no explicit 'connector' set "
+            "and no connectors are configured to default to."
+        )
+    return watcher_connector or connectors[0].name
+
+
+def _resolve_watcher_agent(
+    wc: dict, index: int, agents: dict[str, AgentConfig], default_agent: str,
+) -> str:
+    """Shared by _parse_one_watcher_entry() and _parse_one_watcher_rule()."""
+    watcher_agent = wc.get("agent", default_agent)
+    if not isinstance(watcher_agent, str):
+        # PR review finding: same class of bug as 'connector' above — a
+        # truthy-but-non-string 'agent' (e.g. a YAML list) reached
+        # `watcher_agent not in agents` (a dict) unchecked, crashing with
+        # an uncaught TypeError instead of a clean ValueError.
+        raise ValueError(
+            f"Watcher entry at index {index}: 'agent' must be a string "
+            f"(got {type(watcher_agent).__name__})."
+        )
+    if watcher_agent not in agents:
+        raise ValueError(
+            f"Watcher entry at index {index} references unknown agent "
+            f"'{watcher_agent}'"
+        )
+    return watcher_agent
+
+
+def _parse_watcher_history_handoff(wc: dict) -> HistoryHandoffConfig:
+    """Shared by _parse_one_watcher_entry() and _parse_one_watcher_rule().
+    Defaults sourced from module-level _HH_DEFAULTS — see its docstring above."""
+    hh_raw = wc.get("history_handoff", {}) or {}
+    return HistoryHandoffConfig(
+        enabled=hh_raw.get("enabled", _HH_DEFAULTS.enabled),
+        fetch_count=hh_raw.get("fetch_count", _HH_DEFAULTS.fetch_count),
+        verbatim_tail=hh_raw.get("verbatim_tail", _HH_DEFAULTS.verbatim_tail),
+    )
+
+
+def _is_wildcard_room_entry(wc_raw: object) -> bool:
+    """True for a raw `watchers:` entry that is a room: "*" rule
+    (docs/design/on-the-fly-watchers.md) rather than a concrete watcher.
+
+    Checked directly against the RAW entry, before `inherits:` resolution —
+    'room'/'rooms' are forbidden keys inside `watcher_templates:` blocks
+    (see the `frozenset({"name", "room", "rooms", ...})` passed to
+    `_parse_templates_block` below), so a template can never itself
+    contribute the wildcard; whether an entry is a rule is always fully
+    determined by its own raw 'room'/'rooms' key.
+
+    `rooms: ["*"]` (plural form, single wildcard element) counts too, for
+    consistency with 'room' being a documented alias for a single-item
+    'rooms' list. `rooms: ["*", "general"]` (wildcard mixed with real room
+    names) deliberately does NOT count — that is not a meaningful rule
+    shape, and falls through to _parse_one_watcher_entry()'s ordinary
+    per-room handling, where auto-naming a room literally called "*" fails
+    with a clear (if generic) "could not derive a safe watcher name" error
+    rather than silently doing something unintended.
+    """
+    if not isinstance(wc_raw, Mapping):
+        return False
+    if wc_raw.get("room") == "*":
+        return True
+    rooms = wc_raw.get("rooms")
+    return isinstance(rooms, list) and rooms == ["*"]
+
+
+def _parse_one_watcher_rule(
+    wc_raw: object,
+    index: int,
+    watcher_templates: dict[str, dict],
+    connector_names: set[str],
+    connectors: list[ConnectorConfig],
+    agents: dict[str, AgentConfig],
+    default_agent: str,
+    config_dir: Path,
+) -> WatcherConfig:
+    """Parses ONE raw `watchers:` entry whose room is the wildcard "*" into
+    a single rule-shaped WatcherConfig (docs/design/on-the-fly-watchers.md).
+
+    Callers MUST route the result into `GatewayConfig.watcher_rules`, never
+    into `watchers` — see `_is_wildcard_room_entry()`'s caller in
+    from_file()/collect_config() for the dispatch. A rule is never started
+    directly; it is only ever consulted by
+    `WatcherLifecycle.try_lazy_create()` at runtime.
+
+    Mirrors _parse_one_watcher_entry()'s resolution for every field a rule
+    shares with a concrete watcher (connector, agent, context_inject_files,
+    history_handoff, online/offline_notification) via the same shared
+    helpers; diverges on 'room' (always "*", plus 'exclude_room' parsing)
+    and rejects 'name'/'session_id' outright — neither makes sense before a
+    real room is even known.
+    """
+    if not isinstance(wc_raw, Mapping):
+        raise ValueError(
+            f"Watcher entry at index {index} must be a mapping "
+            f"(got {type(wc_raw).__name__})."
+        )
+    wc = _resolve_inherits(
+        wc_raw, watcher_templates, "watcher_templates",
+        "Watcher entry", f"index {index}",
+    )
+
+    if wc.get("name"):
+        raise ValueError(
+            f"Watcher entry at index {index}: 'name' cannot be set on a "
+            'room: "*" rule — a concrete name is auto-generated per '
+            "matched room when a watcher is actually created for it."
+        )
+    if wc.get("session_id"):
+        raise ValueError(
+            f"Watcher entry at index {index}: 'session_id' cannot be set on "
+            'a room: "*" rule — sticky session pinning requires a single '
+            "known room, which a rule does not have."
+        )
+
+    raw_exclude = wc.get("exclude_room")
+    exclude_rooms: list[str] = []
+    if raw_exclude is not None:
+        if not isinstance(raw_exclude, list) or not raw_exclude:
+            raise ValueError(
+                f"Watcher entry at index {index}: 'exclude_room' must be a "
+                "non-empty list of room names."
+            )
+        if not all(isinstance(r, str) and r for r in raw_exclude):
+            raise ValueError(
+                f"Watcher entry at index {index}: 'exclude_room' entries "
+                "must be non-empty strings."
+            )
+        if len(set(raw_exclude)) != len(raw_exclude):
+            dupes = sorted({r for r in raw_exclude if raw_exclude.count(r) > 1})
+            raise ValueError(
+                f"Watcher entry at index {index}: 'exclude_room' contains "
+                f"duplicate room(s): {dupes}."
+            )
+        exclude_rooms = list(raw_exclude)
+
+    resolved_connector = _resolve_watcher_connector(wc, index, connector_names, connectors)
+    watcher_agent = _resolve_watcher_agent(wc, index, agents, default_agent)
+
+    raw_ctx = wc.get("context_inject_files", [])
+    ctx_files = _resolve_paths(raw_ctx, config_dir)
+    history_handoff = _parse_watcher_history_handoff(wc)
+
+    return WatcherConfig(
+        name="",
+        connector=resolved_connector,
+        room="*",
+        agent=watcher_agent,
+        session_id=None,
+        exclude_rooms=exclude_rooms,
+        context_inject_files=ctx_files,
+        online_notification=wc.get("online_notification"),
+        offline_notification=wc.get("offline_notification"),
+        history_handoff=history_handoff,
+    )
+
+
 def _parse_one_watcher_entry(
     wc_raw: object,
     index: int,
@@ -962,44 +1157,26 @@ def _parse_one_watcher_entry(
             "'room' or 'rooms' field"
         )
 
-    # ── exclude_room: only meaningful alongside room: "*" ──────────────────
-    # (docs/design/on-the-fly-watchers.md). Shape is validated now so this
-    # field is test-covered ahead of the actual rule-matching engine, but
-    # room: "*" itself is rejected below — accepting it today would let a
-    # user configure a watcher the runtime has no way to act on correctly
-    # (there's no room literally named "*").
-    raw_exclude = wc.get("exclude_room")
-    if raw_exclude is not None:
-        if not isinstance(raw_exclude, list) or not raw_exclude:
-            raise ValueError(
-                f"Watcher entry at index {index}: 'exclude_room' must be a "
-                "non-empty list of room names."
-            )
-        if not all(isinstance(r, str) and r for r in raw_exclude):
-            raise ValueError(
-                f"Watcher entry at index {index}: 'exclude_room' entries "
-                "must be non-empty strings."
-            )
-        if len(set(raw_exclude)) != len(raw_exclude):
-            dupes = sorted({r for r in raw_exclude if raw_exclude.count(r) > 1})
-            raise ValueError(
-                f"Watcher entry at index {index}: 'exclude_room' contains "
-                f"duplicate room(s): {dupes}."
-            )
-
-    is_wildcard_room = rooms_list == ["*"]
-    if raw_exclude is not None and not is_wildcard_room:
+    # ── exclude_room: only valid on a room: "*" rule ────────────────────────
+    # (docs/design/on-the-fly-watchers.md). A rule-shaped raw entry never
+    # reaches this function — see _is_wildcard_room_entry()'s caller in
+    # from_file()/collect_config(), which routes it to
+    # _parse_one_watcher_rule() instead — so an 'exclude_room' seen HERE is
+    # necessarily attached to a non-wildcard room/rooms and is always an error.
+    if wc.get("exclude_room") is not None:
         raise ValueError(
             f"Watcher entry at index {index}: 'exclude_room' is only valid "
             "when 'room' is the wildcard \"*\" — it has no meaning against "
             "an explicit room name or a 'rooms:' list."
         )
-    if is_wildcard_room:
+    if rooms_list == ["*"]:
+        # Defensive only — every real caller routes a wildcard entry to
+        # _parse_one_watcher_rule() before ever reaching here (see
+        # _is_wildcard_room_entry()). Reaching this branch means some
+        # caller didn't; that's a caller bug, not a config error.
         raise ValueError(
-            f"Watcher entry at index {index}: room: \"*\" (rule-based room "
-            "matching / on-the-fly watchers) is not implemented yet — use an "
-            "explicit 'room:' or 'rooms:' list for now. See "
-            "docs/design/on-the-fly-watchers.md."
+            f"Watcher entry at index {index}: room: \"*\" must be parsed by "
+            "_parse_one_watcher_rule(), not _parse_one_watcher_entry()."
         )
 
     # 'name' / 'session_id' pin a single sticky identity — only meaningful
@@ -1042,65 +1219,14 @@ def _parse_one_watcher_entry(
                 "entries."
             )
 
-    watcher_connector = wc.get("connector", "")
-    if watcher_connector and not isinstance(watcher_connector, str):
-        # PR review finding: same class of bug as 'name'/'session_id' above
-        # — a truthy-but-non-string 'connector' (e.g. a YAML list) reached
-        # `watcher_connector not in connector_names` (a set) unchecked,
-        # crashing with an uncaught TypeError instead of a clean ValueError.
-        raise ValueError(
-            f"Watcher entry at index {index}: 'connector' must be a string "
-            f"(got {type(watcher_connector).__name__})."
-        )
-    if watcher_connector and watcher_connector not in connector_names:
-        raise ValueError(
-            f"Watcher entry at index {index} references unknown connector "
-            f"'{watcher_connector}'"
-        )
-    if not watcher_connector and not connectors:
-        # from_file() can never reach this function with an empty
-        # `connectors` list (an earlier structural check already raised),
-        # and collect_config() guards against it too (its own "no connectors
-        # parsed successfully" branch returns before ever reaching the
-        # watcher loop) — but EditableConfig.expanded_watchers() calls this
-        # function directly, per raw watcher entry, against whatever partial
-        # `connectors` collect_config() returned, so an all-connectors-failed
-        # config CAN legitimately land here. Without this guard,
-        # `connectors[0].name` below raises an uncaught IndexError instead
-        # of the ValueError every caller's `except ValueError` expects.
-        raise ValueError(
-            f"Watcher entry at index {index} has no explicit 'connector' set "
-            "and no connectors are configured to default to."
-        )
-    resolved_connector = watcher_connector or connectors[0].name
-
-    watcher_agent = wc.get("agent", default_agent)
-    if not isinstance(watcher_agent, str):
-        # PR review finding: same class of bug as 'connector' above — a
-        # truthy-but-non-string 'agent' (e.g. a YAML list) reached
-        # `watcher_agent not in agents` (a dict) unchecked, crashing with
-        # an uncaught TypeError instead of a clean ValueError.
-        raise ValueError(
-            f"Watcher entry at index {index}: 'agent' must be a string "
-            f"(got {type(watcher_agent).__name__})."
-        )
-    if watcher_agent not in agents:
-        raise ValueError(
-            f"Watcher entry at index {index} references unknown agent "
-            f"'{watcher_agent}'"
-        )
+    resolved_connector = _resolve_watcher_connector(wc, index, connector_names, connectors)
+    watcher_agent = _resolve_watcher_agent(wc, index, agents, default_agent)
 
     # Resolve watcher-level context_inject_files (shared across expanded rooms)
     raw_ctx = wc.get("context_inject_files", [])
     ctx_files = _resolve_paths(raw_ctx, config_dir)
 
-    # Defaults sourced from module-level _HH_DEFAULTS — see its docstring above.
-    hh_raw = wc.get("history_handoff", {}) or {}
-    history_handoff = HistoryHandoffConfig(
-        enabled=hh_raw.get("enabled", _HH_DEFAULTS.enabled),
-        fetch_count=hh_raw.get("fetch_count", _HH_DEFAULTS.fetch_count),
-        verbatim_tail=hh_raw.get("verbatim_tail", _HH_DEFAULTS.verbatim_tail),
-    )
+    history_handoff = _parse_watcher_history_handoff(wc)
 
     # Names are staged here, NOT written into `seen_watcher_names` directly,
     # until this whole entry finishes successfully (committed just before
@@ -1561,12 +1687,24 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
         )
 
     seen_watcher_names: set[str] = set()
+    watcher_rules: list[WatcherConfig] = []
     for i, wc_raw in enumerate(watchers_raw):
         # See the identical connector-loop comment above: only ever use
         # name_hint when it's genuinely a usable string.
         name_hint = wc_raw.get("name") if isinstance(wc_raw, Mapping) else None
         if not isinstance(name_hint, str) or not name_hint:
             name_hint = None
+        if _is_wildcard_room_entry(wc_raw):
+            try:
+                watcher_rules.append(
+                    _parse_one_watcher_rule(
+                        wc_raw, i, watcher_templates, connector_names, connectors,
+                        agents, default_agent, config_dir,
+                    )
+                )
+            except ValueError as exc:
+                issues.append(ConfigIssue("watcher", name_hint or f"(index {i})", str(exc)))
+            continue
         try:
             watchers.extend(
                 _parse_one_watcher_entry(
@@ -1593,6 +1731,22 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
             else:
                 seen_session_ids.add(wc.session_id)
 
+    # At most one room: "*" rule per connector — same reasoning as
+    # from_file()'s own post-loop pass.
+    seen_rule_connectors: set[str] = set()
+    for rule in watcher_rules:
+        if rule.connector in seen_rule_connectors:
+            issues.append(
+                ConfigIssue(
+                    "global", None,
+                    f"Multiple room: \"*\" rules found for connector "
+                    f"'{rule.connector}' — at most one wildcard rule is "
+                    "allowed per connector today.",
+                )
+            )
+        else:
+            seen_rule_connectors.add(rule.connector)
+
     # max_queue_depth/scheduler: don't gate any single entity's validity —
     # collected as issues, falling back to safe defaults for the returned
     # config, rather than discarding all connector/agent/watcher progress.
@@ -1608,6 +1762,7 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
         agents=agents,
         default_agent=default_agent,
         watchers=watchers,
+        watcher_rules=watcher_rules,
         max_queue_depth=max_queue_depth,
         scheduler=scheduler_cfg,
     )

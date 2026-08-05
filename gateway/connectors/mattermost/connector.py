@@ -33,6 +33,7 @@ from ...core.adapter_utils import ts_ms_to_iso_local, weekday_abbrev
 from ...core.connector import (
     Connector,
     IncomingMessage,
+    LazyCreationHook,
     MessageHandler,
     Room,
 )
@@ -117,6 +118,10 @@ class MattermostConnector(Connector):
         )
         self._handler: MessageHandler | None = None
         self._capacity_check: Callable[[str], bool] | None = None
+        # docs/design/on-the-fly-watchers.md — set by SessionManager via
+        # register_lazy_creation_hook(); consulted by _on_posted_event()
+        # when a message arrives for a channel with no local _ChannelState.
+        self._lazy_creation_hook: LazyCreationHook | None = None
         self._channels: dict[str, _ChannelState] = {}  # channel_id -> state
         self._attachments_cache_base = (
             Path(config.attachments.cache_dir_global).expanduser() / config.name
@@ -245,6 +250,9 @@ class MattermostConnector(Connector):
     def register_capacity_check(self, check) -> None:
         self._capacity_check = check
 
+    def register_lazy_creation_hook(self, hook: LazyCreationHook) -> None:
+        self._lazy_creation_hook = hook
+
     # ── Outbound ─────────────────────────────────────────────────────────────
 
     async def send_text(
@@ -324,6 +332,17 @@ class MattermostConnector(Connector):
         return Room(
             id=info["id"],
             name=info.get("name", room_name),
+            type=info.get("type", "channel"),
+        )
+
+    async def resolve_room_by_id(self, room_id: str) -> Room:
+        """Reverse of resolve_room() — used by lazy watcher creation to
+        learn a channel's name from a raw channel_id before rule matching
+        (docs/design/on-the-fly-watchers.md)."""
+        info = await self._rest.get_channel_by_id(room_id)
+        return Room(
+            id=info["id"],
+            name=info.get("name", room_id),
             type=info.get("type", "channel"),
         )
 
@@ -642,7 +661,24 @@ class MattermostConnector(Connector):
         channel_id = post.get("channel_id", "")
         state = self._channels.get(channel_id)
         if not state:
-            return  # Not a channel any watcher is tracking — ignore.
+            # docs/design/on-the-fly-watchers.md: give a rule-matched
+            # channel a chance to get a watcher created on the spot before
+            # giving up on it. Never reached from the reconnect-replay path
+            # (_on_ws_reconnect only ever replays already-tracked channels,
+            # so `state` is never None there) — this only ever fires for
+            # live traffic in a channel with no watcher yet.
+            if self._lazy_creation_hook is not None:
+                try:
+                    created = await self._lazy_creation_hook(channel_id)
+                except Exception as e:
+                    logger.error(
+                        "Lazy creation hook raised for channel %s: %s", channel_id, e
+                    )
+                    created = False
+                if created:
+                    state = self._channels.get(channel_id)
+            if not state:
+                return  # Not a channel any watcher is tracking — ignore.
 
         msg_id = post.get("id", "")
         if msg_id and msg_id in state.seen_ids_set:

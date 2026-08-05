@@ -494,7 +494,7 @@ class TestCollectConfigOnTheFlyWatcherFields(_CollectConfigTestBase):
             any("must be strictly less than" in i.message for i in issues)
         )
 
-    def test_wildcard_room_is_a_collected_watcher_issue(self):
+    def test_wildcard_room_is_parsed_into_watcher_rules_not_watchers(self):
         config_path = self._write(f"""\
             connectors:
               - name: rc
@@ -512,7 +512,56 @@ class TestCollectConfigOnTheFlyWatcherFields(_CollectConfigTestBase):
         config, issues = collect_config(config_path)
         self.assertIsNotNone(config)
         self.assertEqual(config.watchers, [])
-        self.assertTrue(any("not implemented yet" in i.message for i in issues))
+        self.assertEqual(len(config.watcher_rules), 1)
+        self.assertEqual(issues, [])
+
+    def test_invalid_wildcard_rule_is_a_collected_watcher_issue(self):
+        config_path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - connector: rc
+                agent: default
+                name: bad-name-on-a-rule
+                room: "*"
+        """)
+        config, issues = collect_config(config_path)
+        self.assertIsNotNone(config)
+        self.assertEqual(config.watcher_rules, [])
+        self.assertTrue(any("cannot be set on a room: \"*\" rule" in i.message for i in issues))
+
+    def test_duplicate_wildcard_rule_per_connector_is_a_collected_issue(self):
+        config_path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - connector: rc
+                agent: default
+                room: "*"
+              - connector: rc
+                agent: default
+                room: "*"
+                exclude_room: [general]
+        """)
+        config, issues = collect_config(config_path)
+        self.assertIsNotNone(config)
+        # Fault-tolerant: both rules still parsed and returned individually...
+        self.assertEqual(len(config.watcher_rules), 2)
+        # ...but the ambiguity is flagged as an issue, same "collected, not
+        # silently accepted" treatment as the duplicate session_id check.
+        self.assertTrue(any("Multiple room: \"*\" rules" in i.message for i in issues))
 
 
 if __name__ == "__main__":
