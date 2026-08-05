@@ -246,7 +246,8 @@ a one-time reminder.
   nullable inheritable field, which is real product-design work, not a
   quick patch — worth a dedicated follow-up rather than a one-off hack
   scoped to just these two TTL fields. Until then, the workaround is
-  hand-editing `config.yaml` directly.
+  hand-editing `config.yaml` directly. Tracked as
+  [issue #78](https://github.com/HammerMei/agent-chat-gateway/issues/78).
 
 ## Sources (2026-08-02 research)
 
