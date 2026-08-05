@@ -401,6 +401,39 @@ class MattermostREST:
             posts = [p for p in posts if p.get("create_at", 0) >= after_ms]
         return posts
 
+    async def get_channel_by_id(self, channel_id: str) -> dict[str, Any]:
+        """Reverse of resolve_room(): look up a channel's info by its ID.
+
+        Needed by WatcherLifecycle.try_lazy_create() (docs/design/
+        on-the-fly-watchers.md) — a lazily-triggering incoming post only
+        carries a raw channel_id, but rule matching (exclude_room:) is
+        name-based like every other room field in this config, so the name
+        has to be resolved before a rule can be evaluated against it.
+
+        Same type mapping as resolve_room(): 'O' (public)/'P' (private) ->
+        "channel"/"group"; 'D' (direct message)/'G' (group direct message)
+        -> "dm" — callers that want to exclude DMs from wildcard matching
+        check for "dm" the same way they would from resolve_room().
+        """
+        try:
+            result = await self._request("GET", f"channels/{channel_id}")
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                raise RoomNotFoundError(f"Channel id '{channel_id}' not found") from e
+            raise
+        raw_type = result.get("type")
+        if raw_type in ("D", "G"):
+            room_type = "dm"
+        elif raw_type == "P":
+            room_type = "group"
+        else:
+            room_type = "channel"
+        return {
+            "id": result["id"],
+            "name": result.get("name", channel_id),
+            "type": room_type,
+        }
+
     async def resolve_room(self, room_name: str) -> dict[str, Any]:
         """Resolve a channel name to its info dict, within the configured team.
 

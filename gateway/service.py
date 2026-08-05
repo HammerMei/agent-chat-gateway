@@ -276,6 +276,12 @@ class GatewayService:
             connector_watchers = [
                 wc for wc in config.watchers if wc.connector == cc.name
             ]
+            # Same filtering for room: "*" rules (docs/design/
+            # on-the-fly-watchers.md) — each connector's WatcherLifecycle
+            # only ever needs to know about its own rules.
+            connector_rules = [
+                wr for wr in config.watcher_rules if wr.connector == cc.name
+            ]
             sm = SessionManager(
                 connector=connector,
                 agents=agents,
@@ -283,6 +289,7 @@ class GatewayService:
                 config=core_config,
                 state_name=cc.name,
                 watcher_configs=connector_watchers,
+                watcher_rules=connector_rules,
                 permission_registry=self._registry,
                 session_maps=self._maps,
             )

@@ -10,6 +10,7 @@ belong in the connector's own config (e.g. RocketChatConfig).
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -199,10 +200,19 @@ class HistoryHandoffConfig:
 
 @dataclass
 class WatcherConfig:
-    """Static definition of a watcher (connector + room + agent binding).
+    """Static definition of a watcher (connector + room + agent binding), OR
+    a rule-based room-matching template (docs/design/on-the-fly-watchers.md).
 
-    Defined in config.yaml under 'watchers:'. The gateway starts all configured
-    watchers on startup — no runtime add-watcher commands are needed.
+    Concrete watchers are defined in config.yaml under 'watchers:' and are
+    started eagerly at gateway startup — no runtime add-watcher commands are
+    needed for these. A 'room: "*"' entry is parsed into a SEPARATE list,
+    ``GatewayConfig.watcher_rules`` — never into ``watchers`` — and is never
+    started directly; it is only ever consulted by
+    ``WatcherLifecycle.try_lazy_create()`` when a message arrives for a room
+    with no existing watcher, to decide whether (and with which agent) to
+    create one on the spot. ``exclude_rooms`` is only meaningful on a rule
+    (``room == "*"``) — a concrete watcher's `room` is a single real room
+    name and has nothing to exclude.
 
     session_id:
       - Set to a session ID string to pin this watcher to an existing session (sticky).
@@ -211,18 +221,53 @@ class WatcherConfig:
         The generated session ID is stored in state.json and cleared by 'reset'.
     """
 
-    name: str                                        # unique watcher name (used in CLI commands)
+    name: str                                        # unique watcher name (used in CLI commands); unused on a rule
     connector: str                                   # must match a ConnectorConfig.name
-    room: str                                        # room name or @username for DM
+    room: str                                        # room name, @username for DM, or "*" for a rule
     agent: str                                       # must match an AgentConfig.name
     session_id: str | None = None                    # sticky session ID; None = auto-create
-    exclude_rooms: list[str] = field(default_factory=list)  # only meaningful once room == "*" is
-    # supported (docs/design/on-the-fly-watchers.md) — the config loader currently rejects
-    # room == "*" with a clear "not implemented yet" error, so this is always empty today.
+    exclude_rooms: list[str] = field(default_factory=list)  # only meaningful on a rule (room == "*")
     context_inject_files: list[str] = field(default_factory=list)  # watcher-level context (layer 3)
     online_notification: str | None = None   # message text on startup; None = suppress (default: quiet)
     offline_notification: str | None = None  # message text on shutdown; None = suppress (default: quiet)
     history_handoff: HistoryHandoffConfig = field(default_factory=HistoryHandoffConfig)  # session context recovery
+
+
+# ── Watcher naming ───────────────────────────────────────────────────────────
+# Lives in core (not gateway/config.py, the YAML loader) because
+# WatcherLifecycle.try_lazy_create() (docs/design/on-the-fly-watchers.md)
+# needs the exact same deterministic naming at runtime, when a rule-matched
+# room gets a watcher created on the spot — core does not import from the
+# top-level gateway.config module (that module imports FROM core and
+# re-exports; the dependency only ever goes one direction). gateway/config.py
+# re-exports both names below for existing callers/tests.
+
+_NAME_SANITIZE_RE = re.compile(r"[^A-Za-z0-9._-]")
+_NAME_COLLAPSE_DASH_RE = re.compile(r"-{2,}")
+
+
+def sanitize_room_for_name(room: str) -> str:
+    """Turn a room identifier into a filesystem/CLI-safe watcher-name fragment.
+
+    - A leading '@' (DM room, e.g. '@alice') becomes a 'dm-' prefix: '@alice' -> 'dm-alice'.
+    - Any character outside [A-Za-z0-9._-] (including '/') becomes '-'.
+    - Runs of '-' collapse to one; leading/trailing '-' and '.' are stripped.
+    """
+    prefix = "dm-" if room.startswith("@") else ""
+    body = room[1:] if room.startswith("@") else room
+    body = _NAME_SANITIZE_RE.sub("-", body)
+    sanitized = _NAME_COLLAPSE_DASH_RE.sub("-", prefix + body).strip("-.")
+    if not sanitized:
+        raise ValueError(
+            f"Could not derive a safe watcher name from room {room!r} — "
+            "set an explicit 'name:' for this entry."
+        )
+    return sanitized
+
+
+def auto_watcher_name(connector: str, room: str) -> str:
+    """Deterministic watcher name for a (connector, room) pair: '<connector>-<room>'."""
+    return f"{connector}-{sanitize_room_for_name(room)}"
 
 
 # ── CoreConfig ───────────────────────────────────────────────────────────────

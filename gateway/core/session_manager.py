@@ -49,6 +49,7 @@ class SessionManager:
         config: CoreConfig,
         state_name: str = "default",
         watcher_configs: list[WatcherConfig] | None = None,
+        watcher_rules: list[WatcherConfig] | None = None,
         permission_registry: PermissionRegistry | None = None,
         session_maps: SessionMaps | None = None,
     ) -> None:
@@ -70,6 +71,7 @@ class SessionManager:
             injector=self._injector,
             permission_registry=permission_registry,
             maps=maps,
+            watcher_rules=watcher_rules,
         )
 
     # ── Main entry point ──────────────────────────────────────────────────────
@@ -105,6 +107,7 @@ class SessionManager:
         """
         self._connector.register_handler(self._dispatcher.dispatch)
         self._connector.register_capacity_check(self._dispatcher.has_capacity)
+        self._connector.register_lazy_creation_hook(self._lifecycle.try_lazy_create)
         await self._connector.connect()
         errors = await self._lifecycle.sync_watchers(unavailable_agents=unavailable_agents)
         logger.info("SessionManager ready (run_once)")

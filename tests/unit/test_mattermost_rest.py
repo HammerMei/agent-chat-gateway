@@ -314,6 +314,64 @@ class TestResolveRoom(unittest.IsolatedAsyncioTestCase):
             await rest.resolve_room("general")
 
 
+class TestGetChannelById(unittest.IsolatedAsyncioTestCase):
+    """docs/design/on-the-fly-watchers.md: reverse of resolve_room(), used
+    by lazy watcher creation to resolve a raw channel_id to a name before
+    rule matching."""
+
+    async def test_resolves_public_channel(self):
+        rest = _make_rest(token="tok")
+        rest._request = AsyncMock(return_value={"id": "chan-1", "name": "general", "type": "O"})
+
+        result = await rest.get_channel_by_id("chan-1")
+
+        self.assertEqual(result, {"id": "chan-1", "name": "general", "type": "channel"})
+        rest._request.assert_called_once_with("GET", "channels/chan-1")
+
+    async def test_private_channel_type_mapped_to_group(self):
+        rest = _make_rest(token="tok")
+        rest._request = AsyncMock(return_value={"id": "chan-1", "name": "priv", "type": "P"})
+
+        result = await rest.get_channel_by_id("chan-1")
+        self.assertEqual(result["type"], "group")
+
+    async def test_direct_message_type_mapped_to_dm(self):
+        rest = _make_rest(token="tok")
+        rest._request = AsyncMock(return_value={"id": "dm-1", "name": "dm-name", "type": "D"})
+
+        result = await rest.get_channel_by_id("dm-1")
+        self.assertEqual(result["type"], "dm")
+
+    async def test_group_direct_message_type_mapped_to_dm(self):
+        rest = _make_rest(token="tok")
+        rest._request = AsyncMock(return_value={"id": "gdm-1", "name": "gdm-name", "type": "G"})
+
+        result = await rest.get_channel_by_id("gdm-1")
+        self.assertEqual(result["type"], "dm")
+
+    async def test_channel_not_found_raises(self):
+        rest = _make_rest(token="tok")
+        rest._request = AsyncMock(
+            side_effect=httpx.HTTPStatusError(
+                "404", request=httpx.Request("GET", "http://x"),
+                response=httpx.Response(404, request=httpx.Request("GET", "http://x")),
+            )
+        )
+        with self.assertRaises(RoomNotFoundError):
+            await rest.get_channel_by_id("nonexistent")
+
+    async def test_non_404_http_error_propagates(self):
+        rest = _make_rest(token="tok")
+        rest._request = AsyncMock(
+            side_effect=httpx.HTTPStatusError(
+                "500", request=httpx.Request("GET", "http://x"),
+                response=httpx.Response(500, request=httpx.Request("GET", "http://x")),
+            )
+        )
+        with self.assertRaises(httpx.HTTPStatusError):
+            await rest.get_channel_by_id("chan-1")
+
+
 # ── 401 re-login behavior (login mode vs token mode) ─────────────────────────
 
 

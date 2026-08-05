@@ -14,7 +14,7 @@ from datetime import datetime
 from ..agents import AgentBackend
 from .adapter_utils import ts_gt as _ts_gt
 from .attachment_workspace import AttachmentWorkspace
-from .config import CoreConfig, WatcherConfig
+from .config import CoreConfig, WatcherConfig, auto_watcher_name
 from .connector import Connector
 from .dispatch import MessageDispatcher
 from .history_context import format_history_context
@@ -50,6 +50,7 @@ class WatcherLifecycle:
         injector: InjectedContextBuilder,
         permission_registry: PermissionRegistry | None,
         maps: SessionMaps,
+        watcher_rules: "list[WatcherConfig] | None" = None,
     ) -> None:
         self._connector = connector
         self._agents = agents
@@ -63,6 +64,13 @@ class WatcherLifecycle:
         self._maps = maps
         self._attachment_workspace = AttachmentWorkspace(connector)
         self._blocked_agents: set[str] = set()
+        # room: "*" rule-based room-matching templates for this connector
+        # (docs/design/on-the-fly-watchers.md) — already pre-filtered to
+        # this connector by the caller, same convention as watcher_configs.
+        # Optional (defaults to none) so every existing caller/test
+        # constructing a WatcherLifecycle without lazy creation in mind
+        # keeps working unchanged.
+        self._watcher_rules: list[WatcherConfig] = watcher_rules or []
 
         self._processors: dict[str, MessageProcessor] = {}
         self._states: dict[str, WatcherState] = {}
@@ -167,6 +175,117 @@ class WatcherLifecycle:
         if name not in self._watcher_locks:
             self._watcher_locks[name] = asyncio.Lock()
         return self._watcher_locks[name]
+
+    # ── Lazy (rule-matched) watcher creation ─────────────────────────────────
+    # docs/design/on-the-fly-watchers.md. Called by a connector when a
+    # message arrives for a room with no existing watcher/state — see
+    # MattermostConnector._on_posted_event's hook. RC has no equivalent
+    # caller yet (see the design doc's "trigger point differs by connector"
+    # section) — this method itself is connector-agnostic and will be
+    # reused once RC's own event-hook-triggered path is built.
+
+    async def try_lazy_create(self, room_id: str) -> bool:
+        """Resolve `room_id`, check it against this connector's watcher_rules,
+        and — if exactly one rule matches — create a full watcher for it on
+        the spot (subscribe, session, processor; the same `_start_watcher()`
+        every static watcher goes through).
+
+        Returns True if a watcher now exists for this room (either just
+        created here, or already existing — e.g. two near-simultaneous
+        callers) and the caller should proceed with processing the
+        triggering message. Returns False if no rule matches (or resolution/
+        creation failed) and the caller should keep dropping messages for
+        this room, exactly as before this feature existed.
+
+        Never raises — a resolution or creation failure is logged and
+        treated as "no match", not propagated to the connector's message-
+        handling loop.
+        """
+        if not self._watcher_rules:
+            return False
+
+        try:
+            room = await self._connector.resolve_room_by_id(room_id)
+        except Exception as e:
+            logger.warning(
+                "try_lazy_create: failed to resolve room id=%s: %s", room_id, e
+            )
+            return False
+
+        # Wildcard rules match channels only, never DMs — binding an agent
+        # to every DM the bot account has is very unlikely to be the intent
+        # of "listen to all rooms I have access to" (docs/design/
+        # on-the-fly-watchers.md, decided 2026-08-05).
+        if room.type == "dm":
+            return False
+
+        # At most one rule per connector is enforced at config-load time
+        # (gateway/config.py) — never ambiguous which rule's agent to use.
+        rule = self._watcher_rules[0]
+        if room.name in rule.exclude_rooms:
+            return False
+
+        watcher_name = auto_watcher_name(rule.connector, room.name)
+
+        async with self._get_watcher_lock(watcher_name):
+            # Collision/idempotency check deliberately lives INSIDE the
+            # lock, not before it: two DIFFERENT rooms that sanitize to the
+            # SAME auto-generated name (e.g. differing only in punctuation
+            # stripped by sanitize_room_for_name()) arrive on Mattermost via
+            # two INDEPENDENT per-channel worker queues (websocket.py's
+            # _dispatch()) — they are not naturally serialized against each
+            # other the way two messages for the SAME room are. Checking
+            # before the lock would let both callers race past a "no
+            # collision yet" read before either had registered anything.
+            existing = self.get_watcher_config(watcher_name)
+            if existing is not None and existing.room != room.name:
+                logger.error(
+                    "try_lazy_create: auto-generated name '%s' for room "
+                    "'%s' collides with an existing watcher for a "
+                    "different room ('%s') — refusing to create.",
+                    watcher_name, room.name, existing.room,
+                )
+                return False
+            if watcher_name in self._processors:
+                # Already running — either a concurrent caller for this
+                # exact room won the race while we waited for the lock, or
+                # (rare) a static watcher of the same name is already live.
+                return True
+
+            wc = WatcherConfig(
+                name=watcher_name,
+                connector=rule.connector,
+                room=room.name,
+                agent=rule.agent,
+                session_id=None,
+                exclude_rooms=[],
+                context_inject_files=rule.context_inject_files,
+                online_notification=rule.online_notification,
+                offline_notification=rule.offline_notification,
+                history_handoff=rule.history_handoff,
+            )
+            # Resume a dormant session from a prior run, if one was
+            # persisted under this exact (deterministic) name — same
+            # resume-first behavior _provision_session() already gives
+            # every static watcher.
+            state = self._state_store.load().get(watcher_name)
+
+            try:
+                await self._start_watcher(wc, state)
+            except Exception as e:
+                logger.error(
+                    "try_lazy_create: failed to start watcher '%s' for "
+                    "room '%s': %s", watcher_name, room.name, e,
+                )
+                return False
+
+            self._watcher_configs.append(wc)
+            self._state_store.save(self._states)
+            logger.info(
+                "Lazily created watcher '%s' for room '%s' (rule-matched, "
+                "agent '%s')", watcher_name, room.name, rule.agent,
+            )
+            return True
 
     # ── Lifecycle controls ────────────────────────────────────────────────────
 

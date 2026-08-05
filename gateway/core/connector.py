@@ -126,6 +126,14 @@ MessageHandler = Callable[[IncomingMessage], Awaitable[bool]]
 # queue is already full.  Returns True if at least one processor has capacity.
 CapacityCheck = Callable[[str], bool]  # (room_id: str) -> bool
 
+# Lazy-creation hook: called by a connector when a message arrives for a
+# room with no local state, to decide (and, if warranted, perform) on-the-
+# fly watcher creation (docs/design/on-the-fly-watchers.md). Returns True
+# if a watcher now exists for room_id (caller should re-check its own
+# state and proceed), False if no rule matched (caller should keep
+# dropping as before). (room_id: str) -> bool
+LazyCreationHook = Callable[[str], Awaitable[bool]]
+
 
 # ---------------------------------------------------------------------------
 # Connector ABC
@@ -211,6 +219,26 @@ class Connector(ABC):
 
         The default implementation is a no-op — connectors that don't perform
         expensive pre-dispatch work (e.g. ScriptConnector) need not override.
+        """
+
+    def register_lazy_creation_hook(self, hook: "LazyCreationHook") -> None:
+        """Register the callback that decides whether an unwatched room
+        should get a watcher created on the spot (docs/design/
+        on-the-fly-watchers.md, WatcherLifecycle.try_lazy_create()).
+
+        Called by a connector's own inbound-filtering path, at the exact
+        point it would otherwise silently drop a message for a room it has
+        no local state for. `hook(room_id)` resolves and rule-matches the
+        room and, if matched, performs a full synchronous watcher creation
+        before returning — the caller should re-check its own local state
+        for `room_id` after a `True` return and proceed normally; a `False`
+        return means "no rule matched, keep dropping as before."
+
+        The default implementation is a no-op — only connectors whose
+        transport already delivers events for rooms with no local state
+        (Mattermost today; see the design doc's "trigger point differs by
+        connector" section for why RC cannot use this same hook) need to
+        call it.
         """
 
     # ── Outbound ─────────────────────────────────────────────────────────────
@@ -307,6 +335,25 @@ class Connector(ABC):
             Populated Room dataclass with platform id, name, and type.
         """
         ...
+
+    async def resolve_room_by_id(self, room_id: str) -> Room:
+        """Reverse of resolve_room(): resolve an opaque platform room ID to
+        a populated Room object.
+
+        Needed by lazy watcher creation (docs/design/on-the-fly-watchers.md,
+        WatcherLifecycle.try_lazy_create()): a message that triggers lazy
+        creation only carries the platform's raw room ID, but rule matching
+        (exclude_room:) is name-based like every other room field in this
+        config, so the name must be resolved before a rule can be evaluated.
+
+        Default: raises NotImplementedError. Only connectors that support
+        rule-based lazy creation need to override this (Mattermost, via a
+        REST channel-by-id lookup). RC's lazy creation needs a different
+        mechanism entirely (see the design doc) and does not call this.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support resolve_room_by_id()"
+        )
 
     # ── Per-room subscription (pull-based platforms) ─────────────────────────
     # Rocket.Chat DDP requires explicit per-room WebSocket subscriptions.
