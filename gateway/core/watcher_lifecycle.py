@@ -279,6 +279,25 @@ class WatcherLifecycle:
             existing_for_room = next(
                 (wc for wc in self._watcher_configs if wc.room == room.name), None
             )
+            if existing_for_room is None:
+                # PR #79 review (fifth round): `wc.room` is a NAME, which
+                # is not stable — a channel renamed on the platform while
+                # its watcher is paused means the just-resolved room.name
+                # no longer matches the config's stored (stale) name, even
+                # though it's the exact same room. Fall back to matching
+                # by the room's STABLE platform ID via each watcher's
+                # state (state.room_id is set from the real resolved room
+                # every time _start_watcher runs, and — since the fifth-
+                # round fix just above — now survives resume/reset too).
+                # Empty room_id (a watcher paused via the CLI's own
+                # not-found fallback, before ever actually starting) is
+                # deliberately excluded — nothing to confirm a match against.
+                state_for_room_id = next(
+                    (s for s in self._states.values() if s.room_id and s.room_id == room.id),
+                    None,
+                )
+                if state_for_room_id is not None:
+                    existing_for_room = self.get_watcher_config(state_for_room_id.watcher_name)
             if existing_for_room is not None:
                 if existing_for_room.name in self._processors:
                     # Already running (under its own name, custom or
@@ -735,6 +754,15 @@ class WatcherLifecycle:
             context_injected=state.context_injected if state else False,
             paused=False,
             last_processed_ts=state.last_processed_ts if state else "",
+            # PR #79 review (fifth round): _start_watcher() always builds a
+            # BRAND NEW WatcherState here — without copying this flag
+            # forward from the incoming `state`, a dynamically-created
+            # watcher that's later legitimately resumed or reset would
+            # have it silently reset to False (the dataclass default), so
+            # sync_watchers() would then drop its state on the NEXT
+            # restart after all, defeating that fix for any dynamic
+            # watcher that's ever been resumed/reset even once.
+            dynamically_created=state.dynamically_created if state else False,
         )
         self._states[wc.name] = ws
         self._maps.bind_session(session_id, room.id, self._connector)
