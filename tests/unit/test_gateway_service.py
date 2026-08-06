@@ -557,3 +557,42 @@ class TestStartupFdOnCancel(unittest.IsolatedAsyncioTestCase):
 
         fds_written = [fd for fd, _ in write_signal_calls]
         self.assertIn(5, fds_written, "startup_fd must be written/closed in finally on CancelledError")
+
+
+class TestIsWatcherNameGloballyAvailable(unittest.TestCase):
+    """docs/design/on-the-fly-watchers.md, PR #79 review (fourth round):
+    GatewayService is the only layer with cross-connector visibility, so
+    the global watcher-name-uniqueness check for lazy creation has to live
+    here and be handed down to each WatcherLifecycle as a callback."""
+
+    def _entry(self, name: str, known_names: list[str]):
+        entry = SimpleNamespace(name=name, session_manager=MagicMock())
+        entry.session_manager.get_watcher_config = MagicMock(
+            side_effect=lambda n: object() if n in known_names else None
+        )
+        return entry
+
+    def test_available_when_no_entry_has_the_name(self):
+        service = _make_service()
+        service._entries = [self._entry("rc", ["support"]), self._entry("mm", ["sales"])]
+
+        self.assertTrue(service._is_watcher_name_globally_available("new-name"))
+
+    def test_unavailable_when_a_different_connector_already_has_it(self):
+        service = _make_service()
+        service._entries = [self._entry("rc", ["support"]), self._entry("mm", ["sales"])]
+
+        self.assertFalse(service._is_watcher_name_globally_available("sales"))
+
+    def test_reads_entries_at_call_time_not_capture_time(self):
+        """The callback is handed to a WatcherLifecycle before
+        self._entries is fully populated (each SessionManager is
+        constructed inside the same loop that appends to it) — must be a
+        live closure over self._entries, not a snapshot."""
+        service = _make_service()
+        checker = service._is_watcher_name_globally_available
+        self.assertTrue(checker("late-comer"))  # nothing registered yet
+
+        service._entries.append(self._entry("mm", ["late-comer"]))
+
+        self.assertFalse(checker("late-comer"))  # now sees the new entry

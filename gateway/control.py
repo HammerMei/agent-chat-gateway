@@ -234,7 +234,23 @@ class ControlServer:
             watcher_name = request.get("watcher_name", "")
             entry = self._find_entry_for_watcher(watcher_name)
             if isinstance(entry, dict):
-                return entry  # error response (unknown watcher)
+                # PR #79 review (fourth round): _find_entry_for_watcher()'s
+                # plain, synchronous get_watcher_config() lookup only sees
+                # each connector's already-known WatcherConfigs — a
+                # dynamically-created watcher's config is gone from that
+                # list after a restart (only its WatcherState survives).
+                # Before giving up, let every connector attempt the async,
+                # reconstruction-aware probe — without this, a persisted
+                # dynamic watcher was unreachable through the one CLI path
+                # meant to bring it back, even though resume_watcher()/
+                # reset_watcher()/pause_watcher() themselves already know
+                # how to reconstruct it once actually called.
+                for candidate in self._entries:
+                    if await candidate.session_manager.can_find_or_reconstruct_watcher(watcher_name):
+                        entry = candidate
+                        break
+            if isinstance(entry, dict):
+                return entry  # still unknown even after the reconstruction attempt
             return await entry.session_manager.dispatch_command(request)
 
         # All other commands: route to a specific entry

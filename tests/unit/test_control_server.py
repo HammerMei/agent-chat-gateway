@@ -40,6 +40,15 @@ def _make_entry(name: str, dispatch_result: dict | None = None,
         def _get_watcher_config(wname: str):
             return MagicMock() if wname in watcher_names else None
         entry.session_manager.get_watcher_config = MagicMock(side_effect=_get_watcher_config)
+        # PR #79 review: pause/resume/reset routing falls back to this
+        # async, reconstruction-aware probe when the plain lookup above
+        # finds nothing anywhere — mirror the same watcher_names truth
+        # table so existing "unknown watcher" tests still see a miss.
+        entry.session_manager.can_find_or_reconstruct_watcher = AsyncMock(
+            side_effect=lambda wname: wname in watcher_names
+        )
+    else:
+        entry.session_manager.can_find_or_reconstruct_watcher = AsyncMock(return_value=False)
     return entry
 
 
@@ -277,6 +286,34 @@ class TestResetRouting(unittest.IsolatedAsyncioTestCase):
         result = await server.dispatch_command({"cmd": "reset", "watcher_name": "unknown"})
         self.assertFalse(result["ok"])
         self.assertIn("unknown", result["error"])
+
+    async def test_resume_routes_to_entry_that_can_reconstruct_a_dynamic_watcher(self):
+        """PR #79 review, fourth round: a dynamically-created watcher's
+        config is gone from get_watcher_config() after a restart (only its
+        WatcherState survives), so the plain lookup in _find_entry_for_watcher()
+        misses it — dispatch_command() must fall back to the async,
+        reconstruction-aware probe on every entry before giving up."""
+        e_rc = _make_entry("rc", watcher_names=[])  # plain lookup finds nothing anywhere
+        e_rc.session_manager.can_find_or_reconstruct_watcher = AsyncMock(
+            side_effect=lambda name: name == "mm-home-general"
+        )
+        e_slack = _make_entry("slack", watcher_names=[])
+        server = _make_server(e_rc, e_slack)
+
+        result = await server.dispatch_command({"cmd": "resume", "watcher_name": "mm-home-general"})
+
+        self.assertTrue(result["ok"])
+        e_rc.session_manager.dispatch_command.assert_called_once()
+        e_slack.session_manager.dispatch_command.assert_not_called()
+
+    async def test_resume_still_errors_when_no_entry_can_reconstruct_either(self):
+        e_rc = _make_entry("rc", watcher_names=[])
+        server = _make_server(e_rc)
+
+        result = await server.dispatch_command({"cmd": "resume", "watcher_name": "truly-unknown"})
+
+        self.assertFalse(result["ok"])
+        self.assertIn("truly-unknown", result["error"])
 
     async def test_reset_with_explicit_connector_still_works(self):
         """Passing connector= explicitly in the request still routes via _resolve_entry."""

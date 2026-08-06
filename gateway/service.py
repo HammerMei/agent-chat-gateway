@@ -292,6 +292,7 @@ class GatewayService:
                 watcher_rules=connector_rules,
                 permission_registry=self._registry,
                 session_maps=self._maps,
+                check_global_name_available=self._is_watcher_name_globally_available,
             )
             self._entries.append(
                 ConnectorEntry(name=cc.name, connector=connector, session_manager=sm)
@@ -309,6 +310,33 @@ class GatewayService:
         self._control = ControlServer(
             self._entries,
             job_store=self._job_store,
+        )
+
+    def _is_watcher_name_globally_available(self, name: str) -> bool:
+        """True if no connector's WatcherLifecycle already has a watcher
+        (static, or already lazily-created) using this exact name.
+
+        Passed into every WatcherLifecycle as `check_global_name_available`
+        (docs/design/on-the-fly-watchers.md, PR #79 review, fourth round) —
+        a lazily-created watcher's own collision checks in
+        `try_lazy_create()` only see its OWN connector's watchers, but
+        `ControlServer._find_entry_for_watcher()` and the scheduler both
+        assume watcher names are globally unique across ALL connectors
+        (an invariant enforced for static watchers at config-load time,
+        `gateway/config.py`'s `seen_watcher_names`) — without this check, a
+        lazily-created watcher could take a name already used by a
+        DIFFERENT connector's watcher, breaking that assumption for both.
+
+        A closure over `self._entries`, read at CALL time — safe even
+        though this is handed to a `WatcherLifecycle` built *before*
+        `self._entries` is fully populated (each `SessionManager` is
+        constructed inside the very loop that appends to `self._entries`):
+        by the time `try_lazy_create()` actually runs, `__init__` has long
+        since finished and `self._entries` holds every connector.
+        """
+        return not any(
+            entry.session_manager.get_watcher_config(name) is not None
+            for entry in self._entries
         )
 
     async def run(self, startup_fd: int = -1) -> None:
