@@ -658,6 +658,22 @@ class MattermostConnector(Connector):
             return
 
         post = decoded["post"]
+
+        # System messages and the bot's own messages never warrant lazy
+        # watcher creation (PR #79 review) — checked BEFORE the
+        # lazy-creation gate below, not after: neither check needs `state`,
+        # so both can run before it's resolved. Without this ordering, a
+        # system_join_channel event (e.g. the bot itself being added to a
+        # channel) or an own-message echo arriving in an otherwise-
+        # unwatched channel could trigger a full watcher creation
+        # (subscribe, session, possibly an online_notification post) before
+        # ever being recognized as noise.
+        if post.get("type"):
+            return
+        sender_id = post.get("user_id", "")
+        if sender_id == self._rest.bot_user_id:
+            return  # Own message — skip before spending a resolve_username call.
+
         channel_id = post.get("channel_id", "")
         state = self._channels.get(channel_id)
         if not state:
@@ -684,16 +700,6 @@ class MattermostConnector(Connector):
         if msg_id and msg_id in state.seen_ids_set:
             logger.debug("Skipping already-seen message id=%s in channel %s", msg_id, channel_id)
             return
-
-        # System messages carry no useful sender identity to resolve — and
-        # filter_mm_message rejects them anyway — so skip the async username
-        # resolution entirely for them.
-        if post.get("type"):
-            return
-
-        sender_id = post.get("user_id", "")
-        if sender_id == self._rest.bot_user_id:
-            return  # Own message — skip before spending a resolve_username call.
 
         # Register BEFORE the first await (resolve_username) — see the
         # seen_ids registration timing note in the docstring above.

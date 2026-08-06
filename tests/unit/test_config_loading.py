@@ -2273,6 +2273,20 @@ class TestWatcherRoomsExpansion(unittest.TestCase):
         config = GatewayConfig.from_file(path)
         self.assertEqual(config.watcher_rules[0].exclude_rooms, ["general", "dev"])
 
+    def test_wildcard_room_with_rooms_also_set_raises_not_silently_ignored(self):
+        """PR #79 review, second round: room: "*" alongside a `rooms:` list
+        (both keys present) must not be silently classified as a wildcard
+        rule that ignores `rooms:` entirely — it's the existing
+        mutually-exclusive-fields error instead."""
+        path = self._write_config("""\
+            - connector: rc-home
+              room: "*"
+              rooms: [general, dev]
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        self.assertIn("set either 'room' or 'rooms', not both", str(ctx.exception))
+
     def test_two_wildcard_rules_same_connector_raises(self):
         path = self._write_config("""\
             - connector: rc-home

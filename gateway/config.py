@@ -983,13 +983,24 @@ def _is_wildcard_room_entry(wc_raw: object) -> bool:
     per-room handling, where auto-naming a room literally called "*" fails
     with a clear (if generic) "could not derive a safe watcher name" error
     rather than silently doing something unintended.
+
+    `room: "*"` with `rooms:` ALSO set (both keys present) deliberately
+    returns False too (PR #79 review, second round) — `_parse_one_watcher_rule()`
+    has no `rooms:` concept at all and would silently ignore it, turning a
+    likely typo (leftover `rooms:` from before adding `room: "*"`, or vice
+    versa) into a full wildcard rule instead of the existing, clear "set
+    either 'room' or 'rooms', not both" error _parse_one_watcher_entry()
+    already raises for this exact shape.
     """
     if not isinstance(wc_raw, Mapping):
         return False
-    if wc_raw.get("room") == "*":
+    raw_room = wc_raw.get("room")
+    raw_rooms = wc_raw.get("rooms")
+    if raw_room and raw_rooms:
+        return False
+    if raw_room == "*":
         return True
-    rooms = wc_raw.get("rooms")
-    return isinstance(rooms, list) and rooms == ["*"]
+    return isinstance(raw_rooms, list) and raw_rooms == ["*"]
 
 
 def _parse_one_watcher_rule(
