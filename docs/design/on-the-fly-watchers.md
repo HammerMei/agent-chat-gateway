@@ -243,7 +243,8 @@ rather than assumed:
   persisted session correctly, just without the eager-startup latency
   optimization — **this "resuming correctly" half was a genuine bug until
   the PR #79 review round below caught it; see `WatcherState.
-  dynamically_created`**). Both are real gaps, not silently dropped — tracked here
+  dynamically_created`**). Both are real gaps, not silently dropped —
+  tracked here for a later pass, not assumed solved.
 
 ### PR #79 review round (2026-08-05) — four real findings, all fixed
 
@@ -282,7 +283,45 @@ deferred:
    fix) claiming resume-across-restart worked. Fixed: `WatcherState` gained
    a `dynamically_created` flag; `sync_watchers()` now carries forward any
    persisted entry with that flag set instead of treating it as removed.
-  for a later pass, not assumed solved.
+
+### PR #79 review, second round (2026-08-05) — three more findings, all fixed
+
+A follow-up review pass (same PR, second commit) caught three more —
+two of them direct extensions of round-one's fixes into cases the first
+pass hadn't covered yet:
+
+5. **Lazy creation ran before the system-message/own-message filters.**
+   `_on_posted_event()`'s existing `post.get("type")` (system message) and
+   `sender_id == bot_user_id` (own message) checks sat AFTER the
+   lazy-creation gate, not before — so a `system_join_channel` event (e.g.
+   the bot itself being added to a channel) or an echo of the bot's own
+   post in an otherwise-unwatched channel could trigger a full watcher
+   creation (subscribe, session, possibly an `online_notification` post)
+   before ever being recognized as noise that `filter_mm_message` would
+   have rejected anyway. Fixed: both checks moved before the lazy-creation
+   gate — neither needs `state`, so neither needs to wait for it.
+6. **Round one's "honor paused watchers" fix only covered the same-process
+   case.** After a restart, a lazy watcher's `WatcherConfig` is gone from
+   `_watcher_configs` (finding #4's fix only preserves the *state*, not the
+   config — reconstructing the config itself was explicitly left out of
+   scope, see above) — so `get_watcher_config()` returns `None` and finding
+   #3's fix never fires. The loaded `WatcherState` (now correctly resumed
+   thanks to finding #4) could still have `paused=True`, but nothing
+   checked it before calling `_start_watcher()`, which has no
+   "am I paused" gate of its own — it always starts unconditionally. Fixed:
+   a second, explicit check on the loaded `state.paused` right before
+   calling `_start_watcher()`, independent of the `_watcher_configs`-based
+   check above.
+7. **`room: "*"` alongside a `rooms:` list was silently accepted as a
+   rule.** `_is_wildcard_room_entry()` checked `room == "*"` first, without
+   checking whether `rooms:` was ALSO present — `_parse_one_watcher_rule()`
+   has no `rooms:` concept at all and would silently ignore it, turning a
+   likely typo (leftover `rooms:` from before adding `room: "*"`, or vice
+   versa) into a full wildcard rule instead of the existing, clear "set
+   either 'room' or 'rooms', not both" error `_parse_one_watcher_entry()`
+   already raises for this shape. Fixed: the dispatcher now returns `False`
+   (not a rule) whenever both keys are present, letting that existing
+   validation fire as it would have without the wildcard feature.
 
 ## Idle-expiry / auto-remove
 

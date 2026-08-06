@@ -302,6 +302,35 @@ class TestTryLazyCreateFailClosedAndPause(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result)
         agent.create_session.assert_not_called()
 
+    async def test_paused_persisted_state_after_restart_is_not_auto_resumed(self):
+        """PR #79 review, second round: after a restart, a lazily-created
+        watcher's WatcherConfig is gone from _watcher_configs (never
+        persisted, only its runtime state is — see dynamically_created),
+        so get_watcher_config() returns None and the earlier same-process
+        pause check never fires. Without a SECOND check against the loaded
+        WatcherState itself, a paused lazy watcher would get silently
+        resumed by the very next message post-restart."""
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=[_rule()],
+            state_by_name={
+                "mm-home-general": WatcherState(
+                    watcher_name="mm-home-general",
+                    session_id="old-sess-id",
+                    room_id="chan-1",
+                    paused=True,
+                    dynamically_created=True,
+                )
+            },
+        )
+        # Simulates post-restart: _watcher_configs has nothing for this room.
+        self.assertIsNone(lifecycle.get_watcher_config("mm-home-general"))
+
+        result = await lifecycle.try_lazy_create("chan-1")
+
+        self.assertFalse(result)
+        agent.create_session.assert_not_called()
+        connector.subscribe_room.assert_not_called()
+
 
 class TestSyncWatchersPreservesLazyState(unittest.IsolatedAsyncioTestCase):
     """PR #79 review finding: sync_watchers()'s final save() only persists

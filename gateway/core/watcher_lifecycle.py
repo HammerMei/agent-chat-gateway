@@ -312,6 +312,24 @@ class WatcherLifecycle:
             # every static watcher.
             state = self._state_store.load().get(watcher_name)
 
+            # PR #79 review (second round): after a restart, this room's
+            # WatcherConfig is gone from `_watcher_configs` (never
+            # persisted — only the runtime state is, via
+            # dynamically_created), so the `existing`/pause check above
+            # can't see it and never fires. Without this second check here,
+            # a paused lazy watcher's persisted state (paused=True) would
+            # get resumed by the very next message post-restart, with no
+            # explicit `resume` — _start_watcher() itself has no
+            # "is this paused" gate, it always starts unconditionally.
+            if state is not None and state.paused:
+                logger.info(
+                    "try_lazy_create: room '%s' has a paused persisted "
+                    "watcher ('%s') — not auto-resuming; use "
+                    "'agent-chat-gateway resume %s' to bring it back.",
+                    room.name, watcher_name, watcher_name,
+                )
+                return False
+
             try:
                 await self._start_watcher(wc, state)
             except Exception as e:

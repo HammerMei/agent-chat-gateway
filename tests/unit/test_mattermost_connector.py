@@ -645,6 +645,39 @@ class TestLazyCreationHook(unittest.IsolatedAsyncioTestCase):
 
         hook.assert_not_called()
 
+    async def test_system_message_in_unwatched_channel_never_calls_the_hook(self):
+        """PR #79 review: a system_join_channel event (e.g. the bot itself
+        being added to a channel) must not trigger lazy creation — it has
+        no useful sender identity and filter_mm_message rejects it anyway,
+        so creating a full watcher for it first would be pure waste (and
+        could post an online_notification for an event nobody sent)."""
+        connector = _make_connector()
+        hook = AsyncMock(return_value=True)
+        connector.register_lazy_creation_hook(hook)
+        connector.register_handler(AsyncMock(return_value=True))
+
+        await connector._on_posted_event({
+            "post": {"id": "p1", "channel_id": "unwatched-chan", "user_id": "u1", "message": "joined", "root_id": "", "type": "system_join_channel", "create_at": 1},
+            "mentions": [],
+        })
+
+        hook.assert_not_called()
+
+    async def test_own_message_in_unwatched_channel_never_calls_the_hook(self):
+        """PR #79 review: an echo of the bot's own post in an otherwise-
+        unwatched channel must not trigger lazy creation either."""
+        connector = _make_connector()
+        hook = AsyncMock(return_value=True)
+        connector.register_lazy_creation_hook(hook)
+        connector.register_handler(AsyncMock(return_value=True))
+
+        await connector._on_posted_event({
+            "post": {"id": "p1", "channel_id": "unwatched-chan", "user_id": "bot-id-1", "message": "pong", "root_id": "", "type": "", "create_at": 1},
+            "mentions": [],
+        })
+
+        hook.assert_not_called()
+
 
 # ── _on_ws_reconnect (history replay) ─────────────────────────────────────────
 
