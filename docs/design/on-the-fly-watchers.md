@@ -427,6 +427,43 @@ first three rounds' narrower fixes hadn't reached:
     time, in the same loop that appends to it). Defaults to "always
     available" for any caller/test with no `GatewayService` above it.
 
+### PR #79 review, fifth round (2026-08-06) — two more findings, both fixed
+
+Round four's fixes were correct as far as they went; round five found the
+next layer down — an identifier assumed stable that isn't, and a flag that
+didn't survive the very operations meant to preserve a watcher:
+
+14. **Room-based matching (finding #10) used the room's NAME, which isn't
+    stable.** `existing_for_room` matched `wc.room == room.name` — but a
+    Mattermost channel can be renamed while its watcher is paused. The
+    just-resolved `room.name` then no longer matches the config's stale
+    stored name, even though `room.id` (the platform's actual stable
+    identifier) is unchanged — so a renamed room's paused watcher became
+    invisible to the very check finding #10 added, and lazy creation
+    would create a duplicate under the new name, right back to the
+    original bug finding #10 was fixing. Fixed: when the by-name check
+    misses, fall back to matching by `room.id` via each watcher's
+    `WatcherState.room_id` (populated from the real resolved room every
+    time `_start_watcher()` runs, and — thanks to finding #15 below — now
+    survives resume/reset too). A state with an empty `room_id` (a watcher
+    paused via the CLI's own not-found fallback, before ever actually
+    starting) is excluded from this check — nothing to confirm a match
+    against.
+15. **The `dynamically_created` marker didn't survive a resume/reset.**
+    `_start_watcher()` always builds a brand-new `WatcherState` — finding
+    #4's fix set the flag once, right after the INITIAL lazy creation, but
+    `_start_watcher()` itself never copied it forward from the incoming
+    `state` on any LATER call. The moment a dynamically-created watcher
+    was legitimately resumed or reset even once, its state's marker
+    silently reset to `False` (the dataclass default) — so
+    `sync_watchers()` would then drop its state on the *next* restart
+    after all, defeating finding #4's fix for any dynamic watcher that's
+    ever been resumed/reset. Fixed at the source: `_start_watcher()` now
+    copies `state.dynamically_created` forward (defaulting to `False` only
+    when there's no incoming `state` at all) — every caller (lazy
+    creation, resume, reset, sync_watchers) benefits automatically,
+    instead of needing to remember to re-apply the flag itself.
+
 ## Idle-expiry / auto-remove
 
 - Track `last_processed_ts` (already exists) per watcher; compare against
