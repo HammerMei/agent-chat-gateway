@@ -294,18 +294,7 @@ class WatcherLifecycle:
                 # bring an already-known watcher back to life.
                 return False
 
-            wc = WatcherConfig(
-                name=watcher_name,
-                connector=rule.connector,
-                room=room.name,
-                agent=rule.agent,
-                session_id=None,
-                exclude_rooms=[],
-                context_inject_files=rule.context_inject_files,
-                online_notification=rule.online_notification,
-                offline_notification=rule.offline_notification,
-                history_handoff=rule.history_handoff,
-            )
+            wc = self._build_watcher_config_from_rule(watcher_name, rule, room.name)
             # Resume a dormant session from a prior run, if one was
             # persisted under this exact (deterministic) name — same
             # resume-first behavior _provision_session() already gives
@@ -356,7 +345,7 @@ class WatcherLifecycle:
 
     async def pause_watcher(self, name: str) -> None:
         """Pause a watcher: stop processing messages but preserve state."""
-        self._find_watcher_config(name)
+        await self._find_or_reconstruct_watcher_config(name)
         async with self._get_watcher_lock(name):
             state = self._states.get(name)
             if state and state.paused:
@@ -388,7 +377,7 @@ class WatcherLifecycle:
 
     async def resume_watcher(self, name: str) -> None:
         """Resume a paused watcher."""
-        wc = self._find_watcher_config(name)
+        wc = await self._find_or_reconstruct_watcher_config(name)
         self._ensure_agent_available(wc)
         async with self._get_watcher_lock(name):
             state = self._states.get(name)
@@ -415,7 +404,7 @@ class WatcherLifecycle:
 
     async def reset_watcher(self, name: str) -> None:
         """Reset a watcher: clear session and restart with fresh state."""
-        wc = self._find_watcher_config(name)
+        wc = await self._find_or_reconstruct_watcher_config(name)
         self._ensure_agent_available(wc)
         async with self._get_watcher_lock(name):
             try:
@@ -498,6 +487,92 @@ class WatcherLifecycle:
     def get_watcher_config(self, watcher_name: str) -> "WatcherConfig | None":
         """Return the WatcherConfig for a watcher name, or None if not found."""
         return next((wc for wc in self._watcher_configs if wc.name == watcher_name), None)
+
+    def _build_watcher_config_from_rule(
+        self, watcher_name: str, rule: WatcherConfig, room_name: str
+    ) -> WatcherConfig:
+        """Shared by try_lazy_create() and _reconstruct_dynamic_watcher_config()
+        below — a concrete, single-room WatcherConfig derived from a
+        room: "*" rule (docs/design/on-the-fly-watchers.md). Sticky
+        session_id/exclude_rooms never carry over — neither concept applies
+        once a real room is known."""
+        return WatcherConfig(
+            name=watcher_name,
+            connector=rule.connector,
+            room=room_name,
+            agent=rule.agent,
+            session_id=None,
+            exclude_rooms=[],
+            context_inject_files=rule.context_inject_files,
+            online_notification=rule.online_notification,
+            offline_notification=rule.offline_notification,
+            history_handoff=rule.history_handoff,
+        )
+
+    async def _reconstruct_dynamic_watcher_config(self, name: str) -> "WatcherConfig | None":
+        """Best-effort reconstruction of a lazily-created watcher's
+        WatcherConfig after a restart (PR #79 review, third round).
+
+        Its config is never persisted, only its WatcherState (via
+        `dynamically_created`) — without this, pause_watcher()/
+        resume_watcher()/reset_watcher() would reject a dynamically-created
+        watcher as "not found in config" forever after a single restart,
+        even via the one CLI path specifically meant to bring it back
+        (e.g. `agent-chat-gateway resume <name>` immediately failing for
+        exactly the watcher it's being asked to resume).
+
+        Returns the reconstructed WatcherConfig — already appended to
+        `self._watcher_configs`, with `self._states[name]` seeded from the
+        persisted state too (so pause_watcher()/resume_watcher()/
+        reset_watcher()'s own `self._states.get(name)` lookups find it —
+        without this, resume_watcher() would still "succeed" but create a
+        brand-new session instead of resuming the old one, since
+        _provision_session() only ever consults `self._states`, never
+        `self._state_store.load()` directly) — if the room can still be
+        resolved and still matches this connector's active rule. Returns
+        `None` if the persisted entry isn't a dynamically-created one, or
+        the room/rule can no longer be resolved/matched (e.g. the wildcard
+        rule was since removed, or the room is now in `exclude_room:`) —
+        genuinely orphaned, nothing to reconstruct.
+        """
+        state = self._state_store.load().get(name)
+        if state is None or not state.dynamically_created:
+            return None
+        if not self._watcher_rules:
+            return None
+        try:
+            room = await self._connector.resolve_room_by_id(state.room_id)
+        except Exception as e:
+            logger.warning(
+                "Could not reconstruct dynamic watcher '%s': failed to "
+                "resolve room id=%s: %s", name, state.room_id, e,
+            )
+            return None
+        rule = self._watcher_rules[0]
+        if room.name in rule.exclude_rooms:
+            return None
+        wc = self._build_watcher_config_from_rule(name, rule, room.name)
+        self._watcher_configs.append(wc)
+        self._states[name] = state
+        return wc
+
+    async def _find_or_reconstruct_watcher_config(self, name: str) -> WatcherConfig:
+        """Shared by pause_watcher()/resume_watcher()/reset_watcher(): the
+        plain `get_watcher_config()` lookup, with a fallback attempt to
+        reconstruct a dynamically-created watcher's config (see
+        `_reconstruct_dynamic_watcher_config()` above) before giving up.
+        Raises RuntimeError (same message shape the old, now-removed
+        `_find_watcher_config()` always raised) if neither finds anything."""
+        wc = self.get_watcher_config(name)
+        if wc is not None:
+            return wc
+        wc = await self._reconstruct_dynamic_watcher_config(name)
+        if wc is not None:
+            return wc
+        raise RuntimeError(
+            f"Watcher '{name}' not found in config. "
+            f"Available: {[w.name for w in self._watcher_configs]}"
+        )
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
 
@@ -890,15 +965,6 @@ class WatcherLifecycle:
             raise RuntimeError(
                 f"Watcher '{name}' stop completed with errors: {'; '.join(errors)}"
             )
-
-    def _find_watcher_config(self, name: str) -> WatcherConfig:
-        for wc in self._watcher_configs:
-            if wc.name == name:
-                return wc
-        raise RuntimeError(
-            f"Watcher '{name}' not found in config. "
-            f"Available: {[wc.name for wc in self._watcher_configs]}"
-        )
 
     def _ensure_agent_available(self, wc: WatcherConfig) -> None:
         """Fail closed if a watcher's resolved agent is currently unavailable."""

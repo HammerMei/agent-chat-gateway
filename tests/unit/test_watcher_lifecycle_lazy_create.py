@@ -373,5 +373,107 @@ class TestSyncWatchersPreservesLazyState(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("rc-old-watcher", saved_states)
 
 
+class TestReconstructDynamicWatcherConfig(unittest.IsolatedAsyncioTestCase):
+    """PR #79 review, third round: pause_watcher()/resume_watcher()/
+    reset_watcher() must be able to reconstruct a dynamically-created
+    watcher's WatcherConfig after a restart (never persisted, only its
+    WatcherState is, via dynamically_created) — otherwise the one CLI path
+    meant to bring a paused lazy watcher back is permanently broken for it."""
+
+    def _post_restart_state(self, paused: bool) -> dict:
+        return {
+            "mm-home-general": WatcherState(
+                watcher_name="mm-home-general",
+                session_id="old-sess-id",
+                room_id="chan-1",
+                paused=paused,
+                dynamically_created=True,
+            )
+        }
+
+    async def test_resume_reconstructs_and_resumes_a_paused_dynamic_watcher(self):
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=[_rule()], state_by_name=self._post_restart_state(paused=True),
+        )
+        self.assertIsNone(lifecycle.get_watcher_config("mm-home-general"))  # gone post-restart
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            await lifecycle.resume_watcher("mm-home-general")
+
+        self.assertIsNotNone(lifecycle.get_watcher_config("mm-home-general"))
+        agent.create_session.assert_not_called()  # resumed the old session, not fresh
+        connector.subscribe_room.assert_awaited_once()
+
+    async def test_reset_reconstructs_and_restarts_a_dynamic_watcher(self):
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=[_rule()], state_by_name=self._post_restart_state(paused=False),
+        )
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            await lifecycle.reset_watcher("mm-home-general")
+
+        self.assertIsNotNone(lifecycle.get_watcher_config("mm-home-general"))
+        connector.subscribe_room.assert_awaited_once()
+
+    async def test_pause_reconstructs_a_not_yet_running_dynamic_watcher(self):
+        """A user pre-emptively pausing a room's dynamic watcher after
+        restart, before its next message would otherwise re-create it."""
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=[_rule()], state_by_name=self._post_restart_state(paused=False),
+        )
+
+        await lifecycle.pause_watcher("mm-home-general")
+
+        self.assertIsNotNone(lifecycle.get_watcher_config("mm-home-general"))
+        self.assertTrue(lifecycle._states["mm-home-general"].paused)
+
+    async def test_genuinely_unknown_watcher_still_raises(self):
+        lifecycle, connector, agent, state_store = _make_lifecycle(rules=[_rule()])
+
+        with self.assertRaises(RuntimeError):
+            await lifecycle.resume_watcher("no-such-watcher")
+
+    async def test_non_dynamic_persisted_state_is_not_reconstructed(self):
+        """A persisted-but-not-dynamically-created entry (e.g. a genuinely
+        removed static watcher) must NOT be resurrected via reconstruction —
+        only entries explicitly flagged dynamically_created qualify."""
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=[_rule()],
+            state_by_name={
+                "rc-removed-watcher": WatcherState(
+                    watcher_name="rc-removed-watcher", session_id="s1", room_id="r1",
+                    dynamically_created=False,
+                )
+            },
+        )
+
+        with self.assertRaises(RuntimeError):
+            await lifecycle.resume_watcher("rc-removed-watcher")
+
+    async def test_rule_removed_since_creation_is_not_reconstructed(self):
+        """If the connector's wildcard rule was since removed entirely, a
+        dynamically-created watcher's persisted state has nothing to
+        reconstruct against — genuinely orphaned, correctly still raises."""
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=None, state_by_name=self._post_restart_state(paused=True),
+        )
+
+        with self.assertRaises(RuntimeError):
+            await lifecycle.resume_watcher("mm-home-general")
+
+    async def test_room_now_excluded_is_not_reconstructed(self):
+        """If the room was added to exclude_room: since this watcher was
+        lazily created, reconstruction correctly refuses too."""
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=[_rule(exclude_rooms=["general"])],
+            state_by_name=self._post_restart_state(paused=True),
+        )
+
+        with self.assertRaises(RuntimeError):
+            await lifecycle.resume_watcher("mm-home-general")
+
+
 if __name__ == "__main__":
     unittest.main()
