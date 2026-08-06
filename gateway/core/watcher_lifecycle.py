@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime
+from typing import Callable
 
 from ..agents import AgentBackend
 from .adapter_utils import ts_gt as _ts_gt
@@ -51,6 +52,7 @@ class WatcherLifecycle:
         permission_registry: PermissionRegistry | None,
         maps: SessionMaps,
         watcher_rules: "list[WatcherConfig] | None" = None,
+        check_global_name_available: Callable[[str], bool] | None = None,
     ) -> None:
         self._connector = connector
         self._agents = agents
@@ -71,6 +73,14 @@ class WatcherLifecycle:
         # constructing a WatcherLifecycle without lazy creation in mind
         # keeps working unchanged.
         self._watcher_rules: list[WatcherConfig] = watcher_rules or []
+        # Cross-connector watcher-name uniqueness check (PR #79 review,
+        # fourth round) — see GatewayService._is_watcher_name_globally_available()
+        # for why this can't be answered from inside a single connector's
+        # own WatcherLifecycle. Optional (defaults to "always available")
+        # so every existing caller/test constructing a WatcherLifecycle
+        # without a GatewayService above it keeps working unchanged — those
+        # callers have no cross-connector name space to protect anyway.
+        self._check_global_name_available = check_global_name_available or (lambda _name: True)
 
         self._processors: dict[str, MessageProcessor] = {}
         self._states: dict[str, WatcherState] = {}
@@ -258,8 +268,37 @@ class WatcherLifecycle:
         watcher_name = auto_watcher_name(rule.connector, room.name)
 
         async with self._get_watcher_lock(watcher_name):
-            # Existing-watcher check deliberately lives INSIDE the lock, not
-            # before it: two DIFFERENT rooms that sanitize to the SAME
+            # PR #79 review (fourth round): check by ROOM first, across ALL
+            # of this connector's watcher configs — not just a name lookup
+            # for the auto-generated name. A static watcher can (and often
+            # does) have an explicit custom `name:` for this exact room —
+            # `get_watcher_config(watcher_name)` alone would never find it,
+            # so a paused/stopped explicitly-named static watcher for this
+            # room could otherwise get silently duplicated by a
+            # differently-named lazy watcher for the same room.
+            existing_for_room = next(
+                (wc for wc in self._watcher_configs if wc.room == room.name), None
+            )
+            if existing_for_room is not None:
+                if existing_for_room.name in self._processors:
+                    # Already running (under its own name, custom or
+                    # auto-generated) — either a concurrent caller for this
+                    # exact room won the race while we waited for the lock,
+                    # or it was already live before this call.
+                    return True
+                # A WatcherConfig for this exact room already exists (static
+                # or previously lazily-created) but has no running
+                # processor — paused, stopped, or never successfully
+                # started. Lazy creation must NEVER implicitly (re)start an
+                # already-known watcher for this room — that would silently
+                # override an explicit pause, or race a legitimate
+                # pause/resume/reset call (which holds this same per-name
+                # lock). Only pause_watcher()/resume_watcher()/
+                # reset_watcher() may bring it back to life.
+                return False
+
+            # Existing-BY-NAME check deliberately lives INSIDE the lock too,
+            # not before it: two DIFFERENT rooms that sanitize to the SAME
             # auto-generated name (e.g. differing only in punctuation
             # stripped by sanitize_room_for_name()) arrive on Mattermost via
             # two INDEPENDENT per-channel worker queues (websocket.py's
@@ -267,31 +306,34 @@ class WatcherLifecycle:
             # other the way two messages for the SAME room are. Checking
             # before the lock would let both callers race past a "no
             # collision yet" read before either had registered anything.
-            existing = self.get_watcher_config(watcher_name)
-            if existing is not None:
-                if existing.room != room.name:
-                    logger.error(
-                        "try_lazy_create: auto-generated name '%s' for room "
-                        "'%s' collides with an existing watcher for a "
-                        "different room ('%s') — refusing to create.",
-                        watcher_name, room.name, existing.room,
-                    )
-                    return False
-                if watcher_name in self._processors:
-                    # Already running — either a concurrent caller for this
-                    # exact room won the race while we waited for the lock,
-                    # or a static watcher of the same name is already live.
-                    return True
-                # A WatcherConfig for this exact room already exists (a
-                # static config.yaml entry, or a previously lazily-created
-                # one) but has no running processor — paused, stopped, or
-                # never successfully started. PR #79 review finding: lazy
-                # creation must NEVER implicitly (re)start an
-                # already-known watcher — that would silently override an
-                # explicit pause, or race a legitimate pause/resume/reset
-                # call (which holds this same per-name lock). Only
-                # pause_watcher()/resume_watcher()/reset_watcher() may
-                # bring an already-known watcher back to life.
+            # (existing_for_room above already ruled out this being the
+            # SAME room, so any match here is necessarily a different one.)
+            existing_by_name = self.get_watcher_config(watcher_name)
+            if existing_by_name is not None:
+                logger.error(
+                    "try_lazy_create: auto-generated name '%s' for room "
+                    "'%s' collides with an existing watcher for a "
+                    "different room ('%s') — refusing to create.",
+                    watcher_name, room.name, existing_by_name.room,
+                )
+                return False
+
+            # Cross-connector check (PR #79 review, fourth round): the two
+            # checks above only see THIS connector's own watchers. Watcher
+            # names are assumed globally unique across every connector
+            # (ControlServer._find_entry_for_watcher(), the scheduler) —
+            # an invariant already enforced for static watchers at
+            # config-load time, but never checked for a name generated at
+            # runtime. Refusing here, rather than creating a same-name
+            # watcher on two different connectors, keeps that assumption true.
+            if not self._check_global_name_available(watcher_name):
+                logger.error(
+                    "try_lazy_create: auto-generated name '%s' for room "
+                    "'%s' is already used by a watcher on a different "
+                    "connector — refusing to create (watcher names must "
+                    "be globally unique).",
+                    watcher_name, room.name,
+                )
                 return False
 
             wc = self._build_watcher_config_from_rule(watcher_name, rule, room.name)
@@ -301,10 +343,29 @@ class WatcherLifecycle:
             # every static watcher.
             state = self._state_store.load().get(watcher_name)
 
+            # PR #79 review (fourth round): the persisted state under this
+            # NAME might belong to a DIFFERENT room that happened to
+            # sanitize to the same name in a PRIOR run (e.g. one whose
+            # watcher was never re-created after that run ended) — reusing
+            # its session_id here would bind the WRONG room's conversation
+            # history/context onto this room, violating the 1-session-per-
+            # room invariant this whole feature is built around. Checked by
+            # room_id, not name, since name is exactly what's ambiguous here.
+            if state is not None and state.room_id and state.room_id != room.id:
+                logger.error(
+                    "try_lazy_create: persisted state for '%s' belongs to a "
+                    "different room (room_id=%s) than the one just resolved "
+                    "(room_id=%s, name=%s) — likely two rooms colliding on "
+                    "the same auto-generated name; refusing to reuse or "
+                    "overwrite it.",
+                    watcher_name, state.room_id, room.id, room.name,
+                )
+                return False
+
             # PR #79 review (second round): after a restart, this room's
             # WatcherConfig is gone from `_watcher_configs` (never
             # persisted — only the runtime state is, via
-            # dynamically_created), so the `existing`/pause check above
+            # dynamically_created), so the `existing_for_room` check above
             # can't see it and never fires. Without this second check here,
             # a paused lazy watcher's persisted state (paused=True) would
             # get resumed by the very next message post-restart, with no
@@ -555,6 +616,34 @@ class WatcherLifecycle:
         self._watcher_configs.append(wc)
         self._states[name] = state
         return wc
+
+    async def can_find_or_reconstruct_watcher(self, name: str) -> bool:
+        """Non-raising probe: True if `name` is either already a known
+        WatcherConfig, or can be reconstructed as a dynamically-created one
+        (see `_reconstruct_dynamic_watcher_config()` below).
+
+        PR #79 review (fourth round): exists specifically for
+        `ControlServer._find_entry_for_watcher()` (gateway/control.py),
+        which routes `pause`/`resume`/`reset` CLI commands to the right
+        connector by checking each one's `get_watcher_config()` — a plain,
+        non-reconstructing, synchronous lookup. Without an async,
+        reconstruction-aware probe like this one, a persisted-but-paused
+        dynamically-created watcher's config is never in
+        `_watcher_configs` post-restart, `_find_entry_for_watcher()` never
+        finds an owning connector, and the CLI command never reaches
+        `resume_watcher()`'s own (correctly reconstruction-aware) handling
+        at all — the fix in that method was unreachable through the one
+        interface real operators actually use.
+
+        A `True` result has the same side effect `_find_or_reconstruct_watcher_config()`
+        does when it reconstructs (appends to `_watcher_configs`, seeds
+        `self._states`) — deliberate, so the caller's SUBSEQUENT
+        `resume_watcher()`/etc. call finds it via the fast, plain
+        `get_watcher_config()` path instead of reconstructing a second time.
+        """
+        if self.get_watcher_config(name) is not None:
+            return True
+        return await self._reconstruct_dynamic_watcher_config(name) is not None
 
     async def _find_or_reconstruct_watcher_config(self, name: str) -> WatcherConfig:
         """Shared by pause_watcher()/resume_watcher()/reset_watcher(): the

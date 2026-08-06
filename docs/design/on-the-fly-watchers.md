@@ -360,6 +360,73 @@ fixes rather than restating them:
    `"room" in wc_raw and "rooms" in wc_raw` (key membership) instead of
    truthiness on the fetched values.
 
+### PR #79 review, fourth round (2026-08-06) — four more findings, all fixed
+
+The deepest pass yet — two P1s this time, both real cross-cutting gaps the
+first three rounds' narrower fixes hadn't reached:
+
+10. **Collision/pause checks looked up by generated NAME, not by ROOM.**
+    `try_lazy_create()`'s existing-watcher check was
+    `get_watcher_config(watcher_name)` — the auto-generated name only. A
+    *static* watcher for this exact room with an explicit custom `name:`
+    (e.g. `name: incident-agent` for `room: general`) would never be found
+    by that lookup, so pausing/stopping it did nothing to prevent lazy
+    creation from starting a SECOND watcher for the same room under the
+    auto-generated name — a silently-created duplicate, and the pause
+    fully defeated. Fixed: search `_watcher_configs` by `.room ==
+    room.name` FIRST (any name), and only fall back to the by-name lookup
+    (which now only ever needs to catch a genuinely different room
+    colliding on the same generated name) once that comes up empty.
+11. **Persisted state was trusted by name alone, not by room identity.**
+    `state = self._state_store.load().get(watcher_name)` assumes the
+    persisted entry under this name belongs to the room currently being
+    resolved — but two DIFFERENT rooms can sanitize to the same
+    auto-generated name across DIFFERENT runs too (not just the
+    same-run race finding #10-adjacent logic already guards): a room
+    whose watcher was created, then the room went quiet and its state sat
+    dormant, and later ANOTHER room that happens to share the same
+    sanitized name posts first. Reusing that state's `session_id` would
+    bind the wrong room's conversation context onto this room — a real
+    cross-room information leak, and a direct violation of the
+    1-session-per-room invariant this whole feature exists to preserve.
+    Fixed: compare `state.room_id` against the just-resolved `room.id`;
+    a mismatch refuses the creation entirely (logged as a likely name
+    collision) rather than silently reusing or silently overwriting
+    whichever room's entry was there first.
+12. **The finding-#8 CLI fix was itself unreachable through the CLI.**
+    `resume_watcher()`/etc. becoming reconstruction-aware only helps if
+    something actually calls them — but `ControlServer._find_entry_for_watcher()`
+    (`gateway/control.py`) resolves which connector owns a watcher name via
+    a plain, synchronous `get_watcher_config()` check across all entries
+    *before* routing the command at all. A dynamically-created watcher's
+    config is gone from that list after a restart, so this pre-check
+    returned "unknown watcher" and `resume_watcher()` was never reached —
+    finding #8's fix worked when called directly (as the unit tests do)
+    but not through the one real interface operators use. Fixed: rather
+    than making the widely-used `_find_entry_for_watcher()` itself async
+    (it has two other call sites and several tests mocking it
+    synchronously — a much larger, riskier change for this one caller),
+    added a narrow fallback at the `pause`/`resume`/`reset` dispatch site
+    only: on a miss, try every entry's new async
+    `can_find_or_reconstruct_watcher()` probe before giving up.
+13. **Lazy-created names were never checked against OTHER connectors.**
+    Static watcher names are enforced globally unique across every
+    connector at config-load time (`gateway/config.py`'s
+    `seen_watcher_names`, shared across the whole file, not per-connector)
+    — `ControlServer`'s routing and the scheduler both depend on that
+    invariant staying true. `try_lazy_create()`'s checks only ever see
+    `self._watcher_rules`/`_watcher_configs` for ITS OWN connector, so a
+    lazily-created name could collide with a different connector's
+    watcher without either connector ever noticing. Fixed: a new
+    `check_global_name_available` callback, threaded from
+    `GatewayService` (the only layer with cross-connector visibility) down
+    through `SessionManager` to `WatcherLifecycle` — a closure over
+    `GatewayService._entries`, read at CALL time so it works correctly
+    even though it's handed to each `WatcherLifecycle` before
+    `_entries` is fully populated (construction is one connector at a
+    time, in the same loop that appends to it). Defaults to "always
+    available" for any caller/test with no `GatewayService` above it.
+
 ## Idle-expiry / auto-remove
 
 - Track `last_processed_ts` (already exists) per watcher; compare against

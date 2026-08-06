@@ -33,7 +33,12 @@ def _rule(**overrides) -> WatcherConfig:
     return WatcherConfig(**defaults)
 
 
-def _make_lifecycle(rules: list[WatcherConfig] | None, resolved_room=None, state_by_name=None):
+def _make_lifecycle(
+    rules: list[WatcherConfig] | None,
+    resolved_room=None,
+    state_by_name=None,
+    check_global_name_available=None,
+):
     config = CoreConfig()
     connector = AsyncMock()
     connector.agent_username = "hammer-mei"
@@ -72,6 +77,7 @@ def _make_lifecycle(rules: list[WatcherConfig] | None, resolved_room=None, state
         permission_registry=None,
         maps=maps,
         watcher_rules=rules,
+        check_global_name_available=check_global_name_available,
     )
     lifecycle._attachment_workspace = MagicMock()
     lifecycle._attachment_workspace.setup = MagicMock(return_value="/tmp/fake")
@@ -164,6 +170,50 @@ class TestTryLazyCreateMatch(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result)
         agent.create_session.assert_not_called()  # resumed, not created fresh
+
+    async def test_persisted_state_for_a_colliding_different_room_is_not_reused(self):
+        """PR #79 review, fourth round: the persisted entry under this
+        auto-generated NAME might belong to a DIFFERENT room from a PRIOR
+        run (name collision across runs, not just within one) — reusing
+        its session_id would leak that other room's conversation context
+        into this one, violating the 1-session-per-room invariant. Must be
+        checked by room_id, not by trusting the name-keyed lookup alone."""
+        persisted = {
+            "mm-home-general": WatcherState(
+                watcher_name="mm-home-general",
+                session_id="belongs-to-a-different-room",
+                room_id="some-other-chan-id",  # NOT "chan-1"
+            )
+        }
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=[_rule()], state_by_name=persisted,
+        )
+
+        result = await lifecycle.try_lazy_create("chan-1")
+
+        self.assertFalse(result)
+        agent.create_session.assert_not_called()
+        connector.subscribe_room.assert_not_called()
+
+    async def test_persisted_state_with_no_room_id_yet_is_still_usable(self):
+        """A state with an empty room_id (e.g. seeded by pause_watcher()'s
+        own not-found fallback, which sets room_id="") has nothing to
+        compare against — must not be treated as a false collision."""
+        persisted = {
+            "mm-home-general": WatcherState(
+                watcher_name="mm-home-general", session_id="old-sess-id", room_id="",
+            )
+        }
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=[_rule()], state_by_name=persisted,
+        )
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            result = await lifecycle.try_lazy_create("chan-1")
+
+        self.assertTrue(result)
+        agent.create_session.assert_not_called()  # resumed the old session_id anyway
 
     async def test_second_call_for_same_room_is_idempotent(self):
         lifecycle, connector, agent, state_store = _make_lifecycle(rules=[_rule()])
@@ -291,6 +341,38 @@ class TestTryLazyCreateFailClosedAndPause(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result)
         agent.create_session.assert_not_called()
 
+    async def test_custom_named_static_watcher_owning_the_room_is_respected(self):
+        """PR #79 review, fourth round: a static watcher for this exact
+        room can have an explicit, custom `name:` that does NOT match the
+        auto-generated name — get_watcher_config(auto_name) alone would
+        never find it, so the room-based check must search ALL
+        _watcher_configs by `.room`, not just look up the generated name."""
+        lifecycle, connector, agent, state_store = _make_lifecycle(rules=[_rule()])
+        lifecycle._watcher_configs.append(
+            WatcherConfig(name="incident-agent", connector="mm-home", room="general", agent="claude")
+        )
+        # incident-agent is paused/stopped — no processor.
+
+        result = await lifecycle.try_lazy_create("chan-1")
+
+        self.assertFalse(result)
+        agent.create_session.assert_not_called()
+        connector.subscribe_room.assert_not_called()
+        # No phantom second watcher created under the auto-generated name.
+        self.assertIsNone(lifecycle.get_watcher_config("mm-home-general"))
+
+    async def test_custom_named_static_watcher_owning_the_room_and_running(self):
+        lifecycle, connector, agent, state_store = _make_lifecycle(rules=[_rule()])
+        lifecycle._watcher_configs.append(
+            WatcherConfig(name="incident-agent", connector="mm-home", room="general", agent="claude")
+        )
+        lifecycle._processors["incident-agent"] = MagicMock()
+
+        result = await lifecycle.try_lazy_create("chan-1")
+
+        self.assertTrue(result)
+        agent.create_session.assert_not_called()
+
     async def test_running_watcher_for_same_room_returns_true_without_recreating(self):
         lifecycle, connector, agent, state_store = _make_lifecycle(rules=[_rule()])
         wc = WatcherConfig(name="mm-home-general", connector="mm-home", room="general", agent="claude")
@@ -330,6 +412,51 @@ class TestTryLazyCreateFailClosedAndPause(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result)
         agent.create_session.assert_not_called()
         connector.subscribe_room.assert_not_called()
+
+
+class TestTryLazyCreateGlobalNameUniqueness(unittest.IsolatedAsyncioTestCase):
+    """PR #79 review, fourth round: try_lazy_create()'s own collision
+    checks only see THIS connector's watchers — ControlServer routing and
+    the scheduler both assume watcher names are globally unique across
+    every connector, so a check_global_name_available callback (wired from
+    GatewayService, which alone has cross-connector visibility) must be
+    consulted before finalizing a lazy creation."""
+
+    async def test_name_taken_by_a_different_connector_refuses(self):
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=[_rule()],
+            check_global_name_available=lambda name: False,
+        )
+
+        result = await lifecycle.try_lazy_create("chan-1")
+
+        self.assertFalse(result)
+        agent.create_session.assert_not_called()
+        connector.subscribe_room.assert_not_called()
+
+    async def test_name_available_globally_still_creates(self):
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=[_rule()],
+            check_global_name_available=lambda name: True,
+        )
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            result = await lifecycle.try_lazy_create("chan-1")
+
+        self.assertTrue(result)
+
+    async def test_no_callback_provided_defaults_to_available(self):
+        """Existing callers/tests constructing a WatcherLifecycle with no
+        GatewayService above them (no cross-connector name space to
+        protect) must keep working unchanged."""
+        lifecycle, connector, agent, state_store = _make_lifecycle(rules=[_rule()])
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            result = await lifecycle.try_lazy_create("chan-1")
+
+        self.assertTrue(result)
 
 
 class TestSyncWatchersPreservesLazyState(unittest.IsolatedAsyncioTestCase):
@@ -473,6 +600,43 @@ class TestReconstructDynamicWatcherConfig(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(RuntimeError):
             await lifecycle.resume_watcher("mm-home-general")
+
+
+class TestCanFindOrReconstructWatcher(unittest.IsolatedAsyncioTestCase):
+    """Direct coverage of the non-raising probe itself, isolated from
+    ControlServer routing (see TestResetRouting in test_control_server.py
+    for the routing-level coverage)."""
+
+    async def test_true_for_an_already_known_watcher(self):
+        lifecycle, connector, agent, state_store = _make_lifecycle(rules=[_rule()])
+        lifecycle._watcher_configs.append(
+            WatcherConfig(name="mm-home-general", connector="mm-home", room="general", agent="claude")
+        )
+
+        self.assertTrue(await lifecycle.can_find_or_reconstruct_watcher("mm-home-general"))
+
+    async def test_true_for_a_reconstructible_dynamic_watcher(self):
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=[_rule()],
+            state_by_name={
+                "mm-home-general": WatcherState(
+                    watcher_name="mm-home-general", session_id="s1", room_id="chan-1",
+                    dynamically_created=True,
+                )
+            },
+        )
+
+        result = await lifecycle.can_find_or_reconstruct_watcher("mm-home-general")
+
+        self.assertTrue(result)
+        # Side effect: the reconstruction actually happened, so a
+        # subsequent plain lookup finds it without reconstructing again.
+        self.assertIsNotNone(lifecycle.get_watcher_config("mm-home-general"))
+
+    async def test_false_for_a_genuinely_unknown_watcher(self):
+        lifecycle, connector, agent, state_store = _make_lifecycle(rules=[_rule()])
+
+        self.assertFalse(await lifecycle.can_find_or_reconstruct_watcher("no-such-watcher"))
 
 
 if __name__ == "__main__":

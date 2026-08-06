@@ -14,6 +14,7 @@ import asyncio
 import logging
 import secrets
 from datetime import UTC, datetime
+from typing import Callable
 
 from ..agents import AgentBackend
 from .config import CoreConfig, WatcherConfig
@@ -52,6 +53,7 @@ class SessionManager:
         watcher_rules: list[WatcherConfig] | None = None,
         permission_registry: PermissionRegistry | None = None,
         session_maps: SessionMaps | None = None,
+        check_global_name_available: Callable[[str], bool] | None = None,
     ) -> None:
         self._connector = connector
         maps = session_maps or SessionMaps()
@@ -71,6 +73,7 @@ class SessionManager:
             injector=self._injector,
             permission_registry=permission_registry,
             maps=maps,
+            check_global_name_available=check_global_name_available,
             watcher_rules=watcher_rules,
         )
 
@@ -139,6 +142,15 @@ class SessionManager:
     def get_watcher_config(self, name: str):
         """Return the WatcherConfig for a watcher name, or None if not found."""
         return self._lifecycle.get_watcher_config(name)
+
+    async def can_find_or_reconstruct_watcher(self, name: str) -> bool:
+        """Non-raising, reconstruction-aware existence probe — see
+        WatcherLifecycle.can_find_or_reconstruct_watcher() (PR #79 review).
+        Used by ControlServer._find_entry_for_watcher() so a persisted
+        dynamically-created watcher can be routed to correctly even when
+        get_watcher_config() alone (a plain, non-reconstructing lookup)
+        would miss it after a restart."""
+        return await self._lifecycle.can_find_or_reconstruct_watcher(name)
 
     def get_all_watcher_names(self) -> list[str]:
         """Return all configured watcher names for this connector."""
