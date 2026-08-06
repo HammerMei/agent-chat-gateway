@@ -323,6 +323,43 @@ pass hadn't covered yet:
    (not a rule) whenever both keys are present, letting that existing
    validation fire as it would have without the wildcard feature.
 
+### PR #79 review, third round (2026-08-05/06) — two more findings, both fixed
+
+Another follow-up pass, again finding real gaps left by the round-two
+fixes rather than restating them:
+
+8. **A paused dynamic watcher was permanently stuck after a restart.**
+   Finding #6's fix correctly *refuses* to auto-resume a paused persisted
+   watcher — but its log message told the operator to run
+   `agent-chat-gateway resume <name>`, and that command was itself broken
+   for exactly this watcher: `resume_watcher()` (and `reset_watcher()`/
+   `pause_watcher()`) looked the name up via `_find_watcher_config()`
+   against `_watcher_configs` only, which — same root cause as finding #6
+   — never has the entry after a restart. The one supported way to bring
+   the watcher back didn't work on it. Fixed: `_find_watcher_config()`
+   replaced with `_find_or_reconstruct_watcher_config()`, which falls back
+   to a new `_reconstruct_dynamic_watcher_config()` — re-resolves the room
+   from the persisted `room_id`, re-matches it against the connector's
+   active rule, rebuilds the `WatcherConfig` (shared with
+   `try_lazy_create()` via a new `_build_watcher_config_from_rule()`
+   helper), and — critically — seeds `self._states[name]` from the
+   persisted state too, so the subsequent start correctly resumes the old
+   session instead of silently creating a fresh one. Returns "genuinely
+   not found" only if the persisted entry isn't `dynamically_created`, or
+   the room/rule can no longer be resolved/matched (rule removed, room now
+   excluded) — a real orphan, nothing to reconstruct. Applied uniformly to
+   `pause_watcher()`/`resume_watcher()`/`reset_watcher()`, not just
+   `resume`, for consistency.
+9. **The `room`+`rooms`-both-present fix (finding #7) used truthiness, not
+   key presence.** `rooms: []` and `rooms: null` are both falsy, so
+   `if raw_room and raw_rooms` still let `room: "*"` with either alongside
+   it through as a wildcard rule — `rooms:`'s own "must be a non-empty
+   list" validation never got a chance to fire, same silent-typo risk
+   finding #7 was meant to close, just for the two falsy-value cases it
+   didn't cover. Fixed: `_is_wildcard_room_entry()` now checks
+   `"room" in wc_raw and "rooms" in wc_raw` (key membership) instead of
+   truthiness on the fetched values.
+
 ## Idle-expiry / auto-remove
 
 - Track `last_processed_ts` (already exists) per watcher; compare against

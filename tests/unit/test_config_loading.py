@@ -2287,6 +2287,21 @@ class TestWatcherRoomsExpansion(unittest.TestCase):
             GatewayConfig.from_file(path)
         self.assertIn("set either 'room' or 'rooms', not both", str(ctx.exception))
 
+    def test_wildcard_room_with_empty_rooms_list_raises_not_silently_ignored(self):
+        """PR #79 review, third round: `rooms: []` is FALSY, so a naive
+        truthiness check on 'rooms' would miss it and still classify this
+        as a wildcard rule — must be checked via key presence instead, so
+        this hits the existing 'rooms must be a non-empty list' error."""
+        path = self._write_config("""\
+            - connector: rc-home
+              room: "*"
+              rooms: []
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        msg = str(ctx.exception)
+        self.assertIn("'rooms' must be a non-empty list", msg)
+
     def test_two_wildcard_rules_same_connector_raises(self):
         path = self._write_config("""\
             - connector: rc-home

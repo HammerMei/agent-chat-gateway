@@ -984,22 +984,27 @@ def _is_wildcard_room_entry(wc_raw: object) -> bool:
     with a clear (if generic) "could not derive a safe watcher name" error
     rather than silently doing something unintended.
 
-    `room: "*"` with `rooms:` ALSO set (both keys present) deliberately
-    returns False too (PR #79 review, second round) — `_parse_one_watcher_rule()`
+    `room: "*"` with `rooms:` ALSO PRESENT deliberately returns False too
+    (PR #79 review, second AND third round) — `_parse_one_watcher_rule()`
     has no `rooms:` concept at all and would silently ignore it, turning a
     likely typo (leftover `rooms:` from before adding `room: "*"`, or vice
     versa) into a full wildcard rule instead of the existing, clear "set
-    either 'room' or 'rooms', not both" error _parse_one_watcher_entry()
-    already raises for this exact shape.
+    either 'room' or 'rooms', not both"/"must be a non-empty list" errors
+    _parse_one_watcher_entry() already raises for this shape. Checked via
+    **key presence** (`"rooms" in wc_raw`), not truthiness — a truthiness
+    check (`wc_raw.get("rooms")`) would miss `rooms: []`/`rooms: null`:
+    both are falsy, so a naive check would let them slip through as "not
+    really set" and still classify the entry as a wildcard rule, silently
+    skipping the "rooms must be a non-empty list" validation an explicitly
+    present-but-empty `rooms:` should hit instead.
     """
     if not isinstance(wc_raw, Mapping):
         return False
-    raw_room = wc_raw.get("room")
-    raw_rooms = wc_raw.get("rooms")
-    if raw_room and raw_rooms:
+    if "room" in wc_raw and "rooms" in wc_raw:
         return False
-    if raw_room == "*":
+    if wc_raw.get("room") == "*":
         return True
+    raw_rooms = wc_raw.get("rooms")
     return isinstance(raw_rooms, list) and raw_rooms == ["*"]
 
 
