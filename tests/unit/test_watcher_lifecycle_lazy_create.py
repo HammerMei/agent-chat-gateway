@@ -37,7 +37,8 @@ def _make_lifecycle(
     rules: list[WatcherConfig] | None,
     resolved_room=None,
     state_by_name=None,
-    check_global_name_available=None,
+    reserve_global_name=None,
+    release_global_name=None,
 ):
     config = CoreConfig()
     room = resolved_room or Room(id="chan-1", name="general", type="channel")
@@ -82,7 +83,8 @@ def _make_lifecycle(
         permission_registry=None,
         maps=maps,
         watcher_rules=rules,
-        check_global_name_available=check_global_name_available,
+        reserve_global_name=reserve_global_name,
+        release_global_name=release_global_name,
     )
     lifecycle._attachment_workspace = MagicMock()
     lifecycle._attachment_workspace.setup = MagicMock(return_value="/tmp/fake")
@@ -482,17 +484,18 @@ class TestTryLazyCreateFailClosedAndPause(unittest.IsolatedAsyncioTestCase):
 
 
 class TestTryLazyCreateGlobalNameUniqueness(unittest.IsolatedAsyncioTestCase):
-    """PR #79 review, fourth round: try_lazy_create()'s own collision
-    checks only see THIS connector's watchers — ControlServer routing and
-    the scheduler both assume watcher names are globally unique across
-    every connector, so a check_global_name_available callback (wired from
-    GatewayService, which alone has cross-connector visibility) must be
-    consulted before finalizing a lazy creation."""
+    """PR #79 review, fourth AND seventh rounds: try_lazy_create()'s own
+    collision checks only see THIS connector's watchers — ControlServer
+    routing and the scheduler both assume watcher names are globally
+    unique across every connector, so an atomic reserve_global_name/
+    release_global_name pair (wired from GatewayService, which alone has
+    cross-connector visibility) must be consulted before finalizing a lazy
+    creation."""
 
     async def test_name_taken_by_a_different_connector_refuses(self):
         lifecycle, connector, agent, state_store = _make_lifecycle(
             rules=[_rule()],
-            check_global_name_available=lambda name: False,
+            reserve_global_name=AsyncMock(return_value=False),
         )
 
         result = await lifecycle.try_lazy_create("chan-1")
@@ -504,7 +507,7 @@ class TestTryLazyCreateGlobalNameUniqueness(unittest.IsolatedAsyncioTestCase):
     async def test_name_available_globally_still_creates(self):
         lifecycle, connector, agent, state_store = _make_lifecycle(
             rules=[_rule()],
-            check_global_name_available=lambda name: True,
+            reserve_global_name=AsyncMock(return_value=True),
         )
 
         with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
@@ -524,6 +527,61 @@ class TestTryLazyCreateGlobalNameUniqueness(unittest.IsolatedAsyncioTestCase):
             result = await lifecycle.try_lazy_create("chan-1")
 
         self.assertTrue(result)
+
+    async def test_reservation_released_after_successful_creation(self):
+        """The transient reservation must not be left held forever once the
+        watcher is durably registered in _watcher_configs — a caller that
+        never releases it would permanently block that name from ever
+        being reserved again by anyone (including a legitimate later
+        reconstruction probe of the very watcher just created)."""
+        release = MagicMock()
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=[_rule()],
+            reserve_global_name=AsyncMock(return_value=True),
+            release_global_name=release,
+        )
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            result = await lifecycle.try_lazy_create("chan-1")
+
+        self.assertTrue(result)
+        release.assert_called_once_with("mm-home-general")
+
+    async def test_reservation_released_after_refused_reservation_is_a_noop(self):
+        """release_global_name is NOT called when the reservation itself
+        was refused — nothing was reserved, so there is nothing to
+        release; calling it anyway would incorrectly clear a DIFFERENT
+        in-flight caller's legitimate reservation for the same name."""
+        release = MagicMock()
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=[_rule()],
+            reserve_global_name=AsyncMock(return_value=False),
+            release_global_name=release,
+        )
+
+        result = await lifecycle.try_lazy_create("chan-1")
+
+        self.assertFalse(result)
+        release.assert_not_called()
+
+    async def test_reservation_released_after_start_watcher_failure(self):
+        """A failure partway through creation (e.g. _start_watcher raising)
+        must still release the reservation — otherwise a single transient
+        failure (network blip subscribing, etc.) would permanently blackhole
+        that name for every future attempt, on every connector."""
+        release = MagicMock()
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=[_rule()],
+            reserve_global_name=AsyncMock(return_value=True),
+            release_global_name=release,
+        )
+        connector.subscribe_room = AsyncMock(side_effect=RuntimeError("boom"))
+
+        result = await lifecycle.try_lazy_create("chan-1")
+
+        self.assertFalse(result)
+        release.assert_called_once_with("mm-home-general")
 
 
 class TestSyncWatchersPreservesLazyState(unittest.IsolatedAsyncioTestCase):

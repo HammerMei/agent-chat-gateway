@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime
-from typing import Callable
+from typing import Awaitable, Callable
 
 from ..agents import AgentBackend
 from .adapter_utils import ts_gt as _ts_gt
@@ -52,7 +52,8 @@ class WatcherLifecycle:
         permission_registry: PermissionRegistry | None,
         maps: SessionMaps,
         watcher_rules: "list[WatcherConfig] | None" = None,
-        check_global_name_available: Callable[[str], bool] | None = None,
+        reserve_global_name: Callable[[str], Awaitable[bool]] | None = None,
+        release_global_name: Callable[[str], None] | None = None,
     ) -> None:
         self._connector = connector
         self._agents = agents
@@ -73,14 +74,26 @@ class WatcherLifecycle:
         # constructing a WatcherLifecycle without lazy creation in mind
         # keeps working unchanged.
         self._watcher_rules: list[WatcherConfig] = watcher_rules or []
-        # Cross-connector watcher-name uniqueness check (PR #79 review,
-        # fourth round) — see GatewayService._is_watcher_name_globally_available()
+        # Cross-connector watcher-name reservation (PR #79 review, fourth
+        # AND seventh rounds) — see GatewayService._reserve_watcher_name()
         # for why this can't be answered from inside a single connector's
-        # own WatcherLifecycle. Optional (defaults to "always available")
-        # so every existing caller/test constructing a WatcherLifecycle
+        # own WatcherLifecycle. `reserve_global_name` must be an ATOMIC
+        # check-and-reserve, not a plain read: each WatcherLifecycle only
+        # ever locks by name WITHIN its own connector
+        # (`_get_watcher_lock()`), so two different connectors racing to
+        # lazily create a watcher for a name that collides across
+        # connectors would otherwise both observe "available" before
+        # either registers anything (seventh round finding). The caller
+        # MUST pair a successful reservation with a `release_global_name`
+        # call once the transient reservation is no longer needed (either
+        # because the watcher is now durably registered in
+        # `_watcher_configs`, or because creation was abandoned).
+        # Both optional (default to "always available" / no-op release) so
+        # every existing caller/test constructing a WatcherLifecycle
         # without a GatewayService above it keeps working unchanged — those
         # callers have no cross-connector name space to protect anyway.
-        self._check_global_name_available = check_global_name_available or (lambda _name: True)
+        self._reserve_global_name = reserve_global_name or self._always_available
+        self._release_global_name = release_global_name or (lambda _name: None)
 
         self._processors: dict[str, MessageProcessor] = {}
         self._states: dict[str, WatcherState] = {}
@@ -90,6 +103,11 @@ class WatcherLifecycle:
         # commands targeting the same watcher could otherwise interleave and
         # corrupt _processors / _states.
         self._watcher_locks: dict[str, asyncio.Lock] = {}
+
+    @staticmethod
+    async def _always_available(_name: str) -> bool:
+        """Default `reserve_global_name` when no GatewayService is present."""
+        return True
 
     # ── Sync ──────────────────────────────────────────────────────────────────
 
@@ -360,15 +378,23 @@ class WatcherLifecycle:
                 )
                 return False
 
-            # Cross-connector check (PR #79 review, fourth round): the two
-            # checks above only see THIS connector's own watchers. Watcher
-            # names are assumed globally unique across every connector
-            # (ControlServer._find_entry_for_watcher(), the scheduler) —
-            # an invariant already enforced for static watchers at
-            # config-load time, but never checked for a name generated at
-            # runtime. Refusing here, rather than creating a same-name
-            # watcher on two different connectors, keeps that assumption true.
-            if not self._check_global_name_available(watcher_name):
+            # Cross-connector RESERVATION (PR #79 review, fourth AND seventh
+            # rounds): the two checks above only see THIS connector's own
+            # watchers. Watcher names are assumed globally unique across
+            # every connector (ControlServer._find_entry_for_watcher(), the
+            # scheduler) — an invariant already enforced for static watchers
+            # at config-load time, but never checked for a name generated at
+            # runtime. A plain read-then-create here would still race: two
+            # connectors each hold only their OWN per-name lock
+            # (`_get_watcher_lock()`), so two near-simultaneous
+            # `try_lazy_create()` calls on DIFFERENT connectors whose
+            # room/connector pairs sanitize to the same name could both
+            # observe "available" before either registers anything
+            # (seventh round finding). `reserve_global_name` must therefore
+            # perform an atomic check-and-reserve; every exit past this
+            # point — success or failure — releases the reservation via the
+            # `finally` block below.
+            if not await self._reserve_global_name(watcher_name):
                 logger.error(
                     "try_lazy_create: auto-generated name '%s' for room "
                     "'%s' is already used by a watcher on a different "
@@ -378,71 +404,79 @@ class WatcherLifecycle:
                 )
                 return False
 
-            wc = self._build_watcher_config_from_rule(watcher_name, rule, room.name)
-            # Resume a dormant session from a prior run, if one was
-            # persisted under this exact (deterministic) name — same
-            # resume-first behavior _provision_session() already gives
-            # every static watcher.
-            state = self._state_store.load().get(watcher_name)
-
-            # PR #79 review (fourth round): the persisted state under this
-            # NAME might belong to a DIFFERENT room that happened to
-            # sanitize to the same name in a PRIOR run (e.g. one whose
-            # watcher was never re-created after that run ended) — reusing
-            # its session_id here would bind the WRONG room's conversation
-            # history/context onto this room, violating the 1-session-per-
-            # room invariant this whole feature is built around. Checked by
-            # room_id, not name, since name is exactly what's ambiguous here.
-            if state is not None and state.room_id and state.room_id != room.id:
-                logger.error(
-                    "try_lazy_create: persisted state for '%s' belongs to a "
-                    "different room (room_id=%s) than the one just resolved "
-                    "(room_id=%s, name=%s) — likely two rooms colliding on "
-                    "the same auto-generated name; refusing to reuse or "
-                    "overwrite it.",
-                    watcher_name, state.room_id, room.id, room.name,
-                )
-                return False
-
-            # PR #79 review (second round): after a restart, this room's
-            # WatcherConfig is gone from `_watcher_configs` (never
-            # persisted — only the runtime state is, via
-            # dynamically_created), so the `existing_for_room` check above
-            # can't see it and never fires. Without this second check here,
-            # a paused lazy watcher's persisted state (paused=True) would
-            # get resumed by the very next message post-restart, with no
-            # explicit `resume` — _start_watcher() itself has no
-            # "is this paused" gate, it always starts unconditionally.
-            if state is not None and state.paused:
-                logger.info(
-                    "try_lazy_create: room '%s' has a paused persisted "
-                    "watcher ('%s') — not auto-resuming; use "
-                    "'agent-chat-gateway resume %s' to bring it back.",
-                    room.name, watcher_name, watcher_name,
-                )
-                return False
-
             try:
-                await self._start_watcher(wc, state)
-            except Exception as e:
-                logger.error(
-                    "try_lazy_create: failed to start watcher '%s' for "
-                    "room '%s': %s", watcher_name, room.name, e,
-                )
-                return False
+                wc = self._build_watcher_config_from_rule(watcher_name, rule, room.name)
+                # Resume a dormant session from a prior run, if one was
+                # persisted under this exact (deterministic) name — same
+                # resume-first behavior _provision_session() already gives
+                # every static watcher.
+                state = self._state_store.load().get(watcher_name)
 
-            self._watcher_configs.append(wc)
-            # Flag so sync_watchers() preserves this entry across a restart
-            # even though `wc` only ever lives in memory, never in
-            # config.yaml (PR #79 review — see WatcherState.dynamically_created).
-            if watcher_name in self._states:
-                self._states[watcher_name].dynamically_created = True
-            self._state_store.save(self._states)
-            logger.info(
-                "Lazily created watcher '%s' for room '%s' (rule-matched, "
-                "agent '%s')", watcher_name, room.name, rule.agent,
-            )
-            return True
+                # PR #79 review (fourth round): the persisted state under this
+                # NAME might belong to a DIFFERENT room that happened to
+                # sanitize to the same name in a PRIOR run (e.g. one whose
+                # watcher was never re-created after that run ended) — reusing
+                # its session_id here would bind the WRONG room's conversation
+                # history/context onto this room, violating the 1-session-per-
+                # room invariant this whole feature is built around. Checked by
+                # room_id, not name, since name is exactly what's ambiguous here.
+                if state is not None and state.room_id and state.room_id != room.id:
+                    logger.error(
+                        "try_lazy_create: persisted state for '%s' belongs to a "
+                        "different room (room_id=%s) than the one just resolved "
+                        "(room_id=%s, name=%s) — likely two rooms colliding on "
+                        "the same auto-generated name; refusing to reuse or "
+                        "overwrite it.",
+                        watcher_name, state.room_id, room.id, room.name,
+                    )
+                    return False
+
+                # PR #79 review (second round): after a restart, this room's
+                # WatcherConfig is gone from `_watcher_configs` (never
+                # persisted — only the runtime state is, via
+                # dynamically_created), so the `existing_for_room` check above
+                # can't see it and never fires. Without this second check here,
+                # a paused lazy watcher's persisted state (paused=True) would
+                # get resumed by the very next message post-restart, with no
+                # explicit `resume` — _start_watcher() itself has no
+                # "is this paused" gate, it always starts unconditionally.
+                if state is not None and state.paused:
+                    logger.info(
+                        "try_lazy_create: room '%s' has a paused persisted "
+                        "watcher ('%s') — not auto-resuming; use "
+                        "'agent-chat-gateway resume %s' to bring it back.",
+                        room.name, watcher_name, watcher_name,
+                    )
+                    return False
+
+                try:
+                    await self._start_watcher(wc, state)
+                except Exception as e:
+                    logger.error(
+                        "try_lazy_create: failed to start watcher '%s' for "
+                        "room '%s': %s", watcher_name, room.name, e,
+                    )
+                    return False
+
+                self._watcher_configs.append(wc)
+                # Flag so sync_watchers() preserves this entry across a restart
+                # even though `wc` only ever lives in memory, never in
+                # config.yaml (PR #79 review — see WatcherState.dynamically_created).
+                if watcher_name in self._states:
+                    self._states[watcher_name].dynamically_created = True
+                self._state_store.save(self._states)
+                logger.info(
+                    "Lazily created watcher '%s' for room '%s' (rule-matched, "
+                    "agent '%s')", watcher_name, room.name, rule.agent,
+                )
+                return True
+            finally:
+                # Release the transient reservation regardless of outcome:
+                # on success the name is now durably visible via
+                # `_watcher_configs` (checked directly, no reservation
+                # needed); on any failure path the name was never claimed
+                # and must not be left stuck "reserved" forever.
+                self._release_global_name(watcher_name)
 
     # ── Lifecycle controls ────────────────────────────────────────────────────
 

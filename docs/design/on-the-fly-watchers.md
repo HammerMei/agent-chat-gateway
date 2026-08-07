@@ -1,6 +1,6 @@
 # On-the-fly watchers: rule-based room matching + lazy watcher lifecycle
 
-Status (updated 2026-08-05): **config schema landed (PR #77); rule-based
+Status (updated 2026-08-07): **config schema landed (PR #77); rule-based
 room matching + lazy creation landed for Mattermost.** RocketChat support,
 `session_id`/`online_notification`/`offline_notification` retirement, and
 the `expire` CLI are still design-only. Coordinating a low-traffic
@@ -515,6 +515,55 @@ hazard between it and the lazy path running alongside it:
     check (refuse outright) still fires first for that path regardless,
     so this new one is simply never reached with a mismatched state from
     there.
+
+### PR #79 review, seventh round (2026-08-07) — two more findings, both fixed
+
+Round seven went back to the fourth round's cross-connector name check
+(`GatewayService._is_watcher_name_globally_available()`) and found it was
+still incomplete in two independent ways — one a coverage gap, one a
+genuine concurrency race:
+
+18. **The global name check missed dormant dynamic watchers.** A
+    dynamically-created watcher's `WatcherConfig` is never persisted, only
+    its `WatcherState` (via `dynamically_created`) — after a restart, a
+    lazy watcher that hasn't yet received a message to reconstruct itself
+    has no entry in any connector's `_watcher_configs`, so the old
+    `get_watcher_config()`-only check considered its name available. A
+    newly added connector, or a rule generating the same composite name,
+    could claim it before the dormant watcher ever woke up — later lazy
+    creation attempts and unqualified lifecycle commands (`pause`/
+    `resume`/`reset <name>`) would then resolve to the wrong owner, or the
+    original watcher would become unreachable under its own name. Fixed by
+    switching the check from `get_watcher_config()` (plain, non-
+    reconstructing) to `can_find_or_reconstruct_watcher()` — the same
+    reconstruction-aware probe `ControlServer` already relies on for
+    routing pause/resume/reset — which resolves the room and rebuilds a
+    dormant dynamic watcher's config (and seeds its state) from persisted
+    state if one matches, then reports it as found.
+19. **The global name check was a plain, unsynchronized read — a genuine
+    cross-connector TOCTOU race.** Each `WatcherLifecycle` only ever
+    serializes lazy creation for a given name against ITSELF, via its own
+    per-connector `_get_watcher_lock()`; nothing serialized the check
+    ACROSS different `WatcherLifecycle` instances. Two connectors
+    receiving their first message for room/connector pairs that sanitize
+    to the same composite name could both call the check concurrently,
+    both observe "available," and both proceed to `_start_watcher()`
+    before either had registered anything — leaving two watchers live
+    under the one name every other part of the system assumes is unique.
+    Fixed by replacing the plain read with an atomic reserve/release pair
+    owned by `GatewayService`: `_reserve_watcher_name()` holds a single
+    lock shared by every connector (`self._watcher_name_lock`, deliberately
+    NOT per-connector — the race is *between* connectors) across the
+    whole check-then-reserve sequence, and tracks in-flight reservations
+    in `self._reserved_watcher_names` so the window between "check passed"
+    and "watcher durably registered in `_watcher_configs`" is covered too,
+    not just the initial read. `try_lazy_create()` now calls
+    `reserve_global_name()` in place of the old
+    `check_global_name_available()` and wraps everything after it in a
+    `finally: release_global_name()` — released on every exit path
+    (success, refusal, or a `_start_watcher()` failure), since holding a
+    reservation past its need would blackhole that name for every future
+    attempt, on every connector, after a single transient failure.
 
 ## Idle-expiry / auto-remove
 
