@@ -804,6 +804,152 @@ the tenth round's own finding #25:
     posture — a transient network blip during startup must not
     permanently discard a legitimate session.
 
+## Startup ordering: root-cause design review (2026-08-07, PROPOSED — not yet implemented)
+
+Eleven review rounds in, a pattern was worth stepping back for instead of
+patching the next instance: **rounds ten and eleven found four findings
+that look superficially identical** (#24, #25, #27, #28), but they are
+actually two different bug classes, and only one of them is a startup-
+ordering problem at all.
+
+- **#24 (`_states` not seeded) and #27 (`_blocked_agents` empty) are the
+  real ordering bugs.** Both are symptoms of the exact same root cause:
+  `SessionManager.run_once()` calls `connector.connect()` — which, for
+  Mattermost, opens the websocket and starts its listen loop as a
+  background task — *before* `sync_watchers()` finishes populating
+  `self._states` / `self._blocked_agents`. Any piece of `WatcherLifecycle`
+  state that `sync_watchers()` is responsible for initializing is exposed
+  to this same window; #24 and #27 are just the first two pieces of state
+  the review happened to find first, not an exhaustive list. A third,
+  currently-undiscovered piece of shared mutable state populated inside
+  `sync_watchers()` would reproduce this exact bug shape again.
+- **#25 (rule removed) and #28 (room excluded) are NOT ordering bugs.**
+  They're a wrong *predicate* in `sync_watchers()`'s dynamic-state
+  preservation logic — "preserve if some rule exists" instead of "preserve
+  if THIS watcher's room still matches the active rule." They would exist
+  identically even with perfect startup ordering, because the bug is in
+  what gets checked, not when. Their fixes (gate on `self._watcher_rules`
+  non-empty; then further gate on `exclude_rooms`) are independently
+  correct and **out of scope for this redesign** — nothing below touches
+  them.
+
+So the actual question is: how to structurally close the #24/#27-shaped
+bug class, rather than continuing to find and patch its next instance one
+piece of state at a time.
+
+### Options considered
+
+**A — Split every connector's `connect()` into an auth phase and a
+"start receiving events" phase, uniformly.** Rejected: RocketChat's DDP
+transport requires an actual `sub` message sent over the *already-open*
+connection to receive events for a room at all (see "Room discovery +
+membership-event hooks" above) — its `subscribe_room()` cannot be
+meaningfully separated from having a live connection the way Mattermost's
+can. Forcing a uniform two-phase contract onto a connector whose protocol
+doesn't have that shape would be solving a Mattermost-specific problem by
+distorting the shared `Connector` ABC for everyone.
+
+**B — A single readiness gate (`asyncio.Event`) inside `WatcherLifecycle`,
+awaited at the top of `try_lazy_create()` and set at the end of
+`sync_watchers()`.** Closes the bug class (any future state gets the same
+protection for free) without touching the `Connector` ABC at all. But it
+serializes *against* the race window instead of removing it, which brings
+its own problems:
+- The websocket is still live and dispatching during the gap — this
+  option holds the triggering message's processing coroutine hostage
+  (via the per-channel worker queue) rather than preventing the event
+  from arriving in the first place. A slow `sync_watchers()` (many static
+  watchers, slow REST calls) delays the first lazy-creation attempt in a
+  new room by however long the whole static startup loop takes — likely
+  fine, but a real, user-visible latency characteristic that option C
+  doesn't have.
+- The gate must be released even when `sync_watchers()` raises partway
+  through, or when `run_once()` never reaches it at all (an earlier
+  `connect()` failure) — a bare `self._ready.set()` at the end of
+  `sync_watchers()` is not enough; it needs a `finally` at minimum, plus a
+  deliberate decision about what "gate released after a failure" means
+  (proceed with incomplete state? refuse and drop the message?) —
+  currently unresolved, and either answer is a real design choice, not a
+  detail.
+- Every existing `try_lazy_create()` unit test (~50 in
+  `test_watcher_lifecycle_lazy_create.py`) constructs a `WatcherLifecycle`
+  without ever calling `sync_watchers()` first — `_make_lifecycle()` would
+  need to default-set the event, or all of them hang forever. Mechanical,
+  but it means the test harness stops exercising the real gate at all,
+  and the one new test that WOULD exercise it (does the gate actually
+  block/release correctly) has to be written from scratch with no
+  existing pattern to extend.
+
+**C — RECOMMENDED. Give `Connector` a new `start_realtime()` lifecycle
+method (default no-op, same pattern already used for
+`register_capacity_check()`/`register_lazy_creation_hook()`), and move
+Mattermost's websocket startup into it.** `MattermostConnector.connect()`
+currently ends with:
+```python
+await self._ws.connect()
+await self._ws.start()
+```
+These two lines move into `start_realtime()`; everything before them
+(REST `authenticate()`/`get_me()`/`resolve_team()`) stays in `connect()`.
+`SessionManager.run_once()` reorders to `connect()` → `sync_watchers()` →
+`start_realtime()`. This removes the window entirely rather than
+serializing against it: no `posted` event can arrive before
+`self._states`/`self._blocked_agents` (or any future state
+`sync_watchers()` owns) are fully populated, because the socket that
+would deliver it isn't open yet. Verified safe by reading
+`gateway/connectors/mattermost/websocket.py` end to end (not assumed):
+- `subscribe_room()` (called by every `_start_watcher()` during
+  `sync_watchers()`) makes **no wire-protocol call at all** — its own
+  docstring says so, confirmed by reading it: "No wire-protocol call: the
+  WebSocket already streams every channel the bot is a member of. This
+  just registers local dispatch state." It only touches
+  `MattermostConnector._channels` (a local dict) and calls
+  `self._ws.register_channel(room.id)`.
+- `MattermostWebSocketClient.register_channel()` is `self._registered_channels.add(channel_id)`
+  — a bare set insert. `_registered_channels` is write-only in this file
+  (grepped: only ever added-to/discarded-from, never read) — it isn't
+  even the mechanism that filters incoming events (that's
+  `MattermostConnector._channels`, checked in `_on_posted_event`). Neither
+  touches `self._ws` (the actual socket object) in any way.
+- Therefore `sync_watchers()`'s entire static-watcher-starting path
+  (resolve room via REST, register local channel state, start the
+  processor) has zero dependency on the websocket being open. No
+  buffer-and-flush shim is needed — this is a clean two-line move, not a
+  redesign of `subscribe_room()`.
+- RocketChat, Script, and Voice inherit the default no-op `start_realtime()`
+  — their `connect()` is completely unchanged, so they're provably
+  unaffected by this change. RC's own DDP subscribe-needs-a-live-
+  connection constraint (which sank option A) never comes into play here,
+  because RC doesn't support `room: "*"` rules at all (finding #26) — this
+  fix only needs to matter for a connector that actually calls
+  `register_lazy_creation_hook()`.
+
+**Decision: recommend C, pending the repo owner's sign-off — not yet implemented.**
+Round ten and eleven's fixes for #24 (disk fallback in the stable-room-ID
+search) and #27 (`seed_blocked_agents()`) are **kept as defense-in-depth**
+either way, not reverted — they're already merged, already reviewed, and
+correct as a second line of defense even once the ordering itself is
+fixed (e.g. if a future connector or code path reintroduces a similar
+gap). #25/#28 are untouched regardless of which option is chosen, per the
+framing above.
+
+### Process notes
+
+- **This belongs in a separate PR/branch, not folded into #79.** #79 is
+  already eleven review rounds and 28 findings deep; a change to
+  `Connector`'s ABC and `SessionManager.run_once()`'s call order is a
+  distinct, separable change from "lazy creation for Mattermost," and
+  keeping it separate makes both easier to review and easier to revert
+  independently if either turns out to have a problem in production.
+- **The existing rollout constraint applies here too, arguably more
+  strictly.** Per the "Rollout" section below, nothing in this feature has
+  touched macbook-server yet and a low-traffic test window must be
+  coordinated with the repo owner first. A change to *startup sequencing*
+  specifically is a class of change unit tests alone cannot fully
+  validate (ordering bugs are, by definition, about real-world timing) —
+  this should get at least one live low-traffic startup cycle watched
+  directly before being trusted, independent of the general rollout gate.
+
 ## Idle-expiry / auto-remove
 
 - Track `last_processed_ts` (already exists) per watcher; compare against
