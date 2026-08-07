@@ -111,6 +111,34 @@ class WatcherLifecycle:
 
     # ── Sync ──────────────────────────────────────────────────────────────────
 
+    def seed_blocked_agents(self, unavailable_agents: set[str] | None) -> None:
+        """Set `self._blocked_agents` ahead of enabling live message
+        callbacks — call this BEFORE `connector.connect()`, not after.
+
+        PR #79 review, eleventh round, finding #27: `SessionManager.run_once()`
+        registers `try_lazy_create()` as the lazy-creation hook and awaits
+        `connector.connect()` (which starts the Mattermost websocket
+        listener as a background task) *before* calling `sync_watchers()` —
+        and `sync_watchers()` is the only place that previously populated
+        `self._blocked_agents` (still the empty set from `__init__` until
+        then). A message arriving in that window would pass
+        `try_lazy_create()`'s fail-closed `agent_name in self._blocked_agents`
+        check even for an agent whose permission broker genuinely failed to
+        start, lazily creating a watcher with zero tool-call enforcement —
+        the exact hole `sync_watchers()`'s own identical check (and the
+        seventh review round's fix extending it to the lazy path) was
+        built to close, just reopened by startup ordering.
+
+        Idempotent with `sync_watchers()`'s own identical assignment
+        (which stays unchanged, including its None-means-"don't touch"
+        semantics for a hypothetical hot-reload re-call) — calling both is
+        deliberate, not a bug: this seeds the value early enough to matter
+        for the pre-`sync_watchers()` window; `sync_watchers()` then
+        harmlessly re-applies the same value once it runs.
+        """
+        if unavailable_agents is not None:
+            self._blocked_agents = set(unavailable_agents)
+
     async def sync_watchers(
         self, unavailable_agents: set[str] | None = None
     ) -> list[str]:
@@ -213,7 +241,11 @@ class WatcherLifecycle:
         config_names = {wc.name for wc in self._watcher_configs}
         for name in list(persisted):
             if name not in config_names:
-                if persisted[name].dynamically_created and self._watcher_rules:
+                if (
+                    persisted[name].dynamically_created
+                    and self._watcher_rules
+                    and await self._dynamic_state_still_matches_rule(persisted[name])
+                ):
                     # PR #79 review finding: a lazily-created watcher
                     # (docs/design/on-the-fly-watchers.md) is NEVER in
                     # `_watcher_configs` at boot — its WatcherConfig only
@@ -239,13 +271,23 @@ class WatcherLifecycle:
                     # forever, permanently blocking any OTHER connector
                     # from ever claiming that generated name for a
                     # watcher that can actually run.
+                    #
+                    # ALSO gated on `_dynamic_state_still_matches_rule()`
+                    # (PR #79 review, eleventh round, finding #28): a rule
+                    # existing at all isn't enough — if the operator added
+                    # this exact room to `exclude_room:` since this watcher
+                    # was created, every future message for it is rejected
+                    # by try_lazy_create()'s own exclusion check AND
+                    # `_reconstruct_dynamic_watcher_config()` refuses it
+                    # too, so it's just as unreachable as the rule-removed
+                    # case above — just a narrower trigger.
                     self._states[name] = persisted[name]
                 elif persisted[name].dynamically_created:
                     logger.info(
                         "Watcher '%s' was dynamically created but this "
-                        "connector no longer has an active wildcard rule — "
-                        "pruning its persisted state (it can never be "
-                        "reconstructed without one).",
+                        "connector no longer has an active, matching "
+                        "wildcard rule for its room — pruning its "
+                        "persisted state (it can never be reconstructed).",
                         name,
                     )
                 else:
@@ -256,6 +298,41 @@ class WatcherLifecycle:
 
         self._state_store.save(self._states)
         return errors
+
+    async def _dynamic_state_still_matches_rule(self, state: WatcherState) -> bool:
+        """True if `state`'s room still resolves and is not excluded by
+        this connector's active wildcard rule.
+
+        Used by `sync_watchers()`'s startup preservation loop (PR #79
+        review, eleventh round, finding #28) — preserving a dynamic
+        watcher's state just because SOME rule exists (the tenth round's
+        finding #25 fix) isn't enough: if the operator added this exact
+        room to `exclude_room:` since the watcher was created, it's just
+        as permanently unreachable as if the whole rule had been removed,
+        yet nothing pruned it.
+
+        Fast path: skips the network round-trip entirely when the active
+        rule has no `exclude_rooms` at all (the common case) — nothing
+        could possibly exclude this room in that case.
+
+        Resolution failure preserves conservatively (True) rather than
+        pruning — consistent with `_reconstruct_dynamic_watcher_config()`'s
+        own best-effort error handling: a transient network blip during
+        startup must not permanently discard a legitimate session.
+        """
+        rule = self._watcher_rules[0]
+        if not rule.exclude_rooms:
+            return True
+        try:
+            room = await self._connector.resolve_room_by_id(state.room_id)
+        except Exception as e:
+            logger.warning(
+                "sync_watchers: could not resolve room id=%s while checking "
+                "dynamic watcher '%s' against exclude_room: — preserving "
+                "conservatively: %s", state.room_id, state.watcher_name, e,
+            )
+            return True
+        return room.name not in rule.exclude_rooms
 
     def _get_watcher_lock(self, name: str) -> asyncio.Lock:
         """Return (creating if needed) the per-watcher mutex for lifecycle ops."""

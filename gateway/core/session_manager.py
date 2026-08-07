@@ -110,6 +110,14 @@ class SessionManager:
         Returns:
             List of human-readable error strings for any watchers that failed.
         """
+        # PR #79 review, eleventh round, finding #27: seed the fail-closed
+        # blocked-agents set BEFORE the lazy-creation hook goes live and
+        # connect() starts the websocket listener — sync_watchers() below
+        # would otherwise be the first (and, until now, only) place that
+        # ever set it, leaving it empty for the entire connect()-to-
+        # sync_watchers() window during which a message could already
+        # trigger try_lazy_create().
+        self._lifecycle.seed_blocked_agents(unavailable_agents)
         self._connector.register_handler(self._dispatcher.dispatch)
         self._connector.register_capacity_check(self._dispatcher.has_capacity)
         self._connector.register_lazy_creation_hook(self._lifecycle.try_lazy_create)
