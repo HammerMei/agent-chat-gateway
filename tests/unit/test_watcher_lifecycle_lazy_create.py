@@ -584,6 +584,161 @@ class TestTryLazyCreateGlobalNameUniqueness(unittest.IsolatedAsyncioTestCase):
         release.assert_called_once_with("mm-home-general")
 
 
+class TestTryLazyCreateDormantWatcherReclaimsOwnName(unittest.IsolatedAsyncioTestCase):
+    """PR #79 review, seventh round, finding #20: a dynamic watcher's
+    persisted state can outlive its WatcherConfig across a restart. Before
+    this fix, the very next (unrelated-to-rename) message for that SAME
+    room would route through the cross-connector reservation, which fans
+    out to can_find_or_reconstruct_watcher() on every connector including
+    this one — truthfully reconstructing and reporting this exact watcher
+    as "already occupied" by itself, and refusing forever. An un-paused
+    dynamic watcher must be able to resume on its own name without ever
+    consulting the cross-connector reservation at all."""
+
+    def _dormant_state(self, *, paused: bool = False) -> dict:
+        return {
+            "mm-home-general": WatcherState(
+                watcher_name="mm-home-general",
+                session_id="old-sess-id",
+                room_id="chan-1",
+                paused=paused,
+                dynamically_created=True,
+            )
+        }
+
+    async def test_unpaused_dormant_watcher_resumes_without_consulting_reservation(self):
+        reserve = AsyncMock(return_value=False)  # would wrongly refuse if called
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=[_rule()],
+            state_by_name=self._dormant_state(),
+            reserve_global_name=reserve,
+        )
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            result = await lifecycle.try_lazy_create("chan-1")
+
+        self.assertTrue(result)
+        reserve.assert_not_called()
+        agent.create_session.assert_not_called()  # resumed the OLD session
+        connector.subscribe_room.assert_awaited_once()
+
+    async def test_reservation_release_not_called_for_a_self_reclaim(self):
+        """Nothing was ever reserved for a self-reclaim — releasing would
+        risk clearing a DIFFERENT caller's unrelated in-flight reservation
+        for the same name."""
+        release = MagicMock()
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=[_rule()],
+            state_by_name=self._dormant_state(),
+            release_global_name=release,
+        )
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            await lifecycle.try_lazy_create("chan-1")
+
+        release.assert_not_called()
+
+    async def test_paused_dormant_watcher_still_not_auto_resumed(self):
+        """The self-reclaim fast path must not bypass the existing
+        (second-round) paused check — only "not paused" dormant watchers
+        skip the reservation and auto-resume."""
+        reserve = AsyncMock(return_value=False)
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=[_rule()],
+            state_by_name=self._dormant_state(paused=True),
+            reserve_global_name=reserve,
+        )
+
+        result = await lifecycle.try_lazy_create("chan-1")
+
+        self.assertFalse(result)
+        connector.subscribe_room.assert_not_called()
+
+    async def test_foreign_ghost_state_under_the_same_name_still_uses_reservation(self):
+        """A DIFFERENT room's stale persisted state colliding on this exact
+        auto-generated name must NOT be treated as a self-reclaim — it
+        still goes through the full reservation and is then caught by the
+        existing room_id-mismatch refusal."""
+        reserve = AsyncMock(return_value=True)
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=[_rule()],
+            state_by_name={
+                "mm-home-general": WatcherState(
+                    watcher_name="mm-home-general",
+                    session_id="ghost-sess-id",
+                    room_id="some-other-chan-id",
+                    dynamically_created=True,
+                )
+            },
+            reserve_global_name=reserve,
+        )
+
+        result = await lifecycle.try_lazy_create("chan-1")
+
+        self.assertFalse(result)
+        reserve.assert_awaited_once_with("mm-home-general")
+        connector.subscribe_room.assert_not_called()
+
+
+class TestTryLazyCreateRenamedRoomRespectsOwnership(unittest.IsolatedAsyncioTestCase):
+    """PR #79 review, seventh round, finding #21: a dynamic watcher's
+    persisted state (room_id-stable) can be found by the fifth round's
+    stable-ID fallback while its WatcherConfig is still absent (never
+    reconstructed) — get_watcher_config() returning None there must not be
+    read as "nothing to see here" when the room was actually renamed;
+    silently building a brand-new config under the new name would abandon
+    the old session and bypass a persisted pause."""
+
+    def _old_name_state(self, *, paused: bool) -> WatcherState:
+        return WatcherState(
+            watcher_name="mm-home-old-name",
+            session_id="old-sess-id",
+            room_id="chan-1",
+            paused=paused,
+            dynamically_created=True,
+        )
+
+    async def test_renamed_room_reconstructs_old_watcher_and_refuses_new_one(self):
+        renamed_room = Room(id="chan-1", name="new-name", type="channel")
+        old_state = self._old_name_state(paused=False)
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=[_rule()],
+            resolved_room=renamed_room,
+            state_by_name={"mm-home-old-name": old_state},
+        )
+        # Simulates what sync_watchers()'s startup preservation logic
+        # (round four/six) already seeded into self._states at boot —
+        # `_make_lifecycle()` doesn't run sync_watchers(), so it's seeded
+        # directly here, same as the fifth round's own rename tests above.
+        lifecycle._states["mm-home-old-name"] = old_state
+
+        result = await lifecycle.try_lazy_create("chan-1")
+
+        self.assertFalse(result)
+        # Reconstructed under its OLD name, not silently replaced by a new one.
+        self.assertIsNotNone(lifecycle.get_watcher_config("mm-home-old-name"))
+        self.assertIsNone(lifecycle.get_watcher_config("mm-home-new-name"))
+        agent.create_session.assert_not_called()
+        connector.subscribe_room.assert_not_called()
+
+    async def test_renamed_paused_watcher_also_reconstructed_and_refused(self):
+        renamed_room = Room(id="chan-1", name="new-name", type="channel")
+        old_state = self._old_name_state(paused=True)
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=[_rule()],
+            resolved_room=renamed_room,
+            state_by_name={"mm-home-old-name": old_state},
+        )
+        lifecycle._states["mm-home-old-name"] = old_state
+
+        result = await lifecycle.try_lazy_create("chan-1")
+
+        self.assertFalse(result)
+        self.assertIsNotNone(lifecycle.get_watcher_config("mm-home-old-name"))
+
+
 class TestSyncWatchersPreservesLazyState(unittest.IsolatedAsyncioTestCase):
     """PR #79 review finding: sync_watchers()'s final save() only persists
     self._states, built solely from _watcher_configs — a lazily-created

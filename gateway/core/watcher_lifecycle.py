@@ -339,6 +339,42 @@ class WatcherLifecycle:
                 )
                 if state_for_room_id is not None:
                     existing_for_room = self.get_watcher_config(state_for_room_id.watcher_name)
+                    if (
+                        existing_for_room is None
+                        and state_for_room_id.watcher_name != watcher_name
+                    ):
+                        # PR #79 review (seventh round, finding #21): a
+                        # dynamic watcher's persisted state can outlive its
+                        # WatcherConfig across a restart — get_watcher_config()
+                        # above just returned None because it was never
+                        # reconstructed, NOT because there's nothing to find.
+                        # `state_for_room_id.watcher_name != watcher_name`
+                        # (computed from room.name a few lines above) means
+                        # the room was RENAMED since this watcher was
+                        # created — silently proceeding to build a
+                        # brand-new config under the new auto-generated
+                        # name would abandon the old session and bypass a
+                        # persisted pause entirely (the "resume a dormant
+                        # session" step below looks up state by the NEW
+                        # name, which has no persisted entry). Reconstruct
+                        # the OLD watcher so the block below recognizes it
+                        # as an existing, dormant watcher needing explicit
+                        # `resume` — same treatment any other paused/stopped
+                        # watcher for this room gets.
+                        #
+                        # Deliberately NOT done when the name is unchanged
+                        # (no rename): that's just the ordinary "next
+                        # message after a restart" case for an un-paused
+                        # dynamic watcher, and the "resume a dormant
+                        # session" step further below (which loads state by
+                        # this exact, unchanged name) is what's SUPPOSED to
+                        # bring it back — reconstructing and blocking here
+                        # too would leave it stuck dormant forever instead
+                        # (finding #20, a separate seventh-round bug fixed
+                        # near the reservation call below).
+                        existing_for_room = await self._reconstruct_dynamic_watcher_config(
+                            state_for_room_id.watcher_name
+                        )
             if existing_for_room is not None:
                 if existing_for_room.name in self._processors:
                     # Already running (under its own name, custom or
@@ -378,39 +414,73 @@ class WatcherLifecycle:
                 )
                 return False
 
-            # Cross-connector RESERVATION (PR #79 review, fourth AND seventh
-            # rounds): the two checks above only see THIS connector's own
-            # watchers. Watcher names are assumed globally unique across
-            # every connector (ControlServer._find_entry_for_watcher(), the
-            # scheduler) — an invariant already enforced for static watchers
-            # at config-load time, but never checked for a name generated at
-            # runtime. A plain read-then-create here would still race: two
-            # connectors each hold only their OWN per-name lock
-            # (`_get_watcher_lock()`), so two near-simultaneous
-            # `try_lazy_create()` calls on DIFFERENT connectors whose
-            # room/connector pairs sanitize to the same name could both
-            # observe "available" before either registers anything
-            # (seventh round finding). `reserve_global_name` must therefore
-            # perform an atomic check-and-reserve; every exit past this
-            # point — success or failure — releases the reservation via the
-            # `finally` block below.
-            if not await self._reserve_global_name(watcher_name):
-                logger.error(
-                    "try_lazy_create: auto-generated name '%s' for room "
-                    "'%s' is already used by a watcher on a different "
-                    "connector — refusing to create (watcher names must "
-                    "be globally unique).",
-                    watcher_name, room.name,
-                )
-                return False
+            # Resume a dormant session from a prior run, if one was
+            # persisted under this exact (deterministic) name — same
+            # resume-first behavior _provision_session() already gives
+            # every static watcher. Loaded BEFORE the cross-connector
+            # reservation below (PR #79 review, seventh round, finding #20)
+            # specifically so a self-reclaim (see `reclaiming_own_state`)
+            # can be detected and the reservation skipped for it.
+            state = self._state_store.load().get(watcher_name)
 
+            # PR #79 review (seventh round, finding #20): if this exact
+            # name's persisted state already belongs to THIS exact room, on
+            # THIS connector, then there is no name collision to arbitrate
+            # at all — it's the same dynamic watcher reclaiming its own
+            # name on the next message after a restart (its WatcherConfig
+            # was never reconstructed, only its state survived — same
+            # premise as finding #21 above). Routing this through the
+            # cross-connector reservation below would be actively harmful:
+            # `_reserve_global_name()` fans out to
+            # `can_find_or_reconstruct_watcher()` on every connector
+            # INCLUDING this one, which would truthfully reconstruct and
+            # report this exact watcher as "already occupied" — by itself —
+            # and refuse forever, leaving an un-paused dynamic watcher
+            # permanently stuck dormant with no path back except an
+            # operator manually running `resume`. A genuinely different
+            # room's state colliding on this same name (a stale ghost from
+            # a prior run) is NOT covered by this flag — its `room_id` bookmark
+            # won't match `room.id`, `reclaiming_own_state` stays False, and
+            # it still goes through the full reservation + the room_id
+            # mismatch check just below, exactly as before.
+            reclaiming_own_state = (
+                state is not None and bool(state.room_id) and state.room_id == room.id
+            )
+
+            reserved = False
             try:
+                if not reclaiming_own_state:
+                    # Cross-connector RESERVATION (PR #79 review, fourth AND
+                    # seventh rounds): the two checks above only see THIS
+                    # connector's own watchers. Watcher names are assumed
+                    # globally unique across every connector
+                    # (ControlServer._find_entry_for_watcher(), the
+                    # scheduler) — an invariant already enforced for static
+                    # watchers at config-load time, but never checked for a
+                    # name generated at runtime. A plain read-then-create
+                    # here would still race: two connectors each hold only
+                    # their OWN per-name lock (`_get_watcher_lock()`), so two
+                    # near-simultaneous `try_lazy_create()` calls on
+                    # DIFFERENT connectors whose room/connector pairs
+                    # sanitize to the same name could both observe
+                    # "available" before either registers anything (seventh
+                    # round finding). `reserve_global_name` must therefore
+                    # perform an atomic check-and-reserve; every exit past
+                    # this point where a reservation was actually taken —
+                    # success or failure — releases it via the `finally`
+                    # block below.
+                    if not await self._reserve_global_name(watcher_name):
+                        logger.error(
+                            "try_lazy_create: auto-generated name '%s' for room "
+                            "'%s' is already used by a watcher on a different "
+                            "connector — refusing to create (watcher names must "
+                            "be globally unique).",
+                            watcher_name, room.name,
+                        )
+                        return False
+                    reserved = True
+
                 wc = self._build_watcher_config_from_rule(watcher_name, rule, room.name)
-                # Resume a dormant session from a prior run, if one was
-                # persisted under this exact (deterministic) name — same
-                # resume-first behavior _provision_session() already gives
-                # every static watcher.
-                state = self._state_store.load().get(watcher_name)
 
                 # PR #79 review (fourth round): the persisted state under this
                 # NAME might belong to a DIFFERENT room that happened to
@@ -420,6 +490,8 @@ class WatcherLifecycle:
                 # history/context onto this room, violating the 1-session-per-
                 # room invariant this whole feature is built around. Checked by
                 # room_id, not name, since name is exactly what's ambiguous here.
+                # (Never true when reclaiming_own_state is True — that flag
+                # already required room_id to match.)
                 if state is not None and state.room_id and state.room_id != room.id:
                     logger.error(
                         "try_lazy_create: persisted state for '%s' belongs to a "
@@ -471,12 +543,20 @@ class WatcherLifecycle:
                 )
                 return True
             finally:
-                # Release the transient reservation regardless of outcome:
-                # on success the name is now durably visible via
-                # `_watcher_configs` (checked directly, no reservation
-                # needed); on any failure path the name was never claimed
-                # and must not be left stuck "reserved" forever.
-                self._release_global_name(watcher_name)
+                # Release the transient reservation regardless of outcome —
+                # but ONLY if this call actually took one (`reserved`,
+                # PR #79 review, seventh round finding #20's companion fix:
+                # a self-reclaim never reserves in the first place, so
+                # unconditionally releasing here would risk releasing a
+                # DIFFERENT, unrelated caller's legitimate in-flight
+                # reservation for the same name). On success the name is
+                # now durably visible via `_watcher_configs` anyway (no
+                # reservation needed to prove ownership going forward); on
+                # any failure path after a real reservation, the name was
+                # never claimed and must not be left stuck "reserved"
+                # forever.
+                if reserved:
+                    self._release_global_name(watcher_name)
 
     # ── Lifecycle controls ────────────────────────────────────────────────────
 
