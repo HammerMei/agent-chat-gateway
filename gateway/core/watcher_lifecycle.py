@@ -122,7 +122,30 @@ class WatcherLifecycle:
         if unavailable_agents is not None:
             self._blocked_agents = set(blocked_agents)
 
-        for wc in self._watcher_configs:
+        # PR #79 review (sixth round): snapshot, NOT a live reference — the
+        # websocket listen loop is already running concurrently by this
+        # point (SessionManager.run_once() calls connector.connect(), which
+        # starts it as a background task, BEFORE calling sync_watchers()).
+        # If a Mattermost event completes try_lazy_create() while this loop
+        # is still awaiting an earlier static watcher's own _start_watcher()
+        # call, that lazy path's `self._watcher_configs.append(wc)` would
+        # otherwise mutate the exact list object this `for` loop is
+        # iterating — Python's list iterator picks up appended items during
+        # iteration, so this loop would eventually revisit that
+        # already-fully-started lazy watcher and call _start_watcher() on
+        # it a SECOND time: _processors[name] gets overwritten with a new
+        # MessageProcessor, but the FIRST one is never stopped or
+        # unregistered — MessageDispatcher.add_processor() appends rather
+        # than replaces, so it stays registered too, leaving TWO live
+        # processors for the same room (duplicate agent responses) and an
+        # orphaned, untracked first processor (no longer reachable via
+        # _processors, never stoppable again). A plain list() snapshot
+        # here is immune: nothing appended to the real
+        # self._watcher_configs during iteration is ever visited by this
+        # loop, which is exactly what's wanted — the lazy path already
+        # fully started that watcher itself; there's nothing left for this
+        # loop to redundantly do for it anyway.
+        for wc in list(self._watcher_configs):
             state = persisted.get(wc.name)
             if state and state.paused:
                 logger.info("Watcher '%s' is paused — skipping startup", wc.name)
@@ -739,6 +762,34 @@ class WatcherLifecycle:
 
         # 1. Resolve room
         room = await self._connector.resolve_room(wc.room)
+
+        # PR #79 review (sixth round): a retained/persisted state under
+        # this watcher's NAME might belong to a DIFFERENT room than the
+        # one just resolved — e.g. a name that used to be a lazily-created
+        # watcher's auto-generated name for some other room, later
+        # reassigned to a static config entry for a different room (a
+        # config edit, the wildcard rule being removed, or a sanitized-
+        # name collision). sync_watchers()'s startup loop looks up
+        # `persisted.get(wc.name)` by name alone with no room check at
+        # all — reusing such a state's session_id/context_injected/
+        # last_processed_ts here would leak that OTHER room's
+        # conversation context into this one. Treat a room_id mismatch as
+        # "no usable prior state" (same as a never-before-seen watcher)
+        # rather than refusing to start — a configured watcher must still
+        # be able to start; the safe response is a fresh session, not a
+        # hard failure. (try_lazy_create()'s own equivalent check, added
+        # in an earlier review round, refuses creation outright instead —
+        # appropriate there since nothing has been configured yet to
+        # start regardless; here `wc` is an explicit, real config entry
+        # that must end up running one way or another.)
+        if state is not None and state.room_id and state.room_id != room.id:
+            logger.warning(
+                "Watcher '%s': retained state belongs to a different room "
+                "(room_id=%s) than the one just resolved (room_id=%s) — "
+                "discarding it and starting a fresh session instead.",
+                wc.name, state.room_id, room.id,
+            )
+            state = None
 
         # 2. Provision session
         session_id, created_new_session = await self._provision_session(

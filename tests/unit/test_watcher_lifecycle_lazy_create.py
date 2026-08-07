@@ -40,11 +40,16 @@ def _make_lifecycle(
     check_global_name_available=None,
 ):
     config = CoreConfig()
+    room = resolved_room or Room(id="chan-1", name="general", type="channel")
     connector = AsyncMock()
     connector.agent_username = "hammer-mei"
-    connector.resolve_room_by_id = AsyncMock(
-        return_value=resolved_room or Room(id="chan-1", name="general", type="channel")
-    )
+    connector.resolve_room_by_id = AsyncMock(return_value=room)
+    # _start_watcher() (called by resume_watcher()/reset_watcher()/
+    # sync_watchers(), not just the lazy path) resolves by NAME, not ID —
+    # wired to the SAME room so its room.id is consistent with
+    # resolve_room_by_id()'s, which the sixth-round mismatched-room-id
+    # check (see WatcherLifecycle._start_watcher) now compares against.
+    connector.resolve_room = AsyncMock(return_value=room)
     connector.subscribe_room = AsyncMock()
     connector.fetch_room_history = AsyncMock(return_value=[])
     connector.get_last_processed_ts = MagicMock(return_value=None)
@@ -727,6 +732,156 @@ class TestCanFindOrReconstructWatcher(unittest.IsolatedAsyncioTestCase):
         lifecycle, connector, agent, state_store = _make_lifecycle(rules=[_rule()])
 
         self.assertFalse(await lifecycle.can_find_or_reconstruct_watcher("no-such-watcher"))
+
+
+class TestSyncWatchersConcurrentLazyAppend(unittest.IsolatedAsyncioTestCase):
+    """PR #79 review, sixth round: sync_watchers()'s startup loop iterates
+    self._watcher_configs directly. The Mattermost websocket listen loop is
+    already running concurrently by the time sync_watchers() is called
+    (SessionManager.run_once() starts it via connector.connect() BEFORE
+    calling sync_watchers()) — if a concurrent try_lazy_create() call
+    finishes and appends to that SAME list while this loop is still
+    awaiting an earlier static watcher's own _start_watcher() call,
+    Python's list iterator would eventually revisit and re-start the
+    already-fully-started lazy watcher a second time."""
+
+    async def test_concurrently_appended_watcher_is_not_double_started(self):
+        config = CoreConfig()
+        static_wc = WatcherConfig(name="static-1", connector="mm-home", room="general", agent="claude")
+        lazy_wc = WatcherConfig(name="mm-home-dev", connector="mm-home", room="dev", agent="claude")
+
+        connector = AsyncMock()
+        connector.agent_username = "hammer-mei"
+        connector.subscribe_room = AsyncMock()
+        connector.fetch_room_history = AsyncMock(return_value=[])
+        connector.get_last_processed_ts = MagicMock(return_value=None)
+        connector.update_last_processed_ts = MagicMock()
+        connector.attachment_cache_dir = MagicMock(return_value=None)
+
+        agent = AsyncMock()
+        agent.create_session = AsyncMock(return_value="new-sess-id")
+        agent.send = AsyncMock(return_value=MagicMock(is_error=False, text="ok"))
+        agent.ensure_durable_instructions = AsyncMock(return_value=None)
+        agent.delete_session = AsyncMock(return_value=True)
+
+        state_store = MagicMock()
+        state_store.load = MagicMock(return_value={})
+        state_store.save = MagicMock()
+        dispatcher = MagicMock()
+        dispatcher.add_processor = MagicMock()
+        injector = InjectedContextBuilder(config)
+        maps = SessionMaps()
+
+        lifecycle = WatcherLifecycle(
+            connector=connector, agents={"claude": agent}, default_agent="claude",
+            config=config, watcher_configs=[static_wc], state_store=state_store,
+            dispatcher=dispatcher, injector=injector, permission_registry=None, maps=maps,
+        )
+        lifecycle._attachment_workspace = MagicMock()
+        lifecycle._attachment_workspace.setup = MagicMock(return_value="/tmp/fake")
+
+        async def resolve_room_with_concurrent_append(room_name):
+            # Simulates the race: WHILE _start_watcher() is awaiting room
+            # resolution for the static watcher, a concurrent
+            # try_lazy_create() call for a DIFFERENT room finishes and
+            # appends its own already-fully-started WatcherConfig to the
+            # SAME list this sync_watchers() call is iterating.
+            lifecycle._watcher_configs.append(lazy_wc)
+            lifecycle._processors[lazy_wc.name] = MagicMock()
+            return Room(id="chan-general", name=room_name, type="channel")
+
+        connector.resolve_room = AsyncMock(side_effect=resolve_room_with_concurrent_append)
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            await lifecycle.sync_watchers()
+
+        # The static watcher started normally...
+        self.assertIn("static-1", lifecycle._processors)
+        # ...but the concurrently-appended lazy watcher must NOT have been
+        # revisited/re-started by this same loop — resolve_room() is only
+        # ever awaited for "general" (the static watcher), never "dev".
+        connector.resolve_room.assert_awaited_once_with("general")
+
+
+class TestStartWatcherDiscardsMismatchedRoomState(unittest.IsolatedAsyncioTestCase):
+    """PR #79 review, sixth round: _start_watcher() must not reuse a
+    retained state whose room_id doesn't match the room it just resolved —
+    same class of cross-room leak as try_lazy_create()'s own room_id check
+    (an earlier review round), but for ANY caller. sync_watchers()'s
+    static-watcher startup loop looks up persisted state by NAME alone
+    (`persisted.get(wc.name)`) with no room check of its own, so a name
+    later reassigned to a different room (config edit, wildcard rule
+    removed, sanitized-name collision) would otherwise silently reuse the
+    wrong room's session/context."""
+
+    async def test_mismatched_room_id_discards_state_and_creates_fresh_session(self):
+        lifecycle, connector, agent, state_store = _make_lifecycle(rules=None)
+        connector.resolve_room = AsyncMock(
+            return_value=Room(id="chan-1", name="general", type="channel")
+        )
+        wc = WatcherConfig(name="static-1", connector="mm-home", room="general", agent="claude")
+        stale_state = WatcherState(
+            watcher_name="static-1",
+            session_id="belongs-to-a-different-room",
+            room_id="some-other-chan-id",  # NOT "chan-1"
+            context_injected=True,
+            dynamically_created=True,
+        )
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            await lifecycle._start_watcher(wc, stale_state)
+
+        agent.create_session.assert_awaited_once()  # fresh session, not reused
+        ws = lifecycle._states["static-1"]
+        self.assertNotEqual(ws.session_id, "belongs-to-a-different-room")
+        # context_injected ends up True here — NOT because the stale
+        # state's flag carried over (it didn't: discarding treats this as
+        # a brand-new session, so injection actually ran and legitimately
+        # succeeded for it), confirmed by ensure_durable_instructions
+        # actually having been called for this fresh session.
+        self.assertTrue(ws.context_injected)
+        agent.ensure_durable_instructions.assert_awaited_once()
+        self.assertFalse(ws.dynamically_created)
+
+    async def test_matching_room_id_state_is_still_reused_normally(self):
+        """Sanity check: the new check must not break the legitimate
+        resume-a-dormant-session case when the room genuinely matches."""
+        lifecycle, connector, agent, state_store = _make_lifecycle(rules=None)
+        connector.resolve_room = AsyncMock(
+            return_value=Room(id="chan-1", name="general", type="channel")
+        )
+        wc = WatcherConfig(name="static-1", connector="mm-home", room="general", agent="claude")
+        matching_state = WatcherState(
+            watcher_name="static-1", session_id="old-sess-id", room_id="chan-1",
+        )
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            await lifecycle._start_watcher(wc, matching_state)
+
+        agent.create_session.assert_not_called()
+        self.assertEqual(lifecycle._states["static-1"].session_id, "old-sess-id")
+
+    async def test_empty_room_id_state_is_not_treated_as_a_mismatch(self):
+        """A state with no room_id yet (e.g. seeded by pause_watcher()'s
+        not-found fallback) has nothing to compare against — must not be
+        wrongly discarded."""
+        lifecycle, connector, agent, state_store = _make_lifecycle(rules=None)
+        connector.resolve_room = AsyncMock(
+            return_value=Room(id="chan-1", name="general", type="channel")
+        )
+        wc = WatcherConfig(name="static-1", connector="mm-home", room="general", agent="claude")
+        state_no_room_id = WatcherState(
+            watcher_name="static-1", session_id="old-sess-id", room_id="",
+        )
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            await lifecycle._start_watcher(wc, state_no_room_id)
+
+        agent.create_session.assert_not_called()  # still resumed
 
 
 if __name__ == "__main__":

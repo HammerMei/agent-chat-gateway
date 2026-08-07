@@ -464,6 +464,58 @@ didn't survive the very operations meant to preserve a watcher:
     creation, resume, reset, sync_watchers) benefits automatically,
     instead of needing to remember to re-apply the flag itself.
 
+### PR #79 review, sixth round (2026-08-06) — two more findings, both fixed
+
+Round six moved past the lazy path entirely and found two gaps in code
+this feature's earlier rounds hadn't touched at all — `sync_watchers()`'s
+own static-watcher startup loop, and a genuine `asyncio` concurrency
+hazard between it and the lazy path running alongside it:
+
+16. **`sync_watchers()`'s startup loop could double-start a concurrently
+    lazily-created watcher.** `for wc in self._watcher_configs:` iterates
+    the list directly — but the Mattermost websocket listen loop is
+    already running as a background task by the time `sync_watchers()` is
+    called (`SessionManager.run_once()` calls `connector.connect()`,
+    which starts it, *before* calling `sync_watchers()`). If a message
+    completes `try_lazy_create()` for some other room WHILE this loop is
+    still `await`-ing an earlier static watcher's own `_start_watcher()`
+    call, that lazy path's `self._watcher_configs.append(wc)` mutates the
+    exact list object this `for` loop is iterating — Python's list
+    iterator picks up items appended during iteration, so the loop would
+    eventually reach and revisit that already-fully-started lazy watcher,
+    calling `_start_watcher()` on it a SECOND time. `_processors[name]`
+    gets silently overwritten with a new `MessageProcessor`, but
+    `MessageDispatcher.add_processor()` *appends* rather than replaces, so
+    the first processor stays registered too — two live processors for
+    the same room (duplicate agent responses), and the first one becomes
+    an orphan, no longer reachable via `_processors`, never stoppable
+    again. Fixed: `for wc in list(self._watcher_configs):` — a plain
+    snapshot. Nothing appended to the real list during iteration is ever
+    visited by this loop, which is exactly what's wanted — the lazy path
+    already fully started that watcher itself.
+17. **`sync_watchers()`'s static-watcher path had no equivalent of the
+    lazy path's room_id mismatch check.** `persisted.get(wc.name)` looks
+    up retained state by NAME alone, with no room check — if that name
+    later gets assigned to a static config entry for a *different* room
+    (a config edit, the wildcard rule being removed, or a sanitized-name
+    collision), `_provision_session()` would reuse the old room's
+    `session_id` before `_start_watcher()` ever overwrites `room_id`,
+    leaking that room's conversation context into the new one — the exact
+    same class of bug as finding #11, just in the one code path that
+    fix's location (inside `try_lazy_create()` only) never covered. Fixed
+    at a more central point this time: right after `_start_watcher()`
+    resolves `room` (its very first step), a `state.room_id != room.id`
+    mismatch discards `state` entirely (sets it to `None`) rather than
+    refusing to start — unlike the lazy path, a *configured* watcher must
+    still end up running one way or another, so the safe response is a
+    fresh session, not a hard failure. Placed inside `_start_watcher()`
+    itself (not duplicated per-caller) so every caller (`sync_watchers()`,
+    `resume_watcher()`, `reset_watcher()`, `try_lazy_create()`) is covered
+    by the same one check — `try_lazy_create()`'s own earlier, stricter
+    check (refuse outright) still fires first for that path regardless,
+    so this new one is simply never reached with a mismatched state from
+    there.
+
 ## Idle-expiry / auto-remove
 
 - Track `last_processed_ts` (already exists) per watcher; compare against
