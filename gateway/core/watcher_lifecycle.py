@@ -213,7 +213,7 @@ class WatcherLifecycle:
         config_names = {wc.name for wc in self._watcher_configs}
         for name in list(persisted):
             if name not in config_names:
-                if persisted[name].dynamically_created:
+                if persisted[name].dynamically_created and self._watcher_rules:
                     # PR #79 review finding: a lazily-created watcher
                     # (docs/design/on-the-fly-watchers.md) is NEVER in
                     # `_watcher_configs` at boot — its WatcherConfig only
@@ -226,7 +226,28 @@ class WatcherLifecycle:
                     # separate, not-yet-built optimization, see the design
                     # doc) so the NEXT message for that room can still find
                     # and resume it via try_lazy_create().
+                    #
+                    # Gated on `self._watcher_rules` being non-empty (PR
+                    # #79 review, tenth round, finding #25): if the
+                    # operator has since removed this connector's `room:
+                    # "*"` rule entirely, `_reconstruct_dynamic_watcher_config()`
+                    # explicitly refuses to bring this watcher back
+                    # (nothing to match against) — preserving it here
+                    # anyway would keep it (and the disk write below) alive
+                    # forever with zero path back, AND `is_watcher_name_known()`
+                    # would keep reporting its name as globally taken
+                    # forever, permanently blocking any OTHER connector
+                    # from ever claiming that generated name for a
+                    # watcher that can actually run.
                     self._states[name] = persisted[name]
+                elif persisted[name].dynamically_created:
+                    logger.info(
+                        "Watcher '%s' was dynamically created but this "
+                        "connector no longer has an active wildcard rule — "
+                        "pruning its persisted state (it can never be "
+                        "reconstructed without one).",
+                        name,
+                    )
                 else:
                     logger.debug(
                         "Watcher '%s' not in current config — will be omitted from next state save",
@@ -337,6 +358,37 @@ class WatcherLifecycle:
                     (s for s in self._states.values() if s.room_id and s.room_id == room.id),
                     None,
                 )
+                if state_for_room_id is None:
+                    # PR #79 review (tenth round, finding #24): self._states
+                    # alone can miss a dormant dynamic watcher during
+                    # startup. `SessionManager.run_once()` calls
+                    # `connector.connect()` (which starts the Mattermost
+                    # websocket listener as a background task) BEFORE
+                    # `sync_watchers()`, and `sync_watchers()` only copies a
+                    # dormant dynamic watcher's persisted state into
+                    # `self._states` as its VERY LAST step (after every
+                    # static watcher has already started). A message for a
+                    # RENAMED dynamic watcher's room arriving anywhere in
+                    # that window would find `self._states` empty or
+                    # incomplete, miss this fallback entirely, and then
+                    # miss the "resume a dormant session" step below too
+                    # (which looks up disk state by the NEW, post-rename
+                    # name — the persisted entry is still under the OLD
+                    # name) — silently creating a brand-new watcher/session
+                    # under the new name, abandoning the old one and
+                    # bypassing a persisted pause. Falls back to a direct
+                    # disk read, which is always complete/authoritative
+                    # this early in the process's life (nothing has been
+                    # mutated in memory yet that isn't already on disk) —
+                    # the "resume a dormant session" step below already
+                    # reads disk directly for the identical reason.
+                    state_for_room_id = next(
+                        (
+                            s for s in self._state_store.load().values()
+                            if s.room_id and s.room_id == room.id
+                        ),
+                        None,
+                    )
                 if state_for_room_id is not None:
                     existing_for_room = self.get_watcher_config(state_for_room_id.watcher_name)
                     if (

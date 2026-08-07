@@ -495,6 +495,33 @@ class TestCollectConfigOnTheFlyWatcherFields(_CollectConfigTestBase):
         )
 
     def test_wildcard_room_is_parsed_into_watcher_rules_not_watchers(self):
+        # PR #79 review (tenth round, finding #26): room: "*" rules are
+        # only accepted for Mattermost connectors now.
+        config_path = self._write(f"""\
+            connectors:
+              - name: mm
+                type: mattermost
+                server: {{url: "http://localhost:8065", team: home, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - connector: mm
+                agent: default
+                room: "*"
+        """)
+        config, issues = collect_config(config_path)
+        self.assertIsNotNone(config)
+        self.assertEqual(config.watchers, [])
+        self.assertEqual(len(config.watcher_rules), 1)
+        self.assertEqual(issues, [])
+
+    def test_wildcard_rule_on_unsupported_connector_type_is_a_collected_issue(self):
+        """PR #79 review (tenth round, finding #26): RocketChat never
+        overrides register_lazy_creation_hook(), so try_lazy_create() can
+        never fire for it — must surface as a collected issue, not boot
+        successfully with a rule that can never match a room."""
         config_path = self._write(f"""\
             connectors:
               - name: rc
@@ -511,9 +538,10 @@ class TestCollectConfigOnTheFlyWatcherFields(_CollectConfigTestBase):
         """)
         config, issues = collect_config(config_path)
         self.assertIsNotNone(config)
-        self.assertEqual(config.watchers, [])
-        self.assertEqual(len(config.watcher_rules), 1)
-        self.assertEqual(issues, [])
+        self.assertEqual(config.watcher_rules, [])
+        self.assertTrue(
+            any('room: "*" rules are only supported on connector types' in i.message for i in issues)
+        )
 
     def test_invalid_wildcard_rule_is_a_collected_watcher_issue(self):
         config_path = self._write(f"""\
@@ -537,20 +565,22 @@ class TestCollectConfigOnTheFlyWatcherFields(_CollectConfigTestBase):
         self.assertTrue(any("cannot be set on a room: \"*\" rule" in i.message for i in issues))
 
     def test_duplicate_wildcard_rule_per_connector_is_a_collected_issue(self):
+        # PR #79 review (tenth round, finding #26): room: "*" rules are
+        # only accepted for Mattermost connectors now.
         config_path = self._write(f"""\
             connectors:
-              - name: rc
-                type: rocketchat
-                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+              - name: mm
+                type: mattermost
+                server: {{url: "http://localhost:8065", team: home, username: bot, password: pw}}
             agents:
               default:
                 type: claude
                 working_directory: {self.agent_dir}
             watchers:
-              - connector: rc
+              - connector: mm
                 agent: default
                 room: "*"
-              - connector: rc
+              - connector: mm
                 agent: default
                 room: "*"
                 exclude_room: [general]

@@ -2099,11 +2099,18 @@ class TestToolPresets(unittest.TestCase):
 
 class TestWatcherRoomsExpansion(unittest.TestCase):
     def _write_config(self, watchers_block: str) -> str:
+        # PR #79 review (tenth round, finding #26): room: "*" rules are
+        # only accepted for Mattermost connectors now — the fixture
+        # connector's `type` was changed from "rocketchat" to
+        # "mattermost" so this class's many wildcard-rule tests below
+        # still parse; `name: rc-home` (and every rule/watcher name
+        # derived from it) is unaffected, since names are independent of
+        # `type`.
         cfg = textwrap.dedent(f"""\
             connectors:
               - name: rc-home
-                type: rocketchat
-                server: {{url: http://localhost:3000, username: bot, password: pw}}
+                type: mattermost
+                server: {{url: http://localhost:8065, team: home, username: bot, password: pw}}
             agents:
               default:
                 type: claude
@@ -2317,22 +2324,24 @@ class TestWatcherRoomsExpansion(unittest.TestCase):
         self.assertIn("rc-home", msg)
 
     def test_wildcard_rules_on_different_connectors_both_allowed(self):
+        # PR #79 review (tenth round, finding #26): both connectors must be
+        # Mattermost now — room: "*" rules are rejected for any other type.
         cfg = textwrap.dedent("""\
             connectors:
-              - name: rc-home
-                type: rocketchat
-                server: {url: http://localhost:3000, username: bot, password: pw}
               - name: mm-home
                 type: mattermost
                 server: {url: http://localhost:8065, team: home, username: bot, password: pw}
+              - name: mm-work
+                type: mattermost
+                server: {url: http://localhost:8066, team: work, username: bot, password: pw}
             agents:
               default:
                 type: claude
                 working_directory: /tmp
             watchers:
-              - connector: rc-home
-                room: "*"
               - connector: mm-home
+                room: "*"
+              - connector: mm-work
                 room: "*"
         """)
         with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
@@ -2340,7 +2349,36 @@ class TestWatcherRoomsExpansion(unittest.TestCase):
             path = f.name
         config = GatewayConfig.from_file(path)
         self.assertEqual(len(config.watcher_rules), 2)
-        self.assertEqual({r.connector for r in config.watcher_rules}, {"rc-home", "mm-home"})
+        self.assertEqual({r.connector for r in config.watcher_rules}, {"mm-home", "mm-work"})
+
+    def test_wildcard_rule_on_rocketchat_connector_raises(self):
+        """PR #79 review (tenth round, finding #26): RocketChat's connector
+        never overrides register_lazy_creation_hook() (base no-op), so
+        try_lazy_create() can never fire for it — accepting a room: "*"
+        rule there would boot successfully with a rule that can never
+        match a single room, no error anywhere. Must fail fast at
+        config-load time instead."""
+        cfg = textwrap.dedent("""\
+            connectors:
+              - name: rc-home
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watchers:
+              - connector: rc-home
+                room: "*"
+        """)
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(cfg)
+            path = f.name
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        msg = str(ctx.exception)
+        self.assertIn('room: "*" rules are only supported on connector types', msg)
+        self.assertIn("rc-home", msg)
 
     def test_wildcard_rooms_plural_single_wildcard_is_also_a_rule(self):
         path = self._write_config("""\

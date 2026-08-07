@@ -750,6 +750,33 @@ class TestTryLazyCreateRenamedRoomRespectsOwnership(unittest.IsolatedAsyncioTest
         self.assertFalse(result)
         self.assertIsNotNone(lifecycle.get_watcher_config("mm-home-old-name"))
 
+    async def test_renamed_room_found_via_disk_during_startup_window(self):
+        """PR #79 review, tenth round, finding #24: SessionManager.run_once()
+        starts the Mattermost websocket (connector.connect()) BEFORE
+        sync_watchers(), and sync_watchers() only copies a dormant dynamic
+        watcher's persisted state into self._states as its VERY LAST step.
+        A message for a renamed dynamic watcher's room arriving in that
+        window sees self._states still empty — deliberately NOT seeded
+        here, unlike the two tests above — and must fall back to a direct
+        disk read instead of silently creating a brand-new watcher/session
+        under the new name."""
+        renamed_room = Room(id="chan-1", name="new-name", type="channel")
+        old_state = self._old_name_state(paused=False)
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=[_rule()],
+            resolved_room=renamed_room,
+            state_by_name={"mm-home-old-name": old_state},
+        )
+        self.assertEqual(lifecycle._states, {})  # the startup-window condition
+
+        result = await lifecycle.try_lazy_create("chan-1")
+
+        self.assertFalse(result)
+        self.assertIsNotNone(lifecycle.get_watcher_config("mm-home-old-name"))
+        self.assertIsNone(lifecycle.get_watcher_config("mm-home-new-name"))
+        agent.create_session.assert_not_called()
+        connector.subscribe_room.assert_not_called()
+
 
 class TestSyncWatchersPreservesLazyState(unittest.IsolatedAsyncioTestCase):
     """PR #79 review finding: sync_watchers()'s final save() only persists
@@ -760,7 +787,11 @@ class TestSyncWatchersPreservesLazyState(unittest.IsolatedAsyncioTestCase):
     exactly one restart."""
 
     async def test_dynamically_created_state_survives_a_sync_watchers_call(self):
-        lifecycle, connector, agent, state_store = _make_lifecycle(rules=None)
+        # PR #79 review (tenth round, finding #25): preservation is now
+        # gated on the connector still having an active wildcard rule —
+        # rules=[_rule()] here, not rules=None, to exercise the
+        # "still active" case this test is meant to cover.
+        lifecycle, connector, agent, state_store = _make_lifecycle(rules=[_rule()])
         persisted_lazy_state = WatcherState(
             watcher_name="mm-home-general",
             session_id="old-sess-id",
@@ -790,6 +821,28 @@ class TestSyncWatchersPreservesLazyState(unittest.IsolatedAsyncioTestCase):
 
         saved_states = state_store.save.call_args.args[0]
         self.assertNotIn("rc-old-watcher", saved_states)
+
+    async def test_dynamically_created_state_is_pruned_once_its_rule_is_removed(self):
+        """PR #79 review (tenth round, finding #25): once this connector's
+        room: "*" rule is removed entirely, _reconstruct_dynamic_watcher_config()
+        explicitly refuses to bring this watcher back (nothing to match
+        against) — preserving its state forever anyway would keep it (and
+        its generated name, via is_watcher_name_known()) permanently
+        unreclaimable garbage. Must be pruned instead, same as any other
+        genuinely-orphaned entry."""
+        lifecycle, connector, agent, state_store = _make_lifecycle(rules=None)
+        persisted_lazy_state = WatcherState(
+            watcher_name="mm-home-general",
+            session_id="old-sess-id",
+            room_id="chan-1",
+            dynamically_created=True,
+        )
+        state_store.load = MagicMock(return_value={"mm-home-general": persisted_lazy_state})
+
+        await lifecycle.sync_watchers()
+
+        saved_states = state_store.save.call_args.args[0]
+        self.assertNotIn("mm-home-general", saved_states)
 
 
 class TestReconstructDynamicWatcherConfig(unittest.IsolatedAsyncioTestCase):
