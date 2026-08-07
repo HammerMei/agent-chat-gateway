@@ -22,6 +22,7 @@ def _make_manager():
     mgr._connector.register_handler = MagicMock()
     mgr._connector.register_capacity_check = MagicMock()
     mgr._connector.connect = AsyncMock()
+    mgr._connector.start_realtime = AsyncMock()
     mgr._connector.disconnect = AsyncMock()
     mgr._lifecycle = MagicMock()
     mgr._lifecycle.list_watchers = MagicMock(return_value=[])
@@ -222,7 +223,30 @@ class TestRunOnce(unittest.IsolatedAsyncioTestCase):
         errors = await mgr.run_once()
         mgr._connector.connect.assert_called_once()
         mgr._lifecycle.sync_watchers.assert_called_once()
+        mgr._connector.start_realtime.assert_called_once()
         self.assertEqual(errors, [])
+
+    async def test_run_once_starts_realtime_after_sync_watchers(self):
+        """docs/design/on-the-fly-watchers.md, "Startup ordering: root-cause
+        design review" — start_realtime() (which, for Mattermost, opens the
+        WebSocket) must run AFTER sync_watchers() has fully populated
+        self._states/self._blocked_agents/local channel subscriptions, not
+        before and not interleaved. This is what actually removes the
+        startup race findings #24/#27 were patched around — connect()
+        alone (REST auth) can never deliver a live event."""
+        mgr = _make_manager()
+        call_order = []
+        mgr._connector.connect = AsyncMock(side_effect=lambda: call_order.append("connect"))
+        mgr._lifecycle.sync_watchers = AsyncMock(
+            side_effect=lambda **_: call_order.append("sync_watchers") or []
+        )
+        mgr._connector.start_realtime = AsyncMock(
+            side_effect=lambda: call_order.append("start_realtime")
+        )
+
+        await mgr.run_once()
+
+        self.assertEqual(call_order, ["connect", "sync_watchers", "start_realtime"])
 
     async def test_run_once_registers_handler(self):
         mgr = _make_manager()
