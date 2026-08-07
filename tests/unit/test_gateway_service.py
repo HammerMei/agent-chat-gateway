@@ -19,6 +19,8 @@ def _make_service() -> GatewayService:
     service._runtime_manager = MagicMock()
     service._control = MagicMock()
     service._entries = []
+    service._watcher_name_lock = asyncio.Lock()
+    service._reserved_watcher_names = set()
     return service
 
 
@@ -559,40 +561,104 @@ class TestStartupFdOnCancel(unittest.IsolatedAsyncioTestCase):
         self.assertIn(5, fds_written, "startup_fd must be written/closed in finally on CancelledError")
 
 
-class TestIsWatcherNameGloballyAvailable(unittest.TestCase):
-    """docs/design/on-the-fly-watchers.md, PR #79 review (fourth round):
-    GatewayService is the only layer with cross-connector visibility, so
-    the global watcher-name-uniqueness check for lazy creation has to live
-    here and be handed down to each WatcherLifecycle as a callback."""
+class TestReserveWatcherName(unittest.IsolatedAsyncioTestCase):
+    """docs/design/on-the-fly-watchers.md, PR #79 review (fourth AND
+    seventh rounds): GatewayService is the only layer with cross-connector
+    visibility, so the global watcher-name reservation for lazy creation
+    has to live here and be handed down to each WatcherLifecycle as an
+    atomic reserve/release callback pair — not a plain read, per the
+    seventh-round findings (dormant dynamic states invisible to a
+    config-only check; a plain read is a TOCTOU race across connectors)."""
 
     def _entry(self, name: str, known_names: list[str]):
+        """known_names simulates can_find_or_reconstruct_watcher()'s
+        result — True for names this connector already knows about
+        (whether live config or a reconstructable dormant dynamic state;
+        the caller doesn't need to distinguish the two)."""
         entry = SimpleNamespace(name=name, session_manager=MagicMock())
-        entry.session_manager.get_watcher_config = MagicMock(
-            side_effect=lambda n: object() if n in known_names else None
+        entry.session_manager.can_find_or_reconstruct_watcher = AsyncMock(
+            side_effect=lambda n: n in known_names
         )
         return entry
 
-    def test_available_when_no_entry_has_the_name(self):
+    async def test_available_when_no_entry_has_the_name(self):
         service = _make_service()
         service._entries = [self._entry("rc", ["support"]), self._entry("mm", ["sales"])]
 
-        self.assertTrue(service._is_watcher_name_globally_available("new-name"))
+        self.assertTrue(await service._reserve_watcher_name("new-name"))
 
-    def test_unavailable_when_a_different_connector_already_has_it(self):
+    async def test_unavailable_when_a_different_connector_already_has_it(self):
         service = _make_service()
         service._entries = [self._entry("rc", ["support"]), self._entry("mm", ["sales"])]
 
-        self.assertFalse(service._is_watcher_name_globally_available("sales"))
+        self.assertFalse(await service._reserve_watcher_name("sales"))
 
-    def test_reads_entries_at_call_time_not_capture_time(self):
+    async def test_unavailable_when_only_a_dormant_dynamic_state_has_it(self):
+        """Seventh-round finding: a dynamically-created watcher's config is
+        never persisted, only its WatcherState — after a restart, before it
+        receives a message to reconstruct itself, get_watcher_config()
+        alone would miss it entirely. can_find_or_reconstruct_watcher()
+        (used here instead) probes persisted dynamic state too, so a name
+        already claimed by a dormant watcher — reconstructable but not yet
+        reconstructed — must still be reported unavailable."""
+        service = _make_service()
+        service._entries = [self._entry("mm", ["mm-home-general"])]
+
+        self.assertFalse(await service._reserve_watcher_name("mm-home-general"))
+
+    async def test_reads_entries_at_call_time_not_capture_time(self):
         """The callback is handed to a WatcherLifecycle before
         self._entries is fully populated (each SessionManager is
         constructed inside the same loop that appends to it) — must be a
         live closure over self._entries, not a snapshot."""
         service = _make_service()
-        checker = service._is_watcher_name_globally_available
-        self.assertTrue(checker("late-comer"))  # nothing registered yet
+        self.assertTrue(await service._reserve_watcher_name("late-comer"))
+        service._release_watcher_name("late-comer")
 
         service._entries.append(self._entry("mm", ["late-comer"]))
 
-        self.assertFalse(checker("late-comer"))  # now sees the new entry
+        self.assertFalse(await service._reserve_watcher_name("late-comer"))
+
+    async def test_reserving_twice_without_release_refuses_second_caller(self):
+        """Seventh-round finding: the check-then-create window itself must
+        be race-free. Once a name is reserved, a second concurrent
+        reservation attempt for the SAME name must be refused even though
+        no connector has actually registered a WatcherConfig for it yet —
+        otherwise two connectors racing to lazily create the same
+        composite name could both pass the check before either finishes
+        registering."""
+        service = _make_service()
+        service._entries = [self._entry("mm", [])]
+
+        self.assertTrue(await service._reserve_watcher_name("mm-home-general"))
+        self.assertFalse(await service._reserve_watcher_name("mm-home-general"))
+
+    async def test_release_allows_the_name_to_be_reserved_again(self):
+        service = _make_service()
+        service._entries = [self._entry("mm", [])]
+
+        self.assertTrue(await service._reserve_watcher_name("mm-home-general"))
+        service._release_watcher_name("mm-home-general")
+
+        self.assertTrue(await service._reserve_watcher_name("mm-home-general"))
+
+    def test_release_of_a_never_reserved_name_is_a_noop(self):
+        service = _make_service()
+
+        service._release_watcher_name("never-reserved")  # must not raise
+
+    async def test_concurrent_reservations_for_the_same_name_only_one_wins(self):
+        """Genuine concurrency check (not just sequential calls): two
+        callers racing via asyncio.gather for the exact same name must
+        not both succeed — this is the actual TOCTOU race the seventh-round
+        finding describes, reproduced with real concurrent scheduling
+        rather than asserted by inspection alone."""
+        service = _make_service()
+        service._entries = [self._entry("mm", [])]
+
+        results = await asyncio.gather(
+            service._reserve_watcher_name("mm-home-general"),
+            service._reserve_watcher_name("mm-home-general"),
+        )
+
+        self.assertEqual(sorted(results), [False, True])

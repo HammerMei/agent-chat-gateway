@@ -14,7 +14,7 @@ import asyncio
 import logging
 import secrets
 from datetime import UTC, datetime
-from typing import Callable
+from typing import Awaitable, Callable
 
 from ..agents import AgentBackend
 from .config import CoreConfig, WatcherConfig
@@ -53,7 +53,8 @@ class SessionManager:
         watcher_rules: list[WatcherConfig] | None = None,
         permission_registry: PermissionRegistry | None = None,
         session_maps: SessionMaps | None = None,
-        check_global_name_available: Callable[[str], bool] | None = None,
+        reserve_global_name: Callable[[str], Awaitable[bool]] | None = None,
+        release_global_name: Callable[[str], None] | None = None,
     ) -> None:
         self._connector = connector
         maps = session_maps or SessionMaps()
@@ -73,7 +74,8 @@ class SessionManager:
             injector=self._injector,
             permission_registry=permission_registry,
             maps=maps,
-            check_global_name_available=check_global_name_available,
+            reserve_global_name=reserve_global_name,
+            release_global_name=release_global_name,
             watcher_rules=watcher_rules,
         )
 

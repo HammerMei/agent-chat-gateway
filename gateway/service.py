@@ -261,6 +261,14 @@ class GatewayService:
         self._expiry_task: asyncio.Task | None = None
         # Scheduler task handle
         self._scheduler_task: asyncio.Task | None = None
+        # Cross-connector watcher-name reservation (PR #79 review, seventh
+        # round) — see _reserve_watcher_name() below. A single lock shared
+        # by every connector's WatcherLifecycle, since the race it closes
+        # is exactly BETWEEN connectors (each already serializes its own
+        # lazy-creation calls for the same name via its own local per-name
+        # lock).
+        self._watcher_name_lock = asyncio.Lock()
+        self._reserved_watcher_names: set[str] = set()
 
         # Build agents — runtime manager handles backend + broker lifecycle
         agents: dict[str, AgentBackend] = {
@@ -292,7 +300,8 @@ class GatewayService:
                 watcher_rules=connector_rules,
                 permission_registry=self._registry,
                 session_maps=self._maps,
-                check_global_name_available=self._is_watcher_name_globally_available,
+                reserve_global_name=self._reserve_watcher_name,
+                release_global_name=self._release_watcher_name,
             )
             self._entries.append(
                 ConnectorEntry(name=cc.name, connector=connector, session_manager=sm)
@@ -312,20 +321,52 @@ class GatewayService:
             job_store=self._job_store,
         )
 
-    def _is_watcher_name_globally_available(self, name: str) -> bool:
-        """True if no connector's WatcherLifecycle already has a watcher
-        (static, or already lazily-created) using this exact name.
+    async def _reserve_watcher_name(self, name: str) -> bool:
+        """Atomically check-and-reserve `name` across ALL connectors, or
+        refuse if it's already taken. Returns True (reserved) or False
+        (unavailable).
 
-        Passed into every WatcherLifecycle as `check_global_name_available`
-        (docs/design/on-the-fly-watchers.md, PR #79 review, fourth round) —
-        a lazily-created watcher's own collision checks in
-        `try_lazy_create()` only see its OWN connector's watchers, but
+        Passed into every WatcherLifecycle as `reserve_global_name`
+        (docs/design/on-the-fly-watchers.md, PR #79 review, fourth AND
+        seventh rounds) — a lazily-created watcher's own collision checks
+        in `try_lazy_create()` only see its OWN connector's watchers, but
         `ControlServer._find_entry_for_watcher()` and the scheduler both
         assume watcher names are globally unique across ALL connectors
         (an invariant enforced for static watchers at config-load time,
         `gateway/config.py`'s `seen_watcher_names`) — without this check, a
         lazily-created watcher could take a name already used by a
         DIFFERENT connector's watcher, breaking that assumption for both.
+
+        Two things a plain read (the fourth-round original version of this
+        method) got wrong, both found in the seventh review round:
+
+        1. It only checked `get_watcher_config()`, i.e. each connector's
+           live, in-memory `_watcher_configs`. A dynamically-created
+           watcher's config is never persisted (only its `WatcherState`,
+           via `dynamically_created`) — after a restart, a DORMANT lazy
+           watcher that hasn't yet received a message to reconstruct
+           itself is invisible to that check. A new connector or changed
+           rule could then generate the same composite name and claim it
+           before the dormant watcher wakes up, leaving two owners for one
+           name. Fixed by probing
+           `session_manager.can_find_or_reconstruct_watcher()` instead,
+           which reconstructs (and durably registers) a dormant dynamic
+           watcher from persisted state if one matches — the same
+           reconstruction-aware check `ControlServer` already relies on
+           for routing pause/resume/reset.
+        2. It was a plain, unsynchronized read — nothing prevented two
+           DIFFERENT connectors from both reading "available" for the same
+           name before either had registered anything, since each
+           connector's own lock (`WatcherLifecycle._get_watcher_lock()`) is
+           local to that connector and cannot serialize against another
+           connector's lock. Fixed by holding a single lock shared by every
+           connector (`self._watcher_name_lock`) across the whole
+           check-then-reserve sequence, and by tracking in-flight
+           reservations in `self._reserved_watcher_names` so the window
+           between "check passed" and "watcher durably registered" is also
+           covered. Callers MUST pair a successful reservation with
+           `_release_watcher_name()` once that window closes (see
+           `WatcherLifecycle.try_lazy_create()`'s `finally` block).
 
         A closure over `self._entries`, read at CALL time — safe even
         though this is handed to a `WatcherLifecycle` built *before*
@@ -334,10 +375,26 @@ class GatewayService:
         by the time `try_lazy_create()` actually runs, `__init__` has long
         since finished and `self._entries` holds every connector.
         """
-        return not any(
-            entry.session_manager.get_watcher_config(name) is not None
-            for entry in self._entries
-        )
+        async with self._watcher_name_lock:
+            if name in self._reserved_watcher_names:
+                return False
+            for entry in self._entries:
+                if await entry.session_manager.can_find_or_reconstruct_watcher(name):
+                    return False
+            self._reserved_watcher_names.add(name)
+            return True
+
+    def _release_watcher_name(self, name: str) -> None:
+        """Release a name reserved by `_reserve_watcher_name()`.
+
+        Safe to call even if `name` was never reserved (e.g. a caller that
+        never got a `True` back) — `set.discard()` is a no-op in that case.
+        Not async: this is a pure in-memory bookkeeping removal, and
+        `WatcherLifecycle.try_lazy_create()` calls it from a `finally`
+        block where keeping the caller synchronous simplifies every exit
+        path.
+        """
+        self._reserved_watcher_names.discard(name)
 
     async def run(self, startup_fd: int = -1) -> None:
         """Connect all connectors, start unified control socket, block until cancelled.
