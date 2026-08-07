@@ -844,6 +844,134 @@ class TestSyncWatchersPreservesLazyState(unittest.IsolatedAsyncioTestCase):
         saved_states = state_store.save.call_args.args[0]
         self.assertNotIn("mm-home-general", saved_states)
 
+    async def test_dynamically_created_state_is_pruned_once_its_room_is_excluded(self):
+        """PR #79 review, eleventh round, finding #28: a rule existing at
+        all (tenth round's finding #25 fix) isn't enough — if the
+        operator added this exact room to exclude_room: since the watcher
+        was created, every future message for it is rejected by
+        try_lazy_create()'s own exclusion check AND
+        _reconstruct_dynamic_watcher_config() refuses it too, so it's just
+        as permanently unreachable as a fully-removed rule."""
+        renamed_room = Room(id="chan-1", name="general", type="channel")
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=[_rule(exclude_rooms=["general"])],
+            resolved_room=renamed_room,
+        )
+        persisted_lazy_state = WatcherState(
+            watcher_name="mm-home-general",
+            session_id="old-sess-id",
+            room_id="chan-1",
+            dynamically_created=True,
+        )
+        state_store.load = MagicMock(return_value={"mm-home-general": persisted_lazy_state})
+
+        await lifecycle.sync_watchers()
+
+        saved_states = state_store.save.call_args.args[0]
+        self.assertNotIn("mm-home-general", saved_states)
+        connector.resolve_room_by_id.assert_awaited_once_with("chan-1")
+
+    async def test_dynamically_created_state_survives_when_room_not_excluded(self):
+        """Sanity check: a rule WITH an exclude_room: list that doesn't
+        name this particular room must still preserve it — only an actual
+        match prunes."""
+        renamed_room = Room(id="chan-1", name="general", type="channel")
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=[_rule(exclude_rooms=["some-other-room"])],
+            resolved_room=renamed_room,
+        )
+        persisted_lazy_state = WatcherState(
+            watcher_name="mm-home-general",
+            session_id="old-sess-id",
+            room_id="chan-1",
+            dynamically_created=True,
+        )
+        state_store.load = MagicMock(return_value={"mm-home-general": persisted_lazy_state})
+
+        await lifecycle.sync_watchers()
+
+        saved_states = state_store.save.call_args.args[0]
+        self.assertIn("mm-home-general", saved_states)
+
+    async def test_exclude_check_skips_resolution_when_rule_has_no_exclusions(self):
+        """Fast path: a rule with an empty exclude_rooms list can never
+        exclude anything — no network call needed to know that."""
+        lifecycle, connector, agent, state_store = _make_lifecycle(rules=[_rule()])
+        persisted_lazy_state = WatcherState(
+            watcher_name="mm-home-general",
+            session_id="old-sess-id",
+            room_id="chan-1",
+            dynamically_created=True,
+        )
+        state_store.load = MagicMock(return_value={"mm-home-general": persisted_lazy_state})
+
+        await lifecycle.sync_watchers()
+
+        saved_states = state_store.save.call_args.args[0]
+        self.assertIn("mm-home-general", saved_states)
+        connector.resolve_room_by_id.assert_not_called()
+
+    async def test_exclude_check_preserves_conservatively_on_resolution_failure(self):
+        """A transient network error resolving the room during startup
+        must not permanently discard a legitimate session — preserve, same
+        as _reconstruct_dynamic_watcher_config()'s own best-effort
+        error handling."""
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=[_rule(exclude_rooms=["general"])],
+        )
+        connector.resolve_room_by_id = AsyncMock(side_effect=RuntimeError("network blip"))
+        persisted_lazy_state = WatcherState(
+            watcher_name="mm-home-general",
+            session_id="old-sess-id",
+            room_id="chan-1",
+            dynamically_created=True,
+        )
+        state_store.load = MagicMock(return_value={"mm-home-general": persisted_lazy_state})
+
+        await lifecycle.sync_watchers()
+
+        saved_states = state_store.save.call_args.args[0]
+        self.assertIn("mm-home-general", saved_states)
+
+
+class TestSeedBlockedAgents(unittest.IsolatedAsyncioTestCase):
+    """PR #79 review, eleventh round, finding #27: self._blocked_agents
+    used to only be set inside sync_watchers() — but SessionManager.run_once()
+    calls connector.connect() (which starts the Mattermost websocket
+    listener) BEFORE sync_watchers(), leaving self._blocked_agents empty
+    for that entire window even when an agent is genuinely unavailable.
+    seed_blocked_agents() lets the caller populate it earlier."""
+
+    def test_seed_sets_blocked_agents_when_a_set_is_given(self):
+        lifecycle, connector, agent, state_store = _make_lifecycle(rules=[_rule()])
+
+        lifecycle.seed_blocked_agents({"slow-agent"})
+
+        self.assertEqual(lifecycle._blocked_agents, {"slow-agent"})
+
+    def test_seed_does_nothing_when_none_is_given(self):
+        """None means "no information yet," not "everyone is available" —
+        must not overwrite a previously-seeded/synced value with an empty
+        set, same semantics sync_watchers() itself already has."""
+        lifecycle, connector, agent, state_store = _make_lifecycle(rules=[_rule()])
+        lifecycle._blocked_agents = {"already-blocked"}
+
+        lifecycle.seed_blocked_agents(None)
+
+        self.assertEqual(lifecycle._blocked_agents, {"already-blocked"})
+
+    async def test_seeded_value_is_honored_by_try_lazy_create_before_sync_watchers_runs(self):
+        """The actual bug scenario: a message arrives (try_lazy_create) for
+        a genuinely-blocked agent BEFORE sync_watchers() has ever run —
+        seed_blocked_agents() must be all that's needed to fail closed."""
+        lifecycle, connector, agent, state_store = _make_lifecycle(rules=[_rule(agent="claude")])
+        lifecycle.seed_blocked_agents({"claude"})
+
+        result = await lifecycle.try_lazy_create("chan-1")
+
+        self.assertFalse(result)
+        connector.subscribe_room.assert_not_called()
+
 
 class TestReconstructDynamicWatcherConfig(unittest.IsolatedAsyncioTestCase):
     """PR #79 review, third round: pause_watcher()/resume_watcher()/

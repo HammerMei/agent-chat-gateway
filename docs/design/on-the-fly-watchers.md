@@ -1,6 +1,6 @@
 # On-the-fly watchers: rule-based room matching + lazy watcher lifecycle
 
-Status (updated 2026-08-07, round 10): **config schema landed (PR #77); rule-based
+Status (updated 2026-08-07, round 11): **config schema landed (PR #77); rule-based
 room matching + lazy creation landed for Mattermost.** RocketChat support,
 `session_id`/`online_notification`/`offline_notification` retirement, and
 the `expire` CLI are still design-only. Coordinating a low-traffic
@@ -758,6 +758,51 @@ in config-time validation:
     `_parse_one_watcher_rule()`, raising a clear `ValueError` at
     config-load time (or a collected `ConfigIssue` via `collect_config()`)
     instead.
+
+### PR #79 review, eleventh round (2026-08-07) — two more findings, both fixed
+
+Round eleven found one more instance of the tenth round's "startup window"
+class of bug (a different piece of state left uninitialized during the
+same `connect()`-before-`sync_watchers()` gap), plus a narrower variant of
+the tenth round's own finding #25:
+
+27. **The fail-closed blocked-agents guard was itself empty during the
+    startup window.** Same root cause as finding #24, a different victim:
+    `self._blocked_agents` (the set `try_lazy_create()` and
+    `sync_watchers()` both fail closed against, per the original review
+    round's fix) was previously populated ONLY inside `sync_watchers()` —
+    which, like the dynamic-state preservation in finding #24, only runs
+    *after* `connector.connect()` starts the Mattermost websocket
+    listener. A message arriving in that window would pass the
+    fail-closed check trivially (the set was still empty, straight from
+    `__init__`), lazily creating a watcher for an agent whose permission
+    broker genuinely failed to start — running with zero tool-call
+    enforcement, the exact hole the original fail-closed check was built
+    to close. Fixed by adding `WatcherLifecycle.seed_blocked_agents()` and
+    calling it from `SessionManager.run_once()` *before*
+    `connector.connect()` — `sync_watchers()`'s own identical assignment
+    is left unchanged (harmlessly redundant on the normal path; still
+    correct for a hypothetical hot-reload re-call with no
+    `unavailable_agents` passed).
+28. **A dynamic watcher's state was preserved even after its OWN room was
+    added to `exclude_room:`.** The tenth round's finding #25 fix gated
+    preservation on "does this connector have SOME active wildcard rule,"
+    which isn't the same question as "would THIS watcher's specific room
+    still match that rule." If the operator excludes this exact room
+    without removing the rule entirely, every future message for it is
+    rejected by `try_lazy_create()`'s own exclusion check, and
+    `_reconstruct_dynamic_watcher_config()` refuses it too — just as
+    unreachable as the fully-removed-rule case, just a narrower trigger,
+    and with the same consequence (an orphaned session, plus a generated
+    name `is_watcher_name_known()` reports as taken forever). Fixed by
+    adding `_dynamic_state_still_matches_rule()`, which resolves the
+    room by its stable ID and checks the CURRENT name against
+    `exclude_rooms` — with a fast path that skips the network round-trip
+    entirely when the rule has no exclusions at all (the common case),
+    and fails toward preserving (not pruning) on a resolution error,
+    matching `_reconstruct_dynamic_watcher_config()`'s own best-effort
+    posture — a transient network blip during startup must not
+    permanently discard a legitimate session.
 
 ## Idle-expiry / auto-remove
 

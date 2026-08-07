@@ -236,6 +236,27 @@ class TestRunOnce(unittest.IsolatedAsyncioTestCase):
         await mgr.run_once(unavailable_agents=unavailable)
         mgr._lifecycle.sync_watchers.assert_called_once_with(unavailable_agents=unavailable)
 
+    async def test_run_once_seeds_blocked_agents_before_connecting(self):
+        """PR #79 review, eleventh round, finding #27: connector.connect()
+        starts the websocket listener, which can deliver a message that
+        reaches try_lazy_create() before sync_watchers() ever runs.
+        seed_blocked_agents() must be called — with the SAME
+        unavailable_agents — before connect(), not left to sync_watchers()
+        alone, or self._blocked_agents stays empty for that entire window
+        even when a real agent is genuinely unavailable."""
+        mgr = _make_manager()
+        unavailable = {"slow-agent"}
+        call_order = []
+        mgr._lifecycle.seed_blocked_agents = MagicMock(
+            side_effect=lambda _: call_order.append("seed")
+        )
+        mgr._connector.connect = AsyncMock(side_effect=lambda: call_order.append("connect"))
+
+        await mgr.run_once(unavailable_agents=unavailable)
+
+        mgr._lifecycle.seed_blocked_agents.assert_called_once_with(unavailable)
+        self.assertEqual(call_order, ["seed", "connect"])
+
 
 if __name__ == "__main__":
     unittest.main()
