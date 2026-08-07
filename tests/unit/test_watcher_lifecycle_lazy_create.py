@@ -585,15 +585,26 @@ class TestTryLazyCreateGlobalNameUniqueness(unittest.IsolatedAsyncioTestCase):
 
 
 class TestTryLazyCreateDormantWatcherReclaimsOwnName(unittest.IsolatedAsyncioTestCase):
-    """PR #79 review, seventh round, finding #20: a dynamic watcher's
-    persisted state can outlive its WatcherConfig across a restart. Before
-    this fix, the very next (unrelated-to-rename) message for that SAME
-    room would route through the cross-connector reservation, which fans
-    out to can_find_or_reconstruct_watcher() on every connector including
-    this one — truthfully reconstructing and reporting this exact watcher
-    as "already occupied" by itself, and refusing forever. An un-paused
-    dynamic watcher must be able to resume on its own name without ever
-    consulting the cross-connector reservation at all."""
+    """PR #79 review, seventh round finding #20, revised in the ninth
+    round: a dynamic watcher's persisted state can outlive its
+    WatcherConfig across a restart. The seventh round's cross-connector
+    reservation fans out to a probe on every connector — including the
+    caller's own — which would truthfully report an un-paused dynamic
+    watcher's ordinary reclaim of its own name as "already occupied," by
+    itself, and refuse forever.
+
+    The eighth round's fix worked around this INSIDE WatcherLifecycle by
+    skipping the reservation call entirely for a self-reclaim — but that
+    then let a DIFFERENT connector's meanwhile-configured static watcher
+    claim the very same name completely unchecked (ninth round, finding
+    #22). The real fix belongs at the GatewayService layer instead
+    (`_reserve_watcher_name()`, tested separately in
+    test_gateway_service.py): it excludes the REQUESTING connector's own
+    entry from the "does anyone already have this" scan, so
+    `reserve_global_name` is now called UNCONDITIONALLY by
+    try_lazy_create() again — these tests exercise WatcherLifecycle's side
+    of that contract: it must always call the callback and trust the
+    result, never trying to special-case self-reclaim on its own."""
 
     def _dormant_state(self, *, paused: bool = False) -> dict:
         return {
@@ -606,8 +617,11 @@ class TestTryLazyCreateDormantWatcherReclaimsOwnName(unittest.IsolatedAsyncioTes
             )
         }
 
-    async def test_unpaused_dormant_watcher_resumes_without_consulting_reservation(self):
-        reserve = AsyncMock(return_value=False)  # would wrongly refuse if called
+    async def test_unpaused_dormant_watcher_resumes_when_reservation_grants_it(self):
+        """A correctly self-excluding reserve_global_name (as
+        GatewayService now provides) returns True for a self-reclaim — the
+        watcher must resume using its OLD session, not a fresh one."""
+        reserve = AsyncMock(return_value=True)
         lifecycle, connector, agent, state_store = _make_lifecycle(
             rules=[_rule()],
             state_by_name=self._dormant_state(),
@@ -619,18 +633,19 @@ class TestTryLazyCreateDormantWatcherReclaimsOwnName(unittest.IsolatedAsyncioTes
             result = await lifecycle.try_lazy_create("chan-1")
 
         self.assertTrue(result)
-        reserve.assert_not_called()
+        reserve.assert_awaited_once_with("mm-home-general")
         agent.create_session.assert_not_called()  # resumed the OLD session
         connector.subscribe_room.assert_awaited_once()
 
-    async def test_reservation_release_not_called_for_a_self_reclaim(self):
-        """Nothing was ever reserved for a self-reclaim — releasing would
-        risk clearing a DIFFERENT caller's unrelated in-flight reservation
-        for the same name."""
+    async def test_reservation_released_after_a_successful_self_reclaim(self):
+        """Reservation is now always taken (even for a self-reclaim), so it
+        must always be released too, exactly like any other successful
+        creation."""
         release = MagicMock()
         lifecycle, connector, agent, state_store = _make_lifecycle(
             rules=[_rule()],
             state_by_name=self._dormant_state(),
+            reserve_global_name=AsyncMock(return_value=True),
             release_global_name=release,
         )
 
@@ -638,17 +653,15 @@ class TestTryLazyCreateDormantWatcherReclaimsOwnName(unittest.IsolatedAsyncioTes
             MockProc.return_value.start = MagicMock()
             await lifecycle.try_lazy_create("chan-1")
 
-        release.assert_not_called()
+        release.assert_called_once_with("mm-home-general")
 
     async def test_paused_dormant_watcher_still_not_auto_resumed(self):
-        """The self-reclaim fast path must not bypass the existing
-        (second-round) paused check — only "not paused" dormant watchers
-        skip the reservation and auto-resume."""
-        reserve = AsyncMock(return_value=False)
+        """The existing (second-round) paused check still applies after a
+        granted reservation — only "not paused" dormant watchers auto-resume."""
         lifecycle, connector, agent, state_store = _make_lifecycle(
             rules=[_rule()],
             state_by_name=self._dormant_state(paused=True),
-            reserve_global_name=reserve,
+            reserve_global_name=AsyncMock(return_value=True),
         )
 
         result = await lifecycle.try_lazy_create("chan-1")
@@ -658,9 +671,8 @@ class TestTryLazyCreateDormantWatcherReclaimsOwnName(unittest.IsolatedAsyncioTes
 
     async def test_foreign_ghost_state_under_the_same_name_still_uses_reservation(self):
         """A DIFFERENT room's stale persisted state colliding on this exact
-        auto-generated name must NOT be treated as a self-reclaim — it
-        still goes through the full reservation and is then caught by the
-        existing room_id-mismatch refusal."""
+        auto-generated name is caught by the existing room_id-mismatch
+        refusal, same as before — unaffected by the self-reclaim fix."""
         reserve = AsyncMock(return_value=True)
         lifecycle, connector, agent, state_store = _make_lifecycle(
             rules=[_rule()],

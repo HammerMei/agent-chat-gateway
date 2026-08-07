@@ -145,6 +145,17 @@ class SessionManager:
         """Return the WatcherConfig for a watcher name, or None if not found."""
         return self._lifecycle.get_watcher_config(name)
 
+    def is_watcher_name_known(self, name: str) -> bool:
+        """Non-mutating existence probe — see
+        WatcherLifecycle.is_watcher_name_known() (PR #79 review, ninth
+        round). Used by GatewayService._reserve_watcher_name() specifically
+        because, unlike can_find_or_reconstruct_watcher() below, it never
+        reconstructs/registers a dormant dynamic watcher as a side effect
+        of merely being asked about — appropriate for a cross-connector
+        availability check where the asker has no intention of acting on
+        a positive result themselves."""
+        return self._lifecycle.is_watcher_name_known(name)
+
     async def can_find_or_reconstruct_watcher(self, name: str) -> bool:
         """Non-raising, reconstruction-aware existence probe — see
         WatcherLifecycle.can_find_or_reconstruct_watcher() (PR #79 review).

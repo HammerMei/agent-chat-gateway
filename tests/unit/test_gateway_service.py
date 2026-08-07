@@ -562,21 +562,29 @@ class TestStartupFdOnCancel(unittest.IsolatedAsyncioTestCase):
 
 
 class TestReserveWatcherName(unittest.IsolatedAsyncioTestCase):
-    """docs/design/on-the-fly-watchers.md, PR #79 review (fourth AND
-    seventh rounds): GatewayService is the only layer with cross-connector
+    """docs/design/on-the-fly-watchers.md, PR #79 review (fourth, seventh
+    AND ninth rounds): GatewayService is the only layer with cross-connector
     visibility, so the global watcher-name reservation for lazy creation
-    has to live here and be handed down to each WatcherLifecycle as an
-    atomic reserve/release callback pair — not a plain read, per the
-    seventh-round findings (dormant dynamic states invisible to a
-    config-only check; a plain read is a TOCTOU race across connectors)."""
+    has to live here and be handed down to each WatcherLifecycle (bound
+    per-connector via functools.partial) as an atomic reserve/release
+    callback pair — not a plain read, per the seventh-round findings
+    (dormant dynamic states invisible to a config-only check; a plain read
+    is a TOCTOU race across connectors), and excluding the REQUESTING
+    connector's own entry using a NON-mutating probe, per the ninth-round
+    findings (#22: skipping the check entirely for a self-reclaim let a
+    different connector's colliding static config through unchecked; #23:
+    the seventh round's mutating probe eagerly registered a colliding
+    OTHER connector's dormant config as a side effect of merely being
+    asked about it)."""
 
     def _entry(self, name: str, known_names: list[str]):
-        """known_names simulates can_find_or_reconstruct_watcher()'s
-        result — True for names this connector already knows about
-        (whether live config or a reconstructable dormant dynamic state;
-        the caller doesn't need to distinguish the two)."""
+        """known_names simulates is_watcher_name_known()'s result — True
+        for names this connector already knows about (whether live config
+        or a persisted dynamic state; the caller doesn't need to
+        distinguish the two). Deliberately a plain (non-async) Mock: the
+        real method is non-mutating and synchronous."""
         entry = SimpleNamespace(name=name, session_manager=MagicMock())
-        entry.session_manager.can_find_or_reconstruct_watcher = AsyncMock(
+        entry.session_manager.is_watcher_name_known = MagicMock(
             side_effect=lambda n: n in known_names
         )
         return entry
@@ -585,26 +593,87 @@ class TestReserveWatcherName(unittest.IsolatedAsyncioTestCase):
         service = _make_service()
         service._entries = [self._entry("rc", ["support"]), self._entry("mm", ["sales"])]
 
-        self.assertTrue(await service._reserve_watcher_name("new-name"))
+        self.assertTrue(
+            await service._reserve_watcher_name("new-name", requesting_connector="rc")
+        )
 
     async def test_unavailable_when_a_different_connector_already_has_it(self):
         service = _make_service()
         service._entries = [self._entry("rc", ["support"]), self._entry("mm", ["sales"])]
 
-        self.assertFalse(await service._reserve_watcher_name("sales"))
+        self.assertFalse(
+            await service._reserve_watcher_name("sales", requesting_connector="rc")
+        )
 
     async def test_unavailable_when_only_a_dormant_dynamic_state_has_it(self):
         """Seventh-round finding: a dynamically-created watcher's config is
         never persisted, only its WatcherState — after a restart, before it
         receives a message to reconstruct itself, get_watcher_config()
-        alone would miss it entirely. can_find_or_reconstruct_watcher()
-        (used here instead) probes persisted dynamic state too, so a name
-        already claimed by a dormant watcher — reconstructable but not yet
-        reconstructed — must still be reported unavailable."""
+        alone would miss it entirely. is_watcher_name_known() (used here
+        instead) probes persisted dynamic state too, so a name already
+        claimed by a dormant watcher on a DIFFERENT connector must still be
+        reported unavailable."""
         service = _make_service()
         service._entries = [self._entry("mm", ["mm-home-general"])]
 
-        self.assertFalse(await service._reserve_watcher_name("mm-home-general"))
+        self.assertFalse(
+            await service._reserve_watcher_name(
+                "mm-home-general", requesting_connector="rc"
+            )
+        )
+
+    async def test_requesting_connectors_own_entry_is_excluded(self):
+        """Ninth-round finding #22's companion: the requesting connector's
+        own dormant/known state for this exact name must NOT count as a
+        collision — try_lazy_create() already resolved that itself before
+        ever calling this. Checking it here would make an un-paused
+        dynamic watcher observe itself as occupied and refuse to ever wake
+        up (the bug the eighth round patched over by skipping this call
+        entirely for a self-reclaim, which then missed OTHER connectors'
+        collisions — see the next test)."""
+        service = _make_service()
+        service._entries = [self._entry("mm", ["mm-home-general"])]
+
+        self.assertTrue(
+            await service._reserve_watcher_name(
+                "mm-home-general", requesting_connector="mm"
+            )
+        )
+
+    async def test_a_different_connectors_collision_is_still_caught_during_self_reclaim(self):
+        """Ninth-round finding #22: even when the requesting connector
+        already owns this name itself, a DIFFERENT connector's
+        meanwhile-configured watcher under the SAME name (invisible to
+        config-load-time uniqueness checks, since dormant dynamic state
+        was never in config.watchers) must still refuse the reservation —
+        the eighth round's "skip reservation entirely for a self-reclaim"
+        fix missed this entirely."""
+        service = _make_service()
+        service._entries = [
+            self._entry("mm", ["mm-home-general"]),
+            self._entry("rc", ["mm-home-general"]),
+        ]
+
+        self.assertFalse(
+            await service._reserve_watcher_name(
+                "mm-home-general", requesting_connector="mm"
+            )
+        )
+
+    async def test_probing_never_mutates_the_probed_connector(self):
+        """Ninth-round finding #23: the availability check must use a
+        non-mutating probe — verified here by asserting the OLD, mutating
+        can_find_or_reconstruct_watcher() is never touched at all."""
+        service = _make_service()
+        other = self._entry("mm", ["mm-home-general"])
+        other.session_manager.can_find_or_reconstruct_watcher = AsyncMock()
+        service._entries = [other]
+
+        await service._reserve_watcher_name(
+            "mm-home-general", requesting_connector="rc"
+        )
+
+        other.session_manager.can_find_or_reconstruct_watcher.assert_not_called()
 
     async def test_reads_entries_at_call_time_not_capture_time(self):
         """The callback is handed to a WatcherLifecycle before
@@ -612,12 +681,16 @@ class TestReserveWatcherName(unittest.IsolatedAsyncioTestCase):
         constructed inside the same loop that appends to it) — must be a
         live closure over self._entries, not a snapshot."""
         service = _make_service()
-        self.assertTrue(await service._reserve_watcher_name("late-comer"))
+        self.assertTrue(
+            await service._reserve_watcher_name("late-comer", requesting_connector="rc")
+        )
         service._release_watcher_name("late-comer")
 
         service._entries.append(self._entry("mm", ["late-comer"]))
 
-        self.assertFalse(await service._reserve_watcher_name("late-comer"))
+        self.assertFalse(
+            await service._reserve_watcher_name("late-comer", requesting_connector="rc")
+        )
 
     async def test_reserving_twice_without_release_refuses_second_caller(self):
         """Seventh-round finding: the check-then-create window itself must
@@ -630,17 +703,25 @@ class TestReserveWatcherName(unittest.IsolatedAsyncioTestCase):
         service = _make_service()
         service._entries = [self._entry("mm", [])]
 
-        self.assertTrue(await service._reserve_watcher_name("mm-home-general"))
-        self.assertFalse(await service._reserve_watcher_name("mm-home-general"))
+        self.assertTrue(
+            await service._reserve_watcher_name("mm-home-general", requesting_connector="mm")
+        )
+        self.assertFalse(
+            await service._reserve_watcher_name("mm-home-general", requesting_connector="mm")
+        )
 
     async def test_release_allows_the_name_to_be_reserved_again(self):
         service = _make_service()
         service._entries = [self._entry("mm", [])]
 
-        self.assertTrue(await service._reserve_watcher_name("mm-home-general"))
+        self.assertTrue(
+            await service._reserve_watcher_name("mm-home-general", requesting_connector="mm")
+        )
         service._release_watcher_name("mm-home-general")
 
-        self.assertTrue(await service._reserve_watcher_name("mm-home-general"))
+        self.assertTrue(
+            await service._reserve_watcher_name("mm-home-general", requesting_connector="mm")
+        )
 
     def test_release_of_a_never_reserved_name_is_a_noop(self):
         service = _make_service()
@@ -657,8 +738,8 @@ class TestReserveWatcherName(unittest.IsolatedAsyncioTestCase):
         service._entries = [self._entry("mm", [])]
 
         results = await asyncio.gather(
-            service._reserve_watcher_name("mm-home-general"),
-            service._reserve_watcher_name("mm-home-general"),
+            service._reserve_watcher_name("mm-home-general", requesting_connector="mm"),
+            service._reserve_watcher_name("mm-home-general", requesting_connector="mm"),
         )
 
         self.assertEqual(sorted(results), [False, True])
