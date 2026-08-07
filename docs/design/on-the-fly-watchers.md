@@ -1,6 +1,6 @@
 # On-the-fly watchers: rule-based room matching + lazy watcher lifecycle
 
-Status (updated 2026-08-07, round 9): **config schema landed (PR #77); rule-based
+Status (updated 2026-08-07, round 10): **config schema landed (PR #77); rule-based
 room matching + lazy creation landed for Mattermost.** RocketChat support,
 `session_id`/`online_notification`/`offline_notification` retirement, and
 the `expire` CLI are still design-only. Coordinating a low-traffic
@@ -701,6 +701,63 @@ distinction that findings #20/#22/#23 all turn on lives entirely on the
 `GatewayService` side, expressed as "which connector is asking," not as
 special-cased logic inside `WatcherLifecycle` about what it's asking
 about.
+
+### PR #79 review, tenth round (2026-08-07) — three more findings, all fixed
+
+Round ten found two remaining gaps in the lazy-creation feature's own
+logic (not this time a regression from a prior round's fix) plus one gap
+in config-time validation:
+
+24. **The startup window itself could still lose a renamed watcher's
+    identity.** `SessionManager.run_once()` calls `connector.connect()` —
+    which starts the Mattermost websocket listener as a background task —
+    *before* calling `sync_watchers()`, and `sync_watchers()` only copies
+    a dormant dynamic watcher's persisted state into `self._states` as its
+    very LAST step (after every static watcher has already started). A
+    message for a renamed dynamic watcher's room arriving anywhere in that
+    window would find `self._states` empty or incomplete, miss the stable-
+    room-ID fallback (finding #21) entirely, and then also miss the
+    "resume a dormant session" step (which looks up disk state by the NEW,
+    post-rename name — the persisted entry is still filed under the OLD
+    one) — silently creating a brand-new watcher/session under the new
+    name, abandoning the old one and bypassing a persisted pause. Fixed by
+    falling back to a direct disk read (`self._state_store.load()`) when
+    the in-memory `self._states` search comes up empty — disk is always
+    complete/authoritative this early in the process's life, and the
+    "resume a dormant session" step a few lines below already reads disk
+    directly for the identical reason.
+25. **A dynamic watcher's state was preserved forever, even after its
+    wildcard rule was removed entirely.** `sync_watchers()`'s startup
+    preservation loop (the fourth/sixth round's fix) copies any persisted
+    `dynamically_created` entry into `self._states` unconditionally,
+    regardless of whether this connector still has an active `room: "*"`
+    rule to match it against. If the operator removes the rule,
+    `_reconstruct_dynamic_watcher_config()` explicitly refuses to bring
+    that watcher back (nothing left to match) — so preserving its state
+    kept it, and the disk write that follows, alive forever with zero path
+    back. Worse, `is_watcher_name_known()` (ninth round) would keep
+    reporting that name as globally taken forever too, permanently
+    blocking any OTHER connector from ever claiming a generated name that
+    can never actually run again. Fixed by gating the preservation on
+    `self._watcher_rules` being non-empty — an orphaned entry with no rule
+    left to reconstruct against is now pruned on the next save, same
+    treatment any other genuinely-removed watcher already got.
+26. **A `room: "*"` rule was accepted for connector types that can never
+    trigger it.** `try_lazy_create()` is only ever called via a connector's
+    own `register_lazy_creation_hook()` override — the base
+    `Connector.register_lazy_creation_hook()` is a no-op, and currently
+    only Mattermost overrides it (RocketChat's own lazy-creation support,
+    via a membership-event-hook-triggered subscription, is a separate,
+    not-yet-built follow-up). Config loading accepted a `room: "*"` rule
+    for ANY connector type, including RocketChat — the gateway would boot
+    successfully, log nothing wrong, and silently drop every message on
+    that connector forever, with no error anywhere pointing at why the
+    documented "listen to all rooms" behavior never happens. Fixed by
+    validating the resolved connector's `type` against a new
+    `_LAZY_CREATION_SUPPORTED_CONNECTOR_TYPES = {"mattermost"}` set in
+    `_parse_one_watcher_rule()`, raising a clear `ValueError` at
+    config-load time (or a collected `ConfigIssue` via `collect_config()`)
+    instead.
 
 ## Idle-expiry / auto-remove
 

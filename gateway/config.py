@@ -1008,6 +1008,17 @@ def _is_wildcard_room_entry(wc_raw: object) -> bool:
     return isinstance(raw_rooms, list) and raw_rooms == ["*"]
 
 
+# PR #79 review (tenth round, finding #26): a `room: "*"` rule only ever
+# does anything on a connector whose Connector subclass overrides
+# register_lazy_creation_hook() — the base Connector.register_lazy_creation_hook()
+# is a no-op (gateway/core/connector.py), so try_lazy_create() is never
+# even wired up for a connector that doesn't override it. Currently that's
+# Mattermost only (docs/design/on-the-fly-watchers.md; RocketChat's own
+# lazy-creation support is a separate, not-yet-built follow-up — it needs
+# a membership-event-hook-triggered subscription RC doesn't have yet).
+_LAZY_CREATION_SUPPORTED_CONNECTOR_TYPES = {"mattermost"}
+
+
 def _parse_one_watcher_rule(
     wc_raw: object,
     index: int,
@@ -1080,6 +1091,24 @@ def _parse_one_watcher_rule(
 
     resolved_connector = _resolve_watcher_connector(wc, index, connector_names, connectors)
     watcher_agent = _resolve_watcher_agent(wc, index, agents, default_agent)
+
+    # PR #79 review (tenth round, finding #26): fail fast rather than
+    # silently starting a rule that can never match a single room. Without
+    # this, the gateway boots successfully, logs nothing wrong, and every
+    # message on that connector is dropped forever — the operator's
+    # "listen to all rooms" config entry is a total no-op with no error
+    # anywhere pointing at why.
+    connector_type = next(
+        (c.type for c in connectors if c.name == resolved_connector), None
+    )
+    if connector_type not in _LAZY_CREATION_SUPPORTED_CONNECTOR_TYPES:
+        raise ValueError(
+            f'Watcher entry at index {index}: room: "*" rules are only '
+            f"supported on connector types "
+            f"{sorted(_LAZY_CREATION_SUPPORTED_CONNECTOR_TYPES)} "
+            f"(docs/design/on-the-fly-watchers.md) — connector "
+            f"'{resolved_connector}' is of type {connector_type!r}."
+        )
 
     raw_ctx = wc.get("context_inject_files", [])
     ctx_files = _resolve_paths(raw_ctx, config_dir)
