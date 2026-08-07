@@ -1,6 +1,6 @@
 # On-the-fly watchers: rule-based room matching + lazy watcher lifecycle
 
-Status (updated 2026-08-07): **config schema landed (PR #77); rule-based
+Status (updated 2026-08-07, round 8): **config schema landed (PR #77); rule-based
 room matching + lazy creation landed for Mattermost.** RocketChat support,
 `session_id`/`online_notification`/`offline_notification` retirement, and
 the `expire` CLI are still design-only. Coordinating a low-traffic
@@ -564,6 +564,71 @@ genuine concurrency race:
     (success, refusal, or a `_start_watcher()` failure), since holding a
     reservation past its need would blackhole that name for every future
     attempt, on every connector, after a single transient failure.
+
+### PR #79 review, eighth round (2026-08-07) — two more findings, both fixed
+
+Round eight found two ways the seventh round's own fixes over-corrected —
+both are cases where an un-paused dynamic watcher legitimately reclaiming
+its OWN identity got treated as a collision with itself (or lost its
+identity entirely), rather than a genuinely different owner:
+
+20. **A dormant (un-paused) dynamic watcher couldn't reclaim its own
+    name.** The seventh round's cross-connector reservation
+    (`reserve_global_name()`) fans out to
+    `can_find_or_reconstruct_watcher()` on EVERY connector, including the
+    very one making the call — for the ordinary "next message after a
+    restart" case (same room, same auto-generated name, not paused), that
+    probe would truthfully reconstruct and report the watcher as "already
+    occupied" — by itself — and refuse forever, since nothing else in
+    `try_lazy_create()` would ever call it again for that name.
+    Previously-dormant-but-legitimate watchers would get permanently stuck
+    needing a manual `resume`, exactly the failure mode the seventh round's
+    fix was supposed to prevent for OTHER connectors, now inflicted on the
+    watcher's own connector instead. Fixed by loading this connector's own
+    persisted state under `watcher_name` *before* deciding whether to
+    reserve at all: if that state's `room_id` already matches the room
+    just resolved, this is unambiguously a self-reclaim, not a collision —
+    skip the reservation entirely and go straight to the existing
+    resume-a-dormant-session logic. A genuinely different room's stale
+    state colliding on the same name is unaffected (its `room_id` won't
+    match, so it still goes through the full reservation and is caught by
+    the existing room_id-mismatch refusal). The `finally: release_global_name()`
+    from the seventh round now only fires when a reservation was actually
+    taken (tracked via a `reserved` flag) — unconditionally releasing would
+    risk clearing a *different*, unrelated caller's legitimate in-flight
+    reservation for that same name.
+21. **The fifth round's stable-room-ID fallback silently dropped a renamed
+    watcher's identity instead of reconstructing it.** When a dynamic
+    watcher's channel is renamed, `existing_for_room`'s primary check
+    (`wc.room == room.name`) naturally misses it (name changed), so it
+    falls back to matching by `state.room_id` — but that fallback then
+    calls the plain, non-reconstructing `get_watcher_config()`, which
+    returns `None` for a dynamic watcher whose config was never
+    reconstructed (only its `WatcherState` survived, same premise as
+    finding #18). The code read that `None` as "no existing watcher here,"
+    fell through, and would have gone on to build a *brand-new* config
+    under the freshly-generated name — abandoning the old session and
+    silently bypassing a persisted pause. Fixed by reconstructing (via
+    `_reconstruct_dynamic_watcher_config()`) whenever the stable-ID match's
+    `get_watcher_config()` lookup misses AND the matched state's own
+    `watcher_name` differs from the one just computed for the current room
+    name (i.e., a rename actually happened) — the reconstructed watcher
+    then correctly falls into the existing "known but not running, needs
+    explicit `resume`" branch. Deliberately scoped to the renamed case
+    only: when the name is unchanged, this is finding #20's ordinary
+    self-reclaim case, and reconstructing-and-blocking here too would
+    reintroduce that exact bug via a different code path.
+
+Both findings share a root cause worth naming explicitly: the seventh
+round added machinery (`can_find_or_reconstruct_watcher`,
+`_reconstruct_dynamic_watcher_config`) that treats "this name is
+reconstructable" as equivalent to "this name is occupied by someone else,"
+which is correct for cross-connector collisions but wrong whenever the
+someone else turns out to be the watcher's own past self. The fix in both
+cases is the same shape: detect the self-reclaim case *before* invoking
+that machinery, using a property that can't lie about identity —
+`state.room_id` — rather than trying to teach the reconstruction machinery
+itself to tell "self" from "other."
 
 ## Idle-expiry / auto-remove
 
