@@ -1,6 +1,6 @@
 # On-the-fly watchers: rule-based room matching + lazy watcher lifecycle
 
-Status (updated 2026-08-07, round 8): **config schema landed (PR #77); rule-based
+Status (updated 2026-08-07, round 9): **config schema landed (PR #77); rule-based
 room matching + lazy creation landed for Mattermost.** RocketChat support,
 `session_id`/`online_notification`/`offline_notification` retirement, and
 the `expire` CLI are still design-only. Coordinating a low-traffic
@@ -589,7 +589,10 @@ identity entirely), rather than a genuinely different owner:
     reserve at all: if that state's `room_id` already matches the room
     just resolved, this is unambiguously a self-reclaim, not a collision —
     skip the reservation entirely and go straight to the existing
-    resume-a-dormant-session logic. A genuinely different room's stale
+    resume-a-dormant-session logic. **(Superseded by the ninth round below —
+    skipping the reservation entirely turned out to have its own bug; the
+    fix moved to excluding just the requesting connector from the check,
+    not skipping the check.)** A genuinely different room's stale
     state colliding on the same name is unaffected (its `room_id` won't
     match, so it still goes through the full reservation and is caught by
     the existing room_id-mismatch refusal). The `finally: release_global_name()`
@@ -629,6 +632,75 @@ cases is the same shape: detect the self-reclaim case *before* invoking
 that machinery, using a property that can't lie about identity —
 `state.room_id` — rather than trying to teach the reconstruction machinery
 itself to tell "self" from "other."
+
+### PR #79 review, ninth round (2026-08-07) — two more findings, both fixed
+
+Round nine went back to the eighth round's own fix for finding #20 (skip
+the cross-connector reservation entirely on a self-reclaim) and found it
+over-corrected in two ways — skipping the check ENTIRELY, rather than
+just excluding the requesting connector from it, threw out real
+protection along with the false positive:
+
+22. **Skipping the reservation for a self-reclaim also skipped checking
+    every OTHER connector.** If a dynamic watcher survives a restart
+    (dormant, un-paused) and, in the meantime, a *new* static watcher gets
+    configured on a *different* connector using the exact same composite
+    name — which passes that connector's own config-load-time uniqueness
+    check, since dormant dynamic state living only in a `WatcherState` is
+    invisible to `config.watchers` — the eighth round's fix would let the
+    next message in the dynamic watcher's own room skip the reservation
+    entirely (because `reclaiming_own_state` was true) and start it
+    directly, without ever asking whether some OTHER connector had since
+    claimed the same name. The result: two connectors both durably own a
+    watcher under the one name every other part of the system
+    (`ControlServer._find_entry_for_watcher()`, the scheduler) assumes is
+    globally unique — unqualified lifecycle commands and scheduled jobs
+    can silently resolve to the wrong connector. Fixed by removing the
+    skip-the-reservation-entirely branch and instead making the
+    reservation call itself connector-aware: `GatewayService` now binds a
+    *separate* `reserve_global_name` callback per connector via
+    `functools.partial(self._reserve_watcher_name, requesting_connector=cc.name)`,
+    and `_reserve_watcher_name()`'s scan **excludes only the requesting
+    connector's own entry** — not the check as a whole. `try_lazy_create()`
+    now calls `reserve_global_name()` unconditionally again, same as the
+    seventh round, but the false-positive self-block is gone because the
+    self-check that caused it is gone, not because the whole check is
+    skipped. Every OTHER connector is still fully checked, closing the gap
+    this round found.
+23. **Merely probing a name during that scan could permanently disable its
+    legitimate owner.** The seventh round's reservation scan used
+    `can_find_or_reconstruct_watcher()` to see persisted dynamic state on
+    other connectors — but that method's reconstruction is a deliberate
+    *mutating* side effect (documented and correct for `ControlServer`,
+    which immediately acts on a positive result). Reusing it here meant a
+    connector B merely asking "does connector A already have this name?"
+    would eagerly reconstruct A's dormant watcher's `WatcherConfig` into
+    A's own `_watcher_configs` — unstarted, purely as a side effect of B's
+    probe, whether or not A's watcher was paused. The next genuine message
+    for A's own room would then find that eagerly-registered-but-never-
+    started config via `existing_by_name`/`existing_for_room` and treat it
+    as an explicitly stopped watcher needing manual `resume` — even though
+    its persisted state had `paused=False` the whole time. A cross-
+    connector availability check silently disabling the very watcher it
+    was checking about, on a connector that never asked for anything, is
+    the same "reconstruction side effect leaks past its intended caller"
+    class of bug as finding #22, just one layer deeper. Fixed by adding
+    `WatcherLifecycle.is_watcher_name_known()` / `SessionManager
+    .is_watcher_name_known()` — a **non-mutating** peek (checks
+    `get_watcher_config()`, then a raw `dynamically_created` flag on the
+    persisted state, with no room resolution or registration) — and
+    switching `_reserve_watcher_name()`'s scan to call that instead of
+    `can_find_or_reconstruct_watcher()`. `ControlServer`'s own use of
+    `can_find_or_reconstruct_watcher()` for pause/resume/reset routing is
+    unchanged — that caller *does* intend to act on a positive result
+    immediately, so the mutation there is correct and desired.
+
+With this round, `try_lazy_create()`'s reservation call is unconditional
+again (matching the seventh round's shape), and the self-vs-other
+distinction that findings #20/#22/#23 all turn on lives entirely on the
+`GatewayService` side, expressed as "which connector is asking," not as
+special-cased logic inside `WatcherLifecycle` about what it's asking
+about.
 
 ## Idle-expiry / auto-remove
 

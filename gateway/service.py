@@ -20,6 +20,7 @@ import asyncio
 import logging
 import os
 from dataclasses import dataclass
+from functools import partial
 
 from .agents import AgentBackend, GatewayBrokerConfig
 from .agents.claude import ClaudeBackend
@@ -300,7 +301,9 @@ class GatewayService:
                 watcher_rules=connector_rules,
                 permission_registry=self._registry,
                 session_maps=self._maps,
-                reserve_global_name=self._reserve_watcher_name,
+                reserve_global_name=partial(
+                    self._reserve_watcher_name, requesting_connector=cc.name
+                ),
                 release_global_name=self._release_watcher_name,
             )
             self._entries.append(
@@ -321,15 +324,17 @@ class GatewayService:
             job_store=self._job_store,
         )
 
-    async def _reserve_watcher_name(self, name: str) -> bool:
-        """Atomically check-and-reserve `name` across ALL connectors, or
-        refuse if it's already taken. Returns True (reserved) or False
-        (unavailable).
+    async def _reserve_watcher_name(self, name: str, requesting_connector: str) -> bool:
+        """Atomically check-and-reserve `name` across ALL connectors OTHER
+        THAN `requesting_connector`, or refuse if it's already taken.
+        Returns True (reserved) or False (unavailable).
 
-        Passed into every WatcherLifecycle as `reserve_global_name`
-        (docs/design/on-the-fly-watchers.md, PR #79 review, fourth AND
-        seventh rounds) — a lazily-created watcher's own collision checks
-        in `try_lazy_create()` only see its OWN connector's watchers, but
+        Passed into every WatcherLifecycle as `reserve_global_name` — bound
+        per-connector via `functools.partial(self._reserve_watcher_name,
+        requesting_connector=cc.name)` in `__init__` — (docs/design/
+        on-the-fly-watchers.md, PR #79 review, fourth, seventh AND ninth
+        rounds): a lazily-created watcher's own collision checks in
+        `try_lazy_create()` only see its OWN connector's watchers, but
         `ControlServer._find_entry_for_watcher()` and the scheduler both
         assume watcher names are globally unique across ALL connectors
         (an invariant enforced for static watchers at config-load time,
@@ -337,28 +342,21 @@ class GatewayService:
         lazily-created watcher could take a name already used by a
         DIFFERENT connector's watcher, breaking that assumption for both.
 
-        Two things a plain read (the fourth-round original version of this
-        method) got wrong, both found in the seventh review round:
+        Three things earlier versions of this method got wrong:
 
-        1. It only checked `get_watcher_config()`, i.e. each connector's
-           live, in-memory `_watcher_configs`. A dynamically-created
-           watcher's config is never persisted (only its `WatcherState`,
-           via `dynamically_created`) — after a restart, a DORMANT lazy
-           watcher that hasn't yet received a message to reconstruct
-           itself is invisible to that check. A new connector or changed
-           rule could then generate the same composite name and claim it
-           before the dormant watcher wakes up, leaving two owners for one
-           name. Fixed by probing
-           `session_manager.can_find_or_reconstruct_watcher()` instead,
-           which reconstructs (and durably registers) a dormant dynamic
-           watcher from persisted state if one matches — the same
-           reconstruction-aware check `ControlServer` already relies on
-           for routing pause/resume/reset.
-        2. It was a plain, unsynchronized read — nothing prevented two
-           DIFFERENT connectors from both reading "available" for the same
-           name before either had registered anything, since each
-           connector's own lock (`WatcherLifecycle._get_watcher_lock()`) is
-           local to that connector and cannot serialize against another
+        1. (fourth round) It only checked `get_watcher_config()`, i.e. each
+           connector's live, in-memory `_watcher_configs`. A dynamically-
+           created watcher's config is never persisted (only its
+           `WatcherState`, via `dynamically_created`) — after a restart, a
+           DORMANT lazy watcher that hasn't yet received a message to
+           reconstruct itself is invisible to that check. Fixed (seventh
+           round) by probing something that also sees persisted dynamic
+           state — see point 3 below for what that probe is now.
+        2. (seventh round) It was a plain, unsynchronized read — nothing
+           prevented two DIFFERENT connectors from both reading "available"
+           for the same name before either had registered anything, since
+           each connector's own lock (`WatcherLifecycle._get_watcher_lock()`)
+           is local to that connector and cannot serialize against another
            connector's lock. Fixed by holding a single lock shared by every
            connector (`self._watcher_name_lock`) across the whole
            check-then-reserve sequence, and by tracking in-flight
@@ -367,6 +365,27 @@ class GatewayService:
            covered. Callers MUST pair a successful reservation with
            `_release_watcher_name()` once that window closes (see
            `WatcherLifecycle.try_lazy_create()`'s `finally` block).
+        3. (ninth round, findings #22 and #23) The seventh round's fix used
+           `can_find_or_reconstruct_watcher()` to see persisted dynamic
+           state, which surfaced two further problems: (a) checking the
+           REQUESTING connector's own entry made an un-paused dynamic
+           watcher observe itself as "already occupied" — by itself — on
+           its own ordinary reclaim (worked around in the eighth round by
+           skipping the call entirely for that case, which then let a
+           DIFFERENT connector's meanwhile-configured static watcher claim
+           the same name completely unchecked); and (b) merely PROBING a
+           name owned by another connector's dormant watcher reconstructed
+           (and durably registered, unstarted) that watcher's config as a
+           side effect, purely because someone else asked — later
+           permanently blocking its own legitimate auto-resume. Fixed here
+           by (a) excluding `requesting_connector`'s own entry from the
+           scan below — its own `try_lazy_create()` already ran its own
+           existing_by_name/existing_for_room checks, so re-checking it
+           here is both redundant and, for a true self-reclaim, wrong — and
+           (b) replacing `can_find_or_reconstruct_watcher()` with
+           `is_watcher_name_known()`, a non-mutating probe that answers the
+           same question without ever reconstructing/registering anything
+           on a connector that isn't the one about to act on the result.
 
         A closure over `self._entries`, read at CALL time — safe even
         though this is handed to a `WatcherLifecycle` built *before*
@@ -379,7 +398,9 @@ class GatewayService:
             if name in self._reserved_watcher_names:
                 return False
             for entry in self._entries:
-                if await entry.session_manager.can_find_or_reconstruct_watcher(name):
+                if entry.name == requesting_connector:
+                    continue
+                if entry.session_manager.is_watcher_name_known(name):
                     return False
             self._reserved_watcher_names.add(name)
             return True
