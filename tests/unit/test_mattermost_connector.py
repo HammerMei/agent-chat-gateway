@@ -144,6 +144,68 @@ class TestComputeToField(unittest.TestCase):
         self.assertEqual(connector._compute_to_field(msg), "to: *")
 
 
+# ── connect / start_realtime split ─────────────────────────────────────────────
+# docs/design/on-the-fly-watchers.md, "Startup ordering: root-cause design
+# review" — connect() now does REST auth only; start_realtime() opens the
+# WebSocket. SessionManager.run_once() calls sync_watchers() in between,
+# so no posted event can arrive before local state is fully populated.
+
+
+class TestConnectStartRealtimeSplit(unittest.IsolatedAsyncioTestCase):
+    async def test_connect_does_rest_auth_but_not_open_the_websocket(self):
+        connector = _make_connector()
+        connector._rest.authenticate = AsyncMock()
+        connector._rest.get_me = AsyncMock()
+        connector._rest.resolve_team = AsyncMock()
+        connector._ws.connect = AsyncMock()
+        connector._ws.start = AsyncMock()
+
+        await connector.connect()
+
+        connector._rest.authenticate.assert_awaited_once()
+        connector._rest.get_me.assert_awaited_once()
+        connector._rest.resolve_team.assert_awaited_once_with(connector._config.team)
+        connector._ws.connect.assert_not_called()
+        connector._ws.start.assert_not_called()
+
+    async def test_connect_registers_ws_callbacks_without_opening_it(self):
+        """Registering the handler/reconnect callback is local bookkeeping,
+        not a wire call — safe to do in connect(), before the socket
+        exists, per MattermostWebSocketClient.register_handler()'s own
+        contract (just stores the callable)."""
+        connector = _make_connector()
+        connector._rest.authenticate = AsyncMock()
+        connector._rest.get_me = AsyncMock()
+        connector._rest.resolve_team = AsyncMock()
+        connector._ws.connect = AsyncMock()
+        connector._ws.start = AsyncMock()
+
+        await connector.connect()
+
+        self.assertEqual(connector._ws._handler, connector._on_posted_event)
+        self.assertEqual(connector._ws._on_reconnect_cb, connector._on_ws_reconnect)
+
+    async def test_start_realtime_opens_the_websocket(self):
+        connector = _make_connector()
+        connector._ws.connect = AsyncMock()
+        connector._ws.start = AsyncMock()
+
+        await connector.start_realtime()
+
+        connector._ws.connect.assert_awaited_once()
+        connector._ws.start.assert_awaited_once()
+
+    async def test_start_realtime_does_not_repeat_rest_auth(self):
+        connector = _make_connector()
+        connector._rest.authenticate = AsyncMock()
+        connector._ws.connect = AsyncMock()
+        connector._ws.start = AsyncMock()
+
+        await connector.start_realtime()
+
+        connector._rest.authenticate.assert_not_called()
+
+
 # ── subscribe_room / unsubscribe_room ─────────────────────────────────────────
 
 

@@ -804,7 +804,7 @@ the tenth round's own finding #25:
     posture — a transient network blip during startup must not
     permanently discard a legitimate session.
 
-## Startup ordering: root-cause design review (2026-08-07, PROPOSED — not yet implemented)
+## Startup ordering: root-cause design review (2026-08-07, IMPLEMENTED on `feature/mm-startup-ordering`, branched off `feature/lazy-watcher-mm-creation`)
 
 Eleven review rounds in, a pattern was worth stepping back for instead of
 patching the next instance: **rounds ten and eleven found four findings
@@ -924,23 +924,29 @@ would deliver it isn't open yet. Verified safe by reading
   fix only needs to matter for a connector that actually calls
   `register_lazy_creation_hook()`.
 
-**Decision: recommend C, pending the repo owner's sign-off — not yet implemented.**
-Round ten and eleven's fixes for #24 (disk fallback in the stable-room-ID
-search) and #27 (`seed_blocked_agents()`) are **kept as defense-in-depth**
-either way, not reverted — they're already merged, already reviewed, and
+**Decision: C, approved by the repo owner and implemented.** Round ten and eleven's
+fixes for #24 (disk fallback in the stable-room-ID search) and #27
+(`seed_blocked_agents()`) are **kept as defense-in-depth**, not reverted —
 correct as a second line of defense even once the ordering itself is
 fixed (e.g. if a future connector or code path reintroduces a similar
-gap). #25/#28 are untouched regardless of which option is chosen, per the
-framing above.
+gap). #25/#28 are untouched, per the framing above.
 
 ### Process notes
 
-- **This belongs in a separate PR/branch, not folded into #79.** #79 is
+- **This lives in a separate branch/PR, not folded into #79.** #79 is
   already eleven review rounds and 28 findings deep; a change to
   `Connector`'s ABC and `SessionManager.run_once()`'s call order is a
   distinct, separable change from "lazy creation for Mattermost," and
   keeping it separate makes both easier to review and easier to revert
   independently if either turns out to have a problem in production.
+  Branched off `feature/lazy-watcher-mm-creation` (not `main`) because the
+  bug being fixed only exists once that branch's code
+  (`try_lazy_create()`, `register_lazy_creation_hook()`,
+  `seed_blocked_agents()`) is present — `main` has no lazy-creation hook
+  wired up yet, so this race is inert there. This second branch is
+  intended to merge INTO `feature/lazy-watcher-mm-creation` before (or as
+  part of) that branch's own merge to `main` as #79 — not merge to `main`
+  independently first.
 - **The existing rollout constraint applies here too, arguably more
   strictly.** Per the "Rollout" section below, nothing in this feature has
   touched macbook-server yet and a low-traffic test window must be
@@ -949,6 +955,48 @@ framing above.
   validate (ordering bugs are, by definition, about real-world timing) —
   this should get at least one live low-traffic startup cycle watched
   directly before being trusted, independent of the general rollout gate.
+
+### Implementation
+
+- `gateway/core/connector.py`: added `Connector.start_realtime()` —
+  non-abstract, default no-op, same pattern as
+  `register_capacity_check()`/`register_lazy_creation_hook()` above it.
+- `gateway/connectors/mattermost/connector.py`: `connect()` now does REST
+  auth only (`authenticate()`/`get_me()`/`resolve_team()`) plus
+  registering the websocket handler/reconnect callback (pure local
+  bookkeeping, confirmed by reading `MattermostWebSocketClient
+  .register_handler()`/`set_reconnect_callback()` — neither touches the
+  socket). `await self._ws.connect()` / `await self._ws.start()` moved
+  into a new `start_realtime()` override.
+- `gateway/core/session_manager.py`: `run_once()` now calls
+  `connector.connect()` → `lifecycle.sync_watchers()` →
+  `connector.start_realtime()`, in that order (previously `connect()`
+  did everything, `sync_watchers()` ran after).
+- **One deliberate, minor behavior change worth naming**: previously, a
+  WebSocket-open failure happened INSIDE `connect()`, before
+  `sync_watchers()` ever ran — no watcher work was attempted at all if
+  the socket couldn't open. Now, `sync_watchers()` runs (and can fully
+  succeed — provisioning sessions, registering local channel state) even
+  if the LATER `start_realtime()` call then fails to open the socket. The
+  failure still surfaces identically to before (`start_realtime()`'s
+  exception propagates out of `run_once()` exactly like `connect()`'s
+  used to, caught the same way by `GatewayService.run()`'s
+  `asyncio.gather(..., return_exceptions=True)`), and cleanup is
+  unaffected (`GatewayService.run()`'s `finally: await self.shutdown()`
+  unconditionally tears down every entry regardless of how far startup
+  got, and `SessionManager.shutdown()` → `WatcherLifecycle.stop_all()` /
+  `connector.disconnect()` are both already safe to call on partially- or
+  never-started state). Net effect: on a websocket-open failure, more
+  work happens before the failure surfaces than before, but the
+  end state (fully torn down, error reported) is identical.
+- Tests: `tests/unit/test_connector.py` (`start_realtime()` default is an
+  awaitable no-op), `tests/unit/test_mattermost_connector.py`
+  (`TestConnectStartRealtimeSplit` — `connect()` does REST auth and
+  registers callbacks but never touches the socket; `start_realtime()`
+  opens it and doesn't repeat REST auth), `tests/unit/test_session_manager_commands.py`
+  (`run_once()` calls `start_realtime()`, and specifically calls it AFTER
+  `sync_watchers()`, verified via real call-order tracking, not just
+  individual `assert_called` checks).
 
 ## Idle-expiry / auto-remove
 

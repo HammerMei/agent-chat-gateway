@@ -135,22 +135,48 @@ class MattermostConnector(Connector):
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
     async def connect(self) -> None:
-        """Authenticate, resolve identity + team, and open the WebSocket."""
+        """Authenticate and resolve identity + team via REST.
+
+        Deliberately does NOT open the WebSocket — see `start_realtime()`
+        (docs/design/on-the-fly-watchers.md, "Startup ordering: root-cause
+        design review"). `SessionManager.run_once()` calls `sync_watchers()`
+        between this method and `start_realtime()`, so no `posted` event
+        can arrive for a room with incomplete local state (dynamic-watcher
+        state, blocked-agents set) — the firehose simply isn't open yet.
+        """
         await self._rest.authenticate()
         # Mandatory regardless of auth mode: PAT mode has no login response to
         # pull an identity from, and the own-message filter needs bot_user_id.
         await self._rest.get_me()
         await self._rest.resolve_team(self._config.team)
 
+        # Registering the handler/reconnect callback here (not in
+        # start_realtime()) is safe and deliberate: these are local
+        # callback registrations only, not wire-protocol calls — nothing
+        # can fire them before the WebSocket is actually opened below in
+        # start_realtime().
         self._ws.register_handler(self._on_posted_event)
         self._ws.set_reconnect_callback(self._on_ws_reconnect)
-        await self._ws.connect()
-        await self._ws.start()
         logger.info(
-            "MattermostConnector connected to %s as %s (team=%s)",
+            "MattermostConnector authenticated to %s as %s (team=%s)",
             self._config.server_url,
             self._rest.bot_username,
             self._config.team,
+        )
+
+    async def start_realtime(self) -> None:
+        """Open the WebSocket and start the listen loop.
+
+        Split from `connect()` so the caller (`SessionManager.run_once()`)
+        can run `sync_watchers()` first — see `connect()`'s docstring and
+        the design doc. Safe to call only after `connect()` has completed
+        (needs `self._rest`'s token for the websocket auth handshake).
+        """
+        await self._ws.connect()
+        await self._ws.start()
+        logger.info(
+            "MattermostConnector realtime listener started (%s)",
+            self._config.server_url,
         )
 
     async def disconnect(self) -> None:

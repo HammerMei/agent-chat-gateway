@@ -195,6 +195,31 @@ class Connector(ABC):
         """Graceful shutdown: close connections, cancel tasks, stop HTTP servers."""
         ...
 
+    async def start_realtime(self) -> None:
+        """Begin delivering live inbound events, if this connector has a
+        separate "start receiving" phase from `connect()`.
+
+        docs/design/on-the-fly-watchers.md, "Startup ordering: root-cause
+        design review" — `SessionManager.run_once()` calls this AFTER
+        `sync_watchers()` has fully finished, specifically so that a
+        connector whose realtime transport can deliver an event for a room
+        with no local watcher state yet (Mattermost's websocket; see
+        `register_lazy_creation_hook()` above) cannot do so before that
+        state exists. Splitting `connect()` (authenticate, resolve
+        identity) from this method (open the firehose) removes the startup
+        race entirely, rather than requiring `WatcherLifecycle` to
+        serialize against it — see the design doc for why a uniform
+        two-phase `connect()` contract was rejected for connectors whose
+        transport requires an explicit per-room subscribe over an
+        already-open connection (RocketChat's DDP) instead.
+
+        The default implementation is a no-op: connectors that already
+        deliver events only from within `connect()` itself (RocketChat,
+        Script, Voice — none of which call `register_lazy_creation_hook()`
+        today) need not override this at all; `connect()` doing everything
+        it already does is correct for them.
+        """
+
     # ── Inbound — Observer pattern ───────────────────────────────────────────
 
     @abstractmethod
