@@ -187,6 +187,11 @@ class Connector(ABC):
         Script connector    : no-op.
 
         Must be called once before the Connector can receive or send messages.
+        For a connector that overrides `start_realtime()` (see below), the
+        transport is already open and receiving after `connect()` returns —
+        what's held back until `start_realtime()` is *delivery* of those
+        events to the registered handler, not the connection itself, so
+        nothing posted in between is lost.
         """
         ...
 
@@ -196,22 +201,30 @@ class Connector(ABC):
         ...
 
     async def start_realtime(self) -> None:
-        """Begin delivering live inbound events, if this connector has a
-        separate "start receiving" phase from `connect()`.
+        """Lift the hold on delivering already-received inbound events to
+        the registered handler, if this connector buffers rather than
+        delivers between `connect()` and this call.
 
         docs/design/on-the-fly-watchers.md, "Startup ordering: root-cause
-        design review" — `SessionManager.run_once()` calls this AFTER
-        `sync_watchers()` has fully finished, specifically so that a
-        connector whose realtime transport can deliver an event for a room
-        with no local watcher state yet (Mattermost's websocket; see
-        `register_lazy_creation_hook()` above) cannot do so before that
-        state exists. Splitting `connect()` (authenticate, resolve
-        identity) from this method (open the firehose) removes the startup
-        race entirely, rather than requiring `WatcherLifecycle` to
-        serialize against it — see the design doc for why a uniform
-        two-phase `connect()` contract was rejected for connectors whose
-        transport requires an explicit per-room subscribe over an
-        already-open connection (RocketChat's DDP) instead.
+        design review" (corrected design, second pass) — `SessionManager.
+        run_once()` calls this AFTER `sync_watchers()` has fully finished,
+        specifically so that a connector whose realtime transport can
+        receive an event for a room with no local watcher state yet
+        (Mattermost's websocket; see `register_lazy_creation_hook()` above)
+        never hands that event to `try_lazy_create()`/the dispatcher before
+        that state exists.
+
+        The first implementation of this method (PR #80) instead delayed
+        *opening the transport itself* until this call — that removed the
+        race but silently turned every event posted during `sync_watchers()`
+        into a permanent, unrecoverable loss (nothing analogous to
+        reconnect-replay runs on an initial connection). The corrected
+        design keeps the transport opening inside `connect()` as before, and
+        buffers at the existing per-channel queue instead: events are
+        received and queued starting at `connect()`, `start_realtime()` only
+        opens the gate that lets each channel's worker start draining its
+        queue into the handler. Nothing posted before this call is lost —
+        only delayed.
 
         The default implementation is a no-op: connectors that already
         deliver events only from within `connect()` itself (RocketChat,

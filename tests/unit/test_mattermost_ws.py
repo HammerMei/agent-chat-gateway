@@ -23,7 +23,13 @@ from gateway.connectors.mattermost.websocket import MattermostWebSocketClient
 
 
 def _make_ws(token: str | None = "tok") -> MattermostWebSocketClient:
-    return MattermostWebSocketClient("https://mm.example.com", token_provider=lambda: token)
+    """Dispatch gate is closed by default on a real client (PR #80 review,
+    Finding A fix) — opened here so tests that only care about dispatch/
+    ordering mechanics, not the gate itself, keep their old pre-gate
+    behavior. See TestDispatchGate below for gate-specific coverage."""
+    ws = MattermostWebSocketClient("https://mm.example.com", token_provider=lambda: token)
+    ws.open_dispatch_gate()
+    return ws
 
 
 def _raw_posted_event(post: dict, mentions: list[str] | None = None) -> dict:
@@ -192,6 +198,86 @@ class TestDispatch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, ["p0", "p1"])  # worker survives the exception
 
         await ws.stop()
+
+
+# ── dispatch gate (PR #80 review, Finding A fix) ───────────────────────────────
+
+
+class TestDispatchGate(unittest.IsolatedAsyncioTestCase):
+    """`_dispatch()` always queues immediately regardless of gate state — the
+    gate only holds back the WORKER's drain loop, so nothing posted before
+    open_dispatch_gate() is lost, only delayed."""
+
+    async def test_events_are_queued_but_not_delivered_before_gate_opens(self):
+        ws = MattermostWebSocketClient("https://mm.example.com", token_provider=lambda: "tok")
+        received = []
+
+        async def handler(decoded):
+            received.append(decoded)
+
+        ws.register_handler(handler)
+        decoded = {"post": {"channel_id": "chan1", "id": "p1"}, "mentions": []}
+
+        await ws._dispatch(decoded)
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(received, [])  # buffered, not delivered
+        self.assertEqual(ws._channel_queues["chan1"].qsize(), 1)
+
+        await ws.stop()
+
+    async def test_buffered_events_are_delivered_in_order_once_gate_opens(self):
+        ws = MattermostWebSocketClient("https://mm.example.com", token_provider=lambda: "tok")
+        received = []
+
+        async def handler(decoded):
+            received.append(decoded["post"]["id"])
+
+        ws.register_handler(handler)
+        for i in range(3):
+            await ws._dispatch({"post": {"channel_id": "chan1", "id": f"p{i}"}, "mentions": []})
+        await asyncio.sleep(0.05)
+        self.assertEqual(received, [])  # still buffered
+
+        ws.open_dispatch_gate()
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(received, ["p0", "p1", "p2"])
+
+        await ws.stop()
+
+    async def test_gate_open_is_idempotent_and_affects_later_channels_too(self):
+        """A channel whose first event arrives AFTER the gate is already open
+        must not re-buffer — the gate has no "close" once opened."""
+        ws = MattermostWebSocketClient("https://mm.example.com", token_provider=lambda: "tok")
+        received = []
+
+        async def handler(decoded):
+            received.append(decoded["post"]["id"])
+
+        ws.register_handler(handler)
+        ws.open_dispatch_gate()
+        ws.open_dispatch_gate()  # idempotent
+
+        await ws._dispatch({"post": {"channel_id": "chan-new", "id": "p1"}, "mentions": []})
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(received, ["p1"])
+
+        await ws.stop()
+
+    async def test_stop_cancels_a_worker_still_parked_on_a_closed_gate(self):
+        """A worker waiting on the gate must be cancellable cleanly by
+        stop() — e.g. shutdown before start_realtime() ever runs."""
+        ws = MattermostWebSocketClient("https://mm.example.com", token_provider=lambda: "tok")
+        ws.register_handler(AsyncMock())
+
+        await ws._dispatch({"post": {"channel_id": "chan1", "id": "p1"}, "mentions": []})
+        await asyncio.sleep(0.05)
+
+        await ws.stop()  # must not hang or raise
+
+        self.assertEqual(ws._channel_workers, {})
 
 
 # ── send_typing ───────────────────────────────────────────────────────────────

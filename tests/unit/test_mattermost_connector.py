@@ -152,7 +152,11 @@ class TestComputeToField(unittest.TestCase):
 
 
 class TestConnectStartRealtimeSplit(unittest.IsolatedAsyncioTestCase):
-    async def test_connect_does_rest_auth_but_not_open_the_websocket(self):
+    """Corrected design (PR #80 review, Finding A fix): connect() opens the
+    WebSocket itself so nothing is lost at the transport layer; start_realtime()
+    only opens the dispatch gate that lets buffered events reach the handler."""
+
+    async def test_connect_does_rest_auth_and_opens_the_websocket(self):
         connector = _make_connector()
         connector._rest.authenticate = AsyncMock()
         connector._rest.get_me = AsyncMock()
@@ -165,13 +169,13 @@ class TestConnectStartRealtimeSplit(unittest.IsolatedAsyncioTestCase):
         connector._rest.authenticate.assert_awaited_once()
         connector._rest.get_me.assert_awaited_once()
         connector._rest.resolve_team.assert_awaited_once_with(connector._config.team)
-        connector._ws.connect.assert_not_called()
-        connector._ws.start.assert_not_called()
+        connector._ws.connect.assert_awaited_once()
+        connector._ws.start.assert_awaited_once()
 
-    async def test_connect_registers_ws_callbacks_without_opening_it(self):
+    async def test_connect_registers_ws_callbacks(self):
         """Registering the handler/reconnect callback is local bookkeeping,
-        not a wire call — safe to do in connect(), before the socket
-        exists, per MattermostWebSocketClient.register_handler()'s own
+        not a wire call — safe to do in connect() alongside opening the
+        socket, per MattermostWebSocketClient.register_handler()'s own
         contract (just stores the callable)."""
         connector = _make_connector()
         connector._rest.authenticate = AsyncMock()
@@ -185,21 +189,22 @@ class TestConnectStartRealtimeSplit(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(connector._ws._handler, connector._on_posted_event)
         self.assertEqual(connector._ws._on_reconnect_cb, connector._on_ws_reconnect)
 
-    async def test_start_realtime_opens_the_websocket(self):
+    async def test_start_realtime_opens_the_dispatch_gate_without_reopening_the_socket(self):
         connector = _make_connector()
         connector._ws.connect = AsyncMock()
         connector._ws.start = AsyncMock()
+        connector._ws.open_dispatch_gate = MagicMock()
 
         await connector.start_realtime()
 
-        connector._ws.connect.assert_awaited_once()
-        connector._ws.start.assert_awaited_once()
+        connector._ws.open_dispatch_gate.assert_called_once()
+        connector._ws.connect.assert_not_called()
+        connector._ws.start.assert_not_called()
 
     async def test_start_realtime_does_not_repeat_rest_auth(self):
         connector = _make_connector()
         connector._rest.authenticate = AsyncMock()
-        connector._ws.connect = AsyncMock()
-        connector._ws.start = AsyncMock()
+        connector._ws.open_dispatch_gate = MagicMock()
 
         await connector.start_realtime()
 

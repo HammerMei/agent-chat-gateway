@@ -998,6 +998,103 @@ gap). #25/#28 are untouched, per the framing above.
   `sync_watchers()`, verified via real call-order tracking, not just
   individual `assert_called` checks).
 
+### PR #80 review round (2026-08-07) — Finding A is a genuine regression in the design above, corrected
+
+GPT/Codex review on PR #80 itself (the branch implementing option C above)
+found two issues. Both were verified against actual code before being
+accepted, per the standing rule for every round in this document — and this
+one is worth being unusually explicit about, because the finding is against
+a design that had already been through advisor consultation and a three-
+option comparison, not against a quick patch.
+
+- **Finding A (P1) — confirmed real, and it falsifies the "removes the
+  window entirely" framing above.** Moving `_ws.connect()`/`_ws.start()`
+  into `start_realtime()` means the socket simply isn't open for the
+  entire `sync_watchers()` duration. Any message posted during that window
+  isn't merely deferred — it's **gone**: `MattermostWebSocketClient`'s
+  reconnect-triggered history replay (`_on_reconnect_cb`, driving
+  `_on_ws_reconnect()`'s REST catch-up) is wired to fire only from
+  `_reconnect()`, itself reachable only from `_listen_loop`'s
+  post-`ConnectionClosed` exception path — confirmed by grep to never run
+  on an initial `start()`. So option C did not remove the "drop vs. delay"
+  tradeoff that option B was criticized for above (see "The websocket is
+  still live and dispatching during the gap..." under option B) — it
+  silently resolved that tradeoff as "drop," and with a **wider** blast
+  radius than the narrower, previously-accepted case this feature already
+  lived with (a static watcher whose `subscribe_room()` hadn't run yet):
+  now *every* channel, for the *entire* `sync_watchers()` duration, loses
+  messages with zero recovery path. This is worse than option B, which at
+  least made an explicit, bounded "delay" choice. **The "Options
+  considered" section above is left unedited on purpose** (history, not
+  corrected in place) — this section is the correction.
+- **Finding B (P2) — confirmed real, secondary.** `MattermostConnector`'s
+  class docstring usage example, and the base `Connector.connect()` ABC
+  docstring's "Must be called once before the Connector can receive or
+  send messages," both stopped being true the moment `connect()` no longer
+  opened the socket. `SessionManager.run_once()` is the only current call
+  site, so this wasn't a live bug, but it's a real contract inconsistency.
+
+**Corrected design: gate delivery, not the connection.** The fix is not a
+fourth option — it's a repair to option C that keeps its shape (same
+`start_realtime()` method, same call position in `run_once()`, same
+ordering test) while removing the data loss:
+
+- `MattermostConnector.connect()` goes back to opening the websocket
+  (`await self._ws.connect()` / `await self._ws.start()`), same as before
+  option C ever existed. Nothing is lost at the transport layer from this
+  point on.
+- `MattermostWebSocketClient` already buffers: `_dispatch()` puts every
+  decoded event on a per-channel `asyncio.Queue` (bounded, depth 50,
+  overflow logged rather than silently dropped) the instant it arrives,
+  regardless of anything downstream. The only thing that needed delaying
+  was *draining* those queues, not receiving into them. Added a single
+  `asyncio.Event` (`_dispatch_gate`, closed by default) that each
+  `_channel_worker` now awaits once, at entry, before its drain loop —
+  events queue up normally while it's closed, and once
+  `open_dispatch_gate()` is called, every worker (already-running or
+  spun up later) drains and delivers in the original arrival order.
+- `MattermostConnector.start_realtime()` now just calls
+  `self._ws.open_dispatch_gate()` — no socket I/O. `SessionManager
+  .run_once()`'s call order (`connect()` → `sync_watchers()` →
+  `start_realtime()`) is **unchanged**, so `try_lazy_create()` still never
+  sees an event before local state is ready (Finding A doesn't reopen
+  #24/#27) — it's just that "not yet delivered" now means "queued," not
+  "never received."
+- Finding B fixed by updating both docstrings (base `Connector.connect()`
+  and `MattermostConnector`'s class example) to describe the corrected
+  two-phase contract accurately: `connect()` opens the transport and
+  begins queuing; `start_realtime()` is what makes queued/incoming events
+  actually reach the handler. The class usage example now calls
+  `start_realtime()` explicitly for direct (non-`run_once()`) callers.
+- One trade-off worth naming honestly: the dispatch gate is
+  **closed-by-default with no matching close operation** (opens once,
+  stays open). A direct caller that calls `connect()` but never calls
+  `start_realtime()` now receives nothing, ever — same failure mode
+  Finding B originally flagged, just moved from "socket never opens" to
+  "gate never opens." This was a deliberate choice (fail-safe over
+  fail-open, since `run_once()` — the only production caller — is a
+  security-relevant gate for `_blocked_agents`), not an oversight; the
+  docstring fix above is what makes the requirement discoverable instead
+  of silent.
+- Verified, not assumed: `MattermostWebSocketClient.stop()` already
+  cancels every task in `_channel_workers` unconditionally, so a worker
+  parked on a still-closed gate (e.g. shutdown ordered before
+  `start_realtime()` ever runs) is cancelled cleanly, not left hanging —
+  covered by a new regression test.
+- Tests: `tests/unit/test_mattermost_ws.py`'s new `TestDispatchGate` class
+  (events queue but don't deliver before the gate opens; buffered events
+  deliver in order once it does; the gate has no "close" once opened; a
+  worker parked on a closed gate is cancelled cleanly by `stop()`);
+  `TestConnectStartRealtimeSplit` in `test_mattermost_connector.py`
+  rewritten for the corrected split (`connect()` opens the socket;
+  `start_realtime()` only opens the gate).
+
+**Rollout note updated accordingly**: the live low-traffic startup-cycle
+observation called for in "Process notes" above should now also confirm
+that a message posted right at startup (during `sync_watchers()`) is
+delivered once ready, not merely that no error is logged — the previous
+design would not have failed loudly, it would have failed silently.
+
 ## Idle-expiry / auto-remove
 
 - Track `last_processed_ts` (already exists) per watcher; compare against
