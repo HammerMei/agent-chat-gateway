@@ -121,18 +121,19 @@ class SessionManager:
         await self._connector.connect()
         errors = await self._lifecycle.sync_watchers(unavailable_agents=unavailable_agents)
         # docs/design/on-the-fly-watchers.md, "Startup ordering: root-cause
-        # design review" — connect() (REST auth only, for connectors that
-        # override start_realtime()) and sync_watchers() (populate
-        # self._states/self._blocked_agents/local channel subscriptions)
-        # both complete BEFORE any connector starts delivering live events.
-        # For Mattermost specifically, this means the WebSocket — the one
-        # transport that can call try_lazy_create() for a room with no
-        # local state — isn't even open yet during the entire window a
-        # startup-ordering bug could previously bite (PR #79 review,
-        # tenth/eleventh rounds, findings #24/#27). Connectors that don't
-        # override start_realtime() (RocketChat, Script, Voice — none call
-        # register_lazy_creation_hook()) already did everything they need
-        # inside connect(), so this is a no-op for them.
+        # design review" (corrected design, second pass, PR #80 review) —
+        # sync_watchers() (populate self._states/self._blocked_agents/local
+        # channel subscriptions) fully completes BEFORE any connector
+        # DELIVERS a live event to the dispatcher, so no room with
+        # incomplete local state can ever reach try_lazy_create() (PR #79
+        # review, tenth/eleventh rounds, findings #24/#27). For Mattermost
+        # specifically, the WebSocket is already open and queuing events
+        # from inside connect() — nothing is lost — but start_realtime()
+        # is what lets those queued events actually reach the handler.
+        # Connectors that don't override start_realtime() (RocketChat,
+        # Script, Voice — none call register_lazy_creation_hook()) already
+        # did everything they need inside connect(), so this is a no-op
+        # for them.
         await self._connector.start_realtime()
         logger.info("SessionManager ready (run_once)")
         return errors

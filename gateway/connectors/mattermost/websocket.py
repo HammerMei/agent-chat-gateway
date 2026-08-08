@@ -79,6 +79,16 @@ class MattermostWebSocketClient:
         # Registered by the connector to replay messages missed during the
         # outage via REST history.
         self._on_reconnect_cb: Callable[[], Any] | None = None
+        # Closed by default (docs/design/on-the-fly-watchers.md, "Startup
+        # ordering" section, corrected design). The socket connects and
+        # _dispatch() queues every event as soon as it arrives — nothing is
+        # lost at the transport layer — but each channel's _channel_worker
+        # holds off DRAINING its queue until this gate opens, so events that
+        # arrive while the caller is still finishing startup (e.g.
+        # SessionManager.sync_watchers()) are buffered, not discarded, and
+        # are only handed to try_lazy_create()/the dispatcher once local
+        # state is actually ready. open_dispatch_gate() opens it permanently.
+        self._dispatch_gate = asyncio.Event()
 
     def register_handler(self, handler: PostedEventHandler) -> None:
         """Register the single callback invoked for every decoded `posted` event."""
@@ -94,6 +104,13 @@ class MattermostWebSocketClient:
 
     def set_reconnect_callback(self, cb: Callable[[], Any]) -> None:
         self._on_reconnect_cb = cb
+
+    def open_dispatch_gate(self) -> None:
+        """Allow buffered/incoming events to actually be handed to the
+        registered handler. Idempotent; once open it stays open for the
+        lifetime of this client (there is no matching close — a later
+        reconnect is not a fresh startup and must not re-buffer)."""
+        self._dispatch_gate.set()
 
     async def connect(self) -> None:
         """Connect and perform the authentication_challenge handshake.
@@ -215,8 +232,14 @@ class MattermostWebSocketClient:
             )
 
     async def _channel_worker(self, channel_id: str, queue: asyncio.Queue) -> None:
-        """Process one channel's events in order, bounded by the global semaphore."""
+        """Process one channel's events in order, bounded by the global semaphore.
+
+        Waits for the dispatch gate before draining anything — events that
+        arrive first are queued by _dispatch() regardless, so nothing posted
+        before the gate opens is lost, only delayed (see open_dispatch_gate()).
+        """
         try:
+            await self._dispatch_gate.wait()
             while True:
                 decoded = await queue.get()
                 async with self._callback_sem:

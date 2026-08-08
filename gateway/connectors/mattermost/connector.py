@@ -91,6 +91,12 @@ class MattermostConnector(Connector):
         room = await connector.resolve_room("town-square")
         await connector.subscribe_room(room, watcher_id="abc123")
 
+        # start_realtime() opens the dispatch gate — required even though
+        # connect() already opened the WebSocket, so that events posted
+        # between connect() and here are buffered rather than delivered
+        # against not-yet-finished setup. See connect()'s docstring.
+        await connector.start_realtime()
+
         # ... messages arrive, handler is called ...
 
         await connector.disconnect()
@@ -135,14 +141,18 @@ class MattermostConnector(Connector):
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
     async def connect(self) -> None:
-        """Authenticate and resolve identity + team via REST.
+        """Authenticate via REST, then open the WebSocket and start listening.
 
-        Deliberately does NOT open the WebSocket — see `start_realtime()`
-        (docs/design/on-the-fly-watchers.md, "Startup ordering: root-cause
-        design review"). `SessionManager.run_once()` calls `sync_watchers()`
-        between this method and `start_realtime()`, so no `posted` event
-        can arrive for a room with incomplete local state (dynamic-watcher
-        state, blocked-agents set) — the firehose simply isn't open yet.
+        The socket opens here (not in `start_realtime()`) so no `posted`
+        event is ever lost at the transport layer — see
+        docs/design/on-the-fly-watchers.md, "Startup ordering: root-cause
+        design review", corrected design. Events that arrive before
+        `start_realtime()` runs are still queued by
+        `MattermostWebSocketClient._dispatch()`; only their delivery to the
+        registered handler is held back (see `start_realtime()`), so a room
+        with incomplete local state (dynamic-watcher state, blocked-agents
+        set) never has `try_lazy_create()`/the dispatcher invoked against it,
+        while nothing posted in the meantime is discarded.
         """
         await self._rest.authenticate()
         # Mandatory regardless of auth mode: PAT mode has no login response to
@@ -150,32 +160,34 @@ class MattermostConnector(Connector):
         await self._rest.get_me()
         await self._rest.resolve_team(self._config.team)
 
-        # Registering the handler/reconnect callback here (not in
-        # start_realtime()) is safe and deliberate: these are local
-        # callback registrations only, not wire-protocol calls — nothing
-        # can fire them before the WebSocket is actually opened below in
-        # start_realtime().
         self._ws.register_handler(self._on_posted_event)
         self._ws.set_reconnect_callback(self._on_ws_reconnect)
+        await self._ws.connect()
+        await self._ws.start()
         logger.info(
-            "MattermostConnector authenticated to %s as %s (team=%s)",
+            "MattermostConnector connected to %s as %s (team=%s)",
             self._config.server_url,
             self._rest.bot_username,
             self._config.team,
         )
 
     async def start_realtime(self) -> None:
-        """Open the WebSocket and start the listen loop.
+        """Open the dispatch gate so buffered/incoming events start reaching
+        the registered handler.
 
-        Split from `connect()` so the caller (`SessionManager.run_once()`)
-        can run `sync_watchers()` first — see `connect()`'s docstring and
-        the design doc. Safe to call only after `connect()` has completed
-        (needs `self._rest`'s token for the websocket auth handshake).
+        The WebSocket is already open (see `connect()`) and has been
+        queueing every event since then — this only lifts the hold on
+        draining those queues. Called by `SessionManager.run_once()` after
+        `sync_watchers()` completes, so `try_lazy_create()` and the message
+        dispatcher never see an event before local state (dynamic-watcher
+        state, blocked-agents set) is ready — see `connect()`'s docstring
+        and the design doc. For direct callers that skip `run_once()` (see
+        this class's usage example above), call this right after `connect()`
+        to get the original single-phase behavior.
         """
-        await self._ws.connect()
-        await self._ws.start()
+        self._ws.open_dispatch_gate()
         logger.info(
-            "MattermostConnector realtime listener started (%s)",
+            "MattermostConnector realtime dispatch enabled (%s)",
             self._config.server_url,
         )
 
