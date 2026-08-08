@@ -19,7 +19,7 @@ import json
 import unittest
 from unittest.mock import AsyncMock
 
-from gateway.connectors.mattermost.websocket import MattermostWebSocketClient
+from gateway.connectors.mattermost.websocket import _CHANNEL_QUEUE_DEPTH, MattermostWebSocketClient
 
 
 def _make_ws(token: str | None = "tok") -> MattermostWebSocketClient:
@@ -263,6 +263,66 @@ class TestDispatchGate(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.05)
 
         self.assertEqual(received, ["p1"])
+
+        await ws.stop()
+
+    async def test_more_than_queue_depth_events_survive_a_closed_gate(self):
+        """PR #80 review, Finding C: the queue used to be bounded at
+        _CHANNEL_QUEUE_DEPTH even while the gate was closed, so the 51st+
+        event in one channel during sync_watchers() hit QueueFull and was
+        silently dropped. The queue is now unbounded while the gate is
+        closed — nothing above the old depth limit should be lost."""
+        ws = MattermostWebSocketClient("https://mm.example.com", token_provider=lambda: "tok")
+        received = []
+
+        async def handler(decoded):
+            received.append(decoded["post"]["id"])
+
+        ws.register_handler(handler)
+        total = _CHANNEL_QUEUE_DEPTH + 20
+        for i in range(total):
+            await ws._dispatch({"post": {"channel_id": "chan1", "id": f"p{i}"}, "mentions": []})
+        await asyncio.sleep(0.05)
+        self.assertEqual(received, [])  # still buffered, gate not open yet
+
+        ws.open_dispatch_gate()
+        await asyncio.sleep(0.1)
+
+        self.assertEqual(received, [f"p{i}" for i in range(total)])
+
+        await ws.stop()
+
+    async def test_queue_still_drops_on_overflow_once_gate_is_open(self):
+        """The pre-#80 drop-on-overflow behavior must be unchanged once the
+        gate is open and a worker is actually draining but has fallen
+        behind (e.g. stuck on a slow/hung handler invocation)."""
+        ws = MattermostWebSocketClient("https://mm.example.com", token_provider=lambda: "tok")
+        ws.open_dispatch_gate()
+        release = asyncio.Event()
+        received = []
+
+        async def handler(decoded):
+            if decoded["post"]["id"] == "p0":
+                await release.wait()  # park the worker mid-handler
+            received.append(decoded["post"]["id"])
+
+        ws.register_handler(handler)
+        # p0 is picked up immediately and parks the worker; the next
+        # _CHANNEL_QUEUE_DEPTH events fill the queue exactly to depth.
+        await ws._dispatch({"post": {"channel_id": "chan1", "id": "p0"}, "mentions": []})
+        await asyncio.sleep(0.02)  # let the worker pick up p0 and park
+        for i in range(_CHANNEL_QUEUE_DEPTH):
+            await ws._dispatch({"post": {"channel_id": "chan1", "id": f"q{i}"}, "mentions": []})
+
+        # One more should now overflow and be dropped, not queued.
+        await ws._dispatch({"post": {"channel_id": "chan1", "id": "overflow"}, "mentions": []})
+        self.assertEqual(ws._channel_queues["chan1"].qsize(), _CHANNEL_QUEUE_DEPTH)
+
+        release.set()
+        await asyncio.sleep(0.05)
+
+        self.assertNotIn("overflow", received)
+        self.assertEqual(len(received), 1 + _CHANNEL_QUEUE_DEPTH)  # p0 + the queued q*
 
         await ws.stop()
 
