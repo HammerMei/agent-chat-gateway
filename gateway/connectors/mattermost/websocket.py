@@ -41,8 +41,13 @@ logger = logging.getLogger("agent-chat-gateway.connectors.mattermost.ws")
 # Bound concurrent per-channel worker tasks, same rationale as RC's
 # _callback_sem: caps total in-flight handler invocations across all channels.
 _CALLBACK_CONCURRENCY = 20
-# Per-channel bounded queue depth — same backpressure model as RC, just
-# without the wire-protocol subscription it's normally paired with.
+# Per-channel backpressure depth, enforced manually at dispatch time (see
+# _dispatch()) rather than via asyncio.Queue(maxsize=...) — same backpressure
+# model as RC once the dispatch gate is open, just without the wire-protocol
+# subscription it's normally paired with. The queue itself is unbounded so
+# that a closed gate (buffering during startup — see _dispatch_gate) can
+# never silently drop events; this depth only caps steady-state growth
+# against a genuinely stuck handler once delivery has actually started.
 _CHANNEL_QUEUE_DEPTH = 50
 
 PostedEventHandler = Callable[[dict[str, Any]], Awaitable[None]]
@@ -213,23 +218,45 @@ class MattermostWebSocketClient:
         }
 
     async def _dispatch(self, decoded: dict[str, Any]) -> None:
-        """Route a decoded posted-event to the per-channel ordering queue."""
+        """Route a decoded posted-event to the per-channel ordering queue.
+
+        The queue itself is unbounded (PR #80 review, Finding C): while the
+        dispatch gate is closed, no `_channel_worker` is draining, so a
+        `maxsize`-bounded queue would hit `QueueFull` on the 51st event in
+        one channel during `sync_watchers()` and silently drop everything
+        after it — recreating the exact data-loss bug Finding A already
+        fixed, just with a higher threshold. Capacity is instead enforced
+        manually, and only once the gate is open: at that point a worker is
+        guaranteed to be actively draining, so `qsize() >= _CHANNEL_QUEUE_DEPTH`
+        means the same thing `asyncio.Queue(maxsize=...).put_nowait()` used
+        to (a handler that's fallen behind / stuck), and gets the same
+        drop-with-a-warning treatment as before.
+
+        Accepted tradeoff, written down on purpose rather than left
+        implicit: between the gate closing and opening, one channel's queue
+        can grow to (inbound rate × sync_watchers() duration) with no cap.
+        That window is bounded in TIME (it ends the moment sync_watchers()
+        returns) and by realistic human/agent chat pace, unlike the steady-
+        state case the depth cap protects against (a handler stuck
+        indefinitely) — same tradeoff already named for option B in the
+        design doc, accepted here for the same reason.
+        """
         channel_id = decoded["post"]["channel_id"]
         queue = self._channel_queues.get(channel_id)
         if queue is None:
-            queue = asyncio.Queue(maxsize=_CHANNEL_QUEUE_DEPTH)
+            queue = asyncio.Queue()  # unbounded — see capacity check below
             self._channel_queues[channel_id] = queue
             worker = asyncio.create_task(self._channel_worker(channel_id, queue))
             self._channel_workers[channel_id] = worker
             self._callback_tasks.add(worker)
             worker.add_done_callback(self._callback_tasks.discard)
-        try:
-            queue.put_nowait(decoded)
-        except asyncio.QueueFull:
+        if self._dispatch_gate.is_set() and queue.qsize() >= _CHANNEL_QUEUE_DEPTH:
             logger.warning(
                 "Channel %s inbound queue full (depth=%d) — dropping event",
                 channel_id, _CHANNEL_QUEUE_DEPTH,
             )
+            return
+        queue.put_nowait(decoded)
 
     async def _channel_worker(self, channel_id: str, queue: asyncio.Queue) -> None:
         """Process one channel's events in order, bounded by the global semaphore.

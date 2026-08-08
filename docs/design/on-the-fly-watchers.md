@@ -1095,6 +1095,81 @@ that a message posted right at startup (during `sync_watchers()`) is
 delivered once ready, not merely that no error is logged — the previous
 design would not have failed loudly, it would have failed silently.
 
+### PR #80 review, second round (2026-08-07/08) — Finding C: the same bug class a third time, now fixed at the actual root
+
+GPT/Codex review found one more issue on the corrected design directly
+above, confirmed real before accepting: **the per-channel queue used to
+buffer events while the gate is closed was still constructed with
+`asyncio.Queue(maxsize=_CHANNEL_QUEUE_DEPTH)` (depth 50).** With no worker
+draining it while the gate is closed, the 51st event posted to one channel
+during `sync_watchers()` hits `QueueFull`, and `_dispatch()`'s existing
+`except asyncio.QueueFull: logger.warning(...)` handler drops it — silently,
+and with the socket staying connected the whole time, so no reconnect-replay
+ever runs to recover it either. This is the *same* data-loss bug class as
+Finding A, just re-introduced by the fix for Finding A, with a higher
+threshold (50 events, not 0) instead of being closed. Per the reviewer's
+own framing: "the new gate reuses the existing 50-item bounded queue without
+draining it."
+
+The reviewer again suggested "replay from the restored watermark when
+opening the gate" as an alternative. **Rejected again, for the identical
+reason given for Finding A above**: a brand-new lazy-creatable room has no
+channel/watermark state to replay from, so this suggestion cannot cover the
+one case this entire feature exists to handle, no matter how many times it
+recurs as a suggestion.
+
+**Fix: make capacity manual and gate-aware, instead of relying on
+`asyncio.Queue`'s built-in `maxsize`.** The queue is now always constructed
+unbounded (`asyncio.Queue()`); `_dispatch()` checks
+`self._dispatch_gate.is_set() and queue.qsize() >= _CHANNEL_QUEUE_DEPTH`
+before enqueuing, and only drops-with-a-warning under that condition. While
+the gate is closed, capacity is never checked — nothing can be dropped for
+being "too much," matching the requirement that a closed gate must buffer
+losslessly. Once the gate is open, a worker is guaranteed to be actively
+draining, so the check is behaviorally identical to the pre-#80 semantics:
+both `asyncio.Queue(maxsize=N).put_nowait()` and
+`qsize() >= N` evaluated at call time reject exactly the same events.
+
+**Accepted tradeoff, written down rather than left implicit (the exact
+category of omission this section exists to close):** for the duration
+between the gate closing and opening, one channel's queue can grow to
+`(inbound rate) × (sync_watchers() duration)` with no cap at all. This
+window is bounded in *time* — it ends the instant `sync_watchers()`
+returns — and by realistic chat pace, unlike the steady-state case
+`_CHANNEL_QUEUE_DEPTH` protects against (a handler stuck indefinitely).
+This is the same memory-growth caveat already named against option B
+above, accepted here for the same reason: a bounded delay beats an
+unbounded, silent loss.
+
+**Process note, said plainly rather than glossed over:** this is the third
+data-loss finding in this same area, and the second one against a fix that
+had already been reviewed once. Neither of the last two findings (A, C)
+came from a design re-read — both came from an independent reviewer
+reading the actual shipped diff and asking "what happens to the events in
+between?" The lesson isn't "get one more review pass" in the abstract; it's
+that **for this specific change, the failure mode is silent** (nothing
+logs, nothing raises, no existing test fails) — so the bar for calling it
+done has to be a test that positively proves delivery under load, not the
+absence of an error. The regression tests added below are deliberately
+built around that: they assert what *does* arrive, not just that nothing
+crashes.
+
+- `gateway/connectors/mattermost/websocket.py`: `_CHANNEL_QUEUE_DEPTH`'s
+  comment corrected — it no longer describes an `asyncio.Queue`-enforced
+  bound; the queue is unbounded, the constant is a manually-checked
+  threshold applied only once the dispatch gate is open. `_dispatch()`'s
+  docstring documents the accepted unbounded-while-closed tradeoff inline.
+- Tests: `tests/unit/test_mattermost_ws.py` —
+  `test_more_than_queue_depth_events_survive_a_closed_gate` (posts
+  `_CHANNEL_QUEUE_DEPTH + 20` events to one channel with the gate closed,
+  then opens it, and asserts every single one is delivered in order — the
+  direct regression test for Finding C); `test_queue_still_drops_on_overflow_once_gate_is_open`
+  (gate already open, worker parked mid-handler, fills the queue to exactly
+  `_CHANNEL_QUEUE_DEPTH`, asserts the next event is dropped and never
+  delivered — pins the pre-#80 drop behavior at the `_dispatch()` level,
+  which no test did before this round, so a future change back to
+  unconditional unbounded queuing would be caught here).
+
 ## Idle-expiry / auto-remove
 
 - Track `last_processed_ts` (already exists) per watcher; compare against
