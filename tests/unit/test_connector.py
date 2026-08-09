@@ -709,7 +709,7 @@ class TestConnectDisconnect(unittest.IsolatedAsyncioTestCase):
 # ── Tests: delivery_mode / supports_attachments / register_capacity_check ─────
 
 
-class TestConnectorProperties(unittest.IsolatedAsyncioTestCase):
+class TestConnectorProperties(unittest.TestCase):
     """Simple property and registration methods — previously uncovered."""
 
     def test_delivery_mode_is_gateway(self):
@@ -727,16 +727,6 @@ class TestConnectorProperties(unittest.IsolatedAsyncioTestCase):
             return True
         connector.register_capacity_check(check)
         self.assertIs(connector._capacity_check, check)
-
-    async def test_start_realtime_default_is_a_safe_no_op(self):
-        """docs/design/on-the-fly-watchers.md, "Startup ordering: root-cause
-        design review" — RocketChatConnector doesn't override
-        start_realtime() (its connect() already does everything it needs,
-        and it never calls register_lazy_creation_hook()), so the base
-        Connector's default must be an awaitable no-op, not raise
-        NotImplementedError the way an unfinished contract might."""
-        connector = _make_connector()
-        await connector.start_realtime()  # must not raise
 
 
 # ── Tests: send_to_room (T3) ──────────────────────────────────────────────────

@@ -804,7 +804,25 @@ the tenth round's own finding #25:
     posture — a transient network blip during startup must not
     permanently discard a legitimate session.
 
-## Startup ordering: root-cause design review (2026-08-07, IMPLEMENTED on `feature/mm-startup-ordering`, branched off `feature/lazy-watcher-mm-creation`)
+## Startup ordering: root-cause design review (2026-08-07, REVERTED 2026-08-09 — see "Reverted" at the end of this section)
+
+**Read this first if you're new to this section**: everything below was
+built on the premise that #24/#27 (below) described a live, unclosed race
+that needed an architectural fix. That premise was wrong — both had
+already been closed by targeted fixes that shipped as part of PR #79
+itself, before this design review even started. The `start_realtime()` /
+dispatch-gate / two-queue mechanism this section designs, implements, and
+then repeatedly patches was prophylaxis against a *hypothetical* future
+instance of the same bug shape, not a fix for an open one — and that
+prophylaxis cost four real, confirmed data-loss bugs (Findings A/C/D/E)
+before the premise itself was checked. The mechanism has been fully
+reverted; nothing described in "Options considered" or "Implementation"
+below is live in the current code. Kept in full, not rewritten, as the
+record of how that conclusion was reached — see "Reverted" at the end for
+what actually ships and why. If you're deciding whether a *new* piece of
+`sync_watchers()`-owned state needs similar protection, read "Reverted"
+first, then verify against actual code whether it's already closed before
+reaching for a gate.
 
 Eleven review rounds in, a pattern was worth stepping back for instead of
 patching the next instance: **rounds ten and eleven found four findings
@@ -1269,6 +1287,108 @@ This is a scope question for 老哥, not a decision made unilaterally here.
   still passes and now specifically exercises the live queue's `maxsize`
   path (gate was already open before any dispatch in that test, so backlog
   is empty and irrelevant — confirmed by re-reading the test, not assumed).
+
+### PR #80 review, fourth round (2026-08-09) — Finding E, and the question that ended the mechanism instead of extending it again
+
+A fifth issue landed (Finding E, P1, on `_channel_worker`'s strict
+backlog-then-live draining order): with a large enough backlog, more than
+`_CHANNEL_QUEUE_DEPTH` live events can arrive while the worker is still
+occupied draining backlog, overflowing the live queue and dropping
+messages even when the handler is fast enough to keep up with live
+traffic — it's just sequentially blocked behind backlog by construction,
+not actually overloaded. Real, per the reviewer's framing: "the new
+separate live queue is still capped at 50 while these lines refuse to
+drain it until the entire backlog is gone."
+
+At this point 老哥 gave two explicit instructions that changed the shape
+of the response: (1) fix it in the *right layer*, not with a fifth patch
+to this one; (2) never again let "this would require updating many
+existing tests" be a reason to avoid the architecturally correct fix — and
+requested two independent advisor passes specifically so this wouldn't
+turn into another round of patching.
+
+**First advisor pass: moving the gate into `WatcherLifecycle.try_lazy_create()`
+was also wrong, and for a sharper reason than test-migration cost.**
+Any gate placed on the handler call path — transport-level or inside
+`try_lazy_create()` — inherits the same drop-vs-delay problem in different
+clothes, plus a new one specific to `try_lazy_create()`: `_channel_worker`
+holds `_callback_sem` (`_CALLBACK_CONCURRENCY = 20`, connector-wide) for
+the full duration of `await self._handler(...)`. Twenty channels parked
+awaiting a `WatcherLifecycle`-level gate during `sync_watchers()` would
+hold all twenty permits connector-wide, stalling delivery to *every*
+channel — including ones for static watchers that had already started
+successfully. Worse than anything Findings A/C/D/E produced. The
+generalizable test: **any fix that puts an `await` on the handler call
+path inherits drop-vs-delay and (if it shares the semaphore) can cascade
+connector-wide — regardless of which file the `asyncio.Event` lives in.**
+
+**Second advisor pass, prompted by asking "does this need a gate at all?"
+instead of "which layer should the gate live in": no gate is needed
+anywhere, because #24 and #27 were never actually open by the time this
+whole redesign began.** Verified directly against code, not assumed:
+
+- **#24** (`_states` cold during the startup window): `try_lazy_create()`
+  already has a disk-read fallback (added in PR #79's tenth round,
+  untouched by any of this) that reads `self._state_store.load()` directly
+  when in-memory `self._states` doesn't have an entry — explicitly
+  documented as authoritative "this early in the process's life," because
+  nothing has been mutated in memory that isn't already on disk. This
+  closes the dormant/renamed-watcher lookup case independent of whether
+  `sync_watchers()` has run yet.
+- More fundamentally: `self._watcher_configs` (which the *first*,
+  by-room collision check scans) is populated once at `WatcherLifecycle`
+  construction, directly from loaded config — **not** built up
+  progressively by `sync_watchers()`. A statically-configured room is
+  findable via `existing_for_room` at every point in the connector's
+  lifetime, including before `sync_watchers()` has reached it. If that
+  room's watcher hasn't started yet, the existing check
+  (`existing_for_room.name not in self._processors → return False`,
+  PR #79's fourth round) correctly refuses and the triggering message
+  drops — the same narrow, already-accepted "static watcher not yet
+  subscribed" case this whole feature always lived with, not a new
+  regression. Confirmed fail-safe, not corrupting: it refuses to act, it
+  doesn't act on wrong state.
+- **#27** (`_blocked_agents` empty during the startup window):
+  `seed_blocked_agents()` (PR #79's eleventh round, also untouched by any
+  of this) is the *first line* of `run_once()`, called before
+  `connector.connect()` — `_blocked_agents` is correctly populated before
+  the websocket can possibly open, independent of anything in this
+  section.
+
+**Conclusion: the entire `start_realtime()` / dispatch-gate / two-queue
+mechanism has been reverted.** `gateway/core/connector.py`,
+`gateway/connectors/mattermost/connector.py`,
+`gateway/connectors/mattermost/websocket.py`, `gateway/core/session_manager.py`,
+and their test files are back to exactly their state on
+`feature/lazy-watcher-mm-creation` (verified via
+`git diff origin/feature/lazy-watcher-mm-creation -- . ':!docs/*'` being
+empty before this revert commit). `gateway/core/watcher_lifecycle.py` and
+its tests were never touched by any of this — #24/#27's actual fixes were
+never part of this branch, confirmed by the same diff being empty against
+`watcher_lifecycle.py` for the whole lifetime of `feature/mm-startup-ordering`.
+PR #80 is reduced to a docs-only PR: this section, in full, as the record
+of how the conclusion was reached.
+
+**The lesson, stated precisely because a nearby-sounding one is already in
+memory and this is a different point:** the failure here was not
+"rejecting Option B over test-migration cost" (real, and worth its own
+correction, but secondary). It was that **the redesign was never
+necessary in the first place** — #24 and #27 were reframed from "these
+shipped fixes closed a real bug" into "a hypothetical future instance of
+this bug shape might exist," and four rounds were spent paying for that
+speculation before anyone checked whether the originally-motivating bug
+was still open. Next time a design review starts from "here's a bug class
+worth closing structurally," the first step is verifying the motivating
+instance is still open against current code — not just true when the
+finding was originally filed.
+
+- Finding E's thread: closed as "mechanism deleted, not patched" —
+  the reply states the WHY (solving a problem already solved one layer
+  up, not "we found a simpler approach") so a future reviewer doesn't
+  re-propose the same gate.
+- Tests: full unit + integration suite re-run after the revert to confirm
+  it's byte-for-byte equivalent to `feature/lazy-watcher-mm-creation`'s
+  own (already-green) test state, not just "still green" by coincidence.
 
 ## Idle-expiry / auto-remove
 
