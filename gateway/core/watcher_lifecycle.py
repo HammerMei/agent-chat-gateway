@@ -469,6 +469,42 @@ class WatcherLifecycle:
                 if state_for_room_id is not None:
                     existing_for_room = self.get_watcher_config(state_for_room_id.watcher_name)
                     if (
+                        existing_for_room is not None
+                        and state_for_room_id.dynamically_created
+                        and existing_for_room.room != room.name
+                    ):
+                        # PR #79 review: `existing_for_room` here is a
+                        # CACHED WatcherConfig from `_watcher_configs`,
+                        # already reconstructed earlier in this same
+                        # process (e.g. by a prior pause/resume/reset call
+                        # or an earlier try_lazy_create() for this room) —
+                        # NOT freshly built from the just-resolved `room`.
+                        # If the room was renamed AFTER that earlier
+                        # reconstruction, this cached config's `.room` is
+                        # now stale: the room-name check just above
+                        # (`wc.room == room.name`) already missed it for
+                        # that exact reason, which is how execution reached
+                        # this room-ID fallback branch at all. Left
+                        # unrefreshed, a later `resume`/`reset` on this
+                        # watcher would call `_start_watcher()` ->
+                        # `resolve_room(wc.room)` with the OLD name, which
+                        # no longer exists — resume/reset would fail until
+                        # a full gateway restart forces `_watcher_configs`
+                        # to be rebuilt from scratch. Gated on
+                        # `dynamically_created` so this can only ever touch
+                        # a lazily-created config, never an operator's
+                        # static one (whose `.room` is config.yaml's
+                        # explicit, intentional value, not a cache).
+                        logger.info(
+                            "try_lazy_create: room for dynamic watcher '%s' "
+                            "was renamed ('%s' -> '%s') since it was last "
+                            "reconstructed in this process — refreshing the "
+                            "cached config so a future resume/reset resolves "
+                            "the current name.",
+                            existing_for_room.name, existing_for_room.room, room.name,
+                        )
+                        existing_for_room.room = room.name
+                    if (
                         existing_for_room is None
                         and state_for_room_id.watcher_name != watcher_name
                     ):
@@ -1055,6 +1091,38 @@ class WatcherLifecycle:
             )
             state = None
 
+        # PR #79 review: a persisted session's agent may not match this
+        # watcher's CURRENT resolved agent — e.g. a wildcard rule's
+        # `agent:` was edited in config.yaml between restarts. Session IDs
+        # are backend-specific: handing an old Claude session ID to
+        # OpenCode (or vice versa) would either fail to resume or, worse,
+        # attach to an unrelated session that happens to share the ID
+        # format. Discarding the WHOLE state here (not just session_id) —
+        # same treatment as the room-id mismatch just above — is
+        # deliberate: reusing the old `context_injected=True` against a
+        # brand-new session on a different backend would skip re-injecting
+        # the identity header/durable context entirely, and this also
+        # means the history-handoff block below correctly fires again
+        # (created_new_session=True), same as any other fresh session.
+        # `state.agent == ""` (every state persisted before this field
+        # existed) is treated as "unknown — assume compatible" so this
+        # doesn't force-reset every already-running watcher's session on
+        # the first restart after this ships. Does not affect a pinned
+        # `wc.session_id` — that short-circuits inside _provision_session()
+        # before `state` is even consulted, by design; pinning a session ID
+        # is an explicit, static operator choice, not something that can
+        # silently drift the way a wildcard rule's `agent:` field can.
+        if state is not None and state.agent and state.agent != agent_name:
+            logger.warning(
+                "Watcher '%s': retained state's session was created under "
+                "agent '%s', but this watcher's active agent is now '%s' "
+                "— discarding it and starting a fresh session instead "
+                "(session IDs are backend-specific and cannot be safely "
+                "reused across agents).",
+                wc.name, state.agent, agent_name,
+            )
+            state = None
+
         # 2. Provision session
         session_id, created_new_session = await self._provision_session(
             wc, state, agent, agent_cfg
@@ -1078,6 +1146,11 @@ class WatcherLifecycle:
             # restart after all, defeating that fix for any dynamic
             # watcher that's ever been resumed/reset even once.
             dynamically_created=state.dynamically_created if state else False,
+            # Record which agent provisioned this session, regardless of
+            # whether `state` was retained or discarded above — this is
+            # what lets a FUTURE restart detect an agent change and
+            # discard the stale session in turn.
+            agent=agent_name,
         )
         self._states[wc.name] = ws
         self._maps.bind_session(session_id, room.id, self._connector)
@@ -1275,6 +1348,15 @@ class WatcherLifecycle:
           1. Explicit ``wc.session_id`` from config (pinned session).
           2. Persisted ``state.session_id`` from a previous run.
           3. Create a new session via the agent backend.
+
+        Agent/session compatibility is NOT re-checked here (PR #79 review)
+        — the caller (`_start_watcher()`) already discards `state` entirely
+        when `state.agent` doesn't match the watcher's current resolved
+        agent, before this method ever sees it. A pinned `wc.session_id`
+        (priority 1) is therefore never subject to that check at all — an
+        explicit, static config choice is the operator's responsibility to
+        keep consistent with `wc.agent`, unlike a wildcard rule's `agent:`,
+        which can silently drift between restarts.
         """
         if wc.session_id:
             return wc.session_id, False

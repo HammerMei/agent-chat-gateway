@@ -52,6 +52,14 @@ class WatcherState:
     # the very next startup save, defeating the "resume a dormant session"
     # behavior after exactly one restart.
     dynamically_created: bool = False
+    # Resolved agent name that provisioned `session_id` (PR #79 review).
+    # Session IDs are backend-specific — if a wildcard rule's `agent:`
+    # changes between restarts, a persisted session created under the OLD
+    # agent must not be handed to the NEW one. "" (the default, and what
+    # every state persisted before this field existed loads as) means
+    # "unknown — assume compatible" so this doesn't force-reset every
+    # already-running watcher's session the first restart after this ships.
+    agent: str = ""
 
 
 def ensure_runtime_dir() -> None:
@@ -85,6 +93,7 @@ def load_state(connector_name: str) -> list[WatcherState]:
                     paused=w.get("paused", False),
                     last_processed_ts=w.get("last_processed_ts", ""),
                     dynamically_created=w.get("dynamically_created", False),
+                    agent=w.get("agent", ""),
                 ))
             elif "watcher_id" in w:
                 # Legacy format — migrate best-effort using room_name as watcher_name

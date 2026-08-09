@@ -64,6 +64,40 @@ class TestStatePersistence(unittest.TestCase):
         self.assertFalse(loaded[0].paused)
         self.assertEqual(loaded[0].last_processed_ts, "2025-01-01T00:00:01.000Z")
 
+    def test_agent_field_round_trips(self):
+        """PR #79 review: the agent field (which agent provisioned
+        session_id) must survive a save/load cycle so a later restart can
+        detect a wildcard rule's agent having changed."""
+        from gateway.core.state import WatcherState, load_state, save_state
+
+        ws = WatcherState(
+            watcher_name="w1", session_id="s1", room_id="r1", agent="opencode",
+        )
+        save_state("rc", [ws])
+        loaded = load_state("rc")
+
+        self.assertEqual(loaded[0].agent, "opencode")
+
+    def test_agent_field_defaults_to_empty_string_for_pre_existing_state(self):
+        """A state file written before the agent field existed (no 'agent'
+        key at all) must load as agent="" ('unknown — assume compatible'),
+        not raise or default to something that would force-reset every
+        already-running watcher's session on the first restart after this
+        field shipped."""
+        from gateway.core.state import RUNTIME_DIR, load_state
+
+        state_file = RUNTIME_DIR / "state.rc.json"
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        state_file.write_text(json.dumps({
+            "watchers": [{
+                "watcher_name": "w1", "session_id": "s1", "room_id": "r1",
+            }],
+        }))
+
+        loaded = load_state("rc")
+
+        self.assertEqual(loaded[0].agent, "")
+
     def test_save_and_load_multiple_watchers(self):
         """Multiple watchers saved and loaded preserve all entries."""
         from gateway.core.state import load_state, save_state

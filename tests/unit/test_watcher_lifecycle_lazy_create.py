@@ -39,6 +39,7 @@ def _make_lifecycle(
     state_by_name=None,
     reserve_global_name=None,
     release_global_name=None,
+    extra_agents: dict | None = None,
 ):
     config = CoreConfig()
     room = resolved_room or Room(id="chan-1", name="general", type="channel")
@@ -73,7 +74,7 @@ def _make_lifecycle(
 
     lifecycle = WatcherLifecycle(
         connector=connector,
-        agents={"claude": agent},
+        agents={"claude": agent, **(extra_agents or {})},
         default_agent="claude",
         config=config,
         watcher_configs=[],
@@ -750,6 +751,37 @@ class TestTryLazyCreateRenamedRoomRespectsOwnership(unittest.IsolatedAsyncioTest
         self.assertFalse(result)
         self.assertIsNotNone(lifecycle.get_watcher_config("mm-home-old-name"))
 
+    async def test_renamed_room_refreshes_a_stale_already_cached_config(self):
+        """PR #79 review: unlike the two tests above (where the config had
+        NEVER been reconstructed before this call), this covers the config
+        already being cached in `_watcher_configs` from an EARLIER
+        reconstruction in this same process — e.g. a prior pause/resume
+        call — with the rename happening AFTER that. Left unrefreshed, a
+        later resume/reset would call resolve_room() with the stale old
+        name, which no longer exists on the platform."""
+        renamed_room = Room(id="chan-1", name="new-name", type="channel")
+        old_state = self._old_name_state(paused=True)
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=[_rule()],
+            resolved_room=renamed_room,
+            state_by_name={"mm-home-old-name": old_state},
+        )
+        lifecycle._states["mm-home-old-name"] = old_state
+        # Simulate an earlier reconstruction in this same process, BEFORE
+        # the rename happened — already appended to _watcher_configs with
+        # the room name as it was at that time.
+        stale_cached_wc = WatcherConfig(
+            name="mm-home-old-name", connector="mm-home", room="old-name", agent="claude",
+        )
+        lifecycle._watcher_configs.append(stale_cached_wc)
+
+        result = await lifecycle.try_lazy_create("chan-1")
+
+        self.assertFalse(result)  # still paused — refuse, don't auto-resume
+        refreshed = lifecycle.get_watcher_config("mm-home-old-name")
+        self.assertIs(refreshed, stale_cached_wc)  # refreshed in place, not replaced
+        self.assertEqual(refreshed.room, "new-name")
+
     async def test_renamed_room_found_via_disk_during_startup_window(self):
         """PR #79 review, tenth round, finding #24: SessionManager.run_once()
         starts the Mattermost websocket (connector.connect()) BEFORE
@@ -1288,6 +1320,93 @@ class TestStartWatcherDiscardsMismatchedRoomState(unittest.IsolatedAsyncioTestCa
             await lifecycle._start_watcher(wc, state_no_room_id)
 
         agent.create_session.assert_not_called()  # still resumed
+
+
+class TestStartWatcherDiscardsStateOnAgentMismatch(unittest.IsolatedAsyncioTestCase):
+    """PR #79 review: _start_watcher() must not reuse a persisted session
+    whose agent doesn't match this watcher's CURRENT resolved agent —
+    e.g. a wildcard rule's `agent:` was edited in config.yaml between
+    restarts. Session IDs are backend-specific; same treatment as the
+    room-id mismatch above (discard the WHOLE state, not just session_id,
+    so context_injected/dynamically_created also reset correctly)."""
+
+    async def test_mismatched_agent_discards_state_and_creates_fresh_session(self):
+        other_agent = AsyncMock()
+        other_agent.create_session = AsyncMock(return_value="new-sess-id")
+        other_agent.send = AsyncMock(return_value=MagicMock(is_error=False, text="ok"))
+        other_agent.ensure_durable_instructions = AsyncMock(return_value=None)
+        other_agent.delete_session = AsyncMock(return_value=True)
+
+        lifecycle, connector, claude_agent, state_store = _make_lifecycle(
+            rules=None, extra_agents={"opencode": other_agent},
+        )
+        connector.resolve_room = AsyncMock(
+            return_value=Room(id="chan-1", name="general", type="channel")
+        )
+        wc = WatcherConfig(name="dyn-1", connector="mm-home", room="general", agent="opencode")
+        stale_state = WatcherState(
+            watcher_name="dyn-1",
+            session_id="claude-session-id",
+            room_id="chan-1",  # room matches — only the agent differs
+            agent="claude",
+            context_injected=True,
+            dynamically_created=True,
+        )
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            await lifecycle._start_watcher(wc, stale_state)
+
+        other_agent.create_session.assert_awaited_once()  # fresh session on the NEW agent
+        claude_agent.create_session.assert_not_called()   # old agent never touched
+        ws = lifecycle._states["dyn-1"]
+        self.assertNotEqual(ws.session_id, "claude-session-id")
+        self.assertEqual(ws.agent, "opencode")
+        # context_injected must NOT carry over from the stale state — a
+        # brand-new session on a different backend needs its identity
+        # header/durable context injected again, confirmed by actually
+        # having run for this fresh session (not just left True by accident).
+        self.assertTrue(ws.context_injected)
+        other_agent.ensure_durable_instructions.assert_awaited_once()
+        self.assertFalse(ws.dynamically_created)  # discarded, not carried over
+
+    async def test_matching_agent_state_is_still_reused_normally(self):
+        lifecycle, connector, agent, state_store = _make_lifecycle(rules=None)
+        connector.resolve_room = AsyncMock(
+            return_value=Room(id="chan-1", name="general", type="channel")
+        )
+        wc = WatcherConfig(name="static-1", connector="mm-home", room="general", agent="claude")
+        matching_state = WatcherState(
+            watcher_name="static-1", session_id="old-sess-id", room_id="chan-1", agent="claude",
+        )
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            await lifecycle._start_watcher(wc, matching_state)
+
+        agent.create_session.assert_not_called()
+        self.assertEqual(lifecycle._states["static-1"].session_id, "old-sess-id")
+
+    async def test_empty_agent_on_state_is_not_treated_as_a_mismatch(self):
+        """A state persisted before the `agent` field existed (agent="")
+        must be treated as 'unknown — assume compatible', not force-reset
+        — otherwise every already-running watcher's session would be
+        discarded on the first restart after this field shipped."""
+        lifecycle, connector, agent, state_store = _make_lifecycle(rules=None)
+        connector.resolve_room = AsyncMock(
+            return_value=Room(id="chan-1", name="general", type="channel")
+        )
+        wc = WatcherConfig(name="static-1", connector="mm-home", room="general", agent="claude")
+        pre_existing_state = WatcherState(
+            watcher_name="static-1", session_id="old-sess-id", room_id="chan-1", agent="",
+        )
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            await lifecycle._start_watcher(wc, pre_existing_state)
+
+        agent.create_session.assert_not_called()  # still resumed, not reset
+        self.assertEqual(lifecycle._states["static-1"].session_id, "old-sess-id")
 
 
 if __name__ == "__main__":
