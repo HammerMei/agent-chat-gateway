@@ -111,30 +111,18 @@ class SessionManager:
             List of human-readable error strings for any watchers that failed.
         """
         # PR #79 review, eleventh round, finding #27: seed the fail-closed
-        # blocked-agents set BEFORE connect()/sync_watchers() — kept as
-        # defense-in-depth even now that start_realtime() (below) closes
-        # the startup race at its root; cheap, and correct regardless.
+        # blocked-agents set BEFORE the lazy-creation hook goes live and
+        # connect() starts the websocket listener — sync_watchers() below
+        # would otherwise be the first (and, until now, only) place that
+        # ever set it, leaving it empty for the entire connect()-to-
+        # sync_watchers() window during which a message could already
+        # trigger try_lazy_create().
         self._lifecycle.seed_blocked_agents(unavailable_agents)
         self._connector.register_handler(self._dispatcher.dispatch)
         self._connector.register_capacity_check(self._dispatcher.has_capacity)
         self._connector.register_lazy_creation_hook(self._lifecycle.try_lazy_create)
         await self._connector.connect()
         errors = await self._lifecycle.sync_watchers(unavailable_agents=unavailable_agents)
-        # docs/design/on-the-fly-watchers.md, "Startup ordering: root-cause
-        # design review" (corrected design, second pass, PR #80 review) —
-        # sync_watchers() (populate self._states/self._blocked_agents/local
-        # channel subscriptions) fully completes BEFORE any connector
-        # DELIVERS a live event to the dispatcher, so no room with
-        # incomplete local state can ever reach try_lazy_create() (PR #79
-        # review, tenth/eleventh rounds, findings #24/#27). For Mattermost
-        # specifically, the WebSocket is already open and queuing events
-        # from inside connect() — nothing is lost — but start_realtime()
-        # is what lets those queued events actually reach the handler.
-        # Connectors that don't override start_realtime() (RocketChat,
-        # Script, Voice — none call register_lazy_creation_hook()) already
-        # did everything they need inside connect(), so this is a no-op
-        # for them.
-        await self._connector.start_realtime()
         logger.info("SessionManager ready (run_once)")
         return errors
 

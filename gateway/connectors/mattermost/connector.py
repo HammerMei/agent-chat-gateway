@@ -91,12 +91,6 @@ class MattermostConnector(Connector):
         room = await connector.resolve_room("town-square")
         await connector.subscribe_room(room, watcher_id="abc123")
 
-        # start_realtime() opens the dispatch gate — required even though
-        # connect() already opened the WebSocket, so that events posted
-        # between connect() and here are buffered rather than delivered
-        # against not-yet-finished setup. See connect()'s docstring.
-        await connector.start_realtime()
-
         # ... messages arrive, handler is called ...
 
         await connector.disconnect()
@@ -141,19 +135,7 @@ class MattermostConnector(Connector):
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
     async def connect(self) -> None:
-        """Authenticate via REST, then open the WebSocket and start listening.
-
-        The socket opens here (not in `start_realtime()`) so no `posted`
-        event is ever lost at the transport layer — see
-        docs/design/on-the-fly-watchers.md, "Startup ordering: root-cause
-        design review", corrected design. Events that arrive before
-        `start_realtime()` runs are still queued by
-        `MattermostWebSocketClient._dispatch()`; only their delivery to the
-        registered handler is held back (see `start_realtime()`), so a room
-        with incomplete local state (dynamic-watcher state, blocked-agents
-        set) never has `try_lazy_create()`/the dispatcher invoked against it,
-        while nothing posted in the meantime is discarded.
-        """
+        """Authenticate, resolve identity + team, and open the WebSocket."""
         await self._rest.authenticate()
         # Mandatory regardless of auth mode: PAT mode has no login response to
         # pull an identity from, and the own-message filter needs bot_user_id.
@@ -169,26 +151,6 @@ class MattermostConnector(Connector):
             self._config.server_url,
             self._rest.bot_username,
             self._config.team,
-        )
-
-    async def start_realtime(self) -> None:
-        """Open the dispatch gate so buffered/incoming events start reaching
-        the registered handler.
-
-        The WebSocket is already open (see `connect()`) and has been
-        queueing every event since then — this only lifts the hold on
-        draining those queues. Called by `SessionManager.run_once()` after
-        `sync_watchers()` completes, so `try_lazy_create()` and the message
-        dispatcher never see an event before local state (dynamic-watcher
-        state, blocked-agents set) is ready — see `connect()`'s docstring
-        and the design doc. For direct callers that skip `run_once()` (see
-        this class's usage example above), call this right after `connect()`
-        to get the original single-phase behavior.
-        """
-        self._ws.open_dispatch_gate()
-        logger.info(
-            "MattermostConnector realtime dispatch enabled (%s)",
-            self._config.server_url,
         )
 
     async def disconnect(self) -> None:

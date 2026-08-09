@@ -187,11 +187,6 @@ class Connector(ABC):
         Script connector    : no-op.
 
         Must be called once before the Connector can receive or send messages.
-        For a connector that overrides `start_realtime()` (see below), the
-        transport is already open and receiving after `connect()` returns —
-        what's held back until `start_realtime()` is *delivery* of those
-        events to the registered handler, not the connection itself, so
-        nothing posted in between is lost.
         """
         ...
 
@@ -199,39 +194,6 @@ class Connector(ABC):
     async def disconnect(self) -> None:
         """Graceful shutdown: close connections, cancel tasks, stop HTTP servers."""
         ...
-
-    async def start_realtime(self) -> None:
-        """Lift the hold on delivering already-received inbound events to
-        the registered handler, if this connector buffers rather than
-        delivers between `connect()` and this call.
-
-        docs/design/on-the-fly-watchers.md, "Startup ordering: root-cause
-        design review" (corrected design, second pass) — `SessionManager.
-        run_once()` calls this AFTER `sync_watchers()` has fully finished,
-        specifically so that a connector whose realtime transport can
-        receive an event for a room with no local watcher state yet
-        (Mattermost's websocket; see `register_lazy_creation_hook()` above)
-        never hands that event to `try_lazy_create()`/the dispatcher before
-        that state exists.
-
-        The first implementation of this method (PR #80) instead delayed
-        *opening the transport itself* until this call — that removed the
-        race but silently turned every event posted during `sync_watchers()`
-        into a permanent, unrecoverable loss (nothing analogous to
-        reconnect-replay runs on an initial connection). The corrected
-        design keeps the transport opening inside `connect()` as before, and
-        buffers at the existing per-channel queue instead: events are
-        received and queued starting at `connect()`, `start_realtime()` only
-        opens the gate that lets each channel's worker start draining its
-        queue into the handler. Nothing posted before this call is lost —
-        only delayed.
-
-        The default implementation is a no-op: connectors that already
-        deliver events only from within `connect()` itself (RocketChat,
-        Script, Voice — none of which call `register_lazy_creation_hook()`
-        today) need not override this at all; `connect()` doing everything
-        it already does is correct for them.
-        """
 
     # ── Inbound — Observer pattern ───────────────────────────────────────────
 
