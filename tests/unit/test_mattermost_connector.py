@@ -588,6 +588,7 @@ class TestLazyCreationHook(unittest.IsolatedAsyncioTestCase):
 
     async def test_hook_returning_false_still_drops(self):
         connector = _make_connector(owners=["alice"])
+        connector._rest.resolve_username = AsyncMock(return_value="alice")
         handler = AsyncMock(return_value=True)
         connector.register_handler(handler)
         connector.register_lazy_creation_hook(AsyncMock(return_value=False))
@@ -601,6 +602,7 @@ class TestLazyCreationHook(unittest.IsolatedAsyncioTestCase):
 
     async def test_hook_raising_is_swallowed_and_message_dropped(self):
         connector = _make_connector(owners=["alice"])
+        connector._rest.resolve_username = AsyncMock(return_value="alice")
         handler = AsyncMock(return_value=True)
         connector.register_handler(handler)
         connector.register_lazy_creation_hook(AsyncMock(side_effect=RuntimeError("boom")))
@@ -617,6 +619,7 @@ class TestLazyCreationHook(unittest.IsolatedAsyncioTestCase):
         populate _channels (e.g. a bug, or a race) must not crash — the
         message is still dropped, exactly as if the hook had returned False."""
         connector = _make_connector(owners=["alice"])
+        connector._rest.resolve_username = AsyncMock(return_value="alice")
         handler = AsyncMock(return_value=True)
         connector.register_handler(handler)
         connector.register_lazy_creation_hook(AsyncMock(return_value=True))
@@ -662,6 +665,58 @@ class TestLazyCreationHook(unittest.IsolatedAsyncioTestCase):
         })
 
         hook.assert_not_called()
+
+    async def test_sender_not_in_allow_list_never_calls_the_hook(self):
+        """PR #79 review: a sender excluded by filter_sender must be
+        rejected BEFORE lazy creation — without this, any ordinary post
+        (even from someone with no permission to interact with the agent)
+        would fully provision a session/subscribe/processor before ever
+        being filtered."""
+        connector = _make_connector(owners=["alice"])  # "mallory" is not allowed
+        connector._rest.resolve_username = AsyncMock(return_value="mallory")
+        hook = AsyncMock(return_value=True)
+        connector.register_lazy_creation_hook(hook)
+        connector.register_handler(AsyncMock(return_value=True))
+
+        await connector._on_posted_event({
+            "post": {"id": "p1", "channel_id": "unwatched-chan", "user_id": "u-mallory", "message": "@hammer.mei hi", "root_id": "", "type": "", "create_at": 1},
+            "mentions": ["bot-id-1"],
+        })
+
+        hook.assert_not_called()
+
+    async def test_message_without_required_mention_never_calls_the_hook(self):
+        """PR #79 review: an ordinary post that never mentions the bot
+        must not trigger lazy creation either, same rationale as the
+        sender check above."""
+        connector = _make_connector(owners=["alice"])
+        connector._rest.resolve_username = AsyncMock(return_value="alice")
+        hook = AsyncMock(return_value=True)
+        connector.register_lazy_creation_hook(hook)
+        connector.register_handler(AsyncMock(return_value=True))
+
+        await connector._on_posted_event({
+            "post": {"id": "p1", "channel_id": "unwatched-chan", "user_id": "u1", "message": "just chatting, no mention", "root_id": "", "type": "", "create_at": 1},
+            "mentions": [],  # bot not mentioned
+        })
+
+        hook.assert_not_called()
+
+    async def test_allowed_sender_with_mention_still_calls_the_hook(self):
+        """Sanity check paired with the two rejection tests above: a
+        message that WOULD pass the real filter must still reach the hook."""
+        connector = _make_connector(owners=["alice"])
+        connector._rest.resolve_username = AsyncMock(return_value="alice")
+        hook = AsyncMock(return_value=False)  # rejects on room-rule grounds, not filter
+        connector.register_lazy_creation_hook(hook)
+        connector.register_handler(AsyncMock(return_value=True))
+
+        await connector._on_posted_event({
+            "post": {"id": "p1", "channel_id": "unwatched-chan", "user_id": "u1", "message": "@hammer.mei hi", "root_id": "", "type": "", "create_at": 1},
+            "mentions": ["bot-id-1"],
+        })
+
+        hook.assert_called_once_with("unwatched-chan")
 
     async def test_own_message_in_unwatched_channel_never_calls_the_hook(self):
         """PR #79 review: an echo of the bot's own post in an otherwise-

@@ -676,6 +676,7 @@ class MattermostConnector(Connector):
 
         channel_id = post.get("channel_id", "")
         state = self._channels.get(channel_id)
+        sender_username: str | None = None
         if not state:
             # docs/design/on-the-fly-watchers.md: give a rule-matched
             # channel a chance to get a watcher created on the spot before
@@ -684,6 +685,61 @@ class MattermostConnector(Connector):
             # so `state` is never None there) — this only ever fires for
             # live traffic in a channel with no watcher yet.
             if self._lazy_creation_hook is not None:
+                # PR #79 review: apply the sender/mention gates BEFORE
+                # committing to lazy creation — without this, ANY ordinary
+                # post (even from a sender excluded by filter_sender, or
+                # one that never mentions the bot) fully provisions a
+                # session/subscribe/processor — and may post an
+                # online_notification — before ever being rejected by the
+                # filter that runs later below. Safe to resolve the
+                # username here, ahead of _remember_seen() further down:
+                # no `state`/seen_ids_set exists yet for this channel, and
+                # the live-vs-replay dedup race the docstring above
+                # describes only applies once a channel is already
+                # tracked — reinforced by two facts already true elsewhere
+                # in this method: replay never reaches this branch at all
+                # (_on_ws_reconnect only replays already-tracked channels,
+                # so `state` is never None there), and per-channel
+                # `_dispatch()` in websocket.py serializes same-channel
+                # events through one worker, so there is no concurrent
+                # caller for this exact channel_id to race against.
+                try:
+                    sender_username = await self._rest.resolve_username(sender_id)
+                except Exception as e:
+                    logger.error(
+                        "Failed to resolve sender username for id=%s: %s", sender_id, e
+                    )
+                    return
+                # room_type="channel" (a lie, but a safe one): lazy
+                # creation never applies to DMs regardless (try_lazy_create()
+                # rejects them internally), so over-applying the mention
+                # gate to what might actually be a DM causes no observable
+                # difference — that message was never going to succeed at
+                # lazy creation either way. turn_store=None deliberately
+                # skips step 5 (agent-chain turn budget) entirely rather
+                # than passing the real turn_store, which would otherwise
+                # double-increment it if the message goes on to pass the
+                # real filter below. Accepted side effect: an agent sender
+                # (is_agent=True) also bypasses step 3's mention gate here,
+                # same as it would in the real filter — agent-chain
+                # traffic can still trigger lazy creation before any turn-
+                # budget check runs, since that check is what's skipped.
+                precheck = filter_mm_message(
+                    post=post,
+                    mentions=decoded["mentions"],
+                    sender_username=sender_username,
+                    config=self._config,
+                    room_type="channel",
+                    last_processed_ts=None,
+                    bot_user_id=self._rest.bot_user_id or "",
+                    turn_store=None,
+                )
+                if not precheck.accepted:
+                    logger.debug(
+                        "Lazy creation skipped for channel %s: %s (sender=%s)",
+                        channel_id, precheck.reason, precheck.sender,
+                    )
+                    return
                 try:
                     created = await self._lazy_creation_hook(channel_id)
                 except Exception as e:
@@ -706,11 +762,12 @@ class MattermostConnector(Connector):
         if msg_id:
             self._remember_seen(state, msg_id)
 
-        try:
-            sender_username = await self._rest.resolve_username(sender_id)
-        except Exception as e:
-            logger.error("Failed to resolve sender username for id=%s: %s", sender_id, e)
-            return
+        if sender_username is None:
+            try:
+                sender_username = await self._rest.resolve_username(sender_id)
+            except Exception as e:
+                logger.error("Failed to resolve sender username for id=%s: %s", sender_id, e)
+                return
 
         filter_ts = (
             replay_after_ts
