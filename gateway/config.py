@@ -627,6 +627,31 @@ def _parse_one_connector(
     connector_type = cc.get("type", "")
     if not name:
         raise ValueError("Each connector entry must have a 'name' field")
+    if isinstance(name, str) and "/" in name:
+        # PR #79 review: connector names are used as filesystem path
+        # components in two places that never validated this — state.json
+        # files (state.<name>.json, see gateway/core/state.py's
+        # _state_file()) and, more subtly, watcher_lifecycle.py's
+        # auto_watcher_name(rule.connector, room.name) for a "room: '*'"
+        # wildcard rule, which concatenates the raw connector name with a
+        # separately-sanitized room name and was NEVER checked before
+        # PR #79. Static watcher names already reject '/' at parse time
+        # (see the "must not contain '/'" check in _parse_one_watcher_rule
+        # below) — but that check only fires when a name actually gets
+        # generated at config-load time, which a wildcard-rule-only
+        # connector never does (its watcher names are generated later, per
+        # room, at runtime). A connector named e.g. 'mm/team' or '../team'
+        # would sail through config validation undetected until a lazily
+        # created watcher's name silently escaped its intended directory.
+        # Rejecting here closes both paths at once, at the one place any
+        # connector name is guaranteed to be validated regardless of
+        # whether it ever uses room: "*".
+        raise ValueError(
+            f"Connector name {name!r} must not contain '/' — connector "
+            "names are used as filesystem path components (e.g. "
+            "state.<name>.json, and as a prefix in auto-generated lazy "
+            "watcher names) and a '/' could escape the intended directory."
+        )
     if not isinstance(name, str):
         # PR review finding: a truthy-but-non-string 'name' (e.g. a YAML
         # list) is technically not caught by `not name` above, and used to

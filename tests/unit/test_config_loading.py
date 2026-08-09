@@ -198,6 +198,35 @@ class TestConfigValidationHardening(unittest.TestCase):
             GatewayConfig.from_file(path)
         self.assertIn("must not contain '/'", str(ctx.exception))
 
+    def test_connector_name_with_slash_raises(self):
+        """PR #79 review: unlike watcher names, connector names were never
+        checked — a wildcard-rule-only connector never triggers the
+        watcher-name '/' check above (its names are generated at runtime,
+        per room, not at config-load time), so a connector named e.g.
+        'mm/team' would sail through undetected until a lazily created
+        watcher's auto-generated name silently escaped its directory."""
+        path = self._write_config("""\
+            connectors:
+              - name: mm/team
+                type: mattermost
+                server_url: https://mm.example.com
+                team: t
+                username: bot
+                password: pw
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watchers:
+              - name: w1
+                connector: mm/team
+                room: general
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        self.assertIn("must not contain '/'", str(ctx.exception))
+        self.assertIn("mm/team", str(ctx.exception))
+
     def test_empty_watcher_room_raises(self):
         path = self._write_config("""\
             connectors:
