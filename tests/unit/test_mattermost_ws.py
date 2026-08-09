@@ -222,7 +222,7 @@ class TestDispatchGate(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.05)
 
         self.assertEqual(received, [])  # buffered, not delivered
-        self.assertEqual(ws._channel_queues["chan1"].qsize(), 1)
+        self.assertEqual(ws._channel_backlogs["chan1"].qsize(), 1)
 
         await ws.stop()
 
@@ -325,6 +325,57 @@ class TestDispatchGate(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(received), 1 + _CHANNEL_QUEUE_DEPTH)  # p0 + the queued q*
 
         await ws.stop()
+
+    async def test_live_event_delivered_while_backlog_still_draining(self):
+        """PR #80 review, Finding D: a single shared queue meant a live
+        event arriving while the worker was still draining a >depth-sized
+        startup backlog got compared against _CHANNEL_QUEUE_DEPTH and
+        dropped as if it were steady-state overflow, even with a healthy
+        WebSocket and handler. The live queue is now independent of
+        backlog size — the live event must be delivered, and delivered
+        strictly after every backlog event (order preserved)."""
+        ws = MattermostWebSocketClient("https://mm.example.com", token_provider=lambda: "tok")
+        received = []
+        release = asyncio.Event()
+
+        async def handler(decoded):
+            post_id = decoded["post"]["id"]
+            if post_id == "backlog0":
+                await release.wait()  # hold the drain open so we can inject a live event mid-drain
+            received.append(post_id)
+
+        ws.register_handler(handler)
+        backlog_total = _CHANNEL_QUEUE_DEPTH + 20
+        for i in range(backlog_total):
+            await ws._dispatch({"post": {"channel_id": "chan1", "id": f"backlog{i}"}, "mentions": []})
+
+        ws.open_dispatch_gate()
+        await asyncio.sleep(0.02)  # worker starts draining, parks on backlog0
+
+        # Live event arrives while backlog draining is still stuck on item 0 —
+        # this must land in the independent live queue, not be compared
+        # against the (still nearly full) backlog.
+        await ws._dispatch({"post": {"channel_id": "chan1", "id": "live0"}, "mentions": []})
+
+        release.set()
+        await asyncio.sleep(0.1)
+
+        self.assertIn("live0", received)
+        self.assertEqual(received.index("live0"), len(received) - 1)  # after all backlog events
+        self.assertEqual(received[:-1], [f"backlog{i}" for i in range(backlog_total)])
+
+        await ws.stop()
+
+    async def test_stop_clears_backlog_queues(self):
+        ws = MattermostWebSocketClient("https://mm.example.com", token_provider=lambda: "tok")
+        ws.register_handler(AsyncMock())
+
+        await ws._dispatch({"post": {"channel_id": "chan1", "id": "p1"}, "mentions": []})
+        await asyncio.sleep(0.02)
+
+        await ws.stop()
+
+        self.assertEqual(ws._channel_backlogs, {})
 
     async def test_stop_cancels_a_worker_still_parked_on_a_closed_gate(self):
         """A worker waiting on the gate must be cancellable cleanly by

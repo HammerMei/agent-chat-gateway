@@ -73,7 +73,15 @@ class MattermostWebSocketClient:
         self._listen_task: asyncio.Task | None = None
         self._callback_sem = asyncio.Semaphore(_CALLBACK_CONCURRENCY)
         self._callback_tasks: set[asyncio.Task] = set()
+        # "Live" queues: bounded at _CHANNEL_QUEUE_DEPTH, normal steady-state
+        # backpressure — only ever written to once the dispatch gate is open.
         self._channel_queues: dict[str, asyncio.Queue] = {}
+        # Startup backlog queues: unbounded, only ever written to while the
+        # dispatch gate is closed. Kept fully separate from the live queue
+        # above (PR #80 review, Finding D) so that draining a large startup
+        # backlog can never look like steady-state overflow to a live event
+        # arriving mid-drain — the two have independent capacity semantics.
+        self._channel_backlogs: dict[str, asyncio.Queue] = {}
         self._channel_workers: dict[str, asyncio.Task] = {}
         # Local bookkeeping only — no wire-protocol subscribe exists.  Tracks
         # which channels the dispatcher currently cares about, purely so
@@ -88,11 +96,12 @@ class MattermostWebSocketClient:
         # ordering" section, corrected design). The socket connects and
         # _dispatch() queues every event as soon as it arrives — nothing is
         # lost at the transport layer — but each channel's _channel_worker
-        # holds off DRAINING its queue until this gate opens, so events that
+        # holds off DRAINING anything until this gate opens, so events that
         # arrive while the caller is still finishing startup (e.g.
-        # SessionManager.sync_watchers()) are buffered, not discarded, and
-        # are only handed to try_lazy_create()/the dispatcher once local
-        # state is actually ready. open_dispatch_gate() opens it permanently.
+        # SessionManager.sync_watchers()) are buffered (in
+        # _channel_backlogs, see below), not discarded, and are only handed
+        # to try_lazy_create()/the dispatcher once local state is actually
+        # ready. open_dispatch_gate() opens it permanently.
         self._dispatch_gate = asyncio.Event()
 
     def register_handler(self, handler: PostedEventHandler) -> None:
@@ -178,6 +187,7 @@ class MattermostWebSocketClient:
             await asyncio.gather(*all_tasks, return_exceptions=True)
         self._callback_tasks.clear()
         self._channel_queues.clear()
+        self._channel_backlogs.clear()
         self._channel_workers.clear()
         if self._ws:
             await self._ws.close()
@@ -218,66 +228,100 @@ class MattermostWebSocketClient:
         }
 
     async def _dispatch(self, decoded: dict[str, Any]) -> None:
-        """Route a decoded posted-event to the per-channel ordering queue.
+        """Route a decoded posted-event to the per-channel backlog or live queue.
 
-        The queue itself is unbounded (PR #80 review, Finding C): while the
-        dispatch gate is closed, no `_channel_worker` is draining, so a
-        `maxsize`-bounded queue would hit `QueueFull` on the 51st event in
-        one channel during `sync_watchers()` and silently drop everything
-        after it — recreating the exact data-loss bug Finding A already
-        fixed, just with a higher threshold. Capacity is instead enforced
-        manually, and only once the gate is open: at that point a worker is
-        guaranteed to be actively draining, so `qsize() >= _CHANNEL_QUEUE_DEPTH`
-        means the same thing `asyncio.Queue(maxsize=...).put_nowait()` used
-        to (a handler that's fallen behind / stuck), and gets the same
-        drop-with-a-warning treatment as before.
+        Two separate queues per channel (PR #80 review, Finding D), not one:
+        - `_channel_backlogs[channel_id]`: unbounded, written to only while
+          the dispatch gate is closed. Nothing arriving before
+          `open_dispatch_gate()` can ever be dropped for "being too much" —
+          this is the startup buffer.
+        - `_channel_queues[channel_id]`: bounded at `_CHANNEL_QUEUE_DEPTH`,
+          written to only once the gate is open. Normal steady-state
+          backpressure, with no dependency on how large the startup backlog
+          was or how far `_channel_worker` has gotten through draining it.
 
-        Accepted tradeoff, written down on purpose rather than left
-        implicit: between the gate closing and opening, one channel's queue
-        can grow to (inbound rate × sync_watchers() duration) with no cap.
-        That window is bounded in TIME (it ends the moment sync_watchers()
-        returns) and by realistic human/agent chat pace, unlike the steady-
-        state case the depth cap protects against (a handler stuck
-        indefinitely) — same tradeoff already named for option B in the
-        design doc, accepted here for the same reason.
+        Keeping these fully separate is the fix for Finding D: an earlier
+        version used one queue and compared its size against
+        `_CHANNEL_QUEUE_DEPTH` once the gate opened — which meant a live
+        event arriving while the worker was still draining a >50-item
+        startup backlog got treated as steady-state overflow and dropped,
+        even though the WebSocket and handler were both healthy. With two
+        queues, a live event's fate never depends on backlog size at all.
+
+        One overflow path is now reachable that wasn't distinct before:
+        if live traffic itself exceeds `_CHANNEL_QUEUE_DEPTH` while the
+        backlog is still draining, live events do drop. That IS genuine
+        backpressure (the handler can't keep up with live traffic, same as
+        it couldn't in steady state) — not a repeat of Finding D, which was
+        about backlog volume alone triggering drops with a healthy handler.
         """
         channel_id = decoded["post"]["channel_id"]
-        queue = self._channel_queues.get(channel_id)
-        if queue is None:
-            queue = asyncio.Queue()  # unbounded — see capacity check below
-            self._channel_queues[channel_id] = queue
-            worker = asyncio.create_task(self._channel_worker(channel_id, queue))
+        if channel_id not in self._channel_queues:
+            live_queue = asyncio.Queue(maxsize=_CHANNEL_QUEUE_DEPTH)
+            backlog_queue = asyncio.Queue()  # unbounded
+            self._channel_queues[channel_id] = live_queue
+            self._channel_backlogs[channel_id] = backlog_queue
+            worker = asyncio.create_task(
+                self._channel_worker(channel_id, backlog_queue, live_queue)
+            )
             self._channel_workers[channel_id] = worker
             self._callback_tasks.add(worker)
             worker.add_done_callback(self._callback_tasks.discard)
-        if self._dispatch_gate.is_set() and queue.qsize() >= _CHANNEL_QUEUE_DEPTH:
+
+        if not self._dispatch_gate.is_set():
+            # Startup buffering — no capacity check, ever. Safe: no other
+            # code path writes here once the gate opens (see class docstring
+            # in open_dispatch_gate()), so this can't race past the check
+            # below once _listen_loop's single-threaded dispatch order is
+            # accounted for.
+            self._channel_backlogs[channel_id].put_nowait(decoded)
+            return
+
+        live_queue = self._channel_queues[channel_id]
+        try:
+            live_queue.put_nowait(decoded)
+        except asyncio.QueueFull:
             logger.warning(
                 "Channel %s inbound queue full (depth=%d) — dropping event",
                 channel_id, _CHANNEL_QUEUE_DEPTH,
             )
-            return
-        queue.put_nowait(decoded)
 
-    async def _channel_worker(self, channel_id: str, queue: asyncio.Queue) -> None:
+    async def _invoke_handler(self, channel_id: str, decoded: dict[str, Any]) -> None:
+        """Run the registered handler for one decoded event, bounded by the
+        global concurrency semaphore. Shared by both drain phases below so
+        there is exactly one copy of this error-handling behavior."""
+        async with self._callback_sem:
+            if self._handler is not None:
+                try:
+                    await self._handler(decoded)
+                except Exception:
+                    logger.exception(
+                        "Unhandled error in posted-event handler for channel %s",
+                        channel_id,
+                    )
+
+    async def _channel_worker(
+        self, channel_id: str, backlog_queue: asyncio.Queue, live_queue: asyncio.Queue
+    ) -> None:
         """Process one channel's events in order, bounded by the global semaphore.
 
-        Waits for the dispatch gate before draining anything — events that
-        arrive first are queued by _dispatch() regardless, so nothing posted
-        before the gate opens is lost, only delayed (see open_dispatch_gate()).
+        Waits for the dispatch gate, then drains the ENTIRE startup backlog
+        first (unbounded, in the order it was buffered) before touching the
+        live queue at all — this preserves overall arrival order (nothing
+        buffered before the gate opened can be posted-before something that
+        arrived after it) and guarantees the backlog is fully gone before
+        live-queue capacity checks become meaningful. Once backlog_queue is
+        empty, no further writes to it are possible (see _dispatch()), so
+        moving on to draining live_queue forever after is safe.
         """
         try:
             await self._dispatch_gate.wait()
+            while not backlog_queue.empty():
+                decoded = backlog_queue.get_nowait()
+                await self._invoke_handler(channel_id, decoded)
             while True:
-                decoded = await queue.get()
-                async with self._callback_sem:
-                    if self._handler is not None:
-                        try:
-                            await self._handler(decoded)
-                        except Exception:
-                            logger.exception(
-                                "Unhandled error in posted-event handler for channel %s",
-                                channel_id,
-                            )
+                decoded = await live_queue.get()
+                await self._invoke_handler(channel_id, decoded)
         except asyncio.CancelledError:
             pass
 
