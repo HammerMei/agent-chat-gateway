@@ -232,25 +232,89 @@ class ControlServer:
         # globally unique across all connectors, so no --connector is needed).
         if cmd in ("pause", "resume", "reset") and not connector_name:
             watcher_name = request.get("watcher_name", "")
+            if not watcher_name:
+                return {"ok": False, "error": "Missing 'watcher_name'"}
             entry = self._find_entry_for_watcher(watcher_name)
-            if isinstance(entry, dict):
+            live_entry = None if isinstance(entry, dict) else entry
+
+            # PR #79 review: config-load-time uniqueness only covers names
+            # sourced from config.yaml — a dynamically-created watcher's
+            # name is never in config.yaml (only its WatcherState is
+            # persisted), so it's invisible to that check. A static watcher
+            # later configured on a DIFFERENT connector with the same name
+            # (accidentally or because the auto-generated format is
+            # predictable) can therefore collide with nothing catching it
+            # at load time. `_find_entry_for_watcher()`'s plain
+            # get_watcher_config() scan would silently pick the LIVE
+            # match (e.g. connector B's static watcher) and never even
+            # look at connector A's dormant claim on the same name — an
+            # unqualified `resume X`/`reset X` would then act on B,
+            # potentially resetting its session, while the operator
+            # believed they were addressing A. Scan every OTHER connector
+            # with the non-mutating is_watcher_name_known() probe (not
+            # can_find_or_reconstruct_watcher(), which has a
+            # reconstruction side effect appropriate for the connector
+            # we're about to ACT on, but not for ones we're merely
+            # checking for ambiguity — same rationale as
+            # is_watcher_name_known()'s own docstring).
+            other_claimants = [
+                candidate for candidate in self._entries
+                if candidate is not live_entry
+                and candidate.session_manager.is_watcher_name_known(watcher_name)
+            ]
+
+            if live_entry is not None and other_claimants:
+                names = ", ".join(f"'{c.name}'" for c in other_claimants)
+                return {
+                    "ok": False,
+                    "error": (
+                        f"Watcher name {watcher_name!r} is ambiguous: it is "
+                        f"live on connector '{live_entry.name}', but also "
+                        f"known (a dormant/persisted watcher) to "
+                        f"connector(s) {names}. Specify --connector to "
+                        f"disambiguate."
+                    ),
+                }
+
+            if live_entry is not None:
+                entry = live_entry
+            elif len(other_claimants) > 1:
+                names = ", ".join(f"'{c.name}'" for c in other_claimants)
+                return {
+                    "ok": False,
+                    "error": (
+                        f"Watcher name {watcher_name!r} is ambiguous: "
+                        f"dormant/persisted watchers with this name exist "
+                        f"on connectors {names}. Specify --connector to "
+                        f"disambiguate."
+                    ),
+                }
+            elif len(other_claimants) == 1:
                 # PR #79 review (fourth round): _find_entry_for_watcher()'s
                 # plain, synchronous get_watcher_config() lookup only sees
                 # each connector's already-known WatcherConfigs — a
                 # dynamically-created watcher's config is gone from that
                 # list after a restart (only its WatcherState survives).
-                # Before giving up, let every connector attempt the async,
+                # Now that is_watcher_name_known() has already identified
+                # the ONE connector that owns this name (unambiguous), let
+                # it actually reconstruct it via the mutating,
                 # reconstruction-aware probe — without this, a persisted
                 # dynamic watcher was unreachable through the one CLI path
                 # meant to bring it back, even though resume_watcher()/
                 # reset_watcher()/pause_watcher() themselves already know
                 # how to reconstruct it once actually called.
-                for candidate in self._entries:
-                    if await candidate.session_manager.can_find_or_reconstruct_watcher(watcher_name):
-                        entry = candidate
-                        break
-            if isinstance(entry, dict):
-                return entry  # still unknown even after the reconstruction attempt
+                candidate = other_claimants[0]
+                if await candidate.session_manager.can_find_or_reconstruct_watcher(watcher_name):
+                    entry = candidate
+                else:
+                    # is_watcher_name_known() said yes but the more
+                    # rigorous reconstruction check said no (e.g. the room
+                    # no longer resolves, or the wildcard rule was
+                    # removed) — genuinely gone, not ambiguous.
+                    return {"ok": False, "error": f"Unknown watcher: {watcher_name!r}"}
+            else:
+                return {"ok": False, "error": f"Unknown watcher: {watcher_name!r}"}
+
             return await entry.session_manager.dispatch_command(request)
 
         # All other commands: route to a specific entry

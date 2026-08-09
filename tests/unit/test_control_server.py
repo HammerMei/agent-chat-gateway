@@ -47,8 +47,17 @@ def _make_entry(name: str, dispatch_result: dict | None = None,
         entry.session_manager.can_find_or_reconstruct_watcher = AsyncMock(
             side_effect=lambda wname: wname in watcher_names
         )
+        # PR #79 review (ambiguous-name round): the non-mutating probe used
+        # for cross-connector ambiguity detection — same truth table.
+        # Without this, an unconfigured MagicMock() call would be truthy
+        # for EVERY entry, making every other connector look like an
+        # ambiguous claimant regardless of watcher_names.
+        entry.session_manager.is_watcher_name_known = MagicMock(
+            side_effect=lambda wname: wname in watcher_names
+        )
     else:
         entry.session_manager.can_find_or_reconstruct_watcher = AsyncMock(return_value=False)
+        entry.session_manager.is_watcher_name_known = MagicMock(return_value=False)
     return entry
 
 
@@ -297,6 +306,15 @@ class TestResetRouting(unittest.IsolatedAsyncioTestCase):
         e_rc.session_manager.can_find_or_reconstruct_watcher = AsyncMock(
             side_effect=lambda name: name == "mm-home-general"
         )
+        # PR #79 review (ambiguous-name round): the non-mutating probe used
+        # for the initial cross-connector scan must agree with the
+        # reconstruction probe above for the SAME watcher — in production
+        # both answer from the same persisted WatcherState, just with
+        # different rigor. Without this, the ambiguity scan would find no
+        # claimants at all and never even reach the reconstruction check.
+        e_rc.session_manager.is_watcher_name_known = MagicMock(
+            side_effect=lambda name: name == "mm-home-general"
+        )
         e_slack = _make_entry("slack", watcher_names=[])
         server = _make_server(e_rc, e_slack)
 
@@ -314,6 +332,66 @@ class TestResetRouting(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result["ok"])
         self.assertIn("truly-unknown", result["error"])
+
+    async def test_live_match_ambiguous_with_a_dormant_claimant_on_another_connector_errors(self):
+        """PR #79 review: a live static watcher on one connector and a
+        dormant/persisted dynamic watcher of the SAME name on another must
+        not be silently resolved to the live one — config-load-time
+        uniqueness never saw the dormant claim (it's not in config.yaml),
+        so an unqualified resume/reset could otherwise act on the wrong
+        connector's watcher entirely."""
+        e_live = _make_entry("mm-b", watcher_names=["shared-name"])
+        e_dormant = _make_entry("mm-a", watcher_names=[])
+        e_dormant.session_manager.is_watcher_name_known = MagicMock(
+            side_effect=lambda name: name == "shared-name"
+        )
+        server = _make_server(e_live, e_dormant)
+
+        result = await server.dispatch_command({"cmd": "resume", "watcher_name": "shared-name"})
+
+        self.assertFalse(result["ok"])
+        self.assertIn("ambiguous", result["error"])
+        self.assertIn("mm-b", result["error"])
+        self.assertIn("mm-a", result["error"])
+        e_live.session_manager.dispatch_command.assert_not_called()
+        e_dormant.session_manager.dispatch_command.assert_not_called()
+
+    async def test_two_dormant_claimants_with_no_live_match_errors(self):
+        """Same ambiguity, no live match at all — both connectors only
+        have a dormant/persisted claim on this exact name."""
+        e_a = _make_entry("mm-a", watcher_names=[])
+        e_a.session_manager.is_watcher_name_known = MagicMock(
+            side_effect=lambda name: name == "shared-name"
+        )
+        e_b = _make_entry("mm-b", watcher_names=[])
+        e_b.session_manager.is_watcher_name_known = MagicMock(
+            side_effect=lambda name: name == "shared-name"
+        )
+        server = _make_server(e_a, e_b)
+
+        result = await server.dispatch_command({"cmd": "resume", "watcher_name": "shared-name"})
+
+        self.assertFalse(result["ok"])
+        self.assertIn("ambiguous", result["error"])
+
+    async def test_explicit_connector_bypasses_ambiguity_check_entirely(self):
+        """The --connector escape hatch routes straight to the named
+        connector without ever consulting is_watcher_name_known() on
+        anyone — the whole point of specifying it explicitly."""
+        e_live = _make_entry("mm-b", watcher_names=["shared-name"])
+        e_dormant = _make_entry("mm-a", watcher_names=[])
+        e_dormant.session_manager.is_watcher_name_known = MagicMock(
+            side_effect=lambda name: name == "shared-name"
+        )
+        server = _make_server(e_live, e_dormant)
+
+        result = await server.dispatch_command({
+            "cmd": "resume", "watcher_name": "shared-name", "connector": "mm-a",
+        })
+
+        self.assertTrue(result["ok"])
+        e_dormant.session_manager.dispatch_command.assert_called_once()
+        e_live.session_manager.dispatch_command.assert_not_called()
 
     async def test_reset_with_explicit_connector_still_works(self):
         """Passing connector= explicitly in the request still routes via _resolve_entry."""

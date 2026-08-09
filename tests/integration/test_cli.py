@@ -748,6 +748,45 @@ class TestCLIPauseResumeReset(_CLITestBase):
         self._run(["pause", "my-watcher"])
         self.assertEqual(received[0]["watcher_name"], "my-watcher")
 
+    def test_resume_connector_flag_forwarded(self):
+        """PR #79 review: --connector disambiguates when the same watcher
+        name exists (live or dormant) on more than one connector — must
+        actually be forwarded in the payload, not just accepted by argparse."""
+        received: list[dict] = []
+
+        def _capture(req):
+            received.append(req)
+            return {"ok": True}
+
+        self._start_daemon({"resume": _capture})
+        self._run(["resume", "shared-name", "--connector", "mm-a"])
+        self.assertEqual(received[0]["watcher_name"], "shared-name")
+        self.assertEqual(received[0].get("connector"), "mm-a")
+
+    def test_reset_connector_flag_forwarded(self):
+        received: list[dict] = []
+
+        def _capture(req):
+            received.append(req)
+            return {"ok": True}
+
+        self._start_daemon({"reset": _capture})
+        self._run(["reset", "shared-name", "--connector", "mm-a"])
+        self.assertEqual(received[0].get("connector"), "mm-a")
+
+    def test_pause_without_connector_flag_omits_it(self):
+        """The common case (no ambiguity) must not send an empty/None
+        connector field that could confuse the server-side routing."""
+        received: list[dict] = []
+
+        def _capture(req):
+            received.append(req)
+            return {"ok": True}
+
+        self._start_daemon({"pause": _capture})
+        self._run(["pause", "my-watcher"])
+        self.assertNotIn("connector", received[0])
+
 
 
 # ---------------------------------------------------------------------------

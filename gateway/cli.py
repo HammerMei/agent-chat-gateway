@@ -58,10 +58,20 @@ def main():
     # pause
     pause_p = sub.add_parser("pause", help="Pause a watcher (stops processing messages)")
     pause_p.add_argument("watcher_name", help="Watcher name as defined in config.yaml")
+    pause_p.add_argument(
+        "--connector", default=None, metavar="NAME",
+        help="Disambiguate when the same watcher name exists (live or dormant) "
+             "on more than one connector — normally auto-resolved",
+    )
 
     # resume
     resume_p = sub.add_parser("resume", help="Resume a paused watcher")
     resume_p.add_argument("watcher_name", help="Watcher name as defined in config.yaml")
+    resume_p.add_argument(
+        "--connector", default=None, metavar="NAME",
+        help="Disambiguate when the same watcher name exists (live or dormant) "
+             "on more than one connector — normally auto-resolved",
+    )
 
     # reset
     reset_p = sub.add_parser(
@@ -69,6 +79,11 @@ def main():
         help="Reset a watcher: clear runtime state and start a fresh session",
     )
     reset_p.add_argument("watcher_name", help="Watcher name as defined in config.yaml")
+    reset_p.add_argument(
+        "--connector", default=None, metavar="NAME",
+        help="Disambiguate when the same watcher name exists (live or dormant) "
+             "on more than one connector — normally auto-resolved",
+    )
 
     # onboard
     onboard_p = sub.add_parser(
@@ -328,6 +343,8 @@ def main():
 
     elif args.command == "pause":
         cmd_data = {"cmd": "pause", "watcher_name": args.watcher_name}
+        if args.connector is not None:
+            cmd_data["connector"] = args.connector
         result = _send_command(cmd_data)
         if result["ok"]:
             print(f"Watcher '{args.watcher_name}' paused")
@@ -337,6 +354,8 @@ def main():
 
     elif args.command == "resume":
         cmd_data = {"cmd": "resume", "watcher_name": args.watcher_name}
+        if args.connector is not None:
+            cmd_data["connector"] = args.connector
         result = _send_command(cmd_data)
         if result["ok"]:
             print(f"Watcher '{args.watcher_name}' resumed")
@@ -346,6 +365,8 @@ def main():
 
     elif args.command == "reset":
         cmd_data = {"cmd": "reset", "watcher_name": args.watcher_name}
+        if args.connector is not None:
+            cmd_data["connector"] = args.connector
         # Reset involves stopping + restarting the agent process and injecting
         # context (an agent round-trip). This can take several minutes for slow
         # agents (e.g. OpenCode startup + context injection). Use a 5-minute
