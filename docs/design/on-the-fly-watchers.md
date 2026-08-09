@@ -1170,6 +1170,106 @@ crashes.
   which no test did before this round, so a future change back to
   unconditional unbounded queuing would be caught here).
 
+### PR #80 review, third round (2026-08-08) — Finding D: fixing Finding C created a new false-positive drop, fixed by splitting into two queues
+
+GPT/Codex found a fourth issue in this same area, confirmed real: **Finding
+C's fix (a single unbounded queue with a manual `qsize() >= _CHANNEL_QUEUE_DEPTH`
+check applied once the gate opens) moved the loss window rather than
+closing it.** If a channel's startup backlog exceeds `_CHANNEL_QUEUE_DEPTH`
+(the exact scenario Finding C's own fix was written to allow), then the
+moment the gate opens, `qsize()` starts at whatever the backlog grew to —
+above depth — and stays above depth until the worker drains it back down.
+Any *live* event arriving during that drain-down, even with a perfectly
+healthy WebSocket and handler, hits the same `qsize() >= _CHANNEL_QUEUE_DEPTH`
+check and gets dropped as if it were steady-state overflow, when it isn't:
+nothing is stuck, the queue is just working through a legitimate backlog.
+In the reviewer's own words: "making the startup queue unbounded merely
+moves the loss window to immediately after the gate opens."
+
+**Root cause of both C and D, named plainly rather than patched around
+again: a single queue conflates two different things — "how much startup
+backlog is left to drain" and "is the handler currently keeping up with
+live traffic" — that need independent capacity semantics.** Comparing one
+queue's size against one threshold cannot answer both questions correctly
+at once, no matter where the threshold is set or when it's checked. Every
+fix so far (unbounded-while-closed for C, gate-aware check for the same
+fix) was a correct answer to the wrong question.
+
+**Fix: two queues per channel, not one, matching the two distinct
+concerns exactly:**
+- `_channel_backlogs[channel_id]` — unbounded, written to only while the
+  gate is closed. This is the startup buffer; nothing here is ever dropped
+  for volume, by construction (there's no capacity check on this path at
+  all).
+- `_channel_queues[channel_id]` — bounded at `_CHANNEL_QUEUE_DEPTH` via
+  `asyncio.Queue`'s own `maxsize` again (back to the original, pre-#80
+  mechanism), written to only once the gate is open. A live event's fate
+  now depends *only* on live-queue depth, never on how large the startup
+  backlog was or how far the worker has gotten through it.
+- `_channel_worker` waits for the gate, then fully drains `backlog_queue`
+  (unbounded, in arrival order) before touching `live_queue` at all. This
+  is safe because nothing can write to `backlog_queue` after the gate
+  opens (`_dispatch()`'s branch on `self._dispatch_gate.is_set()` has no
+  `await` before the write, and `_listen_loop` dispatches events strictly
+  sequentially — confirmed by reading both, not assumed) — so once the
+  worker starts the backlog-drain loop, that queue can only shrink.
+  Draining backlog fully before live traffic also preserves overall
+  arrival order: nothing buffered before the gate opened can be delivered
+  after something that arrived post-gate.
+- The handler-invocation body (semaphore + try/except around
+  `self._handler(decoded)`) was pulled into one shared `_invoke_handler()`
+  helper, used by both the backlog-drain and live-drain loops — three
+  near-identical copies of that block across two fix rounds was exactly
+  how this kind of thing keeps recurring.
+
+**One overflow path is now real and is NOT a repeat of Finding D — said
+explicitly so it doesn't get filed as a fifth finding:** if live traffic
+itself exceeds `_CHANNEL_QUEUE_DEPTH` while the backlog is still draining,
+live events do get dropped. That's genuine backpressure (the handler
+can't keep up with live traffic on top of catching up on backlog) — the
+distinguishing fact about Finding D was that a *healthy* handler with *no*
+live-traffic overload still got events dropped purely because of backlog
+volume. With two independent queues, that specific failure mode is gone;
+true overload is a different, legitimate case with the same accepted
+drop-with-a-warning behavior it always had.
+
+**Scope note, said directly rather than glossed over:** this is the fourth
+finding in this area, the third against a fix to the *same* mechanism
+(`_dispatch()`/`_channel_worker`), and each individual fix was locally
+correct for the case it addressed. That pattern is a signal about the
+layer, not about care taken: transport-level buffering keeps growing new
+edge cases because the actual problem — "don't let `WatcherLifecycle` see
+an event before its state is ready" — lives one layer up, in
+`WatcherLifecycle`/`try_lazy_create()`. Option B from the original design
+review (a readiness gate inside `WatcherLifecycle` itself, awaited at the
+top of `try_lazy_create()`) was passed over partly on the cost of updating
+~50 existing tests in `test_watcher_lifecycle_lazy_create.py` — three
+rounds of transport-layer surgery have now cost more than that estimate,
+and touched code (`_dispatch()`, queue capacity, worker draining) with a
+much larger blast radius than `try_lazy_create()` alone. **Not being
+revisited in this PR** — landing this fix and getting #80 green is the
+immediate goal — but if a fifth finding lands inside `_dispatch()` or
+`_channel_worker` specifically, the answer should be to move the gate up
+to `WatcherLifecycle`, not to patch the transport layer a fourth time.
+This is a scope question for 老哥, not a decision made unilaterally here.
+
+- Tests: `tests/unit/test_mattermost_ws.py` —
+  `test_live_event_delivered_while_backlog_still_draining` (backlog of
+  `_CHANNEL_QUEUE_DEPTH + 20`, gate opens, handler is parked mid-drain via
+  an `asyncio.Event` so a live event can be injected while backlog draining
+  is still in progress, asserts the live event is delivered and delivered
+  strictly after every backlog event — the direct Finding D regression and
+  an ordering check in one); `test_stop_clears_backlog_queues` (the new
+  `_channel_backlogs` dict is cleared by `stop()`, same as the pre-existing
+  dicts — an omission the reviewer didn't catch this round but was worth
+  closing proactively). Both pre-existing Finding C tests re-verified
+  against the two-queue split: `test_more_than_queue_depth_events_survive_a_closed_gate`
+  still passes (all backlog delivered, gate closed the whole time, never
+  touches the live queue); `test_queue_still_drops_on_overflow_once_gate_is_open`
+  still passes and now specifically exercises the live queue's `maxsize`
+  path (gate was already open before any dispatch in that test, so backlog
+  is empty and irrelevant — confirmed by re-reading the test, not assumed).
+
 ## Idle-expiry / auto-remove
 
 - Track `last_processed_ts` (already exists) per watcher; compare against
