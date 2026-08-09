@@ -804,7 +804,25 @@ the tenth round's own finding #25:
     posture — a transient network blip during startup must not
     permanently discard a legitimate session.
 
-## Startup ordering: root-cause design review (2026-08-07, PROPOSED — not yet implemented)
+## Startup ordering: root-cause design review (2026-08-07, REVERTED 2026-08-09 — see "Reverted" at the end of this section)
+
+**Read this first if you're new to this section**: everything below was
+built on the premise that #24/#27 (below) described a live, unclosed race
+that needed an architectural fix. That premise was wrong — both had
+already been closed by targeted fixes that shipped as part of PR #79
+itself, before this design review even started. The `start_realtime()` /
+dispatch-gate / two-queue mechanism this section designs, implements, and
+then repeatedly patches was prophylaxis against a *hypothetical* future
+instance of the same bug shape, not a fix for an open one — and that
+prophylaxis cost four real, confirmed data-loss bugs (Findings A/C/D/E)
+before the premise itself was checked. The mechanism has been fully
+reverted; nothing described in "Options considered" or "Implementation"
+below is live in the current code. Kept in full, not rewritten, as the
+record of how that conclusion was reached — see "Reverted" at the end for
+what actually ships and why. If you're deciding whether a *new* piece of
+`sync_watchers()`-owned state needs similar protection, read "Reverted"
+first, then verify against actual code whether it's already closed before
+reaching for a gate.
 
 Eleven review rounds in, a pattern was worth stepping back for instead of
 patching the next instance: **rounds ten and eleven found four findings
@@ -924,23 +942,29 @@ would deliver it isn't open yet. Verified safe by reading
   fix only needs to matter for a connector that actually calls
   `register_lazy_creation_hook()`.
 
-**Decision: recommend C, pending the repo owner's sign-off — not yet implemented.**
-Round ten and eleven's fixes for #24 (disk fallback in the stable-room-ID
-search) and #27 (`seed_blocked_agents()`) are **kept as defense-in-depth**
-either way, not reverted — they're already merged, already reviewed, and
+**Decision: C, approved by the repo owner and implemented.** Round ten and eleven's
+fixes for #24 (disk fallback in the stable-room-ID search) and #27
+(`seed_blocked_agents()`) are **kept as defense-in-depth**, not reverted —
 correct as a second line of defense even once the ordering itself is
 fixed (e.g. if a future connector or code path reintroduces a similar
-gap). #25/#28 are untouched regardless of which option is chosen, per the
-framing above.
+gap). #25/#28 are untouched, per the framing above.
 
 ### Process notes
 
-- **This belongs in a separate PR/branch, not folded into #79.** #79 is
+- **This lives in a separate branch/PR, not folded into #79.** #79 is
   already eleven review rounds and 28 findings deep; a change to
   `Connector`'s ABC and `SessionManager.run_once()`'s call order is a
   distinct, separable change from "lazy creation for Mattermost," and
   keeping it separate makes both easier to review and easier to revert
   independently if either turns out to have a problem in production.
+  Branched off `feature/lazy-watcher-mm-creation` (not `main`) because the
+  bug being fixed only exists once that branch's code
+  (`try_lazy_create()`, `register_lazy_creation_hook()`,
+  `seed_blocked_agents()`) is present — `main` has no lazy-creation hook
+  wired up yet, so this race is inert there. This second branch is
+  intended to merge INTO `feature/lazy-watcher-mm-creation` before (or as
+  part of) that branch's own merge to `main` as #79 — not merge to `main`
+  independently first.
 - **The existing rollout constraint applies here too, arguably more
   strictly.** Per the "Rollout" section below, nothing in this feature has
   touched macbook-server yet and a low-traffic test window must be
@@ -949,6 +973,422 @@ framing above.
   validate (ordering bugs are, by definition, about real-world timing) —
   this should get at least one live low-traffic startup cycle watched
   directly before being trusted, independent of the general rollout gate.
+
+### Implementation
+
+- `gateway/core/connector.py`: added `Connector.start_realtime()` —
+  non-abstract, default no-op, same pattern as
+  `register_capacity_check()`/`register_lazy_creation_hook()` above it.
+- `gateway/connectors/mattermost/connector.py`: `connect()` now does REST
+  auth only (`authenticate()`/`get_me()`/`resolve_team()`) plus
+  registering the websocket handler/reconnect callback (pure local
+  bookkeeping, confirmed by reading `MattermostWebSocketClient
+  .register_handler()`/`set_reconnect_callback()` — neither touches the
+  socket). `await self._ws.connect()` / `await self._ws.start()` moved
+  into a new `start_realtime()` override.
+- `gateway/core/session_manager.py`: `run_once()` now calls
+  `connector.connect()` → `lifecycle.sync_watchers()` →
+  `connector.start_realtime()`, in that order (previously `connect()`
+  did everything, `sync_watchers()` ran after).
+- **One deliberate, minor behavior change worth naming**: previously, a
+  WebSocket-open failure happened INSIDE `connect()`, before
+  `sync_watchers()` ever ran — no watcher work was attempted at all if
+  the socket couldn't open. Now, `sync_watchers()` runs (and can fully
+  succeed — provisioning sessions, registering local channel state) even
+  if the LATER `start_realtime()` call then fails to open the socket. The
+  failure still surfaces identically to before (`start_realtime()`'s
+  exception propagates out of `run_once()` exactly like `connect()`'s
+  used to, caught the same way by `GatewayService.run()`'s
+  `asyncio.gather(..., return_exceptions=True)`), and cleanup is
+  unaffected (`GatewayService.run()`'s `finally: await self.shutdown()`
+  unconditionally tears down every entry regardless of how far startup
+  got, and `SessionManager.shutdown()` → `WatcherLifecycle.stop_all()` /
+  `connector.disconnect()` are both already safe to call on partially- or
+  never-started state). Net effect: on a websocket-open failure, more
+  work happens before the failure surfaces than before, but the
+  end state (fully torn down, error reported) is identical.
+- Tests: `tests/unit/test_connector.py` (`start_realtime()` default is an
+  awaitable no-op), `tests/unit/test_mattermost_connector.py`
+  (`TestConnectStartRealtimeSplit` — `connect()` does REST auth and
+  registers callbacks but never touches the socket; `start_realtime()`
+  opens it and doesn't repeat REST auth), `tests/unit/test_session_manager_commands.py`
+  (`run_once()` calls `start_realtime()`, and specifically calls it AFTER
+  `sync_watchers()`, verified via real call-order tracking, not just
+  individual `assert_called` checks).
+
+### PR #80 review round (2026-08-07) — Finding A is a genuine regression in the design above, corrected
+
+GPT/Codex review on PR #80 itself (the branch implementing option C above)
+found two issues. Both were verified against actual code before being
+accepted, per the standing rule for every round in this document — and this
+one is worth being unusually explicit about, because the finding is against
+a design that had already been through advisor consultation and a three-
+option comparison, not against a quick patch.
+
+- **Finding A (P1) — confirmed real, and it falsifies the "removes the
+  window entirely" framing above.** Moving `_ws.connect()`/`_ws.start()`
+  into `start_realtime()` means the socket simply isn't open for the
+  entire `sync_watchers()` duration. Any message posted during that window
+  isn't merely deferred — it's **gone**: `MattermostWebSocketClient`'s
+  reconnect-triggered history replay (`_on_reconnect_cb`, driving
+  `_on_ws_reconnect()`'s REST catch-up) is wired to fire only from
+  `_reconnect()`, itself reachable only from `_listen_loop`'s
+  post-`ConnectionClosed` exception path — confirmed by grep to never run
+  on an initial `start()`. So option C did not remove the "drop vs. delay"
+  tradeoff that option B was criticized for above (see "The websocket is
+  still live and dispatching during the gap..." under option B) — it
+  silently resolved that tradeoff as "drop," and with a **wider** blast
+  radius than the narrower, previously-accepted case this feature already
+  lived with (a static watcher whose `subscribe_room()` hadn't run yet):
+  now *every* channel, for the *entire* `sync_watchers()` duration, loses
+  messages with zero recovery path. This is worse than option B, which at
+  least made an explicit, bounded "delay" choice. **The "Options
+  considered" section above is left unedited on purpose** (history, not
+  corrected in place) — this section is the correction.
+- **Finding B (P2) — confirmed real, secondary.** `MattermostConnector`'s
+  class docstring usage example, and the base `Connector.connect()` ABC
+  docstring's "Must be called once before the Connector can receive or
+  send messages," both stopped being true the moment `connect()` no longer
+  opened the socket. `SessionManager.run_once()` is the only current call
+  site, so this wasn't a live bug, but it's a real contract inconsistency.
+
+**Corrected design: gate delivery, not the connection.** The fix is not a
+fourth option — it's a repair to option C that keeps its shape (same
+`start_realtime()` method, same call position in `run_once()`, same
+ordering test) while removing the data loss:
+
+- `MattermostConnector.connect()` goes back to opening the websocket
+  (`await self._ws.connect()` / `await self._ws.start()`), same as before
+  option C ever existed. Nothing is lost at the transport layer from this
+  point on.
+- `MattermostWebSocketClient` already buffers: `_dispatch()` puts every
+  decoded event on a per-channel `asyncio.Queue` (bounded, depth 50,
+  overflow logged rather than silently dropped) the instant it arrives,
+  regardless of anything downstream. The only thing that needed delaying
+  was *draining* those queues, not receiving into them. Added a single
+  `asyncio.Event` (`_dispatch_gate`, closed by default) that each
+  `_channel_worker` now awaits once, at entry, before its drain loop —
+  events queue up normally while it's closed, and once
+  `open_dispatch_gate()` is called, every worker (already-running or
+  spun up later) drains and delivers in the original arrival order.
+- `MattermostConnector.start_realtime()` now just calls
+  `self._ws.open_dispatch_gate()` — no socket I/O. `SessionManager
+  .run_once()`'s call order (`connect()` → `sync_watchers()` →
+  `start_realtime()`) is **unchanged**, so `try_lazy_create()` still never
+  sees an event before local state is ready (Finding A doesn't reopen
+  #24/#27) — it's just that "not yet delivered" now means "queued," not
+  "never received."
+- Finding B fixed by updating both docstrings (base `Connector.connect()`
+  and `MattermostConnector`'s class example) to describe the corrected
+  two-phase contract accurately: `connect()` opens the transport and
+  begins queuing; `start_realtime()` is what makes queued/incoming events
+  actually reach the handler. The class usage example now calls
+  `start_realtime()` explicitly for direct (non-`run_once()`) callers.
+- One trade-off worth naming honestly: the dispatch gate is
+  **closed-by-default with no matching close operation** (opens once,
+  stays open). A direct caller that calls `connect()` but never calls
+  `start_realtime()` now receives nothing, ever — same failure mode
+  Finding B originally flagged, just moved from "socket never opens" to
+  "gate never opens." This was a deliberate choice (fail-safe over
+  fail-open, since `run_once()` — the only production caller — is a
+  security-relevant gate for `_blocked_agents`), not an oversight; the
+  docstring fix above is what makes the requirement discoverable instead
+  of silent.
+- Verified, not assumed: `MattermostWebSocketClient.stop()` already
+  cancels every task in `_channel_workers` unconditionally, so a worker
+  parked on a still-closed gate (e.g. shutdown ordered before
+  `start_realtime()` ever runs) is cancelled cleanly, not left hanging —
+  covered by a new regression test.
+- Tests: `tests/unit/test_mattermost_ws.py`'s new `TestDispatchGate` class
+  (events queue but don't deliver before the gate opens; buffered events
+  deliver in order once it does; the gate has no "close" once opened; a
+  worker parked on a closed gate is cancelled cleanly by `stop()`);
+  `TestConnectStartRealtimeSplit` in `test_mattermost_connector.py`
+  rewritten for the corrected split (`connect()` opens the socket;
+  `start_realtime()` only opens the gate).
+
+**Rollout note updated accordingly**: the live low-traffic startup-cycle
+observation called for in "Process notes" above should now also confirm
+that a message posted right at startup (during `sync_watchers()`) is
+delivered once ready, not merely that no error is logged — the previous
+design would not have failed loudly, it would have failed silently.
+
+### PR #80 review, second round (2026-08-07/08) — Finding C: the same bug class a third time, now fixed at the actual root
+
+GPT/Codex review found one more issue on the corrected design directly
+above, confirmed real before accepting: **the per-channel queue used to
+buffer events while the gate is closed was still constructed with
+`asyncio.Queue(maxsize=_CHANNEL_QUEUE_DEPTH)` (depth 50).** With no worker
+draining it while the gate is closed, the 51st event posted to one channel
+during `sync_watchers()` hits `QueueFull`, and `_dispatch()`'s existing
+`except asyncio.QueueFull: logger.warning(...)` handler drops it — silently,
+and with the socket staying connected the whole time, so no reconnect-replay
+ever runs to recover it either. This is the *same* data-loss bug class as
+Finding A, just re-introduced by the fix for Finding A, with a higher
+threshold (50 events, not 0) instead of being closed. Per the reviewer's
+own framing: "the new gate reuses the existing 50-item bounded queue without
+draining it."
+
+The reviewer again suggested "replay from the restored watermark when
+opening the gate" as an alternative. **Rejected again, for the identical
+reason given for Finding A above**: a brand-new lazy-creatable room has no
+channel/watermark state to replay from, so this suggestion cannot cover the
+one case this entire feature exists to handle, no matter how many times it
+recurs as a suggestion.
+
+**Fix: make capacity manual and gate-aware, instead of relying on
+`asyncio.Queue`'s built-in `maxsize`.** The queue is now always constructed
+unbounded (`asyncio.Queue()`); `_dispatch()` checks
+`self._dispatch_gate.is_set() and queue.qsize() >= _CHANNEL_QUEUE_DEPTH`
+before enqueuing, and only drops-with-a-warning under that condition. While
+the gate is closed, capacity is never checked — nothing can be dropped for
+being "too much," matching the requirement that a closed gate must buffer
+losslessly. Once the gate is open, a worker is guaranteed to be actively
+draining, so the check is behaviorally identical to the pre-#80 semantics:
+both `asyncio.Queue(maxsize=N).put_nowait()` and
+`qsize() >= N` evaluated at call time reject exactly the same events.
+
+**Accepted tradeoff, written down rather than left implicit (the exact
+category of omission this section exists to close):** for the duration
+between the gate closing and opening, one channel's queue can grow to
+`(inbound rate) × (sync_watchers() duration)` with no cap at all. This
+window is bounded in *time* — it ends the instant `sync_watchers()`
+returns — and by realistic chat pace, unlike the steady-state case
+`_CHANNEL_QUEUE_DEPTH` protects against (a handler stuck indefinitely).
+This is the same memory-growth caveat already named against option B
+above, accepted here for the same reason: a bounded delay beats an
+unbounded, silent loss.
+
+**Process note, said plainly rather than glossed over:** this is the third
+data-loss finding in this same area, and the second one against a fix that
+had already been reviewed once. Neither of the last two findings (A, C)
+came from a design re-read — both came from an independent reviewer
+reading the actual shipped diff and asking "what happens to the events in
+between?" The lesson isn't "get one more review pass" in the abstract; it's
+that **for this specific change, the failure mode is silent** (nothing
+logs, nothing raises, no existing test fails) — so the bar for calling it
+done has to be a test that positively proves delivery under load, not the
+absence of an error. The regression tests added below are deliberately
+built around that: they assert what *does* arrive, not just that nothing
+crashes.
+
+- `gateway/connectors/mattermost/websocket.py`: `_CHANNEL_QUEUE_DEPTH`'s
+  comment corrected — it no longer describes an `asyncio.Queue`-enforced
+  bound; the queue is unbounded, the constant is a manually-checked
+  threshold applied only once the dispatch gate is open. `_dispatch()`'s
+  docstring documents the accepted unbounded-while-closed tradeoff inline.
+- Tests: `tests/unit/test_mattermost_ws.py` —
+  `test_more_than_queue_depth_events_survive_a_closed_gate` (posts
+  `_CHANNEL_QUEUE_DEPTH + 20` events to one channel with the gate closed,
+  then opens it, and asserts every single one is delivered in order — the
+  direct regression test for Finding C); `test_queue_still_drops_on_overflow_once_gate_is_open`
+  (gate already open, worker parked mid-handler, fills the queue to exactly
+  `_CHANNEL_QUEUE_DEPTH`, asserts the next event is dropped and never
+  delivered — pins the pre-#80 drop behavior at the `_dispatch()` level,
+  which no test did before this round, so a future change back to
+  unconditional unbounded queuing would be caught here).
+
+### PR #80 review, third round (2026-08-08) — Finding D: fixing Finding C created a new false-positive drop, fixed by splitting into two queues
+
+GPT/Codex found a fourth issue in this same area, confirmed real: **Finding
+C's fix (a single unbounded queue with a manual `qsize() >= _CHANNEL_QUEUE_DEPTH`
+check applied once the gate opens) moved the loss window rather than
+closing it.** If a channel's startup backlog exceeds `_CHANNEL_QUEUE_DEPTH`
+(the exact scenario Finding C's own fix was written to allow), then the
+moment the gate opens, `qsize()` starts at whatever the backlog grew to —
+above depth — and stays above depth until the worker drains it back down.
+Any *live* event arriving during that drain-down, even with a perfectly
+healthy WebSocket and handler, hits the same `qsize() >= _CHANNEL_QUEUE_DEPTH`
+check and gets dropped as if it were steady-state overflow, when it isn't:
+nothing is stuck, the queue is just working through a legitimate backlog.
+In the reviewer's own words: "making the startup queue unbounded merely
+moves the loss window to immediately after the gate opens."
+
+**Root cause of both C and D, named plainly rather than patched around
+again: a single queue conflates two different things — "how much startup
+backlog is left to drain" and "is the handler currently keeping up with
+live traffic" — that need independent capacity semantics.** Comparing one
+queue's size against one threshold cannot answer both questions correctly
+at once, no matter where the threshold is set or when it's checked. Every
+fix so far (unbounded-while-closed for C, gate-aware check for the same
+fix) was a correct answer to the wrong question.
+
+**Fix: two queues per channel, not one, matching the two distinct
+concerns exactly:**
+- `_channel_backlogs[channel_id]` — unbounded, written to only while the
+  gate is closed. This is the startup buffer; nothing here is ever dropped
+  for volume, by construction (there's no capacity check on this path at
+  all).
+- `_channel_queues[channel_id]` — bounded at `_CHANNEL_QUEUE_DEPTH` via
+  `asyncio.Queue`'s own `maxsize` again (back to the original, pre-#80
+  mechanism), written to only once the gate is open. A live event's fate
+  now depends *only* on live-queue depth, never on how large the startup
+  backlog was or how far the worker has gotten through it.
+- `_channel_worker` waits for the gate, then fully drains `backlog_queue`
+  (unbounded, in arrival order) before touching `live_queue` at all. This
+  is safe because nothing can write to `backlog_queue` after the gate
+  opens (`_dispatch()`'s branch on `self._dispatch_gate.is_set()` has no
+  `await` before the write, and `_listen_loop` dispatches events strictly
+  sequentially — confirmed by reading both, not assumed) — so once the
+  worker starts the backlog-drain loop, that queue can only shrink.
+  Draining backlog fully before live traffic also preserves overall
+  arrival order: nothing buffered before the gate opened can be delivered
+  after something that arrived post-gate.
+- The handler-invocation body (semaphore + try/except around
+  `self._handler(decoded)`) was pulled into one shared `_invoke_handler()`
+  helper, used by both the backlog-drain and live-drain loops — three
+  near-identical copies of that block across two fix rounds was exactly
+  how this kind of thing keeps recurring.
+
+**One overflow path is now real and is NOT a repeat of Finding D — said
+explicitly so it doesn't get filed as a fifth finding:** if live traffic
+itself exceeds `_CHANNEL_QUEUE_DEPTH` while the backlog is still draining,
+live events do get dropped. That's genuine backpressure (the handler
+can't keep up with live traffic on top of catching up on backlog) — the
+distinguishing fact about Finding D was that a *healthy* handler with *no*
+live-traffic overload still got events dropped purely because of backlog
+volume. With two independent queues, that specific failure mode is gone;
+true overload is a different, legitimate case with the same accepted
+drop-with-a-warning behavior it always had.
+
+**Scope note, said directly rather than glossed over:** this is the fourth
+finding in this area, the third against a fix to the *same* mechanism
+(`_dispatch()`/`_channel_worker`), and each individual fix was locally
+correct for the case it addressed. That pattern is a signal about the
+layer, not about care taken: transport-level buffering keeps growing new
+edge cases because the actual problem — "don't let `WatcherLifecycle` see
+an event before its state is ready" — lives one layer up, in
+`WatcherLifecycle`/`try_lazy_create()`. Option B from the original design
+review (a readiness gate inside `WatcherLifecycle` itself, awaited at the
+top of `try_lazy_create()`) was passed over partly on the cost of updating
+~50 existing tests in `test_watcher_lifecycle_lazy_create.py` — three
+rounds of transport-layer surgery have now cost more than that estimate,
+and touched code (`_dispatch()`, queue capacity, worker draining) with a
+much larger blast radius than `try_lazy_create()` alone. **Not being
+revisited in this PR** — landing this fix and getting #80 green is the
+immediate goal — but if a fifth finding lands inside `_dispatch()` or
+`_channel_worker` specifically, the answer should be to move the gate up
+to `WatcherLifecycle`, not to patch the transport layer a fourth time.
+This is a scope question for the repo owner, not a decision made unilaterally here.
+
+- Tests: `tests/unit/test_mattermost_ws.py` —
+  `test_live_event_delivered_while_backlog_still_draining` (backlog of
+  `_CHANNEL_QUEUE_DEPTH + 20`, gate opens, handler is parked mid-drain via
+  an `asyncio.Event` so a live event can be injected while backlog draining
+  is still in progress, asserts the live event is delivered and delivered
+  strictly after every backlog event — the direct Finding D regression and
+  an ordering check in one); `test_stop_clears_backlog_queues` (the new
+  `_channel_backlogs` dict is cleared by `stop()`, same as the pre-existing
+  dicts — an omission the reviewer didn't catch this round but was worth
+  closing proactively). Both pre-existing Finding C tests re-verified
+  against the two-queue split: `test_more_than_queue_depth_events_survive_a_closed_gate`
+  still passes (all backlog delivered, gate closed the whole time, never
+  touches the live queue); `test_queue_still_drops_on_overflow_once_gate_is_open`
+  still passes and now specifically exercises the live queue's `maxsize`
+  path (gate was already open before any dispatch in that test, so backlog
+  is empty and irrelevant — confirmed by re-reading the test, not assumed).
+
+### PR #80 review, fourth round (2026-08-09) — Finding E, and the question that ended the mechanism instead of extending it again
+
+A fifth issue landed (Finding E, P1, on `_channel_worker`'s strict
+backlog-then-live draining order): with a large enough backlog, more than
+`_CHANNEL_QUEUE_DEPTH` live events can arrive while the worker is still
+occupied draining backlog, overflowing the live queue and dropping
+messages even when the handler is fast enough to keep up with live
+traffic — it's just sequentially blocked behind backlog by construction,
+not actually overloaded. Real, per the reviewer's framing: "the new
+separate live queue is still capped at 50 while these lines refuse to
+drain it until the entire backlog is gone."
+
+At this point the repo owner gave two explicit instructions that changed the shape
+of the response: (1) fix it in the *right layer*, not with a fifth patch
+to this one; (2) never again let "this would require updating many
+existing tests" be a reason to avoid the architecturally correct fix — and
+requested two independent advisor passes specifically so this wouldn't
+turn into another round of patching.
+
+**First advisor pass: moving the gate into `WatcherLifecycle.try_lazy_create()`
+was also wrong, and for a sharper reason than test-migration cost.**
+Any gate placed on the handler call path — transport-level or inside
+`try_lazy_create()` — inherits the same drop-vs-delay problem in different
+clothes, plus a new one specific to `try_lazy_create()`: `_channel_worker`
+holds `_callback_sem` (`_CALLBACK_CONCURRENCY = 20`, connector-wide) for
+the full duration of `await self._handler(...)`. Twenty channels parked
+awaiting a `WatcherLifecycle`-level gate during `sync_watchers()` would
+hold all twenty permits connector-wide, stalling delivery to *every*
+channel — including ones for static watchers that had already started
+successfully. Worse than anything Findings A/C/D/E produced. The
+generalizable test: **any fix that puts an `await` on the handler call
+path inherits drop-vs-delay and (if it shares the semaphore) can cascade
+connector-wide — regardless of which file the `asyncio.Event` lives in.**
+
+**Second advisor pass, prompted by asking "does this need a gate at all?"
+instead of "which layer should the gate live in": no gate is needed
+anywhere, because #24 and #27 were never actually open by the time this
+whole redesign began.** Verified directly against code, not assumed:
+
+- **#24** (`_states` cold during the startup window): `try_lazy_create()`
+  already has a disk-read fallback (added in PR #79's tenth round,
+  untouched by any of this) that reads `self._state_store.load()` directly
+  when in-memory `self._states` doesn't have an entry — explicitly
+  documented as authoritative "this early in the process's life," because
+  nothing has been mutated in memory that isn't already on disk. This
+  closes the dormant/renamed-watcher lookup case independent of whether
+  `sync_watchers()` has run yet.
+- More fundamentally: `self._watcher_configs` (which the *first*,
+  by-room collision check scans) is populated once at `WatcherLifecycle`
+  construction, directly from loaded config — **not** built up
+  progressively by `sync_watchers()`. A statically-configured room is
+  findable via `existing_for_room` at every point in the connector's
+  lifetime, including before `sync_watchers()` has reached it. If that
+  room's watcher hasn't started yet, the existing check
+  (`existing_for_room.name not in self._processors → return False`,
+  PR #79's fourth round) correctly refuses and the triggering message
+  drops — the same narrow, already-accepted "static watcher not yet
+  subscribed" case this whole feature always lived with, not a new
+  regression. Confirmed fail-safe, not corrupting: it refuses to act, it
+  doesn't act on wrong state.
+- **#27** (`_blocked_agents` empty during the startup window):
+  `seed_blocked_agents()` (PR #79's eleventh round, also untouched by any
+  of this) is the *first line* of `run_once()`, called before
+  `connector.connect()` — `_blocked_agents` is correctly populated before
+  the websocket can possibly open, independent of anything in this
+  section.
+
+**Conclusion: the entire `start_realtime()` / dispatch-gate / two-queue
+mechanism has been reverted.** `gateway/core/connector.py`,
+`gateway/connectors/mattermost/connector.py`,
+`gateway/connectors/mattermost/websocket.py`, `gateway/core/session_manager.py`,
+and their test files are back to exactly their state on
+`feature/lazy-watcher-mm-creation` (verified via
+`git diff origin/feature/lazy-watcher-mm-creation -- . ':!docs/*'` being
+empty before this revert commit). `gateway/core/watcher_lifecycle.py` and
+its tests were never touched by any of this — #24/#27's actual fixes were
+never part of this branch, confirmed by the same diff being empty against
+`watcher_lifecycle.py` for the whole lifetime of `feature/mm-startup-ordering`.
+PR #80 is reduced to a docs-only PR: this section, in full, as the record
+of how the conclusion was reached.
+
+**The lesson, stated precisely because a nearby-sounding one is already in
+memory and this is a different point:** the failure here was not
+"rejecting Option B over test-migration cost" (real, and worth its own
+correction, but secondary). It was that **the redesign was never
+necessary in the first place** — #24 and #27 were reframed from "these
+shipped fixes closed a real bug" into "a hypothetical future instance of
+this bug shape might exist," and four rounds were spent paying for that
+speculation before anyone checked whether the originally-motivating bug
+was still open. Next time a design review starts from "here's a bug class
+worth closing structurally," the first step is verifying the motivating
+instance is still open against current code — not just true when the
+finding was originally filed.
+
+- Finding E's thread: closed as "mechanism deleted, not patched" —
+  the reply states the WHY (solving a problem already solved one layer
+  up, not "we found a simpler approach") so a future reviewer doesn't
+  re-propose the same gate.
+- Tests: full unit + integration suite re-run after the revert to confirm
+  it's byte-for-byte equivalent to `feature/lazy-watcher-mm-creation`'s
+  own (already-green) test state, not just "still green" by coincidence.
 
 ## Idle-expiry / auto-remove
 
