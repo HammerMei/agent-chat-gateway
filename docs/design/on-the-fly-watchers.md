@@ -1,6 +1,6 @@
 # On-the-fly watchers: rule-based room matching + lazy watcher lifecycle
 
-Status (updated 2026-08-09, round 12): **config schema landed (PR #77); rule-based
+Status (updated 2026-08-10, round 14): **config schema landed (PR #77); rule-based
 room matching + lazy creation landed for Mattermost.** RocketChat support,
 `session_id`/`online_notification`/`offline_notification` retirement, and
 the `expire` CLI are still design-only. Coordinating a low-traffic
@@ -964,6 +964,73 @@ small, same-file corrections to the same round's own fixes — no case here
 for splitting further). Full unit (2172) + integration (219) suites green.
 All 36 PR #79 review threads now resolved.
 
+### PR #79 review, fourteenth round (2026-08-10) — one fixed, one deferred as an Open Item
+
+Two more findings, again against code from the round directly above —
+third consecutive round where every finding lands on the immediately
+preceding round's own fixes (12 → 13 → 14). Noted explicitly to the repo
+owner as a signal that `watcher_lifecycle.py`'s dynamic-watcher path has
+accumulated more interacting invariants (pause-respect, cross-connector
+reservation, dynamic provenance, room-identity, agent-identity,
+blocked-agents) than local patches can reliably hold correct — not a
+reason to stop, but a reason to ask whether this file should keep taking
+new rounds before PR #79 merges, or whether the remaining scope should
+wait.
+
+37. **(Fixed) `wake_dormant_watcher()` didn't recheck `paused` after
+    acquiring the lock.** It snapshots `state` before acquiring
+    `self._get_watcher_lock(name)`. If a concurrent `pause_watcher()` call
+    acquired that same lock first and completed — mutating `state.paused`
+    in place, or (if no state existed yet) installing a fresh paused
+    `WatcherState` — the pre-lock snapshot was stale by the time
+    `wake_dormant_watcher()` got the lock. Its in-lock recheck covered
+    only `_processors`, not `paused`, so `_start_watcher()` ran anyway and
+    silently undid the completed pause, letting a scheduled message fire
+    against a watcher the operator had just paused. Fixed by re-fetching
+    `state = self._states.get(name)` immediately after acquiring the lock
+    and rechecking `paused`/`dynamically_created` there too — mirroring
+    the existing `_processors` recheck already at that spot. Regression
+    test drives the actual interleaving directly (holds the per-name
+    lock, starts `wake_dormant_watcher()` in a task so it blocks
+    acquiring it, mutates `state.paused = True` to simulate the
+    concurrent pause completing, releases the lock, asserts the wake is
+    refused) rather than mocking around it; confirmed it fails on the
+    pre-fix code.
+38. **(Deferred) `_dynamic_state_still_matches_rule()`'s fast path never
+    resolves the room when the active rule has no `exclude_rooms`.** A
+    deleted/moved room's dynamic state is therefore preserved on every
+    startup forever, and its generated name stays reserved via
+    `is_watcher_name_known()` forever too — real, but checked the blast
+    radius before deciding whether to patch it here: `auto_watcher_name()`
+    prefixes the *owning* connector's own name into every generated
+    dynamic name, and `_reserve_watcher_name()` already excludes the
+    requesting connector's own entry from its scan (ninth round, finding
+    #23). So the zombie can only ever be observed by a **different**
+    connector, and only if that connector happens to have a *static*
+    watcher explicitly named to collide with `<this-connector>-<room>` —
+    narrow and mostly coincidental, not the common path. A proper fix
+    needs a connector-agnostic "room genuinely gone" signal, distinct
+    from a transient resolution error (which must still preserve
+    conservatively, per this method's existing philosophy) — and that
+    signal doesn't exist at this layer today: `RoomNotFoundError` is
+    defined independently by `mattermost/rest.py` and `rocketchat/rest.py`
+    as two unrelated classes, with no shared contract on `Connector`
+    (`gateway/core/connector.py`). Building that properly is a 4-file
+    change (a core exception + both `rest.py` implementations + this call
+    site) — importing Mattermost's connector-specific exception into core
+    just to close this one P2 would be the wrong direction for this
+    file's layering, for a fix this narrow in practice. Logged below as
+    an Open Item instead; natural to pick up alongside RC's own
+    lazy-creation path, since that's when a second connector actually
+    implementing `resolve_room_by_id()` makes the connector-agnostic
+    contract worth building.
+
+Finding #37 landed alone (finding #38 has no code change this round).
+Full unit (2173) + integration (219) suites green. All 38 PR #79 review
+threads now resolved — 0 unresolved as of this round, confirmed via a
+follow-up GraphQL query rather than assumed (see the "28/28" correction
+two rounds above for why that check is now standard practice here).
+
 ## Startup ordering: root-cause design review (2026-08-07, REVERTED 2026-08-09 — see "Reverted" at the end of this section)
 
 **Read this first if you're new to this section**: everything below was
@@ -1630,6 +1697,27 @@ a one-time reminder.
 
 ## Open items / not yet resolved
 
+- **`_dynamic_state_still_matches_rule()`'s fast path never resolves the
+  room when the active rule has no `exclude_rooms` (found during PR #79
+  review, fourteenth round, finding #38).** A deleted/moved room's dynamic
+  state is preserved on every startup forever, and its generated name
+  stays reserved via `is_watcher_name_known()` forever too. Checked blast
+  radius before deferring: `auto_watcher_name()` prefixes the *owning*
+  connector's own name into every generated dynamic name, and
+  `_reserve_watcher_name()` already excludes the requesting connector's
+  own entry from its scan — so this can only ever be observed by a
+  *different* connector with a *static* watcher explicitly named to
+  collide with `<this-connector>-<room>`, a narrow, mostly-coincidental
+  trigger. Proper fix needs a connector-agnostic "room genuinely gone"
+  signal distinct from a transient resolution error (which must keep
+  preserving conservatively) — `RoomNotFoundError` is currently defined
+  independently by `mattermost/rest.py` and `rocketchat/rest.py` as two
+  unrelated classes, with no shared contract on the `Connector` ABC
+  (`gateway/core/connector.py`). Real fix is a 4-file change: a core
+  exception + both `rest.py` implementations + this call site. Natural
+  to build alongside RC's own lazy-creation path, since that's the point
+  a second connector actually implements `resolve_room_by_id()` and the
+  shared contract becomes worth having rather than speculative.
 - **`gateway/config_validate.py`'s `_check_state_orphans()` doesn't know
   about lazily-created watchers (found 2026-08-05, not fixed).** It builds
   its "is this state.json entry still configured" set from `config.watchers`
