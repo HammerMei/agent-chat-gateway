@@ -887,10 +887,21 @@ class WatcherLifecycle:
             (`_ensure_agent_available()`) — a scheduled job must not be
             able to force-start a watcher whose agent's permission broker
             failed, any more than a live message can.
+          - Cross-connector reservation via `_reserve_global_name()`,
+            same rationale as `try_lazy_create()`'s own (PR #79 review,
+            fourth/seventh/ninth rounds): a dormant dynamic watcher's name
+            is invisible to config-load-time uniqueness checks (it's never
+            in config.yaml), so a static watcher configured on a DIFFERENT
+            connector after this one went dormant could already be live
+            under this exact name by the time a scheduled job wakes it —
+            without reserving first, both would end up as live processors
+            sharing a supposedly globally-unique name, breaking every
+            piece of routing that assumes one owner per name.
 
         Returns True if the watcher is now running (already was, or was
         successfully started here); False if it doesn't exist, is paused,
-        isn't a dynamic watcher, or failed to start.
+        isn't a dynamic watcher, the name is claimed by a different
+        connector, or it failed to start.
         """
         if name in self._processors:
             return True
@@ -900,7 +911,17 @@ class WatcherLifecycle:
         async with self._get_watcher_lock(name):
             if name in self._processors:
                 return True
+            reserved = False
             try:
+                if not await self._reserve_global_name(name):
+                    logger.warning(
+                        "wake_dormant_watcher: name '%s' is already used "
+                        "by a watcher on a different connector — refusing "
+                        "to wake (watcher names must be globally unique).",
+                        name,
+                    )
+                    return False
+                reserved = True
                 wc = await self._find_or_reconstruct_watcher_config(name)
                 self._ensure_agent_available(wc)
                 await self._start_watcher(wc, state)
@@ -910,6 +931,14 @@ class WatcherLifecycle:
                     "watcher '%s' for scheduled delivery: %s", name, e,
                 )
                 return False
+            finally:
+                # Same release discipline as try_lazy_create(): on success
+                # the name is now durably visible via `_watcher_configs`/
+                # `_processors` (no reservation needed to prove ownership
+                # going forward); on any failure after a real reservation,
+                # it must not be left stuck "reserved" forever.
+                if reserved:
+                    self._release_global_name(name)
             return True
 
     def get_watcher_config(self, watcher_name: str) -> "WatcherConfig | None":
@@ -1151,17 +1180,10 @@ class WatcherLifecycle:
         # are backend-specific: handing an old Claude session ID to
         # OpenCode (or vice versa) would either fail to resume or, worse,
         # attach to an unrelated session that happens to share the ID
-        # format. Discarding the WHOLE state here (not just session_id) —
-        # same treatment as the room-id mismatch just above — is
-        # deliberate: reusing the old `context_injected=True` against a
-        # brand-new session on a different backend would skip re-injecting
-        # the identity header/durable context entirely, and this also
-        # means the history-handoff block below correctly fires again
-        # (created_new_session=True), same as any other fresh session.
-        # `state.agent == ""` (every state persisted before this field
-        # existed) is treated as "unknown — assume compatible" so this
-        # doesn't force-reset every already-running watcher's session on
-        # the first restart after this ships. Does not affect a pinned
+        # format. `state.agent == ""` (every state persisted before this
+        # field existed) is treated as "unknown — assume compatible" so
+        # this doesn't force-reset every already-running watcher's session
+        # on the first restart after this ships. Does not affect a pinned
         # `wc.session_id` — that short-circuits inside _provision_session()
         # before `state` is even consulted, by design; pinning a session ID
         # is an explicit, static operator choice, not something that can
@@ -1175,7 +1197,38 @@ class WatcherLifecycle:
                 "reused across agents).",
                 wc.name, state.agent, agent_name,
             )
-            state = None
+            # Unlike the room-id mismatch just above (genuinely a
+            # DIFFERENT room/watcher's leftover data — full discard is
+            # correct there), this state IS still this exact watcher's own
+            # identity: same room, same name, just needing a fresh session
+            # under the new agent. A full `state = None` here would lose
+            # `dynamically_created` along with the session fields — the
+            # rest of this method sources it via `state.dynamically_created
+            # if state else False`, so nulling `state` entirely silently
+            # writes `dynamically_created=False` into the replacement
+            # WatcherState below. Whether that's caught depends entirely on
+            # the caller: try_lazy_create() re-sets the flag explicitly
+            # right after calling this method, but resume_watcher()/
+            # reset_watcher()/wake_dormant_watcher() do NOT — they rely
+            # exactly on this carry-forward (the fifth round's own fix, see
+            # its comment below at the `ws.dynamically_created=` line) to
+            # keep it set. Losing it there means sync_watchers() prunes
+            # this watcher as a removed one on the NEXT restart, abandoning
+            # it a second time. Preserving dynamically_created/room_id/
+            # room_type (all unaffected by an agent change) while
+            # resetting only the session-specific fields keeps that
+            # carry-forward working regardless of which caller reached here.
+            state = WatcherState(
+                watcher_name=state.watcher_name,
+                session_id="",
+                room_id=state.room_id,
+                room_type=state.room_type,
+                context_injected=False,
+                paused=False,
+                last_processed_ts="",
+                dynamically_created=state.dynamically_created,
+                agent="",
+            )
 
         # 2. Provision session
         session_id, created_new_session = await self._provision_session(

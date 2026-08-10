@@ -1326,9 +1326,15 @@ class TestStartWatcherDiscardsStateOnAgentMismatch(unittest.IsolatedAsyncioTestC
     """PR #79 review: _start_watcher() must not reuse a persisted session
     whose agent doesn't match this watcher's CURRENT resolved agent —
     e.g. a wildcard rule's `agent:` was edited in config.yaml between
-    restarts. Session IDs are backend-specific; same treatment as the
-    room-id mismatch above (discard the WHOLE state, not just session_id,
-    so context_injected/dynamically_created also reset correctly)."""
+    restarts. Session IDs are backend-specific, so the session-specific
+    fields (session_id, context_injected, last_processed_ts) reset — but
+    UNLIKE the room-id mismatch above (genuinely a different room/
+    watcher's leftover data), this state is still this exact watcher's
+    own identity: dynamically_created/room_id/room_type must be
+    PRESERVED, not discarded, or a dynamic watcher resumed/reset/
+    scheduler-woken after its rule's agent changes would silently lose
+    its dynamic-provenance marker and get pruned by sync_watchers() on
+    the next restart (a second review finding on top of the first)."""
 
     async def test_mismatched_agent_discards_state_and_creates_fresh_session(self):
         other_agent = AsyncMock()
@@ -1368,7 +1374,45 @@ class TestStartWatcherDiscardsStateOnAgentMismatch(unittest.IsolatedAsyncioTestC
         # having run for this fresh session (not just left True by accident).
         self.assertTrue(ws.context_injected)
         other_agent.ensure_durable_instructions.assert_awaited_once()
-        self.assertFalse(ws.dynamically_created)  # discarded, not carried over
+        # dynamically_created must be PRESERVED — same identity, only the
+        # session-specific fields reset (see class docstring).
+        self.assertTrue(ws.dynamically_created)
+        self.assertEqual(ws.room_id, "chan-1")
+
+    async def test_resume_after_agent_change_preserves_dynamic_marker_for_next_restart(self):
+        """The actual regression this preservation fix targets:
+        resume_watcher() (unlike try_lazy_create()) has NO explicit
+        post-hoc fixup for dynamically_created — it relies entirely on
+        _start_watcher()'s carry-forward from the incoming state. Before
+        this fix, an agent mismatch discarding the whole state silently
+        dropped the marker here, and sync_watchers() would prune this
+        watcher as a removed one on the NEXT restart."""
+        other_agent = AsyncMock()
+        other_agent.create_session = AsyncMock(return_value="new-sess-id")
+        other_agent.send = AsyncMock(return_value=MagicMock(is_error=False, text="ok"))
+        other_agent.ensure_durable_instructions = AsyncMock(return_value=None)
+        other_agent.delete_session = AsyncMock(return_value=True)
+
+        lifecycle, connector, claude_agent, state_store = _make_lifecycle(
+            rules=[_rule(agent="opencode")],
+            resolved_room=Room(id="chan-1", name="general", type="channel"),
+            extra_agents={"opencode": other_agent},
+        )
+        dormant_state = WatcherState(
+            watcher_name="mm-home-general", session_id="claude-sess", room_id="chan-1",
+            agent="claude", dynamically_created=True,
+        )
+        state_store.load = MagicMock(return_value={"mm-home-general": dormant_state})
+        lifecycle._states["mm-home-general"] = dormant_state
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            await lifecycle.resume_watcher("mm-home-general")
+
+        ws = lifecycle._states["mm-home-general"]
+        self.assertTrue(ws.dynamically_created)
+        self.assertEqual(ws.room_id, "chan-1")
+        other_agent.create_session.assert_awaited_once()
 
     async def test_matching_agent_state_is_still_reused_normally(self):
         lifecycle, connector, agent, state_store = _make_lifecycle(rules=None)
@@ -1504,6 +1548,59 @@ class TestWakeDormantWatcher(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result)
         agent.create_session.assert_not_called()
+
+    async def test_name_claimed_by_another_connector_is_not_woken(self):
+        """PR #79 review: without a cross-connector reservation, a static
+        watcher configured on a DIFFERENT connector after this one went
+        dormant (invisible to config-load-time uniqueness — it's not in
+        config.yaml) could already be live under this exact name by the
+        time a scheduled job wakes it, ending up with two live processors
+        sharing a supposedly globally-unique name."""
+        reserve = AsyncMock(return_value=False)  # another connector already owns it
+        release = MagicMock()
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=[_rule()],
+            resolved_room=Room(id="chan-1", name="general", type="channel"),
+            reserve_global_name=reserve,
+            release_global_name=release,
+        )
+        dormant_state = WatcherState(
+            watcher_name="mm-home-general", session_id="old-sess", room_id="chan-1",
+            paused=False, dynamically_created=True,
+        )
+        lifecycle._states["mm-home-general"] = dormant_state
+        state_store.load = MagicMock(return_value={"mm-home-general": dormant_state})
+
+        result = await lifecycle.wake_dormant_watcher("mm-home-general")
+
+        self.assertFalse(result)
+        agent.create_session.assert_not_called()
+        reserve.assert_awaited_once_with("mm-home-general")
+        release.assert_not_called()  # never reserved — nothing to release
+
+    async def test_reservation_is_released_after_successful_wake(self):
+        reserve = AsyncMock(return_value=True)
+        release = MagicMock()
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=[_rule()],
+            resolved_room=Room(id="chan-1", name="general", type="channel"),
+            reserve_global_name=reserve,
+            release_global_name=release,
+        )
+        dormant_state = WatcherState(
+            watcher_name="mm-home-general", session_id="old-sess", room_id="chan-1",
+            paused=False, dynamically_created=True,
+        )
+        lifecycle._states["mm-home-general"] = dormant_state
+        state_store.load = MagicMock(return_value={"mm-home-general": dormant_state})
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            result = await lifecycle.wake_dormant_watcher("mm-home-general")
+
+        self.assertTrue(result)
+        reserve.assert_awaited_once_with("mm-home-general")
+        release.assert_called_once_with("mm-home-general")
 
 
 if __name__ == "__main__":
