@@ -916,6 +916,54 @@ section showed what a single large commit in this area costs when a
 review finds a problem with only part of it. Full unit (2169) + integration
 (219) suites green after all six.
 
+### PR #79 review, thirteenth round (2026-08-10) — two findings against the twelfth round's own fixes
+
+Two more findings landed almost immediately, both against fixes #30 and
+#34 from the round directly above — the exact pattern the startup-ordering
+saga trained everyone to expect by now, caught fast because each fix was
+verified against actual code rather than assumed correct on submission.
+
+35. **The agent-mismatch discard (finding #30) lost `dynamically_created`.**
+    Building the replacement state as `state = None` reset EVERYTHING,
+    including the identity marker that isn't actually agent-specific.
+    Unlike the pre-existing room-id mismatch (genuinely a different room's
+    leftover data, where full discard is correct), an agent mismatch is
+    still the same watcher's own identity — only session_id/
+    context_injected/last_processed_ts should reset.
+    `try_lazy_create()` masked this by re-setting the flag explicitly
+    right after calling `_start_watcher()` (an existing, unrelated line
+    from the fifth round), but `resume_watcher()`/`reset_watcher()`/
+    `wake_dormant_watcher()` (finding #34, THIS round) have no such
+    fixup — they rely entirely on `_start_watcher()`'s carry-forward from
+    the incoming `state`. Losing the marker there means `sync_watchers()`
+    prunes the watcher as removed on the next restart, abandoning it a
+    second time. Fixed by replacing the full `state = None` with a new
+    `WatcherState` that preserves `dynamically_created`/`room_id`/
+    `room_type` and resets only the session-specific fields. Regression
+    test exercises this through `resume_watcher()` specifically (not
+    `try_lazy_create()`, which would have masked the bug) — it would have
+    failed before the fix.
+36. **`wake_dormant_watcher()` (finding #34) started a watcher with no
+    cross-connector reservation.** `try_lazy_create()` has always reserved
+    the name via `_reserve_global_name()` before starting, for exactly
+    this reason: a dormant dynamic watcher's name is invisible to
+    config-load-time uniqueness checks (never in config.yaml), so a
+    static watcher configured on a DIFFERENT connector after this one
+    went dormant could already be live under the same name by the time a
+    scheduled job wakes it — leaving two processors sharing a supposedly
+    globally-unique name. Finding #31 (also this round) closed the
+    equivalent gap for CLI pause/resume/reset routing, but that fix never
+    touched this scheduler-driven path, since the scheduler calls
+    `SessionManager.inject_message()` directly and never goes through
+    `ControlServer.dispatch_command()`'s ambiguity check at all. Fixed by
+    reserving before reconstructing/starting, with the same try/finally
+    release discipline `try_lazy_create()` already uses.
+
+Both confirmed real before being accepted. Landed as one commit (both are
+small, same-file corrections to the same round's own fixes — no case here
+for splitting further). Full unit (2172) + integration (219) suites green.
+All 36 PR #79 review threads now resolved.
+
 ## Startup ordering: root-cause design review (2026-08-07, REVERTED 2026-08-09 — see "Reverted" at the end of this section)
 
 **Read this first if you're new to this section**: everything below was
