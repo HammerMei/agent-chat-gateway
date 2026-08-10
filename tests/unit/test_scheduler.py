@@ -1253,5 +1253,84 @@ class TestInjectMessageTimestampFormat(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ts:", prefix)
 
 
+class TestInjectMessageWakesDormantWatcher(unittest.IsolatedAsyncioTestCase):
+    """PR #79 review: SessionManager.inject_message() must attempt to
+    auto-wake a dormant dynamic watcher (via WatcherLifecycle
+    .wake_dormant_watcher()) before giving up — without this, a scheduled
+    job for an on-the-fly watcher was silently skipped every tick until
+    unrelated channel traffic happened to wake it."""
+
+    def _make_sm(self, *, wake_result: bool, processor_after_wake=None):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from gateway.core.session_manager import SessionManager
+
+        mock_processor_after_wake = processor_after_wake or MagicMock()
+        mock_processor_after_wake.enqueue = AsyncMock(return_value=True)
+
+        mock_lifecycle = MagicMock()
+        # No processor until wake_dormant_watcher() succeeds.
+        get_processor_calls = {"n": 0}
+
+        def _get_processor(name):
+            get_processor_calls["n"] += 1
+            if get_processor_calls["n"] == 1:
+                return None  # first check: nothing running yet
+            return mock_processor_after_wake if wake_result else None
+
+        mock_lifecycle.get_processor = MagicMock(side_effect=_get_processor)
+        mock_lifecycle.wake_dormant_watcher = AsyncMock(return_value=wake_result)
+        mock_lifecycle.get_watcher_state = MagicMock(return_value=None)
+        mock_lifecycle.get_watcher_config = MagicMock(return_value=None)
+
+        sm = SessionManager.__new__(SessionManager)
+        sm._lifecycle = mock_lifecycle
+        return sm, mock_lifecycle, mock_processor_after_wake
+
+    async def test_successful_wake_delivers_the_message(self):
+        sm, lifecycle, processor = self._make_sm(wake_result=True)
+
+        result = await sm.inject_message("dyn-watcher", "scheduled report")
+
+        self.assertTrue(result)
+        lifecycle.wake_dormant_watcher.assert_awaited_once_with("dyn-watcher")
+        processor.enqueue.assert_awaited_once()
+
+    async def test_failed_wake_still_returns_false_as_before(self):
+        """A watcher that can't be woken (paused, not dynamic, genuinely
+        unknown, or blocked agent) must fail exactly as it did before this
+        method existed — no new failure mode introduced."""
+        sm, lifecycle, processor = self._make_sm(wake_result=False)
+
+        result = await sm.inject_message("dyn-watcher", "scheduled report")
+
+        self.assertFalse(result)
+        lifecycle.wake_dormant_watcher.assert_awaited_once_with("dyn-watcher")
+        processor.enqueue.assert_not_called()
+
+    async def test_already_running_watcher_never_calls_wake(self):
+        """The common case (watcher already active) must not pay the cost
+        of even attempting a wake."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from gateway.core.session_manager import SessionManager
+
+        mock_processor = MagicMock()
+        mock_processor.enqueue = AsyncMock(return_value=True)
+        mock_lifecycle = MagicMock()
+        mock_lifecycle.get_processor = MagicMock(return_value=mock_processor)
+        mock_lifecycle.wake_dormant_watcher = AsyncMock(return_value=True)
+        mock_lifecycle.get_watcher_state = MagicMock(return_value=None)
+        mock_lifecycle.get_watcher_config = MagicMock(return_value=None)
+
+        sm = SessionManager.__new__(SessionManager)
+        sm._lifecycle = mock_lifecycle
+
+        result = await sm.inject_message("static-watcher", "hi")
+
+        self.assertTrue(result)
+        mock_lifecycle.wake_dormant_watcher.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

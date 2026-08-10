@@ -858,6 +858,60 @@ class WatcherLifecycle:
         """
         return self._processors.get(watcher_name)
 
+    async def wake_dormant_watcher(self, name: str) -> bool:
+        """Best-effort auto-wake for a dormant, unpaused, dynamically-
+        created watcher (PR #79 review).
+
+        Used by the job scheduler before giving up on a scheduled-job
+        delivery: a lazily created watcher intentionally goes dormant
+        (config gone from `_watcher_configs`, no processor) between
+        messages — that's normal, not a failure — but `inject_message()`
+        previously just returned False the moment no processor existed,
+        so every due/catch-up run for an otherwise-healthy dynamic watcher
+        was silently skipped (and its next run advanced, per
+        `_fire_once()`'s own anti-flood design) until unrelated channel
+        traffic happened to wake it via `try_lazy_create()`.
+
+        Deliberately narrow, mirroring resume_watcher()'s own guards
+        exactly rather than a looser "just start it" attempt:
+          - Only wakes a watcher already flagged `dynamically_created`.
+            A static watcher that failed to start for some other reason
+            (blocked agent, a startup error) is a different, unrelated
+            failure mode this method must not paper over.
+          - Never wakes a PAUSED watcher (static or dynamic) — the
+            standing rule elsewhere in this file ("only pause_watcher()/
+            resume_watcher()/reset_watcher() may bring it back to life")
+            applies here too; a scheduled job for a paused watcher should
+            keep silently skipping, exactly as before.
+          - Respects the fail-closed blocked-agents guard
+            (`_ensure_agent_available()`) — a scheduled job must not be
+            able to force-start a watcher whose agent's permission broker
+            failed, any more than a live message can.
+
+        Returns True if the watcher is now running (already was, or was
+        successfully started here); False if it doesn't exist, is paused,
+        isn't a dynamic watcher, or failed to start.
+        """
+        if name in self._processors:
+            return True
+        state = self._states.get(name)
+        if state is None or state.paused or not state.dynamically_created:
+            return False
+        async with self._get_watcher_lock(name):
+            if name in self._processors:
+                return True
+            try:
+                wc = await self._find_or_reconstruct_watcher_config(name)
+                self._ensure_agent_available(wc)
+                await self._start_watcher(wc, state)
+            except Exception as e:
+                logger.warning(
+                    "wake_dormant_watcher: failed to auto-start dormant "
+                    "watcher '%s' for scheduled delivery: %s", name, e,
+                )
+                return False
+            return True
+
     def get_watcher_config(self, watcher_name: str) -> "WatcherConfig | None":
         """Return the WatcherConfig for a watcher name, or None if not found."""
         return next((wc for wc in self._watcher_configs if wc.name == watcher_name), None)

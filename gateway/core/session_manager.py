@@ -199,6 +199,17 @@ class SessionManager:
         """
         processor = self._lifecycle.get_processor(watcher_name)
         if processor is None:
+            # PR #79 review: a lazily created watcher intentionally goes
+            # dormant between messages — that's normal, not a failure —
+            # but without this, a scheduled job for it was silently
+            # skipped every tick until unrelated channel traffic happened
+            # to wake it. wake_dormant_watcher() mirrors resume_watcher()'s
+            # own guards exactly (never wakes a paused watcher, respects
+            # the fail-closed blocked-agents check), so this can never
+            # bypass an explicit pause the way a bare auto-start would.
+            if await self._lifecycle.wake_dormant_watcher(watcher_name):
+                processor = self._lifecycle.get_processor(watcher_name)
+        if processor is None:
             logger.warning(
                 "inject_message: no active processor for watcher %r — "
                 "watcher may be paused, stopped, or not configured",

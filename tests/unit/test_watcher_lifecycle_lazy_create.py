@@ -1409,5 +1409,102 @@ class TestStartWatcherDiscardsStateOnAgentMismatch(unittest.IsolatedAsyncioTestC
         self.assertEqual(lifecycle._states["static-1"].session_id, "old-sess-id")
 
 
+class TestWakeDormantWatcher(unittest.IsolatedAsyncioTestCase):
+    """PR #79 review: wake_dormant_watcher() — used by the job scheduler so
+    a scheduled job for a lazily created watcher isn't silently skipped
+    every tick just because no channel traffic has happened yet to wake it
+    via the normal try_lazy_create() path. Mirrors resume_watcher()'s own
+    guards (never wakes a paused watcher, respects the fail-closed
+    blocked-agents check) exactly — it must never bypass either."""
+
+    async def test_already_running_returns_true_without_touching_anything(self):
+        lifecycle, connector, agent, state_store = _make_lifecycle(rules=None)
+        lifecycle._processors["dyn-1"] = MagicMock()
+
+        result = await lifecycle.wake_dormant_watcher("dyn-1")
+
+        self.assertTrue(result)
+        agent.create_session.assert_not_called()
+
+    async def test_unknown_watcher_returns_false(self):
+        lifecycle, connector, agent, state_store = _make_lifecycle(rules=None)
+
+        result = await lifecycle.wake_dormant_watcher("never-heard-of-it")
+
+        self.assertFalse(result)
+
+    async def test_paused_dynamic_watcher_is_not_woken(self):
+        """The standing rule elsewhere in this file — only pause_watcher()/
+        resume_watcher()/reset_watcher() may bring a watcher back — applies
+        here too. A scheduled job for a paused watcher must keep silently
+        skipping, exactly as before this method existed."""
+        lifecycle, connector, agent, state_store = _make_lifecycle(rules=None)
+        lifecycle._states["dyn-1"] = WatcherState(
+            watcher_name="dyn-1", session_id="s1", room_id="chan-1",
+            paused=True, dynamically_created=True,
+        )
+
+        result = await lifecycle.wake_dormant_watcher("dyn-1")
+
+        self.assertFalse(result)
+        agent.create_session.assert_not_called()
+
+    async def test_non_dynamic_watcher_is_not_woken(self):
+        """Scoped narrowly to dynamically_created watchers only — a static
+        watcher that isn't running (blocked agent, startup failure) is a
+        different, unrelated failure mode this method must not paper over."""
+        lifecycle, connector, agent, state_store = _make_lifecycle(rules=None)
+        lifecycle._states["static-1"] = WatcherState(
+            watcher_name="static-1", session_id="s1", room_id="chan-1",
+            paused=False, dynamically_created=False,
+        )
+
+        result = await lifecycle.wake_dormant_watcher("static-1")
+
+        self.assertFalse(result)
+        agent.create_session.assert_not_called()
+
+    async def test_dormant_unpaused_dynamic_watcher_is_woken(self):
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=[_rule()],
+            resolved_room=Room(id="chan-1", name="general", type="channel"),
+        )
+        dormant_state = WatcherState(
+            watcher_name="mm-home-general", session_id="old-sess", room_id="chan-1",
+            paused=False, dynamically_created=True,
+        )
+        lifecycle._states["mm-home-general"] = dormant_state
+        state_store.load = MagicMock(return_value={"mm-home-general": dormant_state})
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            result = await lifecycle.wake_dormant_watcher("mm-home-general")
+
+        self.assertTrue(result)
+        self.assertIn("mm-home-general", lifecycle._processors)
+        connector.subscribe_room.assert_awaited_once()
+
+    async def test_blocked_agent_is_not_woken(self):
+        """Respects the same fail-closed guard resume_watcher() enforces —
+        a scheduled job must not be able to force-start a watcher whose
+        agent's permission broker failed, any more than a live message can."""
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=[_rule()],
+            resolved_room=Room(id="chan-1", name="general", type="channel"),
+        )
+        lifecycle.seed_blocked_agents({"claude"})
+        dormant_state = WatcherState(
+            watcher_name="mm-home-general", session_id="old-sess", room_id="chan-1",
+            paused=False, dynamically_created=True,
+        )
+        lifecycle._states["mm-home-general"] = dormant_state
+        state_store.load = MagicMock(return_value={"mm-home-general": dormant_state})
+
+        result = await lifecycle.wake_dormant_watcher("mm-home-general")
+
+        self.assertFalse(result)
+        agent.create_session.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
