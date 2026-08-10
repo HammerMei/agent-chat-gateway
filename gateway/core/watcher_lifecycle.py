@@ -911,6 +911,18 @@ class WatcherLifecycle:
         async with self._get_watcher_lock(name):
             if name in self._processors:
                 return True
+            # Re-fetch under the lock rather than trusting the snapshot
+            # taken above (PR #79 review, fourteenth round): a concurrent
+            # pause_watcher() call could have acquired this same lock
+            # first and marked the watcher paused (or, if `state` was
+            # None then, allocated a fresh paused WatcherState) between
+            # our pre-lock snapshot and here. Without this recheck,
+            # _start_watcher() below would construct a replacement state
+            # with paused=False, silently undoing a pause that had
+            # already completed.
+            state = self._states.get(name)
+            if state is None or state.paused or not state.dynamically_created:
+                return False
             reserved = False
             try:
                 if not await self._reserve_global_name(name):

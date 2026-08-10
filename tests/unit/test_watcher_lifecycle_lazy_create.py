@@ -10,6 +10,7 @@ TestHistoryHandoffSentSeparatelyFromHeader.
 
 from __future__ import annotations
 
+import asyncio
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1601,6 +1602,49 @@ class TestWakeDormantWatcher(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result)
         reserve.assert_awaited_once_with("mm-home-general")
         release.assert_called_once_with("mm-home-general")
+
+    async def test_pause_completing_while_wake_waits_for_the_lock_is_not_undone(self):
+        """PR #79 review, fourteenth round: wake_dormant_watcher() snapshots
+        `state` BEFORE acquiring the per-name lock. If a concurrent
+        pause_watcher() call acquires that same lock first and completes
+        (marking the watcher paused) while this call is still waiting to
+        acquire it, the pre-lock snapshot is stale by the time this call
+        gets the lock. The in-lock recheck must re-fetch state from
+        `self._states`, not reuse the stale snapshot, or it would start the
+        watcher anyway and silently undo the completed pause."""
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=[_rule()],
+            resolved_room=Room(id="chan-1", name="general", type="channel"),
+        )
+        dormant_state = WatcherState(
+            watcher_name="mm-home-general", session_id="old-sess", room_id="chan-1",
+            paused=False, dynamically_created=True,
+        )
+        lifecycle._states["mm-home-general"] = dormant_state
+        state_store.load = MagicMock(return_value={"mm-home-general": dormant_state})
+
+        # Hold the same per-name lock wake_dormant_watcher() needs, so it
+        # blocks on `async with self._get_watcher_lock(...)` exactly like
+        # it would if a concurrent pause_watcher() call had gotten there
+        # first.
+        lock = lifecycle._get_watcher_lock("mm-home-general")
+        await lock.acquire()
+
+        wake_task = asyncio.create_task(
+            lifecycle.wake_dormant_watcher("mm-home-general")
+        )
+        await asyncio.sleep(0)  # let wake_task snapshot state and block on the lock
+
+        # Simulate pause_watcher() completing here, right before releasing
+        # the lock wake_dormant_watcher is waiting on.
+        dormant_state.paused = True
+        lock.release()
+
+        result = await wake_task
+
+        self.assertFalse(result)
+        self.assertNotIn("mm-home-general", lifecycle._processors)
+        agent.create_session.assert_not_called()
 
 
 if __name__ == "__main__":
