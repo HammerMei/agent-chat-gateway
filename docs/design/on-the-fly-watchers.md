@@ -1,6 +1,6 @@
 # On-the-fly watchers: rule-based room matching + lazy watcher lifecycle
 
-Status (updated 2026-08-07, round 11): **config schema landed (PR #77); rule-based
+Status (updated 2026-08-09, round 12): **config schema landed (PR #77); rule-based
 room matching + lazy creation landed for Mattermost.** RocketChat support,
 `session_id`/`online_notification`/`offline_notification` retirement, and
 the `expire` CLI are still design-only. Coordinating a low-traffic
@@ -803,6 +803,118 @@ the tenth round's own finding #25:
     matching `_reconstruct_dynamic_watcher_config()`'s own best-effort
     posture — a transient network blip during startup must not
     permanently discard a legitimate session.
+
+### PR #79 review, twelfth round (2026-08-09) — six more findings, all fixed; correcting the "28/28 resolved" claim above
+
+**Correction first**: the eleventh-round entry above says all 28 threads
+were resolved. That was wrong — four more findings had already landed on
+2026-08-07 (the same day, hours after round eleven) and went unprocessed
+while attention moved to the startup-ordering design review and PR #80.
+Only two of this round's six findings are genuinely new (filed
+2026-08-09, after PR #80's revert). Listing all six together since they
+surfaced and were fixed together, but the timeline matters for anyone
+reconstructing what "round eleven complete" actually meant at the time.
+
+29. **Connector names were never validated for path-safety.** Static
+    watcher names reject `/` at config-load time, but that check only
+    fires when a name is actually generated at load time — a
+    wildcard-rule-only connector never does that (its names are generated
+    later, per room, at runtime via `auto_watcher_name()`, which
+    concatenates the raw connector name with a separately-sanitized room
+    name). A connector named e.g. `mm/team` or `../team` sailed through
+    undetected. Worse than the finding itself described: `gateway/core/
+    state.py`'s `_state_file()` (`RUNTIME_DIR / f"state.{connector_name}.json"`)
+    was already exploitable by a bad connector name with no lazy watchers
+    involved at all. Fixed by rejecting `/` in connector names at
+    `_parse_one_connector()` — the one place any connector name is
+    guaranteed to be validated regardless of whether it ever uses
+    `room: "*"`.
+30. **A persisted session's agent wasn't checked against the CURRENT
+    resolved agent.** When a wildcard rule's `agent:` changes between
+    restarts, `WatcherState` had no record of which agent owned
+    `session_id` — `_start_watcher()` would select the new rule's agent
+    while `_provision_session()` blindly reused the old session ID.
+    Session IDs are backend-specific: this could fail to resume, or
+    attach to an unrelated session that happens to share the ID format.
+    Fixed by adding an `agent` field to `WatcherState` (defaults to `""`
+    for state persisted before this field existed — read as "unknown,
+    assume compatible" so this doesn't force-reset every already-running
+    watcher's session on the first restart after it ships).
+    `_start_watcher()` discards the WHOLE retained state on a mismatch —
+    same treatment as the existing room-id mismatch check right above it,
+    not just the session_id — so `context_injected` also resets correctly
+    instead of skipping re-injection on the new backend.
+31. **`_find_entry_for_watcher()`'s plain scan could silently route to the
+    wrong connector.** Config-load-time watcher-name uniqueness only
+    covers names sourced from config.yaml — a dynamically-created
+    watcher's name is never in config.yaml (only its `WatcherState` is
+    persisted), so it's invisible to that check. A static watcher later
+    configured on a DIFFERENT connector with the same name (accidental, or
+    because the auto-generated format is predictable) could collide with
+    nothing catching it at load time, and the plain scan would pick the
+    live match without ever checking whether another connector also had a
+    dormant claim. Fixed by scanning every other connector with the
+    non-mutating `is_watcher_name_known()` probe before committing to a
+    match in `dispatch_command()`'s pause/resume/reset routing — an
+    ambiguous name now returns an error asking for `--connector` instead
+    of guessing. Added `--connector` to the `pause`/`resume`/`reset` CLI
+    subcommands, which had no way to disambiguate at all before this.
+32. **A dynamic watcher's cached config went stale after a rename that
+    happened AFTER it was already reconstructed once.** Different from
+    the fifth-round rename fix (which covers a config that had never been
+    reconstructed before): if this watcher's `WatcherConfig` was already
+    cached in `_watcher_configs` from an earlier reconstruction in this
+    same process (e.g. a prior pause/resume call), and the room was
+    renamed after that, the cached `.room` goes stale — a later
+    resume/reset would call `resolve_room()` with the old name, which no
+    longer exists, failing until a full restart rebuilt
+    `_watcher_configs` from scratch. Fixed by refreshing the cached
+    config's `.room` in place when `try_lazy_create()`'s room-ID fallback
+    detects this, gated on `dynamically_created` so it can never touch an
+    operator's static config.
+33. **Lazy creation ran before the sender/mention filter, not after.** For
+    an unwatched channel, the lazy-creation hook ran before
+    `resolve_username()`/`filter_mm_message()`, so a sender excluded by
+    `filter_sender` — or any ordinary post that never mentions the bot —
+    still fully provisioned a session, subscribed, started a processor,
+    and could post an `online_notification` before the real filter ever
+    got a chance to reject the message. Fixed by resolving the sender and
+    running a sender/mention pre-check (via `filter_mm_message()` with
+    `turn_store=None` and `last_processed_ts=None`, deliberately skipping
+    the dedup/turn-budget steps rather than double-running them later)
+    before ever calling the hook. Safe to move `resolve_username()`
+    earlier here specifically: no `state`/`seen_ids_set` exists yet for an
+    unwatched channel, so the live-vs-replay dedup race the existing
+    ordering comment protects against doesn't apply — reinforced by
+    replay never reaching this branch at all, and per-channel dispatch
+    serializing same-channel events through one worker.
+34. **A scheduled job for a dormant dynamic watcher was silently skipped
+    forever.** A lazily created watcher intentionally goes dormant between
+    messages — normal, not a failure — but `inject_message()` returned
+    `False` the instant no processor existed, and `_fire_once()` advances
+    `next_run` on any injection failure (anti-flood design). Together,
+    every due/catch-up run for an otherwise-healthy, unpaused dynamic
+    watcher was silently skipped and pushed to the next scheduled time,
+    repeating indefinitely, until unrelated live channel traffic happened
+    to wake it via `try_lazy_create()`. Fixed by adding
+    `WatcherLifecycle.wake_dormant_watcher()`, used by `inject_message()`
+    before giving up — deliberately narrow, mirroring `resume_watcher()`'s
+    own guards exactly (only wakes a watcher flagged `dynamically_created`,
+    never wakes a paused watcher, respects the fail-closed blocked-agents
+    guard) rather than a looser "just start it." Verified the scheduler's
+    existing fan-out fallback (calling `inject_message()` on every session
+    manager when a job's connector isn't specified) stays safe: the new
+    method gates on `self._states`, which is per-`WatcherLifecycle`-
+    instance, so only the owning connector ever finds a match.
+
+All six confirmed real before being accepted, per the standing rule for
+every round in this document. Landed as five commits (findings #30 and
+#32 share `watcher_lifecycle.py`'s dynamic-watcher reconstruction path
+closely enough to land together; the other four are independent) rather
+than one, specifically because the startup-ordering saga just above this
+section showed what a single large commit in this area costs when a
+review finds a problem with only part of it. Full unit (2169) + integration
+(219) suites green after all six.
 
 ## Startup ordering: root-cause design review (2026-08-07, REVERTED 2026-08-09 — see "Reverted" at the end of this section)
 
