@@ -184,7 +184,16 @@ async def _dispatch(admin, args) -> None:
 
 
 async def _run(args: argparse.Namespace) -> int:
-    _configure_error_log(args.log_file)
+    try:
+        _configure_error_log(args.log_file)
+    except OSError as e:
+        # logging.FileHandler opens the file immediately (not lazily) — an
+        # unwritable --log-file (read-only cwd, bad path, permissions)
+        # would otherwise raise here, before either try block below exists
+        # to catch it, turning an otherwise-successful command into a raw
+        # traceback.
+        print(f"Error: could not open log file '{args.log_file}': {e}", file=sys.stderr)
+        return 1
 
     try:
         profiles = load_profiles(args.config)

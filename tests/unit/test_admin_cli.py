@@ -330,6 +330,32 @@ class TestHttpStatusErrorHandling(unittest.IsolatedAsyncioTestCase):
         self.assertIn(args.log_file, output)
 
 
+class TestUnwritableLogFile(unittest.IsolatedAsyncioTestCase):
+    async def test_unwritable_log_file_returns_1_with_clean_message_not_a_traceback(self):
+        # logging.FileHandler opens the file immediately — simulate a
+        # read-only directory / bad path by having _configure_error_log
+        # raise the same way FileHandler would.
+        with patch(
+            "gateway.admin.cli._configure_error_log",
+            side_effect=OSError("Permission denied"),
+        ):
+            args = _args(["--log-file", "/no/such/dir/x.log", "p", "delete-user", "alice"])
+            code = await _run(args)
+
+        self.assertEqual(code, 1)
+
+    async def test_unwritable_log_file_does_not_reach_admin_factory(self):
+        # The failure happens before any profile/admin setup — nothing
+        # downstream should be touched.
+        with patch(
+            "gateway.admin.cli._configure_error_log", side_effect=OSError("Permission denied")
+        ), patch("gateway.admin.cli.admin_factory") as mock_factory:
+            args = _args(["--log-file", "/no/such/dir/x.log", "p", "delete-user", "alice"])
+            await _run(args)
+
+        mock_factory.assert_not_called()
+
+
 class TestMain(unittest.TestCase):
     def test_main_exits_with_run_result_code(self):
         with patch("gateway.admin.cli._run", new=AsyncMock(return_value=7)), \

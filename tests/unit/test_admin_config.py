@@ -74,6 +74,35 @@ class TestLoadProfiles(unittest.TestCase):
             with self.assertRaises(AdminConfigError):
                 load_profiles(path)
 
+    def test_malformed_yaml_syntax_raises_admin_config_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "cfg.yaml"
+            # Unclosed bracket — a genuine YAML syntax error, not just bad content.
+            path.write_text("profiles: [unterminated\n")
+            with self.assertRaises(AdminConfigError):
+                load_profiles(path)
+
+    def test_list_root_raises_admin_config_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "cfg.yaml"
+            path.write_text("- just\n- a\n- list\n")
+            with self.assertRaises(AdminConfigError):
+                load_profiles(path)
+
+    def test_scalar_root_raises_admin_config_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "cfg.yaml"
+            path.write_text("just a string\n")
+            with self.assertRaises(AdminConfigError):
+                load_profiles(path)
+
+    def test_non_mapping_profiles_section_raises_admin_config_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "cfg.yaml"
+            path.write_text("profiles:\n  - a\n  - b\n")
+            with self.assertRaises(AdminConfigError):
+                load_profiles(path)
+
     def test_env_var_path_used_when_no_explicit_path_given(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "cfg.yaml"

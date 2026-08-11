@@ -99,11 +99,23 @@ def load_profiles(path: str | Path | None = None) -> dict[str, AdminProfile]:
             f"(pass --config, set {CONFIG_PATH_ENV_VAR}, or create ./admin-profiles.yaml)"
         )
     with open(config_path) as f:
-        raw = yaml.safe_load(f) or {}
+        try:
+            raw = yaml.safe_load(f) or {}
+        except yaml.YAMLError as e:
+            raise AdminConfigError(f"{config_path}: invalid YAML: {e}") from e
+
+    if not isinstance(raw, dict):
+        raise AdminConfigError(
+            f"{config_path}: expected a mapping at the top level, got {type(raw).__name__}"
+        )
 
     raw_profiles = raw.get("profiles")
     if not raw_profiles:
         raise AdminConfigError(f"{config_path}: no 'profiles' section found")
+    if not isinstance(raw_profiles, dict):
+        raise AdminConfigError(
+            f"{config_path}: 'profiles' must be a mapping, got {type(raw_profiles).__name__}"
+        )
 
     profiles: dict[str, AdminProfile] = {}
     for name, fields in raw_profiles.items():
