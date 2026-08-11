@@ -193,17 +193,19 @@ class PlatformAdmin(ABC):
         password: str,
         *,
         full_name: str | None = None,
-        verified: bool = False,
     ) -> AdminUser:
         """Create a user account.
 
-        ``verified`` maps to each platform's email-verified flag (RC's
-        ``verified``, Mattermost's ``email_verified``) and defaults to False:
-        this tool's primary purpose is provisioning agent accounts, which
-        have no real inbox behind them, so claiming a verified email by
-        default doesn't make sense. Pass ``verified=True`` explicitly for the
-        rare case a created account needs to pass an EnableEmailVerification-
-        gated login flow.
+        There is deliberately NO email-verified option. This tool provisions
+        *agent* accounts, which have no real inbox behind them, so marking
+        their email verified is meaningless — and offering the knob proved to
+        be all cost and no benefit: the platforms make it unobservable
+        (Mattermost strips ``email_verified`` from any read of another user's
+        account, and silently drops it on write unless the caller has
+        manage_system), so the CLI could neither guarantee nor honestly
+        report the requested state. If a genuine need for a verified mailbox
+        ever appears, do it as an explicit, separately-verifiable operation
+        rather than a flag on create.
 
         Raises UserAlreadyExistsError if the username is already taken,
         VerificationError if creation appeared to succeed but a read-back

@@ -95,23 +95,20 @@ class TestCreateUser(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(user.email, "a@x.com")
         create_call = admin._rest._request.call_args_list[1]
         payload = create_call.kwargs["json_data"]
-        self.assertEqual(payload["verified"], False)
+        # No `verified` field at all — RC defaults it to false, and this tool
+        # deliberately offers no option to change it.
+        self.assertNotIn("verified", payload)
+        # requirePasswordChange is a separate concern and must stay: it
+        # suppresses RC's forced password reset, which a service account
+        # logging in unattended must not hit.
         self.assertEqual(payload["requirePasswordChange"], False)
 
-    async def test_verified_true_is_passed_through(self):
+    async def test_create_user_rejects_removed_verified_kwarg(self):
         admin = _admin_with_mock_rest()
-        admin._rest._request = AsyncMock(
-            side_effect=[
-                _http_error(400),
-                {"success": True, "user": {"_id": "u1", "username": "alice", "emails": []}},
-                {"success": True, "user": {"_id": "u1", "username": "alice", "emails": []}},
-            ]
-        )
+        admin._rest._request = AsyncMock()
 
-        await admin.create_user("alice", "a@x.com", "pw", verified=True)
-
-        create_call = admin._rest._request.call_args_list[1]
-        self.assertTrue(create_call.kwargs["json_data"]["verified"])
+        with self.assertRaises(TypeError):
+            await admin.create_user("alice", "a@x.com", "pw", verified=True)
 
     async def test_existing_user_raises(self):
         admin = _admin_with_mock_rest()

@@ -81,7 +81,7 @@ class _DummyAdmin(PlatformAdmin):
     async def close(self):
         self.closed = True
 
-    async def create_user(self, username, email, password, *, full_name=None, verified=False):
+    async def create_user(self, username, email, password, *, full_name=None):
         raise NotImplementedError
 
     async def create_channel(self, name, *, is_private=False):

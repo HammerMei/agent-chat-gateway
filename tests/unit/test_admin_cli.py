@@ -50,13 +50,11 @@ class TestBuildParser(unittest.TestCase):
         self.assertEqual(args.password, "pw")
         self.assertEqual(args.full_name, "Alice A")
 
-    def test_create_user_verified_defaults_to_false(self):
-        args = _args(["mm-lab", "create-user", "alice", "a@x.com", "pw"])
-        self.assertFalse(args.verified)
-
-    def test_create_user_verified_flag(self):
-        args = _args(["mm-lab", "create-user", "alice", "a@x.com", "pw", "--verified"])
-        self.assertTrue(args.verified)
+    def test_create_user_rejects_removed_verified_flag(self):
+        # --verified was deliberately removed (see PlatformAdmin.create_user):
+        # argparse must reject it rather than silently ignoring it.
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            _args(["mm-lab", "create-user", "alice", "a@x.com", "pw", "--verified"])
 
     def test_create_channel_private_flag(self):
         args = _args(["mm-lab", "create-channel", "secret", "--private"])
@@ -111,7 +109,7 @@ class TestRunDispatch(unittest.IsolatedAsyncioTestCase):
         mock_admin.connect.assert_awaited_once()
         mock_admin.close.assert_awaited_once()
         mock_admin.create_user.assert_awaited_once_with(
-            "alice", "a@x.com", "pw", full_name=None, verified=False
+            "alice", "a@x.com", "pw", full_name=None
         )
 
     async def test_create_user_already_exists_is_not_an_error(self):

@@ -65,7 +65,6 @@ class RocketChatAdmin(PlatformAdmin):
         password: str,
         *,
         full_name: str | None = None,
-        verified: bool = False,
     ) -> AdminUser:
         existing = await self._get_user_or_none(username)
         if existing is not None:
@@ -83,13 +82,14 @@ class RocketChatAdmin(PlatformAdmin):
             "email": email,
             "password": password,
             "username": username,
-            # verified defaults to False (see PlatformAdmin.create_user
-            # docstring — agent accounts have no real inbox behind them).
-            # requirePasswordChange is unconditionally False regardless: an
-            # admin-created service/seed account still needs to be usable
-            # unattended, and that's an unrelated RC default (forced
-            # password reset on first login), not an email-verification one.
-            "verified": verified,
+            # No `verified` field is sent: RC defaults it to false, which is
+            # correct for an agent account with no real inbox (see
+            # PlatformAdmin.create_user for why this tool offers no option to
+            # change it).
+            #
+            # requirePasswordChange stays, and is NOT the same concern: it
+            # suppresses RC's forced password reset on first login, which a
+            # service account must not hit if it is to log in unattended.
             "requirePasswordChange": False,
         }
         result = await self._rest._request("POST", "users.create", json_data=payload)

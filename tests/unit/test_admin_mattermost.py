@@ -184,10 +184,7 @@ class TestCreateUser(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(user.username, "alice")
         admin._rest._request.assert_any_await(
             "POST", "users",
-            json_data={
-                "username": "alice", "email": "a@x.com", "password": "pw",
-                "email_verified": False,
-            },
+            json_data={"username": "alice", "email": "a@x.com", "password": "pw"},
         )
         admin._rest._request.assert_any_await("GET", "teams/team-1/members/u1")
 
@@ -210,19 +207,28 @@ class TestCreateUser(unittest.IsolatedAsyncioTestCase):
             "POST", "teams/team-1/members", json_data={"team_id": "team-1", "user_id": "u1"}
         )
 
-    async def test_verified_true_is_passed_through(self):
+    async def test_create_user_rejects_removed_verified_kwarg(self):
+        # The email-verified knob was deliberately removed (see
+        # PlatformAdmin.create_user): unobservable on Mattermost, and
+        # meaningless for agent accounts with no real inbox.
+        admin = _admin_with_mock_rest()
+        admin._rest.get_user_by_username = AsyncMock(side_effect=_http_error(404))
+        admin._rest._request = AsyncMock()
+
+        with self.assertRaises(TypeError):
+            await admin.create_user("alice", "a@x.com", "pw", verified=True)
+
+    async def test_email_verified_is_never_sent(self):
         admin = _admin_with_mock_rest()
         admin._rest.get_user_by_username = AsyncMock(
             side_effect=[_http_error(404), {"id": "u1", "username": "alice", "email": "a@x.com"}]
         )
-        admin._rest._request = AsyncMock(
-            side_effect=[{"id": "u1"}, {"user_id": "u1"}]
-        )
+        admin._rest._request = AsyncMock(side_effect=[{"id": "u1"}, {"user_id": "u1"}])
 
-        await admin.create_user("alice", "a@x.com", "pw", verified=True)
+        await admin.create_user("alice", "a@x.com", "pw")
 
         create_call = admin._rest._request.call_args_list[0]
-        self.assertTrue(create_call.kwargs["json_data"]["email_verified"])
+        self.assertNotIn("email_verified", create_call.kwargs["json_data"])
 
     async def test_full_name_maps_to_nickname(self):
         admin = _admin_with_mock_rest()
@@ -286,42 +292,6 @@ class TestCreateUser(unittest.IsolatedAsyncioTestCase):
         admin._rest._request = AsyncMock(return_value={"user_id": "u1"})
 
         with self.assertRaises(UserAlreadyExistsError):
-            await admin.create_user("alice", "a@x.com", "pw")
-
-    async def test_verified_warns_when_server_did_not_confirm(self):
-        admin = _admin_with_mock_rest()
-        admin._rest.get_user_by_username = AsyncMock(
-            side_effect=[_http_error(404), {"id": "u1", "username": "alice", "email": "a@x.com"}]
-        )
-        # POST echo omits email_verified — what a non-manage_system credential
-        # gets after SanitizeInput() drops the field.
-        admin._rest._request = AsyncMock(side_effect=[{"id": "u1"}, {"user_id": "u1"}])
-
-        with self.assertLogs("agent-chat-gateway.admin.mattermost", level="WARNING") as logs:
-            await admin.create_user("alice", "a@x.com", "pw", verified=True)
-
-        self.assertTrue(any("did not confirm email_verified" in m for m in logs.output))
-
-    async def test_verified_does_not_warn_when_server_confirms(self):
-        admin = _admin_with_mock_rest()
-        admin._rest.get_user_by_username = AsyncMock(
-            side_effect=[_http_error(404), {"id": "u1", "username": "alice", "email": "a@x.com"}]
-        )
-        admin._rest._request = AsyncMock(
-            side_effect=[{"id": "u1", "email_verified": True}, {"user_id": "u1"}]
-        )
-
-        with self.assertNoLogs("agent-chat-gateway.admin.mattermost", level="WARNING"):
-            await admin.create_user("alice", "a@x.com", "pw", verified=True)
-
-    async def test_no_verified_warning_when_verified_not_requested(self):
-        admin = _admin_with_mock_rest()
-        admin._rest.get_user_by_username = AsyncMock(
-            side_effect=[_http_error(404), {"id": "u1", "username": "alice", "email": "a@x.com"}]
-        )
-        admin._rest._request = AsyncMock(side_effect=[{"id": "u1"}, {"user_id": "u1"}])
-
-        with self.assertNoLogs("agent-chat-gateway.admin.mattermost", level="WARNING"):
             await admin.create_user("alice", "a@x.com", "pw")
 
     async def test_existing_user_repairs_team_membership_before_raising(self):

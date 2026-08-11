@@ -536,7 +536,13 @@ class TestEditAgent:
             assert app.screen.mode == "view"
             body = app.screen._body_text()
             assert "timeout: 500" in body
-            assert "-1" not in body
+            # Scoped to the timeout field rather than a bare `"-1" not in
+            # body`: the body embeds the tmp working-directory path, and
+            # pytest's own basetemp counter puts "-1" in it for every run
+            # numbered 1, 1x, or 1xx (e.g. ".../pytest-106/..."), which made
+            # the bare check fail on roughly a third of runs regardless of
+            # the behavior under test.
+            assert "timeout: -1" not in body
 
             raw = yaml.safe_load(Path(config_path).read_text())
             assert raw["agents"]["existing-agent"]["timeout"] == 500

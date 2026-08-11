@@ -151,11 +151,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("email")
     p.add_argument("password")
     p.add_argument("--full-name")
-    p.add_argument(
-        "--verified", action="store_true",
-        help="Mark the account's email as verified (default: false — this tool "
-        "mainly provisions agent accounts, which have no real inbox)",
-    )
 
     p = sub.add_parser("create-channel", help="Create a channel")
     p.add_argument("name")
@@ -178,8 +173,7 @@ async def _dispatch(admin, args) -> None:
     if args.command == "create-user":
         try:
             user = await admin.create_user(
-                args.username, args.email, args.password,
-                full_name=args.full_name, verified=args.verified,
+                args.username, args.email, args.password, full_name=args.full_name,
             )
             print(f"Created user '{user.username}' (id={user.id})")
         except UserAlreadyExistsError as e:

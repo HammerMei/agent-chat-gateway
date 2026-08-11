@@ -167,7 +167,6 @@ class MattermostAdmin(PlatformAdmin):
         password: str,
         *,
         full_name: str | None = None,
-        verified: bool = False,
     ) -> AdminUser:
         existing = await self._get_user_or_none(username)
         if existing is not None:
@@ -204,20 +203,15 @@ class MattermostAdmin(PlatformAdmin):
                 await self._ensure_team_member(existing.id)
             raise UserAlreadyExistsError(username, existing=existing, identity_matches=matches)
 
+        # No email_verified field is sent at all: Mattermost defaults it to
+        # false, which is what an agent account should be (see
+        # PlatformAdmin.create_user for why this tool deliberately offers no
+        # option to change it). Sending an explicit `false` would be
+        # equivalent but invites someone to "just make it configurable" again.
         payload: dict = {
             "username": username,
             "email": email,
             "password": password,
-            # Defaults to False (see PlatformAdmin.create_user docstring —
-            # agent accounts have no real inbox behind them). When True is
-            # passed explicitly: Mattermost's SanitizeInput() strips this
-            # field from the request unless the caller has manage_system
-            # permission, so it only takes effect because this tool is meant
-            # to run with a system-admin credential (see
-            # MattermostAdmin.__init__) — a lesser credential has the field
-            # silently dropped, not rejected, which is what the post-create
-            # check below warns about.
-            "email_verified": verified,
         }
         if full_name:
             # Mattermost has no single "full name" field — nickname is the
@@ -229,30 +223,6 @@ class MattermostAdmin(PlatformAdmin):
         if not user_id:
             raise VerificationError(
                 f"Mattermost user creation for '{username}' returned no id: {result}"
-            )
-
-        if verified and not result.get("email_verified"):
-            # Checked against the POST response, NOT a read-back: Mattermost's
-            # user-fetch path runs ClearNonProfileFields, which zeroes
-            # email_verified unconditionally for any account other than the
-            # caller's own AND tags it `omitempty` — so the field is simply
-            # absent from a GET, and a read-back-based check here would
-            # hard-fail every *working* --verified run. The create response is
-            # the only place the real value is observable (it echoes the saved
-            # struct without that sanitizer).
-            #
-            # A warning rather than a VerificationError, deliberately: unlike
-            # a deactivated or missing account, the account here is real and
-            # usable — only one requested attribute may not have applied — and
-            # this tool cannot tell whether the server even enforces
-            # RequireEmailVerification without a manage_system config read. A
-            # false positive would break the documented reseed workflow; a
-            # warning preserves it while still surfacing the gap.
-            logger.warning(
-                "Mattermost did not confirm email_verified for '%s' — the server likely "
-                "stripped it because this credential lacks manage_system. If the server "
-                "requires email verification, this account may be unable to log in.",
-                username,
             )
 
         # Read back rather than trust the response body: a server with
