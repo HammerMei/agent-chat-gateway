@@ -34,6 +34,12 @@ def _http_error(status_code: int) -> httpx.HTTPStatusError:
     return httpx.HTTPStatusError("error", request=request, response=response)
 
 
+def _http_error_with_body(status_code: int, json_body: dict) -> httpx.HTTPStatusError:
+    request = httpx.Request("GET", "https://x")
+    response = httpx.Response(status_code, request=request, json=json_body)
+    return httpx.HTTPStatusError("error", request=request, response=response)
+
+
 def _profile(**overrides) -> AdminProfile:
     defaults = dict(
         name="mm-lab", type="mattermost", server_url="https://mm.example",
@@ -579,6 +585,121 @@ class TestAddUserToChannel(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(VerificationError):
             await admin.add_user_to_channel("alice", "eng")
+
+
+class TestPostWriteReadbackErrors(unittest.IsolatedAsyncioTestCase):
+    """A read-back that fails AFTER the write already landed must say so.
+
+    Two defects were bundled here. The message used to splice in httpx's
+    generic "Client error '403 Forbidden' for url '...' For more information
+    check: https://developer.mozilla.org/..." instead of the platform's own
+    text (wrapping the error means cli._run() never reaches its
+    httpx.HTTPStatusError arm, so friendly_error_message() never ran). And
+    nothing told the operator the write had already been applied — a bare
+    "Error: You do not have the appropriate permissions." after a successful
+    account creation reads like "nothing happened", inviting a re-run of a
+    command that already did its job.
+    """
+
+    def _forbidden(self):
+        return _http_error_with_body(
+            403, {"id": "api.context.permissions.app_error",
+                  "message": "You do not have the appropriate permissions."}
+        )
+
+    async def test_create_user_readback_failure_says_the_account_exists(self):
+        admin = _admin_with_mock_rest()
+        admin._rest.get_user_by_username = AsyncMock(
+            side_effect=[_http_error(404), self._forbidden()]
+        )
+        admin._rest._request = AsyncMock(return_value={"id": "u1"})
+
+        with self.assertRaises(VerificationError) as ctx:
+            await admin.create_user("alice", "a@x.com", "pw")
+
+        msg = str(ctx.exception)
+        self.assertIn("was created", msg)
+        self.assertIn("already been applied", msg)
+        # Platform's own wording, not httpx's generic text.
+        self.assertIn("You do not have the appropriate permissions.", msg)
+        self.assertNotIn("developer.mozilla.org", msg)
+
+    async def test_delete_user_readback_failure_says_the_deactivation_landed(self):
+        admin = _admin_with_mock_rest()
+        admin._rest.get_user_by_username = AsyncMock(
+            return_value={"id": "u1", "username": "alice", "email": "a@x.com"}
+        )
+        admin._rest._request = AsyncMock(side_effect=[{}, self._forbidden()])
+
+        with self.assertRaises(VerificationError) as ctx:
+            await admin.delete_user("alice")
+
+        msg = str(ctx.exception)
+        self.assertIn("was deactivated", msg)
+        self.assertIn("already been applied", msg)
+        self.assertIn("You do not have the appropriate permissions.", msg)
+
+    async def test_add_to_channel_readback_failure_says_the_add_landed(self):
+        admin = _admin_with_mock_rest()
+        admin._rest.get_user_by_username = AsyncMock(
+            return_value={"id": "u1", "username": "alice", "email": ""}
+        )
+        admin._rest._request = AsyncMock(
+            side_effect=[
+                {"id": "c1", "name": "eng", "type": "O"},  # channel lookup
+                {"user_id": "u1"},  # already a team member
+                {},  # POST channel members
+                self._forbidden(),  # read-back
+            ]
+        )
+
+        with self.assertRaises(VerificationError) as ctx:
+            await admin.add_user_to_channel("alice", "eng")
+
+        msg = str(ctx.exception)
+        self.assertIn("was added to channel", msg)
+        self.assertIn("already been applied", msg)
+        self.assertIn("You do not have the appropriate permissions.", msg)
+
+    async def test_a_specific_verification_error_is_not_reworded(self):
+        # The read-back's own logic (delete_at still unset) already produces a
+        # precise message; only HTTP failures get the wrapper treatment.
+        admin = _admin_with_mock_rest()
+        admin._rest.get_user_by_username = AsyncMock(
+            return_value={"id": "u1", "username": "alice", "email": "a@x.com"}
+        )
+        admin._rest._request = AsyncMock(side_effect=[{}, {"delete_at": 0}])
+
+        with self.assertRaises(VerificationError) as ctx:
+            await admin.delete_user("alice")
+
+        self.assertIn("delete_at is still unset", str(ctx.exception))
+        self.assertNotIn("already been applied", str(ctx.exception))
+
+
+class TestResolveTeamErrorMessage(unittest.IsolatedAsyncioTestCase):
+    async def test_combined_failure_uses_platform_wording_not_httpx_generic(self):
+        admin = _admin_with_mock_rest()
+        admin._rest.authenticate = AsyncMock()
+        admin._rest.get_me = AsyncMock()
+        admin._rest.resolve_team = AsyncMock(
+            side_effect=RoomNotFoundError("Team 'labteam' not found among the bot's teams")
+        )
+        admin._rest._request = AsyncMock(
+            side_effect=_http_error_with_body(
+                404, {"id": "app.team.get_by_name.missing.app_error",
+                      "message": "Unable to find the existing team"}
+            )
+        )
+
+        with self.assertRaises(RoomNotFoundError) as ctx:
+            await admin.connect()
+
+        msg = str(ctx.exception)
+        self.assertIn("Unable to find the existing team", msg)
+        self.assertNotIn("developer.mozilla.org", msg)
+        # The actionable remedy must survive.
+        self.assertIn("mmctl team add", msg)
 
 
 class TestDeleteUser(unittest.IsolatedAsyncioTestCase):

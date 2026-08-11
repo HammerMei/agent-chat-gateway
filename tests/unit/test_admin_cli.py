@@ -11,8 +11,12 @@ import contextlib
 import io
 import logging
 import os
+import shlex
 import signal
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -34,6 +38,21 @@ def _http_status_error(status_code: int, json_body: dict) -> httpx.HTTPStatusErr
     request = httpx.Request("POST", "https://mm.example/api/v4/users")
     response = httpx.Response(status_code, request=request, json=json_body)
     return httpx.HTTPStatusError("error", request=request, response=response)
+
+
+def _detach_admin_log_handlers(abs_path: str) -> None:
+    """Remove handlers a test attached for `abs_path`, so a temp file that is
+    about to be deleted is not left wired to a module-level logger."""
+    for lg in (
+        logging.getLogger("agent-chat-gateway.admin.errors"),
+        logging.getLogger("agent-chat-gateway"),
+    ):
+        for h in [
+            h for h in lg.handlers
+            if isinstance(h, logging.FileHandler) and h.baseFilename == abs_path
+        ]:
+            lg.removeHandler(h)
+            h.close()
 
 
 def _args(argv: list[str]):
@@ -453,6 +472,109 @@ class TestReaderlessFifoLogFile(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(code, 1)
         self.assertIn("could not open log file", stderr.getvalue())
+
+    def test_probe_fd_is_held_open_until_both_handlers_are_constructed(self):
+        """The deterministic regression detector for the one-shot-reader hang.
+
+        Background: the ENXIO probe originally closed its fd immediately. On a
+        FIFO that drops the writer count to zero, so a one-shot reader like
+        `cat fifo > log` sees EOF and exits — and the next
+        logging.FileHandler's blocking open() then waits forever for a reader
+        that is gone, reintroducing the exact hang the probe exists to
+        prevent. Once wedged it is silent and SIGINT-proof (the blocked open()
+        restarts under SA_RESTART), so it must be SIGTERM'd by hand.
+
+        Asserted as an ORDERING invariant rather than by reproducing the hang:
+        the real race window is microseconds wide, so an end-to-end attempt
+        only fires ~30-68% of the time and would be exactly the kind of flaky
+        test this suite has already had to fix once. The ordering is what the
+        fix actually guarantees, and it is deterministic.
+        """
+        err_logger = logging.getLogger("agent-chat-gateway.admin.errors")
+        umb_logger = logging.getLogger("agent-chat-gateway")
+        real_close = os.close
+        at_close = []
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "plain.log")
+            target = os.path.abspath(path)
+            # Pre-create so the probe actually opens something (a missing file
+            # takes the FileNotFoundError branch and never opens a probe).
+            open(path, "a").close()
+
+            def tracking_close(fd):
+                # Snapshot how many handlers for THIS path exist at the moment
+                # the probe fd is released.
+                at_close.append(
+                    sum(
+                        1
+                        for lg in (err_logger, umb_logger)
+                        for h in lg.handlers
+                        if isinstance(h, logging.FileHandler) and h.baseFilename == target
+                    )
+                )
+                return real_close(fd)
+
+            try:
+                with patch("gateway.admin.cli.os.close", side_effect=tracking_close):
+                    _configure_error_log(path)
+
+                self.assertEqual(
+                    len(at_close), 1, "expected exactly one probe fd close"
+                )
+                # With the fix, both handlers are already attached (and so have
+                # already opened the path) before the probe is released. With
+                # the bug this is 0.
+                self.assertEqual(
+                    at_close[0], 2,
+                    "probe fd was closed before the handlers opened the path — "
+                    "on a FIFO this drops the writer count to zero and a "
+                    "one-shot reader will exit, hanging the next open()",
+                )
+            finally:
+                _detach_admin_log_handlers(target)
+
+    def test_one_shot_reader_fifo_smoke(self):
+        """End-to-end smoke check that a FIFO with a one-shot reader completes.
+
+        NOT a reliable regression detector on its own — the race is
+        microseconds wide, so a broken build still passes this most of the
+        time (measured: it does). The deterministic guarantee lives in
+        test_probe_fd_is_held_open_until_both_handlers_are_constructed above;
+        this one exists to confirm the whole path really works against a real
+        FIFO and a real reader, in a subprocess so a wedge can be killed
+        rather than blocking the test run.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            fifo = os.path.join(d, "log.fifo")
+            out = os.path.join(d, "out")
+            os.mkfifo(fifo)
+
+            driver = (
+                "from gateway.admin.cli import _configure_error_log;"
+                f"_configure_error_log({fifo!r});"
+                "print('OK')"
+            )
+            reader = subprocess.Popen(
+                f"cat {shlex.quote(fifo)} > {shlex.quote(out)}", shell=True
+            )
+            try:
+                time.sleep(0.3)  # let the reader block in its own open()
+                proc = subprocess.Popen(
+                    [sys.executable, "-c", driver],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+                try:
+                    stdout, stderr = proc.communicate(timeout=20)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.communicate()
+                    self.fail("_configure_error_log() hung on a FIFO with a one-shot reader")
+                self.assertEqual(proc.returncode, 0, f"stderr={stderr!r}")
+                self.assertIn("OK", stdout)
+            finally:
+                reader.terminate()
+                reader.wait(timeout=5)
 
     async def test_regular_log_file_path_still_works(self):
         # Guard the flip side: the probe must not reject ordinary paths.

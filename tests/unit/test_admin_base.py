@@ -3,6 +3,7 @@ PlatformAdmin async context manager contract."""
 
 from __future__ import annotations
 
+import asyncio
 import unittest
 
 from gateway.admin.base import (
@@ -39,6 +40,52 @@ class TestEmailsMatch(unittest.TestCase):
         self.assertFalse(emails_match("a@x.com", ""))
 
 
+class TestAdminUserMatchesEmail(unittest.TestCase):
+    """Owner rule: when pulling one value out of an array, traverse it —
+    don't index [0]. RC's `emails` really is an array."""
+
+    def test_matches_an_address_that_is_not_first(self):
+        u = AdminUser(
+            id="u1", username="alice", email="primary@x.com",
+            emails=("primary@x.com", "secondary@x.com", "third@x.com"),
+        )
+        self.assertTrue(u.matches_email("secondary@x.com"))
+        self.assertTrue(u.matches_email("third@x.com"))
+
+    def test_match_is_position_invariant(self):
+        a = AdminUser(id="u1", username="alice", email="a@x.com", emails=("a@x.com", "b@x.com"))
+        b = AdminUser(id="u1", username="alice", email="b@x.com", emails=("b@x.com", "a@x.com"))
+        for target in ("a@x.com", "b@x.com"):
+            with self.subTest(target=target):
+                self.assertEqual(a.matches_email(target), b.matches_email(target))
+                self.assertTrue(a.matches_email(target))
+
+    def test_genuine_mismatch_against_all_addresses(self):
+        u = AdminUser(
+            id="u1", username="alice", email="a@x.com", emails=("a@x.com", "b@x.com")
+        )
+        self.assertFalse(u.matches_email("someone-else@x.com"))
+
+    def test_case_and_whitespace_insensitive_on_a_later_address(self):
+        u = AdminUser(
+            id="u1", username="alice", email="a@x.com", emails=("a@x.com", " Second@X.COM ")
+        )
+        self.assertTrue(u.matches_email("second@x.com"))
+
+    def test_primary_email_is_always_included_even_if_emails_not_passed(self):
+        # Callers that only set `email` must still match — the collection is
+        # backfilled in __post_init__.
+        u = AdminUser(id="u1", username="alice", email="a@x.com")
+        self.assertEqual(u.emails, ("a@x.com",))
+        self.assertTrue(u.matches_email("a@x.com"))
+        self.assertFalse(u.matches_email("b@x.com"))
+
+    def test_no_addresses_at_all_fails_open(self):
+        u = AdminUser(id="u1", username="alice", email="")
+        self.assertEqual(u.emails, ())
+        self.assertTrue(u.matches_email("anything@x.com"))
+
+
 class TestExceptionPayloads(unittest.TestCase):
     def test_user_already_exists_carries_existing_user(self):
         existing = AdminUser(id="u1", username="alice", email="a@x.com")
@@ -68,18 +115,29 @@ class TestExceptionPayloads(unittest.TestCase):
 class _DummyAdmin(PlatformAdmin):
     """Minimal concrete PlatformAdmin to exercise __aenter__/__aexit__."""
 
-    def __init__(self, fail_connect: bool = False):
+    def __init__(
+        self,
+        fail_connect: bool = False,
+        connect_error: BaseException | None = None,
+        close_error: BaseException | None = None,
+    ):
         self.connected = False
         self.closed = False
         self._fail_connect = fail_connect
+        self._connect_error = connect_error
+        self._close_error = close_error
 
     async def connect(self):
+        if self._connect_error is not None:
+            raise self._connect_error
         if self._fail_connect:
             raise RuntimeError("bad credentials")
         self.connected = True
 
     async def close(self):
         self.closed = True
+        if self._close_error is not None:
+            raise self._close_error
 
     async def create_user(self, username, email, password, *, full_name=None):
         raise NotImplementedError
@@ -105,6 +163,29 @@ class TestPlatformAdminContextManager(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(admin.connected)
             self.assertFalse(admin.closed)
         self.assertTrue(admin.closed)
+
+    async def test_closes_and_reraises_when_connect_is_cancelled(self):
+        # CancelledError/KeyboardInterrupt are BaseException, so an
+        # `except Exception` here would skip cleanup on exactly the paths
+        # where __aexit__ also never runs.
+        admin = _DummyAdmin(connect_error=asyncio.CancelledError())
+
+        with self.assertRaises(asyncio.CancelledError):
+            async with admin:
+                pass
+
+        self.assertTrue(admin.closed)
+
+    async def test_cancellation_is_not_replaced_by_a_failing_close(self):
+        # Cleanup must never outrank the signal that triggered it: if close()
+        # raises while a CancelledError propagates, the CancelledError must
+        # still be what the caller sees, or asyncio.timeout()/task.cancelled()
+        # misreport.
+        admin = _DummyAdmin(connect_error=asyncio.CancelledError(), close_error=RuntimeError("boom"))
+
+        with self.assertRaises(asyncio.CancelledError):
+            async with admin:
+                pass
 
     async def test_closes_and_reraises_when_connect_fails(self):
         # Python's async-with protocol never calls __aexit__ if __aenter__

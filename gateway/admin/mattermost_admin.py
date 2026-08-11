@@ -13,6 +13,7 @@ import logging
 
 import httpx
 
+from gateway.admin._errors import friendly_error_message, readback_after_write
 from gateway.admin._logging import quiet_expected_error
 from gateway.admin.base import (
     AdminChannel,
@@ -24,13 +25,27 @@ from gateway.admin.base import (
     UserDeactivatedError,
     UserNotFoundError,
     VerificationError,
-    emails_match,
 )
 from gateway.admin.config import AdminProfile
 from gateway.connectors.mattermost.rest import MattermostREST, RoomNotFoundError
 from gateway.connectors.mattermost.rest import logger as _mm_rest_logger
 
 logger = logging.getLogger("agent-chat-gateway.admin.mattermost")
+
+
+def _fmt(exc: Exception | None) -> str:
+    """Render an exception for embedding in a composed error message.
+
+    HTTP errors go through friendly_error_message() so the platform's own text
+    ("Unable to find the existing team", ...) is shown rather than httpx's
+    generic "Client error '404 Not Found' for url '...' For more information
+    check: https://developer.mozilla.org/..." — which is what a composed
+    message would otherwise splice in mid-sentence, since wrapping the error
+    means cli._run() never reaches its httpx.HTTPStatusError arm.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        return friendly_error_message(exc)
+    return str(exc)
 
 
 class MattermostAdmin(PlatformAdmin):
@@ -147,8 +162,8 @@ class MattermostAdmin(PlatformAdmin):
             raise RoomNotFoundError(
                 f"Team '{team}' not found among the caller's own teams "
                 f"({membership_error_msg}), and the admin by-name lookup "
-                f"also failed ({by_name_error}), as did the by-id lookup "
-                f"({by_id_error}). Either the team name/ID is wrong, or this "
+                f"also failed ({_fmt(by_name_error)}), as did the by-id lookup "
+                f"({_fmt(by_id_error)}). Either the team name/ID is wrong, or this "
                 "credential isn't a system admin — if it should just be a "
                 f"member, add it with `mmctl team add {team} <username>`."
             ) from by_id_error
@@ -196,9 +211,12 @@ class MattermostAdmin(PlatformAdmin):
             # access to every one of its channels that they were never
             # meant to have. Matching email is a reasonable proxy for "this
             # is genuinely the same create_user() call, retried." Uses the
-            # same emails_match() the CLI checks (identity_matches, below)
-            # so the two layers can't disagree about the same inputs.
-            matches = emails_match(existing.email, email)
+            # same AdminUser.matches_email() the CLI's identity_matches
+            # check consumes, so the two layers can't disagree about the same
+            # inputs. Mattermost reports a single `email` string (no array to
+            # traverse), but going through the same helper keeps the two
+            # platforms' matching semantics identical.
+            matches = existing.matches_email(email)
             if matches:
                 await self._ensure_team_member(existing.id)
             raise UserAlreadyExistsError(username, existing=existing, identity_matches=matches)
@@ -230,7 +248,8 @@ class MattermostAdmin(PlatformAdmin):
         # respond in ways that don't reliably reflect a created account
         # (mattermost/mattermost#6644). If it's not actually there, fail
         # loudly instead of returning a user that doesn't exist.
-        created = await self._get_user_or_none(username)
+        with readback_after_write(f"Mattermost user '{username}' was created"):
+            created = await self._get_user_or_none(username)
         if created is None:
             raise VerificationError(
                 f"Mattermost reported user '{username}' created (id={user_id}) "
@@ -269,7 +288,8 @@ class MattermostAdmin(PlatformAdmin):
                 f"Mattermost channel creation for '{name}' returned no id: {result}"
             )
 
-        verified = await self._get_channel_or_none(name)
+        with readback_after_write(f"Mattermost channel '{name}' was created"):
+            verified = await self._get_channel_or_none(name)
         if verified is None:
             raise VerificationError(
                 f"Mattermost reported channel '{name}' created (id={channel_id}) "
@@ -298,15 +318,10 @@ class MattermostAdmin(PlatformAdmin):
             json_data={"user_id": user.id},
         )
 
-        try:
-            await self._rest._request(
-                "GET", f"channels/{channel.id}/members/{user.id}"
-            )
-        except httpx.HTTPStatusError as e:
-            raise VerificationError(
-                f"Added '{username}' to channel '{channel_name}' but a "
-                f"read-back membership check failed: {e}"
-            ) from e
+        with readback_after_write(
+            f"'{username}' was added to channel '{channel_name}'"
+        ):
+            await self._rest._request("GET", f"channels/{channel.id}/members/{user.id}")
 
     async def delete_user(self, username: str) -> None:
         """Deactivate a user. Mattermost has no hard user-delete via the
@@ -317,7 +332,8 @@ class MattermostAdmin(PlatformAdmin):
 
         await self._rest._request("DELETE", f"users/{user.id}")
 
-        result = await self._rest._request("GET", f"users/{user.id}")
+        with readback_after_write(f"Mattermost user '{username}' was deactivated"):
+            result = await self._rest._request("GET", f"users/{user.id}")
         if not result.get("delete_at"):
             raise VerificationError(
                 f"Deactivated user '{username}' but a read-back check shows "
@@ -333,7 +349,8 @@ class MattermostAdmin(PlatformAdmin):
 
         await self._rest._request("DELETE", f"channels/{channel.id}")
 
-        result = await self._rest._request("GET", f"channels/{channel.id}")
+        with readback_after_write(f"Mattermost channel '{channel_name}' was archived"):
+            result = await self._rest._request("GET", f"channels/{channel.id}")
         if not result.get("delete_at"):
             raise VerificationError(
                 f"Archived channel '{channel_name}' but a read-back check "

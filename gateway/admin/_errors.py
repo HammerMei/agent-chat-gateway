@@ -10,10 +10,48 @@ and separately preserves the full raw body in a log file so nothing is lost
 even though the console message is now short.
 """
 
+import contextlib
 import json
 import logging
 
 import httpx
+
+from gateway.admin.base import VerificationError
+
+
+@contextlib.contextmanager
+def readback_after_write(what_already_happened: str):
+    """Wrap a verification read-back that follows an ALREADY-SUCCEEDED write.
+
+    Every create/delete in this package writes, then reads back to confirm the
+    change landed (the platforms have been observed to report success without
+    applying it). If that read-back itself fails with an API error, two things
+    used to go wrong at once:
+
+    - The operator saw httpx's generic ``Client error '403 Forbidden' for url
+      '...'  For more information check: https://developer.mozilla.org/...``
+      instead of the platform's own message, because the wrapping bypassed
+      cli._run()'s httpx.HTTPStatusError arm (which calls
+      friendly_error_message) in favour of its generic Exception arm.
+    - Worse, nothing said the write had ALREADY been applied. A bare
+      ``Error: You do not have the appropriate permissions.`` after a
+      successful account creation reads exactly like "nothing happened",
+      inviting the operator to re-run a command that already did its job.
+
+    So the message states both: the platform's real error, and that the write
+    is already done. Only httpx.HTTPStatusError is caught — a VerificationError
+    raised by the read-back's own logic (e.g. "delete_at is still unset") is
+    already specific and passes through untouched.
+    """
+    try:
+        yield
+    except httpx.HTTPStatusError as e:
+        raise VerificationError(
+            f"{what_already_happened}, but the follow-up verification request "
+            f"failed: {friendly_error_message(e)} — NOTE: the change above has "
+            "already been applied on the server, so re-running is not required "
+            "and may not be idempotent."
+        ) from e
 
 
 def friendly_error_message(exc: httpx.HTTPStatusError) -> str:

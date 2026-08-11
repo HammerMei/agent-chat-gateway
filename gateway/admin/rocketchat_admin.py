@@ -18,6 +18,7 @@ import logging
 
 import httpx
 
+from gateway.admin._errors import readback_after_write
 from gateway.admin._logging import quiet_expected_error
 from gateway.admin.base import (
     AdminChannel,
@@ -28,7 +29,6 @@ from gateway.admin.base import (
     UserAlreadyExistsError,
     UserNotFoundError,
     VerificationError,
-    emails_match,
 )
 from gateway.admin.config import AdminConfigError, AdminProfile
 from gateway.connectors.rocketchat.rest import RocketChatREST
@@ -74,7 +74,7 @@ class RocketChatAdmin(PlatformAdmin):
             # dispatches identically for both platforms) can refuse an
             # identity collision uniformly rather than only for Mattermost.
             raise UserAlreadyExistsError(
-                username, existing=existing, identity_matches=emails_match(existing.email, email)
+                username, existing=existing, identity_matches=existing.matches_email(email)
             )
 
         payload = {
@@ -98,7 +98,8 @@ class RocketChatAdmin(PlatformAdmin):
                 f"Rocket.Chat user creation for '{username}' failed: {result.get('error', result)}"
             )
 
-        created = await self._get_user_or_none(username)
+        with readback_after_write(f"Rocket.Chat user '{username}' was created"):
+            created = await self._get_user_or_none(username)
         if created is None:
             raise VerificationError(
                 f"Rocket.Chat reported user '{username}' created but a "
@@ -118,7 +119,8 @@ class RocketChatAdmin(PlatformAdmin):
                 f"Rocket.Chat channel creation for '{name}' failed: {result.get('error', result)}"
             )
 
-        verified = await self._get_channel_or_none(name)
+        with readback_after_write(f"Rocket.Chat channel '{name}' was created"):
+            verified = await self._get_channel_or_none(name)
         if verified is None:
             raise VerificationError(
                 f"Rocket.Chat reported channel '{name}' created but a "
@@ -159,7 +161,9 @@ class RocketChatAdmin(PlatformAdmin):
             )
 
         members_endpoint = "groups.members" if channel.is_private else "channels.members"
-        if not await self._is_channel_member(members_endpoint, channel.id, username):
+        with readback_after_write(f"'{username}' was added to channel '{channel_name}'"):
+            is_member = await self._is_channel_member(members_endpoint, channel.id, username)
+        if not is_member:
             raise VerificationError(
                 f"Added '{username}' to channel '{channel_name}' but a "
                 "read-back membership check did not find them in the member list."
@@ -179,7 +183,8 @@ class RocketChatAdmin(PlatformAdmin):
                 f"Rocket.Chat user deletion for '{username}' failed: {result.get('error', result)}"
             )
 
-        still_there = await self._get_user_or_none(username)
+        with readback_after_write(f"Rocket.Chat user '{username}' was deleted"):
+            still_there = await self._get_user_or_none(username)
         if still_there is not None:
             raise VerificationError(
                 f"Deleted user '{username}' but a read-back lookup still finds it."
@@ -200,7 +205,8 @@ class RocketChatAdmin(PlatformAdmin):
                 f"{result.get('error', result)}"
             )
 
-        still_there = await self._get_channel_or_none(channel_name)
+        with readback_after_write(f"Rocket.Chat channel '{channel_name}' was deleted"):
+            still_there = await self._get_channel_or_none(channel_name)
         if still_there is not None:
             raise VerificationError(
                 f"Deleted channel '{channel_name}' but a read-back lookup still finds it."
@@ -219,11 +225,27 @@ class RocketChatAdmin(PlatformAdmin):
         if not result.get("success"):
             return None
         user = result["user"]
-        email = ""
-        emails = user.get("emails") or []
-        if emails:
-            email = emails[0].get("address", "")
-        return AdminUser(id=user["_id"], username=user["username"], email=email)
+        # RC's `emails` is an array and an account can hold several. Keep ALL
+        # of them for identity matching (see AdminUser.matches_email) instead
+        # of only emails[0] — a requested address sitting at any other index
+        # used to be judged a different identity, turning create_user()'s
+        # idempotent skip into a hard failure. Entries without an "address"
+        # key are dropped rather than becoming ""; a stray "" would make
+        # matches_email() fail open for the whole account.
+        raw_emails = user.get("emails") or []
+        addresses = tuple(
+            entry["address"]
+            for entry in raw_emails
+            if isinstance(entry, dict) and entry.get("address")
+        )
+        return AdminUser(
+            id=user["_id"],
+            username=user["username"],
+            # First address stays the display/primary one, matching what RC
+            # itself presents; matching no longer depends on this choice.
+            email=addresses[0] if addresses else "",
+            emails=addresses,
+        )
 
     async def _get_channel_or_none(self, name: str) -> AdminChannel | None:
         try:

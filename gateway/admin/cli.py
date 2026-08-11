@@ -97,6 +97,19 @@ def _configure_error_log(path: str) -> None:
     # well, and rejecting them would break working invocations. "Would
     # opening it block right now" is the actual question, and O_NONBLOCK
     # answers it directly.
+    #
+    # The probe fd is then held open until BOTH handlers have been
+    # constructed, and only closed in the finally below. Closing it early
+    # (as this originally did) reintroduced the very hang it prevents: with
+    # a one-shot reader like `cat fifo > log`, closing the probe drops the
+    # writer count to zero, the reader sees EOF and exits, and the next
+    # FileHandler's blocking open() then waits forever for a reader that is
+    # gone. Measured: ~30-68% of runs, and the resulting hang is silent AND
+    # SIGINT-proof (the blocked open() restarts under SA_RESTART, so no
+    # bytecode boundary is reached and main()'s KeyboardInterrupt handler
+    # never runs) — it has to be SIGTERM'd by hand. Keeping one writer fd
+    # open throughout means the reader never observes EOF in the gap.
+    probe = None
     try:
         probe = os.open(target, os.O_WRONLY | os.O_APPEND | os.O_NONBLOCK)
     except FileNotFoundError:
@@ -108,24 +121,26 @@ def _configure_error_log(path: str) -> None:
                 "opening it for logging would block forever"
             ) from e
         raise
-    else:
-        os.close(probe)
 
-    _error_logger.setLevel(logging.ERROR)
-    _error_logger.propagate = False
-    if not _has_file_handler_for(_error_logger, target):
-        handler = logging.FileHandler(path)
-        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
-        _error_logger.addHandler(handler)
+    try:
+        _error_logger.setLevel(logging.ERROR)
+        _error_logger.propagate = False
+        if not _has_file_handler_for(_error_logger, target):
+            handler = logging.FileHandler(path)
+            handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
+            _error_logger.addHandler(handler)
 
-    umbrella_logger = logging.getLogger("agent-chat-gateway")
-    if not _has_file_handler_for(umbrella_logger, target):
-        umbrella_handler = logging.FileHandler(path)
-        umbrella_handler.setLevel(logging.WARNING)
-        umbrella_handler.setFormatter(
-            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-        )
-        umbrella_logger.addHandler(umbrella_handler)
+        umbrella_logger = logging.getLogger("agent-chat-gateway")
+        if not _has_file_handler_for(umbrella_logger, target):
+            umbrella_handler = logging.FileHandler(path)
+            umbrella_handler.setLevel(logging.WARNING)
+            umbrella_handler.setFormatter(
+                logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+            )
+            umbrella_logger.addHandler(umbrella_handler)
+    finally:
+        if probe is not None:
+            os.close(probe)
 
 
 def build_parser() -> argparse.ArgumentParser:

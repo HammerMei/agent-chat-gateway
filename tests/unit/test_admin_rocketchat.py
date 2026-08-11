@@ -135,6 +135,65 @@ class TestCreateUser(unittest.IsolatedAsyncioTestCase):
             await admin.create_user("alice", "a@x.com", "pw")
         self.assertTrue(ctx.exception.identity_matches)
 
+    async def test_matches_email_registered_at_a_later_array_index(self):
+        # RC's `emails` is an array; the requested address sitting anywhere
+        # other than index 0 must still count as the same identity.
+        admin = _admin_with_mock_rest()
+        admin._rest._request = AsyncMock(
+            return_value={
+                "success": True,
+                "user": {
+                    "_id": "u1", "username": "alice",
+                    "emails": [
+                        {"address": "primary@x.com"},
+                        {"address": "a@x.com"},
+                    ],
+                },
+            }
+        )
+
+        with self.assertRaises(UserAlreadyExistsError) as ctx:
+            await admin.create_user("alice", "a@x.com", "pw")
+        self.assertTrue(ctx.exception.identity_matches)
+        self.assertEqual(ctx.exception.existing.emails, ("primary@x.com", "a@x.com"))
+
+    async def test_all_addresses_are_retained_from_the_lookup(self):
+        admin = _admin_with_mock_rest()
+        admin._rest._request = AsyncMock(
+            return_value={
+                "success": True,
+                "user": {
+                    "_id": "u1", "username": "alice",
+                    "emails": [{"address": "one@x.com"}, {"address": "two@x.com"}],
+                },
+            }
+        )
+
+        user = await admin._get_user_or_none("alice")
+
+        self.assertEqual(user.emails, ("one@x.com", "two@x.com"))
+        # Primary/display address stays the first, as RC presents it.
+        self.assertEqual(user.email, "one@x.com")
+
+    async def test_malformed_email_entries_are_dropped_not_turned_into_blanks(self):
+        # A stray "" would make matches_email() fail open for the whole
+        # account, so entries without a usable address are discarded.
+        admin = _admin_with_mock_rest()
+        admin._rest._request = AsyncMock(
+            return_value={
+                "success": True,
+                "user": {
+                    "_id": "u1", "username": "alice",
+                    "emails": [{"verified": True}, {"address": ""}, {"address": "real@x.com"}],
+                },
+            }
+        )
+
+        user = await admin._get_user_or_none("alice")
+
+        self.assertEqual(user.emails, ("real@x.com",))
+        self.assertFalse(user.matches_email("someone-else@x.com"))
+
     async def test_existing_user_with_mismatched_email_identity_does_not_match(self):
         admin = _admin_with_mock_rest()
         admin._rest._request = AsyncMock(

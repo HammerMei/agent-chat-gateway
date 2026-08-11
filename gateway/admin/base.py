@@ -10,6 +10,7 @@ admin operations (create, wire up, delete) — different lifecycles, no
 shared behavior worth inheriting.
 """
 
+import contextlib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
@@ -151,6 +152,8 @@ class VerificationError(AdminError):
 class AdminUser:
     id: str
     username: str
+    # Primary/display address. Used in human-facing messages; identity
+    # matching must go through matches_email(), never this field alone.
     email: str
     # Whether the platform reports this account as deactivated/soft-deleted.
     # Defaults False and is keyword-safe for every existing construction site.
@@ -159,6 +162,34 @@ class AdminUser:
     # UserDeactivatedError); Rocket.Chat's delete_user() hard-deletes, so a
     # deleted RC account simply stops resolving.
     deactivated: bool = False
+    # EVERY address the platform reports for this account, not just the first.
+    # Rocket.Chat's users.info returns `emails` as an array and an account can
+    # legitimately hold more than one; reading only `emails[0]` meant a
+    # requested address registered at any other index was judged a different
+    # identity, turning an idempotent skip into a hard failure. Populated by
+    # each admin's lookup; __post_init__ guarantees it always contains
+    # `email`, so a caller that sets only `email` still matches correctly.
+    emails: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.email and self.email not in self.emails:
+            self.emails = (self.email, *self.emails)
+
+    def matches_email(self, requested_email: str) -> bool:
+        """True if ANY of this account's addresses matches ``requested_email``.
+
+        Traverses the whole collection rather than checking a single address:
+        a multi-address account is a normal platform state, not an edge case,
+        and picking one index is only correct by luck.
+
+        Fail-open behavior is inherited from emails_match() and unchanged: an
+        account with no address on file — or a malformed/empty entry among
+        several — counts as a match. See that function for why failing open
+        is the deliberate choice here.
+        """
+        if not self.emails:
+            return True
+        return any(emails_match(addr, requested_email) for addr in self.emails)
 
 
 @dataclass
@@ -241,12 +272,30 @@ class PlatformAdmin(ABC):
         # succeeded). Both concrete admins allocate their httpx.AsyncClient
         # instances in their constructors (before connect() ever runs), so
         # without this, every failed connection attempt through `async
-        # with SomeAdmin(profile) as admin:` would leak those clients and
-        # their connection pools.
+        # with SomeAdmin(profile) as admin:` would leave those clients
+        # un-closed.
+        #
+        # BaseException, not Exception: asyncio.CancelledError and
+        # KeyboardInterrupt do not derive from Exception, and a cancelled or
+        # Ctrl-C'd connect() is precisely when cleanup is skipped. (Scope,
+        # stated honestly: httpcore closes the in-flight socket itself, so
+        # no file descriptor actually leaks — what remains is two Python
+        # objects never marked closed. This is correctness-of-intent, not a
+        # socket leak, and the shipping CLI doesn't use `async with` at all;
+        # it matters for the library callers gateway/admin/__init__.py
+        # anticipates.)
+        #
+        # close() is suppressed rather than awaited bare: if it raised while
+        # a CancelledError was propagating, that new exception would replace
+        # the CancelledError, which breaks cancellation semantics for the
+        # caller — asyncio.timeout() would surface the wrong error and
+        # task.cancelled() would report False. Cleanup must never outrank the
+        # signal that triggered it.
         try:
             await self.connect()
-        except Exception:
-            await self.close()
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await self.close()
             raise
         return self
 
