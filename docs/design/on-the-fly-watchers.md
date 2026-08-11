@@ -1746,6 +1746,21 @@ a one-time reminder.
   table is missing a row for it), but a rule is currently invisible in the
   config TUI entirely. Not fixed here — needs a real "how does the TUI
   represent/edit a rule" design, out of scope for the lazy-creation PR.
+- **`gateway/config.py`'s `find_mergeable_watcher_entry()` doesn't exclude
+  wildcard rules from config-tool room merging (found during PR #79
+  review, fifteenth round).** Once `room: "*"` is a valid entry, the config
+  tool still passes every raw watcher entry — rules included — to this
+  merge-target search. Adding an ordinary named room with the same
+  connector/agent/shared fields as an existing wildcard rule selects the
+  rule as the merge target and rewrites it to `rooms: ["*", "new-room"]`;
+  validation then correctly rejects that as malformed, so an operator with
+  the common "one minimal wildcard rule" setup can't add a normal watcher
+  through the TUI at all. Third instance of the exact same scope boundary
+  as the two items above (`_check_state_orphans()`, `expanded_watchers()`)
+  — config-tool surface work, not core lifecycle work, deliberately not
+  fixed in this PR. Needs the same "how does the TUI represent/edit a
+  rule" design those two are waiting on; the merge search should skip
+  rule entries entirely once that design exists.
 - `session_idle_days`/`session_expire_days` exact default values — not yet
   chosen. **Invariant to validate at config-load time, not just a value to
   pick later:** `session_idle_days` must be strictly less than the
