@@ -140,6 +140,42 @@ class TestRunDispatch(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(code, 0)
 
+    async def test_create_channel_privacy_mismatch_is_an_error(self):
+        # Existing channel is PUBLIC, but --private was requested — the
+        # requested state was never achieved, so this must NOT be a silent
+        # idempotent no-op.
+        mock_admin = AsyncMock()
+        existing = AdminChannel(id="c1", name="secret", is_private=False)
+        mock_admin.create_channel = AsyncMock(
+            side_effect=ChannelAlreadyExistsError("secret", existing=existing)
+        )
+        stderr = io.StringIO()
+        with patch("gateway.admin.cli.load_profiles", return_value={}), \
+             patch("gateway.admin.cli.get_profile", return_value=object()), \
+             patch("gateway.admin.cli.admin_factory", return_value=mock_admin), \
+             contextlib.redirect_stderr(stderr):
+            args = _args(["p", "create-channel", "secret", "--private"])
+            code = await _run(args)
+
+        self.assertEqual(code, 1)
+        self.assertIn("already exists but is public, not private", stderr.getvalue())
+
+    async def test_create_channel_privacy_match_is_still_a_noop(self):
+        # Sanity check the fix didn't break the existing idempotent-no-op
+        # path when the privacy actually does match.
+        mock_admin = AsyncMock()
+        existing = AdminChannel(id="c1", name="secret", is_private=True)
+        mock_admin.create_channel = AsyncMock(
+            side_effect=ChannelAlreadyExistsError("secret", existing=existing)
+        )
+        with patch("gateway.admin.cli.load_profiles", return_value={}), \
+             patch("gateway.admin.cli.get_profile", return_value=object()), \
+             patch("gateway.admin.cli.admin_factory", return_value=mock_admin):
+            args = _args(["p", "create-channel", "secret", "--private"])
+            code = await _run(args)
+
+        self.assertEqual(code, 0)
+
     async def test_not_found_error_returns_1_and_still_closes(self):
         mock_admin = AsyncMock()
         mock_admin.delete_user = AsyncMock(side_effect=UserNotFoundError("no such user"))

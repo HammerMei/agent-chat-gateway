@@ -121,6 +121,28 @@ class TestLoadProfiles(unittest.TestCase):
             with self.assertRaises(AdminConfigError):
                 load_profiles(path)
 
+    def test_numeric_profile_name_raises_admin_config_error(self):
+        # Unquoted "123:" parses as an int key, not a string — the classic
+        # YAML "Norway problem" (also bites true/false/yes/no).
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "cfg.yaml"
+            path.write_text(
+                "profiles:\n  123:\n    type: rocketchat\n"
+                "    server_url: https://rc\n    username: admin\n    password: pw\n"
+            )
+            with self.assertRaises(AdminConfigError):
+                load_profiles(path)
+
+    def test_boolean_profile_name_raises_admin_config_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "cfg.yaml"
+            path.write_text(
+                "profiles:\n  true:\n    type: rocketchat\n"
+                "    server_url: https://rc\n    username: admin\n    password: pw\n"
+            )
+            with self.assertRaises(AdminConfigError):
+                load_profiles(path)
+
     def test_unknown_field_raises_admin_config_error(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "cfg.yaml"

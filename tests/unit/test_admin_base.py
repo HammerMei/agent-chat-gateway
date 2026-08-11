@@ -33,11 +33,14 @@ class TestExceptionPayloads(unittest.TestCase):
 class _DummyAdmin(PlatformAdmin):
     """Minimal concrete PlatformAdmin to exercise __aenter__/__aexit__."""
 
-    def __init__(self):
+    def __init__(self, fail_connect: bool = False):
         self.connected = False
         self.closed = False
+        self._fail_connect = fail_connect
 
     async def connect(self):
+        if self._fail_connect:
+            raise RuntimeError("bad credentials")
         self.connected = True
 
     async def close(self):
@@ -66,6 +69,18 @@ class TestPlatformAdminContextManager(unittest.IsolatedAsyncioTestCase):
             self.assertIs(ctx, admin)
             self.assertTrue(admin.connected)
             self.assertFalse(admin.closed)
+        self.assertTrue(admin.closed)
+
+    async def test_closes_and_reraises_when_connect_fails(self):
+        # Python's async-with protocol never calls __aexit__ if __aenter__
+        # raises — __aenter__ itself must clean up, or the httpx.AsyncClient
+        # instances allocated in the constructor leak.
+        admin = _DummyAdmin(fail_connect=True)
+
+        with self.assertRaises(RuntimeError):
+            async with admin:
+                pass
+
         self.assertTrue(admin.closed)
 
 

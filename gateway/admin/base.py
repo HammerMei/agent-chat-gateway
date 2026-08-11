@@ -145,7 +145,19 @@ class PlatformAdmin(ABC):
         """Delete a channel. Raises ChannelNotFoundError if it does not exist."""
 
     async def __aenter__(self) -> "PlatformAdmin":
-        await self.connect()
+        # If connect() raises, __aenter__ never returns normally, and per
+        # the async-context-manager protocol Python will NOT call
+        # __aexit__ in that case (it's only invoked once __aenter__ has
+        # succeeded). Both concrete admins allocate their httpx.AsyncClient
+        # instances in their constructors (before connect() ever runs), so
+        # without this, every failed connection attempt through `async
+        # with SomeAdmin(profile) as admin:` would leak those clients and
+        # their connection pools.
+        try:
+            await self.connect()
+        except Exception:
+            await self.close()
+            raise
         return self
 
     async def __aexit__(self, *exc_info) -> None:

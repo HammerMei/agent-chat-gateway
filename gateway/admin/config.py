@@ -124,6 +124,19 @@ def load_profiles(path: str | Path | None = None) -> dict[str, AdminProfile]:
 
     profiles: dict[str, AdminProfile] = {}
     for name, fields in raw_profiles.items():
+        if not isinstance(name, str):
+            # An unquoted YAML scalar that looks numeric/boolean (123, true,
+            # yes/no — the classic "Norway problem") parses as that type,
+            # not a string. argparse always hands the CLI's profile argument
+            # back as a str, so the lookup in get_profile() would silently
+            # miss even for what looks like the same name, and — worse —
+            # ", ".join(sorted(profiles)) in that function's error message
+            # raises TypeError on a non-str key, escaping AdminConfigError
+            # handling as a traceback. Reject it here instead.
+            raise AdminConfigError(
+                f"{config_path}: profile name {name!r} must be a string "
+                f"(quote it in YAML if it looks like a number or boolean)"
+            )
         if not isinstance(fields, dict):
             raise AdminConfigError(f"{config_path}: profile '{name}' must be a mapping")
         try:

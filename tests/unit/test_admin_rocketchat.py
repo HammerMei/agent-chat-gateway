@@ -31,6 +31,12 @@ def _http_error(status_code: int) -> httpx.HTTPStatusError:
     return httpx.HTTPStatusError("error", request=request, response=response)
 
 
+def _http_error_with_body(status_code: int, json_body: dict) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "https://x")
+    response = httpx.Response(status_code, request=request, json=json_body)
+    return httpx.HTTPStatusError("error", request=request, response=response)
+
+
 def _profile(**overrides) -> AdminProfile:
     defaults = dict(
         name="rc-lab", type="rocketchat", server_url="https://rc.example",
@@ -226,6 +232,49 @@ class TestAddUserToChannel(unittest.IsolatedAsyncioTestCase):
 
         invite_call = admin._rest._request.call_args_list[2]
         self.assertEqual(invite_call.args[1], "channels.invite")
+
+    async def test_already_in_room_400_is_treated_as_success(self):
+        # Confirmed real RC behavior (see tests/e2e/rc_client.py's
+        # invite_to_channel, which already works around this): re-inviting
+        # a user who's already a member returns HTTP 400, not success:false
+        # in a 200. A re-run seed script must not fail here.
+        admin = _admin_with_mock_rest()
+        admin._rest._request = AsyncMock(
+            side_effect=[
+                {"success": True, "user": {"_id": "u1", "username": "alice", "emails": []}},
+                {"success": True, "channel": {"_id": "c1", "name": "eng"}},
+                _http_error_with_body(400, {"success": False, "error": "[User already in room]"}),
+                {"success": True, "members": [{"username": "alice"}]},
+            ]
+        )
+
+        await admin.add_user_to_channel("alice", "eng")  # must not raise
+
+    async def test_400_without_already_in_body_still_raises(self):
+        admin = _admin_with_mock_rest()
+        admin._rest._request = AsyncMock(
+            side_effect=[
+                {"success": True, "user": {"_id": "u1", "username": "alice", "emails": []}},
+                {"success": True, "channel": {"_id": "c1", "name": "eng"}},
+                _http_error_with_body(400, {"success": False, "error": "some other failure"}),
+            ]
+        )
+
+        with self.assertRaises(httpx.HTTPStatusError):
+            await admin.add_user_to_channel("alice", "eng")
+
+    async def test_500_during_invite_still_raises(self):
+        admin = _admin_with_mock_rest()
+        admin._rest._request = AsyncMock(
+            side_effect=[
+                {"success": True, "user": {"_id": "u1", "username": "alice", "emails": []}},
+                {"success": True, "channel": {"_id": "c1", "name": "eng"}},
+                _http_error(500),
+            ]
+        )
+
+        with self.assertRaises(httpx.HTTPStatusError):
+            await admin.add_user_to_channel("alice", "eng")
 
     async def test_user_not_found(self):
         admin = _admin_with_mock_rest()

@@ -127,9 +127,23 @@ class RocketChatAdmin(PlatformAdmin):
             raise ChannelNotFoundError(f"Rocket.Chat channel '{channel_name}' not found")
 
         endpoint = "groups.invite" if channel.is_private else "channels.invite"
-        result = await self._rest._request(
-            "POST", endpoint, json_data={"roomId": channel.id, "userId": user.id}
-        )
+        try:
+            result = await self._rest._request(
+                "POST", endpoint, json_data={"roomId": channel.id, "userId": user.id}
+            )
+        except httpx.HTTPStatusError as e:
+            # RC returns an HTTP 400 (not success:false in a 200) when the
+            # user is already a member — the exact same behavior
+            # tests/e2e/rc_client.py.invite_to_channel() already works
+            # around ("RC returns error if already a member — safe to
+            # ignore"). Without this, re-running a seed script against a
+            # user already in the channel would fail here even though the
+            # requested end state already holds — the read-back check right
+            # below still confirms membership either way.
+            if e.response.status_code == 400 and "already" in e.response.text.lower():
+                result = {"success": True}
+            else:
+                raise
         if not result.get("success"):
             raise VerificationError(
                 f"Adding '{username}' to channel '{channel_name}' failed: "

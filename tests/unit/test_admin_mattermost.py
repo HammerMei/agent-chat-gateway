@@ -194,6 +194,21 @@ class TestCreateUser(unittest.IsolatedAsyncioTestCase):
             "POST", "teams/team-1/members", json_data={"team_id": "team-1", "user_id": "u1"}
         )
 
+    async def test_mismatched_email_does_not_repair_team_membership(self):
+        # Username collision alone isn't proof of shared identity — this
+        # could be an unrelated pre-existing account. Must not blindly
+        # grant them team access.
+        admin = _admin_with_mock_rest()
+        admin._rest.get_user_by_username = AsyncMock(
+            return_value={"id": "u1", "username": "alice", "email": "someone-else@x.com"}
+        )
+        admin._rest._request = AsyncMock()
+
+        with self.assertRaises(UserAlreadyExistsError):
+            await admin.create_user("alice", "a@x.com", "pw")
+
+        admin._rest._request.assert_not_awaited()
+
     async def test_existing_user_team_repair_failure_propagates(self):
         admin = _admin_with_mock_rest()
         admin._rest.get_user_by_username = AsyncMock(

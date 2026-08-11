@@ -86,10 +86,18 @@ class MattermostAdmin(PlatformAdmin):
             # plain "already exists" no-op on retry would leave the account
             # permanently stuck outside every one of the team's channels,
             # since nothing else in this tool re-attempts the join for an
-            # account that already exists. Ensuring team membership here
-            # means retrying create_user() is the actual, complete recovery
-            # path a caller would reach for.
-            await self._ensure_team_member(existing.id)
+            # account that already exists.
+            #
+            # Only repair when the email also matches, though: a username
+            # collision alone isn't proof this is "our" account from a
+            # failed prior attempt — it could be an unrelated pre-existing
+            # account (typo'd username, stale seed data, etc.), and blindly
+            # adding an unrelated identity to the team would grant them
+            # access to every one of its channels that they were never
+            # meant to have. Matching email is a reasonable proxy for "this
+            # is genuinely the same create_user() call, retried."
+            if existing.email == email:
+                await self._ensure_team_member(existing.id)
             raise UserAlreadyExistsError(username, existing=existing)
 
         payload: dict = {

@@ -165,6 +165,19 @@ async def _dispatch(admin, args) -> None:
             channel = await admin.create_channel(args.name, is_private=args.private)
             print(f"Created channel '{channel.name}' (id={channel.id})")
         except ChannelAlreadyExistsError as e:
+            if e.existing.is_private != args.private:
+                # The idempotent-no-op default only makes sense when the
+                # existing thing actually matches what was requested. A
+                # channel that exists with the WRONG privacy is a state
+                # mismatch, not a success — silently exiting 0 here would
+                # let a provisioning script believe e.g. a sensitive
+                # channel is private when it's actually public.
+                existing_kind = "private" if e.existing.is_private else "public"
+                requested_kind = "private" if args.private else "public"
+                raise RuntimeError(
+                    f"Channel '{e.name}' already exists but is {existing_kind}, "
+                    f"not {requested_kind} as requested (id={e.existing.id})"
+                ) from e
             print(
                 f"Channel '{e.name}' already exists (id={e.existing.id}) — skipping",
                 file=sys.stderr,
