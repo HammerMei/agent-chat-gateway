@@ -103,6 +103,30 @@ class TestLoadProfiles(unittest.TestCase):
             with self.assertRaises(AdminConfigError):
                 load_profiles(path)
 
+    def test_unknown_field_raises_admin_config_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "cfg.yaml"
+            path.write_text(
+                "profiles:\n  rc-lab:\n    type: rocketchat\n"
+                "    server_url: https://rc\n    username: admin\n    password: pw\n"
+                "    usernme: typo\n"
+            )
+            with self.assertRaises(AdminConfigError):
+                load_profiles(path)
+
+    def test_redundant_name_key_raises_admin_config_error(self):
+        # 'name' is already passed positionally (name=name) — a profile
+        # body that also sets 'name' collides with it (TypeError: multiple
+        # values for argument 'name'), not just an "unknown field".
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "cfg.yaml"
+            path.write_text(
+                "profiles:\n  rc-lab:\n    name: something-else\n    type: rocketchat\n"
+                "    server_url: https://rc\n    username: admin\n    password: pw\n"
+            )
+            with self.assertRaises(AdminConfigError):
+                load_profiles(path)
+
     def test_env_var_path_used_when_no_explicit_path_given(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "cfg.yaml"

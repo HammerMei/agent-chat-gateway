@@ -121,7 +121,15 @@ def load_profiles(path: str | Path | None = None) -> dict[str, AdminProfile]:
     for name, fields in raw_profiles.items():
         if not isinstance(fields, dict):
             raise AdminConfigError(f"{config_path}: profile '{name}' must be a mapping")
-        profiles[name] = AdminProfile(name=name, **fields)
+        try:
+            profiles[name] = AdminProfile(name=name, **fields)
+        except TypeError as e:
+            # A misspelled/unsupported key, or a redundant 'name' key inside
+            # the profile body (colliding with the name=name passed above),
+            # makes this raise TypeError — not caught by _run()'s
+            # `except AdminConfigError`, so left alone this was a raw
+            # traceback for a common config typo instead of a clean error.
+            raise AdminConfigError(f"{config_path}: profile '{name}' has invalid fields: {e}") from e
     return profiles
 
 

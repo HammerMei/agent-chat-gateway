@@ -40,12 +40,23 @@ class MattermostAdmin(PlatformAdmin):
         # credential than any bot account a connector uses (MattermostREST.
         # resolve_team's docstring documents a non-admin bot getting 403 from
         # the team-by-name endpoint — the admin path needs to not hit that).
-        self._rest = MattermostREST(
-            server_url=profile.server_url,
-            token=profile.token or "",
-            username=profile.username or "",
-            password=profile.password or "",
-        )
+        #
+        # When a token is selected, username/password are deliberately NOT
+        # passed through even if the profile also sets them (AdminProfile
+        # permits both). MattermostREST._is_login_mode only checks whether
+        # username+password are present — it has no idea a token was meant
+        # to be authoritative — so passing all three would make a 401 from a
+        # revoked/expired PAT silently trigger login() with the password
+        # instead of failing loudly, defeating PAT revocation as a way to
+        # cut this admin tool's access.
+        if profile.token:
+            self._rest = MattermostREST(server_url=profile.server_url, token=profile.token)
+        else:
+            self._rest = MattermostREST(
+                server_url=profile.server_url,
+                username=profile.username or "",
+                password=profile.password or "",
+            )
 
     async def connect(self) -> None:
         await self._rest.authenticate()
@@ -68,6 +79,17 @@ class MattermostAdmin(PlatformAdmin):
     ) -> AdminUser:
         existing = await self._get_user_or_none(username)
         if existing is not None:
+            # Repair path, not just an idempotency short-circuit: a user can
+            # exist but still not be a team member if a PRIOR create_user()
+            # call created the account and then failed at the team-join step
+            # (see the team-join-failure test below) — reporting that as a
+            # plain "already exists" no-op on retry would leave the account
+            # permanently stuck outside every one of the team's channels,
+            # since nothing else in this tool re-attempts the join for an
+            # account that already exists. Ensuring team membership here
+            # means retrying create_user() is the actual, complete recovery
+            # path a caller would reach for.
+            await self._ensure_team_member(existing.id)
             raise UserAlreadyExistsError(username, existing=existing)
 
         payload: dict = {

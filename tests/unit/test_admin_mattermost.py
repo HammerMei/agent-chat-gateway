@@ -48,6 +48,33 @@ def _admin_with_mock_rest() -> MattermostAdmin:
     return admin
 
 
+class TestConstructor(unittest.TestCase):
+    def test_token_wins_and_password_login_mode_is_disabled_even_if_both_set(self):
+        # AdminProfile permits both a token and username/password to be set
+        # at once. If both were passed through to MattermostREST, a 401
+        # from a revoked/expired PAT would silently trigger a password
+        # relogin (MattermostREST._is_login_mode only checks username+
+        # password presence) instead of failing loudly — defeating PAT
+        # revocation as a way to cut this tool's access.
+        profile = _profile(token="tok", username="admin", password="pw")
+
+        admin = MattermostAdmin(profile)
+
+        self.assertEqual(admin._rest._token, "tok")
+        self.assertIsNone(admin._rest._username)
+        self.assertIsNone(admin._rest._password)
+        self.assertFalse(admin._rest._is_login_mode)
+
+    def test_username_password_used_when_no_token(self):
+        profile = _profile(token=None, username="admin", password="pw")
+
+        admin = MattermostAdmin(profile)
+
+        self.assertIsNone(admin._rest._token)
+        self.assertEqual(admin._rest._username, "admin")
+        self.assertTrue(admin._rest._is_login_mode)
+
+
 class TestConnect(unittest.IsolatedAsyncioTestCase):
     async def test_connect_authenticates_and_resolves_configured_team(self):
         admin = _admin_with_mock_rest()
@@ -143,12 +170,41 @@ class TestCreateUser(unittest.IsolatedAsyncioTestCase):
         admin._rest.get_user_by_username = AsyncMock(
             return_value={"id": "u1", "username": "alice", "email": "a@x.com"}
         )
-        admin._rest._request = AsyncMock()
+        admin._rest._request = AsyncMock(return_value={"user_id": "u1"})  # already a team member
 
         with self.assertRaises(UserAlreadyExistsError) as ctx:
             await admin.create_user("alice", "a@x.com", "pw")
         self.assertEqual(ctx.exception.existing.id, "u1")
-        admin._rest._request.assert_not_awaited()
+
+    async def test_existing_user_repairs_team_membership_before_raising(self):
+        # Retry-recovery path: a prior create_user() call may have created
+        # the account but failed at the team-join step (see
+        # test_team_join_failure_propagates) — a retry must not just report
+        # "already exists" without ALSO fixing the missing team membership.
+        admin = _admin_with_mock_rest()
+        admin._rest.get_user_by_username = AsyncMock(
+            return_value={"id": "u1", "username": "alice", "email": "a@x.com"}
+        )
+        admin._rest._request = AsyncMock(side_effect=[_http_error(404), {}])  # not a member yet, then join
+
+        with self.assertRaises(UserAlreadyExistsError):
+            await admin.create_user("alice", "a@x.com", "pw")
+
+        admin._rest._request.assert_any_await(
+            "POST", "teams/team-1/members", json_data={"team_id": "team-1", "user_id": "u1"}
+        )
+
+    async def test_existing_user_team_repair_failure_propagates(self):
+        admin = _admin_with_mock_rest()
+        admin._rest.get_user_by_username = AsyncMock(
+            return_value={"id": "u1", "username": "alice", "email": "a@x.com"}
+        )
+        admin._rest._request = AsyncMock(side_effect=_http_error(500))
+
+        # A genuine failure repairing team membership must surface loudly,
+        # not be swallowed into the idempotent "already exists" no-op.
+        with self.assertRaises(httpx.HTTPStatusError):
+            await admin.create_user("alice", "a@x.com", "pw")
 
     async def test_readback_miss_raises_verification_error(self):
         admin = _admin_with_mock_rest()
