@@ -739,8 +739,17 @@ class WatcherLifecycle:
 
     async def pause_watcher(self, name: str) -> None:
         """Pause a watcher: stop processing messages but preserve state."""
-        await self._find_or_reconstruct_watcher_config(name)
         async with self._get_watcher_lock(name):
+            # Reconstruction (PR #79 review, fifteenth round) must happen
+            # INSIDE this lock, not before it: _reconstruct_dynamic_watcher_
+            # config() reads disk and unconditionally overwrites
+            # self._states[name] — called before acquiring the lock, a
+            # concurrent _start_watcher() for this exact name (holding the
+            # lock, per its own assertion) could finish and install a fresh
+            # state in between this call's disk read and its write,
+            # silently clobbering that fresh state with a stale disk copy
+            # once this call finally resumes.
+            await self._find_or_reconstruct_watcher_config(name)
             state = self._states.get(name)
             if state and state.paused:
                 logger.info("Watcher '%s' is already paused", name)
@@ -771,9 +780,16 @@ class WatcherLifecycle:
 
     async def resume_watcher(self, name: str) -> None:
         """Resume a paused watcher."""
-        wc = await self._find_or_reconstruct_watcher_config(name)
-        self._ensure_agent_available(wc)
         async with self._get_watcher_lock(name):
+            # Reconstruction must happen INSIDE this lock (PR #79 review,
+            # fifteenth round) — see pause_watcher()'s identical comment.
+            # Without this, a concurrent _start_watcher() for this exact
+            # name (which always holds this same lock) could install a
+            # fresh state in the gap between this call's disk read and its
+            # write, and this call's stale disk copy would silently
+            # clobber it once resumed.
+            wc = await self._find_or_reconstruct_watcher_config(name)
+            self._ensure_agent_available(wc)
             state = self._states.get(name)
             if name in self._processors:
                 logger.info("Watcher '%s' is already running", name)
@@ -831,9 +847,16 @@ class WatcherLifecycle:
 
     async def reset_watcher(self, name: str) -> None:
         """Reset a watcher: clear session and restart with fresh state."""
-        wc = await self._find_or_reconstruct_watcher_config(name)
-        self._ensure_agent_available(wc)
         async with self._get_watcher_lock(name):
+            # Reconstruction must happen INSIDE this lock (PR #79 review,
+            # fifteenth round) — see pause_watcher()'s identical comment.
+            # Without this, a concurrent _start_watcher() for this exact
+            # name (which always holds this same lock) could install a
+            # fresh state in the gap between this call's disk read and its
+            # write, and this call's stale disk copy would silently
+            # clobber it once resumed.
+            wc = await self._find_or_reconstruct_watcher_config(name)
+            self._ensure_agent_available(wc)
             # Cross-connector reservation (PR #79 review, fifteenth round)
             # — same rationale as resume_watcher()'s identical check: an
             # explicit `reset --connector A <name>` bypasses
@@ -1171,10 +1194,19 @@ class WatcherLifecycle:
         `self._states`) — deliberate, so the caller's SUBSEQUENT
         `resume_watcher()`/etc. call finds it via the fast, plain
         `get_watcher_config()` path instead of reconstructing a second time.
+
+        Reconstruction happens under this watcher's per-name lock (PR #79
+        review, fifteenth round) for the same reason pause_watcher()/
+        resume_watcher()/reset_watcher() now acquire it before calling
+        `_find_or_reconstruct_watcher_config()` — `ControlServer` (the only
+        caller, via `SessionManager.can_find_or_reconstruct_watcher()`) has
+        no access to this lock itself, so it must be taken here instead of
+        left to the caller.
         """
         if self.get_watcher_config(name) is not None:
             return True
-        return await self._reconstruct_dynamic_watcher_config(name) is not None
+        async with self._get_watcher_lock(name):
+            return await self._reconstruct_dynamic_watcher_config(name) is not None
 
     async def _find_or_reconstruct_watcher_config(self, name: str) -> WatcherConfig:
         """Shared by pause_watcher()/resume_watcher()/reset_watcher(): the

@@ -1136,6 +1136,101 @@ class TestReconstructDynamicWatcherConfig(unittest.IsolatedAsyncioTestCase):
             await lifecycle.resume_watcher("mm-home-general")
 
 
+class TestReconstructionRunsUnderWatcherLock(unittest.IsolatedAsyncioTestCase):
+    """PR #79 review, fifteenth round: reconstruction must run under this
+    watcher's per-name lock. `_reconstruct_dynamic_watcher_config()`
+    unconditionally overwrites `self._states[name]` from a disk read;
+    `_start_watcher()` always holds this same lock while it runs (asserted
+    at its own entry). Before this fix, pause_watcher()/resume_watcher()/
+    reset_watcher()/can_find_or_reconstruct_watcher() all called
+    reconstruction BEFORE acquiring the lock — a concurrent
+    `_start_watcher()` for this exact name could install a fresh state in
+    the gap between the reconstructing call's disk read and its write, and
+    the stale disk copy would then silently clobber it once that call
+    resumed and finally wrote."""
+
+    def _post_restart_state(self, paused: bool) -> dict:
+        return {
+            "mm-home-general": WatcherState(
+                watcher_name="mm-home-general", session_id="old-sess", room_id="chan-1",
+                paused=paused, dynamically_created=True,
+            )
+        }
+
+    def _spy_on_reconstruction(self, lifecycle) -> dict:
+        """Wrap _reconstruct_dynamic_watcher_config() to record whether
+        this watcher's lock was held at the moment it was called."""
+        observed: dict = {}
+        original = lifecycle._reconstruct_dynamic_watcher_config
+
+        async def spy(name):
+            observed["lock_held"] = lifecycle._get_watcher_lock(name).locked()
+            return await original(name)
+
+        lifecycle._reconstruct_dynamic_watcher_config = spy
+        return observed
+
+    async def test_pause_reconstructs_with_the_lock_held(self):
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=[_rule()], state_by_name=self._post_restart_state(paused=False),
+        )
+        observed = self._spy_on_reconstruction(lifecycle)
+
+        await lifecycle.pause_watcher("mm-home-general")
+
+        self.assertTrue(
+            observed.get("lock_held"),
+            "reconstruction ran without holding the per-watcher lock",
+        )
+
+    async def test_resume_reconstructs_with_the_lock_held(self):
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=[_rule()], state_by_name=self._post_restart_state(paused=True),
+        )
+        observed = self._spy_on_reconstruction(lifecycle)
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            await lifecycle.resume_watcher("mm-home-general")
+
+        self.assertTrue(
+            observed.get("lock_held"),
+            "reconstruction ran without holding the per-watcher lock",
+        )
+
+    async def test_reset_reconstructs_with_the_lock_held(self):
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=[_rule()], state_by_name=self._post_restart_state(paused=False),
+        )
+        observed = self._spy_on_reconstruction(lifecycle)
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            await lifecycle.reset_watcher("mm-home-general")
+
+        self.assertTrue(
+            observed.get("lock_held"),
+            "reconstruction ran without holding the per-watcher lock",
+        )
+
+    async def test_can_find_or_reconstruct_watcher_reconstructs_with_the_lock_held(self):
+        """The only caller (ControlServer, via SessionManager) has no
+        access to this WatcherLifecycle's internal lock at all — the lock
+        must be taken inside this method itself, not left to the caller."""
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=[_rule()], state_by_name=self._post_restart_state(paused=True),
+        )
+        observed = self._spy_on_reconstruction(lifecycle)
+
+        result = await lifecycle.can_find_or_reconstruct_watcher("mm-home-general")
+
+        self.assertTrue(result)
+        self.assertTrue(
+            observed.get("lock_held"),
+            "reconstruction ran without holding the per-watcher lock",
+        )
+
+
 class TestCanFindOrReconstructWatcher(unittest.IsolatedAsyncioTestCase):
     """Direct coverage of the non-raising probe itself, isolated from
     ControlServer routing (see TestResetRouting in test_control_server.py
