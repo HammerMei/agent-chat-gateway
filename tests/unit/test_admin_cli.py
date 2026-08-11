@@ -126,6 +126,26 @@ class TestRunDispatch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(code, 0)
         mock_admin.close.assert_awaited_once()
 
+    async def test_create_user_identity_mismatch_is_an_error(self):
+        # Existing account has a DIFFERENT email than requested — must not
+        # be silently treated as a safe retry (see identity_matches).
+        mock_admin = AsyncMock()
+        existing = AdminUser(id="u1", username="alice", email="someone-else@x.com")
+        mock_admin.create_user = AsyncMock(
+            side_effect=UserAlreadyExistsError("alice", existing=existing, identity_matches=False)
+        )
+        stderr = io.StringIO()
+        with patch("gateway.admin.cli.load_profiles", return_value={}), \
+             patch("gateway.admin.cli.get_profile", return_value=object()), \
+             patch("gateway.admin.cli.admin_factory", return_value=mock_admin), \
+             contextlib.redirect_stderr(stderr):
+            args = _args(["p", "create-user", "alice", "a@x.com", "pw"])
+            code = await _run(args)
+
+        self.assertEqual(code, 1)
+        self.assertIn("already exists but with a different email", stderr.getvalue())
+        mock_admin.close.assert_awaited_once()
+
     async def test_create_channel_already_exists_is_not_an_error(self):
         mock_admin = AsyncMock()
         existing = AdminChannel(id="c1", name="eng", is_private=False)

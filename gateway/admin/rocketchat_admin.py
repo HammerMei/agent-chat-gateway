@@ -28,6 +28,7 @@ from gateway.admin.base import (
     UserAlreadyExistsError,
     UserNotFoundError,
     VerificationError,
+    emails_match,
 )
 from gateway.admin.config import AdminConfigError, AdminProfile
 from gateway.connectors.rocketchat.rest import RocketChatREST
@@ -68,7 +69,14 @@ class RocketChatAdmin(PlatformAdmin):
     ) -> AdminUser:
         existing = await self._get_user_or_none(username)
         if existing is not None:
-            raise UserAlreadyExistsError(username, existing=existing)
+            # RC has no team/repair concept, so identity_matches doesn't
+            # gate any action here the way it does for Mattermost — it's
+            # still computed and passed through so the CLI layer (which
+            # dispatches identically for both platforms) can refuse an
+            # identity collision uniformly rather than only for Mattermost.
+            raise UserAlreadyExistsError(
+                username, existing=existing, identity_matches=emails_match(existing.email, email)
+            )
 
         payload = {
             "name": full_name or username,

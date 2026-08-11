@@ -23,6 +23,7 @@ from gateway.admin.base import (
 )
 from gateway.admin.config import AdminProfile
 from gateway.admin.mattermost_admin import MattermostAdmin
+from gateway.connectors.mattermost.rest import RoomNotFoundError
 
 
 def _http_error(status_code: int) -> httpx.HTTPStatusError:
@@ -87,6 +88,51 @@ class TestConnect(unittest.IsolatedAsyncioTestCase):
         admin._rest.authenticate.assert_awaited_once()
         admin._rest.get_me.assert_awaited_once()
         admin._rest.resolve_team.assert_awaited_once_with("labteam")
+
+    async def test_connect_never_falls_back_when_membership_scan_succeeds(self):
+        admin = _admin_with_mock_rest()
+        admin._rest.authenticate = AsyncMock()
+        admin._rest.get_me = AsyncMock()
+        admin._rest.resolve_team = AsyncMock()
+        admin._rest._request = AsyncMock()
+
+        await admin.connect()
+
+        admin._rest._request.assert_not_awaited()
+
+    async def test_connect_falls_back_to_admin_by_name_lookup_when_not_a_member(self):
+        # The scenario this fallback exists for: a system-admin/PAT
+        # credential administering a team it hasn't itself joined.
+        admin = _admin_with_mock_rest()
+        admin._rest.authenticate = AsyncMock()
+        admin._rest.get_me = AsyncMock()
+        admin._rest.resolve_team = AsyncMock(
+            side_effect=RoomNotFoundError("Team 'labteam' not found among the bot's teams")
+        )
+        admin._rest._request = AsyncMock(return_value={"id": "team-99", "name": "labteam"})
+
+        await admin.connect()
+
+        admin._rest._request.assert_awaited_once_with("GET", "teams/name/labteam")
+        self.assertEqual(admin._rest.team_id, "team-99")
+
+    async def test_connect_raises_combined_error_when_both_lookups_fail(self):
+        admin = _admin_with_mock_rest()
+        admin._rest.authenticate = AsyncMock()
+        admin._rest.get_me = AsyncMock()
+        admin._rest.resolve_team = AsyncMock(
+            side_effect=RoomNotFoundError("Team 'labteam' not found among the bot's teams")
+        )
+        admin._rest._request = AsyncMock(side_effect=_http_error(404))
+
+        with self.assertRaises(RoomNotFoundError) as ctx:
+            await admin.connect()
+
+        # Both failure reasons should be present, not just whichever
+        # happened last — this is what a human debugging a typo'd team
+        # name or a non-admin credential actually needs to see.
+        self.assertIn("not found among the bot's teams", str(ctx.exception))
+        self.assertIn("admin by-name lookup also failed", str(ctx.exception))
 
 
 class TestCreateUser(unittest.IsolatedAsyncioTestCase):
@@ -187,12 +233,25 @@ class TestCreateUser(unittest.IsolatedAsyncioTestCase):
         )
         admin._rest._request = AsyncMock(side_effect=[_http_error(404), {}])  # not a member yet, then join
 
-        with self.assertRaises(UserAlreadyExistsError):
+        with self.assertRaises(UserAlreadyExistsError) as ctx:
             await admin.create_user("alice", "a@x.com", "pw")
+        self.assertTrue(ctx.exception.identity_matches)
 
         admin._rest._request.assert_any_await(
             "POST", "teams/team-1/members", json_data={"team_id": "team-1", "user_id": "u1"}
         )
+
+    async def test_case_and_whitespace_insensitive_email_still_repairs(self):
+        admin = _admin_with_mock_rest()
+        admin._rest.get_user_by_username = AsyncMock(
+            return_value={"id": "u1", "username": "alice", "email": " Alice@X.COM "}
+        )
+        admin._rest._request = AsyncMock(return_value={"user_id": "u1"})  # already a team member
+
+        with self.assertRaises(UserAlreadyExistsError) as ctx:
+            await admin.create_user("alice", "alice@x.com", "pw")
+        self.assertTrue(ctx.exception.identity_matches)
+        admin._rest._request.assert_awaited_once()  # the team membership check ran
 
     async def test_mismatched_email_does_not_repair_team_membership(self):
         # Username collision alone isn't proof of shared identity — this
@@ -204,10 +263,25 @@ class TestCreateUser(unittest.IsolatedAsyncioTestCase):
         )
         admin._rest._request = AsyncMock()
 
-        with self.assertRaises(UserAlreadyExistsError):
+        with self.assertRaises(UserAlreadyExistsError) as ctx:
             await admin.create_user("alice", "a@x.com", "pw")
+        self.assertFalse(ctx.exception.identity_matches)
 
         admin._rest._request.assert_not_awaited()
+
+    async def test_empty_existing_email_fails_open_and_still_repairs(self):
+        # Deliberate, documented trade-off (see emails_match) — not a claim
+        # this is provably the same identity, just the chosen default.
+        admin = _admin_with_mock_rest()
+        admin._rest.get_user_by_username = AsyncMock(
+            return_value={"id": "u1", "username": "alice", "email": ""}
+        )
+        admin._rest._request = AsyncMock(return_value={"user_id": "u1"})
+
+        with self.assertRaises(UserAlreadyExistsError) as ctx:
+            await admin.create_user("alice", "a@x.com", "pw")
+        self.assertTrue(ctx.exception.identity_matches)
+        admin._rest._request.assert_awaited_once()
 
     async def test_existing_user_team_repair_failure_propagates(self):
         admin = _admin_with_mock_rest()

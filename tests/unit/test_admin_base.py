@@ -11,7 +11,32 @@ from gateway.admin.base import (
     ChannelAlreadyExistsError,
     PlatformAdmin,
     UserAlreadyExistsError,
+    emails_match,
 )
+
+
+class TestEmailsMatch(unittest.TestCase):
+    def test_exact_match(self):
+        self.assertTrue(emails_match("a@x.com", "a@x.com"))
+
+    def test_case_insensitive_match(self):
+        self.assertTrue(emails_match("Alice@X.COM", "alice@x.com"))
+
+    def test_whitespace_insensitive_match(self):
+        self.assertTrue(emails_match("  a@x.com  ", "a@x.com"))
+
+    def test_genuine_mismatch(self):
+        self.assertFalse(emails_match("a@x.com", "b@x.com"))
+
+    def test_empty_existing_email_fails_open_to_match(self):
+        # Deliberate, documented trade-off (see emails_match's docstring),
+        # not a claim that it's provably the same identity.
+        self.assertTrue(emails_match("", "anything@x.com"))
+
+    def test_empty_requested_email_against_real_existing_is_a_mismatch(self):
+        # Only an EMPTY existing_email fails open — an empty requested
+        # email against a real existing one is a genuine mismatch.
+        self.assertFalse(emails_match("a@x.com", ""))
 
 
 class TestExceptionPayloads(unittest.TestCase):
@@ -21,6 +46,16 @@ class TestExceptionPayloads(unittest.TestCase):
         self.assertEqual(err.username, "alice")
         self.assertIs(err.existing, existing)
         self.assertIn("alice", str(err))
+
+    def test_user_already_exists_identity_matches_defaults_to_true(self):
+        existing = AdminUser(id="u1", username="alice", email="a@x.com")
+        err = UserAlreadyExistsError("alice", existing=existing)
+        self.assertTrue(err.identity_matches)
+
+    def test_user_already_exists_identity_matches_explicit_false(self):
+        existing = AdminUser(id="u1", username="alice", email="someone-else@x.com")
+        err = UserAlreadyExistsError("alice", existing=existing, identity_matches=False)
+        self.assertFalse(err.identity_matches)
 
     def test_channel_already_exists_carries_existing_channel(self):
         existing = AdminChannel(id="c1", name="general", is_private=False)

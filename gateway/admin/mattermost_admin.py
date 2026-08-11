@@ -23,9 +23,10 @@ from gateway.admin.base import (
     UserAlreadyExistsError,
     UserNotFoundError,
     VerificationError,
+    emails_match,
 )
 from gateway.admin.config import AdminProfile
-from gateway.connectors.mattermost.rest import MattermostREST
+from gateway.connectors.mattermost.rest import MattermostREST, RoomNotFoundError
 from gateway.connectors.mattermost.rest import logger as _mm_rest_logger
 
 logger = logging.getLogger("agent-chat-gateway.admin.mattermost")
@@ -37,9 +38,13 @@ class MattermostAdmin(PlatformAdmin):
         # Prefer a PAT (profile.token) over username/password: it sidesteps
         # the session-token relogin path entirely, and the admin account
         # backing this tool is deliberately a *different*, higher-privilege
-        # credential than any bot account a connector uses (MattermostREST.
-        # resolve_team's docstring documents a non-admin bot getting 403 from
-        # the team-by-name endpoint — the admin path needs to not hit that).
+        # credential than any bot account a connector uses. This matters
+        # concretely for _resolve_team()'s admin-only fallback below (GET
+        # teams/name/{team}): MattermostREST.resolve_team's docstring
+        # documents that a non-admin bot gets 403 from that same endpoint
+        # regardless of team membership — a system-admin-caliber credential
+        # is exactly what's needed for that fallback to have a chance of
+        # working.
         #
         # When a token is selected, username/password are deliberately NOT
         # passed through even if the profile also sets them (AdminProfile
@@ -63,7 +68,65 @@ class MattermostAdmin(PlatformAdmin):
         await self._rest.get_me()
         # profile.team is required for type=mattermost (enforced in
         # AdminProfile.__post_init__), so this is safe unconditionally.
-        await self._rest.resolve_team(self.profile.team)  # type: ignore[arg-type]
+        await self._resolve_team(self.profile.team)  # type: ignore[arg-type]
+
+    async def _resolve_team(self, team: str) -> None:
+        """Resolve profile.team to a team_id, preferring the membership-
+        scoped lookup MattermostREST already provides, falling back to an
+        admin-visible by-name lookup only when the caller isn't a member.
+
+        Order matters: MattermostREST.resolve_team() (GET /users/me/teams)
+        is tried FIRST because it's known-safe for every credential
+        AdminProfile accepts today — AdminProfile does NOT require a
+        system-admin credential, plain username/password is allowed, and
+        resolve_team()'s own docstring (+ its regression test) confirm a
+        non-admin gets 403 from GET /teams/name/{name} "regardless of team
+        membership." Falling back to that endpoint UNCONDITIONALLY would
+        break the currently-working non-admin-but-a-team-member case.
+
+        The fallback only runs when the team isn't among the caller's own
+        memberships — the scenario this tool's credential is meant to cover
+        (see __init__ above): a system-admin/PAT account administering a
+        team it hasn't necessarily joined itself, e.g. provisioning a
+        brand-new team's users/channels before anyone (including the admin)
+        has joined it.
+
+        KNOWN UNVERIFIED GAP: resolving team_id here does not by itself
+        guarantee create_channel()/_ensure_team_member()/
+        _get_channel_or_none() (all team-scoped) will actually succeed for
+        a non-member admin against a live server — that depends on
+        Mattermost's system-admin RBAC bypass actually covering those
+        endpoints too, which has not been confirmed against a real server.
+        If it doesn't, resolving team_id alone doesn't fully unlock the
+        "administer a team you haven't joined" use case this targets — only
+        that connect() itself no longer fails immediately.
+        """
+        try:
+            await self._rest.resolve_team(team)
+            return
+        except RoomNotFoundError as membership_error:
+            # `except ... as name` unbinds `name` once this block ends
+            # (a standard Python 3 gotcha, to avoid reference cycles) —
+            # capture the message now so it's still available below.
+            membership_error_msg = str(membership_error)
+        # Not wrapped in quiet_expected_error: unlike the existence checks
+        # elsewhere in this file, a 404 here is the SECOND of two failed
+        # lookups — a genuine misconfiguration (bad team name, or a
+        # non-admin credential), not an expected outcome on the happy path.
+        # It should stay loud.
+        try:
+            result = await self._rest._request("GET", f"teams/name/{team}")
+        except httpx.HTTPStatusError as by_name_error:
+            raise RoomNotFoundError(
+                f"Team '{team}' not found among the caller's own teams "
+                f"({membership_error_msg}), and the admin by-name lookup "
+                f"also failed ({by_name_error}). Either the team name is "
+                "wrong, or this credential isn't a system admin — if it "
+                f"should just be a member, add it with `mmctl team add "
+                f"{team} <username>`."
+            ) from by_name_error
+        self._rest.team_id = result["id"]
+        logger.info("Resolved team '%s' -> id=%s (admin by-name lookup)", team, self._rest.team_id)
 
     async def close(self) -> None:
         await self._rest.close()
@@ -95,10 +158,13 @@ class MattermostAdmin(PlatformAdmin):
             # adding an unrelated identity to the team would grant them
             # access to every one of its channels that they were never
             # meant to have. Matching email is a reasonable proxy for "this
-            # is genuinely the same create_user() call, retried."
-            if existing.email == email:
+            # is genuinely the same create_user() call, retried." Uses the
+            # same emails_match() the CLI checks (identity_matches, below)
+            # so the two layers can't disagree about the same inputs.
+            matches = emails_match(existing.email, email)
+            if matches:
                 await self._ensure_team_member(existing.id)
-            raise UserAlreadyExistsError(username, existing=existing)
+            raise UserAlreadyExistsError(username, existing=existing, identity_matches=matches)
 
         payload: dict = {
             "username": username,

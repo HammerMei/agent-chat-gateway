@@ -119,8 +119,37 @@ class TestCreateUser(unittest.IsolatedAsyncioTestCase):
             return_value={"success": True, "user": {"_id": "u1", "username": "alice", "emails": []}}
         )
 
-        with self.assertRaises(UserAlreadyExistsError):
+        with self.assertRaises(UserAlreadyExistsError) as ctx:
             await admin.create_user("alice", "a@x.com", "pw")
+        # RC's own "no email on file" sentinel ("") fails open to a match —
+        # see emails_match's documented trade-off.
+        self.assertTrue(ctx.exception.identity_matches)
+
+    async def test_existing_user_with_matching_email_identity_matches(self):
+        admin = _admin_with_mock_rest()
+        admin._rest._request = AsyncMock(
+            return_value={
+                "success": True,
+                "user": {"_id": "u1", "username": "alice", "emails": [{"address": "a@x.com"}]},
+            }
+        )
+
+        with self.assertRaises(UserAlreadyExistsError) as ctx:
+            await admin.create_user("alice", "a@x.com", "pw")
+        self.assertTrue(ctx.exception.identity_matches)
+
+    async def test_existing_user_with_mismatched_email_identity_does_not_match(self):
+        admin = _admin_with_mock_rest()
+        admin._rest._request = AsyncMock(
+            return_value={
+                "success": True,
+                "user": {"_id": "u1", "username": "alice", "emails": [{"address": "someone-else@x.com"}]},
+            }
+        )
+
+        with self.assertRaises(UserAlreadyExistsError) as ctx:
+            await admin.create_user("alice", "a@x.com", "pw")
+        self.assertFalse(ctx.exception.identity_matches)
 
     async def test_create_failure_response_raises_verification_error(self):
         admin = _admin_with_mock_rest()

@@ -155,6 +155,21 @@ async def _dispatch(admin, args) -> None:
             )
             print(f"Created user '{user.username}' (id={user.id})")
         except UserAlreadyExistsError as e:
+            if not e.identity_matches:
+                # Same reasoning as the channel-privacy-mismatch check
+                # below: a username collision alone isn't proof of shared
+                # identity (see gateway/admin/base.py's emails_match,
+                # which both admins already used to decide this before
+                # raising) — silently treating it as a successful skip
+                # would let a provisioning script proceed to add-to-channel
+                # next and grant an unrelated pre-existing account access
+                # it was never meant to have.
+                raise RuntimeError(
+                    f"User '{e.username}' already exists but with a different "
+                    f"email (existing: {e.existing.email!r}, requested: "
+                    f"{args.email!r}, id={e.existing.id}) — refusing to treat "
+                    "this as the same account"
+                ) from e
             print(
                 f"User '{e.username}' already exists (id={e.existing.id}) — skipping",
                 file=sys.stderr,

@@ -18,6 +18,41 @@ class AdminError(Exception):
     """Base class for all admin-operation failures raised by this package."""
 
 
+def emails_match(existing_email: str, requested_email: str) -> bool:
+    """Case/whitespace-insensitive comparison used to decide whether an
+    "already exists" collision is plausibly the same identity retrying, or
+    an unrelated account that happens to share a username.
+
+    Single source of truth for both concrete admins AND the CLI layer,
+    specifically so the decision "is this a safe retry" can't drift between
+    them — see UserAlreadyExistsError.identity_matches and
+    MattermostAdmin.create_user's team-repair gate, both of which must
+    agree on the same answer for the same inputs.
+
+    Two deliberate, NOT provably-safe trade-offs, stated honestly rather
+    than as guarantees:
+
+    - An empty ``existing_email`` (Rocket.Chat returns "" when an account
+      genuinely has no email on file — see RocketChatAdmin._get_user_or_none)
+      is treated as a MATCH, not a mismatch. This fails open: a false
+      mismatch turns into a hard CLI failure that blocks this tool's own
+      primary re-run-a-seed-script workflow, whereas a false match only
+      risks the same limited blast radius idempotent retries already carry
+      (repairing team membership / reporting a skip). It is NOT proof the
+      account is the same identity — an account with no email on record
+      could just as easily be genuinely unrelated.
+    - Comparison is case/whitespace-normalized because Mattermost is
+      understood to normalize stored email server-side — an exact,
+      case-sensitive compare would turn a legitimate idempotent retry
+      (same account, different input casing) into a false-positive hard
+      failure. This has not been empirically verified against a live
+      server.
+    """
+    if not existing_email:
+        return True
+    return existing_email.strip().lower() == requested_email.strip().lower()
+
+
 class UserAlreadyExistsError(AdminError):
     """Raised by create_user() when the username is already taken.
 
@@ -25,12 +60,21 @@ class UserAlreadyExistsError(AdminError):
     "ensure this user exists" behavior (e.g. re-run seed scripts, or a
     Btrfs restore that lands on a partially-seeded state) can catch this
     specifically and use .existing instead of treating it as a hard failure.
+
+    ``identity_matches`` (computed by each admin via emails_match(), above)
+    tells the caller whether the existing account is plausibly the SAME
+    identity retrying, or an unrelated account that happens to share a
+    username — the CLI uses this to decide whether "already exists" is a
+    safe no-op or a real error worth failing on (see gateway/admin/cli.py).
+    Defaults to True so constructing this error without specifying it
+    doesn't accidentally manufacture a spurious identity-collision failure.
     """
 
-    def __init__(self, username: str, existing: "AdminUser"):
+    def __init__(self, username: str, existing: "AdminUser", *, identity_matches: bool = True):
         super().__init__(f"User '{username}' already exists")
         self.username = username
         self.existing = existing
+        self.identity_matches = identity_matches
 
 
 class ChannelAlreadyExistsError(AdminError):
