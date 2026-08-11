@@ -226,94 +226,15 @@ class ControlServer:
 
         # schedule-*: managed by JobStore (no connector routing needed)
         if cmd and cmd.startswith("schedule-"):
-            return self._handle_schedule(cmd, request)
+            return await self._handle_schedule(cmd, request)
 
         # pause/resume/reset: auto-resolve connector from watcher name (watcher names are
         # globally unique across all connectors, so no --connector is needed).
         if cmd in ("pause", "resume", "reset") and not connector_name:
             watcher_name = request.get("watcher_name", "")
-            if not watcher_name:
-                return {"ok": False, "error": "Missing 'watcher_name'"}
-            entry = self._find_entry_for_watcher(watcher_name)
-            live_entry = None if isinstance(entry, dict) else entry
-
-            # PR #79 review: config-load-time uniqueness only covers names
-            # sourced from config.yaml — a dynamically-created watcher's
-            # name is never in config.yaml (only its WatcherState is
-            # persisted), so it's invisible to that check. A static watcher
-            # later configured on a DIFFERENT connector with the same name
-            # (accidentally or because the auto-generated format is
-            # predictable) can therefore collide with nothing catching it
-            # at load time. `_find_entry_for_watcher()`'s plain
-            # get_watcher_config() scan would silently pick the LIVE
-            # match (e.g. connector B's static watcher) and never even
-            # look at connector A's dormant claim on the same name — an
-            # unqualified `resume X`/`reset X` would then act on B,
-            # potentially resetting its session, while the operator
-            # believed they were addressing A. Scan every OTHER connector
-            # with the non-mutating is_watcher_name_known() probe (not
-            # can_find_or_reconstruct_watcher(), which has a
-            # reconstruction side effect appropriate for the connector
-            # we're about to ACT on, but not for ones we're merely
-            # checking for ambiguity — same rationale as
-            # is_watcher_name_known()'s own docstring).
-            other_claimants = [
-                candidate for candidate in self._entries
-                if candidate is not live_entry
-                and candidate.session_manager.is_watcher_name_known(watcher_name)
-            ]
-
-            if live_entry is not None and other_claimants:
-                names = ", ".join(f"'{c.name}'" for c in other_claimants)
-                return {
-                    "ok": False,
-                    "error": (
-                        f"Watcher name {watcher_name!r} is ambiguous: it is "
-                        f"live on connector '{live_entry.name}', but also "
-                        f"known (a dormant/persisted watcher) to "
-                        f"connector(s) {names}. Specify --connector to "
-                        f"disambiguate."
-                    ),
-                }
-
-            if live_entry is not None:
-                entry = live_entry
-            elif len(other_claimants) > 1:
-                names = ", ".join(f"'{c.name}'" for c in other_claimants)
-                return {
-                    "ok": False,
-                    "error": (
-                        f"Watcher name {watcher_name!r} is ambiguous: "
-                        f"dormant/persisted watchers with this name exist "
-                        f"on connectors {names}. Specify --connector to "
-                        f"disambiguate."
-                    ),
-                }
-            elif len(other_claimants) == 1:
-                # PR #79 review (fourth round): _find_entry_for_watcher()'s
-                # plain, synchronous get_watcher_config() lookup only sees
-                # each connector's already-known WatcherConfigs — a
-                # dynamically-created watcher's config is gone from that
-                # list after a restart (only its WatcherState survives).
-                # Now that is_watcher_name_known() has already identified
-                # the ONE connector that owns this name (unambiguous), let
-                # it actually reconstruct it via the mutating,
-                # reconstruction-aware probe — without this, a persisted
-                # dynamic watcher was unreachable through the one CLI path
-                # meant to bring it back, even though resume_watcher()/
-                # reset_watcher()/pause_watcher() themselves already know
-                # how to reconstruct it once actually called.
-                candidate = other_claimants[0]
-                if await candidate.session_manager.can_find_or_reconstruct_watcher(watcher_name):
-                    entry = candidate
-                else:
-                    # is_watcher_name_known() said yes but the more
-                    # rigorous reconstruction check said no (e.g. the room
-                    # no longer resolves, or the wildcard rule was
-                    # removed) — genuinely gone, not ambiguous.
-                    return {"ok": False, "error": f"Unknown watcher: {watcher_name!r}"}
-            else:
-                return {"ok": False, "error": f"Unknown watcher: {watcher_name!r}"}
+            entry = await self._resolve_watcher_entry(watcher_name)
+            if isinstance(entry, dict):
+                return entry  # error response
 
             return await entry.session_manager.dispatch_command(request)
 
@@ -366,6 +287,12 @@ class ControlServer:
         Watcher names are globally unique (enforced at config load time), so
         searching all entries by name is unambiguous.  Returns an error dict
         if no entry owns the watcher.
+
+        Plain and non-reconstructing: only sees each connector's already-known
+        WatcherConfigs, so a dormant lazily-created watcher (config gone from
+        that list after a restart — only its WatcherState survives) is
+        invisible here. Callers that must also see those should use
+        `_resolve_watcher_entry()` instead.
         """
         if not watcher_name:
             return {"ok": False, "error": "Missing 'watcher_name'"}
@@ -374,20 +301,115 @@ class ControlServer:
                 return entry
         return {"ok": False, "error": f"Unknown watcher: {watcher_name!r}"}
 
-    def _handle_schedule(self, cmd: str, request: dict) -> dict:
+    async def _resolve_watcher_entry(self, watcher_name: str) -> "ConnectorEntry | dict":
+        """Resolve `watcher_name` to its single owning ConnectorEntry,
+        reconstruction-aware: unlike `_find_entry_for_watcher()`, this also
+        finds a dormant, lazily-created watcher whose WatcherConfig hasn't
+        been reconstructed yet post-restart (only its WatcherState
+        survives — docs/design/on-the-fly-watchers.md).
+
+        Shared by every caller that needs to turn a watcher name into a
+        connector before acting on it: `dispatch_command()`'s pause/resume/
+        reset routing (PR #79 review, fourth/ninth rounds — see the inline
+        history there for why each step below exists), `_handle_schedule_create()`,
+        and `_handle_fetch_history()` (PR #79 review, fifteenth round — both
+        of the latter two previously used the plain, non-reconstructing
+        `_find_entry_for_watcher()` and so rejected a perfectly resumable
+        dormant dynamic watcher as "Unknown watcher").
+
+        Returns the resolved ConnectorEntry, or an error dict if the name is
+        missing, unknown, or ambiguous across connectors (multiple
+        connectors claim it — specify --connector to disambiguate, handled
+        by the caller since only some commands accept that parameter).
+        """
+        if not watcher_name:
+            return {"ok": False, "error": "Missing 'watcher_name'"}
+        entry = self._find_entry_for_watcher(watcher_name)
+        live_entry = None if isinstance(entry, dict) else entry
+
+        # PR #79 review: config-load-time uniqueness only covers names
+        # sourced from config.yaml — a dynamically-created watcher's name is
+        # never in config.yaml (only its WatcherState is persisted), so it's
+        # invisible to that check. A static watcher later configured on a
+        # DIFFERENT connector with the same name (accidentally or because
+        # the auto-generated format is predictable) can therefore collide
+        # with nothing catching it at load time. `_find_entry_for_watcher()`'s
+        # plain get_watcher_config() scan would silently pick the LIVE match
+        # (e.g. connector B's static watcher) and never even look at
+        # connector A's dormant claim on the same name. Scan every OTHER
+        # connector with the non-mutating is_watcher_name_known() probe (not
+        # can_find_or_reconstruct_watcher(), which has a reconstruction side
+        # effect appropriate for the connector we're about to ACT on, but
+        # not for ones we're merely checking for ambiguity — same rationale
+        # as is_watcher_name_known()'s own docstring).
+        other_claimants = [
+            candidate for candidate in self._entries
+            if candidate is not live_entry
+            and candidate.session_manager.is_watcher_name_known(watcher_name)
+        ]
+
+        if live_entry is not None and other_claimants:
+            names = ", ".join(f"'{c.name}'" for c in other_claimants)
+            return {
+                "ok": False,
+                "error": (
+                    f"Watcher name {watcher_name!r} is ambiguous: it is "
+                    f"live on connector '{live_entry.name}', but also "
+                    f"known (a dormant/persisted watcher) to "
+                    f"connector(s) {names}. Specify --connector to "
+                    f"disambiguate."
+                ),
+            }
+
+        if live_entry is not None:
+            return live_entry
+        if len(other_claimants) > 1:
+            names = ", ".join(f"'{c.name}'" for c in other_claimants)
+            return {
+                "ok": False,
+                "error": (
+                    f"Watcher name {watcher_name!r} is ambiguous: "
+                    f"dormant/persisted watchers with this name exist "
+                    f"on connectors {names}. Specify --connector to "
+                    f"disambiguate."
+                ),
+            }
+        if len(other_claimants) == 1:
+            # PR #79 review (fourth round): _find_entry_for_watcher()'s
+            # plain, synchronous get_watcher_config() lookup only sees each
+            # connector's already-known WatcherConfigs — a dynamically-
+            # created watcher's config is gone from that list after a
+            # restart (only its WatcherState survives). Now that
+            # is_watcher_name_known() has already identified the ONE
+            # connector that owns this name (unambiguous), let it actually
+            # reconstruct it via the mutating, reconstruction-aware probe.
+            candidate = other_claimants[0]
+            if await candidate.session_manager.can_find_or_reconstruct_watcher(watcher_name):
+                return candidate
+            # is_watcher_name_known() said yes but the more rigorous
+            # reconstruction check said no (e.g. the room no longer
+            # resolves, or the wildcard rule was removed) — genuinely gone,
+            # not ambiguous.
+            return {"ok": False, "error": f"Unknown watcher: {watcher_name!r}"}
+        return {"ok": False, "error": f"Unknown watcher: {watcher_name!r}"}
+
+    async def _handle_schedule(self, cmd: str, request: dict) -> dict:
         """Route schedule-* commands to the JobStore.
 
-        All sub-handlers are synchronous (they call JobStore.save() which is
-        synchronous file I/O).  This method is therefore a plain def — not async —
-        to make the call-site ``return self._handle_schedule(cmd, request)`` in
-        ``dispatch_command`` accurate and avoid the misleading impression that there
-        is any I/O awaiting happening here.
+        Async (PR #79 review, fifteenth round) because schedule-create now
+        resolves its watcher via `_resolve_watcher_entry()`, which can
+        reconstruct a dormant dynamic watcher's config — a real network
+        round-trip via `resolve_room_by_id()` in the worst case, not the
+        "no I/O awaiting" the previous synchronous version's docstring
+        promised. The other sub-handlers remain plain synchronous JobStore
+        calls; this method is async only because its caller must `await`
+        the one branch that isn't.
         """
         if self._job_store is None:
             return {"ok": False, "error": "Scheduler is not enabled (JobStore not configured)"}
 
         if cmd == "schedule-create":
-            return self._handle_schedule_create(request)
+            return await self._handle_schedule_create(request)
         if cmd == "schedule-list":
             return self._handle_schedule_list(request)
         if cmd == "schedule-delete":
@@ -398,7 +420,7 @@ class ControlServer:
             return self._handle_schedule_resume(request)
         return {"ok": False, "error": f"Unknown schedule command: {cmd!r}"}
 
-    def _handle_schedule_create(self, request: dict) -> dict:
+    async def _handle_schedule_create(self, request: dict) -> dict:
         from datetime import UTC, datetime
 
         from .core.scheduler import compute_next_run
@@ -413,12 +435,20 @@ class ControlServer:
             return {"ok": False, "error": "Missing 'watcher' field"}
 
         # Resolve the connector early — we need its timezone as the default
-        # fallback when --tz is not supplied by the caller.
-        entry = self._find_entry_for_watcher(watcher)
+        # fallback when --tz is not supplied by the caller. Reconstruction-
+        # aware (PR #79 review, fifteenth round): a dormant, lazily-created
+        # watcher's WatcherConfig is gone from _watcher_configs after a
+        # restart (only its WatcherState survives) — the previous plain
+        # _find_entry_for_watcher() lookup rejected scheduling against it as
+        # "not found" even though pause/resume/reset could all already
+        # bring it back.
+        entry = await self._resolve_watcher_entry(watcher)
         if isinstance(entry, dict):
-            available = self._list_all_watcher_names()
-            hint = f" Available watchers: {available}" if available else ""
-            return {"ok": False, "error": f"Watcher {watcher!r} not found in any connector.{hint}"}
+            if "ambiguous" not in entry.get("error", ""):
+                available = self._list_all_watcher_names()
+                hint = f" Available watchers: {available}" if available else ""
+                return {"ok": False, "error": f"Watcher {watcher!r} not found in any connector.{hint}"}
+            return entry
 
         connector_tz = entry.connector.timezone  # "" → _server_local_timezone() inside connector
         timezone = request.get("timezone") or connector_tz or _server_local_timezone()
@@ -631,17 +661,23 @@ class ControlServer:
         if not watcher_name:
             return {"ok": False, "error": "Missing 'watcher' field in fetch-history command"}
 
-        entry = self._find_entry_for_watcher(watcher_name)
+        # Reconstruction-aware (PR #79 review, fifteenth round): a dormant,
+        # lazily-created watcher's WatcherConfig is gone from
+        # _watcher_configs after a restart (only its WatcherState
+        # survives) — the previous plain _find_entry_for_watcher() lookup
+        # rejected fetch-history against it as "unknown watcher" even
+        # though pause/resume/reset could all already bring it back.
+        entry = await self._resolve_watcher_entry(watcher_name)
         if isinstance(entry, dict):
-            return entry  # error: unknown watcher
+            return entry  # error: unknown/ambiguous watcher
 
         if not entry.connector.supports_history():
             return {
                 "ok": False,
                 "error": (
                     f"Connector '{entry.name}' does not support history fetch. "
-                    f"fetch-history is only available for connectors that implement "
-                    f"fetch_room_history() (e.g. Rocket.Chat)."
+                    f"fetch-history requires a connector that implements "
+                    f"fetch_room_history()."
                 ),
             }
 

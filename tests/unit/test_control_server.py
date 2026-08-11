@@ -622,6 +622,20 @@ def _make_history_entry(
         return wc if name == watcher_name else None
 
     entry.session_manager.get_watcher_config = MagicMock(side_effect=_get_watcher_config)
+    # PR #79 review, fifteenth round: _handle_fetch_history() now resolves
+    # via _resolve_watcher_entry() (reconstruction-aware, shared with
+    # pause/resume/reset routing), which also probes every OTHER entry via
+    # is_watcher_name_known()/can_find_or_reconstruct_watcher() for
+    # cross-connector ambiguity — an unconfigured MagicMock() would be
+    # truthy for every name, making an unknown watcher look like an
+    # ambiguous dormant claim instead of genuinely not found. Wire both to
+    # the same truth table as get_watcher_config() above.
+    entry.session_manager.is_watcher_name_known = MagicMock(
+        side_effect=lambda name: name == watcher_name
+    )
+    entry.session_manager.can_find_or_reconstruct_watcher = AsyncMock(
+        side_effect=lambda name: name == watcher_name
+    )
     return entry
 
 
@@ -637,6 +651,58 @@ class TestHandleFetchHistory(unittest.IsolatedAsyncioTestCase):
         })
         self.assertFalse(result["ok"])
         self.assertIn("unknown-watcher", result["error"])
+
+    async def test_reconstructs_a_dormant_dynamic_watcher(self):
+        """PR #79 review, fifteenth round: fetch-history against a dormant,
+        lazily-created watcher (docs/design/on-the-fly-watchers.md) must
+        succeed via the same reconstruction-aware routing pause/resume/
+        reset already use, not reject it as unknown. Before this fix,
+        _handle_fetch_history() used the plain, non-reconstructing
+        _find_entry_for_watcher() directly — a dynamic watcher's
+        WatcherConfig is gone from get_watcher_config() after a restart
+        (only its WatcherState survives), so it was rejected even though
+        it's perfectly resumable."""
+        from gateway.core.config import HistoryHandoffConfig, WatcherConfig
+        from gateway.core.connector import Room
+
+        wc = MagicMock(spec=WatcherConfig)
+        wc.room = "#test-room"
+        wc.history_handoff = HistoryHandoffConfig(max_fetch_count=200)
+
+        entry = MagicMock()
+        entry.name = "mm-home"
+        entry.connector.supports_history.return_value = True
+        entry.connector.resolve_room = AsyncMock(
+            return_value=Room(id="ROOM_ID", name="test-room", type="c")
+        )
+        entry.connector.fetch_room_history = AsyncMock(return_value=[])
+
+        # get_watcher_config() misses until reconstruction "happens" below —
+        # mirrors production, where the config only appears in
+        # _watcher_configs AFTER can_find_or_reconstruct_watcher() succeeds.
+        reconstructed = {"done": False}
+
+        def _get_watcher_config(name):
+            return wc if reconstructed["done"] else None
+
+        async def _can_reconstruct(name):
+            reconstructed["done"] = name == "mm-home-general"
+            return reconstructed["done"]
+
+        entry.session_manager.get_watcher_config = MagicMock(side_effect=_get_watcher_config)
+        entry.session_manager.is_watcher_name_known = MagicMock(
+            side_effect=lambda name: name == "mm-home-general"
+        )
+        entry.session_manager.can_find_or_reconstruct_watcher = AsyncMock(
+            side_effect=_can_reconstruct
+        )
+
+        server = _make_server(entry)
+        result = await server.dispatch_command({
+            "cmd": "fetch-history", "watcher": "mm-home-general"
+        })
+
+        self.assertTrue(result["ok"], f"Expected success, got: {result}")
 
     async def test_connector_no_history_support_returns_error(self):
         """fetch-history against a connector that doesn't support it must return an error."""

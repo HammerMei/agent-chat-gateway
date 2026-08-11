@@ -14,6 +14,7 @@ Run with:
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import shutil
@@ -999,7 +1000,7 @@ class TestScheduleCreate(_ScheduleCLITestBase):
                     "times": 1,
                     "next_run": bad_next_run,
                 }
-                result = server._handle_schedule_create(request)
+                result = asyncio.run(server._handle_schedule_create(request))
                 self.assertFalse(result.get("ok"), f"Expected rejection for next_run={bad_next_run!r}")
                 self.assertIn("next_run", result.get("error", "").lower())
 
@@ -1019,7 +1020,7 @@ class TestScheduleCreate(_ScheduleCLITestBase):
             "times": 1,
             "next_run": "2026-04-10T15:30:00",  # no timezone info
         }
-        result = server._handle_schedule_create(request)
+        result = asyncio.run(server._handle_schedule_create(request))
         self.assertFalse(result.get("ok"))
         self.assertIn("timezone", result.get("error", "").lower())
 
@@ -1042,7 +1043,7 @@ class TestScheduleCreate(_ScheduleCLITestBase):
             "times": 1,
             "next_run": "2099-04-10T15:30:00+00:00",
         }
-        result = server._handle_schedule_create(request)
+        result = asyncio.run(server._handle_schedule_create(request))
         self.assertTrue(result.get("ok"), f"Expected success, got: {result}")
 
     def test_control_handle_schedule_create_rejects_unknown_watcher(self):
@@ -1064,11 +1065,62 @@ class TestScheduleCreate(_ScheduleCLITestBase):
             "cron": "* * * * *",
             "times": 0,
         }
-        result = server._handle_schedule_create(request)
+        result = asyncio.run(server._handle_schedule_create(request))
         self.assertFalse(result.get("ok"))
         error = result.get("error", "")
         self.assertIn("bad-watcher", error)
         self.assertIn("real-watcher", error)  # available watchers listed in error
+
+    def test_control_handle_schedule_create_reconstructs_a_dormant_dynamic_watcher(self):
+        """PR #79 review, fifteenth round: scheduling against a dormant,
+        lazily-created watcher (docs/design/on-the-fly-watchers.md) must
+        succeed via the same reconstruction-aware routing pause/resume/
+        reset already use, not reject it as unknown. Before this fix,
+        _handle_schedule_create() used the plain, non-reconstructing
+        _find_entry_for_watcher() directly, so a dynamic watcher whose
+        WatcherConfig is gone after a restart (only its WatcherState
+        survives) could never have a job scheduled against it."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from gateway.control import ControlServer
+
+        mock_store = MagicMock()
+        mock_store.add = MagicMock(return_value=MagicMock(id="acg-test002"))
+
+        entry = _make_mock_watcher_entry("mm-home")
+        # get_watcher_config() misses until reconstruction "happens" below —
+        # mirrors production, where the config only appears in
+        # _watcher_configs AFTER can_find_or_reconstruct_watcher() succeeds.
+        reconstructed = {"done": False}
+        entry.session_manager.get_watcher_config = MagicMock(
+            side_effect=lambda name: MagicMock() if reconstructed["done"] else None
+        )
+        entry.session_manager.is_watcher_name_known = MagicMock(
+            side_effect=lambda name: name == "mm-home-general"
+        )
+
+        async def _can_reconstruct(name):
+            reconstructed["done"] = name == "mm-home-general"
+            return reconstructed["done"]
+
+        entry.session_manager.can_find_or_reconstruct_watcher = AsyncMock(
+            side_effect=_can_reconstruct
+        )
+
+        # Use the real ControlServer._entries scan (not a mocked
+        # _find_entry_for_watcher) so _resolve_watcher_entry()'s
+        # cross-connector reconstruction path actually runs.
+        server = ControlServer(entries=[entry], job_store=mock_store)
+
+        request = {
+            "cmd": "schedule-create",
+            "watcher": "mm-home-general",
+            "message": "test",
+            "cron": "* * * * *",
+            "times": 0,
+        }
+        result = asyncio.run(server._handle_schedule_create(request))
+        self.assertTrue(result.get("ok"), f"Expected success, got: {result}")
 
     def test_control_handle_schedule_create_rejects_bool_times(self):
         """C2: _handle_schedule_create rejects True/False for 'times' (bool is a subclass of int)."""
@@ -1089,7 +1141,7 @@ class TestScheduleCreate(_ScheduleCLITestBase):
                     "cron": "* * * * *",
                     "times": bad_times,
                 }
-                result = server._handle_schedule_create(request)
+                result = asyncio.run(server._handle_schedule_create(request))
                 self.assertFalse(result.get("ok"), f"Expected rejection for times={bad_times!r}")
                 self.assertIn("times", result.get("error", "").lower())
 
@@ -1111,7 +1163,7 @@ class TestScheduleCreate(_ScheduleCLITestBase):
             "times": 1,
             "next_run": "2000-01-01T00:00:00+00:00",  # clearly in the past
         }
-        result = server._handle_schedule_create(request)
+        result = asyncio.run(server._handle_schedule_create(request))
         self.assertFalse(result.get("ok"), f"Expected rejection for past next_run, got: {result}")
         error = result.get("error", "").lower()
         self.assertTrue(
@@ -1139,7 +1191,7 @@ class TestScheduleCreate(_ScheduleCLITestBase):
                     "times": 0,
                     "timezone": bad_tz,
                 }
-                result = server._handle_schedule_create(request)
+                result = asyncio.run(server._handle_schedule_create(request))
                 self.assertFalse(result.get("ok"), f"Expected rejection for tz={bad_tz!r}, got: {result}")
                 self.assertIn("timezone", result.get("error", "").lower())
 
