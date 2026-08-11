@@ -98,11 +98,16 @@ def load_profiles(path: str | Path | None = None) -> dict[str, AdminProfile]:
             f"Admin config file not found: {config_path} "
             f"(pass --config, set {CONFIG_PATH_ENV_VAR}, or create ./admin-profiles.yaml)"
         )
-    with open(config_path) as f:
-        try:
+    try:
+        with open(config_path) as f:
             raw = yaml.safe_load(f) or {}
-        except yaml.YAMLError as e:
-            raise AdminConfigError(f"{config_path}: invalid YAML: {e}") from e
+    except OSError as e:
+        # e.g. --config pointing at a directory (IsADirectoryError) or an
+        # unreadable file (PermissionError) — ordinary configuration
+        # mistakes that open() surfaces before YAML parsing even starts.
+        raise AdminConfigError(f"{config_path}: could not read config file: {e}") from e
+    except yaml.YAMLError as e:
+        raise AdminConfigError(f"{config_path}: invalid YAML: {e}") from e
 
     if not isinstance(raw, dict):
         raise AdminConfigError(

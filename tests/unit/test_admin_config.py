@@ -60,6 +60,24 @@ class TestLoadProfiles(unittest.TestCase):
         with self.assertRaises(AdminConfigError):
             load_profiles("/nonexistent/admin-profiles.yaml")
 
+    def test_config_path_is_a_directory_raises_admin_config_error(self):
+        # A directory passes the earlier exists() check but open() then
+        # raises IsADirectoryError, not FileNotFoundError.
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(AdminConfigError):
+                load_profiles(d)
+
+    def test_permission_error_reading_config_raises_admin_config_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "cfg.yaml"
+            path.write_text(
+                "profiles:\n  rc-lab:\n    type: rocketchat\n"
+                "    server_url: https://rc\n    username: admin\n    password: pw\n"
+            )
+            with patch("builtins.open", side_effect=PermissionError("denied")):
+                with self.assertRaises(AdminConfigError):
+                    load_profiles(path)
+
     def test_missing_profiles_section_raises(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "cfg.yaml"
