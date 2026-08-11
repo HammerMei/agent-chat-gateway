@@ -9,17 +9,9 @@ verified 2026-08-11) are still design-only. Coordinating a low-traffic
 production test window with the repo owner is still required before any of
 this touches macbook-server (see "Rollout" below) — nothing in this feature
 has been deployed to production yet, regardless of what has merged.
-**Round 15 opened an architecture review** (see "Architecture review
-(2026-08-11): retiring the static/dynamic watcher split" below) on
-finishing the single-shot migration this doc already committed to in
-"Rollout" — PR #79 shipped `watchers:`/`watcher_rules:` as two permanently
-separate paths instead, which the round-15 root-cause tally traces most of
-PR #79's review findings to. A subsequent full code-level pass (see "Full
-code-level analysis of the unification (2026-08-11)") confirmed the
-one-config-shape/one-code-path half is worth doing, but found that
-**"lazy-init only" is not achievable** — only Mattermost implements the
-lazy path, so removing eager start would stop RocketChat/Script/Voice
-watchers from ever starting. Decision pending.
+**A unification of the static/dynamic watcher split is proposed and not
+yet decided** — see "Unifying watchers onto one rule-based mechanism
+(2026-08-11)" below for the analysis and design.
 
 ## Problem
 
@@ -158,6 +150,45 @@ connector today. The real gate is earlier, and differs by transport:
   separate follow-up** (2026-08-04/05 discussion) — it isn't optional
   polish, it's a different mechanism (event-hook-triggered subscribe, not
   message-triggered creation) requiring its own design pass.
+
+  > **Incorrect as of 2026-08-11.** RC's DDP supports subscribing to all
+  > rooms at once: `stream-room-messages` accepts the reserved room id
+  > `__my_messages__`. A per-room `sub` is therefore *not* a precondition
+  > for receiving a room's messages, and message-triggered lazy creation
+  > is achievable on RC without a membership-event hook.
+  >
+  > Server implementation (`RocketChat/Rocket.Chat`, current):
+  > `notifications.module.ts` declares
+  > `streamRoomMessage.allowRead('__my_messages__', 'all')` — any
+  > authenticated user may subscribe — plus an
+  > `allowEmit('__my_messages__', …)` filter evaluated **per message**,
+  > which resolves the room, checks
+  > `Authorization.canAccessRoom(room, user)`, and returns
+  > `roomParticipant: (await Subscriptions.countByRoomIdAndUserId(...)) > 0`.
+  > `listeners.module.ts`'s `watch.messages` handler emits every message
+  > to `__my_messages__` subscribers
+  > (`streamRoomMessage._emit('__my_messages__', [message], …)`) in
+  > addition to the per-room emit. RocketChat's Go SDK exposes the same
+  > thing as `SubscribeToMyMessages()`.
+  >
+  > Design consequences:
+  > 1. RC receives messages for rooms it never per-room-subscribed to, so
+  >    it needs no separate trigger mechanism from MM's.
+  > 2. The emit filter runs per message against live queries, so rooms
+  >    joined *after* subscribing are covered with no re-subscribe and no
+  >    boot-time enumeration.
+  > 3. `roomParticipant` is a server-provided "is the bot a member vs
+  >    merely able to access this room" signal — what a wildcard rule
+  >    needs to decide whether to create a watcher. MM has no equivalent
+  >    and must infer it.
+  >
+  > Unverified, required before implementing: the `__my_messages__` emit
+  > path appends the `allowed` object to the args (`args: [...args, allowed]`
+  > via `changedPayload`), so the payload is not identical to the per-room
+  > emit ACG parses today. ACG also passes `False` as
+  > `stream-room-messages`' second (added-event) param
+  > (`websocket.py:239-242`) where the Go SDK passes `true`. Both need
+  > checking against a live RC server.
 
 **Concurrency (MM): already handled by existing architecture, verified —
 not something this feature needs to add.** `MattermostWebSocketClient.
@@ -1133,606 +1164,322 @@ individual missing check — is the thing generating new findings faster
 than they can be patched. A review of unifying the two paths was
 requested before writing a fifth round of patches. That review is below.
 
-## Architecture review (2026-08-11): retiring the static/dynamic watcher split
+## Unifying watchers onto one rule-based mechanism (2026-08-11)
 
-**The question under review:** keep only `watcher_rules`, delete
-`sync_watchers()` and the exact-room `watchers:` list entirely, and treat
-every watcher — including today's "static, exact-room" ones — as a rule.
-Would this actually simplify the code, or just move the complexity
-around?
+**Proposal:** retire the static/dynamic watcher split. Today
+`GatewayConfig` carries two lists with two lifecycles — `watchers:`
+(exact room, eager-started by `sync_watchers()`, config permanently
+resident in `_watcher_configs`) and `watcher_rules:` (`room: "*"`,
+lazily created by `try_lazy_create()`, config never persisted and
+rebuilt on demand from `WatcherState.dynamically_created`). Collapse
+these into one list where every entry is a rule and an exact room is a
+rule matching exactly one room.
 
-**This is not a new idea — it's the design this document already
-committed to, and PR #79 never finished executing it.** The "Rollout"
-section above, written before implementation started, says explicitly:
+This is the migration the "Rollout" section above already committed to
+("a single-room rule is a strict degenerate case of the general
+mechanism"). The shipped code kept the lists separate; the "Scope
+decisions made while starting implementation (2026-08-05)" section gives
+the reason, and it is narrow — it is about `resolve_room(wc.room)` never
+being handed a literal `"*"` at boot, a parsing concern. It does not
+cover the *lifecycle* divergence that followed (separate eager-start
+path, `dynamically_created`, non-persisted dynamic configs, the
+reconstruction layer). Keeping two config-parsing shapes and unifying the
+lifecycle are independent choices; the analysis below concerns the
+second.
 
-> **Decision: single-shot migration.** Static `room: roomX` watchers
-> migrate to the new rule engine (a single-room rule is a strict
-> degenerate case of the general mechanism, so this is mechanically
-> safe) in the same release as the rest of this design — no
-> additive-first staging, no separate follow-up release for the
-> migration.
+### Why: the asymmetry generating the finding stream
 
-What actually shipped kept `watchers:` and `watcher_rules:` as two
-permanently separate `GatewayConfig` fields with two separate lifecycle
-paths (`sync_watchers()` eager-starts one; `try_lazy_create()` +
-reconstruction lazily materializes the other). This was a deliberate
-choice, not an oversight — the "Scope decisions made while starting
-implementation (2026-08-05)" section above (dated *after* the Rollout
-decision) makes it explicitly, and that matches the recollection of
-proposing exactly this — keeping the static room config and rule-based
-config separate to keep the scope of the original PR limited. So this is
-two dated decisions in real tension, not one that silently reversed the
-other. The 2026-08-05 section's own stated
-reason for the split is narrow, though: it's about `resolve_room(wc.room)`
-never seeing a literal `"*"` string at boot — a config-schema/parsing
-concern. That reason doesn't cover, and was never argued to cover, the
-*lifecycle* divergence that followed it (separate eager-start path,
-`dynamically_created`, non-persisted dynamic configs, the whole
-reconstruction layer). Keeping the schema split (two config-parsing
-shapes, for the parsing-safety reason already given) and unifying the
-*lifecycle* (one start path, one reconstructible-config model) are
-independent axes — the finding tally below traces to the second axis,
-not the first.
+An exact-room watcher's `WatcherConfig` is always present — loaded from
+`config.yaml` at construction, resident for the process lifetime. A
+rule-matched watcher's config is **never** persisted; only its
+`WatcherState` is. Every operation touching a rule-matched watcher after
+a restart must therefore rebuild a config that an exact-room watcher
+simply has, which is why the codebase carries a four-function
+reconstruction layer that exists for one half of the watchers only.
 
-**Root-cause tally.** Went back through every PR #79 finding and checked
-whether it traces to the same asymmetry: an exact-room watcher's
-`WatcherConfig` is always present (loaded from `config.yaml` at
-construction, lives in `self._watcher_configs` for the process's
-lifetime), while a dynamically-created watcher's config is **never**
-persisted — only its `WatcherState` is, forcing every operation that
-touches a dynamic watcher after a restart to reconstruct a config it
-shouldn't need to reconstruct in the first place. Findings #21, #22, #23,
-#25, #28, #30, #31, #34, #35, #36, #37, #38, plus this round's #884 and
-#1142 — every one of them is either (a) a check that exists on the
-reconstruction path but was missing on the static path or vice versa, or
-(b) a race/staleness bug in the reconstruction machinery itself. None of
-them would exist if there were only one path.
+PR #79 review findings #21, #22, #23, #25, #28, #30, #31, #34, #35, #36,
+#37, #38, #884 and #1142 all trace to this: each is either a check
+present on one path and absent on the other, or a staleness/race defect
+inside the reconstruction machinery. Findings that do **not** trace to it
+and would survive unification unchanged: `control.py:387` and
+`control.py:445` (control-plane lookup/disambiguation) and
+`watcher_lifecycle.py:1386` (agent-reassignment watermark handling).
 
-**What would actually disappear, not just move:**
-`_reconstruct_dynamic_watcher_config()`, `_find_or_reconstruct_watcher_config()`,
-`can_find_or_reconstruct_watcher()`, `is_watcher_name_known()`,
-`WatcherState.dynamically_created`, `_dynamic_state_still_matches_rule()`,
-`sync_watchers()`'s entire tail preservation/pruning loop (lines
-243–306 above), the `_reserve_watcher_name()`/`_release_watcher_name()` +
-`_reserved_watcher_names` cross-connector reservation machinery (still
-needed in some form, but currently duplicated across four call sites
-specifically *because* dynamic names aren't known until runtime — a
-single unified start path needs it in exactly one place), and
-`ControlServer._resolve_watcher_entry()`'s ambiguity-scan-then-reconstruct
-dance. `gateway/config.py`'s two parse dispatch blocks
-(`_is_wildcard_room_entry()` → `_parse_one_watcher_rule()` vs.
-`_parse_one_watcher_entry()`) collapse toward one shape, since every
-entry becomes the same kind of thing (a rule; an exact room is just a
-rule matching exactly one room).
+### Current implementation facts
 
-**Two things initially assumed to be regressions, checked against actual
-code, and found not to be:**
-- **Startup pre-warming.** The fear: unifying loses "static watchers
-  always start eagerly regardless of activity" (the `#nest`-latency
-  concern in "Lazy watcher creation" above). Checked: today's eager start
-  for static watchers isn't actually activity-based — it's *possible*
-  because the room name is already known from `config.yaml`, so
-  `resolve_room(wc.room)` works at boot with no discovery step. An
-  exact-room *rule* has exactly the same room name available at boot, so
-  it can be resolved and started eagerly the same way — discovery is
-  only needed for *wildcard*-matched rooms nobody's named yet, which stay
-  exactly as activity-gated as they are today. No regression: only
-  wildcard rules are lazy either way, before or after.
-- **`agent-chat-gateway list`.** Same reasoning — an exact-room rule
-  still materializes a concrete `WatcherConfig` at boot (the name is
-  known), so it still has a row in the table without needing any new
-  machinery.
+Verified directly against the source, because three of these contradict
+descriptions elsewhere in this document:
 
-**What's genuinely open, not a blocker:**
-- RC still can't do message-triggered lazy creation for *wildcard* rules
-  (DDP requires an explicit `sub` before any event fires) — unchanged by
-  unification either way. RC's exact-room rules are unaffected and work
-  today exactly as they would post-unification.
-- `WatcherConfig.session_id` (sticky pinning) is dropped when
-  `_build_watcher_config_from_rule()` derives a config from a rule
-  (`session_id=None`, "neither concept applies once a real room is
-  known" — correct for a *wildcard* rule matching many rooms, but an
-  exact-room rule matching exactly one room could theoretically want it).
-  Not moot, but a sequencing precondition: `session_id` retirement is
-  still design-only per the status line above, not shipped. This
-  migration must land after (or together with) that retirement — landing
-  it first would silently drop sticky-session pinning for every
-  exact-room watcher the moment it becomes a rule.
-- Finding #38's Open Item (a connector-agnostic "room genuinely gone"
-  signal, vs. `RoomNotFoundError` currently being two unrelated
-  per-connector classes) stops being a narrow, deferrable P2 and becomes
-  a real prerequisite: every watcher's config becomes reconstructible
-  from (rule + persisted room_id) rather than just dynamic ones, so
-  "the room this rule used to match is actually gone, not just
-  transiently unreachable" needs a real answer for every watcher, not
-  just the rare cross-connector collision case that motivated deferring
-  it in round 14.
-
-**Effect on this round's four still-open findings** — checked each
-against the unified design rather than assuming unification makes them
-moot:
-- `control.py:387`, `control.py:445` — **survive unchanged.** Both are
-  about `ControlServer`'s lookup/disambiguation behavior, orthogonal to
-  whether the underlying config is static or rule-derived. Still need
-  their own fix either way.
-- `watcher_lifecycle.py:1386` — **survives unchanged.** Agent-reassignment
-  discard logic applies to any watcher whose agent changed out from under
-  it; not specific to the static/dynamic split.
-- `watcher_lifecycle.py:1071` — **the specific function disappears, but
-  the bug pattern doesn't.** `wake_dormant_watcher()` only exists because
-  it's the dynamic-specific "bring a `dynamically_created` watcher back"
-  path; under unification, waking any dormant rule-derived watcher
-  becomes one universal path, and whatever that path ends up looking
-  like needs to be checked for the same missing-`save()`-after-success
-  mistake, since nothing about unification makes that mistake structurally
-  impossible on its own.
-
-**Recommendation:** proceed with the migration — it's not a new
-direction, it's finishing the one this document already committed to,
-and the round-15 tally shows it would have prevented essentially every
-finding of the last five rounds rather than just the four that prompted
-this review. Scope is real, though: this changes the `GatewayConfig`
-schema (`watchers:`/`watcher_rules:` merge into one shape) and touches
-`gateway/config.py` (parsing + the duplicated `from_dict`/`from_file`
-blocks), `watcher_lifecycle.py` (most of the file), `control.py`
-(`_resolve_watcher_entry()` simplifies once there's one lookup path),
-`config_validate.py`'s `_check_state_orphans()`, and the config TUI's
-`expanded_watchers()` — bigger than PR #79 itself, and needs its own
-migration-guide treatment (same precedent as `agent_defaults` →
-`agent_templates`, PR #71). Given the project's stated preference for
-infra work (a larger, correct PR over patching an unstable design), the
-question isn't whether to do this but whether to do it as a follow-up PR
-after landing #79's current fixes, or as more commits on this same
-branch before merging anything.
-
-### Full code-level analysis of the unification (2026-08-11) — and three corrections to the section above
-
-The review above was written from a reading of this document plus targeted
-code checks. It was then followed by an exhaustive pass: seven independent
-full-file reads (`watcher_lifecycle.py` all 1768 lines, `config.py` all
-1839, `control.py`, `config_validate.py`, `configtool/model.py`,
-`core/connector.py`, `mattermost/connector.py`, `core/scheduler.py`, plus
-a test-suite blast-radius inventory), each mapping every function that
-touches the static/dynamic split. That pass **disproved three claims in
-the section above** and surfaced one finding that changes the shape of
-the answer entirely. Corrections first, since the section above is
-already committed:
-
-**Correction 1 — "idle/expire semantics" is not an existing guarantee,
-because it isn't implemented.** The section above lists it among the
-lifecycle guarantees unification must preserve. Verified: `session_idle_days`
-and `session_expire_days` are parsed, cross-validated (`config.py:804-847`),
-modeled on `AgentConfig` (`core/config.py:136-139`) and exposed in the
-config TUI — but have **zero runtime consumers**. Nothing in
-`watcher_lifecycle.py`, `session_manager.py`, `service.py`, or
-`scheduler.py` ever reads either field; there is no background tick and
-no expiry hook. `AgentBackend.typical_session_retention_days()` is
-implemented by both adapters and consumed by nothing. `WatcherState` has
-no "expired" flag. The `agent-chat-gateway expire <watcher>` CLI
-described under "CLI" above **does not exist** in `cli.py`,
-`control.py`, or `session_manager.py` — the "resolved 2026-08-02" note
-there records a design decision, not a shipped feature (the status line
-at the top of this document does say "the `expire` CLI [is] still
-design-only", so this is the section above over-reading its own
-document). Consequence for unification: there is no TTL behavior to
-preserve or regress. This *removes* a constraint rather than adding one.
-
-**Correction 2 — the round-15 tally claim was overstated.** The section
-above says unification "would have prevented essentially every finding
-of the last five rounds." Its own following paragraph then concludes 3 of
-the 4 newest findings survive unification unchanged. Both can't be true.
-The accurate statement: unification eliminates the
-**reconstruction/dual-path finding class** — the bulk of #21, #22, #23,
-#25, #28, #30, #31, #34, #35, #36, #37, #38, #884, #1142 — and does
-nothing for control-plane findings (`control.py:387`, `control.py:445`)
-or agent-reassignment findings (`watcher_lifecycle.py:1386`). "Most of
-the findings, and specifically the ones that kept recurring" is the
-defensible version.
-
-**Correction 3 — `_build_watcher_config_from_rule()` needs a new branch,
-not just to survive.** The section above treats the `session_id`
-sequencing issue as the only wrinkle. It's sharper than that: that
-function (`watcher_lifecycle.py:1106-1125`) *unconditionally* zeroes both
-`session_id` (line 1119) and `exclude_rooms` (line 1120) on the stated
-grounds that "neither concept applies once a real room is known" — true
-for a wildcard-derived room, false for an exact-room rule, which can
-legitimately pin a session. `_provision_session()` (1603-1641) already
-prioritizes a pinned `wc.session_id` correctly and needs no change, and
-`reset_watcher()`'s pinned-session branch (line 904) already reads it —
-so if this function isn't given an exact-room branch, both silently stop
-working for every migrated watcher. Still moot **if** `session_id`
-retirement lands first, which remains the sequencing precondition.
-
-#### The finding that reframes the question: "lazy init only" is not achievable
-
-The request under review was "rule-based only **and lazy-init only**,
-without the static one." The second half is not implementable without
-first building infrastructure that does not exist, and attempting it
-would silently stop three of the four connector types from working at
-all. Evidence, all verified directly:
-
-- Four connector types are registered (`connectors/__init__.py:16-27`):
-  `rocketchat`, `script`, `voice`, `mattermost`.
+- **TTL idle/expire does not exist.** `session_idle_days` and
+  `session_expire_days` are parsed and cross-validated
+  (`config.py:804-847`), modeled on `AgentConfig`
+  (`core/config.py:136-139`) and exposed in the config TUI, but have zero
+  runtime consumers. `AgentBackend.typical_session_retention_days()` is
+  implemented by both adapters and read by nothing. `WatcherState` has no
+  expiry field. The `agent-chat-gateway expire <watcher>` command
+  described under "CLI" above is not implemented in `cli.py`,
+  `control.py`, or `session_manager.py`. There is no TTL behavior for a
+  migration to preserve.
+- **`last_processed_ts` is a message-dedup watermark only.** Restored at
+  `watcher_lifecycle.py:1590-1593`, captured at `1722-1726`, and never
+  read to decide whether to start anything. Exact-room watchers start
+  unconditionally at every boot — not because they are active, but
+  because their room name resolves without discovery. Rule-matched rooms
+  are never pre-started (`watcher_lifecycle.py:260-268`). "Activity-gated
+  pre-warming" as described under "Lazy watcher creation" above is not
+  implemented.
+- **No room discovery exists.** Neither connector's `rest.py` has a
+  `subscriptions.get` / `GET /api/v4/users/me/channels` enumeration —
+  only single-room `resolve_room()` / `get_channel_by_id()`. The "Room
+  discovery + membership-event hooks" section above describes a design.
 - **Only Mattermost implements the lazy path.**
   `register_lazy_creation_hook()` is overridden solely in
-  `mattermost/connector.py:253`; `resolve_room_by_id()` solely in
-  `mattermost/connector.py:338`. RC, Script, and Voice inherit the base
-  ABC's inert no-op / `NotImplementedError` defaults
-  (`core/connector.py:224`, `:339`).
-- This is enforced at config-load time:
+  `mattermost/connector.py:253`, `resolve_room_by_id()` solely in
+  `mattermost/connector.py:338`; `rocketchat`, `script` and `voice`
+  inherit the base ABC's no-op / `NotImplementedError` defaults
+  (`core/connector.py:224`, `:339`). Enforced at load time by
   `_LAZY_CREATION_SUPPORTED_CONNECTOR_TYPES = {"mattermost"}`
-  (`config.py:1044`), raising for any other connector type inside
-  `_parse_one_watcher_rule()` (`config.py:1129-1136`).
-- **No room discovery exists anywhere.** There is no
-  `subscriptions.get` / `GET /api/v4/users/me/channels` enumeration in
-  either connector's `rest.py` — only single-room `resolve_room()` /
-  `get_channel_by_id()` calls. The "Room discovery + membership-event
-  hooks" section near the top of this document describes a design, not
-  shipped code.
-- RC's constraint is structural, not incidental: DDP requires an explicit
-  per-room `sub` frame (`rocketchat/websocket.py:207-290`, frame at
-  234-242) before the client receives anything for a room, and
-  `RocketChatConnector.subscribe_room()` (`connector.py:379-433`) is the
-  only sender — called only for rooms an existing watcher already names.
+  (`config.py:1044`, raising at `1129-1136` inside
+  `_parse_one_watcher_rule()`).
+- **RC's protocol does support subscribe-all** via
+  `stream-room-messages` + `__my_messages__` — see the retraction note
+  under "2026-08-05 revision" above. So the connector gap is in ACG's RC
+  implementation, not in RC itself.
 
-Therefore, for RC/Script/Voice, a watcher can start **only** because its
-room name is known from config at boot and `sync_watchers()` resolves it
-eagerly. Remove eager start and those watchers never start, ever — not a
-config-format break but a total functional loss.
+### Consequence for scope: eager start must survive
 
-**The one escape hatch, checked rather than assumed:** `subscribe_room()`
-is step 7 of `_start_watcher()` (line 1548), not step 1 — so one could
-ask whether it can be *hoisted* to boot (eagerly DDP-`sub` every named
-room) while deferring the expensive rest of init (session provisioning,
-history handoff, context injection, processor construction) to first
-message. RC's plumbing does not rule this out: `subscribe_room()`
-(`rocketchat/connector.py:379-433`) is refcounted and registers a
-per-room callback, and RC's `_handle_room_message` gates precisely on
-`self._callbacks.get(room_id)` (`websocket.py:528-530`) — so an eager
-boot-time subscribe would in fact make messages start arriving. But
-making that useful requires two further changes: (a) a "message arrived,
-no processor yet → materialize" hook on RC's delivery path, which *is*
-the RC lazy-creation support already scoped as a separate follow-up, and
+Because only MM implements a lazy trigger today and no room discovery
+exists, an RC/Script/Voice watcher can currently start *only* because its
+room name is in config and `sync_watchers()` resolves it eagerly.
+Removing eager start would stop those three connector types from ever
+starting a watcher — a functional loss, not a config-format break.
+
+`subscribe_room()` is step 7 of `_start_watcher()` (line 1548), so it
+could in principle be hoisted to boot (eagerly subscribe every named
+room, defer session provisioning / history handoff / context injection /
+processor construction to first message). RC's plumbing permits it:
+`subscribe_room()` (`rocketchat/connector.py:379-433`) is refcounted and
+registers a per-room callback, and `_handle_room_message` gates on
+`self._callbacks.get(room_id)` (`websocket.py:528-530`). But it requires
+(a) a "message arrived, no processor yet" hook on RC's delivery path, and
 (b) splitting subscription lifetime from processor lifetime, which
-rewrites the subscribe-failure rollback (1555-1573) and `_stop_processor()`'s
-unsubscribe (1698) around a new invariant: a subscription that outlives
-its processor. That new seam is the same shape as the bug class this
-whole refactor exists to remove. So the accurate claim is not "lazy-init
-only is impossible" but: **not achievable without first building RC
-lazy-creation support and splitting subscribe from init — which adds a
-seam rather than removing one, and so argues against doing it regardless.**
-The recommendation is unchanged either way. So:
+rewrites the subscribe-failure rollback (1555-1573) and
+`_stop_processor()`'s unsubscribe (1698) around a subscription that
+outlives its processor — a new dual-path seam of the same shape this
+unification exists to remove.
 
-- **"Rule-based only" (one config shape, one lifecycle code path):
-  achievable and worth doing.**
-- **"Lazy-init only" (no eager start): not achievable today.** What can
-  actually be eliminated is the *separate* `sync_watchers()`-vs-
-  `try_lazy_create()` **code paths** — not the eager *trigger*. Eager
-  start for exact-room rules is mandatory, not an optional pre-warming
-  optimization. (This also means `seed_blocked_agents()` and the whole
-  startup-ordering hazard class stay relevant, since two start entry
-  points still coexist.)
+**Scope: one config shape and one lifecycle code path, keeping eager
+start.** "Lazy-init only" is not a goal worth pursuing.
 
-A useful corollary: this reframes the "startup pre-warming" discussion
-above. `last_processed_ts` is verified to be a message-dedup watermark
-only (`watcher_lifecycle.py:1590-1593` restore, `1722-1726` capture) and
-is **never** read to decide whether to start anything. Static watchers
-start unconditionally at every boot — not because they're active, but
-because their room name is resolvable without discovery. Wildcard-matched
-rooms are never pre-started at all today
-(`watcher_lifecycle.py:260-268` says so explicitly). So "activity-gated
-pre-warming" is not a behavior anything can regress from; it has never
-existed.
+### What simplifies
 
-#### What genuinely simplifies
-
-- **The reconstruction quartet collapses to one resolver.**
+- **The reconstruction layer collapses to one resolver.**
   `_reconstruct_dynamic_watcher_config()` (1127-1172),
   `_find_or_reconstruct_watcher_config()` (1211-1227),
-  `can_find_or_reconstruct_watcher()` (1174-1209), and
-  `is_watcher_name_known()` (1077-1104) exist as four functions only
-  because a dynamic watcher's config doesn't survive a restart while a
-  static one's does. One uniform "materialize a config for this name"
-  resolver replaces all four (a side-effect-free probe variant is still
-  worth keeping, but for reasons unrelated to the split).
-- **`sync_watchers()`'s two-phase shape collapses to one.** Its phase-2
-  tail (249-305) exists purely to reconcile the blind spot that phase 1
-  only ever walks `_watcher_configs`. The three-way
-  preserve/prune/debug-log branch — branched entirely on
-  `dynamically_created` — becomes one question asked uniformly of every
-  persisted state: does some rule still cover this room?
-  `_dynamic_state_still_matches_rule()` (310-343) becomes that uniform
-  helper.
+  `can_find_or_reconstruct_watcher()` (1174-1209) and
+  `is_watcher_name_known()` (1077-1104) are four functions only because
+  one half of the watchers has a persistence gap the other doesn't.
+- **`sync_watchers()` loses its second phase.** The tail loop (249-305)
+  exists to reconcile phase 1 only ever walking `_watcher_configs`; its
+  three-way preserve/prune/log branch is switched entirely on
+  `dynamically_created`.
 - **`WatcherState.dynamically_created` disappears** — 18 references,
-  including the carry-forward at `_start_watcher()` lines 1387 and 1413
-  plus its dedicated comment block (1405-1412), which is the single
-  cleanest deletion attributable to unification.
-- **`try_lazy_create()`'s two separate paused-checks become one** — the
-  pre-restart check via `_processors`/`_states` (551-567) and the
-  post-restart disk lookup for the deterministic name (680-687) are two
-  checks only because a static config's pause status is visible
-  immediately while a dynamic one's isn't until that path loads it.
+  including `_start_watcher()`'s carry-forward at 1387 and 1413 and its
+  comment block (1405-1412).
+- **`try_lazy_create()`'s two paused-checks merge.** The pre-restart
+  check (551-567) and the post-restart disk lookup (680-687) are separate
+  only because an exact-room config's pause state is visible immediately
+  while a rule-matched one's is not until that path loads it.
 - **`control.py`'s `_resolve_watcher_entry()` loses its two-tier
-  structure** — two lookup passes, two claimant tiers, and two
-  differently-worded ambiguity messages exist to bridge the asymmetry.
-- **Config parsing loses one of its two dispatch shapes.** Note the
-  `from_file()` (fail-fast, 135-310) vs `collect_config()`
-  (fault-tolerant, 1443-1839) duplication is **orthogonal** and does not
-  go away — those two already share every per-entity parser deliberately
-  (module docstring, 596-607); what's duplicated is the
-  `_is_wildcard_room_entry()` dispatch shape and two post-loop
-  cross-entry checks, each spelled twice. Unification removes the
-  dispatch, not the two-loader structure.
+  claimant structure** and its two ambiguity messages become one.
+- **`config.py` loses the `_is_wildcard_room_entry()` dispatch.** Note
+  the `from_file()` (fail-fast, 135-310) vs `collect_config()`
+  (fault-tolerant, 1443-1839) split is deliberate and unaffected — those
+  already share every per-entity parser (module docstring, 596-607).
 
-#### What gets harder — the counterweight the section above omitted
+### What gets harder
 
-1. **`self._watcher_rules[0]` is hardcoded in three places** (lines 331,
-   396, 1166) on the documented "at most one rule per connector"
-   invariant, enforced at config-load time (`config.py:283-294` /
-   `1804-1818`). **Unification breaks that invariant by construction** —
-   an exact-room rule and a wildcard rule coexisting on one connector
-   becomes the normal case. All three `[0]`s must become precedence-aware
-   matching, and the load-time check must be *replaced by a precedence
-   policy*, not deleted. This is a correctness change, not a
-   simplification, and it should be settled before any code moves.
-2. **Cross-connector name reservation becomes the only uniqueness
-   guard.** Today static names are validated unique at config-load time,
-   so `_reserve_global_name`/`_release_global_name` (call sites 639/736,
-   820/836, 875/926, 1035/1070) only ever guard runtime-generated names —
-   `sync_watchers()` never calls them. Post-unification every name can
-   materialize at runtime, making this reservation path load-bearing for
-   everything. Concretely this is a **fail-fast → fail-late regression**:
-   a config typo colliding two exact-room watcher names currently fails
-   at startup; under a fully-runtime model it may only surface on first
-   message. Mitigation: keep load-time uniqueness validation for rules
-   whose room set is statically known.
-3. **`list_watchers()` requires new code** (930-953). It iterates
-   `_watcher_configs` only; with no authoritative in-memory list of
-   "every watcher that exists," it needs new enumeration over persisted
-   states and/or rules. Related pre-existing gap worth fixing
-   independently: dormant dynamic watchers are already invisible to
-   `list` and to `schedule-create`'s "Available watchers:" hint
-   (`control.py:612-621`, `448-450`) even though pause/resume/reset/
-   fetch-history/schedule-create can all resolve them.
+1. **Rule precedence.** `self._watcher_rules[0]` is hardcoded at lines
+   331, 396 and 1166 on the "at most one rule per connector" invariant
+   enforced at load time (`config.py:283-294` / `1804-1818`).
+   Unification breaks that invariant by construction — an exact rule and
+   a wildcard rule on one connector becomes normal. All three sites need
+   precedence-aware matching, and the load-time check needs replacing
+   with a precedence policy rather than deletion.
+2. **Name uniqueness moves from load time to runtime.** Exact-room names
+   are currently validated unique at load, so
+   `_reserve_global_name`/`_release_global_name` (639/736, 820/836,
+   875/926, 1035/1070) only ever guard runtime-generated names —
+   `sync_watchers()` never calls them. Post-unification this reservation
+   becomes the only uniqueness guard, turning a startup failure into a
+   first-message failure for a colliding-name config typo.
+3. **`list_watchers()` needs new code** (930-953). It iterates
+   `_watcher_configs`; with no authoritative in-memory list of every
+   watcher it must enumerate persisted states too. Related existing gap:
+   dormant rule-matched watchers are already invisible to `list` and to
+   `schedule-create`'s "Available watchers:" hint (`control.py:612-621`,
+   `448-450`) though pause/resume/reset/fetch-history can all resolve
+   them.
 4. **`wake_dormant_watcher()` loses its only semantic signal.** Its
    `dynamically_created` gate (1016, 1031) distinguishes "dormant because
    this watcher idles between messages" (safe for the scheduler to
-   auto-wake) from "dormant because it failed to start at boot — blocked
-   agent, subscribe failure" (must not be silently retried), per its own
-   docstring at 984-987. Unification deletes the flag and leaves nothing
-   in its place. A replacement signal (e.g. "has this ever started
-   successfully?") must be designed, not assumed away.
-5. **First-ever start of an exact-room rule has no persisted `room_id`.**
-   The unified premise is "reconstructible from rule + persisted
-   room_id," but a rule that has never run has no state to reconstruct
-   from — its first start must resolve by the rule's `room:` *name*
-   (as `_start_watcher()` does at line 1305), which reintroduces exactly
-   the name-vs-id staleness that `try_lazy_create()`'s 479-514 refresh
-   branch handles today for the dynamic case only. That handling would
-   need to become universal.
+   auto-wake) from "dormant because it failed to start — blocked agent,
+   subscribe failure" (must not be retried), per its docstring at
+   984-987.
+5. **First start of an exact rule has no persisted `room_id`.** A rule
+   that has never run must resolve by the rule's `room:` name (as
+   `_start_watcher()` does at 1305), reintroducing the name-vs-id
+   staleness that `try_lazy_create()`'s 479-514 refresh branch currently
+   handles for rule-matched watchers only.
 
-#### Functional-breakage risks (config-format breakage excluded by request)
+### Functional-breakage risks
 
-**Method caveat, stated because this document holds itself to it
-elsewhere:** the risks in this subsection were derived in a single
-reasoning pass over the seven discovery maps. Unlike the numbered
-findings in the review-round sections above, they were **not**
-independently multi-lens hunted or adversarially verified — the fan-out
-that was supposed to do that (six breakage lenses, three refuters per
-finding) was cut short by an org spend limit before any of it ran. Every
-*code fact* cited below was verified directly against the source; the
-severity labels and the completeness of the list were not. Treat this as
-a first pass that still wants an adversarial round, not as a verified
-finding set.
+Single-pass analysis: the code facts below are verified against source
+with line citations; the severity assessment and the completeness of the
+list have not been independently reviewed.
 
-- **(Resolved by Decision 2 in the design below; recorded because it is
-  the failure mode a naive implementation walks straight into) the
-  `_LAZY_CREATION_SUPPORTED_CONNECTOR_TYPES` gate would reject every
-  RC/Script/Voice watcher.** Today that gate
-  (`config.py:1129`) lives inside `_parse_one_watcher_rule()`, so it
-  fires only for rule-shaped entries — correctly, because only *deferred*
-  room resolution needs a connector that can lazily create. If
-  unification routes every entry through the rule parser, every existing
-  RocketChat exact-room watcher fails config load. Mitigation: the gate
-  must key on "is this rule's room set unbounded/deferred?" (i.e. only
-  wildcards), never on "is this entry rule-shaped."
-- **P1 — paused-watcher precedence would silently change.** Verified
-  behavior today: for a room covered by both an exact-room watcher and a
-  wildcard rule, when that watcher is *running*, MM's
-  `_on_posted_event` never even invokes the lazy hook
-  (`mattermost/connector.py:677-753` gates on
-  `self._channels.get(channel_id) is None`), so no collision arises. When
-  it is *paused*, the hook does fire, `try_lazy_create()` finds the entry
-  via its by-room scan (426-428) and **deliberately returns False**
-  (551-567) — refusing to resurrect it, dropping the message. That's the
-  correct behavior (an explicit pause must not be overridden), and a
-  naive "any matching rule may create a watcher" unification breaks it:
-  the wildcard rule would spin up a second, differently-named watcher for
-  a room whose operator-set pause is thereby silently overridden. Note
-  also that no config-load check cross-references exact entries against a
-  same-connector wildcard rule's coverage today — verified absent from
-  both loaders — so this overlap is currently permitted and invisible.
-  Any unified precedence policy must preserve "a more specific rule
-  claims the room even when its watcher is paused."
-- **P2 — scheduler auto-wake could start a boot-failed watcher** (risk 4
-  above), turning a legitimate startup failure into a silent retry loop
-  against a watcher whose agent is unavailable.
-- **P2 — an unrelated pre-existing gap found during this pass, worth
-  filing separately:** `JobScheduler._get_sm_for_watcher()`
-  (`scheduler.py:438-450`) uses a plain, non-reconstructing
-  `get_watcher_config()` lookup on its failure-notification path — the
-  same defect class as the `control.py` paths fixed in round 15, in a
-  file round 15 didn't sweep. Not caused by unification; would be
-  inherited by it.
-- **P2 — `pause_watcher()`'s fabricated-state case has no unified
-  reconstruction story.** Pausing a name with no prior `WatcherState`
-  (770-777) fabricates one with `room_id=""`. Under "derive every config
-  from rule + persisted room_id," that shape is unreconstructible. Needs
-  an explicit decision (reject pausing unknown names, or give the shape a
-  real path).
+- **The `_LAZY_CREATION_SUPPORTED_CONNECTOR_TYPES` gate must not follow
+  entry shape.** It currently lives inside `_parse_one_watcher_rule()`,
+  firing only for rule-shaped entries — correct, since only deferred room
+  resolution needs a lazy-capable connector. Routing every entry through
+  the rule parser would reject every existing RocketChat exact-room
+  watcher at config load. Addressed by Decision 2 below.
+- **Paused-watcher precedence.** For a room covered by both an exact
+  entry and a wildcard rule: while the exact watcher runs, MM's
+  `_on_posted_event` never invokes the lazy hook (it gates on
+  `self._channels.get(channel_id) is None`,
+  `mattermost/connector.py:677-753`), so no collision arises. While it is
+  *paused*, the hook fires, `try_lazy_create()` finds the entry by its
+  by-room scan (426-428) and returns False (551-567) — refusing to
+  resurrect it and dropping the message. That refusal is correct. A
+  unification allowing any matching rule to create a watcher would
+  instead start a second, differently-named watcher for a room whose
+  pause is thereby overridden. No load-time check currently
+  cross-references exact entries against a same-connector wildcard rule's
+  coverage, so this overlap is permitted and load-time-invisible today.
+- **Scheduler auto-wake of a boot-failed watcher** — consequence of
+  point 4 above; turns a legitimate startup failure into a silent retry
+  against an unavailable agent.
+- **`pause_watcher()`'s fabricated state has no reconstruction story.**
+  Pausing a name with no prior `WatcherState` (770-777) fabricates one
+  with `room_id=""`, which is unreconstructible under a
+  rule-plus-persisted-room_id model.
+- **Pre-existing, not caused by unification but inherited by it:**
+  `JobScheduler._get_sm_for_watcher()` (`scheduler.py:438-450`) uses a
+  plain non-reconstructing `get_watcher_config()` on its
+  failure-notification path — the same defect class as the `control.py`
+  paths fixed in PR #79's fifteenth round.
 
-#### Blast radius
+### Design
 
-Test inventory across the whole `tests/` tree (no `tests/e2e` or
-`helpers.py` references): **~100 tests by literal symbol grep, ~135
-counting same-mechanism tests that reach the code via
-`pause_watcher`/`resume_watcher`/connector hooks instead of naming the
-symbol.** Dominated by `test_watcher_lifecycle_lazy_create.py` (~85,
-the feature's dedicated file). Rewrite-not-touch-up categories:
-`TestLazyCreationHook` (4), `TestReserveWatcherName` (6),
-`TestInjectMessageWakesDormantWatcher` (3), ~6 of `test_control_server.py`,
-1 in `test_schedule_cmd.py`. Roughly 20 more (`test_config_collect.py`'s
-4 plus `test_config_loading.py`'s wildcard cluster of ~16) move in or out
-of scope depending on whether the *config representation* is unified or
-only the *runtime path*. Also of note: `dynamically_created` — an
-on-disk format field — has **no dedicated serialization/round-trip
-test**, so the persistence surface being changed has no direct
-regression net today.
+**Decision 1 — most-specific-wins precedence; a paused exact rule keeps
+its claim.** Per connector, an exact rule (`room: <name>`) claims that
+room; a wildcard rule (`room: "*"` plus `exclude_rooms`) claims
+everything else it matches. Load-time validation becomes: exact rules
+unique per `(connector, room)`; at most one wildcard rule per connector
+(unchanged); an exact rule overlapping a wildcard rule is explicitly
+legal and the exact rule wins. A room claimed by an exact rule stays
+claimed **while its watcher is paused**, so the wildcard rule never
+picks up its traffic — reproducing the current refusal at 551-567 rather
+than overriding an operator's pause. All three `self._watcher_rules[0]`
+sites become one `_match_rule_for_room(room) -> WatcherConfig | None`
+helper, which also absorbs the `exclude_rooms` check currently inlined at
+each.
 
-Two known config-tool bugs were re-verified during this pass and are
-worse than the Open Items below record.
-`find_mergeable_watcher_entry()` (`configtool/model.py:532-551`) doesn't
-just produce an invalid config: traced end-to-end, it mutates the
-in-memory document in place (`add_watcher_rooms()`, 587-598) turning
-`room: "*"` into `rooms: ["*", "<newroom>"]`, which `_is_wildcard_room_entry()`
-disqualifies as a rule, so it falls through to `_parse_one_watcher_entry()`
-→ `_auto_watcher_name(connector, "*")` → `sanitize_room_for_name("*")`
-returns empty → `ValueError`. `save()`'s validate-before-write gate does
-protect the on-disk file, but the in-memory document stays corrupted and
-dirty, and the only recovery is `reload()`, which discards every other
-unsaved edit in that TUI session. And `_check_state_orphans()`
-(`config_validate.py:229-254`) indexes only `config.watchers` (line 233),
-so it emits a false "will be dropped" warning for exactly the states
-`sync_watchers()` deliberately preserves.
+**Decision 2 — the lazy-capable gate keys on the room set, not the entry
+shape.** Move the `_LAZY_CREATION_SUPPORTED_CONNECTOR_TYPES` check from
+"parsed as a rule" to "this rule's room set is deferred"
+(`rule.room == "*"`). An exact rule needs no lazy-creation capability —
+its room resolves by name at boot — so RC/Script/Voice exact rules keep
+loading.
 
-#### Proposed design
+**Decision 3 — `wake_dormant_watcher()` needs a new state field.**
+`state.room_id` is not a usable "has this ever started successfully?"
+substitute: on subscribe failure the rollback path deliberately keeps the
+state in `_states` with `room_id` already populated (line 1571, to
+preserve `context_injected`/`session_id` for the next attempt), so a
+boot-failed watcher is indistinguishable from a healthy dormant one. Add
+`WatcherState.last_started_ok: str = ""` (ISO timestamp), written only
+after `_start_watcher()` completes its final step, and gate auto-wake on
+it being non-empty. Additive, fail-safe default (`""` = never confirmed
+started = do not auto-wake), and it states the real predicate instead of
+proxying it through provenance.
 
-The three decisions the analysis above says must be settled first are
-decidable from the code, so they're answered here rather than deferred.
+**Data model.** `GatewayConfig.watchers` and `.watcher_rules` collapse
+into one `rules: list[WatcherConfig]`, where `room == "*"` marks a
+wildcard rule. `exclude_rooms` becomes load-time-rejected on an exact
+rule (currently silently ignored). `WatcherState` drops
+`dynamically_created` and gains `last_started_ok`.
+`WatcherLifecycle.__init__` takes one list; `_watcher_configs` survives
+only as a cache of materialized configs, renamed to say so.
 
-**Decision 1 — rule precedence: most-specific-wins, and a paused rule
-still holds its claim.** Replace the "at most one `room: "*"` rule per
-connector" load-time check with a two-tier claim model per connector:
-an *exact* rule (`room: <name>`) claims exactly that room; a *wildcard*
-rule (`room: "*"`, plus `exclude_rooms`) claims everything else it
-matches. Load-time validation becomes: exact rules must be unique per
-`(connector, room)`; at most one wildcard rule per connector (unchanged);
-an exact rule overlapping a wildcard rule is **explicitly legal** and
-means the exact rule wins — which is what makes the currently-unchecked,
-load-time-invisible overlap described above a defined case instead of an
-accident. Crucially, a room claimed by an exact rule stays claimed **even
-while that watcher is paused**, so the wildcard rule never picks up its
-traffic — exactly reproducing today's verified drop behavior
-(`try_lazy_create()` 551-567) rather than silently overriding an
-operator's pause with a second, differently-named watcher. All three
-`self._watcher_rules[0]` sites (331, 396, 1166) become one
-`_match_rule_for_room(room) -> WatcherConfig | None` helper implementing
-this precedence, which is also the natural home for the `exclude_rooms`
-check currently inlined in each.
-
-**Decision 2 — the lazy-capable-connector gate keys on the room set, not
-the entry shape.** Move the `_LAZY_CREATION_SUPPORTED_CONNECTOR_TYPES`
-check (`config.py:1129`) out of "this entry parsed as a rule" and onto
-"this rule's room set is unbounded/deferred," i.e. `rule.room == "*"`.
-An exact rule needs no lazy-creation capability from its connector — its
-room resolves by name at boot — so RC/Script/Voice exact rules keep
-loading and keep working. This is the single change that makes unification
-safe for three of the four connector types.
-
-**Decision 3 — `wake_dormant_watcher()` needs a new persisted field; the
-obvious candidate does not work.** `state.room_id` looks like a
-ready-made "has this ever started successfully?" signal (it's written
-only inside `_start_watcher()`, at line 1400), but it is not: on a
-subscribe failure the rollback path **deliberately keeps** the state in
-`_states` with `room_id` already populated (line 1571, with an explicit
-comment — it preserves `context_injected`/`session_id` for the next
-attempt). So a watcher that failed at boot is indistinguishable by
-`room_id` from one that ran fine and went dormant — precisely the
-distinction the `dynamically_created` gate (1016, 1031) is standing in
-for today. Proposal: add `WatcherState.last_started_ok: str = ""` (ISO
-timestamp), written only after `_start_watcher()` completes its final
-step, and gate the scheduler's auto-wake on it being non-empty. Additive,
-with a fail-safe default (`""` = never confirmed started = do not
-auto-wake), and it expresses the real predicate rather than proxying it
-through provenance.
-
-**Data model.** `GatewayConfig.watchers` and `GatewayConfig.watcher_rules`
-collapse into one `rules: list[WatcherConfig]`, where `room == "*"` marks
-a wildcard rule and anything else is an exact rule. `WatcherConfig` is
-unchanged as a dataclass except that `exclude_rooms` becomes
-load-time-rejected on an exact rule (meaningless there — today it's just
-silently ignored). `WatcherState` loses `dynamically_created` and gains
-`last_started_ok`. `WatcherLifecycle.__init__` takes one `rules` list
-instead of two; `_watcher_configs` survives only as an in-process cache
-of *materialized* configs (rename it to say so), not as a second source
-of truth.
-
-**Function-by-function transformation.** Deleted outright:
+**Function-by-function.** *Deleted:*
 `_reconstruct_dynamic_watcher_config`, `_find_or_reconstruct_watcher_config`,
 `can_find_or_reconstruct_watcher`, `is_watcher_name_known` — replaced by
-one `_materialize_watcher_config(name)` resolver plus a side-effect-free
-`_knows_watcher(name)` probe (the probe/act split is worth keeping, but
-for reasons unrelated to the static/dynamic asymmetry that created these
-four). Also deleted: `_dynamic_state_still_matches_rule` (subsumed by
-`_match_rule_for_room`), `sync_watchers()`'s phase-2 preserve/prune/log
-branch (249-305), and `_start_watcher()`'s `dynamically_created`
-carry-forward (1387, 1413) with its comment block (1405-1412). Rewritten:
-`sync_watchers()` becomes one pass that, for every rule with a statically
-known room plus every persisted state, resolves the owning rule via
-`_match_rule_for_room` and either starts it (exact rules — eager, as
-today) or preserves/prunes it (wildcard-derived — dormant until a
-message); `try_lazy_create()` keeps its structure but takes its rule from
-`_match_rule_for_room` and loses one of its two paused-checks (551-567
-and 680-687 merge); `_build_watcher_config_from_rule()` gains the
-exact-rule branch that carries `session_id` forward (moot if `session_id`
-retirement lands first, which it should); `list_watchers()` gains
-enumeration over persisted states so dormant watchers become visible —
-a behavior gain, and it closes the existing `control.py:612-621` /
-`448-450` gap for free; `_stop_processor()`'s linear `_watcher_configs`
-scan (1690) becomes a dict lookup. Unchanged: `_get_watcher_lock`,
-`_start_watcher`'s entire body apart from the two deleted lines,
-`_provision_session`, `_cleanup_startup_session_best_effort`,
-`_ensure_agent_available`, `_resolve_agent_name`, `stop_all`,
-`save_state`, `get_watcher_state`, `get_processor`, `pause_watcher`/
-`resume_watcher`/`reset_watcher` bodies (their simplification lives
-entirely inside the resolver they call). In `control.py`,
-`_resolve_watcher_entry()` loses its two-tier claimant structure and its
-two ambiguity messages become one. In `config.py`, the
-`_is_wildcard_room_entry()` *dispatch* disappears (one parser, with a
-wildcard branch) while the deliberate `from_file()`/`collect_config()`
-two-loader split stays; the two post-loop cross-entry checks become the
-precedence validation from Decision 1.
+one `_materialize_watcher_config(name)` plus a side-effect-free
+`_knows_watcher(name)` probe (the probe/act split is worth keeping for
+reasons unrelated to the split that created these four);
+`_dynamic_state_still_matches_rule` (subsumed by `_match_rule_for_room`);
+`sync_watchers()`'s phase-2 branch (249-305); `_start_watcher()`'s
+`dynamically_created` carry-forward (1387, 1413) and comment block
+(1405-1412). *Rewritten:* `sync_watchers()` becomes one pass that, for
+every rule with a statically known room plus every persisted state,
+resolves the owning rule via `_match_rule_for_room` and either starts it
+(exact rules, eager as today) or preserves/prunes it (wildcard-derived,
+dormant until a message); `try_lazy_create()` keeps its structure but
+sources its rule from `_match_rule_for_room` and merges its two
+paused-checks; `_build_watcher_config_from_rule()` gains an exact-rule
+branch — it currently zeroes `session_id` unconditionally (line 1119) on
+the grounds that the concept doesn't apply once a room is known, which
+holds for a wildcard-derived room but not an exact rule that pins a
+session, and `_provision_session()` (1626-1627) and `reset_watcher()`
+(904) both already read that field; `list_watchers()` gains enumeration
+over persisted states, which also closes the dormant-visibility gap
+above; `_stop_processor()`'s linear `_watcher_configs` scan (1690) becomes
+a dict lookup. *Unchanged:* `_get_watcher_lock`, `_start_watcher`'s body
+apart from the two deleted lines, `_provision_session`,
+`_cleanup_startup_session_best_effort`, `_ensure_agent_available`,
+`_resolve_agent_name`, `stop_all`, `save_state`, `get_watcher_state`,
+`get_processor`, and the bodies of `pause_watcher`/`resume_watcher`/
+`reset_watcher` (their simplification is entirely inside the resolver
+they call). In `control.py`, `_resolve_watcher_entry()` loses its two-tier
+structure. In `config.py`, the `_is_wildcard_room_entry()` dispatch
+disappears; the two post-loop cross-entry checks become Decision 1's
+precedence validation.
 
-**Sequencing.** (1) `session_id` retirement — still a hard precondition,
-per "Also removing" above. (2) The `last_started_ok` state field, landable
-on its own as a small additive change with its own persistence test (note
-`dynamically_created` shipped without one, which is why this whole
-on-disk surface has no regression net today). (3) `_match_rule_for_room`
-+ the precedence validation, additive while both lists still exist.
-(4) The list collapse and the lifecycle rewrite. (5) Independently of all
-of the above and worth doing now regardless: the `list_watchers()`/
-`get_all_watcher_names()` dormant-visibility fix, `_check_state_orphans()`,
-`find_mergeable_watcher_entry()`, and the `scheduler.py:438-450` gap —
-none of these depend on unification, and three of them are live bugs.
+**Sequencing.** (1) `session_id` retirement, a hard precondition per
+"Also removing" above — otherwise the exact-rule `session_id` branch is
+needed. (2) `WatcherState.last_started_ok`, landable alone as an additive
+change with its own persistence test (`dynamically_created` shipped
+without one, so this on-disk surface has no regression net today).
+(3) `_match_rule_for_room` plus the precedence validation, additive while
+both lists still exist. (4) The list collapse and lifecycle rewrite.
 
-#### Recommendation
+Independent of the above and worth doing regardless, since three are live
+bugs: the `list_watchers()`/`get_all_watcher_names()` dormant-visibility
+fix; `_check_state_orphans()` (`config_validate.py:229-254`) indexing only
+`config.watchers` at line 233, producing a false "will be dropped"
+warning for exactly the states `sync_watchers()` preserves;
+`find_mergeable_watcher_entry()` (`configtool/model.py:532-551`), which
+selects a wildcard rule as a merge target and mutates it in place via
+`add_watcher_rooms()` (587-598) to `rooms: ["*", "<newroom>"]` —
+`_is_wildcard_room_entry()` then disqualifies it as a rule, so it falls
+through to `_parse_one_watcher_entry()` → `_auto_watcher_name(connector, "*")`
+→ `sanitize_room_for_name("*")` returns empty → `ValueError`; `save()`'s
+validate-before-write gate protects the file but the in-memory document
+stays corrupted and only `reload()` recovers, discarding other unsaved
+edits; and `scheduler.py:438-450`.
 
-Do the unification, with the scope corrected: **one config shape and one
-lifecycle code path, but keeping eager start.** "Lazy-init only" as
-originally framed should be dropped, not deferred — it requires building
-RC lazy-creation support *and* splitting subscribe from init, and that
-split introduces exactly the kind of dual-path seam this refactor exists
-to remove. The three previously-open decisions are answered above and
-none of them blocks starting.
-
-Given the ~135-test blast radius, that this is strictly larger than PR
-#79 itself, and that step 5 of the sequencing contains three live bugs
-worth shipping sooner, this belongs in its own PR after #79's remaining
-findings land — not as more commits on an already-fifteen-round branch.
-The breakage list above should get the adversarial round it didn't get
-(see its method caveat) before implementation starts, since a missed
-functional break in the lifecycle path is exactly what the last five
-review rounds were made of.
+**Blast radius.** ~100 tests by literal symbol grep, ~135 counting
+same-mechanism tests that reach the code via `pause_watcher`/
+`resume_watcher`/connector hooks. Dominated by
+`test_watcher_lifecycle_lazy_create.py` (~85). Rewrite rather than
+touch-up: `TestLazyCreationHook` (4), `TestReserveWatcherName` (6),
+`TestInjectMessageWakesDormantWatcher` (3), ~6 of
+`test_control_server.py`, 1 in `test_schedule_cmd.py`. A further ~20
+(`test_config_collect.py`'s 4 plus `test_config_loading.py`'s wildcard
+cluster of ~16) are in or out of scope depending on whether the config
+representation is unified or only the runtime path.
 
 ## Startup ordering: root-cause design review (2026-08-07, REVERTED 2026-08-09 — see "Reverted" at the end of this section)
 
