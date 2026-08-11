@@ -378,7 +378,8 @@ class TestHistoryHandoffSentSeparatelyFromHeader(unittest.IsolatedAsyncioTestCas
 
         with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
             MockProc.return_value.start = MagicMock()
-            await lifecycle._start_watcher(wc, state=None)
+            async with lifecycle._get_watcher_lock(wc.name):
+                await lifecycle._start_watcher(wc)
 
         # The header/context path goes through agent.ensure_durable_instructions(),
         # not agent.send() — so agent.send() must have been called exactly once,
@@ -396,7 +397,8 @@ class TestHistoryHandoffSentSeparatelyFromHeader(unittest.IsolatedAsyncioTestCas
 
         with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
             MockProc.return_value.start = MagicMock()
-            await lifecycle._start_watcher(wc, state=None)
+            async with lifecycle._get_watcher_lock(wc.name):
+                await lifecycle._start_watcher(wc)
 
         agent.send.assert_not_called()
         agent.ensure_durable_instructions.assert_awaited_once()
@@ -484,7 +486,9 @@ class TestWatcherLifecycleHistoryHandoff(unittest.IsolatedAsyncioTestCase):
         # Patch MessageProcessor.start to avoid consumer loop startup
         with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
             MockProc.return_value.start = MagicMock()
-            await lifecycle._start_watcher(lifecycle._watcher_configs[0], state=None)
+            wc = lifecycle._watcher_configs[0]
+            async with lifecycle._get_watcher_lock(wc.name):
+                await lifecycle._start_watcher(wc)
 
         connector.fetch_room_history.assert_called_once()
         call_args = connector.fetch_room_history.call_args
@@ -497,7 +501,9 @@ class TestWatcherLifecycleHistoryHandoff(unittest.IsolatedAsyncioTestCase):
 
         with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
             MockProc.return_value.start = MagicMock()
-            await lifecycle._start_watcher(lifecycle._watcher_configs[0], state=None)
+            wc = lifecycle._watcher_configs[0]
+            async with lifecycle._get_watcher_lock(wc.name):
+                await lifecycle._start_watcher(wc)
 
         connector.fetch_room_history.assert_not_called()
 
@@ -514,9 +520,11 @@ class TestWatcherLifecycleHistoryHandoff(unittest.IsolatedAsyncioTestCase):
             context_injected=True,
         )
 
+        lifecycle._states[wc.name] = existing_state
         with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
             MockProc.return_value.start = MagicMock()
-            await lifecycle._start_watcher(wc, state=existing_state)
+            async with lifecycle._get_watcher_lock(wc.name):
+                await lifecycle._start_watcher(wc)
 
         connector.fetch_room_history.assert_not_called()
 
@@ -528,7 +536,9 @@ class TestWatcherLifecycleHistoryHandoff(unittest.IsolatedAsyncioTestCase):
         with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
             MockProc.return_value.start = MagicMock()
             # Must not raise
-            await lifecycle._start_watcher(lifecycle._watcher_configs[0], state=None)
+            wc = lifecycle._watcher_configs[0]
+            async with lifecycle._get_watcher_lock(wc.name):
+                await lifecycle._start_watcher(wc)
 
         # Processor was still started despite the fetch failure
         MockProc.return_value.start.assert_called_once()

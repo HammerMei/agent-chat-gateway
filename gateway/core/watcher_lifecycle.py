@@ -226,7 +226,15 @@ class WatcherLifecycle:
                 # All other _start_watcher callers (resume_watcher, reset_watcher)
                 # already hold this lock, so this makes the invariant uniform.
                 async with self._get_watcher_lock(wc.name):
-                    await self._start_watcher(wc, state)
+                    # Seed self._states from the disk-persisted copy read
+                    # above before calling — _start_watcher() now reads its
+                    # own state from self._states rather than taking it as
+                    # a parameter (PR #79 review, fifteenth round; see its
+                    # docstring). Done here, under the lock, immediately
+                    # before the call.
+                    if state is not None:
+                        self._states[wc.name] = state
+                    await self._start_watcher(wc)
             except Exception as e:
                 msg = f"Watcher '{wc.name}' (room '{wc.room}'): failed to start: {e}"
                 logger.error(msg)
@@ -679,7 +687,19 @@ class WatcherLifecycle:
                     return False
 
                 try:
-                    await self._start_watcher(wc, state)
+                    # Seed self._states from the disk-loaded copy read above
+                    # — _start_watcher() now reads its own state from
+                    # self._states rather than taking it as a parameter (PR
+                    # #79 review, fifteenth round; see its docstring).
+                    # Deliberately done here, AFTER the room-id-mismatch and
+                    # paused refusals above (both return False without
+                    # reaching this point) — seeding any earlier would leave
+                    # a stray self._states entry behind on those refusal
+                    # paths, which save() below would then persist for a
+                    # watcher that was never actually started.
+                    if state is not None:
+                        self._states[watcher_name] = state
+                    await self._start_watcher(wc)
                 except Exception as e:
                     logger.error(
                         "try_lazy_create: failed to start watcher '%s' for "
@@ -764,15 +784,18 @@ class WatcherLifecycle:
                 self._state_store.save(self._states)
                 return
             try:
-                await self._start_watcher(wc, state)
+                await self._start_watcher(wc)
             except Exception as e:
                 logger.error("Failed to resume watcher '%s': %s", name, e)
                 raise
-            # Only clear paused flag AFTER successful start — if _start_watcher() raises,
-            # the watcher is still stopped and the paused flag should remain True in memory
-            # so the next restart (or manual retry) correctly reflects the watcher's state.
-            if state:
-                state.paused = False
+            # No explicit "clear paused" step needed here on success:
+            # _start_watcher() always builds a brand-new WatcherState with
+            # paused=False (it has no "resume vs fresh start" distinction —
+            # every start is unpaused by construction), which is already
+            # sitting in self._states[name] by the time we get here. The
+            # local `state` reference above is the PRE-start object, which
+            # _start_watcher() has since replaced — mutating it here would
+            # touch a discarded WatcherState, not the current one.
             self._state_store.save(self._states)
             logger.info("Watcher '%s' resumed", name)
 
@@ -807,13 +830,20 @@ class WatcherLifecycle:
             if old_session_id:
                 self._injector.reset_session(old_session_id)
             if state:
+                # Mutated in place — `state` is the same object as
+                # self._states[name] (not a copy), so this is exactly the
+                # "seed self._states before calling" step _start_watcher()
+                # now requires of every caller whose prior state didn't
+                # already live there untouched (PR #79 review, fifteenth
+                # round; see _start_watcher()'s docstring). No separate
+                # seed line needed here — the mutation itself is the seed.
                 if not wc.session_id:
                     state.session_id = ""
                 state.context_injected = False
                 state.paused = False
 
             try:
-                await self._start_watcher(wc, state)
+                await self._start_watcher(wc)
             except Exception as e:
                 logger.error("Failed to restart watcher '%s' after reset: %s", name, e)
                 raise
@@ -936,7 +966,17 @@ class WatcherLifecycle:
                 reserved = True
                 wc = await self._find_or_reconstruct_watcher_config(name)
                 self._ensure_agent_available(wc)
-                await self._start_watcher(wc, state)
+                # No seed needed: `state` (re-fetched from self._states just
+                # above, under this same lock) is already the exact object
+                # sitting in self._states[name] — _start_watcher() now reads
+                # it from there itself (PR #79 review, fifteenth round).
+                # Note _find_or_reconstruct_watcher_config() above may have
+                # since replaced that entry with a fresh disk-loaded copy
+                # (if this watcher's config wasn't already known); reading
+                # self._states fresh inside _start_watcher(), rather than
+                # reusing this now-possibly-superseded local `state`, is the
+                # more correct choice, not just an equivalent one.
+                await self._start_watcher(wc)
             except Exception as e:
                 logger.warning(
                     "wake_dormant_watcher: failed to auto-start dormant "
@@ -1133,7 +1173,6 @@ class WatcherLifecycle:
     async def _start_watcher(
         self,
         wc: WatcherConfig,
-        state: WatcherState | None,
     ) -> None:
         """Start a single watcher: resolve room, ensure session, start processor.
 
@@ -1150,7 +1189,28 @@ class WatcherLifecycle:
           8. Register processor with dispatcher (deferred until subscribe succeeds).
           9. Activate processor (start consumer loop + online notification).
          10. Restore dedup watermark.
+
+        Reads any prior state itself from `self._states.get(wc.name)` rather
+        than taking it as a parameter (PR #79 review, fifteenth round).
+        Findings #35 and #37 were both the same shape: a caller read a
+        `WatcherState` snapshot, then acted on it after an `await` or a lock
+        acquisition during which the real state could have changed (an
+        agent-mismatch discard losing `dynamically_created`; a concurrent
+        pause completing while a wake was still holding a stale unpaused
+        snapshot). Self-reading here closes that whole class at once: every
+        caller MUST hold `self._get_watcher_lock(wc.name)` for the duration
+        of this call (asserted below) and, if its own prior state came from
+        somewhere other than `self._states` (e.g. a disk read), must seed
+        `self._states[wc.name]` with it BEFORE calling — there is no
+        parameter left to smuggle a stale copy through.
         """
+        assert self._get_watcher_lock(wc.name).locked(), (
+            f"_start_watcher('{wc.name}') called without holding its "
+            "per-watcher lock — every caller must acquire "
+            "self._get_watcher_lock(wc.name) first, so this method's own "
+            "self._states read below is guaranteed fresh."
+        )
+        state = self._states.get(wc.name)
         agent_name = self._resolve_agent_name(wc.agent)
         agent = self._agents[agent_name]
         agent_cfg = self._config.agent_config(agent_name)

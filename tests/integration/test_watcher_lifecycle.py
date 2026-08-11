@@ -343,7 +343,8 @@ class TestAttachmentWorkspaceInThread(unittest.IsolatedAsyncioTestCase):
             patch.object(lc, "_cleanup_startup_session_best_effort", new_callable=AsyncMock),
         ):
             try:
-                await lc._start_watcher(wc, None)
+                async with lc._get_watcher_lock(wc.name):
+                    await lc._start_watcher(wc)
             except Exception:
                 pass
 
@@ -408,7 +409,8 @@ class TestAttachmentWorkspaceRollback(unittest.IsolatedAsyncioTestCase):
                   side_effect=OSError("permission denied")),
         ):
             with self.assertRaises(OSError):
-                await lc._start_watcher(wc, None)
+                async with lc._get_watcher_lock(wc.name):
+                    await lc._start_watcher(wc)
 
         self.assertNotIn("test-watcher", lc._states, "_states must be rolled back after setup() failure")
         maps.remove_session.assert_called_once()
@@ -475,7 +477,8 @@ class TestContextInjectedResetOnSubscribeFailure(unittest.IsolatedAsyncioTestCas
                   new_callable=AsyncMock, return_value=None),
         ):
             with self.assertRaises(RuntimeError):
-                await lc._start_watcher(wc, None)
+                async with lc._get_watcher_lock(wc.name):
+                    await lc._start_watcher(wc)
 
         saved_ws = lc._states.get("test-watcher")
         self.assertIsNotNone(saved_ws)
@@ -537,7 +540,8 @@ class TestContextInjectedResetOnSubscribeFailure(unittest.IsolatedAsyncioTestCas
                   new_callable=AsyncMock, return_value=None),
         ):
             with self.assertRaises(RuntimeError):
-                await lc._start_watcher(wc, None)
+                async with lc._get_watcher_lock(wc.name):
+                    await lc._start_watcher(wc)
 
         saved_ws = lc._states.get("test-watcher2")
         self.assertIsNotNone(saved_ws)
@@ -558,7 +562,7 @@ class TestSyncWatchersHoldsLock(unittest.IsolatedAsyncioTestCase):
         start_watcher_entered = asyncio.Event()
         start_watcher_proceed = asyncio.Event()
 
-        async def slow_start_watcher(wc, state):
+        async def slow_start_watcher(wc):
             start_watcher_entered.set()
             await start_watcher_proceed.wait()
             lifecycle._processors[wc.name] = MagicMock()
@@ -586,7 +590,7 @@ class TestSyncWatchersHoldsLock(unittest.IsolatedAsyncioTestCase):
         start_entered = asyncio.Event()
         pause_can_run = asyncio.Event()
 
-        async def controlled_start(wc, state):
+        async def controlled_start(wc):
             ordering.append("start:begin")
             start_entered.set()
             await pause_can_run.wait()
@@ -619,7 +623,7 @@ class TestSyncWatchersHoldsLock(unittest.IsolatedAsyncioTestCase):
 
         processor_mock = MagicMock(start=MagicMock(), stop=AsyncMock())
 
-        async def simple_start(wc, state):
+        async def simple_start(wc):
             lifecycle._processors[wc.name] = processor_mock
 
         with patch.object(lifecycle, "_start_watcher", simple_start):
@@ -632,7 +636,7 @@ class TestSyncWatchersHoldsLock(unittest.IsolatedAsyncioTestCase):
         """If _start_watcher raises, the error is captured and the lock is released."""
         lifecycle, watcher_configs, connector, agent = _make_lifecycle_r14(["support"])
 
-        async def failing_start(wc, state):
+        async def failing_start(wc):
             raise RuntimeError("subscribe failed")
 
         with patch.object(lifecycle, "_start_watcher", failing_start):
@@ -650,7 +654,7 @@ class TestSyncWatchersHoldsLock(unittest.IsolatedAsyncioTestCase):
 
         started: list[str] = []
 
-        async def simple_start(wc, state):
+        async def simple_start(wc):
             started.append(wc.name)
             lifecycle._processors[wc.name] = MagicMock(start=MagicMock(), stop=AsyncMock())
 

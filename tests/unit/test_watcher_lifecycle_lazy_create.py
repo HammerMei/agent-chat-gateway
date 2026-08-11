@@ -1268,9 +1268,11 @@ class TestStartWatcherDiscardsMismatchedRoomState(unittest.IsolatedAsyncioTestCa
             dynamically_created=True,
         )
 
+        lifecycle._states[wc.name] = stale_state
         with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
             MockProc.return_value.start = MagicMock()
-            await lifecycle._start_watcher(wc, stale_state)
+            async with lifecycle._get_watcher_lock(wc.name):
+                await lifecycle._start_watcher(wc)
 
         agent.create_session.assert_awaited_once()  # fresh session, not reused
         ws = lifecycle._states["static-1"]
@@ -1296,9 +1298,11 @@ class TestStartWatcherDiscardsMismatchedRoomState(unittest.IsolatedAsyncioTestCa
             watcher_name="static-1", session_id="old-sess-id", room_id="chan-1",
         )
 
+        lifecycle._states[wc.name] = matching_state
         with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
             MockProc.return_value.start = MagicMock()
-            await lifecycle._start_watcher(wc, matching_state)
+            async with lifecycle._get_watcher_lock(wc.name):
+                await lifecycle._start_watcher(wc)
 
         agent.create_session.assert_not_called()
         self.assertEqual(lifecycle._states["static-1"].session_id, "old-sess-id")
@@ -1316,9 +1320,11 @@ class TestStartWatcherDiscardsMismatchedRoomState(unittest.IsolatedAsyncioTestCa
             watcher_name="static-1", session_id="old-sess-id", room_id="",
         )
 
+        lifecycle._states[wc.name] = state_no_room_id
         with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
             MockProc.return_value.start = MagicMock()
-            await lifecycle._start_watcher(wc, state_no_room_id)
+            async with lifecycle._get_watcher_lock(wc.name):
+                await lifecycle._start_watcher(wc)
 
         agent.create_session.assert_not_called()  # still resumed
 
@@ -1360,9 +1366,11 @@ class TestStartWatcherDiscardsStateOnAgentMismatch(unittest.IsolatedAsyncioTestC
             dynamically_created=True,
         )
 
+        lifecycle._states[wc.name] = stale_state
         with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
             MockProc.return_value.start = MagicMock()
-            await lifecycle._start_watcher(wc, stale_state)
+            async with lifecycle._get_watcher_lock(wc.name):
+                await lifecycle._start_watcher(wc)
 
         other_agent.create_session.assert_awaited_once()  # fresh session on the NEW agent
         claude_agent.create_session.assert_not_called()   # old agent never touched
@@ -1425,9 +1433,11 @@ class TestStartWatcherDiscardsStateOnAgentMismatch(unittest.IsolatedAsyncioTestC
             watcher_name="static-1", session_id="old-sess-id", room_id="chan-1", agent="claude",
         )
 
+        lifecycle._states[wc.name] = matching_state
         with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
             MockProc.return_value.start = MagicMock()
-            await lifecycle._start_watcher(wc, matching_state)
+            async with lifecycle._get_watcher_lock(wc.name):
+                await lifecycle._start_watcher(wc)
 
         agent.create_session.assert_not_called()
         self.assertEqual(lifecycle._states["static-1"].session_id, "old-sess-id")
@@ -1446,9 +1456,11 @@ class TestStartWatcherDiscardsStateOnAgentMismatch(unittest.IsolatedAsyncioTestC
             watcher_name="static-1", session_id="old-sess-id", room_id="chan-1", agent="",
         )
 
+        lifecycle._states[wc.name] = pre_existing_state
         with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
             MockProc.return_value.start = MagicMock()
-            await lifecycle._start_watcher(wc, pre_existing_state)
+            async with lifecycle._get_watcher_lock(wc.name):
+                await lifecycle._start_watcher(wc)
 
         agent.create_session.assert_not_called()  # still resumed, not reset
         self.assertEqual(lifecycle._states["static-1"].session_id, "old-sess-id")
