@@ -11,6 +11,7 @@ import contextlib
 import io
 import logging
 import os
+import signal
 import tempfile
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -22,6 +23,7 @@ from gateway.admin.base import (
     AdminUser,
     ChannelAlreadyExistsError,
     UserAlreadyExistsError,
+    UserDeactivatedError,
     UserNotFoundError,
 )
 from gateway.admin.cli import _configure_error_log, _run, build_parser, main
@@ -144,6 +146,30 @@ class TestRunDispatch(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(code, 1)
         self.assertIn("already exists but with a different email", stderr.getvalue())
+        mock_admin.close.assert_awaited_once()
+
+    async def test_create_user_deactivated_account_is_an_error(self):
+        # End-to-end proof of the property UserDeactivatedError's docstring
+        # depends on: because it is NOT a UserAlreadyExistsError subclass, it
+        # falls through to _run()'s broad handler and exits 1 rather than
+        # being reported as an idempotent skip.
+        mock_admin = AsyncMock()
+        existing = AdminUser(id="u1", username="alice", email="a@x.com", deactivated=True)
+        mock_admin.create_user = AsyncMock(
+            side_effect=UserDeactivatedError("alice", existing=existing)
+        )
+        stderr = io.StringIO()
+        with patch("gateway.admin.cli.load_profiles", return_value={}), \
+             patch("gateway.admin.cli.get_profile", return_value=object()), \
+             patch("gateway.admin.cli.admin_factory", return_value=mock_admin), \
+             contextlib.redirect_stderr(stderr):
+            args = _args(["p", "create-user", "alice", "a@x.com", "pw"])
+            code = await _run(args)
+
+        self.assertEqual(code, 1)
+        output = stderr.getvalue()
+        self.assertIn("deactivated", output)
+        self.assertNotIn("skipping", output)
         mock_admin.close.assert_awaited_once()
 
     async def test_create_channel_already_exists_is_not_an_error(self):
@@ -412,6 +438,48 @@ class TestUnwritableLogFile(unittest.IsolatedAsyncioTestCase):
         mock_factory.assert_not_called()
 
 
+class TestReaderlessFifoLogFile(unittest.IsolatedAsyncioTestCase):
+    async def test_fifo_log_file_with_no_reader_is_a_clean_error_not_a_hang(self):
+        # logging.FileHandler opens eagerly, and open() on a reader-less FIFO
+        # blocks forever — no message, no exit code, process left hung. The
+        # non-blocking probe must turn that into a clean CLI error instead.
+        # (unittest's own timeout isn't relied on here: if the probe were
+        # missing, this test would hang, which is itself the signal.)
+        with tempfile.TemporaryDirectory() as d:
+            fifo = os.path.join(d, "log.fifo")
+            os.mkfifo(fifo)
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                args = _args(["--log-file", fifo, "p", "delete-user", "alice"])
+                code = await _run(args)
+
+        self.assertEqual(code, 1)
+        self.assertIn("could not open log file", stderr.getvalue())
+
+    async def test_regular_log_file_path_still_works(self):
+        # Guard the flip side: the probe must not reject ordinary paths.
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "fresh.log")
+            with patch("gateway.admin.cli.load_profiles", side_effect=AdminConfigError("no cfg")), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                args = _args(["--log-file", path, "p", "delete-user", "alice"])
+                code = await _run(args)
+
+            # Asserted INSIDE the tempdir context — checking after it exits
+            # would test the cleanup, not the log file.
+            self.assertEqual(code, 1)  # failed on config, not on the log file
+            self.assertTrue(os.path.exists(path))
+
+    async def test_dev_null_log_file_still_works(self):
+        # /dev/null is a character device, not a FIFO — must pass the probe.
+        with patch("gateway.admin.cli.load_profiles", side_effect=AdminConfigError("no cfg")), \
+             contextlib.redirect_stderr(io.StringIO()):
+            args = _args(["--log-file", "/dev/null", "p", "delete-user", "alice"])
+            code = await _run(args)
+
+        self.assertEqual(code, 1)
+
+
 class TestMain(unittest.TestCase):
     def test_main_exits_with_run_result_code(self):
         with patch("gateway.admin.cli._run", new=AsyncMock(return_value=7)), \
@@ -419,6 +487,30 @@ class TestMain(unittest.TestCase):
              self.assertRaises(SystemExit) as ctx:
             main()
         self.assertEqual(ctx.exception.code, 7)
+
+    def test_keyboard_interrupt_prints_clean_error_and_re_signals(self):
+        # Ctrl-C must not dump ~100 lines of asyncio internals. Re-signalling
+        # (rather than returning a chosen exit code) is what lets a shell
+        # seed-loop actually abort, so assert the re-signal mechanics, not an
+        # exit code.
+        killed = []
+        stderr = io.StringIO()
+        with patch("gateway.admin.cli._run", new=AsyncMock(side_effect=KeyboardInterrupt())), \
+             patch("sys.argv", ["msg-admin", "p", "delete-user", "alice"]), \
+             patch("gateway.admin.cli.signal.signal") as mock_signal, \
+             patch("gateway.admin.cli.os.kill", side_effect=lambda *a: killed.append(a)), \
+             contextlib.redirect_stderr(stderr):
+            main()
+
+        self.assertIn("Error: interrupted", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+        # Default SIGINT disposition restored before re-raising, so the
+        # re-signal actually kills instead of re-entering this handler.
+        # assert_any_call, not assert_called_once_with: asyncio.run()
+        # installs its own SIGINT handler first, so this mock sees two calls.
+        mock_signal.assert_any_call(signal.SIGINT, signal.SIG_DFL)
+        self.assertEqual(len(killed), 1)
+        self.assertEqual(killed[0][1], signal.SIGINT)
 
 
 if __name__ == "__main__":

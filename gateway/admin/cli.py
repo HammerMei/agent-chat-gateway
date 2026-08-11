@@ -27,8 +27,10 @@ troubleshooting.
 
 import argparse
 import asyncio
+import errno
 import logging
 import os
+import signal
 import sys
 
 import httpx
@@ -82,6 +84,32 @@ def _configure_error_log(path: str) -> None:
        already prints.
     """
     target = os.path.abspath(path)
+
+    # logging.FileHandler opens its target EAGERLY, and open() on a FIFO with
+    # no reader attached blocks forever — which is strictly worse than a
+    # traceback: no message, no exit code, and the process is left hung
+    # indefinitely (an orphan that outlives whatever created the pipe).
+    # A non-blocking probe turns exactly that case into an immediate ENXIO.
+    #
+    # Deliberately probe rather than test S_ISFIFO: "is this a FIFO" is the
+    # wrong question — a piped `--log-file /dev/stdout`, an inherited pipe,
+    # and a FIFO that DOES have a reader are all FIFOs that open perfectly
+    # well, and rejecting them would break working invocations. "Would
+    # opening it block right now" is the actual question, and O_NONBLOCK
+    # answers it directly.
+    try:
+        probe = os.open(target, os.O_WRONLY | os.O_APPEND | os.O_NONBLOCK)
+    except FileNotFoundError:
+        pass  # normal case: FileHandler creates it, or reports its own OSError
+    except OSError as e:
+        if e.errno == errno.ENXIO:
+            raise OSError(
+                f"{target} is a pipe with no reader attached — "
+                "opening it for logging would block forever"
+            ) from e
+        raise
+    else:
+        os.close(probe)
 
     _error_logger.setLevel(logging.ERROR)
     _error_logger.propagate = False
@@ -260,7 +288,22 @@ async def _run(args: argparse.Namespace) -> int:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    sys.exit(asyncio.run(_run(args)))
+    try:
+        sys.exit(asyncio.run(_run(args)))
+    except KeyboardInterrupt:
+        # Ctrl-C during a slow connect() otherwise ends in ~100 lines of
+        # asyncio/anyio internals: KeyboardInterrupt and CancelledError are
+        # BaseException, so neither `except AdminConfigError` nor the broad
+        # `except Exception` in _run() sees them.
+        #
+        # Re-signalling (rather than exiting with a chosen code) keeps the
+        # process dying *by* SIGINT, which is what a shell needs to abort a
+        # seed loop like `for f in ...; do msg-admin ...; done`. Returning a
+        # plain exit code here would silently make such loops run to
+        # completion after a Ctrl-C.
+        print("Error: interrupted", file=sys.stderr)
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGINT)
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ from gateway.admin.base import (
     ChannelNotFoundError,
     PlatformAdmin,
     UserAlreadyExistsError,
+    UserDeactivatedError,
     UserNotFoundError,
     VerificationError,
     emails_match,
@@ -109,24 +110,52 @@ class MattermostAdmin(PlatformAdmin):
             # (a standard Python 3 gotcha, to avoid reference cycles) —
             # capture the message now so it's still available below.
             membership_error_msg = str(membership_error)
-        # Not wrapped in quiet_expected_error: unlike the existence checks
-        # elsewhere in this file, a 404 here is the SECOND of two failed
-        # lookups — a genuine misconfiguration (bad team name, or a
-        # non-admin credential), not an expected outcome on the happy path.
-        # It should stay loud.
+        # Two admin lookups, not one: MattermostREST.resolve_team() matches
+        # profile.team against either a team NAME or a team ID
+        # (`if t.get("name") == team or t.get("id") == team`), so a profile
+        # legitimately configured with an ID resolves fine while the caller
+        # is a member — but would then hit a name-only fallback and fail with
+        # a message blaming the team name. Mattermost has no "by name or id"
+        # endpoint, so try each in turn.
+        #
+        # Deliberately NOT gated on an is-this-an-ID heuristic: Mattermost's
+        # own NewRandomTeamName() derives team names from NewId(), so ID-
+        # shaped names genuinely exist and any such guess would misroute them.
+        #
+        # Neither call is wrapped in quiet_expected_error: unlike the
+        # existence checks elsewhere in this file, a 404 here is a genuine
+        # misconfiguration (bad team name/ID, or a non-admin credential),
+        # not an expected outcome on the happy path. It should stay loud.
+        result = None
+        by_name_error: Exception | None = None
+        by_id_error: Exception | None = None
         try:
             result = await self._rest._request("GET", f"teams/name/{team}")
-        except httpx.HTTPStatusError as by_name_error:
+            lookup = "by-name"
+        except httpx.HTTPStatusError as e:
+            by_name_error = e
+            try:
+                result = await self._rest._request("GET", f"teams/{team}")
+                lookup = "by-id"
+            except httpx.HTTPStatusError as e2:
+                by_id_error = e2
+
+        if result is None:
+            # Wording note: keeps the exact substring "admin by-name lookup
+            # also failed" that tests assert on, while now also reporting the
+            # by-id attempt.
             raise RoomNotFoundError(
                 f"Team '{team}' not found among the caller's own teams "
                 f"({membership_error_msg}), and the admin by-name lookup "
-                f"also failed ({by_name_error}). Either the team name is "
-                "wrong, or this credential isn't a system admin — if it "
-                f"should just be a member, add it with `mmctl team add "
-                f"{team} <username>`."
-            ) from by_name_error
+                f"also failed ({by_name_error}), as did the by-id lookup "
+                f"({by_id_error}). Either the team name/ID is wrong, or this "
+                "credential isn't a system admin — if it should just be a "
+                f"member, add it with `mmctl team add {team} <username>`."
+            ) from by_id_error
         self._rest.team_id = result["id"]
-        logger.info("Resolved team '%s' -> id=%s (admin by-name lookup)", team, self._rest.team_id)
+        logger.info(
+            "Resolved team '%s' -> id=%s (admin %s lookup)", team, self._rest.team_id, lookup
+        )
 
     async def close(self) -> None:
         await self._rest.close()
@@ -142,6 +171,15 @@ class MattermostAdmin(PlatformAdmin):
     ) -> AdminUser:
         existing = await self._get_user_or_none(username)
         if existing is not None:
+            if existing.deactivated:
+                # Checked BEFORE the team-membership repair below: repairing
+                # a dead account's team membership accomplishes nothing (it
+                # still can't log in), and the whole point is that this must
+                # not end in the CLI's idempotent "skipping" + exit 0. Note
+                # UserDeactivatedError is deliberately NOT a
+                # UserAlreadyExistsError subclass, or cli.py's handler for
+                # that would swallow this right back into a false success.
+                raise UserDeactivatedError(username, existing=existing)
             # Repair path, not just an idempotency short-circuit: a user can
             # exist but still not be a team member if a PRIOR create_user()
             # call created the account and then failed at the team-join step
@@ -176,10 +214,9 @@ class MattermostAdmin(PlatformAdmin):
             # field from the request unless the caller has manage_system
             # permission, so it only takes effect because this tool is meant
             # to run with a system-admin credential (see
-            # MattermostAdmin.__init__). TODO: unverified against a live
-            # server with RequireEmailVerification on; if it turns out not
-            # to take effect, this needs an explicit follow-up verify call
-            # instead.
+            # MattermostAdmin.__init__) — a lesser credential has the field
+            # silently dropped, not rejected, which is what the post-create
+            # check below warns about.
             "email_verified": verified,
         }
         if full_name:
@@ -192,6 +229,30 @@ class MattermostAdmin(PlatformAdmin):
         if not user_id:
             raise VerificationError(
                 f"Mattermost user creation for '{username}' returned no id: {result}"
+            )
+
+        if verified and not result.get("email_verified"):
+            # Checked against the POST response, NOT a read-back: Mattermost's
+            # user-fetch path runs ClearNonProfileFields, which zeroes
+            # email_verified unconditionally for any account other than the
+            # caller's own AND tags it `omitempty` — so the field is simply
+            # absent from a GET, and a read-back-based check here would
+            # hard-fail every *working* --verified run. The create response is
+            # the only place the real value is observable (it echoes the saved
+            # struct without that sanitizer).
+            #
+            # A warning rather than a VerificationError, deliberately: unlike
+            # a deactivated or missing account, the account here is real and
+            # usable — only one requested attribute may not have applied — and
+            # this tool cannot tell whether the server even enforces
+            # RequireEmailVerification without a manage_system config read. A
+            # false positive would break the documented reseed workflow; a
+            # warning preserves it while still surfacing the gap.
+            logger.warning(
+                "Mattermost did not confirm email_verified for '%s' — the server likely "
+                "stripped it because this credential lacks manage_system. If the server "
+                "requires email verification, this account may be unable to log in.",
+                username,
             )
 
         # Read back rather than trust the response body: a server with
@@ -361,7 +422,17 @@ class MattermostAdmin(PlatformAdmin):
             if e.response.status_code == 404:
                 return None
             raise
-        return AdminUser(id=result["id"], username=result["username"], email=result.get("email", ""))
+        return AdminUser(
+            id=result["id"],
+            username=result["username"],
+            email=result.get("email", ""),
+            # Mattermost soft-deletes: DELETE /users/{id} sets delete_at, and
+            # the username lookup still returns the row afterwards. Retained
+            # (rather than discarded, as it was) so create_user() can tell an
+            # existing-and-usable account from an existing-but-dead one —
+            # see UserDeactivatedError.
+            deactivated=bool(result.get("delete_at")),
+        )
 
     async def _get_channel_or_none(self, name: str) -> AdminChannel | None:
         try:

@@ -93,6 +93,43 @@ class UserNotFoundError(AdminError):
     """Raised when an operation references a username that does not exist."""
 
 
+class UserDeactivatedError(AdminError):
+    """Raised by create_user() when the username belongs to an existing but
+    DEACTIVATED account, so the requested "an active user exists" state was
+    not achieved.
+
+    Deliberately subclasses AdminError **directly, and must never subclass
+    UserAlreadyExistsError**, however tempting that reads (it is, literally,
+    an already-exists case). gateway/admin/cli.py catches
+    UserAlreadyExistsError and prints an idempotent "already exists —
+    skipping" with exit 0; if this were a subclass, that handler would swallow
+    it and reinstate the exact bug this exists to fix — a CLI reporting
+    success for an account that cannot log in.
+
+    Reachable using nothing but this tool's own documented commands, in its
+    own primary workflow: MattermostAdmin.delete_user() only SOFT-deactivates
+    (Mattermost's DELETE /users/{id} sets delete_at rather than removing the
+    row), and Mattermost's username lookup still returns soft-deleted
+    accounts — so `delete-user bob` followed by `create-user bob ...` while
+    reseeding a lab environment would otherwise report a clean skip over a
+    dead account.
+
+    Does NOT auto-reactivate: silently resurrecting an account someone
+    deliberately deactivated is a bigger surprise than failing loudly, and
+    reactivation is a distinct intent that deserves a distinct explicit
+    action rather than being a side effect of "create".
+    """
+
+    def __init__(self, username: str, existing: "AdminUser"):
+        super().__init__(
+            f"User '{username}' already exists but is deactivated (id={existing.id}) — "
+            "the requested active-user state was not achieved. Reactivate it on the "
+            "server, or pick a different username."
+        )
+        self.username = username
+        self.existing = existing
+
+
 class ChannelNotFoundError(AdminError):
     """Raised when an operation references a channel name that does not exist."""
 
@@ -115,6 +152,13 @@ class AdminUser:
     id: str
     username: str
     email: str
+    # Whether the platform reports this account as deactivated/soft-deleted.
+    # Defaults False and is keyword-safe for every existing construction site.
+    # Only Mattermost populates it today (its delete_user() soft-deactivates,
+    # and its username lookup still returns such accounts — see
+    # UserDeactivatedError); Rocket.Chat's delete_user() hard-deletes, so a
+    # deleted RC account simply stops resolving.
+    deactivated: bool = False
 
 
 @dataclass

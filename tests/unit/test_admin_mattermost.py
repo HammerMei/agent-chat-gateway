@@ -15,9 +15,11 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 
 from gateway.admin.base import (
+    AdminError,
     ChannelAlreadyExistsError,
     ChannelNotFoundError,
     UserAlreadyExistsError,
+    UserDeactivatedError,
     UserNotFoundError,
     VerificationError,
 )
@@ -133,6 +135,31 @@ class TestConnect(unittest.IsolatedAsyncioTestCase):
         # name or a non-admin credential actually needs to see.
         self.assertIn("not found among the bot's teams", str(ctx.exception))
         self.assertIn("admin by-name lookup also failed", str(ctx.exception))
+        self.assertIn("by-id lookup", str(ctx.exception))
+
+    async def test_connect_falls_back_to_by_id_lookup_when_team_is_an_id(self):
+        # MattermostREST.resolve_team() matches profile.team against a team
+        # NAME *or* a team ID, so an ID-configured profile is legitimate —
+        # but Mattermost has no by-name-or-id endpoint, so the name lookup
+        # 404s and the fallback must then try the ID endpoint.
+        admin = _admin_with_mock_rest()
+        admin._rest.authenticate = AsyncMock()
+        admin._rest.get_me = AsyncMock()
+        admin._rest.resolve_team = AsyncMock(
+            side_effect=RoomNotFoundError("Team 'labteam' not found among the bot's teams")
+        )
+        admin._rest._request = AsyncMock(
+            side_effect=[
+                _http_error(404),  # GET teams/name/labteam -> not a name
+                {"id": "team-77", "name": "actual-name"},  # GET teams/labteam -> found by id
+            ]
+        )
+
+        await admin.connect()
+
+        admin._rest._request.assert_any_await("GET", "teams/name/labteam")
+        admin._rest._request.assert_any_await("GET", "teams/labteam")
+        self.assertEqual(admin._rest.team_id, "team-77")
 
 
 class TestCreateUser(unittest.IsolatedAsyncioTestCase):
@@ -221,6 +248,81 @@ class TestCreateUser(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(UserAlreadyExistsError) as ctx:
             await admin.create_user("alice", "a@x.com", "pw")
         self.assertEqual(ctx.exception.existing.id, "u1")
+
+    async def test_deactivated_existing_user_raises_user_deactivated_error(self):
+        # Reachable with this tool's own commands: delete-user soft-
+        # deactivates (MM sets delete_at), and the username lookup still
+        # returns the row — so a reseed's create-user must NOT report a
+        # clean skip over an account that can't log in.
+        admin = _admin_with_mock_rest()
+        admin._rest.get_user_by_username = AsyncMock(
+            return_value={
+                "id": "u1", "username": "alice", "email": "a@x.com",
+                "delete_at": 1750000000000,
+            }
+        )
+        admin._rest._request = AsyncMock()
+
+        with self.assertRaises(UserDeactivatedError) as ctx:
+            await admin.create_user("alice", "a@x.com", "pw")
+
+        self.assertTrue(ctx.exception.existing.deactivated)
+        # Must not have bothered repairing team membership for a dead account.
+        admin._rest._request.assert_not_awaited()
+
+    def test_user_deactivated_error_is_not_a_user_already_exists_error(self):
+        # Load-bearing: cli.py catches UserAlreadyExistsError and reports an
+        # idempotent skip with exit 0. If UserDeactivatedError were a
+        # subclass, that handler would swallow it and reinstate the bug.
+        self.assertFalse(issubclass(UserDeactivatedError, UserAlreadyExistsError))
+        self.assertTrue(issubclass(UserDeactivatedError, AdminError))
+
+    async def test_active_existing_user_is_not_treated_as_deactivated(self):
+        # delete_at: 0 is MM's "active" value — must not trip the check.
+        admin = _admin_with_mock_rest()
+        admin._rest.get_user_by_username = AsyncMock(
+            return_value={"id": "u1", "username": "alice", "email": "a@x.com", "delete_at": 0}
+        )
+        admin._rest._request = AsyncMock(return_value={"user_id": "u1"})
+
+        with self.assertRaises(UserAlreadyExistsError):
+            await admin.create_user("alice", "a@x.com", "pw")
+
+    async def test_verified_warns_when_server_did_not_confirm(self):
+        admin = _admin_with_mock_rest()
+        admin._rest.get_user_by_username = AsyncMock(
+            side_effect=[_http_error(404), {"id": "u1", "username": "alice", "email": "a@x.com"}]
+        )
+        # POST echo omits email_verified — what a non-manage_system credential
+        # gets after SanitizeInput() drops the field.
+        admin._rest._request = AsyncMock(side_effect=[{"id": "u1"}, {"user_id": "u1"}])
+
+        with self.assertLogs("agent-chat-gateway.admin.mattermost", level="WARNING") as logs:
+            await admin.create_user("alice", "a@x.com", "pw", verified=True)
+
+        self.assertTrue(any("did not confirm email_verified" in m for m in logs.output))
+
+    async def test_verified_does_not_warn_when_server_confirms(self):
+        admin = _admin_with_mock_rest()
+        admin._rest.get_user_by_username = AsyncMock(
+            side_effect=[_http_error(404), {"id": "u1", "username": "alice", "email": "a@x.com"}]
+        )
+        admin._rest._request = AsyncMock(
+            side_effect=[{"id": "u1", "email_verified": True}, {"user_id": "u1"}]
+        )
+
+        with self.assertNoLogs("agent-chat-gateway.admin.mattermost", level="WARNING"):
+            await admin.create_user("alice", "a@x.com", "pw", verified=True)
+
+    async def test_no_verified_warning_when_verified_not_requested(self):
+        admin = _admin_with_mock_rest()
+        admin._rest.get_user_by_username = AsyncMock(
+            side_effect=[_http_error(404), {"id": "u1", "username": "alice", "email": "a@x.com"}]
+        )
+        admin._rest._request = AsyncMock(side_effect=[{"id": "u1"}, {"user_id": "u1"}])
+
+        with self.assertNoLogs("agent-chat-gateway.admin.mattermost", level="WARNING"):
+            await admin.create_user("alice", "a@x.com", "pw")
 
     async def test_existing_user_repairs_team_membership_before_raising(self):
         # Retry-recovery path: a prior create_user() call may have created
