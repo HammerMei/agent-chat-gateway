@@ -834,67 +834,73 @@ class WatcherLifecycle:
         wc = await self._find_or_reconstruct_watcher_config(name)
         self._ensure_agent_available(wc)
         async with self._get_watcher_lock(name):
-            try:
-                await self._stop_processor(name, save=False)
-            except Exception as e:
-                # Best-effort teardown: log the error but continue with the restart.
-                # A failure here (e.g. network error while sending DDP unsub) should
-                # not prevent the user from recovering the watcher via reset.
-                logger.warning(
-                    "Watcher '%s': error during stop phase of reset (proceeding with restart): %s",
-                    name,
-                    e,
-                )
-
-            state = self._states.get(name)
-            # Clear injection retry state BEFORE resetting context_injected so
-            # the new startup attempt begins with a fresh failure counter.
-            # Without this, a watcher that reached ``failed_degraded`` would
-            # immediately re-enter that state after reset (the old failure_count
-            # is still at ``_MAX_INJECT_ATTEMPTS``, so one more failure tips it
-            # over again).
-            # NOTE: computed OUTSIDE the `if state:` guard — a pinned wc.session_id
-            # must be reset even when state is None (watcher failed before any
-            # state was persisted).
-            old_session_id = wc.session_id or (state.session_id if state else "")
-            if old_session_id:
-                self._injector.reset_session(old_session_id)
-            if state:
-                # Mutated in place — `state` is the same object as
-                # self._states[name] (not a copy), so this is exactly the
-                # "seed self._states before calling" step _start_watcher()
-                # now requires of every caller whose prior state didn't
-                # already live there untouched (PR #79 review, fifteenth
-                # round; see _start_watcher()'s docstring). No separate
-                # seed line needed here — the mutation itself is the seed.
-                if not wc.session_id:
-                    state.session_id = ""
-                state.context_injected = False
-                state.paused = False
-
             # Cross-connector reservation (PR #79 review, fifteenth round)
-            # — same rationale as resume_watcher()'s identical addition
-            # just above: an explicit `reset --connector A <name>` bypasses
+            # — same rationale as resume_watcher()'s identical check: an
+            # explicit `reset --connector A <name>` bypasses
             # dispatch_command()'s cross-connector ambiguity scan entirely,
             # so the check must live here to be unbypassable. Self-reclaim
-            # is safe for the same reason (requesting connector excluded
-            # from the scan).
-            reserved = False
+            # is safe (requesting connector excluded from the scan).
+            #
+            # MUST happen before every destructive step below (stopping
+            # the processor, clearing session_id/context_injected/paused)
+            # — a follow-up review finding caught that this was originally
+            # placed AFTER those mutations: they write directly into
+            # self._states[name], so a refused reset (reservation lost)
+            # would still leave the old session cleared and an explicit
+            # pause undone, persisted by the very next save()/shutdown,
+            # even though the command reported failure.
+            if not await self._reserve_global_name(name):
+                raise RuntimeError(
+                    f"Watcher '{name}' is already used by a watcher on a "
+                    "different connector — refusing to reset (watcher "
+                    "names must be globally unique)."
+                )
             try:
-                if not await self._reserve_global_name(name):
-                    raise RuntimeError(
-                        f"Watcher '{name}' is already used by a watcher on "
-                        "a different connector — refusing to reset "
-                        "(watcher names must be globally unique)."
+                try:
+                    await self._stop_processor(name, save=False)
+                except Exception as e:
+                    # Best-effort teardown: log the error but continue with the restart.
+                    # A failure here (e.g. network error while sending DDP unsub) should
+                    # not prevent the user from recovering the watcher via reset.
+                    logger.warning(
+                        "Watcher '%s': error during stop phase of reset (proceeding with restart): %s",
+                        name,
+                        e,
                     )
-                reserved = True
-                await self._start_watcher(wc)
-            except Exception as e:
-                logger.error("Failed to restart watcher '%s' after reset: %s", name, e)
-                raise
+
+                state = self._states.get(name)
+                # Clear injection retry state BEFORE resetting context_injected so
+                # the new startup attempt begins with a fresh failure counter.
+                # Without this, a watcher that reached ``failed_degraded`` would
+                # immediately re-enter that state after reset (the old failure_count
+                # is still at ``_MAX_INJECT_ATTEMPTS``, so one more failure tips it
+                # over again).
+                # NOTE: computed OUTSIDE the `if state:` guard — a pinned wc.session_id
+                # must be reset even when state is None (watcher failed before any
+                # state was persisted).
+                old_session_id = wc.session_id or (state.session_id if state else "")
+                if old_session_id:
+                    self._injector.reset_session(old_session_id)
+                if state:
+                    # Mutated in place — `state` is the same object as
+                    # self._states[name] (not a copy), so this is exactly the
+                    # "seed self._states before calling" step _start_watcher()
+                    # now requires of every caller whose prior state didn't
+                    # already live there untouched (PR #79 review, fifteenth
+                    # round; see _start_watcher()'s docstring). No separate
+                    # seed line needed here — the mutation itself is the seed.
+                    if not wc.session_id:
+                        state.session_id = ""
+                    state.context_injected = False
+                    state.paused = False
+
+                try:
+                    await self._start_watcher(wc)
+                except Exception as e:
+                    logger.error("Failed to restart watcher '%s' after reset: %s", name, e)
+                    raise
             finally:
-                if reserved:
-                    self._release_global_name(name)
+                self._release_global_name(name)
             self._state_store.save(self._states)
             logger.info("Watcher '%s' reset", name)
 

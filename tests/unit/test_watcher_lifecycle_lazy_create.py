@@ -1530,14 +1530,25 @@ class TestResumeResetGlobalNameReservation(unittest.IsolatedAsyncioTestCase):
         release.assert_called_once_with("static-1")
 
     async def test_reset_refuses_when_name_claimed_by_another_connector(self):
+        """PR #79 review, fifteenth round (follow-up finding): the
+        reservation check must run BEFORE reset_watcher()'s destructive
+        steps (stopping the processor, clearing session_id/
+        context_injected/paused) — those mutate self._states[name]
+        directly. Placed after them (this method's first version), a
+        refused reset would still leave the old session cleared and an
+        explicit pause undone, persisted by the next save()/shutdown, even
+        though the command reported failure. Asserts the pre-existing
+        state survives the refusal completely untouched."""
         reserve = AsyncMock(return_value=False)
         release = MagicMock()
         lifecycle, connector, agent, state_store = self._static_lifecycle(
             reserve_global_name=reserve, release_global_name=release,
         )
-        lifecycle._states["static-1"] = WatcherState(
+        original_state = WatcherState(
             watcher_name="static-1", session_id="old-sess", room_id="chan-1",
+            context_injected=True, paused=True,
         )
+        lifecycle._states["static-1"] = original_state
 
         with self.assertRaises(RuntimeError):
             await lifecycle.reset_watcher("static-1")
@@ -1546,6 +1557,11 @@ class TestResumeResetGlobalNameReservation(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("static-1", lifecycle._processors)
         reserve.assert_awaited_once_with("static-1")
         release.assert_not_called()
+        # The refused reset must not have mutated the pre-existing state at all.
+        self.assertIs(lifecycle._states["static-1"], original_state)
+        self.assertEqual(original_state.session_id, "old-sess")
+        self.assertTrue(original_state.context_injected)
+        self.assertTrue(original_state.paused)
 
     async def test_reset_releases_reservation_after_successful_start(self):
         reserve = AsyncMock(return_value=True)
