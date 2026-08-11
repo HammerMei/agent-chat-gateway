@@ -783,11 +783,41 @@ class WatcherLifecycle:
                     state.paused = False
                 self._state_store.save(self._states)
                 return
+            # Cross-connector reservation (PR #79 review, fifteenth round):
+            # `ControlServer.dispatch_command()`'s cross-connector ambiguity
+            # scan only runs when the caller did NOT pass --connector — an
+            # explicit `resume --connector A <name>` bypasses that scan
+            # entirely and calls straight into this method. Without a check
+            # HERE, inside WatcherLifecycle itself, nothing stopped a
+            # connector-qualified resume from starting a watcher under a
+            # name a DIFFERENT connector already has live, leaving two
+            # processors sharing a supposedly globally-unique name. Same
+            # reserve-then-release pattern try_lazy_create()/
+            # wake_dormant_watcher() already use. Self-reclaim is safe —
+            # `_reserve_watcher_name()` excludes the requesting connector's
+            # own entry from its scan — so a connector resuming its OWN
+            # watcher is never blocked by itself, only by a genuine foreign
+            # claim; this closes the bypass without requiring the
+            # dispatch-layer scan to run at all.
+            reserved = False
             try:
+                if not await self._reserve_global_name(name):
+                    raise RuntimeError(
+                        f"Watcher '{name}' is already used by a watcher on "
+                        "a different connector — refusing to resume "
+                        "(watcher names must be globally unique)."
+                    )
+                reserved = True
                 await self._start_watcher(wc)
             except Exception as e:
                 logger.error("Failed to resume watcher '%s': %s", name, e)
                 raise
+            finally:
+                # Same release discipline as try_lazy_create(): once
+                # durably registered (or on any failure), the transient
+                # reservation must not be left stuck forever.
+                if reserved:
+                    self._release_global_name(name)
             # No explicit "clear paused" step needed here on success:
             # _start_watcher() always builds a brand-new WatcherState with
             # paused=False (it has no "resume vs fresh start" distinction —
@@ -842,11 +872,29 @@ class WatcherLifecycle:
                 state.context_injected = False
                 state.paused = False
 
+            # Cross-connector reservation (PR #79 review, fifteenth round)
+            # — same rationale as resume_watcher()'s identical addition
+            # just above: an explicit `reset --connector A <name>` bypasses
+            # dispatch_command()'s cross-connector ambiguity scan entirely,
+            # so the check must live here to be unbypassable. Self-reclaim
+            # is safe for the same reason (requesting connector excluded
+            # from the scan).
+            reserved = False
             try:
+                if not await self._reserve_global_name(name):
+                    raise RuntimeError(
+                        f"Watcher '{name}' is already used by a watcher on "
+                        "a different connector — refusing to reset "
+                        "(watcher names must be globally unique)."
+                    )
+                reserved = True
                 await self._start_watcher(wc)
             except Exception as e:
                 logger.error("Failed to restart watcher '%s' after reset: %s", name, e)
                 raise
+            finally:
+                if reserved:
+                    self._release_global_name(name)
             self._state_store.save(self._states)
             logger.info("Watcher '%s' reset", name)
 

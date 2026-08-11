@@ -1466,6 +1466,106 @@ class TestStartWatcherDiscardsStateOnAgentMismatch(unittest.IsolatedAsyncioTestC
         self.assertEqual(lifecycle._states["static-1"].session_id, "old-sess-id")
 
 
+class TestResumeResetGlobalNameReservation(unittest.IsolatedAsyncioTestCase):
+    """PR #79 review, fifteenth round: resume_watcher()/reset_watcher() must
+    reserve the watcher name across connectors before starting.
+
+    ControlServer.dispatch_command()'s cross-connector ambiguity scan
+    (gateway/control.py) only runs when the caller did NOT pass
+    --connector — an explicit `resume --connector A <name>` bypasses that
+    scan entirely and calls straight into WatcherLifecycle.resume_watcher().
+    Without a check HERE, nothing stopped a connector-qualified resume/reset
+    from starting a watcher under a name a DIFFERENT connector already has
+    live. Mirrors try_lazy_create()/wake_dormant_watcher()'s existing
+    reserve-then-release pattern; self-reclaim is safe because
+    _reserve_watcher_name() excludes the requesting connector's own entry
+    from its scan (verified separately in test_service.py-style coverage
+    for that method — not re-verified here, this class only checks that
+    WatcherLifecycle actually calls reserve/release around the start)."""
+
+    def _static_lifecycle(self, reserve_global_name=None, release_global_name=None):
+        lifecycle, connector, agent, state_store = _make_lifecycle(
+            rules=None,
+            reserve_global_name=reserve_global_name,
+            release_global_name=release_global_name,
+        )
+        wc = WatcherConfig(name="static-1", connector="mm-home", room="general", agent="claude")
+        lifecycle._watcher_configs.append(wc)
+        return lifecycle, connector, agent, state_store
+
+    async def test_resume_refuses_when_name_claimed_by_another_connector(self):
+        reserve = AsyncMock(return_value=False)
+        release = MagicMock()
+        lifecycle, connector, agent, state_store = self._static_lifecycle(
+            reserve_global_name=reserve, release_global_name=release,
+        )
+        lifecycle._states["static-1"] = WatcherState(
+            watcher_name="static-1", session_id="old-sess", room_id="chan-1", paused=True,
+        )
+
+        with self.assertRaises(RuntimeError):
+            await lifecycle.resume_watcher("static-1")
+
+        agent.create_session.assert_not_called()
+        self.assertNotIn("static-1", lifecycle._processors)
+        reserve.assert_awaited_once_with("static-1")
+        release.assert_not_called()  # never reserved — nothing to release
+
+    async def test_resume_releases_reservation_after_successful_start(self):
+        reserve = AsyncMock(return_value=True)
+        release = MagicMock()
+        lifecycle, connector, agent, state_store = self._static_lifecycle(
+            reserve_global_name=reserve, release_global_name=release,
+        )
+        lifecycle._states["static-1"] = WatcherState(
+            watcher_name="static-1", session_id="old-sess", room_id="chan-1", paused=True,
+        )
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            await lifecycle.resume_watcher("static-1")
+
+        self.assertIn("static-1", lifecycle._processors)
+        reserve.assert_awaited_once_with("static-1")
+        release.assert_called_once_with("static-1")
+
+    async def test_reset_refuses_when_name_claimed_by_another_connector(self):
+        reserve = AsyncMock(return_value=False)
+        release = MagicMock()
+        lifecycle, connector, agent, state_store = self._static_lifecycle(
+            reserve_global_name=reserve, release_global_name=release,
+        )
+        lifecycle._states["static-1"] = WatcherState(
+            watcher_name="static-1", session_id="old-sess", room_id="chan-1",
+        )
+
+        with self.assertRaises(RuntimeError):
+            await lifecycle.reset_watcher("static-1")
+
+        agent.create_session.assert_not_called()
+        self.assertNotIn("static-1", lifecycle._processors)
+        reserve.assert_awaited_once_with("static-1")
+        release.assert_not_called()
+
+    async def test_reset_releases_reservation_after_successful_start(self):
+        reserve = AsyncMock(return_value=True)
+        release = MagicMock()
+        lifecycle, connector, agent, state_store = self._static_lifecycle(
+            reserve_global_name=reserve, release_global_name=release,
+        )
+        lifecycle._states["static-1"] = WatcherState(
+            watcher_name="static-1", session_id="old-sess", room_id="chan-1",
+        )
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            await lifecycle.reset_watcher("static-1")
+
+        self.assertIn("static-1", lifecycle._processors)
+        reserve.assert_awaited_once_with("static-1")
+        release.assert_called_once_with("static-1")
+
+
 class TestWakeDormantWatcher(unittest.IsolatedAsyncioTestCase):
     """PR #79 review: wake_dormant_watcher() — used by the job scheduler so
     a scheduled job for a lazily created watcher isn't silently skipped
