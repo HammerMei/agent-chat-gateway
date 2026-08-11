@@ -1,0 +1,230 @@
+"""Standalone argparse entrypoint for the RC/MM admin CLI.
+
+Usage:
+    msg-admin [--config PATH] [--log-file PATH] <profile> create-user <username> <email> <password> [--full-name NAME]
+    msg-admin [--config PATH] [--log-file PATH] <profile> create-channel <name> [--private]
+    msg-admin [--config PATH] [--log-file PATH] <profile> add-to-channel <username> <channel>
+    msg-admin [--config PATH] [--log-file PATH] <profile> delete-user <username>
+    msg-admin [--config PATH] [--log-file PATH] <profile> delete-channel <channel>
+
+Not wired into gateway/cli.py — see gateway/admin/__init__.py for why.
+
+create-user / create-channel treat "already exists" as an idempotent no-op
+(printed as a note, not an error, exit code 0) rather than a failure: the
+underlying PlatformAdmin methods still raise a distinguishable exception
+(UserAlreadyExistsError / ChannelAlreadyExistsError) for library callers
+that want to react to it, but the CLI's own default fits its primary use
+case — reseeding a lab/test environment where re-running the same seed
+script against a partially-set-up state should just work.
+
+API failures (httpx.HTTPStatusError, e.g. a 400 from creating a user whose
+email already exists) print a short, platform-specific message extracted
+from the response body (see gateway/admin/_errors.py) rather than httpx's
+own generic "Client error '400 Bad Request' for url '...'" — the full raw
+response body is preserved in --log-file (default: ./msg-admin.log) for
+troubleshooting.
+"""
+
+import argparse
+import asyncio
+import logging
+import os
+import sys
+
+import httpx
+
+from gateway.admin._errors import friendly_error_message, log_error_response
+from gateway.admin.base import ChannelAlreadyExistsError, UserAlreadyExistsError
+from gateway.admin.config import AdminConfigError, get_profile, load_profiles
+from gateway.admin.factory import admin_factory
+
+DEFAULT_LOG_FILE = "msg-admin.log"
+
+_error_logger = logging.getLogger("agent-chat-gateway.admin.errors")
+
+
+def _has_file_handler_for(logger: logging.Logger, target: str) -> bool:
+    return any(
+        isinstance(h, logging.FileHandler) and h.baseFilename == target for h in logger.handlers
+    )
+
+
+def _configure_error_log(path: str) -> None:
+    """Attach file handlers so full API error bodies are preserved even
+    though the console only shows a short, friendly message. Idempotent —
+    safe to call more than once (e.g. across tests) without duplicating
+    handlers/output lines.
+
+    Two separate handlers are attached, both pointed at the same file:
+
+    1. On ``_error_logger`` directly — this is what log_error_response()
+       writes to explicitly from _run()'s httpx.HTTPStatusError handler.
+       ``propagate`` is turned off so this doesn't ALSO get written via
+       handler 2 below (same file, would otherwise double the line).
+
+    2. On the "agent-chat-gateway" umbrella logger — this is the actual fix
+       for what prompted this function to exist: RocketChatREST/
+       MattermostREST's shared ``_request()`` calls ``logger.error()``
+       itself on every non-2xx response, on loggers named
+       "agent-chat-gateway.connectors.<platform>.rest". With NO handler
+       configured anywhere in that hierarchy, Python's logging module falls
+       back to its "handler of last resort" and prints the raw log record
+       (including the full JSON body) straight to stderr — which is exactly
+       the noisy line this whole feature was meant to get rid of; quieting
+       the *expected*-404 existence checks (see gateway/admin/_logging.py)
+       was never going to catch this, since a genuine creation failure like
+       "email already exists" is deliberately NOT one of those suppressed
+       calls. Attaching a WARNING+ handler here (a common ancestor of every
+       "agent-chat-gateway.*" logger this CLI touches) means a handler is
+       always found during that walk, so the "no handler" fallback never
+       triggers — the detail lands in the file instead of leaking to the
+       console a second time, redundant with the friendly message _run()
+       already prints.
+    """
+    target = os.path.abspath(path)
+
+    _error_logger.setLevel(logging.ERROR)
+    _error_logger.propagate = False
+    if not _has_file_handler_for(_error_logger, target):
+        handler = logging.FileHandler(path)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
+        _error_logger.addHandler(handler)
+
+    umbrella_logger = logging.getLogger("agent-chat-gateway")
+    if not _has_file_handler_for(umbrella_logger, target):
+        umbrella_handler = logging.FileHandler(path)
+        umbrella_handler.setLevel(logging.WARNING)
+        umbrella_handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        )
+        umbrella_logger.addHandler(umbrella_handler)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="msg-admin",
+        description="Standalone admin CLI for Rocket.Chat / Mattermost user & channel provisioning.",
+    )
+    parser.add_argument(
+        "--config",
+        help="Path to the profiles YAML file (default: ./admin-profiles.yaml, or $ACG_ADMIN_CONFIG)",
+    )
+    parser.add_argument(
+        "--log-file", default=DEFAULT_LOG_FILE,
+        help=f"Path to append full API error bodies to for troubleshooting "
+        f"(default: ./{DEFAULT_LOG_FILE})",
+    )
+    parser.add_argument("profile", help="Profile name from the config file")
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("create-user", help="Create a user account")
+    p.add_argument("username")
+    p.add_argument("email")
+    p.add_argument("password")
+    p.add_argument("--full-name")
+    p.add_argument(
+        "--verified", action="store_true",
+        help="Mark the account's email as verified (default: false — this tool "
+        "mainly provisions agent accounts, which have no real inbox)",
+    )
+
+    p = sub.add_parser("create-channel", help="Create a channel")
+    p.add_argument("name")
+    p.add_argument("--private", action="store_true")
+
+    p = sub.add_parser("add-to-channel", help="Add an existing user to an existing channel")
+    p.add_argument("username")
+    p.add_argument("channel")
+
+    p = sub.add_parser("delete-user", help="Delete (or deactivate) a user account")
+    p.add_argument("username")
+
+    p = sub.add_parser("delete-channel", help="Delete (or archive) a channel")
+    p.add_argument("channel")
+
+    return parser
+
+
+async def _dispatch(admin, args) -> None:
+    if args.command == "create-user":
+        try:
+            user = await admin.create_user(
+                args.username, args.email, args.password,
+                full_name=args.full_name, verified=args.verified,
+            )
+            print(f"Created user '{user.username}' (id={user.id})")
+        except UserAlreadyExistsError as e:
+            print(
+                f"User '{e.username}' already exists (id={e.existing.id}) — skipping",
+                file=sys.stderr,
+            )
+
+    elif args.command == "create-channel":
+        try:
+            channel = await admin.create_channel(args.name, is_private=args.private)
+            print(f"Created channel '{channel.name}' (id={channel.id})")
+        except ChannelAlreadyExistsError as e:
+            print(
+                f"Channel '{e.name}' already exists (id={e.existing.id}) — skipping",
+                file=sys.stderr,
+            )
+
+    elif args.command == "add-to-channel":
+        await admin.add_user_to_channel(args.username, args.channel)
+        print(f"Added '{args.username}' to channel '{args.channel}'")
+
+    elif args.command == "delete-user":
+        await admin.delete_user(args.username)
+        print(f"Deleted user '{args.username}'")
+
+    elif args.command == "delete-channel":
+        await admin.delete_channel(args.channel)
+        print(f"Deleted channel '{args.channel}'")
+
+
+async def _run(args: argparse.Namespace) -> int:
+    _configure_error_log(args.log_file)
+
+    try:
+        profiles = load_profiles(args.config)
+        profile = get_profile(profiles, args.profile)
+        admin = admin_factory(profile)
+    except AdminConfigError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    try:
+        await admin.connect()
+        await _dispatch(admin, args)
+    except httpx.HTTPStatusError as e:
+        # httpx's own str(e) is generic ("Client error '400 Bad Request' for
+        # url '...'") and never shows *why* — the platform's actual message
+        # only exists in the response body. Show that instead, and keep the
+        # full raw body in --log-file so nothing is lost for troubleshooting.
+        log_error_response(_error_logger, e)
+        print(f"Error: {friendly_error_message(e)}", file=sys.stderr)
+        print(f"(full response logged to {args.log_file})", file=sys.stderr)
+        return 1
+    except Exception as e:
+        # Broad on purpose (matching gateway/cli.py's own CLI-boundary
+        # handling): connect()/the REST clients underneath can also raise
+        # plain RuntimeError (bad login), not just AdminError subclasses —
+        # all of those should surface as a clean "Error: ..." line, not a
+        # raw traceback.
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    finally:
+        await admin.close()
+
+    return 0
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    sys.exit(asyncio.run(_run(args)))
+
+
+if __name__ == "__main__":
+    main()

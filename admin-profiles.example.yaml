@@ -1,0 +1,23 @@
+# Example profile file for the standalone gateway.admin CLI (msg-admin).
+#
+# Copy to admin-profiles.yaml (gitignored) and fill in real credentials, or
+# point --config / $ACG_ADMIN_CONFIG at a copy kept elsewhere. This is a
+# separate, standalone config — NOT read by ACG's own config.yaml/daemon.
+#
+# The admin credentials here should be a distinct, higher-privilege account
+# from whatever bot account a Connector uses — see gateway/admin/mattermost_admin.py.
+
+profiles:
+  mm-lab:
+    type: mattermost
+    server_url: https://mm.labpig.com
+    team: labteam           # required for mattermost — channels live inside a team
+    token: xxx               # Personal Access Token, preferred over username/password
+    # username: admin        # fallback auth mode if no token is set
+    # password: xxx
+
+  rc-lab:
+    type: rocketchat
+    server_url: https://rc.labpig.com
+    username: admin          # required — RocketChatAdmin has no token-only auth path yet
+    password: xxx

@@ -1,0 +1,282 @@
+"""Mattermost implementation of PlatformAdmin.
+
+Composes a MattermostREST instance rather than extending it — REST stays a
+thin transport client (auth, 401-retry, JSON in/out); this class owns admin
+business logic (idempotency checks, post-write verification) on top of it.
+The handful of admin endpoints not already exposed as public REST methods
+(user/channel create, channel membership, delete) are called via
+MattermostREST._request directly rather than duplicating its auth-header +
+401-retry handling here — see MattermostAdmin.__init__.
+"""
+
+import logging
+
+import httpx
+
+from gateway.admin._logging import quiet_expected_error
+from gateway.admin.base import (
+    AdminChannel,
+    AdminUser,
+    ChannelAlreadyExistsError,
+    ChannelNotFoundError,
+    PlatformAdmin,
+    UserAlreadyExistsError,
+    UserNotFoundError,
+    VerificationError,
+)
+from gateway.admin.config import AdminProfile
+from gateway.connectors.mattermost.rest import MattermostREST
+from gateway.connectors.mattermost.rest import logger as _mm_rest_logger
+
+logger = logging.getLogger("agent-chat-gateway.admin.mattermost")
+
+
+class MattermostAdmin(PlatformAdmin):
+    def __init__(self, profile: AdminProfile):
+        self.profile = profile
+        # Prefer a PAT (profile.token) over username/password: it sidesteps
+        # the session-token relogin path entirely, and the admin account
+        # backing this tool is deliberately a *different*, higher-privilege
+        # credential than any bot account a connector uses (MattermostREST.
+        # resolve_team's docstring documents a non-admin bot getting 403 from
+        # the team-by-name endpoint — the admin path needs to not hit that).
+        self._rest = MattermostREST(
+            server_url=profile.server_url,
+            token=profile.token or "",
+            username=profile.username or "",
+            password=profile.password or "",
+        )
+
+    async def connect(self) -> None:
+        await self._rest.authenticate()
+        await self._rest.get_me()
+        # profile.team is required for type=mattermost (enforced in
+        # AdminProfile.__post_init__), so this is safe unconditionally.
+        await self._rest.resolve_team(self.profile.team)  # type: ignore[arg-type]
+
+    async def close(self) -> None:
+        await self._rest.close()
+
+    async def create_user(
+        self,
+        username: str,
+        email: str,
+        password: str,
+        *,
+        full_name: str | None = None,
+        verified: bool = False,
+    ) -> AdminUser:
+        existing = await self._get_user_or_none(username)
+        if existing is not None:
+            raise UserAlreadyExistsError(username, existing=existing)
+
+        payload: dict = {
+            "username": username,
+            "email": email,
+            "password": password,
+            # Defaults to False (see PlatformAdmin.create_user docstring —
+            # agent accounts have no real inbox behind them). When True is
+            # passed explicitly: Mattermost's SanitizeInput() strips this
+            # field from the request unless the caller has manage_system
+            # permission, so it only takes effect because this tool is meant
+            # to run with a system-admin credential (see
+            # MattermostAdmin.__init__). TODO: unverified against a live
+            # server with RequireEmailVerification on; if it turns out not
+            # to take effect, this needs an explicit follow-up verify call
+            # instead.
+            "email_verified": verified,
+        }
+        if full_name:
+            # Mattermost has no single "full name" field — nickname is the
+            # closest freeform display field, so that's where this goes
+            # rather than guessing a first/last split.
+            payload["nickname"] = full_name
+        result = await self._rest._request("POST", "users", json_data=payload)
+        user_id = result.get("id")
+        if not user_id:
+            raise VerificationError(
+                f"Mattermost user creation for '{username}' returned no id: {result}"
+            )
+
+        # Read back rather than trust the response body: a server with
+        # EnableUserCreation/EnableOpenServer disabled has been observed to
+        # respond in ways that don't reliably reflect a created account
+        # (mattermost/mattermost#6644). If it's not actually there, fail
+        # loudly instead of returning a user that doesn't exist.
+        created = await self._get_user_or_none(username)
+        if created is None:
+            raise VerificationError(
+                f"Mattermost reported user '{username}' created (id={user_id}) "
+                "but a read-back lookup could not find it. Check "
+                "EnableUserCreation/EnableOpenServer on the server, or use "
+                "`mmctl user create` / `mmctl --local` as a fallback."
+            )
+
+        # Add to the profile's team at creation time, not only when the user
+        # is later added to a channel: a channel lives inside a team, so a
+        # user who isn't a team member yet can't be added to ANY of that
+        # team's channels — including by a human doing it manually later,
+        # outside this tool. Ensuring team membership up front means a freshly
+        # created account is immediately usable, not just usable via
+        # add_user_to_channel(). (add_user_to_channel() still does this too,
+        # as a safety net for accounts that reached this team from outside —
+        # e.g. created directly against the server, not via this tool.)
+        await self._ensure_team_member(created.id)
+        return created
+
+    async def create_channel(self, name: str, *, is_private: bool = False) -> AdminChannel:
+        existing = await self._get_channel_or_none(name)
+        if existing is not None:
+            raise ChannelAlreadyExistsError(name, existing=existing)
+
+        payload = {
+            "team_id": self._rest.team_id,
+            "name": name,
+            "display_name": name,
+            "type": "P" if is_private else "O",
+        }
+        result = await self._rest._request("POST", "channels", json_data=payload)
+        channel_id = result.get("id")
+        if not channel_id:
+            raise VerificationError(
+                f"Mattermost channel creation for '{name}' returned no id: {result}"
+            )
+
+        verified = await self._get_channel_or_none(name)
+        if verified is None:
+            raise VerificationError(
+                f"Mattermost reported channel '{name}' created (id={channel_id}) "
+                "but a read-back lookup could not find it."
+            )
+        return verified
+
+    async def add_user_to_channel(self, username: str, channel_name: str) -> None:
+        user = await self._get_user_or_none(username)
+        if user is None:
+            raise UserNotFoundError(f"Mattermost user '{username}' not found")
+        channel = await self._get_channel_or_none(channel_name)
+        if channel is None:
+            raise ChannelNotFoundError(f"Mattermost channel '{channel_name}' not found")
+
+        # A channel belongs to a team, and Mattermost rejects adding a user
+        # to a channel unless they're already a member of that channel's
+        # team — a freshly create_user()'d account is in no team at all, so
+        # without this, the create_user -> add_user_to_channel sequence
+        # (this tool's primary use case) would fail on Mattermost every time.
+        await self._ensure_team_member(user.id)
+
+        await self._rest._request(
+            "POST",
+            f"channels/{channel.id}/members",
+            json_data={"user_id": user.id},
+        )
+
+        try:
+            await self._rest._request(
+                "GET", f"channels/{channel.id}/members/{user.id}"
+            )
+        except httpx.HTTPStatusError as e:
+            raise VerificationError(
+                f"Added '{username}' to channel '{channel_name}' but a "
+                f"read-back membership check failed: {e}"
+            ) from e
+
+    async def delete_user(self, username: str) -> None:
+        """Deactivate a user. Mattermost has no hard user-delete via the
+        standard API — DELETE /users/{id} soft-deletes (sets delete_at)."""
+        user = await self._get_user_or_none(username)
+        if user is None:
+            raise UserNotFoundError(f"Mattermost user '{username}' not found")
+
+        await self._rest._request("DELETE", f"users/{user.id}")
+
+        result = await self._rest._request("GET", f"users/{user.id}")
+        if not result.get("delete_at"):
+            raise VerificationError(
+                f"Deactivated user '{username}' but a read-back check shows "
+                "delete_at is still unset."
+            )
+
+    async def delete_channel(self, channel_name: str) -> None:
+        """Archive a channel. Mattermost has no hard channel-delete via the
+        standard API — DELETE /channels/{id} archives (sets delete_at)."""
+        channel = await self._get_channel_or_none(channel_name)
+        if channel is None:
+            raise ChannelNotFoundError(f"Mattermost channel '{channel_name}' not found")
+
+        await self._rest._request("DELETE", f"channels/{channel.id}")
+
+        result = await self._rest._request("GET", f"channels/{channel.id}")
+        if not result.get("delete_at"):
+            raise VerificationError(
+                f"Archived channel '{channel_name}' but a read-back check "
+                "shows delete_at is still unset."
+            )
+
+    async def add_user_to_team(self, username: str) -> None:
+        """Idempotently ensure ``username`` is a member of the profile's team.
+
+        Public and independently usable (not just an internal step of
+        create_user()/add_user_to_channel()) — Mattermost requires team
+        membership before a user can be added to ANY channel in that team,
+        so this is useful on its own for an account that predates this tool
+        or otherwise fell out of the team. MM-only: there's no RC equivalent
+        concept, so this isn't part of the PlatformAdmin ABC.
+
+        Raises UserNotFoundError if the username does not exist.
+        """
+        user = await self._get_user_or_none(username)
+        if user is None:
+            raise UserNotFoundError(f"Mattermost user '{username}' not found")
+        await self._ensure_team_member(user.id)
+
+    async def _ensure_team_member(self, user_id: str) -> None:
+        """Idempotently add a user (by id) to the profile's team.
+
+        Internal id-based helper behind add_user_to_team() — used directly
+        by create_user()/add_user_to_channel() too, since both already have
+        the user's id in hand and calling this instead of add_user_to_team()
+        avoids a redundant username lookup.
+
+        Checked first rather than POSTed unconditionally: Mattermost is not
+        guaranteed to treat re-adding an existing team member as a no-op, so
+        this avoids relying on that being true.
+        """
+        try:
+            with quiet_expected_error(_mm_rest_logger):
+                await self._rest._request(
+                    "GET", f"teams/{self._rest.team_id}/members/{user_id}"
+                )
+            return  # already a member
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code != 404:
+                raise
+        await self._rest._request(
+            "POST",
+            f"teams/{self._rest.team_id}/members",
+            json_data={"team_id": self._rest.team_id, "user_id": user_id},
+        )
+
+    async def _get_user_or_none(self, username: str) -> AdminUser | None:
+        try:
+            with quiet_expected_error(_mm_rest_logger):
+                result = await self._rest.get_user_by_username(username)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return None
+            raise
+        return AdminUser(id=result["id"], username=result["username"], email=result.get("email", ""))
+
+    async def _get_channel_or_none(self, name: str) -> AdminChannel | None:
+        try:
+            with quiet_expected_error(_mm_rest_logger):
+                result = await self._rest._request(
+                    "GET", f"teams/{self._rest.team_id}/channels/name/{name}"
+                )
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return None
+            raise
+        return AdminChannel(
+            id=result["id"], name=result["name"], is_private=result.get("type") == "P"
+        )
