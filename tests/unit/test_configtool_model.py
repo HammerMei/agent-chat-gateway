@@ -1002,5 +1002,147 @@ class TestWatcherCrudPrimitives(_EditableConfigTestBase):
         self.assertFalse(cfg.dirty)
 
 
+class TestRoomlessEntriesAreNotMergeTargets(_EditableConfigTestBase):
+    """A watcher entry with no room of its own must never absorb a new room.
+
+    Such an entry is a live hazard rather than a curiosity.  It is invisible in
+    the TUI — expanded_watchers() swallows the ValueError it raises, so it has no
+    row and cannot be opened, edited or deleted — yet it is still in
+    watchers_raw, and with none of the six shared keys _watcher_shared_fields()
+    returns {}, which matched a fresh add's shared={}.
+
+    Merging into it then reached disk, because save()'s gate blocks only errors
+    a save *introduces* and merging a room into a roomless entry REMOVES its
+    pre-existing error.  The result reads as a legal single-room entry, and every
+    other room that should have had its own watcher is gone at the next start.
+    """
+
+    def _base_config(self, watchers_yaml: str = "") -> Path:
+        return self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+{watchers_yaml}
+        """)
+
+    ROOMLESS = """\
+              - connector: rc
+                agent: default
+    """
+
+    def test_a_roomless_entry_is_not_selected_as_a_merge_target(self):
+        cfg = EditableConfig.load(self._base_config(self.ROOMLESS))
+
+        self.assertIsNone(cfg.find_mergeable_watcher_entry("rc", "default", {}))
+
+    def test_adding_a_room_creates_a_new_entry_instead_of_mutating_it(self):
+        """The regression: the roomless entry must be left exactly as it was."""
+        cfg = EditableConfig.load(self._base_config(self.ROOMLESS))
+
+        added = cfg.add_watcher_rooms("rc", "default", ["general"], {})
+
+        self.assertEqual(added, ["general"])
+        watchers = cfg.document["watchers"]
+        self.assertEqual(len(watchers), 2, "should have added a second entry")
+        self.assertEqual(watchers[0], {"connector": "rc", "agent": "default"},
+                         "the roomless entry was mutated")
+        self.assertEqual(
+            watchers[1], {"connector": "rc", "agent": "default", "room": "general"}
+        )
+
+    def test_an_entry_with_an_empty_rooms_list_is_also_skipped(self):
+        """`rooms: []` fails the loader's non-empty check just as absence does."""
+        cfg = EditableConfig.load(self._base_config("""\
+              - connector: rc
+                agent: default
+                rooms: []
+        """))
+
+        self.assertIsNone(cfg.find_mergeable_watcher_entry("rc", "default", {}))
+
+    def test_an_entry_with_an_empty_room_string_is_also_skipped(self):
+        cfg = EditableConfig.load(self._base_config("""\
+              - connector: rc
+                agent: default
+                room: ""
+        """))
+
+        self.assertIsNone(cfg.find_mergeable_watcher_entry("rc", "default", {}))
+
+    def test_a_valid_entry_alongside_a_roomless_one_is_still_matched(self):
+        """The guard must skip only the roomless entry, not disable merging."""
+        cfg = EditableConfig.load(self._base_config("""\
+              - connector: rc
+                agent: default
+              - connector: rc
+                agent: default
+                room: general
+        """))
+
+        target = cfg.find_mergeable_watcher_entry("rc", "default", {})
+
+        self.assertIsNotNone(target)
+        self.assertEqual(target["room"], "general")
+
+    def test_merging_still_works_when_the_roomless_entry_comes_second(self):
+        cfg = EditableConfig.load(self._base_config("""\
+              - connector: rc
+                agent: default
+                room: general
+              - connector: rc
+                agent: default
+        """))
+
+        cfg.add_watcher_rooms("rc", "default", ["dev"], {})
+
+        self.assertEqual(cfg.document["watchers"][0]["rooms"], ["general", "dev"])
+        self.assertEqual(len(cfg.document["watchers"]), 2, "no third entry expected")
+
+
+class TestWatcherSharedFields(unittest.TestCase):
+    """_watcher_shared_fields() had no direct test, despite deciding merge
+    eligibility — an entry whose result equals the caller's `shared` is adopted."""
+
+    def test_an_entry_with_none_of_the_shared_keys_returns_empty(self):
+        """This is what made a roomless entry match a fresh add's shared={}."""
+        from gateway.configtool.model import _watcher_shared_fields
+
+        self.assertEqual(_watcher_shared_fields({"connector": "rc", "agent": "d"}), {})
+
+    def test_only_the_allowlisted_keys_are_returned(self):
+        from gateway.configtool.model import _watcher_shared_fields
+
+        got = _watcher_shared_fields({
+            "connector": "rc", "agent": "d", "room": "general", "name": "x",
+            "description": "desc", "inherits": "tpl",
+            "context_inject_files": ["a.md"],
+            "online_notification": "up", "offline_notification": "down",
+            "history_handoff": {"enabled": True},
+        })
+
+        self.assertEqual(got, {
+            "inherits": "tpl",
+            "context_inject_files": ["a.md"],
+            "online_notification": "up",
+            "offline_notification": "down",
+            "history_handoff": {"enabled": True},
+            "description": "desc",
+        })
+
+    def test_absent_keys_are_omitted_rather_than_defaulted(self):
+        from gateway.configtool.model import _watcher_shared_fields
+
+        got = _watcher_shared_fields({"connector": "rc", "agent": "d", "description": "d"})
+
+        self.assertEqual(got, {"description": "d"})
+
+
+
 if __name__ == "__main__":
     unittest.main()
