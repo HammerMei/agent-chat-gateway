@@ -1043,14 +1043,16 @@ class TestPostUpgradeHook:
 
         with patch("gateway.upgrade.subprocess.run") as run:
             run.return_value = MagicMock(returncode=0)
-            _run_post_upgrade_hook(repo)
+            _run_post_upgrade_hook(repo, "0.5.1")
 
         run.assert_called_once()
         argv = run.call_args[0][0]
         assert argv[0] == str(repo / ".venv" / "bin" / "python"), (
             "must use the pulled tree's interpreter, not the running one"
         )
-        assert argv[1:] == ["-c", _POST_UPGRADE_BOOTSTRAP, str(repo)]
+        # from_version must reach the child: version-aware work belongs in
+        # run_post_upgrade, and run_migrations cannot do it (frozen parent).
+        assert argv[1:] == ["-c", _POST_UPGRADE_BOOTSTRAP, str(repo), "0.5.1"]
         kwargs = run.call_args[1]
         # cwd so `import gateway` resolves from the source tree even if the
         # editable install's .pth is stale.
@@ -1073,7 +1075,7 @@ class TestPostUpgradeHook:
         (pkg / "upgrade.py").write_text("# a release predating run_post_upgrade\n")
 
         result = subprocess.run(
-            [sys.executable, "-c", _POST_UPGRADE_BOOTSTRAP, str(tmp_path)],
+            [sys.executable, "-c", _POST_UPGRADE_BOOTSTRAP, str(tmp_path), "0.5.1"],
             cwd=str(tmp_path),
             capture_output=True,
             text=True,
@@ -1083,6 +1085,32 @@ class TestPostUpgradeHook:
         assert result.returncode == 0, result.stderr
         assert "Traceback" not in result.stderr
         assert result.stdout == ""
+
+    def test_bootstrap_passes_repo_and_from_version_through(self, tmp_path: Path):
+        """The literal string we ship must deliver BOTH arguments.
+
+        The bootstrap is frozen in the release that runs it, so if it dropped
+        from_version a future version-aware step could never receive one, and the
+        breakage would only show up a release later.
+        """
+        pkg = tmp_path / "gateway"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text("")
+        (pkg / "upgrade.py").write_text(
+            "def run_post_upgrade(repo_path, from_version=''):\n"
+            "    print(f'GOT {repo_path} | {from_version}')\n"
+        )
+
+        result = subprocess.run(
+            [sys.executable, "-c", _POST_UPGRADE_BOOTSTRAP, str(tmp_path), "0.4.2"],
+            cwd=str(tmp_path),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == f"GOT {tmp_path} | 0.4.2"
 
     def test_missing_interpreter_warns_and_does_not_spawn(self, tmp_path: Path):
         repo = self._repo(tmp_path, with_python=False)
@@ -1117,6 +1145,15 @@ class TestPostUpgradeHook:
             run_post_upgrade(repo)
         ensure.assert_called_once_with(repo)
 
+    def test_run_post_upgrade_accepts_from_version(self, tmp_path: Path):
+        """Signature guard. The `python -c` line that calls this lives in the
+        PREVIOUS release, so parameters may gain defaults but must never be
+        removed or reordered — otherwise an in-the-wild bootstrap breaks."""
+        repo = tmp_path / "repo"
+        with patch("gateway.upgrade._ensure_local_bin_symlinks"):
+            run_post_upgrade(repo)  # positional-only, as an older bootstrap sends
+            run_post_upgrade(repo, "0.5.1")  # as the current bootstrap sends
+
     def test_do_git_upgrade_goes_through_the_hook(self, tmp_path: Path):
         """Regression guard for the whole mechanism.
 
@@ -1136,7 +1173,7 @@ class TestPostUpgradeHook:
              patch("gateway.upgrade._ensure_local_bin_symlinks") as ensure, \
              patch("gateway.upgrade._run_post_upgrade_hook") as hook:
             run.return_value = MagicMock(returncode=0)
-            do_git_upgrade(repo)
+            do_git_upgrade(repo, "0.5.1")
 
-        hook.assert_called_once_with(repo)
+        hook.assert_called_once_with(repo, "0.5.1")
         ensure.assert_not_called()

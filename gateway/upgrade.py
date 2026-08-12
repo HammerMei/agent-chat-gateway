@@ -302,7 +302,7 @@ def _ensure_local_bin_symlinks(repo_path: Path) -> None:
                     )
 
 
-def run_post_upgrade(repo_path: Path) -> None:
+def run_post_upgrade(repo_path: Path, from_version: str = "") -> None:
     """Steps that must run with the NEWLY PULLED release's own logic.
 
     This is the extension point for automatic upgrade steps. Anything added here
@@ -311,17 +311,30 @@ def run_post_upgrade(repo_path: Path) -> None:
     a fresh interpreter rather than called directly (see
     _run_post_upgrade_hook()).
 
+    `from_version` is the version recorded in install_meta.json BEFORE this
+    upgrade (or "" if unknown), so version-aware work belongs here too. It is
+    passed in rather than read from install_meta.json to keep the child from
+    depending on when the caller happens to rewrite that file.
+
+    Do NOT put version-aware work in run_migrations() instead: that runs in the
+    pre-pull process, so a migration added to it never executes for the upgrade
+    that delivers it, and by the next upgrade install_meta.json already records
+    the newer version — so its `from_version` condition can be missed
+    permanently. See run_migrations()'s own docstring.
+
     Contract for anything added here:
       * Idempotent. It may run again on the next upgrade, and re-running must be
-        harmless.
+        harmless. Do not rely on `from_version` alone to run something once —
+        an interrupted upgrade can repeat the same transition.
       * Non-fatal in effect. Prefer warning over raising; the caller treats a
         non-zero exit as a warning, but an exception here still means the
         remaining steps are skipped.
       * No network, and fast. The caller runs inside the window where the daemon
         is stopped, and enforces a timeout.
-      * Not version-aware. If a step must only run once, or only for upgrades
-        from a specific version, that belongs in run_migrations() — which
-        receives the old version — not here.
+
+    The signature is a frozen contract: the `python -c` line that calls it lives
+    in the PREVIOUS release, so parameters can be added with defaults but never
+    removed or reordered. Anything else the step needs, it should read from disk.
     """
     _ensure_local_bin_symlinks(repo_path)
 
@@ -338,11 +351,12 @@ def run_post_upgrade(repo_path: Path) -> None:
 # still surface, which is the part worth seeing.
 _POST_UPGRADE_BOOTSTRAP = (
     "import pathlib, sys, gateway.upgrade as u; "
-    "getattr(u, 'run_post_upgrade', lambda _p: None)(pathlib.Path(sys.argv[1]))"
+    "getattr(u, 'run_post_upgrade', lambda *_a: None)"
+    "(pathlib.Path(sys.argv[1]), sys.argv[2])"
 )
 
 
-def _run_post_upgrade_hook(repo_path: Path) -> None:
+def _run_post_upgrade_hook(repo_path: Path, from_version: str = "") -> None:
     """Run the pulled release's run_post_upgrade() in a FRESH interpreter.
 
     `gateway.upgrade` is imported into this process before `git pull`, so the
@@ -375,7 +389,7 @@ def _run_post_upgrade_hook(repo_path: Path) -> None:
 
     try:
         result = subprocess.run(
-            [str(python), "-c", _POST_UPGRADE_BOOTSTRAP, str(repo_path)],
+            [str(python), "-c", _POST_UPGRADE_BOOTSTRAP, str(repo_path), from_version],
             # cwd so `import gateway` still resolves from the source tree even if
             # the editable install's .pth is missing or stale.
             cwd=str(repo_path),
@@ -404,8 +418,12 @@ def _run_post_upgrade_hook(repo_path: Path) -> None:
         )
 
 
-def do_git_upgrade(repo_path: Path) -> None:
-    """git pull + uv sync + context file sync in the given repo directory."""
+def do_git_upgrade(repo_path: Path, from_version: str = "") -> None:
+    """git pull + uv sync + context file sync in the given repo directory.
+
+    `from_version` is only forwarded to the post-upgrade hook, so version-aware
+    steps run with the pulled release's logic instead of this process's.
+    """
     # Snapshot context file hashes BEFORE git pull so we can compare afterwards
     # to determine which files changed and whether users have local modifications.
     pre_pull_hashes = _snapshot_context_hashes(repo_path)
@@ -434,14 +452,29 @@ def do_git_upgrade(repo_path: Path) -> None:
 
     # After uv sync, so the freshly pulled release's dependencies and console
     # scripts are in place before its own post-upgrade steps run.
-    _run_post_upgrade_hook(repo_path)
+    _run_post_upgrade_hook(repo_path, from_version)
 
 
 def run_migrations(from_version: str) -> None:
-    """No-op skeleton for future config migrations."""
-    # Future: add per-version migration logic here.
-    # e.g. if from_version == "0.1.0": migrate_0_1_0_to_0_2_0()
-    pass
+    """No-op skeleton, kept for callers. DO NOT add migrations here.
+
+    This runs in the PRE-PULL process, so it has the same frozen-module problem
+    _run_post_upgrade_hook() exists to solve — but worse, because the failure is
+    silent and permanent rather than one-release-late:
+
+      * A migration added here in release N+1 does not run when a user upgrades
+        from N to N+1: this process is still executing N's copy of this function,
+        which does not contain it.
+      * run_upgrade() then records N+1 in install_meta.json regardless.
+      * On the next upgrade the migration finally exists in memory, but
+        `from_version` is now N+1, so a condition written for N never matches.
+        The migration is missed forever, with nothing reporting it.
+
+    Put version-aware upgrade work in run_post_upgrade(repo_path, from_version)
+    instead. It receives the same value and executes in the pulled release, which
+    is where the code that needs to run actually lives.
+    """
+    # Intentionally empty — see the docstring before adding anything.
 
 
 def _read_current_version(repo_path: Path) -> str:
@@ -554,7 +587,10 @@ def run_upgrade() -> None:
             console.print("  Daemon is running — stopping it before upgrade...")
             stop_daemon()
 
-        do_git_upgrade(repo_path)
+        # old_version is forwarded so the pulled release's run_post_upgrade() can
+        # do version-aware work. It must be read BEFORE install_meta.json is
+        # rewritten below, which it is (see old_version above).
+        do_git_upgrade(repo_path, old_version)
         run_migrations(old_version)
 
         # Update version in install_meta
