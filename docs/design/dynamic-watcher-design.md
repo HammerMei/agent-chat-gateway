@@ -141,7 +141,15 @@ persisted name** — a name freed by a rename can be reused by a different
 room, and resolving by name would bind an existing session to the wrong one.
 
 Derived names need no disambiguating flag: connector names are validated
-unique at config load, so `<connector>-<room>` is unique by construction.
+unique at config load, so `<connector>-<room>` is unique by construction —
+**provided a connector never spans two namespaces of room names.** On
+Mattermost a channel name is unique only within a team (§6.3), so this holds
+exactly because one connector serves one team; the room *name* is really
+`(team, channel)` even though only the channel part is used. The stable
+`room_id` is the actual identity and is globally unique regardless, so a
+name collision could only ever produce a confusing display, not a
+mis-binding — but the display name is also a filesystem path component
+(below), where a collision does real damage. Hence §4.5.
 
 **Name derivation changes to percent-encoding.** The current sanitizer
 collapses anything outside `[A-Za-z0-9._-]` to `-` and raises when the
@@ -376,12 +384,15 @@ Ordering, which is where the cost and the correctness both live:
    messages, own-message echoes, and the sender/allow-list/mention gate.
    These filters are synchronous; run them with no turn store so the
    precheck does not consume the agent-chain budget.
-2. **Membership gate**: on RocketChat, the `roomParticipant` flag the server
-   computes per message — required, since subscribe-all also delivers public
-   channels the account can merely read. On Mattermost, none is needed:
-   delivery *is* the membership signal, verified rather than assumed (§6.2).
-   Team scope is still worth checking, since one connector serves one team
-   while the socket spans the account's teams.
+2. **Membership and scope gate**: on RocketChat, the `roomParticipant` flag
+   the server computes per message — required, since subscribe-all also
+   delivers public channels the account can merely read. On Mattermost no
+   membership gate is needed: delivery *is* the membership signal, verified
+   rather than assumed (§6.2). Mattermost does need a **team** gate, since one
+   connector serves one team while the socket spans every team the account
+   belongs to — and that gate must pass rooms with **no** team (DMs) through
+   rather than rejecting them, or enabling it silently disables DM support
+   (§6.3).
 3. **Creation runs off the connector's handler path**, with the triggering
    message held in a **bounded** per-room buffer and replayed into the new
    processor. Creation is expensive — room resolution, session creation, a
@@ -426,6 +437,16 @@ agent offline each idle period and online on each burst.
 **DMs are opt-in per rule**, with 1:1 and group DMs distinguished. Group DMs
 have no stable display identity on either platform, so deriving a name from
 the sender is wrong — it would change with whoever speaks.
+
+Two things make DMs structurally unlike channels, both verified in §6.3:
+
+- **A DM has no team**, so it arrives with an empty team id and the
+  Mattermost team gate cannot classify it. The gate must treat "no team" as
+  "not a team channel, evaluate on its own merits" rather than as a
+  non-matching team — otherwise enabling the gate silently disables DMs.
+- **A DM reaches every socket the bot account has open**, so exactly one
+  connector per account may own DM handling (§4.5). Without that, a bot
+  serving two teams answers every DM twice.
 
 #### Membership events: register on join, do not start
 
@@ -688,6 +709,33 @@ pause, reset and shutdown. Fix with a reproducing test.
 Not by creation, not by wake, not by rule edits. Corollary: expiry must skip
 paused records.
 
+### 4.5 One bot account, one connector — and one owner for direct messages
+
+Under subscribe-all, a connector receives everything its bot account can see.
+Two connectors sharing an account therefore receive **identical** streams, and
+every room matching rules on both gets two watchers — two agents in one room,
+which is §4.1 again. The `(connector, room_id)` key cannot detect it: the
+records differ in their connector component, and each connector writes a
+separate state file.
+
+Config load must reject two connectors that share a `(server_url, bot
+identity)` pair, with one exception and one condition:
+
+- **Exception — Mattermost connectors scoped to different teams.** A channel
+  name is unique only within a team (§6.3), and one connector serves one team,
+  so team-scoped connectors both disambiguate their channels and keep their
+  derived names unique. The team gate on the routing path is what enforces
+  this, which is why it is an invariant and not an optimisation.
+- **Condition — at most one of them may handle direct messages.** A DM has no
+  team, so the team gate cannot separate it, and it is delivered to every
+  socket the account has open (§6.3). DM handling is opt-in per rule (§2.7), so
+  config load must additionally reject more than one DM-enabled rule per bot
+  account.
+
+The general rule matters beyond Mattermost: Rocket.Chat has no team scoping to
+fall back on, so two Rocket.Chat connectors sharing an account duplicate
+*everything*, not just DMs.
+
 ---
 
 ## 5. What changes
@@ -803,6 +851,10 @@ presence.
 - Pattern compilation, never-firing and shadowed-rule detection at load.
 - Warning when a rule's `session_expire_days` exceeds the session retention
   its agent's backend declares (§3).
+- **Rejection of two connectors sharing a `(server_url, bot identity)` pair**,
+  except Mattermost connectors scoped to different teams — and among those, at
+  most one DM-enabled rule per bot account (§4.5). Only connector *names* are
+  checked for uniqueness today.
 
 **Migration is manual.** Every removed or moved field is a hard load error
 naming its replacement — no silent acceptance, no auto-rewrite of the
@@ -907,7 +959,34 @@ arrived normally.
 | DM `channel_name` is the opaque `<userid>__<userid>` form, but `channel_display_name` is the counterpart handle | Mattermost supplies a usable DM display name where Rocket.Chat does not. |
 | Own messages and system messages (`system_join_channel`, `system_leave_channel`) are delivered | Both filters are required; the existing non-empty-`type` check covers the system case. |
 
-### 6.3 Still open
+### 6.3 Mattermost: channel names are per-team, DMs are per-account
+
+Two further observations, both with design consequences:
+
+**A channel name is unique only within a team.** Creating `sandbox` in a
+second team succeeded while `sandbox` already existed in the first, yielding
+two distinct room ids. So `channel name` is not a global identifier on
+Mattermost, and a derived display name of the form `<connector>-<channel>` is
+unique only because a connector is scoped to exactly one team. That scoping
+stops being an organisational preference and becomes load-bearing — see §4.5.
+
+**A direct message belongs to no team and reaches every socket the account
+has open.** Observed by opening two independent sessions for one bot account:
+a single DM was delivered to **both**, with `team_id` empty on each. A
+team-channel post was likewise delivered to both sockets, because the account
+belongs to that team.
+
+The channel case is handled by the team gate — a connector scoped to team B
+discards a team-A channel event. **The DM case is not**, and it cannot be,
+because there is no team to gate on. Two connectors serving two teams with the
+same bot account would therefore both create a watcher for the same DM. Since
+each connector keys its state by `(connector, room_id)` and writes its own
+state file, the two records differ in their connector component and the usual
+one-watcher-per-room dedup never sees the collision. The result is two agents
+answering one DM — an R4 violation invisible to every existing check. Closed
+by §4.5.
+
+### 6.4 Still open
 
 None of these gate the design.
 
