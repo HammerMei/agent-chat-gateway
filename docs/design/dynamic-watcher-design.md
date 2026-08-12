@@ -538,28 +538,73 @@ uses them: a DM is one human, a channel is a group, and they usually want a
 different agent, different history-handoff behaviour and different TTLs.
 That is a recommendation, not a constraint.
 
-**Per-DM include/exclude is deliberately not part of this design.** The
-obvious motivation — restricting which people may DM the agent — is
-authorization, and it already has a mechanism: each connector carries
-`owners:` and `guests:` lists, and every message is gated on the sender being
-in one of them. That gate applies uniformly to channels and DMs, at message
-level, on both platforms.
+#### The DM opt-in is all-or-nothing, and that is the intended scope
 
-Two further reasons not to duplicate it as room matching:
+`direct: true` admits **every** DM the connector can see. There is no
+per-counterpart selection in this design.
+
+What that does *not* mean is "anyone may now talk to the agent". Two existing
+connector-level mechanisms, easy to conflate, still apply:
+
+| Mechanism | Config | Decides |
+|---|---|---|
+| **Admission** | `filter_sender` (defaults to **true**) gating on `allow_senders`, which is `owners + guests` | whether a message is processed at all |
+| **Authorization** | `role_of(username)` → `owner` or `guest` | which tools the agent may run on that person's behalf |
+
+So under default config a DM from someone in neither list is rejected at
+message level with "sender not in allow-list", and never reaches routing.
+Note the second mechanism's fallback: `role_of()` returns `guest` for an
+unrecognised username rather than raising, which is what matters when
+`filter_sender` is turned **off** — then everyone is admitted and everyone
+unlisted is a guest.
+
+The practical consequence: DM enablement is all-or-nothing at the *room*
+level, while *who* may use it is already controlled per user by the sender
+allow-list. What cannot be expressed today is routing different counterparts
+to **different agents** — every admitted DM goes to the one rule that opted
+in.
+
+#### Future extension, if per-DM control is ever needed
+
+The chosen shape is deliberately forward-compatible. `direct: true` is
+equivalent to a wildcard, so granular control can be added later without
+breaking any existing config:
+
+```yaml
+# today — all DMs the connector can see, one agent
+rooms:
+  direct: true
+
+# possible later — equivalent to the above
+rooms:
+  direct: {include: ["*"]}
+
+# possible later — different agents per counterpart, two rules
+- name: dm-support
+  rooms: {direct: {include: ["@alice", "@bob"]}}
+  agent: claude-support
+- name: dm-everyone-else
+  rooms: {direct: {include: ["*"], exclude: ["@alice", "@bob"]}}
+  agent: claude-general
+```
+
+`direct: true` would then be parsed as sugar for `{include: ["*"]}`, so the
+boolean form stays valid indefinitely and no migration is needed.
+
+Two things that extension would have to solve, recorded now so the cost is
+known rather than discovered:
 
 - **The identity source is asymmetric.** Mattermost supplies the counterpart
   free in `channel_display_name`, but Rocket.Chat's per-message access object
-  omits the room name for DMs entirely (§6.1), so a pattern would need a REST
-  lookup or a derivation from the sender — and the sender of a DM is the
-  counterpart *or* the bot itself, so it does not reliably identify the room.
-- **Group DMs have no stable identity on either platform**, so a pattern
-  could not be relied on for them at all.
+  omits the room name for DMs entirely (§6.1), so matching a pattern there
+  needs a REST lookup or a derivation from the sender — and the sender of a DM
+  is the counterpart *or* the bot itself, so it does not reliably identify the
+  room.
+- **Group DMs have no stable identity on either platform**, so patterns could
+  not be relied on for `group_direct` even once they work for 1:1.
 
-The one thing the allow-list genuinely cannot express is routing different
-counterparts to *different agents* — alice's DMs to one agent, bob's to
-another. That is routing rather than authorization, but it is speculative, and
-adding it later is additive rather than breaking: `direct: true` becomes sugar
-for `direct: {include: ["*"]}`.
+Neither is a reason to avoid the extension; both are reasons it is more than a
+parsing change, which is why it is not being done speculatively.
 
 #### Membership events: register on join, do not start
 
@@ -958,6 +1003,9 @@ presence.
   `.rooms.exclude`, patterns, order-significant.
 - New `watchers[].rooms.direct` and `.group_direct` booleans, both defaulting
   to false — DMs cannot be matched by name pattern on either platform (§2.7).
+  Accept only the boolean form for now; the JSON schema should leave room for
+  the object form (`direct: {include: [...], exclude: [...]}`) so the later
+  extension in §2.7 is additive rather than a breaking schema change.
 - `session_idle_days` / `session_expire_days` move from the agent to the
   rule, so two rules sharing an agent can differ.
 - `session_id` rejected on a rule.
