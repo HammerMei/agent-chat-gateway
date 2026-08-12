@@ -126,20 +126,27 @@ uv sync --project ~/.agent-chat-gateway/repo
 
 ```bash
 mkdir -p ~/.local/bin
-ln -sf ~/.agent-chat-gateway/repo/.venv/bin/agent-chat-gateway ~/.local/bin/agent-chat-gateway
+
+# Unlink first, then link. `ln -sf` on its own is not enough: if the destination
+# is a symlink pointing at a directory, `ln -sf` follows it and creates the link
+# *inside* that directory, so the command path keeps resolving to a directory.
+rm -f ~/.local/bin/agent-chat-gateway
+ln -s ~/.agent-chat-gateway/repo/.venv/bin/agent-chat-gateway ~/.local/bin/agent-chat-gateway
 
 # acg-provision — creates RC/Mattermost accounts and channels. Optional; skip
-# this link if you don't need it.
-ln -sf ~/.agent-chat-gateway/repo/.venv/bin/acg-provision ~/.local/bin/acg-provision
+# these two lines if you don't need it.
+rm -f ~/.local/bin/acg-provision
+ln -s ~/.agent-chat-gateway/repo/.venv/bin/acg-provision ~/.local/bin/acg-provision
 ```
 
-> **Note:** `ln -sf` deletes whatever is already at those paths — including a
-> hand-written wrapper of your own. If you keep one there, link to a different
-> name instead, or check the path first with `ls -l ~/.local/bin/<name>`.
+> **Note:** those `rm -f` lines delete whatever is already at those paths —
+> including a hand-written wrapper of your own. Check first with
+> `ls -l ~/.local/bin/agent-chat-gateway ~/.local/bin/acg-provision`, and link to
+> a different name if you want to keep what is there.
 >
-> `install.sh` guards only the `acg-provision` link, where it refuses to replace
-> anything that is not a symlink. Its `agent-chat-gateway` link, and both of the
-> manual commands above, still overwrite unconditionally.
+> `install.sh` is stricter than these manual commands: for `acg-provision` it
+> refuses to replace anything that is not a symlink. Its `agent-chat-gateway`
+> link still overwrites unconditionally.
 
 Add `~/.local/bin` to your PATH if needed (add to `~/.zshrc` or `~/.bashrc`):
 ```bash
@@ -196,9 +203,11 @@ This stops the daemon, runs `git pull` + `uv sync`, and restarts the daemon auto
 # Stop the daemon
 agent-chat-gateway stop
 
-# Remove the symlinks
-rm -f ~/.local/bin/agent-chat-gateway
-rm -f ~/.local/bin/acg-provision
+# Remove the symlinks this install created. The -L test means a hand-written
+# wrapper of your own at either path is left alone: install.sh refuses to
+# replace one, so uninstalling should not delete one either.
+if [ -L ~/.local/bin/agent-chat-gateway ]; then rm -f ~/.local/bin/agent-chat-gateway; fi
+if [ -L ~/.local/bin/acg-provision ];     then rm -f ~/.local/bin/acg-provision;     fi
 
 # Remove all data — repo, config, logs (this deletes everything!)
 rm -rf ~/.agent-chat-gateway
