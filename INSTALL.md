@@ -22,7 +22,7 @@ curl -fsSL https://raw.githubusercontent.com/HammerMei/agent-chat-gateway/main/i
 This will:
 1. Clone the repo to `~/agent-chat-gateway`
 2. Install dependencies with `uv sync`
-3. Create a symlink at `~/.local/bin/agent-chat-gateway`
+3. Create symlinks at `~/.local/bin/agent-chat-gateway` and `~/.local/bin/acg-provision`
 4. Launch the interactive setup wizard
 
 ### Option B: AI-guided install with Claude Code
@@ -122,12 +122,52 @@ git clone https://github.com/HammerMei/agent-chat-gateway.git ~/.agent-chat-gate
 uv sync --project ~/.agent-chat-gateway/repo
 ```
 
-### 3. Create the symlink
+### 3. Create the symlinks
 
 ```bash
 mkdir -p ~/.local/bin
-ln -sf ~/.agent-chat-gateway/repo/.venv/bin/agent-chat-gateway ~/.local/bin/agent-chat-gateway
+repo=~/.agent-chat-gateway/repo
+
+# Deliberately refuses rather than replaces: it never moves or deletes anything, so
+# there is no state in which your command could go missing. If a path is occupied,
+# it shows you what is there and leaves it alone — decide yourself, then re-run.
+for cmd in agent-chat-gateway acg-provision; do
+  link=~/.local/bin/"$cmd"
+  if [ -e "$link" ] || [ -L "$link" ]; then
+    echo "already exists, leaving it alone:"
+    ls -ld "$link"
+    continue
+  fi
+  ln -s "$repo/.venv/bin/$cmd" "$link"
+done
 ```
+
+`acg-provision` creates Rocket.Chat / Mattermost users and channels; the loop links
+it alongside the gateway.
+
+> **Occupied path?** Look at what `ls -ld` printed. A stale symlink can just be
+> deleted (`rm ~/.local/bin/<name>`) — the file it pointed at is untouched. Something
+> you wrote should be moved somewhere you choose, not deleted. Then re-run the block.
+>
+> `install.sh` does replace an occupied path — it moves a real file to
+> `<name>.<timestamp>.bak` and reports where it went. This block does not try to
+> match that: a snippet pasted into a shell cannot be made reliably transactional,
+> and refusing is both shorter and impossible to get wrong.
+>
+> **If a link ends up missing or wrong** — a full disk, a read-only home, an
+> interrupted run — nothing here needs unpicking by hand. Re-run `bash install.sh`
+> from the repo, or `agent-chat-gateway upgrade` on an existing install: both are
+> idempotent and will put the links right. `ls -l ~/.local/bin/*.bak` shows anything
+> that was moved aside.
+
+> **Both commands are part of the installation.** `acg-provision` is not an
+> optional extra: `install.sh` links it alongside the gateway, and
+> `agent-chat-gateway upgrade` keeps both links current. Leaving it out here does
+> not stick — the next upgrade creates it — so link both, or link neither and use
+> `<repo>/.venv/bin/<command>` directly.
+>
+> Re-running the block is safe and does nothing: a path it already linked is
+> occupied, so the second run reports it and moves on.
 
 Add `~/.local/bin` to your PATH if needed (add to `~/.zshrc` or `~/.bashrc`):
 ```bash
@@ -174,7 +214,43 @@ the user guide for the full field reference and a worked example (including the
 agent-chat-gateway upgrade
 ```
 
-This stops the daemon, runs `git pull` + `uv sync`, and restarts the daemon automatically.
+This stops the daemon, runs `git pull` + `uv sync`, runs the pulled release's
+post-upgrade steps, and restarts the daemon automatically.
+
+> **One-time note for installs that predate `acg-provision`:** the post-upgrade
+> step that puts new commands on your PATH is itself delivered by an upgrade, so
+> the first upgrade that lands it cannot run it. If `acg-provision` is not found
+> after upgrading, link it once:
+>
+> ```bash
+> # Locate the managed virtualenv. Two things this deliberately avoids:
+> #   * assuming ~/.agent-chat-gateway/repo — running `./install.sh` from a local
+> #     checkout uses that checkout as the repo and records it in install_meta.json;
+> #   * needing a system `python3` — install.sh may have installed Python with
+> #     `uv python install`, which provides `python3.12` and not `python3`.
+> # Both cases describe installs that predate acg-provision, i.e. this note's readers.
+> bin=$(dirname "$(readlink ~/.local/bin/agent-chat-gateway 2>/dev/null)" 2>/dev/null)
+> if [ ! -x "$bin/acg-provision" ]; then
+>   # The entrypoint is not a managed symlink (a wrapper of your own, say), so use
+>   # the path the installer recorded.
+>   repo=$(sed -n 's/.*"repo_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' ~/.agent-chat-gateway/install_meta.json)
+>   bin=$repo/.venv/bin
+> fi
+> echo "$bin"          # sanity-check this before continuing
+>
+> link=~/.local/bin/acg-provision
+> # Refuses rather than replaces, like the manual setup block above: nothing is moved
+> # or deleted, so nothing can go missing.
+> if [ -e "$link" ] || [ -L "$link" ]; then
+>   echo "already exists, leaving it alone:"; ls -ld "$link"
+> else
+>   ln -s "$bin/acg-provision" "$link"
+> fi
+> ```
+>
+> Or run it without linking anything at all — same `$bin` as above:
+> `"$bin/python" -m gateway.admin --help`.
+> Later upgrades handle new commands on their own.
 
 ---
 
@@ -184,8 +260,15 @@ This stops the daemon, runs `git pull` + `uv sync`, and restarts the daemon auto
 # Stop the daemon
 agent-chat-gateway stop
 
-# Remove the symlink
-rm -f ~/.local/bin/agent-chat-gateway
+# Remove the symlinks this install created. The -L test leaves a hand-written
+# wrapper of your own at either path alone — uninstalling should remove what was
+# installed, not something you wrote.
+if [ -L ~/.local/bin/agent-chat-gateway ]; then rm -f ~/.local/bin/agent-chat-gateway; fi
+if [ -L ~/.local/bin/acg-provision ];     then rm -f ~/.local/bin/acg-provision;     fi
+
+# If the installer ever moved something of yours aside, it is still here. Check
+# before deleting — this is the only copy, and nothing else cleans it up.
+ls -l ~/.local/bin/*.bak 2>/dev/null
 
 # Remove all data — repo, config, logs (this deletes everything!)
 rm -rf ~/.agent-chat-gateway

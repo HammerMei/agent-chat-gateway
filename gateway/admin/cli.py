@@ -1,11 +1,11 @@
 """Standalone argparse entrypoint for the RC/MM admin CLI.
 
 Usage:
-    msg-admin [--config PATH] [--log-file PATH] <profile> create-user <username> <email> <password> [--full-name NAME]
-    msg-admin [--config PATH] [--log-file PATH] <profile> create-channel <name> [--private]
-    msg-admin [--config PATH] [--log-file PATH] <profile> add-to-channel <username> <channel>
-    msg-admin [--config PATH] [--log-file PATH] <profile> delete-user <username>
-    msg-admin [--config PATH] [--log-file PATH] <profile> delete-channel <channel>
+    acg-provision [--config PATH] [--log-file PATH] <profile> create-user <username> <email> <password> [--full-name NAME]
+    acg-provision [--config PATH] [--log-file PATH] <profile> create-channel <name> [--private]
+    acg-provision [--config PATH] [--log-file PATH] <profile> add-to-channel <username> <channel>
+    acg-provision [--config PATH] [--log-file PATH] <profile> delete-user <username>
+    acg-provision [--config PATH] [--log-file PATH] <profile> delete-channel <channel>
 
 Not wired into gateway/cli.py — see gateway/admin/__init__.py for why.
 
@@ -21,7 +21,7 @@ API failures (httpx.HTTPStatusError, e.g. a 400 from creating a user whose
 email already exists) print a short, platform-specific message extracted
 from the response body (see gateway/admin/_errors.py) rather than httpx's
 own generic "Client error '400 Bad Request' for url '...'" — the full raw
-response body is preserved in --log-file (default: ./msg-admin.log) for
+response body is preserved in --log-file (default: ./acg-provision.log) for
 troubleshooting.
 """
 
@@ -40,7 +40,7 @@ from gateway.admin.base import ChannelAlreadyExistsError, UserAlreadyExistsError
 from gateway.admin.config import AdminConfigError, get_profile, load_profiles
 from gateway.admin.factory import admin_factory
 
-DEFAULT_LOG_FILE = "msg-admin.log"
+DEFAULT_LOG_FILE = "acg-provision.log"
 
 _error_logger = logging.getLogger("agent-chat-gateway.admin.errors")
 
@@ -145,7 +145,7 @@ def _configure_error_log(path: str) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="msg-admin",
+        prog="acg-provision",
         description="Standalone admin CLI for Rocket.Chat / Mattermost user & channel provisioning.",
     )
     parser.add_argument(
@@ -328,7 +328,7 @@ def main() -> None:
         #
         # Re-signalling (rather than exiting with a chosen code) keeps the
         # process dying *by* SIGINT, which is what a shell needs to abort a
-        # seed loop like `for f in ...; do msg-admin ...; done`. Returning a
+        # seed loop like `for f in ...; do acg-provision ...; done`. Returning a
         # plain exit code here would silently make such loops run to
         # completion after a Ctrl-C.
         print("Error: interrupted", file=sys.stderr)

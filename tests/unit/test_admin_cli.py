@@ -91,7 +91,7 @@ class TestBuildParser(unittest.TestCase):
 
     def test_log_file_defaults_to_msg_admin_log(self):
         args = _args(["mm-lab", "delete-user", "alice"])
-        self.assertEqual(args.log_file, "msg-admin.log")
+        self.assertEqual(args.log_file, "acg-provision.log")
 
     def test_log_file_flag_overrides_default(self):
         args = _args(["--log-file", "/tmp/custom.log", "mm-lab", "delete-user", "alice"])
@@ -101,7 +101,7 @@ class TestBuildParser(unittest.TestCase):
 class TestRunDispatch(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         # _run() always calls _configure_error_log(args.log_file), which
-        # defaults to a real, cwd-relative "msg-admin.log" — none of these
+        # defaults to a real, cwd-relative "acg-provision.log" — none of these
         # tests care about that concern (it's covered by TestConfigureErrorLog
         # and TestHttpStatusErrorHandling below), so stub it out to avoid
         # every test in this class writing a stray file to the repo.
@@ -683,7 +683,7 @@ class TestReaderlessFifoLogFile(unittest.IsolatedAsyncioTestCase):
 class TestMain(unittest.TestCase):
     def test_main_exits_with_run_result_code(self):
         with patch("gateway.admin.cli._run", new=AsyncMock(return_value=7)), \
-             patch("sys.argv", ["msg-admin", "p", "delete-user", "alice"]), \
+             patch("sys.argv", ["acg-provision", "p", "delete-user", "alice"]), \
              self.assertRaises(SystemExit) as ctx:
             main()
         self.assertEqual(ctx.exception.code, 7)
@@ -696,7 +696,7 @@ class TestMain(unittest.TestCase):
         killed = []
         stderr = io.StringIO()
         with patch("gateway.admin.cli._run", new=AsyncMock(side_effect=KeyboardInterrupt())), \
-             patch("sys.argv", ["msg-admin", "p", "delete-user", "alice"]), \
+             patch("sys.argv", ["acg-provision", "p", "delete-user", "alice"]), \
              patch("gateway.admin.cli.signal.signal") as mock_signal, \
              patch("gateway.admin.cli.os.kill", side_effect=lambda *a: killed.append(a)), \
              contextlib.redirect_stderr(stderr):

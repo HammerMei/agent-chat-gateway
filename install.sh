@@ -112,15 +112,150 @@ uv sync --project "$REPO_DIR"
 
 # ---------------------------------------------------------------------------
 # Symlink into ~/.local/bin
+#
+# link_console_script <target> <link>
+#   Points <link> at <target>, never destroying anything the user put there.
+#
+#   already exactly this link -> nothing to do. Compares the readlink TEXT, so a
+#                                relative or differently-spelled link to the same
+#                                file counts as "not ours" and gets rewritten.
+#                                (upgrade.py compares resolve() instead and would
+#                                leave it alone — same end state, one extra
+#                                rewrite here.)
+#   any other symlink        -> removed and its old target reported. Nothing is
+#                               preserved by keeping it: the file it pointed at is
+#                               untouched, and a .bak symlink would accumulate on
+#                               every re-run.
+#   a real file or directory -> moved aside to <link>.<YYYYmmddHHMMSS>.bak — or
+#                               <link>.<ts>-N.bak if that name is taken — and
+#                               reported, THEN replaced. Note the timestamp comes
+#                               BEFORE .bak: a cleanup glob is `*.bak`, never
+#                               `*.bak.*`.
+#
+#   Backing up rather than refusing is deliberate. Refusing sounds safer but
+#   leaves a worse state: install_meta.json is written unconditionally further
+#   down, so `agent-chat-gateway upgrade` would manage $REPO_DIR while PATH ran
+#   whatever occupied the destination — a repo whose code never executes.
+#   Backing up keeps the managed command working AND loses nothing.
+#
+#   `mv` on a symlink moves the link itself, it does not follow it, so the file
+#   a foreign symlink pointed at is never touched.
+#
+#   `rm -f` + `ln -s` rather than `ln -sf`: when the destination is a symlink to
+#   a DIRECTORY, `ln -sf` dereferences it and creates the link *inside* that
+#   directory, then reports success while the path still resolves to a
+#   directory. Reproduced on both BSD/macOS and GNU ln. `-n`/`-h` also fix it
+#   but are not in POSIX, so the explicit unlink is the portable form.
+#
+#   Returns 0 if <link> now points at <target>, 1 otherwise. Every step is
+#   tested inside an `if` because of `set -e`: run bare, a failing mv or ln
+#   would abort the installer outright, and only the CALLER knows whether that
+#   is warranted (fatal for the entrypoint, survivable for acg-provision).
 # ---------------------------------------------------------------------------
+link_console_script() {
+  local target="$1" link="$2" bak="" n ts oldtarget=""
+
+  if [ -L "$link" ] && [ "$(readlink "$link")" = "$target" ]; then
+    success "Symlink already current: $link → $target"
+    return 0
+  fi
+
+  if [ -L "$link" ]; then
+    # A symlink, but not ours. Nothing is preserved by backing it up: the file
+    # it points at is not touched, and a stale .bak symlink is pure litter. So
+    # replace it — but SAY what it pointed at, because the actual complaint
+    # about the old behaviour was that the change was silent, not that it
+    # happened. Covers a dangling link too (readlink still reports the target).
+    oldtarget="$(readlink "$link")"
+    warn "$link pointed at $oldtarget — repointing it"
+    if ! rm -f "$link"; then
+      warn "Could not remove the existing symlink at $link"
+      return 1
+    fi
+  elif [ -e "$link" ]; then
+    # A real file or directory — something the user made by hand. This is what
+    # gets preserved, because it cannot be reconstructed from a printed path.
+    # Timestamped so repeated installs accumulate distinct backups instead of
+    # one clobbering the next. The collision loop only matters for two runs
+    # inside the same second, but `mv` overwrites silently, and losing a
+    # previous backup is exactly the data loss this branch exists to prevent.
+    ts="$(date +%Y%m%d%H%M%S)"
+    bak="$link.$ts.bak"
+    n=1
+    while [ -e "$bak" ] || [ -L "$bak" ]; do
+      bak="$link.$ts-$n.bak"
+      n=$((n + 1))
+    done
+    if mv "$link" "$bak"; then
+      warn "$link was not a symlink — backed it up before replacing:"
+      warn "  $link → $bak"
+    else
+      warn "Could not back up $link — leaving it untouched."
+      return 1
+    fi
+  fi
+
+  if rm -f "$link" && ln -s "$target" "$link"; then
+    success "Symlink created: $link → $target"
+    return 0
+  fi
+
+  # Roll back. Getting here means the destination was cleared but the new link
+  # could not be made (no inodes, a filesystem without symlinks, a race), so
+  # without this the user is left with LESS than they started with — their
+  # working command moved into a .bak, and for the entrypoint the caller then
+  # aborts the install outright. A failure must never cost them the command.
+  warn "Could not create $link"
+  if [ -n "$bak" ]; then
+    if mv "$bak" "$link"; then
+      warn "  Restored what was there before: $link"
+    else
+      warn "  Could not restore it — your original is still at $bak"
+    fi
+  elif [ -n "$oldtarget" ]; then
+    if ln -s "$oldtarget" "$link"; then
+      warn "  Restored the previous symlink: $link → $oldtarget"
+    else
+      warn "  Could not restore the previous symlink to $oldtarget"
+    fi
+  fi
+  return 1
+}
+
 VENV_BIN="$REPO_DIR/.venv/bin/agent-chat-gateway"
 if [ ! -f "$VENV_BIN" ]; then
   error "Expected binary not found: $VENV_BIN"
 fi
 
 mkdir -p "$HOME/.local/bin"
-ln -sf "$VENV_BIN" "$HOME/.local/bin/agent-chat-gateway"
-success "Symlink created: ~/.local/bin/agent-chat-gateway → $VENV_BIN"
+# Fatal for the entrypoint: an install whose primary command is not on the PATH
+# it just configured has not succeeded, and install_meta.json written below would
+# describe a repo the user cannot invoke.
+if ! link_console_script "$VENV_BIN" "$HOME/.local/bin/agent-chat-gateway"; then
+  error "Could not install ~/.local/bin/agent-chat-gateway"
+fi
+
+# acg-provision (RC/MM account & channel provisioning). A first-class command, not
+# an optional extra: it is linked here and kept current by `agent-chat-gateway
+# upgrade`, and INSTALL.md documents both links together.
+#
+# Deliberately a WARNING rather than error() if absent, which is about INSTALL
+# CRITICALITY and not about the command being dispensable: the gateway daemon can
+# start and serve without it, so a missing or unlinkable provisioning CLI must not
+# throw away an install that otherwise succeeded. A missing ENTRYPOINT is fatal
+# because nothing works without that one.
+PROVISION_BIN="$REPO_DIR/.venv/bin/acg-provision"
+PROVISION_LINK="$HOME/.local/bin/acg-provision"
+PROVISION_LINKED=false
+if [ ! -f "$PROVISION_BIN" ]; then
+  warn "acg-provision not found at $PROVISION_BIN — skipping its symlink."
+elif link_console_script "$PROVISION_BIN" "$PROVISION_LINK"; then
+  PROVISION_LINKED=true
+else
+  # NOT fatal, unlike the entrypoint above — see the criticality note at the top
+  # of this block. The command still exists; only its PATH entry is missing.
+  warn "  Run it directly at $PROVISION_BIN, or link it manually later."
+fi
 
 # ---------------------------------------------------------------------------
 # PATH setup — add ~/.local/bin if missing
@@ -208,6 +343,13 @@ success "Installation complete!"
 printf '\n'
 printf '  Repository cloned to:    ~/.agent-chat-gateway/repo\n'
 printf '  Executable installed at: ~/.local/bin/agent-chat-gateway\n'
+if [ "$PROVISION_LINKED" = true ]; then
+  printf '  Provisioning CLI:        ~/.local/bin/acg-provision\n'
+elif [ -f "$PROVISION_BIN" ]; then
+  # Built but not linked (destination occupied) — point at the real binary so
+  # the command is still discoverable.
+  printf '  Provisioning CLI:        %s\n' "$PROVISION_BIN"
+fi
 printf '\n'
 printf '  To use agent-chat-gateway in your current shell, run:\n'
 printf '    source %s\n' "$SHELL_RC"
