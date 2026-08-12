@@ -87,13 +87,38 @@ Consequences that must be implemented rather than assumed:
   present to fix it.
 - **Config order is load-bearing.** Any tool that rewrites `config.yaml`
   must preserve watcher entry order; reordering silently re-routes rooms.
-- A rule that can never fire must be reported at load, in three forms: a
-  pattern matching nothing; a rule **fully shadowed** by an earlier rule whose
-  pattern subsumes it; and a DM opt-in shadowed by an earlier rule that
-  already claimed the direct or group-direct class (§2.7). All are invisible
-  at runtime, because first-match means a shadowed rule never participates in
-  any decision. Where shadowing cannot be decided statically, expose a
-  per-rule match count so `list` can show a rule that has matched zero rooms.
+**The pattern language is globs, not regexes**, deliberately constrained so the
+static checks below are decidable:
+
+| | |
+|---|---|
+| syntax | `*` (any run, including empty), `?` (one character), `[…]` character class. Nothing else — no alternation, no quantifiers, no anchors |
+| matched against | the room's **full** platform name, implicitly anchored at both ends |
+| case | sensitive; both platforms' slugs are lowercase by construction |
+| unicode | compared NFC-normalised, so a decomposed pattern matches a composed name |
+| exclude | evaluated after include, within the same rule; an excluded room does **not** fall through to a later rule — the rule claimed it and then declined it |
+
+That last row is a real decision rather than an implementation detail: fall-
+through would make `exclude` a routing operator, and two rules could then
+silently contend for the same room.
+
+Given globs, the load-time checks split into three tiers by what is actually
+decidable, rather than one promise that cannot be kept:
+
+- **Hard errors**: a syntactically invalid pattern; an empty include list on a
+  rule that is not DM-only; a duplicate rule name.
+- **Exact warnings**, decidable for globs: one rule fully shadowed by an
+  earlier one (glob subsumption is decidable for this syntax), and a DM opt-in
+  shadowed by an earlier rule that already claimed that class (§2.7).
+- **Observational only**: a rule that has matched zero rooms. This is *not*
+  reported as a dead rule, because it is indistinguishable from a correct rule
+  whose rooms have simply been quiet — `list` shows the count and lets the
+  operator judge.
+
+"A pattern matching nothing" is deliberately absent from the error tier: with
+no room inventory at load time, it is not knowable, and claiming otherwise
+would either produce false positives or require the room discovery this design
+does without.
 - `session_id` is **rejected on a rule** (§2.4).
 
 ### 2.2 Routing
@@ -130,18 +155,48 @@ therefore:
    message buffered, and classify there.
 3. Match rules against the now-known kind, then create or drop.
 
-Two consequences to implement deliberately:
+**Cache the kind per room id.** A room's kind does not change, with one
+exception: a 1:1 DM that gains members becomes a group DM, which must
+invalidate rather than be served stale (§6.4).
 
-- **Cache the kind per room id.** A room's kind does not change, with one
-  exception: a 1:1 DM that gains members becomes a group DM, which must
-  invalidate rather than be served stale (§6.4).
-- **A drop decided *after* classification still has to account for the
-  message.** The trigger's dedup id was registered optimistically before the
-  handler; a post-classification drop is a *deliberate* outcome, so the id
-  stays registered and the watermark advances — unlike a creation *failure*,
-  where both must be rolled back so the message can be redelivered (§2.7).
-  Conflating the two either re-delivers dropped messages forever or silently
-  loses failed ones.
+#### One dedup transaction, for every outcome
+
+Because classification and creation can now both happen off the handler path,
+message accounting needs a single state machine rather than a rule per branch.
+Today's shape — register the id optimistically, roll back on a `False` return
+but not on an exception — has no answer for "buffered, still classifying".
+
+**Reserve → resolve → commit or abort:**
+
+| Step | Effect |
+|---|---|
+| **Reserve** the message id, before any async work | A concurrent duplicate for the same room is recognised and discarded. The reservation is in-memory and does **not** advance the durable watermark. |
+| **Resolve**: classify, match, create, enqueue | May await. May be interrupted. |
+| **Commit** — on successful enqueue *or* a deliberate drop | Id becomes durably seen; watermark advances. A deliberate drop is a completed decision, so re-delivering it later would be wrong. |
+| **Abort** — on any retryable failure | Reservation released, watermark unchanged, so redelivery or reconnect replay can retry. Creation failures are retryable; a rule miss is not. |
+
+Terminal outcomes each need a defined effect, and each needs a test:
+
+- rule matched, watcher created, message enqueued → **commit**
+- no rule matched (including a DM whose kind opted out) → **commit**; the
+  decision is final
+- classification lookup failed (network) → **abort**; the kind is unknown, so
+  the routing decision was never actually made
+- creation raised → **abort**; the message must survive, and a brand-new room
+  has an empty watermark so reconnect replay would otherwise skip it
+- pre-creation buffer full → **abort**, with a room-visible "starting up"
+  notice; silently committing would drop a message the user watched arrive
+- duplicate arrives while the first copy is reserved → discard the duplicate,
+  do not disturb the reservation
+- process exits mid-resolve → nothing was committed, so the watermark still
+  points before the message and replay redelivers it
+
+The distinction that makes this coherent: **a reservation prevents duplicate
+*work*; only a commit prevents duplicate *delivery*.** The watermark is the
+durable record and moves once, at commit.
+
+This supersedes the "defer bookkeeping until accepted" phrasing in §2.7, which
+described only the success path.
 
 An unmatched message is dropped deliberately. The connector knows nothing
 about watcher lifecycle, which is both the correct separation and the reason
@@ -168,7 +223,7 @@ Three distinct keys, deliberately:
 |---|---|
 | Watcher instance, sticky binding, per-room lock | `(connector, room_id)` |
 | Persisted state record | `(connector, room_id)` |
-| Filesystem paths (system prompt, attachment workspace) | `room_id` |
+| Filesystem paths (system prompt, attachment workspace) | `hash(connector, room_id)` — never the raw id |
 | Display and CLI | `<connector>-<room_label>` — cosmetic, never load-bearing |
 
 The `room_name` on the state record is the platform's own name, refreshed from
@@ -197,10 +252,25 @@ load-bearing and every change to it destructive: the old file and symlink are
 orphaned, and a collision repoints one room's attachment path at another's
 files.
 
-**Both move to `room_id`.** The display name then becomes purely cosmetic:
-free to change, free to be ugly, free to be absent. This costs a little
-debugging convenience — a directory listing no longer reads as room names —
-which `list` offsets by showing both.
+**Both move to a derived key, not to the raw `room_id`.** The display name
+then becomes purely cosmetic: free to change, free to be ugly, free to be
+absent. This costs a little debugging convenience — a directory listing no
+longer reads as room names — which `list` offsets by showing both.
+
+"Derived" rather than raw matters, because `room_id` is **external connector
+data** and nothing constrains it to a single safe path segment. Today's two
+platforms emit opaque alphanumeric ids, but a future connector — or a corrupted
+state file — could supply `/`, `..`, a leading dash, or something absurdly long,
+any of which escapes or collides inside the prompt and attachment roots. So the
+path component is a fixed-width encoding of `(connector, room_id)` — a hash,
+which is uniform, injective in practice, and safe by construction — with the
+raw id kept only in state and in `list` output.
+
+Two further requirements that follow from treating these as untrusted paths:
+**validate containment** after constructing any such path (resolve it and
+assert it is still under the intended root), and **define symlink handling
+before deletion** during expiry, so reclaiming an attachment workspace cannot
+follow a link out of the tree.
 
 The reason this is worth doing rather than tolerating is that *three separate
 things* all want to change the display name, and only this decoupling makes
@@ -417,10 +487,15 @@ A watcher can therefore exist as a record before it has ever run — which is
 what makes a newly-joined room listable and pausable before its first
 message.
 
-**Paused is a real state and is never auto-reclaimed** — not idled, not
+**Paused is a real state and is never reclaimed by a timer** — not idled, not
 expired. Once config no longer names rooms, pause is the only durable way to
-mute one, so expiring a paused record would erase an explicit instruction.
-For the same reason, `reset` must not silently clear `paused`.
+mute one, so letting an idle clock expire a paused record would erase an
+explicit instruction. For the same reason, `reset` must not silently clear
+`paused`.
+
+The one thing that *does* reclaim a paused record is the platform reporting the
+bot has been removed from the room — an authoritative fact rather than an
+inference from inactivity (§2.7, §4.4).
 
 **A room the gateway has never seen cannot be paused.** Pause acts on a
 record, and an unobserved room has none — no id, no kind, nothing to key on.
@@ -570,11 +645,12 @@ Ordering, which is where the cost and the correctness both live:
    and post a "server busy" notice into the room from a completely idle
    gateway. The preflight should also distinguish *empty* from *full*, so a
    routing miss is never reported as backpressure.
-6. **Defer the trigger's dedup bookkeeping until it is accepted.** Message
-   ids are currently registered before the handler and rolled back only on
-   a negative return, never on an exception. Since a brand-new room has an
-   empty watermark, reconnect replay skips it too — so a creation that
-   throws loses the message with nothing visible in the room.
+6. **Run the trigger through the reserve/commit transaction in §2.2.** The
+   creation path is the abort-heavy branch of it: ids are currently registered
+   before the handler and rolled back only on a negative return, never on an
+   exception, and since a brand-new room has an empty watermark, reconnect
+   replay skips it too — so a creation that throws loses the message with
+   nothing visible in the room.
 7. **Cap concurrent creations.** Queue depth bounds messages per room;
    nothing bounds rooms being created at once. Over-cap triggers get an
    honest "starting up" response.
@@ -802,11 +878,33 @@ Three properties this must have:
 - **The rule is snapshotted at join time**, so a rule edited between join and
   first message does not apply to that room (§2.4, sticky binding). This is
   consistent but worth knowing.
-- **Removal is symmetric.** A membership-remove event should expire the
-  record: there is no reason to keep a session for a room the bot can no
-  longer read, and RocketChat's server tears down its own subscription
-  anyway. Expiry rather than idle, since the room is gone rather than quiet —
-  subject to the paused-record rule (§4.4).
+- **Removal is symmetric, and it overrides pause.** A membership-remove event
+  reclaims the record: there is no reason to keep a session for a room the bot
+  can no longer read, and RocketChat's server tears down its own subscription
+  anyway.
+
+  This is deliberately **not** "subject to the paused-record rule" (§4.4),
+  because that rule and this event answer different questions. Pause protects a
+  record from *inactivity-driven* reclamation — the operator's "stay quiet here"
+  must not be misread as "nobody needs this". Removal is not an inference from
+  inactivity; it is the platform stating authoritatively that the room is gone.
+  Honouring pause here would keep a session, a system-prompt file, an
+  attachment directory and any pending jobs alive forever for a room that can
+  never receive another message, and would leave `resume` able to "revive" a
+  room the bot has no access to — which contradicts R3 outright.
+
+  So: **revocation force-reclaims even a paused record**, logged as an audit
+  event naming the room and noting that a pause was overridden, since that is
+  the one case where an operator's explicit setting is discarded and it should
+  never be silent. Pending jobs for the room are cancelled with a stated
+  reason rather than left pointing at nothing.
+
+  Two consequences worth stating. Reclamation must be idempotent, because
+  Mattermost's socket has no replay and a removal event can be *missed* —
+  discovered later as a REST failure, which must reach the same end state
+  rather than a different one. And re-adding the bot afterwards is simply a
+  fresh start: a new record, a new session, no continuity with what was
+  reclaimed. That is the correct outcome, not a regression.
 
 Connectors that declare no unsolicited inbound have no membership stream and
 are unaffected.
@@ -920,6 +1018,14 @@ This matters more once membership events register joined rooms as idle
 by rooms nobody has ever spoken in, burying the handful being worked on.
 Idle is one flag away when the question is "what does the bot know about"
 rather than "what is it doing".
+
+**A scheduled job keys on `(connector, room_id)`, not on the label.** Jobs
+persist a watcher *name* today, which under this design is cosmetic and free to
+change (§2.3) — so a rename would orphan every job on that room, a label
+collision would make lookup ambiguous, and the expiry-exemption check below
+would consult the wrong room. The label is kept alongside as display metadata
+only. Existing jobs are rewritten during the pre-upgrade migration, which is
+the only moment the `name → room_id` mapping still exists (§5.3).
 
 **Rooms with pending scheduled jobs are exempt from expiry, not from
 idling.** Idling such a room is harmless: the job fires, `get` recreates the
@@ -1039,10 +1145,34 @@ room's fetched history and every prior turn's server-injected
 map, which is single-valued, so permission prompts for one room's tool calls
 would surface in another. **A reused session is a cross-room data leak.**
 
-The enforcement point does not exist today: processor registration appends
-to a per-room list and dispatch fans out to every entry, so a duplicate
-degrades silently into two agents answering every message. Registration must
-become reject-or-replace, with a test asserting it.
+**Two enforcement points are needed, in opposite directions.**
+
+*One room, one processor.* Registration appends to a per-room list today and
+dispatch fans out to every entry, so a duplicate degrades silently into two
+agents answering every message. Registration becomes reject-or-replace, with a
+test asserting it.
+
+*One session, one room.* That is the reverse direction, and reject-or-replace
+does not cover it: it prevents two processors for one key, not one session bound
+to two keys. Per-room locks do not help either — they serialise access to a
+*room*, while the hazard is two different rooms resuming the same
+`session_id`. And the session-to-room map is single-valued, so the second
+binding silently overwrites the first instead of being detected.
+
+Reachable how? A hand-edited or corrupted state file, a migration defect
+(§5.3), or a legacy record carrying a pinned `session_id`. Rare, but the
+consequence is the cross-room leak this invariant is *about*, so it needs a
+positive check rather than an argument that it cannot happen:
+
+- Maintain a reverse index keyed by `(agent identity, session_id)` →
+  `WatcherKey`, and **fail closed** if a second key attempts to bind an
+  already-bound session.
+- Validate it across all persisted records at load, so a bad state file is
+  caught before anything starts rather than on the unlucky second start.
+- Check it atomically during provisioning, before either processor becomes
+  visible to the dispatcher.
+- Test: two records carrying the same `session_id`; assert the second watcher
+  never starts and never receives a message.
 
 ### 4.2 State persistence must merge
 
@@ -1064,10 +1194,19 @@ depends on, so the persisted watermark silently stays stale. §2.2 removes
 this from the idle path by never unsubscribing there, but it remains live on
 pause, reset and shutdown. Fix with a reproducing test.
 
-### 4.4 An explicit pause is never overridden
+### 4.4 An explicit pause is never overridden by inference
 
-Not by creation, not by wake, not by rule edits. Corollary: expiry must skip
-paused records.
+Not by creation, not by wake, not by rule edits, and not by idle or expiry
+timers. The common thread is that all of those are the gateway *inferring* that
+a room no longer needs attention, and a pause is the operator having already
+answered that question.
+
+**The single exception is authoritative revocation**: the platform reporting
+that the bot was removed from the room. That is not an inference — it is a fact
+about access, and honouring a pause against it would preserve a session for a
+room that can never receive another message (§2.7). Revocation force-reclaims,
+and logs that it overrode a pause, because that is the one path where an
+explicit operator setting is discarded and it must never be silent.
 
 ### 4.5 One bot account, one connector — and one owner for direct messages
 
@@ -1078,8 +1217,26 @@ which is §4.1 again. The `(connector, room_id)` key cannot detect it: the
 records differ in their connector component, and each connector writes a
 separate state file.
 
-Config load must reject two connectors that share a `(server_url, bot
-identity)` pair, with one exception and one condition:
+**Enforcement is at runtime, after authentication — config alone cannot do
+it.** Mattermost supports token-only auth, where `username` is empty, and two
+*different* tokens can authenticate the *same* bot account. Comparing config
+fields therefore misses precisely the case this invariant exists to catch, and
+comparing token strings misses it too.
+
+So each connector, once authenticated, reports a canonical
+`(server origin, platform user id)` — the id from the platform's own
+whoami-style call, not from config. A global registry rejects a duplicate
+**before any subscription opens or any watcher is restored**, and fails closed:
+a connector that cannot establish its own identity does not start, rather than
+starting unvalidated.
+
+Config load keeps a cheap early version of the same check for the case where a
+stable identity *is* declared (username/password auth), because failing at load
+is friendlier than failing at startup — but it is an optimisation, not the
+enforcement point.
+
+The rule, applied at that registry, is: reject two connectors sharing a
+`(server origin, platform user id)` pair, with one exception and one condition:
 
 - **Exception — Mattermost connectors scoped to different teams.** The socket
   spans every team the account belongs to, and two teams may hold channels of
@@ -1217,46 +1374,90 @@ addition here carries one.
 serialization test must cover nesting and the empty/absent cases, not just
 presence.
 
-#### Migrating existing state files
+#### Migrating existing state and jobs
 
 Re-keying from `watcher_name` to `(connector, room_id)` makes this a new
-on-disk format, so first boot after the upgrade must handle the old one.
-Unlike the config migration (§5.4), this **is** automatic — an operator cannot
-reasonably hand-edit runtime state, and the alternative is silently losing
-every live session.
+on-disk format. It cannot be migrated at first boot, and the reason is worth
+being precise about because the naive version silently loses every session.
 
-It is mechanical, because the information needed is already present: legacy
-records carry `room_id`, and the connector comes from the file name
-(`state.<connector>.json`). So the new key is derivable with no network calls
-and no guessing. Fields the old format lacks take conservative defaults:
+**A legacy state record does not contain enough to recreate a watcher.** It
+carries `watcher_name`, `session_id`, `room_id`, `room_type`,
+`context_injected`, `paused` and `last_processed_ts` — and no agent, no
+context files, no history-handoff settings. The agent binding lives only in
+`config.yaml`. But config migration is manual and the old concrete-watcher
+shape is a hard load error (§5.4), so by the time the new version boots
+successfully the operator has already replaced those entries with rules. At
+that moment both sources needed to reconstruct the record are gone: state never
+had the agent, and config no longer has it.
 
-| New field | Value for a migrated record |
+Adopting migrated rooms into whichever rule now matches them is not an
+acceptable fallback — it is exactly the silent re-binding sticky binding exists
+to prevent (§2.4), and it can hand a room's existing session to a different
+agent.
+
+**So migration is a discrete pre-upgrade step, run while both sources still
+exist:**
+
+```
+1. install the new version                     (do not start it)
+2. acg migrate-state                           # reads OLD config + OLD state
+3. edit config.yaml: concrete watchers → rules  (§5.4)
+4. start
+```
+
+`acg migrate-state` ships with the new version but reads the *old* config
+shape deliberately — it is the one component permitted to, and it never starts
+a gateway. For each legacy record it writes a fully materialized new-format
+record: the key from `(connector-from-filename, room_id)`, and `config`
+populated from the matching `config.yaml` watcher entry, so the agent and every
+watcher setting are preserved exactly.
+
+Three guards make the ordering enforceable rather than merely documented:
+
+- **`migrate-state` refuses** if `config.yaml` no longer contains concrete
+  watcher entries, naming step 3 as having been run too early. It also writes a
+  backup of both inputs first, so a mis-ordered upgrade is recoverable.
+- **The gateway refuses to start** if it finds legacy-format state that has not
+  been migrated, rather than starting with an empty registry. Fail closed: a
+  silent empty start would abandon every session and re-create every room from
+  scratch, which looks like success.
+- **`migrate-state` is idempotent** — re-running it after a successful
+  migration is a no-op, so a half-finished upgrade can simply be repeated.
+
+Field defaults for a migrated record:
+
+| New field | Value |
 |---|---|
-| `room_kind` | inferred from the existing `room_type`, which already distinguishes channel / group / dm; a legacy `dm` becomes `dm` (never `group_dm`, since the old model could not name one) |
-| `participants` | empty, and refilled on the next inbound message |
+| `config` | from the matching `config.yaml` entry — the whole point of the pre-upgrade ordering |
+| `rule_name`, `rule` | empty: the record predates rules and has no originating rule. §2.4's drift check must treat this as *adopted, unknown provenance* and leave it alone rather than reporting spurious drift; it acquires a rule the first time it is legitimately re-materialized |
+| `room_kind` | from the existing `room_type`, which already distinguishes channel / group / dm. A legacy `dm` becomes `dm`, never `group_dm` — the old model could not name a group DM |
+| `participants` | empty, refilled on the next inbound message |
 | `created_at` | the migration timestamp, flagged as unknown rather than fabricated |
-| `last_activity_at` | seeded from `last_processed_ts` — the closest available truth, and it errs toward "recently active", which delays reclamation rather than hastening it |
-| `dropped_at` | empty, so every migrated record is treated as active and gets recreated at boot, matching today's behaviour |
-| `config`, `rule`, `rule_name` | empty. A migrated watcher has no originating rule, so it recreates from its own config until it next materializes — see below |
+| `last_activity_at` | seeded from `last_processed_ts` — the closest available truth, and it errs toward "recently active", delaying reclamation rather than hastening it |
+| `dropped_at` | empty, so every migrated record is treated as active and recreated at boot, matching today's behaviour |
+
+**Scheduled jobs migrate in the same pass, and for the same reason.** A job
+currently persists `watcher` (the name) plus `connector` — not `room_id` — so
+jobs are keyed on what is now a *cosmetic* label (§2.3). Left alone they would
+orphan on the first channel rename, resolve ambiguously after a label
+collision, and make the expiry-exemption check consult the wrong room. Jobs
+therefore persist the full `(connector, room_id)` key, keeping the label only
+as display metadata, and `migrate-state` rewrites them while the
+`watcher_name → room_id` mapping still exists. Nothing else can reconstruct
+that mapping afterwards, which is why this cannot be a separate later change.
 
 **One legacy shape cannot be migrated: a record with an empty `room_id`.**
 That is produced by pausing a name that had never started, which fabricates a
-record with no session and no room. It has no room identity to re-key on.
+record with no session and no room, so there is no room identity to re-key on.
+Those are dropped with a warning naming each one. Nothing of value is lost —
+such a record holds neither a session nor a watermark, only an intent — and the
+same decision answers whether pausing an unseen room is expressible at all: it
+is not (§2.5), and the intent belongs in a rule's `exclude:` list.
 
-Its fate: **dropped, with a warning naming each one**, and the same decision
-answers the open question of whether pausing an unseen room is expressible at
-all — it is not. Nothing of value is lost (such a record holds neither a
-session nor a watermark, only the intent), and the intent has a better home
-under this design: a room the gateway should never engage with belongs in a
-rule's `exclude:` list, which is declarative, survives restarts, and does not
-require the room to have been observed first. Pre-emptive `pause` on an
-unseen room is therefore rejected with a message pointing at `exclude:`.
-
-**Migrated records have no `rule`, which the drift check must tolerate.** A
-record whose `rule_name` is empty predates rules entirely, so §2.4's
-comparison has no baseline to diff against. Treat it as "adopted, unknown
-provenance" and leave it alone rather than reporting spurious drift; it
-acquires a rule the first time it is legitimately re-materialized.
+The upgrade test that matters: a real old-format state file plus the matching
+old config, migrated, then a first boot asserted to resume **the same session
+with the same agent and the same watcher settings**, with its scheduled jobs
+still pointing at the right room.
 
 ### 5.4 Config schema
 
@@ -1275,10 +1476,11 @@ acquires a rule the first time it is legitimately re-materialized.
 - Pattern compilation, never-firing and shadowed-rule detection at load.
 - Warning when a rule's `session_expire_days` exceeds the session retention
   its agent's backend declares (§3).
-- **Rejection of two connectors sharing a `(server_url, bot identity)` pair**,
-  except Mattermost connectors scoped to different teams — and among those, at
-  most one DM-enabled rule per bot account (§4.5). Only connector *names* are
-  checked for uniqueness today.
+- **Rejection of two connectors sharing a bot account** — but only as an early
+  best-effort here, for connectors whose config declares a username. The
+  enforcement point is the post-authentication registry in §4.5, because
+  token-only auth leaves no identity in config to compare. Only connector
+  *names* are checked for uniqueness today.
 
 **Migration is manual.** Every removed or moved field is a hard load error
 naming its replacement — no silent acceptance, no auto-rewrite of the
@@ -1318,29 +1520,39 @@ what makes §5.1's corruption reachable.
    existing state files (§5.3) — including a test that a legacy record with a
    populated `room_id` re-keys losslessly and one that an empty-`room_id`
    record is dropped with a warning rather than crashing the load.
-4. **Re-key the system-prompt file and attachment workspace on `room_id`**
+4. **Re-key the system-prompt file and attachment workspace on a hash of `(connector, room_id)`**
    (§2.3). Independent of everything else, and it must land before labels can
    change freely — which the group-DM and rename cases both require. Existing
    installs have paths under the old names, so this needs a one-time move or a
    documented "these become orphaned, delete them" note in the migration guide.
-5. Processor registration becomes reject-or-replace; capacity preflight
+5. **`acg migrate-state`** (§5.3): the pre-upgrade command, covering both
+   watcher records and scheduled jobs, plus the start-up refusal on
+   unmigrated legacy state. Must exist before anyone can run the new version
+   against an existing install, so it lands early rather than with the guide.
+6. **The post-authentication identity registry** (§4.5): each connector
+   reports `(server origin, platform user id)` after login, duplicates are
+   rejected fail-closed before any subscription opens. Independent of the rest
+   and cheap; doing it early means every later step runs under the invariant.
+7. Processor registration becomes reject-or-replace, **and the reverse
+   `(agent, session_id)` uniqueness index** (§4.1) — validated across
+   persisted records at load and atomically at provisioning; capacity preflight
    distinguishes empty from full.
-6. The watcher manager: resolution as a pure function of (rule, room),
+8. The watcher manager: resolution as a pure function of (rule, room),
    materialization, the per-room lock, transparent recreation in `get`, the
    four-state lifecycle.
-7. Routing: connector subscribes to everything, router walks rules,
+9. Routing: connector subscribes to everything, router walks rules,
    unmatched dropped — with the pre-routing cost audit. Mattermost first,
    then RocketChat.
-8. The creation path in §2.7's ordering.
-9. `list` with its state filter, in the control server and the CLI — before
+10. The creation path in §2.7's ordering.
+11. `list` with its state filter, in the control server and the CLI — before
    the idle tick, so there is a way to observe what idling does.
-10. The idle tick, for connectors declaring unsolicited inbound.
-11. Expiry, with full reclamation.
-12. Membership-event registration (join → idle record, leave → expire). Last
+12. The idle tick, for connectors declaring unsolicited inbound.
+13. Expiry, with full reclamation.
+14. Membership-event registration (join → idle record, leave → expire). Last
     of the runtime work because it is an optimisation over the
     message-triggered path, which must be correct on its own first.
-13. Config tooling.
-14. The migration guide, shipped with the release that lands the schema
+15. Config tooling.
+16. The migration guide, shipped with the release that lands the schema
     change.
 
 ---
