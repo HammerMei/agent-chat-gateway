@@ -412,11 +412,30 @@ paths that consume `room` must therefore not treat it as a lookup key. Room
 resolution already goes by `room_id` (§2.3), so the only requirement is that
 nothing regresses to resolving by this field.
 
-**`session_id` must not be settable on a rule.** Session provisioning gives
-a config-pinned session id absolute priority and returns it unconditionally,
-so a rule carrying one would hand *every room it matches the same session* —
-violating R4 at config level rather than through a race. Reject at config
-load; strip at materialization as a second line of defence.
+#### `WatcherConfig.session_id` is removed
+
+A rule cannot carry a pinned session id: provisioning gives one absolute
+priority and returns it unconditionally, so a rule holding one would hand
+*every room it matches the same session* — violating R4 at config level rather
+than through a race.
+
+But once every watcher is rule-derived, nothing can populate the field at all,
+so it is **removed entirely** rather than merely rejected. That deletes three
+things: the field itself, the priority-1 branch in `_provision_session`, and
+`reset_watcher`'s pinned-session handling. Leaving them would mean carrying
+branches that nothing can reach and a future reader cannot tell are dead.
+
+`session_id` in `config.yaml` becomes a hard load error naming the replacement.
+**The replacement is a handoff, not a pin**: have the agent summarise its
+session to a file and read that file back in the next one. That is strictly
+more robust than pinning — it survives the backend expiring the session, which
+pinning never did (§3, backend retention).
+
+Note precisely which id disappears. `WatcherConfig.session_id` — the
+*config-pinned* one — is gone. `WatcherState.session_id` — the id ACG assigns
+at provisioning and persists so a room can resume — is untouched and remains
+central to the whole idle/expiry model (§2.5). Conflating the two would be an
+easy and damaging mistake.
 
 What sticky binding buys:
 
@@ -1171,10 +1190,12 @@ to two keys. Per-room locks do not help either — they serialise access to a
 `session_id`. And the session-to-room map is single-valued, so the second
 binding silently overwrites the first instead of being detected.
 
-Reachable how? A hand-edited or corrupted state file, a migration defect
-(§5.3), or a legacy record carrying a pinned `session_id`. Rare, but the
-consequence is the cross-room leak this invariant is *about*, so it needs a
-positive check rather than an argument that it cannot happen:
+Reachable how? A hand-edited or corrupted state file, or a defect in the
+creation path itself. Not from legacy data — the clean break means no
+pre-upgrade record survives to carry a stale binding in (§5.3). Rare either
+way, but the consequence is the cross-room leak this invariant exists to
+prevent, so it needs a positive check rather than an argument that it cannot
+happen:
 
 - Maintain a reverse index keyed by `(agent identity, session_id)` →
   `WatcherKey`, and **fail closed** if a second key attempts to bind an
@@ -1272,22 +1293,52 @@ fall back on, so two Rocket.Chat connectors sharing an account duplicate
 
 ### 5.1 Prerequisites
 
-These block the design and are independently shippable:
+Independently shippable, and each is a separate change. The first two are
+**live bugs today**, not merely groundwork.
 
-1. **State save becomes a merge** (§4.2), with a test asserting an idle
-   room's record survives a save driven by an unrelated command.
-2. **Watermark capture before unsubscribe** (§4.3), with a reproducing test.
-3. **Config-tool room merging must exclude roomless rules.** The merge
-   target search matches on a hardcoded field allowlist that is blind to
-   rule-ness, so adding a room would rewrite a rule in place into a
-   single-room entry. The result is valid YAML, so validation passes and
-   the write commits — silently dropping every other room's watcher at the
-   next start. This must land before a roomless rule is expressible.
-4. **Ten hardcoded watcher-field lists collapse into one declarative
-   table** — template forbidden keys, two shared-field sets, known fields,
-   template fields, template defaults, shared field keys, required field
-   keys, the split loop, and the JSON schema — plus the user guide. None
-   are auto-derived, and the design adds fields to all of them.
+1. **State save becomes a merge** (§4.2). Live: `sync_watchers` seeds the
+   in-memory map only from configured watchers before saving unconditionally,
+   so a watcher skipped because its agent was unavailable — a fail-closed
+   guard, not a removal — has its session id, watermark and paused flag wiped.
+   The same happens if its start raised. Only the "removed from config" case is
+   intended, and that one is already warned about elsewhere. Fix by merging on
+   save and making intentional pruning explicit, which turns silent loss into a
+   record that outlives its config. Ships with a test that a record absent from
+   config survives a save.
+2. **Watermark capture before unsubscribe** (§4.3). Live, and silent: teardown
+   unsubscribes before reading the watermark, and unsubscribing at the last
+   watcher pops the very dict the read depends on, so the read returns nothing
+   and the persisted value stays stale — messages are redelivered after a
+   restart. Doubled, because the save path pulls from the same dict. Needs a
+   reproducing test with a connector that models the pop; the existing tests
+   cannot catch it, since they mock the getter or use a connector whose base
+   implementation always returns nothing.
+3. **Config-tool room merging must exclude roomless entries.** The merge-target
+   search is blind to whether an entry has a room, so adding a room rewrites a
+   roomless one in place. The write is not merely permitted but *actively*
+   permitted: the save gate blocks only newly-introduced errors, and merging a
+   room into a roomless entry **removes** its pre-existing error, so the
+   difference is empty. Compounding it, such an entry is invisible in the TUI
+   while remaining a live merge target. Must land before a roomless rule is
+   expressible.
+4. **De-duplicate the watcher field lists.** Not a collapse into one table —
+   most of these lists are genuinely different concerns and merging them would
+   be a regression. Only two are real duplication:
+   - the template-forbidden-keys set exists in **four byte-identical copies**
+     across the loader and the config tool, with a comment claiming tests keep
+     them in sync and no such test existing;
+   - the watcher template *field specs* and their *defaults* are one table
+     split in two, with identical key sets.
+
+   Left deliberately alone: the two shared-field sets differ by one key that a
+   screen re-adds, and read from raw versus merged sources; known-fields
+   (display) and template-fields (edit) differ in nesting granularity; and the
+   shared-field and required-field sets are disjoint concerns.
+
+   The genuine gap — the JSON schema is a superset that the config tool's lists
+   do not track, and the user guide's field table is already stale — is fixed
+   with the config-tool work (§5.6), not here. The schema is about to change
+   shape, so a sync test written now would encode the wrong target.
 
 ### 5.2 Connector interface
 
@@ -1414,6 +1465,7 @@ one upgrade.
 3. stop the gateway
 4. rewrite config.yaml: concrete watchers → rules (§5.4)
       – a paused watcher becomes an `exclude:` entry, not a rule
+      – drop any `session_id:`; it no longer exists (§2.4)
 5. remove the old state files:  ~/.agent-chat-gateway/state.*.json
 6. start, then re-create the scheduled jobs from step 2
 ```
@@ -1426,6 +1478,7 @@ one upgrade.
 | `last_processed_ts` watermarks | A one-off boundary effect per room: a message either side of the cut may be reprocessed or skipped once |
 | Paused state | **The dangerous one.** A paused room becomes active unless its pause is re-expressed. Step 4 turns it into `exclude:`, which is the better home anyway (§2.5) — declarative, and effective before the first message rather than after |
 | Scheduled jobs | Jobs key on a watcher name that no longer exists; they are re-created in step 6 |
+| Pinned `session_id` | The field is gone (§2.4). A config that sets it fails to load, naming the replacement: have the agent summarise its session to a file and read that back in the new one — which also survives the backend expiring a session, as pinning never did |
 
 **One guard is worth the ten lines**: if the gateway finds legacy-format state
 files it **refuses to start**, naming them and pointing at the guide. This is a
@@ -1451,7 +1504,9 @@ expressible in the new model (§2.5).
   extension in §2.7 is additive rather than a breaking schema change.
 - `session_idle_days` / `session_expire_days` move from the agent to the
   rule, so two rules sharing an agent can differ.
-- `session_id` rejected on a rule.
+- `session_id` removed entirely — a hard load error naming the handoff
+  replacement (§2.4). Also drops the multi-room and duplicate-id cross-entry
+  checks that only existed to police it.
 - Literal-only `rooms.include` enforced for connectors declaring no
   unsolicited inbound.
 - Pattern compilation, never-firing and shadowed-rule detection at load.
