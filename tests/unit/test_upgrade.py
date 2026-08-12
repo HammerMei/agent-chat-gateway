@@ -776,6 +776,34 @@ class TestEnsureLocalBinSymlinks:
 
         assert (local_bin / "acg-provision").resolve() == (venv_bin / "acg-provision").resolve()
 
+    def test_repairs_a_dangling_installer_symlink(self, tmp_path: Path):
+        """A repo/venv move leaves the fingerprint symlink dangling — still repair it.
+
+        Path.exists() FOLLOWS symlinks, so a symlink to a target that has gone
+        away reads as False. Gating the whole function on exists() alone made it
+        bail out in precisely the situation it exists to fix: the primary command
+        stays dangling AND no other script gets linked, even though the upgrade
+        against the corrected repo path succeeded.
+        """
+        home, local_bin, repo, venv_bin = self._setup(
+            tmp_path, installed=False, scripts=("agent-chat-gateway", "acg-provision")
+        )
+        # The old repo path was never created => this symlink dangles.
+        gone = tmp_path / "old-repo" / ".venv" / "bin" / "agent-chat-gateway"
+        (local_bin / "agent-chat-gateway").symlink_to(gone)
+        assert (local_bin / "agent-chat-gateway").is_symlink()
+        assert not (local_bin / "agent-chat-gateway").exists()  # the trap
+
+        with patch("gateway.upgrade.Path.home", return_value=home):
+            _ensure_local_bin_symlinks(repo)
+
+        # Both are now linked into the current venv, and both actually resolve.
+        for name in ("agent-chat-gateway", "acg-provision"):
+            link = local_bin / name
+            assert link.is_symlink(), f"{name} was not linked"
+            assert link.exists(), f"{name} still dangles"
+            assert link.resolve() == (venv_bin / name).resolve()
+
     def test_is_idempotent(self, tmp_path: Path):
         home, local_bin, repo, venv_bin = self._setup(
             tmp_path, installed=True, scripts=("agent-chat-gateway", "acg-provision")

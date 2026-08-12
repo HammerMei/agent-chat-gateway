@@ -143,7 +143,16 @@ elif [ -e "$PROVISION_LINK" ] && [ ! -L "$PROVISION_LINK" ]; then
   warn "$PROVISION_LINK already exists and is not a symlink — leaving it untouched."
   warn "  Remove it and re-run this installer if you want the managed symlink."
 else
-  ln -sf "$PROVISION_BIN" "$PROVISION_LINK"
+  # `rm -f` + `ln -s` rather than `ln -sf`: when the destination is a symlink to
+  # a DIRECTORY, `ln -sf` dereferences it and creates the link *inside* that
+  # directory, leaving the original symlink in place — and then reports success
+  # while the path still resolves to a directory. Reproduced on both BSD/macOS
+  # and GNU ln. `-n`/`-h` also fixes it but is not in POSIX, so the explicit
+  # unlink is the portable form. Safe here because the branch above already
+  # refused every non-symlink, so this can only remove an absent path or a
+  # symlink — never a real file or directory.
+  rm -f "$PROVISION_LINK"
+  ln -s "$PROVISION_BIN" "$PROVISION_LINK"
   PROVISION_LINKED=true
   success "Symlink created: ~/.local/bin/acg-provision → $PROVISION_BIN"
 fi

@@ -159,18 +159,28 @@ def _ensure_local_bin_symlinks(repo_path: Path) -> None:
     this flow would end up with .venv/bin/acg-provision and no ~/.local/bin
     entry, leaving the command missing until they manually re-ran the installer.
 
-    Gated on ~/.local/bin/agent-chat-gateway already existing, because that
+    Gated on ~/.local/bin/agent-chat-gateway already being present, because that
     symlink is install.sh's own fingerprint: its presence means this machine
     opted into that layout. Without the guard, a pipx / distro-package /
     manual-venv install would suddenly acquire symlinks it never asked for.
     (Only the `git` upgrade method reaches this — brew and pip manage their own
-    shims.)
+    shims.) "Present" deliberately includes a *dangling* symlink; see the gate.
+
+    Stale symlinks are re-pointed, which covers the repo-moved case — including
+    when the move left the old symlink dangling rather than merely stale.
 
     Never fatal. A symlink that cannot be written does not invalidate the
     upgrade that just succeeded, so failures warn and continue.
     """
     local_bin = Path.home() / ".local" / "bin"
-    if not (local_bin / "agent-chat-gateway").exists():
+    fingerprint = local_bin / "agent-chat-gateway"
+    # `or is_symlink()` is load-bearing: exists() FOLLOWS symlinks, so an
+    # installer symlink whose target has gone away (the repo or venv was moved)
+    # reads as False. Gating on exists() alone bailed out in exactly the case
+    # this function is supposed to repair, leaving the primary command dangling
+    # AND every other script unlinked. A dangling symlink is still install.sh's
+    # fingerprint — arguably more so, since only a managed install creates it.
+    if not (fingerprint.exists() or fingerprint.is_symlink()):
         return
 
     for script in _LOCAL_BIN_SCRIPTS:
