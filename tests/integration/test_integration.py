@@ -902,6 +902,126 @@ class TestMultiWatcherDispatch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(connector._rest.post_message.await_count, 2)
 
 
+class RoomStateTrackingConnector(ScriptConnector):
+    """A ScriptConnector that models the real per-room watermark storage.
+
+    The stock ScriptConnector inherits the base no-op ``get_last_processed_ts``,
+    which returns None unconditionally — so no test built on it can distinguish
+    "the watermark was read too late" from "there was never a watermark".  That
+    is why the ordering bug in ``_stop_processor`` went unnoticed.
+
+    This mirrors what Rocket.Chat and Mattermost actually do: the watermark
+    lives *inside* the per-room entry, and unsubscribing the last watcher pops
+    that entry — after which the getter can only return None.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.rooms: dict[str, str] = {}          # room_id -> last_processed_ts
+        self.read_order: list[tuple[str, str | None]] = []
+
+    def seed(self, room_id: str, ts: str) -> None:
+        self.rooms[room_id] = ts
+
+    async def unsubscribe_room(self, room_id: str, watcher_id: str = "") -> None:
+        await super().unsubscribe_room(room_id, watcher_id)
+        self.rooms.pop(room_id, None)           # the pop that broke the read
+
+    def get_last_processed_ts(self, room_id: str) -> str | None:
+        ts = self.rooms.get(room_id)
+        self.read_order.append((room_id, ts))
+        return ts
+
+    def update_last_processed_ts(self, room_id: str, ts: str) -> None:
+        if room_id in self.rooms:
+            self.rooms[room_id] = ts
+
+
+class TestWatermarkCapturedBeforeUnsubscribe(IsolatedTestCase):
+    """The watermark must be read while the connector still holds the room.
+
+    Unsubscribing the last watcher pops the connector's per-room entry, and the
+    watermark lives in it.  Reading afterwards returned None *silently* — dict
+    lookups do not raise — so the stale value was persisted and every message
+    since it was redelivered on the next start.
+    """
+
+    async def test_pause_persists_the_live_watermark(self):
+        connector = RoomStateTrackingConnector()
+        agent = MockAgentBackend()
+        manager = make_manager(connector, agent, watcher_configs=[make_watcher(name="w1")])
+        await manager.run_once()
+
+        room_id = manager._lifecycle._states["w1"].room_id
+        connector.seed(room_id, "2025-06-06T06:06:06Z")
+
+        await manager.dispatch_command({"cmd": "pause", "watcher_name": "w1"})
+
+        self.assertEqual(
+            manager._lifecycle._states["w1"].last_processed_ts,
+            "2025-06-06T06:06:06Z",
+            "watermark was read after the unsubscribe popped the room entry",
+        )
+        await manager.shutdown()
+
+    async def test_the_watermark_is_read_before_the_room_is_popped(self):
+        """Pins the ordering directly, not just its outcome."""
+        connector = RoomStateTrackingConnector()
+        agent = MockAgentBackend()
+        manager = make_manager(connector, agent, watcher_configs=[make_watcher(name="w1")])
+        await manager.run_once()
+
+        room_id = manager._lifecycle._states["w1"].room_id
+        connector.seed(room_id, "2025-06-06T06:06:06Z")
+        # Startup's own save already polled this room (before the seed), so
+        # observe only the reads the pause itself performs.
+        connector.read_order.clear()
+
+        await manager.dispatch_command({"cmd": "pause", "watcher_name": "w1"})
+
+        reads = [ts for (rid, ts) in connector.read_order if rid == room_id]
+        self.assertTrue(reads, "the watermark was never read at all")
+        self.assertEqual(
+            reads[0], "2025-06-06T06:06:06Z",
+            "the first read returned None — it happened after the unsubscribe",
+        )
+        await manager.shutdown()
+
+    async def test_reset_also_persists_the_live_watermark(self):
+        connector = RoomStateTrackingConnector()
+        agent = MockAgentBackend()
+        manager = make_manager(connector, agent, watcher_configs=[make_watcher(name="w1")])
+        await manager.run_once()
+
+        room_id = manager._lifecycle._states["w1"].room_id
+        connector.seed(room_id, "2025-07-07T07:07:07Z")
+
+        await manager.dispatch_command({"cmd": "reset", "watcher_name": "w1"})
+
+        # reset restarts the watcher, so the surviving record is the new one —
+        # it must have inherited the watermark rather than resetting to empty.
+        self.assertEqual(
+            manager._lifecycle._states["w1"].last_processed_ts,
+            "2025-07-07T07:07:07Z",
+        )
+        await manager.shutdown()
+
+    async def test_a_stale_held_value_is_not_overwritten_when_there_is_no_live_one(self):
+        """No live watermark must leave the known value alone, not blank it."""
+        connector = RoomStateTrackingConnector()
+        agent = MockAgentBackend()
+        manager = make_manager(connector, agent, watcher_configs=[make_watcher(name="w1")])
+        await manager.run_once()
+
+        manager._lifecycle._states["w1"].last_processed_ts = "known"
+        # connector.rooms deliberately left empty — nothing live to report.
+
+        await manager.dispatch_command({"cmd": "pause", "watcher_name": "w1"})
+
+        self.assertEqual(manager._lifecycle._states["w1"].last_processed_ts, "known")
+        await manager.shutdown()
+
+
 class TestWatermarkPersistence(IsolatedTestCase):
     """Issue 2: Watermark (last_processed_ts) is pulled from connector on save
     and restored into connector on startup."""

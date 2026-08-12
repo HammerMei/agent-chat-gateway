@@ -179,7 +179,7 @@ class WatcherLifecycle:
                 logger.info("Watcher '%s' is already paused", name)
                 return
             try:
-                await self._stop_processor(name, save=False)
+                await self._stop_processor(name)
             except Exception as e:
                 # Best-effort teardown: _stop_processor already removed the processor
                 # from _processors even when it raises (e.g. network error during
@@ -235,7 +235,7 @@ class WatcherLifecycle:
         self._ensure_agent_available(wc)
         async with self._get_watcher_lock(name):
             try:
-                await self._stop_processor(name, save=False)
+                await self._stop_processor(name)
             except Exception as e:
                 # Best-effort teardown: log the error but continue with the restart.
                 # A failure here (e.g. network error while sending DDP unsub) should
@@ -332,7 +332,7 @@ class WatcherLifecycle:
         """
         names = list(self._processors)
         results = await asyncio.gather(
-            *[self._stop_processor(name, save=False) for name in names],
+            *[self._stop_processor(name) for name in names],
             return_exceptions=True,
         )
         for name, result in zip(names, results):
@@ -636,16 +636,40 @@ class WatcherLifecycle:
             )
             return False
 
-    async def _stop_processor(self, name: str, save: bool) -> None:
+    async def _stop_processor(self, name: str) -> None:
         """Stop a processor and clean up all mappings.
 
         Order is critical for correctness:
           1. Remove from dispatcher — new inbound messages stop being routed here.
-          2. Unsubscribe from connector — DDP stops delivering messages to this room.
-          3. Stop the processor — drains any already-queued messages, then shuts down.
-          4. Capture live watermark — after the queue is drained so the timestamp
-             reflects the last message the processor *actually* handled.
+          2. Capture live watermark — MUST precede the unsubscribe, see below.
+          3. Unsubscribe from connector — transport stops delivering for this room.
+          4. Stop the processor — drains any already-queued messages, then shuts down.
           5. Clean session maps.
+
+        Why capture comes before unsubscribe: unsubscribing the *last* watcher on
+        a room pops the connector's per-room state (``self._rooms`` on
+        Rocket.Chat, ``self._channels`` on Mattermost), and the watermark lives
+        in exactly that entry.  Reading it afterwards returned None — silently,
+        because ``dict.get`` does not raise, so ``if live_ts:`` simply never
+        fired and the stale value was persisted.  On restart every message
+        between the stale watermark and the true one was redelivered.
+
+        This capture used to sit after the drain, on the reasoning that the
+        timestamp should reflect the last message the processor *actually*
+        handled.  That reasoning does not hold: both connectors advance their
+        watermark when a message is **accepted into the queue**
+        (``rocketchat/connector.py`` and ``mattermost/connector.py``, at the
+        point ``dispatch()`` confirms acceptance), not when it is handled.  Step
+        1 has already removed this processor from the dispatcher, so
+        ``dispatch()`` finds none and returns False, and the connector cannot
+        advance the watermark any further.  The value is therefore identical
+        before and after the drain — and capturing before the unsubscribe is the
+        only position where it is readable at all.
+
+        Capture is deliberately *not* moved after the drain-and-before-unsubscribe
+        instead, which would also read the right value: that would leave the room
+        subscribed for the whole drain, widening the window in which arriving
+        messages find no processor and are dropped by the dispatcher.
         """
         processor = self._processors.pop(name, None)
         state = self._states.get(name)
@@ -656,7 +680,14 @@ class WatcherLifecycle:
         if processor and state and state.room_id:
             self._dispatcher.remove_processor(state.room_id, processor)
 
-        # Step 2: Unsubscribe from the connector (stop DDP delivery for this room).
+        # Step 2: Capture the live watermark while the connector still holds the
+        # room entry it lives in — the unsubscribe below pops that entry.
+        if state and state.room_id:
+            live_ts = self._connector.get_last_processed_ts(state.room_id)
+            if live_ts:
+                state.last_processed_ts = live_ts
+
+        # Step 3: Unsubscribe from the connector (stop delivery for this room).
         if state and state.room_id:
             try:
                 await self._connector.unsubscribe_room(state.room_id, watcher_id=name)
@@ -673,19 +704,13 @@ class WatcherLifecycle:
                 "Watcher '%s' has no room_id in state — skipping unsubscribe", name
             )
 
-        # Step 3: Stop the processor (drain the queue; _stopping=True rejects late arrivals).
+        # Step 4: Stop the processor (drain the queue; _stopping=True rejects late arrivals).
         if processor:
             try:
                 await processor.stop()
             except Exception as e:
                 errors.append(f"processor stop failed: {e}")
                 logger.error("Watcher '%s': processor stop failed: %s", name, e)
-
-        # Step 4: Capture the live watermark after the queue has been fully drained.
-        if state and state.room_id:
-            live_ts = self._connector.get_last_processed_ts(state.room_id)
-            if live_ts:
-                state.last_processed_ts = live_ts
 
         # Step 5: Clean up session maps.
         # Convention: empty string "" in session_id means "no session" (auto-create
@@ -699,8 +724,11 @@ class WatcherLifecycle:
                     self._permission_registry.cancel_session(effective_session)
                 self._maps.remove_session(effective_session)
 
-        if save:
-            self._state_store.save(self._states)
+        # Persisting is the caller's job.  Every caller already saves at a point
+        # that suits it — pause_watcher and reset_watcher after their own state
+        # mutations, stop_all via save_state() during shutdown — so a `save`
+        # flag here was dead in all three cases and has been removed rather than
+        # left as an option nothing selects.
         logger.info("Stopped processor for watcher '%s'", name)
         if errors:
             raise RuntimeError(
