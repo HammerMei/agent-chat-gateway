@@ -209,11 +209,16 @@ post-upgrade steps, and restarts the daemon automatically.
 > after upgrading, link it once:
 >
 > ```bash
-> rm -f ~/.local/bin/acg-provision
-> ln -s ~/.agent-chat-gateway/repo/.venv/bin/acg-provision ~/.local/bin/acg-provision
+> link=~/.local/bin/acg-provision
+> # Move aside, don't rm: `rm -f` refuses a directory, and `ln -s` would then
+> # create the link inside it. Same form as "Create the symlinks" above.
+> if [ -e "$link" ] || [ -L "$link" ]; then
+>   mv "$link" "$link.$(date +%Y%m%d%H%M%S).bak"
+> fi
+> ln -s ~/.agent-chat-gateway/repo/.venv/bin/acg-provision "$link"
 > ```
 >
-> Or run it without linking anything:
+> Or run it without linking anything at all:
 > `~/.agent-chat-gateway/repo/.venv/bin/python -m gateway.admin --help`.
 > Later upgrades handle new commands on their own.
 
