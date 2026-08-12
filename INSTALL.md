@@ -212,12 +212,20 @@ post-upgrade steps, and restarts the daemon automatically.
 > after upgrading, link it once:
 >
 > ```bash
-> # Ask the installer where it actually put the repo. Do NOT assume
-> # ~/.agent-chat-gateway/repo: running `./install.sh` from a local checkout uses
-> # that checkout as the repo and records it here, and those are exactly the
-> # installs this note is for.
-> repo=$(python3 -c 'import json,pathlib; print(json.loads((pathlib.Path.home()/".agent-chat-gateway/install_meta.json").read_text())["repo_path"])')
-> echo "$repo"
+> # Locate the managed virtualenv. Two things this deliberately avoids:
+> #   * assuming ~/.agent-chat-gateway/repo — running `./install.sh` from a local
+> #     checkout uses that checkout as the repo and records it in install_meta.json;
+> #   * needing a system `python3` — install.sh may have installed Python with
+> #     `uv python install`, which provides `python3.12` and not `python3`.
+> # Both cases describe installs that predate acg-provision, i.e. this note's readers.
+> bin=$(dirname "$(readlink ~/.local/bin/agent-chat-gateway 2>/dev/null)" 2>/dev/null)
+> if [ ! -x "$bin/acg-provision" ]; then
+>   # The entrypoint is not a managed symlink (a wrapper of your own, say), so use
+>   # the path the installer recorded.
+>   repo=$(sed -n 's/.*"repo_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' ~/.agent-chat-gateway/install_meta.json)
+>   bin=$repo/.venv/bin
+> fi
+> echo "$bin"          # sanity-check this before continuing
 >
 > link=~/.local/bin/acg-provision
 > # Same policy as install.sh: move a real file/directory aside, but just remove a
@@ -227,11 +235,11 @@ post-upgrade steps, and restarts the daemon automatically.
 >   mv "$link" "$link.$(date +%Y%m%d%H%M%S).bak"
 > fi
 > rm -f "$link"
-> ln -s "$repo/.venv/bin/acg-provision" "$link"
+> ln -s "$bin/acg-provision" "$link"
 > ```
 >
-> Or run it without linking anything at all — same `$repo` as above:
-> `"$repo/.venv/bin/python" -m gateway.admin --help`.
+> Or run it without linking anything at all — same `$bin` as above:
+> `"$bin/python" -m gateway.admin --help`.
 > Later upgrades handle new commands on their own.
 
 ---
