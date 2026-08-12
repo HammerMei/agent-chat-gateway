@@ -117,13 +117,25 @@ WATCHER_TEMPLATE_FIELDS: tuple[FieldSpec, ...] = (
 # did once, for over two months (commit 31f966d flipped only the dataclass
 # default to enabled=True and missed the loader).
 _HH_DEFAULTS = HistoryHandoffConfig()
-WATCHER_TEMPLATE_DATACLASS_DEFAULTS: dict[str, object] = {
+
+# Just the values.  The KEY SET is not repeated here — it is derived from
+# WATCHER_TEMPLATE_FIELDS below, so the two halves of what is really one table
+# cannot drift apart.  They were two independently-maintained dicts with
+# identical keys; adding a field to the specs and forgetting it here would have
+# left that field with no default (breaking its provenance display), and the
+# reverse would have left dead entries nothing reads.  Now a spec without a
+# default raises KeyError at import, not at some later render.
+_WATCHER_TEMPLATE_DEFAULT_VALUES: dict[str, object] = {
     "online_notification": None,
     "offline_notification": None,
     "context_inject_files": [],
     "history_handoff.enabled": _HH_DEFAULTS.enabled,
     "history_handoff.fetch_count": _HH_DEFAULTS.fetch_count,
     "history_handoff.verbatim_tail": _HH_DEFAULTS.verbatim_tail,
+}
+WATCHER_TEMPLATE_DATACLASS_DEFAULTS: dict[str, object] = {
+    spec.key: _WATCHER_TEMPLATE_DEFAULT_VALUES[spec.key]
+    for spec in WATCHER_TEMPLATE_FIELDS
 }
 
 # The ONE key that's truly safe to edit in place across a whole rooms:

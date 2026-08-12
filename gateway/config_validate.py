@@ -33,7 +33,12 @@ from urllib.parse import urlparse
 
 import yaml
 
-from .config import GatewayConfig, _parse_templates_block, collect_config
+from .config import (
+    TEMPLATE_FORBIDDEN_KEYS,
+    GatewayConfig,
+    _parse_templates_block,
+    collect_config,
+)
 from .connectors.mattermost.config import MattermostConfig
 from .connectors.rocketchat.config import RocketChatConfig
 from .connectors.voice.config import VoiceConfig
@@ -271,11 +276,11 @@ def _lint_config(raw: dict, result: ValidationResult) -> None:
         except ValueError:
             return {}
 
-    agent_templates = _templates_or_empty("agent_templates", frozenset())
+    agent_templates = _templates_or_empty("agent_templates", TEMPLATE_FORBIDDEN_KEYS["agent"])
     watcher_templates = _templates_or_empty(
-        "watcher_templates", frozenset({"name", "room", "rooms", "session_id"})
+        "watcher_templates", TEMPLATE_FORBIDDEN_KEYS["watcher"]
     )
-    connector_templates = _templates_or_empty("connector_templates", frozenset({"name"}))
+    connector_templates = _templates_or_empty("connector_templates", TEMPLATE_FORBIDDEN_KEYS["connector"])
 
     # PR review finding: the guards below (isinstance(agents_raw, dict),
     # the isinstance(str) checks on name/label) exist for the exact same
