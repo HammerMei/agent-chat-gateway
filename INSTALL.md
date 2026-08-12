@@ -166,12 +166,8 @@ it alongside the gateway.
 > not stick — the next upgrade creates it — so link both, or link neither and use
 > `<repo>/.venv/bin/<command>` directly.
 >
-> **Note:** a real file or directory that was at either path is now
-> `<name>.<timestamp>.bak` beside it — nothing is deleted, but nothing cleans
-> those up for you either. `ls -l ~/.local/bin/*.bak` to see them.
->
-> Re-running the block is safe: the second run finds a symlink it created itself,
-> removes it, and links again, so it never backs up its own work.
+> Re-running the block is safe and does nothing: a path it already linked is
+> occupied, so the second run reports it and moves on.
 
 Add `~/.local/bin` to your PATH if needed (add to `~/.zshrc` or `~/.bashrc`):
 ```bash
