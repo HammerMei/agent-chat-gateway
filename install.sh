@@ -151,10 +151,22 @@ else
   # unlink is the portable form. Safe here because the branch above already
   # refused every non-symlink, so this can only remove an absent path or a
   # symlink — never a real file or directory.
-  rm -f "$PROVISION_LINK"
-  ln -s "$PROVISION_BIN" "$PROVISION_LINK"
-  PROVISION_LINKED=true
-  success "Symlink created: ~/.local/bin/acg-provision → $PROVISION_BIN"
+  #
+  # Wrapped in an `if` condition, not run bare, because of `set -e` at the top
+  # of this script: a bare `ln -s` that fails (unwritable ~/.local/bin, or a
+  # race that recreated the path between the rm and the ln) would abort the
+  # whole installer here — after uv sync, but before PATH setup, install_meta
+  # and the onboard wizard. That directly contradicts this block's premise that
+  # the provisioning CLI must never break an otherwise-successful install, and
+  # matches how upgrade.py's helper treats the same failure: warn and continue.
+  # Commands inside an `if` test are exempt from set -e, so both are checked.
+  if rm -f "$PROVISION_LINK" && ln -s "$PROVISION_BIN" "$PROVISION_LINK"; then
+    PROVISION_LINKED=true
+    success "Symlink created: ~/.local/bin/acg-provision → $PROVISION_BIN"
+  else
+    warn "Could not create $PROVISION_LINK — continuing without it."
+    warn "  Run it directly at $PROVISION_BIN, or link it manually later."
+  fi
 fi
 
 # ---------------------------------------------------------------------------
