@@ -13,5 +13,5 @@ reasons (see the profile-based design in config.py):
      lab-specific assumptions.
 
 Not yet wired into gateway/cli.py or config.yaml; run via
-``python -m gateway.admin`` or the ``msg-admin`` console script.
+``python -m gateway.admin`` or the ``acg-provision`` console script.
 """

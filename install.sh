@@ -122,6 +122,18 @@ mkdir -p "$HOME/.local/bin"
 ln -sf "$VENV_BIN" "$HOME/.local/bin/agent-chat-gateway"
 success "Symlink created: ~/.local/bin/agent-chat-gateway → $VENV_BIN"
 
+# acg-provision (RC/MM account & channel provisioning). Deliberately a WARNING
+# rather than error() if absent: unlike the main entrypoint, a missing
+# provisioning CLI must not abort an otherwise-successful install — the gateway
+# itself is fully usable without it.
+PROVISION_BIN="$REPO_DIR/.venv/bin/acg-provision"
+if [ -f "$PROVISION_BIN" ]; then
+  ln -sf "$PROVISION_BIN" "$HOME/.local/bin/acg-provision"
+  success "Symlink created: ~/.local/bin/acg-provision → $PROVISION_BIN"
+else
+  warn "acg-provision not found at $PROVISION_BIN — skipping its symlink."
+fi
+
 # ---------------------------------------------------------------------------
 # PATH setup — add ~/.local/bin if missing
 # ---------------------------------------------------------------------------
@@ -208,6 +220,9 @@ success "Installation complete!"
 printf '\n'
 printf '  Repository cloned to:    ~/.agent-chat-gateway/repo\n'
 printf '  Executable installed at: ~/.local/bin/agent-chat-gateway\n'
+if [ -f "$PROVISION_BIN" ]; then
+  printf '  Provisioning CLI:        ~/.local/bin/acg-provision\n'
+fi
 printf '\n'
 printf '  To use agent-chat-gateway in your current shell, run:\n'
 printf '    source %s\n' "$SHELL_RC"

@@ -1,4 +1,4 @@
-# Example profile file for the standalone gateway.admin CLI (msg-admin).
+# Example profile file for the standalone gateway.admin CLI (acg-provision).
 #
 # Copy to admin-profiles.yaml (gitignored) and fill in real credentials, or
 # point --config / $ACG_ADMIN_CONFIG at a copy kept elsewhere. This is a
