@@ -142,6 +142,65 @@ def _find_uv() -> str:
     sys.exit(1)
 
 
+# Console scripts that install.sh symlinks into ~/.local/bin. Kept in sync with
+# the symlink block in install.sh by hand — there is no clean way to share one
+# list between bash and Python, so a script added there must be added here too.
+_LOCAL_BIN_SCRIPTS = ("agent-chat-gateway", "acg-provision")
+
+
+def _ensure_local_bin_symlinks(repo_path: Path) -> None:
+    """Ensure ~/.local/bin has a symlink for each console script.
+
+    install.sh creates these at install time, but do_git_upgrade only runs
+    `git pull` + `uv sync` — so a console script introduced in a LATER release
+    lands in .venv/bin and never becomes reachable on the PATH the installer
+    configured. That is not hypothetical: acg-provision shipped after install.sh
+    already existed, so every user who installed before it and upgraded through
+    this flow would end up with .venv/bin/acg-provision and no ~/.local/bin
+    entry, leaving the command missing until they manually re-ran the installer.
+
+    Gated on ~/.local/bin/agent-chat-gateway already existing, because that
+    symlink is install.sh's own fingerprint: its presence means this machine
+    opted into that layout. Without the guard, a pipx / distro-package /
+    manual-venv install would suddenly acquire symlinks it never asked for.
+    (Only the `git` upgrade method reaches this — brew and pip manage their own
+    shims.)
+
+    Never fatal. A symlink that cannot be written does not invalidate the
+    upgrade that just succeeded, so failures warn and continue.
+    """
+    local_bin = Path.home() / ".local" / "bin"
+    if not (local_bin / "agent-chat-gateway").exists():
+        return
+
+    for script in _LOCAL_BIN_SCRIPTS:
+        target = repo_path / ".venv" / "bin" / script
+        link = local_bin / script
+        if not target.exists():
+            # Script not built in this release — nothing to link.
+            continue
+        try:
+            if link.is_symlink():
+                if link.resolve() == target.resolve():
+                    continue  # already correct
+            elif link.exists():
+                # A regular file, not a symlink — e.g. a hand-written wrapper
+                # (observed in the wild: one that sets PYTHONPATH and pins a
+                # specific interpreter). The command is already reachable on
+                # PATH, which is the entire goal here, so there is nothing to
+                # do. Skipped SILENTLY on purpose: replacing it would be
+                # destructive, and warning about a working setup on every
+                # single upgrade is noise about a non-problem.
+                continue
+            link.unlink(missing_ok=True)
+            link.symlink_to(target)
+            console.print(f"  Linked ~/.local/bin/{script} -> {target}")
+        except OSError as e:
+            console.print(
+                f"  [yellow]Warning:[/yellow] could not link ~/.local/bin/{script}: {e}"
+            )
+
+
 def do_git_upgrade(repo_path: Path) -> None:
     """git pull + uv sync + context file sync in the given repo directory."""
     # Snapshot context file hashes BEFORE git pull so we can compare afterwards
@@ -169,6 +228,10 @@ def do_git_upgrade(repo_path: Path) -> None:
         sys.exit(1)
 
     _sync_context_files(repo_path, RUNTIME_DIR, pre_pull_hashes)
+
+    # After uv sync, so console scripts added in this release exist in
+    # .venv/bin and can be linked.
+    _ensure_local_bin_symlinks(repo_path)
 
 
 def run_migrations(from_version: str) -> None:

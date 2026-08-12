@@ -6,7 +6,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from gateway.upgrade import load_install_meta, run_migrations
+from gateway.upgrade import (
+    _ensure_local_bin_symlinks,
+    load_install_meta,
+    run_migrations,
+)
 
 # ---------------------------------------------------------------------------
 # load_install_meta
@@ -706,3 +710,118 @@ class TestFindUv:
             _find_uv()
 
         assert exc_info.value.code == 1
+
+
+# ---------------------------------------------------------------------------
+# _ensure_local_bin_symlinks
+# ---------------------------------------------------------------------------
+
+
+class TestEnsureLocalBinSymlinks:
+    """do_git_upgrade only runs `git pull` + `uv sync`, so a console script added
+    in a later release lands in .venv/bin and never reaches the PATH install.sh
+    configured. Every test here redirects Path.home() — this function writes to
+    ~/.local/bin, and must never touch the real one."""
+
+    def _setup(self, tmp_path: Path, *, installed: bool, scripts=("agent-chat-gateway",)):
+        home = tmp_path / "home"
+        local_bin = home / ".local" / "bin"
+        local_bin.mkdir(parents=True)
+        repo = tmp_path / "repo"
+        venv_bin = repo / ".venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        for name in scripts:
+            (venv_bin / name).write_text("#!/bin/sh\n")
+        if installed:
+            # install.sh's fingerprint: the primary entrypoint is already linked.
+            (local_bin / "agent-chat-gateway").symlink_to(venv_bin / "agent-chat-gateway")
+        return home, local_bin, repo, venv_bin
+
+    def test_links_a_script_added_after_install(self, tmp_path: Path):
+        home, local_bin, repo, venv_bin = self._setup(
+            tmp_path, installed=True, scripts=("agent-chat-gateway", "acg-provision")
+        )
+        assert not (local_bin / "acg-provision").exists()
+
+        with patch("gateway.upgrade.Path.home", return_value=home):
+            _ensure_local_bin_symlinks(repo)
+
+        link = local_bin / "acg-provision"
+        assert link.is_symlink()
+        assert link.resolve() == (venv_bin / "acg-provision").resolve()
+
+    def test_does_nothing_when_not_an_installer_managed_layout(self, tmp_path: Path):
+        # No ~/.local/bin/agent-chat-gateway => pipx/distro/manual install.
+        # Must not inject symlinks the user never asked for.
+        home, local_bin, repo, _ = self._setup(
+            tmp_path, installed=False, scripts=("agent-chat-gateway", "acg-provision")
+        )
+
+        with patch("gateway.upgrade.Path.home", return_value=home):
+            _ensure_local_bin_symlinks(repo)
+
+        assert list(local_bin.iterdir()) == []
+
+    def test_repoints_a_stale_symlink(self, tmp_path: Path):
+        home, local_bin, repo, venv_bin = self._setup(
+            tmp_path, installed=True, scripts=("agent-chat-gateway", "acg-provision")
+        )
+        stale = tmp_path / "old-repo" / ".venv" / "bin" / "acg-provision"
+        stale.parent.mkdir(parents=True)
+        stale.write_text("#!/bin/sh\n")
+        (local_bin / "acg-provision").symlink_to(stale)
+
+        with patch("gateway.upgrade.Path.home", return_value=home):
+            _ensure_local_bin_symlinks(repo)
+
+        assert (local_bin / "acg-provision").resolve() == (venv_bin / "acg-provision").resolve()
+
+    def test_is_idempotent(self, tmp_path: Path):
+        home, local_bin, repo, venv_bin = self._setup(
+            tmp_path, installed=True, scripts=("agent-chat-gateway", "acg-provision")
+        )
+        with patch("gateway.upgrade.Path.home", return_value=home):
+            _ensure_local_bin_symlinks(repo)
+            first = (local_bin / "acg-provision").resolve()
+            _ensure_local_bin_symlinks(repo)
+
+        assert (local_bin / "acg-provision").resolve() == first
+
+    def test_leaves_a_users_own_regular_file_alone(self, tmp_path: Path):
+        # Overwriting a real file the user placed there would be destructive.
+        # Observed in the wild: a hand-written wrapper that sets PYTHONPATH and
+        # pins a specific interpreter. It already makes the command reachable on
+        # PATH, so this is skipped silently rather than warned about on every
+        # upgrade.
+        home, local_bin, repo, _ = self._setup(
+            tmp_path, installed=True, scripts=("agent-chat-gateway", "acg-provision")
+        )
+        own = local_bin / "acg-provision"
+        own.write_text("# my own wrapper\n")
+
+        with patch("gateway.upgrade.Path.home", return_value=home):
+            _ensure_local_bin_symlinks(repo)
+
+        assert not own.is_symlink()
+        assert own.read_text() == "# my own wrapper\n"
+
+    def test_skips_scripts_absent_from_this_release(self, tmp_path: Path):
+        # An older release where acg-provision does not exist in .venv/bin.
+        home, local_bin, repo, _ = self._setup(
+            tmp_path, installed=True, scripts=("agent-chat-gateway",)
+        )
+
+        with patch("gateway.upgrade.Path.home", return_value=home):
+            _ensure_local_bin_symlinks(repo)
+
+        assert not (local_bin / "acg-provision").exists()
+
+    def test_symlink_failure_is_not_fatal(self, tmp_path: Path):
+        # A failure here must not invalidate an upgrade that already succeeded.
+        home, _, repo, _ = self._setup(
+            tmp_path, installed=True, scripts=("agent-chat-gateway", "acg-provision")
+        )
+
+        with patch("gateway.upgrade.Path.home", return_value=home), \
+             patch("gateway.upgrade.Path.symlink_to", side_effect=OSError("read-only fs")):
+            _ensure_local_bin_symlinks(repo)  # must not raise
