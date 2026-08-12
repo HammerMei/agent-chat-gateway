@@ -1024,8 +1024,9 @@ persist a watcher *name* today, which under this design is cosmetic and free to
 change (§2.3) — so a rename would orphan every job on that room, a label
 collision would make lookup ambiguous, and the expiry-exemption check below
 would consult the wrong room. The label is kept alongside as display metadata
-only. Existing jobs are rewritten during the pre-upgrade migration, which is
-the only moment the `name → room_id` mapping still exists (§5.3).
+only. Jobs created before the upgrade are not converted; they are re-created by
+the operator (§5.3), which is why the job schema can change to the correct key
+without a compatibility path.
 
 **Rooms with pending scheduled jobs are exempt from expiry, not from
 idling.** Idling such a room is harmless: the job fires, `get` recreates the
@@ -1094,16 +1095,27 @@ on-disk records persist, and boot then eagerly starts every room ever seen.
   in the transport layer and reintroduces per-room subscribe management,
   which is the coupling this design removes. The pre-routing work audit in
   §2.2 exists to keep the dropped case cheap.
-- **Migration is manual and documented.** The config change is breaking:
-  `room:`/`rooms:` becomes `rooms.include`/`rooms.exclude`, and TTLs move
-  from the agent to the rule. There is **no auto-migration and no
-  backward-compatibility shim** — a leftover old field is a hard load error
-  naming the replacement, and the release ships a migration guide. Both
-  alternatives were considered and rejected: silently accepting old fields
-  means two schemas live in the loader indefinitely, and rewriting the
-  operator's `config.yaml` in place is a surprising thing for a gateway to
-  do to a file a human owns. A one-time documented edit is cheaper than
-  permanent dual-path parsing.
+- **The upgrade is a clean break, not a migration.** Config, runtime state and
+  scheduled jobs all change shape, and **none of them is converted**. A
+  leftover old config field is a hard load error naming its replacement;
+  legacy state files cause a refusal to start; jobs are re-created. The
+  release ships one guide covering the procedure and stating the losses —
+  chiefly that every room starts a fresh agent session, and that a paused
+  room must be re-expressed as an `exclude:` entry or it becomes active
+  (§5.3).
+
+  Every alternative was considered and rejected for the same reason: each
+  buys continuity on a single upgrade in exchange for permanent complexity.
+  Accepting old config fields keeps two schemas in the loader forever;
+  rewriting the operator's `config.yaml` is a surprising thing to do to a file
+  a human owns; and a state converter cannot even work in principle, because
+  a legacy record has no agent and the config that held it is gone by the time
+  it would run.
+
+  This is affordable **because adoption is early**, and the window closes. The
+  same decision taken later, with real deployments, would be far more
+  expensive — which is the argument for taking it now rather than deferring it
+  behind a compatibility layer that would then be permanent.
 
 **Rejected:**
 
@@ -1374,90 +1386,59 @@ addition here carries one.
 serialization test must cover nesting and the empty/absent cases, not just
 presence.
 
-#### Migrating existing state and jobs
+#### Upgrading: a clean break, not a migration
 
-Re-keying from `watcher_name` to `(connector, room_id)` makes this a new
-on-disk format. It cannot be migrated at first boot, and the reason is worth
-being precise about because the naive version silently loses every session.
+**There is no state migration, and none should be built.** A legacy state
+record cannot be converted into a new one, and the cost of pretending otherwise
+outweighs what it would preserve.
 
-**A legacy state record does not contain enough to recreate a watcher.** It
-carries `watcher_name`, `session_id`, `room_id`, `room_type`,
-`context_injected`, `paused` and `last_processed_ts` — and no agent, no
-context files, no history-handoff settings. The agent binding lives only in
-`config.yaml`. But config migration is manual and the old concrete-watcher
-shape is a hard load error (§5.4), so by the time the new version boots
-successfully the operator has already replaced those entries with rules. At
-that moment both sources needed to reconstruct the record are gone: state never
-had the agent, and config no longer has it.
+Why it cannot: a legacy record carries `watcher_name`, `session_id`, `room_id`,
+`room_type`, `context_injected`, `paused` and `last_processed_ts` — and no
+agent, no context files, no history-handoff settings. Those live only in
+`config.yaml`, whose concrete-watcher shape is being removed. Any automatic
+conversion would therefore have to either guess the agent from whichever rule
+now matches the room — the silent re-binding sticky binding exists to prevent
+(§2.4) — or read a config shape the loader no longer accepts, which means
+keeping the old schema alive indefinitely for a one-time path.
 
-Adopting migrated rooms into whichever rule now matches them is not an
-acceptable fallback — it is exactly the silent re-binding sticky binding exists
-to prevent (§2.4), and it can hand a room's existing session to a different
-agent.
+So the upgrade is an operator procedure with a documented, accepted loss. This
+is a deliberate trade: the alternative is permanent complexity in the loader and
+a migration path that must stay tested forever, in exchange for continuity on
+one upgrade.
 
-**So migration is a discrete pre-upgrade step, run while both sources still
-exist:**
+**The procedure**, which belongs in the migration guide:
 
 ```
-1. install the new version                     (do not start it)
-2. acg migrate-state                           # reads OLD config + OLD state
-3. edit config.yaml: concrete watchers → rules  (§5.4)
-4. start
+1. acg list                      # record what exists, and what is paused
+2. acg schedule list             # record scheduled jobs
+3. stop the gateway
+4. rewrite config.yaml: concrete watchers → rules (§5.4)
+      – a paused watcher becomes an `exclude:` entry, not a rule
+5. remove the old state files:  ~/.agent-chat-gateway/state.*.json
+6. start, then re-create the scheduled jobs from step 2
 ```
 
-`acg migrate-state` ships with the new version but reads the *old* config
-shape deliberately — it is the one component permitted to, and it never starts
-a gateway. For each legacy record it writes a fully materialized new-format
-record: the key from `(connector-from-filename, room_id)`, and `config`
-populated from the matching `config.yaml` watcher entry, so the agent and every
-watcher setting are preserved exactly.
+**What is lost, stated plainly rather than discovered:**
 
-Three guards make the ordering enforceable rather than merely documented:
-
-- **`migrate-state` refuses** if `config.yaml` no longer contains concrete
-  watcher entries, naming step 3 as having been run too early. It also writes a
-  backup of both inputs first, so a mis-ordered upgrade is recoverable.
-- **The gateway refuses to start** if it finds legacy-format state that has not
-  been migrated, rather than starting with an empty registry. Fail closed: a
-  silent empty start would abandon every session and re-create every room from
-  scratch, which looks like success.
-- **`migrate-state` is idempotent** — re-running it after a successful
-  migration is a no-op, so a half-finished upgrade can simply be repeated.
-
-Field defaults for a migrated record:
-
-| New field | Value |
+| Lost | Consequence |
 |---|---|
-| `config` | from the matching `config.yaml` entry — the whole point of the pre-upgrade ordering |
-| `rule_name`, `rule` | empty: the record predates rules and has no originating rule. §2.4's drift check must treat this as *adopted, unknown provenance* and leave it alone rather than reporting spurious drift; it acquires a rule the first time it is legitimately re-materialized |
-| `room_kind` | from the existing `room_type`, which already distinguishes channel / group / dm. A legacy `dm` becomes `dm`, never `group_dm` — the old model could not name a group DM |
-| `participants` | empty, refilled on the next inbound message |
-| `created_at` | the migration timestamp, flagged as unknown rather than fabricated |
-| `last_activity_at` | seeded from `last_processed_ts` — the closest available truth, and it errs toward "recently active", delaying reclamation rather than hastening it |
-| `dropped_at` | empty, so every migrated record is treated as active and recreated at boot, matching today's behaviour |
+| Agent sessions | Every room starts a fresh session. Conversational memory inside the agent is gone; history handoff refetches recent room messages, so there is partial continuity from the room's own transcript |
+| `last_processed_ts` watermarks | A one-off boundary effect per room: a message either side of the cut may be reprocessed or skipped once |
+| Paused state | **The dangerous one.** A paused room becomes active unless its pause is re-expressed. Step 4 turns it into `exclude:`, which is the better home anyway (§2.5) — declarative, and effective before the first message rather than after |
+| Scheduled jobs | Jobs key on a watcher name that no longer exists; they are re-created in step 6 |
 
-**Scheduled jobs migrate in the same pass, and for the same reason.** A job
-currently persists `watcher` (the name) plus `connector` — not `room_id` — so
-jobs are keyed on what is now a *cosmetic* label (§2.3). Left alone they would
-orphan on the first channel rename, resolve ambiguously after a label
-collision, and make the expiry-exemption check consult the wrong room. Jobs
-therefore persist the full `(connector, room_id)` key, keeping the label only
-as display metadata, and `migrate-state` rewrites them while the
-`watcher_name → room_id` mapping still exists. Nothing else can reconstruct
-that mapping afterwards, which is why this cannot be a separate later change.
+**One guard is worth the ten lines**: if the gateway finds legacy-format state
+files it **refuses to start**, naming them and pointing at the guide. This is a
+version check rather than a fallback — no conversion logic, no dual-schema
+reader. It exists because the alternative is starting with an empty registry,
+which silently abandons every session and looks like a successful boot.
 
-**One legacy shape cannot be migrated: a record with an empty `room_id`.**
-That is produced by pausing a name that had never started, which fabricates a
-record with no session and no room, so there is no room identity to re-key on.
-Those are dropped with a warning naming each one. Nothing of value is lost —
-such a record holds neither a session nor a watermark, only an intent — and the
-same decision answers whether pausing an unseen room is expressible at all: it
-is not (§2.5), and the intent belongs in a rule's `exclude:` list.
-
-The upgrade test that matters: a real old-format state file plus the matching
-old config, migrated, then a first boot asserted to resume **the same session
-with the same agent and the same watcher settings**, with its scheduled jobs
-still pointing at the right room.
+**Records that would have needed special handling anyway**, noted because their
+absence simplifies things: a legacy record with an empty `room_id` (produced by
+pausing a name that never started) has no room identity at all, and a legacy
+record has no originating rule. Under a clean break neither needs an answer.
+Fresh records get a rule at creation, and pausing an unseen room is not
+expressible in the new model (§2.5).
 
 ### 5.4 Config schema
 
@@ -1482,11 +1463,17 @@ still pointing at the right room.
   token-only auth leaves no identity in config to compare. Only connector
   *names* are checked for uniqueness today.
 
-**Migration is manual.** Every removed or moved field is a hard load error
-naming its replacement — no silent acceptance, no auto-rewrite of the
-operator's file, no dual-path parsing. The release ships a migration guide
-with the mechanical edits, following the precedent already set for earlier
-breaking config changes. Rationale is in §3.
+**Migration is manual, and so is the rest of the upgrade.** Every removed or
+moved field is a hard load error naming its replacement — no silent acceptance,
+no auto-rewrite of the operator's file, no dual-path parsing. The same applies
+to runtime state and scheduled jobs: neither is converted (§5.3). One migration
+guide covers all three, following the precedent set by earlier breaking config
+changes. Rationale is in §3.
+
+This is affordable precisely because adoption is early. Choosing the clean
+break now trades a one-time operator procedure for permanently simpler
+loader, state and job code — the opposite trade to carrying a compatibility
+path that would need maintaining and testing indefinitely.
 
 ### 5.5 Config tooling
 
@@ -1516,43 +1503,39 @@ what makes §5.1's corruption reachable.
 1. §5.1 prerequisites.
 2. Rule parsing: patterns, include/exclude, order preservation,
    literal-only enforcement, shadowing detection.
-3. State schema, its serialization tests, and the automatic migration of
-   existing state files (§5.3) — including a test that a legacy record with a
-   populated `room_id` re-keys losslessly and one that an empty-`room_id`
-   record is dropped with a warning rather than crashing the load.
+3. State schema and its serialization tests, plus the legacy-state **refusal**
+   (§5.3) — a version check with a message, not a converter. Test that a
+   legacy-format file causes a clean refusal naming the file, rather than a
+   crash or an empty-registry start.
 4. **Re-key the system-prompt file and attachment workspace on a hash of `(connector, room_id)`**
    (§2.3). Independent of everything else, and it must land before labels can
    change freely — which the group-DM and rename cases both require. Existing
    installs have paths under the old names, so this needs a one-time move or a
    documented "these become orphaned, delete them" note in the migration guide.
-5. **`acg migrate-state`** (§5.3): the pre-upgrade command, covering both
-   watcher records and scheduled jobs, plus the start-up refusal on
-   unmigrated legacy state. Must exist before anyone can run the new version
-   against an existing install, so it lands early rather than with the guide.
-6. **The post-authentication identity registry** (§4.5): each connector
+5. **The post-authentication identity registry** (§4.5): each connector
    reports `(server origin, platform user id)` after login, duplicates are
    rejected fail-closed before any subscription opens. Independent of the rest
    and cheap; doing it early means every later step runs under the invariant.
-7. Processor registration becomes reject-or-replace, **and the reverse
+6. Processor registration becomes reject-or-replace, **and the reverse
    `(agent, session_id)` uniqueness index** (§4.1) — validated across
    persisted records at load and atomically at provisioning; capacity preflight
    distinguishes empty from full.
-8. The watcher manager: resolution as a pure function of (rule, room),
+7. The watcher manager: resolution as a pure function of (rule, room),
    materialization, the per-room lock, transparent recreation in `get`, the
    four-state lifecycle.
-9. Routing: connector subscribes to everything, router walks rules,
+8. Routing: connector subscribes to everything, router walks rules,
    unmatched dropped — with the pre-routing cost audit. Mattermost first,
    then RocketChat.
-10. The creation path in §2.7's ordering.
-11. `list` with its state filter, in the control server and the CLI — before
+9. The creation path in §2.7's ordering.
+10. `list` with its state filter, in the control server and the CLI — before
    the idle tick, so there is a way to observe what idling does.
-12. The idle tick, for connectors declaring unsolicited inbound.
-13. Expiry, with full reclamation.
-14. Membership-event registration (join → idle record, leave → expire). Last
+11. The idle tick, for connectors declaring unsolicited inbound.
+12. Expiry, with full reclamation.
+13. Membership-event registration (join → idle record, leave → expire). Last
     of the runtime work because it is an optimisation over the
     message-triggered path, which must be correct on its own first.
-15. Config tooling.
-16. The migration guide, shipped with the release that lands the schema
+14. Config tooling.
+15. The migration guide, shipped with the release that lands the schema
     change.
 
 ---
