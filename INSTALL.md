@@ -126,8 +126,9 @@ uv sync --project ~/.agent-chat-gateway/repo
 
 ```bash
 mkdir -p ~/.local/bin
+repo=~/.agent-chat-gateway/repo
 
-# Clear each path, then link. Same policy as install.sh:
+# Same policy as install.sh, one command at a time:
 #   * a real file or directory is MOVED ASIDE, because you made it and it cannot
 #     be reconstructed;
 #   * a symlink is just removed — the file it pointed at is untouched, so there
@@ -139,16 +140,19 @@ mkdir -p ~/.local/bin
 for cmd in agent-chat-gateway acg-provision; do
   link=~/.local/bin/"$cmd"
   if [ ! -L "$link" ] && [ -e "$link" ]; then
-    mv "$link" "$link.$(date +%Y%m%d%H%M%S).bak"
+    # `|| continue` is the important part: if the backup cannot be made, skip this
+    # command entirely. Without it the `rm -f` below still runs and deletes the very
+    # file the move was meant to preserve.
+    mv "$link" "$link.$(date +%Y%m%d%H%M%S).bak" || {
+      echo "skipped $cmd: could not back up $link"; continue
+    }
   fi
-  rm -f "$link"            # absent or a symlink by now, so this always works
+  rm -f "$link" && ln -s "$repo/.venv/bin/$cmd" "$link"
 done
-
-ln -s ~/.agent-chat-gateway/repo/.venv/bin/agent-chat-gateway ~/.local/bin/agent-chat-gateway
-
-# acg-provision — creates Rocket.Chat / Mattermost users and channels.
-ln -s ~/.agent-chat-gateway/repo/.venv/bin/acg-provision ~/.local/bin/acg-provision
 ```
+
+`acg-provision` creates Rocket.Chat / Mattermost users and channels; the loop links
+it alongside the gateway.
 
 > **Both commands are part of the installation.** `acg-provision` is not an
 > optional extra: `install.sh` links it alongside the gateway, and
@@ -233,14 +237,22 @@ post-upgrade steps, and restarts the daemon automatically.
 > echo "$bin"          # sanity-check this before continuing
 >
 > link=~/.local/bin/acg-provision
+> backed_up=yes
 > # Same policy as install.sh: move a real file/directory aside, but just remove a
 > # symlink (nothing to preserve, and this way re-running never backs up its own
 > # link into the same timestamped name).
 > if [ ! -L "$link" ] && [ -e "$link" ]; then
->   mv "$link" "$link.$(date +%Y%m%d%H%M%S).bak"
+>   mv "$link" "$link.$(date +%Y%m%d%H%M%S).bak" || backed_up=no
 > fi
-> rm -f "$link"
-> ln -s "$bin/acg-provision" "$link"
+>
+> # Only replace what was successfully preserved — otherwise the `rm -f` would
+> # delete the very file the move was meant to save.
+> if [ "$backed_up" = yes ]; then
+>   rm -f "$link"
+>   ln -s "$bin/acg-provision" "$link"
+> else
+>   echo "could not back up $link — left it alone, nothing changed"
+> fi
 > ```
 >
 > Or run it without linking anything at all — same `$bin` as above:
