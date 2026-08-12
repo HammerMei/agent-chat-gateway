@@ -303,6 +303,83 @@ class TestLoadProfiles(unittest.TestCase):
             self.assertEqual(profiles["rc-lab"].type, "rocketchat")
 
 
+class TestDuplicateKeys(unittest.TestCase):
+    """PyYAML silently keeps the LAST value for a repeated key. For a tool that
+    drives destructive operations against whichever server the config names,
+    that turns a copy/paste into a silent change of target or credential."""
+
+    def _load(self, body: str):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "cfg.yaml"
+            path.write_text(body)
+            return load_profiles(path)
+
+    def test_duplicate_field_within_a_profile_is_rejected(self):
+        with self.assertRaises(AdminConfigError) as ctx:
+            self._load(
+                "profiles:\n  mm-lab:\n    type: mattermost\n    team: t\n"
+                "    server_url: https://prod.example.com\n    token: prod-token\n"
+                "    server_url: https://lab.example.com\n    token: lab-token\n"
+            )
+        # Must name the offending key and where it is, or the operator has to
+        # diff the file by eye.
+        self.assertIn("server_url", str(ctx.exception))
+        self.assertIn("duplicate key", str(ctx.exception))
+
+    def test_duplicate_profile_name_is_rejected(self):
+        with self.assertRaises(AdminConfigError) as ctx:
+            self._load(
+                "profiles:\n  p:\n    type: rocketchat\n    server_url: https://first\n"
+                "    username: a\n    password: b\n"
+                "  p:\n    type: rocketchat\n    server_url: https://second\n"
+                "    username: c\n    password: d\n"
+            )
+        self.assertIn("duplicate key", str(ctx.exception))
+
+    def test_duplicate_top_level_key_is_rejected(self):
+        with self.assertRaises(AdminConfigError):
+            self._load(
+                "profiles:\n  a:\n    type: rocketchat\n    server_url: https://x\n"
+                "    username: u\n    password: p\n"
+                "profiles:\n  b:\n    type: rocketchat\n    server_url: https://y\n"
+                "    username: u\n    password: p\n"
+            )
+
+    def test_a_config_without_duplicates_still_loads(self):
+        profiles = self._load(
+            "profiles:\n  rc-lab:\n    type: rocketchat\n    server_url: https://rc\n"
+            "    username: admin\n    password: pw\n"
+            "  mm-lab:\n    type: mattermost\n    server_url: https://mm\n"
+            "    team: t\n    token: tok\n"
+        )
+        self.assertEqual(set(profiles), {"rc-lab", "mm-lab"})
+
+    def test_same_key_in_DIFFERENT_profiles_is_not_a_duplicate(self):
+        # Duplicate detection is per-mapping, not per-document — every profile
+        # legitimately has its own `type`/`server_url`.
+        profiles = self._load(
+            "profiles:\n  a:\n    type: rocketchat\n    server_url: https://x\n"
+            "    username: u\n    password: p\n"
+            "  b:\n    type: rocketchat\n    server_url: https://y\n"
+            "    username: u\n    password: p\n"
+        )
+        self.assertEqual(set(profiles), {"a", "b"})
+
+    def test_unhashable_complex_key_is_a_clean_error_not_a_traceback(self):
+        # A YAML complex key (`? [a, b]`) is unhashable. There is deliberately
+        # no special-case guard for it — this pins that the generic backstop
+        # still turns it into a clean AdminConfigError rather than a traceback.
+        with self.assertRaises(AdminConfigError) as ctx:
+            self._load("profiles:\n  ? [a, b]\n  : value\n")
+        self.assertIn("unhashable", str(ctx.exception))
+
+    def test_strict_loader_still_refuses_unsafe_tags(self):
+        # Subclassing SafeLoader must not have widened the tag set: an
+        # arbitrary-object tag has to remain a YAML error, not get constructed.
+        with self.assertRaises(AdminConfigError):
+            self._load("profiles: !!python/object/apply:os.system ['echo pwned']\n")
+
+
 class TestGetProfile(unittest.TestCase):
     def test_returns_matching_profile(self):
         profiles = {

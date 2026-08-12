@@ -248,7 +248,7 @@ class MattermostAdmin(PlatformAdmin):
         # respond in ways that don't reliably reflect a created account
         # (mattermost/mattermost#6644). If it's not actually there, fail
         # loudly instead of returning a user that doesn't exist.
-        with readback_after_write(f"Mattermost user '{username}' was created"):
+        with readback_after_write(f"Mattermost reported user '{username}' created"):
             created = await self._get_user_or_none(username)
         if created is None:
             raise VerificationError(
@@ -288,7 +288,7 @@ class MattermostAdmin(PlatformAdmin):
                 f"Mattermost channel creation for '{name}' returned no id: {result}"
             )
 
-        with readback_after_write(f"Mattermost channel '{name}' was created"):
+        with readback_after_write(f"Mattermost reported channel '{name}' created"):
             verified = await self._get_channel_or_none(name)
         if verified is None:
             raise VerificationError(
@@ -319,7 +319,7 @@ class MattermostAdmin(PlatformAdmin):
         )
 
         with readback_after_write(
-            f"'{username}' was added to channel '{channel_name}'"
+            f"Mattermost reported '{username}' added to channel '{channel_name}'"
         ):
             await self._rest._request("GET", f"channels/{channel.id}/members/{user.id}")
 
@@ -332,7 +332,7 @@ class MattermostAdmin(PlatformAdmin):
 
         await self._rest._request("DELETE", f"users/{user.id}")
 
-        with readback_after_write(f"Mattermost user '{username}' was deactivated"):
+        with readback_after_write(f"Mattermost reported user '{username}' deactivated"):
             result = await self._rest._request("GET", f"users/{user.id}")
         if not result.get("delete_at"):
             raise VerificationError(
@@ -349,7 +349,7 @@ class MattermostAdmin(PlatformAdmin):
 
         await self._rest._request("DELETE", f"channels/{channel.id}")
 
-        with readback_after_write(f"Mattermost channel '{channel_name}' was archived"):
+        with readback_after_write(f"Mattermost reported channel '{channel_name}' archived"):
             result = await self._rest._request("GET", f"channels/{channel.id}")
         if not result.get("delete_at"):
             raise VerificationError(

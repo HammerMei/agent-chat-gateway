@@ -108,7 +108,7 @@ class RocketChatAdmin(PlatformAdmin):
                 f"Rocket.Chat user creation for '{username}' failed: {result.get('error', result)}"
             )
 
-        with readback_after_write(f"Rocket.Chat user '{username}' was created"):
+        with readback_after_write(f"Rocket.Chat reported user '{username}' created"):
             created = await self._get_user_or_none(username)
         if created is None:
             raise VerificationError(
@@ -149,7 +149,7 @@ class RocketChatAdmin(PlatformAdmin):
                 f"Rocket.Chat channel creation for '{name}' failed: {result.get('error', result)}"
             )
 
-        with readback_after_write(f"Rocket.Chat channel '{name}' was created"):
+        with readback_after_write(f"Rocket.Chat reported channel '{name}' created"):
             verified = await self._get_channel_or_none(name)
         if verified is None:
             raise VerificationError(
@@ -191,7 +191,7 @@ class RocketChatAdmin(PlatformAdmin):
             )
 
         members_endpoint = "groups.members" if channel.is_private else "channels.members"
-        with readback_after_write(f"'{username}' was added to channel '{channel_name}'"):
+        with readback_after_write(f"Rocket.Chat reported '{username}' added to channel '{channel_name}'"):
             # user.username, NOT the caller's input: the invite above is keyed
             # on the immutable user.id, so it succeeds even when the string the
             # caller passed isn't the account's canonical username (an account
@@ -223,7 +223,7 @@ class RocketChatAdmin(PlatformAdmin):
                 f"Rocket.Chat user deletion for '{username}' failed: {result.get('error', result)}"
             )
 
-        with readback_after_write(f"Rocket.Chat user '{username}' was deleted"):
+        with readback_after_write(f"Rocket.Chat reported user '{username}' deleted"):
             still_there = await self._get_user_or_none(username)
         if still_there is not None:
             raise VerificationError(
@@ -245,7 +245,7 @@ class RocketChatAdmin(PlatformAdmin):
                 f"{result.get('error', result)}"
             )
 
-        with readback_after_write(f"Rocket.Chat channel '{channel_name}' was deleted"):
+        with readback_after_write(f"Rocket.Chat reported channel '{channel_name}' deleted"):
             still_there = await self._get_channel_or_none(channel_name)
         if still_there is not None:
             raise VerificationError(

@@ -21,6 +21,9 @@ File shape::
         server_url: https://rc.labpig.com
         username: admin
         password: xxx
+
+Duplicate keys (a repeated profile name, or a repeated field within a profile)
+are rejected rather than silently resolved last-wins — see _StrictLoader.
 """
 
 import os
@@ -28,6 +31,65 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
+
+
+class _DuplicateKeyError(yaml.YAMLError):
+    """Raised by _StrictLoader when a mapping repeats a key.
+
+    Subclasses yaml.YAMLError deliberately, so load_profiles()'s existing
+    ``except yaml.YAMLError`` arm converts it to AdminConfigError with no new
+    handling — and so a future refactor cannot accidentally let it escape as a
+    raw traceback.
+    """
+
+
+class _StrictLoader(yaml.SafeLoader):
+    """SafeLoader that rejects duplicate mapping keys instead of last-wins.
+
+    PyYAML (like the YAML spec's "should" rather than "must") silently keeps the
+    LAST value for a repeated key. That default is actively dangerous for this
+    particular tool: it drives destructive operations against multiple
+    deployments selected purely by config, so a copy/paste while adding a second
+    profile can silently swap the target server or the credential. Verified
+    behavior of the default loader:
+
+        profiles:
+          mm-lab:
+            server_url: https://prod.example.com   # <- silently discarded
+            token: prod-token                      # <- silently discarded
+            server_url: https://lab.example.com
+            token: lab-token
+
+    ...loads as the lab values with no warning, and every downstream validation
+    passes. Duplicated *profile names* collapse the same way. Failing loudly is
+    the only safe reading, since neither value is more likely to be the intended
+    one.
+    """
+
+
+def _no_duplicate_keys(loader, node, deep=False):
+    mapping = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        # No guard for an unhashable key (a YAML complex key such as
+        # `? [a, b]`): the membership test below raises TypeError, which
+        # load_profiles()'s backstop arm already turns into a clean
+        # AdminConfigError naming the real cause. An explicit try/except here
+        # produced the identical message from the dict assignment one line
+        # later, so it was five lines that changed nothing.
+        if key in mapping:
+            raise _DuplicateKeyError(
+                f"duplicate key {key!r} at line {key_node.start_mark.line + 1} "
+                "— refusing to guess which value was intended"
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_StrictLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _no_duplicate_keys
+)
+
 
 DEFAULT_CONFIG_PATH = Path("admin-profiles.yaml")
 CONFIG_PATH_ENV_VAR = "ACG_ADMIN_CONFIG"
@@ -161,7 +223,10 @@ def load_profiles(path: str | Path | None = None) -> dict[str, AdminProfile]:
     # original message, so the check was pure liability.
     try:
         with open(config_path, "rb") as f:
-            raw = yaml.safe_load(f) or {}
+            # _StrictLoader, not safe_load: same safe tag set, but duplicate
+            # mapping keys raise instead of silently last-winning. See its
+            # docstring for why that default is unacceptable here.
+            raw = yaml.load(f, Loader=_StrictLoader) or {}  # noqa: S506 - safe subclass
     except FileNotFoundError as e:
         raise AdminConfigError(
             f"Admin config file not found: {config_path} "

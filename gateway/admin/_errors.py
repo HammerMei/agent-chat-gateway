@@ -20,37 +20,51 @@ from gateway.admin.base import VerificationError
 
 
 @contextlib.contextmanager
-def readback_after_write(what_already_happened: str):
-    """Wrap a verification read-back that follows an ALREADY-SUCCEEDED write.
+def readback_after_write(what_the_write_reported: str):
+    """Wrap a verification read-back that follows a write which REPORTED success.
 
     Every create/delete in this package writes, then reads back to confirm the
-    change landed (the platforms have been observed to report success without
-    applying it). If that read-back itself fails with an API error, two things
-    used to go wrong at once:
+    change landed — precisely because these platforms have been observed to
+    report success WITHOUT applying the write (mattermost/mattermost#6644). If
+    the read-back itself fails with an API error, two things used to go wrong:
 
     - The operator saw httpx's generic ``Client error '403 Forbidden' for url
       '...'  For more information check: https://developer.mozilla.org/...``
       instead of the platform's own message, because the wrapping bypassed
       cli._run()'s httpx.HTTPStatusError arm (which calls
       friendly_error_message) in favour of its generic Exception arm.
-    - Worse, nothing said the write had ALREADY been applied. A bare
-      ``Error: You do not have the appropriate permissions.`` after a
-      successful account creation reads exactly like "nothing happened",
-      inviting the operator to re-run a command that already did its job.
+    - Nothing indicated that the write had reported success first. A bare
+      ``Error: You do not have the appropriate permissions.`` after an
+      apparently-successful account creation reads exactly like "nothing
+      happened".
 
-    So the message states both: the platform's real error, and that the write
-    is already done. Only httpx.HTTPStatusError is caught — a VerificationError
-    raised by the read-back's own logic (e.g. "delete_at is still unset") is
-    already specific and passes through untouched.
+    What the message must NOT do — and originally did — is assert that the
+    change definitely landed and tell the operator not to re-run. The read-back
+    is the only thing that could have established that, and it just failed, so
+    the outcome is genuinely UNKNOWN. Combined with the false-success behavior
+    above, the confident wording was actively harmful in exactly the scenario
+    this wrapper exists for: a Mattermost create that returns 2xx without
+    creating the account, followed by a 403 read-back, would have told the
+    operator the account exists and must not be re-created. So the message now
+    reports what is actually known (the write reported success, verification
+    could not confirm it) and directs the operator to check server state before
+    deciding — rather than making the decision for them on an unverified
+    premise.
+
+    Only httpx.HTTPStatusError is caught — a VerificationError raised by the
+    read-back's own logic (e.g. "delete_at is still unset") is already specific
+    and passes through untouched.
     """
     try:
         yield
     except httpx.HTTPStatusError as e:
         raise VerificationError(
-            f"{what_already_happened}, but the follow-up verification request "
-            f"failed: {friendly_error_message(e)} — NOTE: the change above has "
-            "already been applied on the server, so re-running is not required "
-            "and may not be idempotent."
+            f"{what_the_write_reported}, but the follow-up verification request "
+            f"failed: {friendly_error_message(e)} — so whether the change "
+            "actually landed is UNKNOWN. Check the current state on the server "
+            "before deciding whether to re-run: these platforms can report "
+            "success without applying a write, and re-running may not be "
+            "idempotent if it did land."
         ) from e
 
 

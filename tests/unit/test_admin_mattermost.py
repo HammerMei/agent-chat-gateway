@@ -588,7 +588,7 @@ class TestAddUserToChannel(unittest.IsolatedAsyncioTestCase):
 
 
 class TestPostWriteReadbackErrors(unittest.IsolatedAsyncioTestCase):
-    """A read-back that fails AFTER the write already landed must say so.
+    """A read-back failure must report the outcome as UNKNOWN, not as applied.
 
     Two defects were bundled here. The message used to splice in httpx's
     generic "Client error '403 Forbidden' for url '...' For more information
@@ -607,7 +607,7 @@ class TestPostWriteReadbackErrors(unittest.IsolatedAsyncioTestCase):
                   "message": "You do not have the appropriate permissions."}
         )
 
-    async def test_create_user_readback_failure_says_the_account_exists(self):
+    async def test_create_user_readback_failure_reports_unknown_not_applied(self):
         admin = _admin_with_mock_rest()
         admin._rest.get_user_by_username = AsyncMock(
             side_effect=[_http_error(404), self._forbidden()]
@@ -618,13 +618,16 @@ class TestPostWriteReadbackErrors(unittest.IsolatedAsyncioTestCase):
             await admin.create_user("alice", "a@x.com", "pw")
 
         msg = str(ctx.exception)
-        self.assertIn("was created", msg)
-        self.assertIn("already been applied", msg)
+        self.assertIn("reported user 'alice' created", msg)
+        # Must NOT assert the write definitely landed — the read-back that
+        # would have established that is exactly what failed.
+        self.assertIn("UNKNOWN", msg)
+        self.assertNotIn("already been applied", msg)
         # Platform's own wording, not httpx's generic text.
         self.assertIn("You do not have the appropriate permissions.", msg)
         self.assertNotIn("developer.mozilla.org", msg)
 
-    async def test_delete_user_readback_failure_says_the_deactivation_landed(self):
+    async def test_delete_user_readback_failure_reports_unknown_not_applied(self):
         admin = _admin_with_mock_rest()
         admin._rest.get_user_by_username = AsyncMock(
             return_value={"id": "u1", "username": "alice", "email": "a@x.com"}
@@ -635,11 +638,12 @@ class TestPostWriteReadbackErrors(unittest.IsolatedAsyncioTestCase):
             await admin.delete_user("alice")
 
         msg = str(ctx.exception)
-        self.assertIn("was deactivated", msg)
-        self.assertIn("already been applied", msg)
+        self.assertIn("reported user 'alice' deactivated", msg)
+        self.assertIn("UNKNOWN", msg)
+        self.assertNotIn("already been applied", msg)
         self.assertIn("You do not have the appropriate permissions.", msg)
 
-    async def test_add_to_channel_readback_failure_says_the_add_landed(self):
+    async def test_add_to_channel_readback_failure_reports_unknown_not_applied(self):
         admin = _admin_with_mock_rest()
         admin._rest.get_user_by_username = AsyncMock(
             return_value={"id": "u1", "username": "alice", "email": ""}
@@ -657,8 +661,9 @@ class TestPostWriteReadbackErrors(unittest.IsolatedAsyncioTestCase):
             await admin.add_user_to_channel("alice", "eng")
 
         msg = str(ctx.exception)
-        self.assertIn("was added to channel", msg)
-        self.assertIn("already been applied", msg)
+        self.assertIn("added to channel 'eng'", msg)
+        self.assertIn("UNKNOWN", msg)
+        self.assertNotIn("already been applied", msg)
         self.assertIn("You do not have the appropriate permissions.", msg)
 
     async def test_a_specific_verification_error_is_not_reworded(self):
