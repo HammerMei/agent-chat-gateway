@@ -127,27 +127,33 @@ uv sync --project ~/.agent-chat-gateway/repo
 ```bash
 mkdir -p ~/.local/bin
 
-# Unlink first, then link. `ln -sf` on its own is not enough: if the destination
-# is a symlink pointing at a directory, `ln -sf` follows it and creates the link
-# *inside* that directory, so the command path keeps resolving to a directory.
-rm -f ~/.local/bin/agent-chat-gateway
+# Move aside anything already at these paths, then link. This mirrors what
+# install.sh does, and it is why the step is not just `ln -sf`:
+#   * `ln -sf` onto a symlink that points at a DIRECTORY follows it and creates
+#     the link *inside* that directory, leaving the command path unusable.
+#   * `rm -f` does not remove a directory, so clearing the path that way fails
+#     and then `ln -s` links inside the directory for the same reason.
+#   * `mv` handles a file, a directory, and a symlink alike, and destroys nothing.
+for cmd in agent-chat-gateway acg-provision; do
+  if [ -e ~/.local/bin/"$cmd" ] || [ -L ~/.local/bin/"$cmd" ]; then
+    mv ~/.local/bin/"$cmd" ~/.local/bin/"$cmd.$(date +%Y%m%d%H%M%S).bak"
+  fi
+done
+
 ln -s ~/.agent-chat-gateway/repo/.venv/bin/agent-chat-gateway ~/.local/bin/agent-chat-gateway
 
 # acg-provision — creates RC/Mattermost accounts and channels. Optional; skip
-# these two lines if you don't need it.
-rm -f ~/.local/bin/acg-provision
+# this line if you don't need it.
 ln -s ~/.agent-chat-gateway/repo/.venv/bin/acg-provision ~/.local/bin/acg-provision
 ```
 
-> **Note:** those `rm -f` lines delete whatever is already at those paths —
-> including a hand-written wrapper of your own. Check first with
-> `ls -l ~/.local/bin/agent-chat-gateway ~/.local/bin/acg-provision`.
+> **Note:** anything that was at those paths is now at
+> `<name>.<timestamp>.bak` in the same directory — nothing is deleted, but nothing
+> cleans those up for you either. `ls -l ~/.local/bin/*.bak` to see them.
 >
-> `install.sh` is safer than these manual commands. For **both** links, if the
-> destination is a real file or directory rather than a symlink, it moves it aside
-> to `<name>.<timestamp>.bak` before creating the link, and tells you where it
-> went. An existing symlink is repointed (and the old target printed), since a
-> symlink has nothing to preserve.
+> `install.sh` applies the same policy with one difference: it repoints an existing
+> **symlink** instead of backing it up (printing the old target), because a symlink
+> has nothing to preserve — the file it pointed at is untouched.
 
 Add `~/.local/bin` to your PATH if needed (add to `~/.zshrc` or `~/.bashrc`):
 ```bash
