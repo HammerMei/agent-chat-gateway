@@ -1021,6 +1021,47 @@ class TestEnsureLocalBinSymlinks:
         assert own.read_text() == "# my own wrapper\n"
         assert list(local_bin.glob("acg-provision.*.bak")) == [], "backup left behind"
 
+    def test_says_where_the_backup_is_when_the_rollback_also_fails(
+        self, tmp_path: Path, capsys
+    ):
+        """The worst reachable state must not also be a silent one.
+
+        Link creation fails, and putting the file back fails too (another process
+        took the path, permissions changed). The user then has no command on PATH
+        and their original under a timestamped name they never chose — so the name
+        is the one thing that has to be printed. Swallowing the rollback error is
+        right (it must not replace the real one); swallowing the location is not.
+        """
+        home, local_bin, repo, _ = self._setup(
+            tmp_path, installed=True, scripts=("agent-chat-gateway", "acg-provision")
+        )
+        own = local_bin / "acg-provision"
+        own.write_text("# my own wrapper\n")
+
+        real_rename = Path.rename
+
+        def rename_then_fail(self, target):
+            # Let the move-aside succeed, then fail the rollback's move-back.
+            if str(self).endswith(".bak"):
+                raise OSError("rollback blocked")
+            return real_rename(self, target)
+
+        with patch("gateway.upgrade.Path.home", return_value=home), \
+             patch("gateway.upgrade.Path.symlink_to", side_effect=OSError("read-only fs")), \
+             patch("gateway.upgrade.Path.rename", new=rename_then_fail):
+            _ensure_local_bin_symlinks(repo)  # must not raise
+
+        # ALL whitespace removed, not collapsed: rich wraps at the console width, so
+        # a long path arrives split across lines and a naive `name in out` fails on
+        # the newline rather than on a missing message.
+        flat = "".join(capsys.readouterr().out.split())
+        backups = list(local_bin.glob("acg-provision.*.bak"))
+        assert len(backups) == 1, "the file should still be in its backup"
+        assert backups[0].read_text() == "# my own wrapper\n"
+        assert backups[0].name in flat, (
+            f"the backup location must be reported; got: {flat}"
+        )
+
     def test_backups_do_not_clobber_each_other(self, tmp_path: Path):
         """Two runs must not have the second backup overwrite the first.
 

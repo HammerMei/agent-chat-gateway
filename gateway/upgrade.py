@@ -1,6 +1,5 @@
 """Upgrade logic for agent-chat-gateway."""
 
-import contextlib
 import json
 import subprocess
 import sys
@@ -341,13 +340,21 @@ def _ensure_local_bin_symlinks(repo_path: Path) -> None:
             # started with. Suppressed rather than raised because a failed rollback
             # must not turn a missing link into a lost file as well.
             restored = ""
-            with contextlib.suppress(OSError):
+            try:
                 if displaced_backup is not None and displaced_backup.exists():
                     displaced_backup.rename(link)
                     restored = "file"
                 elif displaced_target is not None and not link.is_symlink():
                     link.symlink_to(displaced_target)
                     restored = "link"
+            except OSError:
+                # Swallowed so a failed rollback cannot replace the original error —
+                # but NOT silently. This is the worst reachable state (no command on
+                # PATH, and the user's file under a timestamped name they never
+                # chose), so the one thing they need is where it went. install.sh
+                # already reports this; not doing so here was the two
+                # implementations disagreeing again.
+                restored = "failed"
 
             console.print(
                 f"  [yellow]Warning:[/yellow] could not link ~/.local/bin/{script}: {e}"
@@ -357,6 +364,17 @@ def _ensure_local_bin_symlinks(repo_path: Path) -> None:
             elif restored == "link":
                 console.print(
                     f"  Restored ~/.local/bin/{script} -> {displaced_target}",
+                    markup=False,
+                )
+            elif restored == "failed" and displaced_backup is not None:
+                console.print(
+                    f"  Could not put it back either — your original is at {displaced_backup}",
+                    markup=False,
+                )
+            elif restored == "failed" and displaced_target is not None:
+                console.print(
+                    "  Could not restore the previous link, which pointed at "
+                    f"{displaced_target}",
                     markup=False,
                 )
 
@@ -394,6 +412,13 @@ def run_post_upgrade(repo_path: Path, from_version: str = "") -> None:
       * Idempotent. It may run again on the next upgrade, and re-running must be
         harmless. Do not rely on `from_version` alone to run something once —
         an interrupted upgrade can repeat the same transition.
+      * SKIPPABLE, which is the sharp edge. A step that raises makes the child exit
+        non-zero, the caller only WARNS, and run_upgrade then records the new
+        version anyway — so on the next upgrade `from_version` is already the newer
+        one and a step guarded on the older version never runs again. A failure here
+        is therefore permanent, not deferred. Do not put anything here that must
+        eventually happen exactly once; there is no retry, and adding one means
+        changing when the version is recorded (issue #85).
       * Non-fatal in effect. Prefer warning over raising; the caller treats a
         non-zero exit as a warning, but an exception here still means the
         remaining steps are skipped.
