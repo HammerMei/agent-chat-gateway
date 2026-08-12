@@ -194,7 +194,22 @@ the user guide for the full field reference and a worked example (including the
 agent-chat-gateway upgrade
 ```
 
-This stops the daemon, runs `git pull` + `uv sync`, and restarts the daemon automatically.
+This stops the daemon, runs `git pull` + `uv sync`, runs the pulled release's
+post-upgrade steps, and restarts the daemon automatically.
+
+> **One-time note for installs that predate `acg-provision`:** the post-upgrade
+> step that puts new commands on your PATH is itself delivered by an upgrade, so
+> the first upgrade that lands it cannot run it. If `acg-provision` is not found
+> after upgrading, link it once:
+>
+> ```bash
+> rm -f ~/.local/bin/acg-provision
+> ln -s ~/.agent-chat-gateway/repo/.venv/bin/acg-provision ~/.local/bin/acg-provision
+> ```
+>
+> Or run it without linking anything:
+> `~/.agent-chat-gateway/repo/.venv/bin/python -m gateway.admin --help`.
+> Later upgrades handle new commands on their own.
 
 ---
 

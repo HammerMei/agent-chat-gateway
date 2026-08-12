@@ -148,6 +148,11 @@ def _find_uv() -> str:
 # list between bash and Python, so a script added there must be added here too.
 _LOCAL_BIN_SCRIPTS = ("agent-chat-gateway", "acg-provision")
 
+# Post-upgrade steps are local filesystem work, so this is a hang guard rather
+# than a work budget. It is kept short on purpose: the hook runs while the daemon
+# is stopped, so waiting is an outage.
+_POST_UPGRADE_TIMEOUT = 120
+
 
 def _backup_path(link: Path) -> Path:
     """Return an unused `<link>.<timestamp>.bak` path next to `link`.
@@ -297,6 +302,108 @@ def _ensure_local_bin_symlinks(repo_path: Path) -> None:
                     )
 
 
+def run_post_upgrade(repo_path: Path) -> None:
+    """Steps that must run with the NEWLY PULLED release's own logic.
+
+    This is the extension point for automatic upgrade steps. Anything added here
+    executes from the release being upgraded *to*, not the one being upgraded
+    *from* — which is the whole reason it exists, and the reason it is invoked in
+    a fresh interpreter rather than called directly (see
+    _run_post_upgrade_hook()).
+
+    Contract for anything added here:
+      * Idempotent. It may run again on the next upgrade, and re-running must be
+        harmless.
+      * Non-fatal in effect. Prefer warning over raising; the caller treats a
+        non-zero exit as a warning, but an exception here still means the
+        remaining steps are skipped.
+      * No network, and fast. The caller runs inside the window where the daemon
+        is stopped, and enforces a timeout.
+      * Not version-aware. If a step must only run once, or only for upgrades
+        from a specific version, that belongs in run_migrations() — which
+        receives the old version — not here.
+    """
+    _ensure_local_bin_symlinks(repo_path)
+
+
+# Executed by `python -c` in the pulled tree. Deliberately tiny: everything it
+# does is resolved at subprocess start from the NEW code on disk, so keeping
+# logic out of this string is what makes the mechanism work.
+#
+# getattr with a no-op default rather than a bare attribute access: a pulled
+# release that has no run_post_upgrade — checking out an older ref, say — has no
+# post-upgrade steps, which is not an error. A bare access printed a full
+# AttributeError traceback in that case, which reads like a failed upgrade
+# immediately after a successful one. Genuine failures INSIDE run_post_upgrade
+# still surface, which is the part worth seeing.
+_POST_UPGRADE_BOOTSTRAP = (
+    "import pathlib, sys, gateway.upgrade as u; "
+    "getattr(u, 'run_post_upgrade', lambda _p: None)(pathlib.Path(sys.argv[1]))"
+)
+
+
+def _run_post_upgrade_hook(repo_path: Path) -> None:
+    """Run the pulled release's run_post_upgrade() in a FRESH interpreter.
+
+    `gateway.upgrade` is imported into this process before `git pull`, so the
+    module object in memory belongs to the OLD release; rewriting the file on disk
+    cannot change it. A subprocess re-imports from disk, so it executes the NEW
+    code — this is the only way post-upgrade logic can run during the very upgrade
+    that delivers it.
+
+    The limit is worth stating exactly, because it is easy to expect too much: the
+    *call below* is itself frozen in the old release. A release therefore benefits
+    only if the release BEFORE it already contained this call. It does nothing for
+    the release that introduces it, and works for every release after — which is
+    the point. Anything that must reach users on the introducing release still
+    needs a manual step or a documented note.
+
+    Never fatal, on two counts. A `git pull` + `uv sync` that already succeeded
+    must not be reported as a failure because a follow-up step could not run. And
+    this executes between stop_daemon() and start_daemon() in run_upgrade(), which
+    has no try/finally (see issue #83) — so an exception escaping here would leave
+    the daemon stopped after a successful pull. Hence the timeout as well: a hung
+    child in that window is an outage, not a delay.
+    """
+    python = repo_path / ".venv" / "bin" / "python"
+    if not python.exists():
+        console.print(
+            f"  [yellow]Warning:[/yellow] no interpreter at {python} — "
+            "skipping post-upgrade steps."
+        )
+        return
+
+    try:
+        result = subprocess.run(
+            [str(python), "-c", _POST_UPGRADE_BOOTSTRAP, str(repo_path)],
+            # cwd so `import gateway` still resolves from the source tree even if
+            # the editable install's .pth is missing or stale.
+            cwd=str(repo_path),
+            check=False,
+            timeout=_POST_UPGRADE_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        console.print(
+            "  [yellow]Warning:[/yellow] post-upgrade steps timed out after "
+            f"{_POST_UPGRADE_TIMEOUT}s — the upgrade itself succeeded."
+        )
+        return
+    except OSError as e:
+        console.print(
+            f"  [yellow]Warning:[/yellow] could not run post-upgrade steps: {e}"
+        )
+        return
+
+    if result.returncode != 0:
+        # Includes the pulled release simply not having run_post_upgrade — e.g.
+        # checking out an older ref — which surfaces as a non-zero exit from the
+        # child's ImportError/AttributeError rather than as a crash here.
+        console.print(
+            "  [yellow]Warning:[/yellow] post-upgrade steps exited "
+            f"{result.returncode} — the upgrade itself succeeded."
+        )
+
+
 def do_git_upgrade(repo_path: Path) -> None:
     """git pull + uv sync + context file sync in the given repo directory."""
     # Snapshot context file hashes BEFORE git pull so we can compare afterwards
@@ -325,9 +432,9 @@ def do_git_upgrade(repo_path: Path) -> None:
 
     _sync_context_files(repo_path, RUNTIME_DIR, pre_pull_hashes)
 
-    # After uv sync, so console scripts added in this release exist in
-    # .venv/bin and can be linked.
-    _ensure_local_bin_symlinks(repo_path)
+    # After uv sync, so the freshly pulled release's dependencies and console
+    # scripts are in place before its own post-upgrade steps run.
+    _run_post_upgrade_hook(repo_path)
 
 
 def run_migrations(from_version: str) -> None:

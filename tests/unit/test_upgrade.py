@@ -1,15 +1,21 @@
 """Unit tests for gateway.upgrade."""
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from gateway.upgrade import (
+    _POST_UPGRADE_BOOTSTRAP,
     _ensure_local_bin_symlinks,
+    _run_post_upgrade_hook,
+    do_git_upgrade,
     load_install_meta,
     run_migrations,
+    run_post_upgrade,
 )
 
 # ---------------------------------------------------------------------------
@@ -1006,3 +1012,131 @@ class TestEnsureLocalBinSymlinks:
 
         with patch("gateway.upgrade.Path.home", return_value=home):
             _ensure_local_bin_symlinks(repo)  # must not raise on any Python we support
+
+
+# ---------------------------------------------------------------------------
+# run_post_upgrade / _run_post_upgrade_hook
+# ---------------------------------------------------------------------------
+
+
+class TestPostUpgradeHook:
+    """The hook exists so post-upgrade logic added in a LATER release can run
+    during the upgrade that delivers it.
+
+    `gateway.upgrade` is imported into the upgrading process before `git pull`, so
+    the module in memory is the OLD release's, and rewriting the file on disk
+    cannot change it — only a subprocess re-imports from disk. Verified end to end
+    outside the suite (a parent holding the old module invoked the hook and the
+    child executed a step written after import); these tests pin the contract.
+    """
+
+    def _repo(self, tmp_path: Path, *, with_python: bool = True) -> Path:
+        repo = tmp_path / "repo"
+        venv_bin = repo / ".venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        if with_python:
+            (venv_bin / "python").write_text("#!/bin/sh\n")
+        return repo
+
+    def test_invokes_the_pulled_tree_with_its_own_interpreter(self, tmp_path: Path):
+        repo = self._repo(tmp_path)
+
+        with patch("gateway.upgrade.subprocess.run") as run:
+            run.return_value = MagicMock(returncode=0)
+            _run_post_upgrade_hook(repo)
+
+        run.assert_called_once()
+        argv = run.call_args[0][0]
+        assert argv[0] == str(repo / ".venv" / "bin" / "python"), (
+            "must use the pulled tree's interpreter, not the running one"
+        )
+        assert argv[1:] == ["-c", _POST_UPGRADE_BOOTSTRAP, str(repo)]
+        kwargs = run.call_args[1]
+        # cwd so `import gateway` resolves from the source tree even if the
+        # editable install's .pth is stale.
+        assert kwargs["cwd"] == str(repo)
+        # A hang here happens while the daemon is stopped, so it must be bounded.
+        assert kwargs["timeout"] > 0
+        assert kwargs["check"] is False
+
+    def test_bootstrap_is_a_no_op_when_the_pulled_release_predates_it(self, tmp_path: Path):
+        """An older ref has no post-upgrade steps, which is not an error.
+
+        Runs the literal string we ship against a real package that lacks the
+        entry point. A bare attribute access exits non-zero here and prints a full
+        AttributeError traceback, which reads like a failed upgrade immediately
+        after a successful one.
+        """
+        pkg = tmp_path / "gateway"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text("")
+        (pkg / "upgrade.py").write_text("# a release predating run_post_upgrade\n")
+
+        result = subprocess.run(
+            [sys.executable, "-c", _POST_UPGRADE_BOOTSTRAP, str(tmp_path)],
+            cwd=str(tmp_path),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert "Traceback" not in result.stderr
+        assert result.stdout == ""
+
+    def test_missing_interpreter_warns_and_does_not_spawn(self, tmp_path: Path):
+        repo = self._repo(tmp_path, with_python=False)
+
+        with patch("gateway.upgrade.subprocess.run") as run:
+            _run_post_upgrade_hook(repo)
+
+        run.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "outcome",
+        [
+            {"return_value": MagicMock(returncode=1)},
+            {"side_effect": subprocess.TimeoutExpired(cmd="python", timeout=1)},
+            {"side_effect": OSError("exec format error")},
+        ],
+        ids=["nonzero-exit", "timeout", "oserror"],
+    )
+    def test_failures_are_never_fatal(self, tmp_path: Path, outcome: dict):
+        """A pull + sync that already succeeded must not be reported as a failure,
+        and nothing may escape: this runs between stop_daemon() and start_daemon()
+        in run_upgrade(), which has no try/finally (issue #83), so an exception
+        here would strand a stopped daemon."""
+        repo = self._repo(tmp_path)
+
+        with patch("gateway.upgrade.subprocess.run", **outcome):
+            _run_post_upgrade_hook(repo)  # must not raise
+
+    def test_run_post_upgrade_ensures_the_console_script_links(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        with patch("gateway.upgrade._ensure_local_bin_symlinks") as ensure:
+            run_post_upgrade(repo)
+        ensure.assert_called_once_with(repo)
+
+    def test_do_git_upgrade_goes_through_the_hook(self, tmp_path: Path):
+        """Regression guard for the whole mechanism.
+
+        Calling _ensure_local_bin_symlinks() directly from do_git_upgrade looks
+        equivalent and is silently broken: it runs the OLD release's logic, which
+        is the bug the hook exists to fix. Nothing else would catch that, because
+        both spellings behave identically whenever the code happens to be
+        unchanged — which is every test that does not simulate a pull.
+        """
+        repo = tmp_path / "repo"
+        repo.mkdir()
+
+        with patch("gateway.upgrade.subprocess.run") as run, \
+             patch("gateway.upgrade._find_uv", return_value="uv"), \
+             patch("gateway.upgrade._snapshot_context_hashes", return_value={}), \
+             patch("gateway.upgrade._sync_context_files"), \
+             patch("gateway.upgrade._ensure_local_bin_symlinks") as ensure, \
+             patch("gateway.upgrade._run_post_upgrade_hook") as hook:
+            run.return_value = MagicMock(returncode=0)
+            do_git_upgrade(repo)
+
+        hook.assert_called_once_with(repo)
+        ensure.assert_not_called()
