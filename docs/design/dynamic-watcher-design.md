@@ -134,43 +134,114 @@ Three distinct keys, deliberately:
 |---|---|
 | Watcher instance, sticky binding, per-room lock | `(connector, room_id)` |
 | Persisted state record | `(connector, room_id)` |
-| Display and CLI | `<connector>-<room_name>` |
+| Filesystem paths (system prompt, attachment workspace) | `room_id` |
+| Display and CLI | `<connector>-<room_label>` — cosmetic, never load-bearing |
 
-`room_name` is carried on the state record for display and refreshed from
+The `room_name` on the state record is the platform's own name, refreshed from
 inbound messages. **Boot and recreation resolve by `room_id`, never by the
 persisted name** — a name freed by a rename can be reused by a different
 room, and resolving by name would bind an existing session to the wrong one.
 
-Derived names need no disambiguating flag: connector names are validated
-unique at config load, so `<connector>-<room>` is unique by construction —
-**provided a connector never spans two namespaces of room names.** On
-Mattermost a channel name is unique only within a team (§6.3), so this holds
-exactly because one connector serves one team; the room *name* is really
-`(team, channel)` even though only the channel part is used. The stable
-`room_id` is the actual identity and is globally unique regardless, so a
-name collision could only ever produce a confusing display, not a
-mis-binding — but the display name is also a filesystem path component
-(below), where a collision does real damage. Hence §4.5.
+Labels need no disambiguating flag: connector names are validated unique at
+config load, so `<connector>-<label>` is unique by construction — **provided a
+connector never spans two namespaces of room names.** On Mattermost a channel
+name is unique only within a team (§6.3), so this holds exactly because one
+connector serves one team; the room *name* is really `(team, channel)` even
+though only the channel part appears in the label.
 
-**Name derivation changes to percent-encoding.** The current sanitizer
-collapses anything outside `[A-Za-z0-9._-]` to `-` and raises when the
-result is empty. Replace with: percent-encode anything outside that set;
-never raise; if the result exceeds a length cap, truncate and append a short
-`room_id` hash. The cap is required because the derived name is a filesystem
-path component in two places and percent-encoded CJK runs nine bytes per
-character.
+Because the label is cosmetic (below), a collision would produce two
+identical-looking rows and nothing worse. The reason §4.5 still forbids a
+connector spanning teams is not the label — it is that a shared bot account
+duplicates *watchers*, which is a correctness problem independent of naming.
 
-This is forward-looking rather than a present fix. Both connectors derive
-room names from platform *slugs*, and both slug character sets already sit
-inside the safe set — Mattermost's are lowercase alphanumeric plus `-`/`_`,
-RocketChat's default validation is `[0-9a-zA-Z-_.]+` — so the sanitizer is
-currently the identity function and neither collisions nor the raise are
-reachable. They become reachable with the first connector whose platform
-permits unicode channel names. The consequence is severe enough to design
-for now: the derived name keys three namespaces (the state record, the
-agent's system-prompt file, the attachment workspace symlink), and a
-collision means one session serving two rooms, a system prompt naming the
-wrong room, and an attachment path resolving into another room's files.
+#### Filesystem paths key on room_id, not on the display name
+
+Today the derived watcher name is also a path component in two places —
+`RUNTIME_DIR/system-prompts/<name>.md` and
+`{working_directory}/.acg-attachments/<name>` — which makes the display name
+load-bearing and every change to it destructive: the old file and symlink are
+orphaned, and a collision repoints one room's attachment path at another's
+files.
+
+**Both move to `room_id`.** The display name then becomes purely cosmetic:
+free to change, free to be ugly, free to be absent. This costs a little
+debugging convenience — a directory listing no longer reads as room names —
+which `list` offsets by showing both.
+
+The reason this is worth doing rather than tolerating is that *three separate
+things* all want to change the display name, and only this decoupling makes
+all three harmless at once: a channel rename, a group DM's membership
+changing (§2.7), and a re-derivation from an improved sanitizer.
+
+#### Name derivation changes to percent-encoding
+
+The current sanitizer collapses anything outside `[A-Za-z0-9._-]` to `-` and
+raises when the result is empty. Replace with: percent-encode anything outside
+that set; never raise; if the result exceeds a length cap, truncate and append
+a short `room_id` hash.
+
+With paths keyed on `room_id` the length cap is no longer a correctness
+requirement, but it stays as a sanity bound — a display name should not be
+several hundred characters wide in a table.
+
+#### What the label is, per room kind
+
+A channel has a name; the DM kinds do not, and group DMs have nothing usable
+at all (§6.4). The label is therefore derived per kind, and only the group case
+gives up on readability:
+
+| Room kind | Label | Stable? |
+|---|---|---|
+| channel / private group | the channel name | until renamed |
+| 1:1 DM | `dm-<counterpart>` | yes — a username is stable |
+| group DM | `gdm-<first 8 of a room_id hash>` | yes, by construction |
+
+**Group DMs deliberately do not encode their members in the label.** The
+tempting alternative is Mattermost's `channel_display_name`, which is exactly
+the member list — but it moves whenever membership does, it includes the bot's
+own name, its ordering is unspecified (alphabetical in the one case observed,
+but that is not a documented contract), and Rocket.Chat supplies no equivalent
+at all, so the two platforms would label the same kind of room by different
+rules.
+
+A short hash of `room_id` sidesteps all of that: identical on both platforms,
+stable for the life of the room, and short enough to type. The members are
+better presented as a **column in `list`** than crammed into an identifier —
+they are information about the room, not its name.
+
+So `list` shows the label, the room id, and for DMs the participants:
+
+```
+NAME                     ROOM ID                     STATE   PARTICIPANTS
+mm-eng-incident-42       r1o6c8a1k3d8icd931qq1n6g4y  active  —
+mm-eng-dm-alice          iwihkhk9jpf3tngp14ushkx6pe  idle    @alice
+mm-eng-gdm-a3f9c1b2      cib3hjsrgpydtf6tyac7frcu6o  active  @alice, @bob
+```
+
+`resolve()` (§2.8) accepts the label **or** the room id, so an operator always
+has a stable handle even for a room whose label is a hash — and pasting an id
+straight from `list` always works.
+
+One consequence worth stating: a Mattermost group DM's `channel_name` is itself
+a stable hash, so it *could* serve as the label. It is not used, because it is
+40 characters and Rocket.Chat has no counterpart — deriving the label from
+`room_id` on both platforms keeps one rule instead of two.
+
+Both changes above are forward-looking rather than fixes for a present fault.
+Both connectors derive room names from platform *slugs*, and both slug
+character sets already sit inside the safe set — Mattermost's are lowercase
+alphanumeric plus `-`/`_`, Rocket.Chat's default validation is
+`[0-9a-zA-Z-_.]+` — so the sanitizer is currently the identity function, and
+neither a collision nor the raise is reachable. They become reachable with the
+first connector whose platform permits unicode channel names.
+
+Note how much the decoupling reduces the stakes. Before it, a label collision
+meant one session serving two rooms, a system prompt naming the wrong room,
+and an attachment path resolving into another room's files. After it, the same
+collision produces two identical-looking rows in `list` and nothing else —
+the bindings, the paths and the sessions are all keyed on `room_id` and remain
+distinct. That is the difference between a data-leak class and a cosmetic one,
+which is why it is worth doing even though the trigger is not yet reachable.
 
 ### 2.4 Sticky binding and materialization
 
@@ -892,11 +963,12 @@ separate state file.
 Config load must reject two connectors that share a `(server_url, bot
 identity)` pair, with one exception and one condition:
 
-- **Exception — Mattermost connectors scoped to different teams.** A channel
-  name is unique only within a team (§6.3), and one connector serves one team,
-  so team-scoped connectors both disambiguate their channels and keep their
-  derived names unique. The team gate on the routing path is what enforces
-  this, which is why it is an invariant and not an optimisation.
+- **Exception — Mattermost connectors scoped to different teams.** The socket
+  spans every team the account belongs to, and two teams may hold channels of
+  the same name (§6.3, §6.4), so each connector must discard events for teams
+  other than its own. That team gate is what makes two connectors on one
+  account safe for channels — which is why it is an invariant and not an
+  optimisation.
 - **Condition — at most one of them may handle direct messages.** A DM has no
   team, so the team gate cannot separate it, and it is delivered to every
   socket the account has open (§6.3). DM handling is opt-in per rule (§2.7), so
@@ -994,7 +1066,9 @@ Records are keyed on `(connector, room_id)`. Added to each record:
 
 | Field | Purpose |
 |---|---|
-| `room_name` | display; refreshed from inbound messages |
+| `room_name` | the platform's own name, refreshed from inbound messages; empty for DMs |
+| `room_kind` | `channel` / `group` / `dm` / `group_dm` — decides the label form and whether `require_mention` applies (§2.7) |
+| `participants` | DM counterparts, for the `list` column; refreshed, never part of a key |
 | `connector`, `agent` | so a rule edit cannot silently re-point a dormant session |
 | `created_at` | audit |
 | `last_activity_at` | the idle clock (§2.5) |
@@ -1069,24 +1143,29 @@ what makes §5.1's corruption reachable.
 2. Rule parsing: patterns, include/exclude, order preservation,
    literal-only enforcement, shadowing detection.
 3. State schema and its serialization tests.
-4. Processor registration becomes reject-or-replace; capacity preflight
+4. **Re-key the system-prompt file and attachment workspace on `room_id`**
+   (§2.3). Independent of everything else, and it must land before labels can
+   change freely — which the group-DM and rename cases both require. Existing
+   installs have paths under the old names, so this needs a one-time move or a
+   documented "these become orphaned, delete them" note in the migration guide.
+5. Processor registration becomes reject-or-replace; capacity preflight
    distinguishes empty from full.
-5. The watcher manager: resolution as a pure function of (rule, room),
+6. The watcher manager: resolution as a pure function of (rule, room),
    materialization, the per-room lock, transparent recreation in `get`, the
    four-state lifecycle.
-6. Routing: connector subscribes to everything, router walks rules,
+7. Routing: connector subscribes to everything, router walks rules,
    unmatched dropped — with the pre-routing cost audit. Mattermost first,
    then RocketChat.
-7. The creation path in §2.7's ordering.
-8. `list` with its state filter, in the control server and the CLI — before
+8. The creation path in §2.7's ordering.
+9. `list` with its state filter, in the control server and the CLI — before
    the idle tick, so there is a way to observe what idling does.
-9. The idle tick, for connectors declaring unsolicited inbound.
-10. Expiry, with full reclamation.
-11. Membership-event registration (join → idle record, leave → expire). Last
+10. The idle tick, for connectors declaring unsolicited inbound.
+11. Expiry, with full reclamation.
+12. Membership-event registration (join → idle record, leave → expire). Last
     of the runtime work because it is an optimisation over the
     message-triggered path, which must be correct on its own first.
-12. Config tooling.
-13. The migration guide, shipped with the release that lands the schema
+13. Config tooling.
+14. The migration guide, shipped with the release that lands the schema
     change.
 
 ---
