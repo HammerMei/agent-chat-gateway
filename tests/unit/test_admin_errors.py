@@ -10,7 +10,12 @@ from unittest.mock import MagicMock
 
 import httpx
 
-from gateway.admin._errors import friendly_error_message, log_error_response
+from gateway.admin._errors import (
+    friendly_error_message,
+    log_error_response,
+    readback_after_write,
+)
+from gateway.admin.base import VerificationError
 
 
 def _http_status_error(status_code: int, json_body=None, text: str | None = None) -> httpx.HTTPStatusError:
@@ -79,6 +84,78 @@ class TestFriendlyErrorMessage(unittest.TestCase):
         exc = _http_status_error(400, json_body={"message": "", "error": "actual error"})
 
         self.assertEqual(friendly_error_message(exc), "actual error")
+
+
+class TestReadbackAfterWrite(unittest.TestCase):
+    """The wrapper must preserve the full response body in the log file.
+
+    Wrapping HTTPStatusError in VerificationError makes cli._run() take its
+    generic `except Exception` arm, so it never calls log_error_response()
+    itself — and read-backs routed through _get_user_or_none()/
+    _get_channel_or_none() also have the REST client's own error line suppressed
+    by quiet_expected_error(). Measured before this was fixed: the log file was
+    left at 0 bytes, losing `detailed_error` and `request_id`, the two fields
+    friendly_error_message() drops.
+    """
+
+    def _forbidden(self):
+        return _http_status_error(
+            403,
+            {
+                "id": "api.context.permissions.app_error",
+                "message": "You do not have the appropriate permissions.",
+                "detailed_error": "detail-marker",
+                "request_id": "reqid-marker",
+                "status_code": 403,
+            },
+        )
+
+    def test_logs_the_full_body_before_wrapping(self):
+        records = []
+        logger = logging.getLogger("agent-chat-gateway.admin.errors")
+
+        class _Capture(logging.Handler):
+            def emit(self, record):
+                records.append(record.getMessage())
+
+        handler = _Capture()
+        logger.addHandler(handler)
+        self.addCleanup(logger.removeHandler, handler)
+
+        with self.assertRaises(VerificationError):
+            with readback_after_write("X reported created"):
+                raise self._forbidden()
+
+        blob = "\n".join(records)
+        # The fields friendly_error_message() drops must survive somewhere.
+        self.assertIn("detail-marker", blob)
+        self.assertIn("reqid-marker", blob)
+
+    def test_message_carries_the_platform_text_and_admits_uncertainty(self):
+        with self.assertRaises(VerificationError) as ctx:
+            with readback_after_write("X reported created"):
+                raise self._forbidden()
+
+        msg = str(ctx.exception)
+        self.assertIn("X reported created", msg)
+        self.assertIn("You do not have the appropriate permissions.", msg)
+        self.assertIn("UNKNOWN", msg)
+        self.assertIn("--log-file", msg)
+        # Must not claim the write definitely landed.
+        self.assertNotIn("already been applied", msg)
+
+    def test_non_http_errors_pass_through_untouched(self):
+        # A VerificationError from the read-back's own logic is already
+        # specific and must not be reworded or re-wrapped.
+        original = VerificationError("delete_at is still unset")
+        with self.assertRaises(VerificationError) as ctx:
+            with readback_after_write("X reported deleted"):
+                raise original
+        self.assertIs(ctx.exception, original)
+
+    def test_success_path_is_transparent(self):
+        with readback_after_write("X reported created"):
+            pass  # must not raise
 
 
 class TestLogErrorResponse(unittest.TestCase):

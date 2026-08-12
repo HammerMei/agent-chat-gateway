@@ -18,6 +18,12 @@ import httpx
 
 from gateway.admin.base import VerificationError
 
+# The same logger gateway/admin/cli.py attaches its --log-file handler to
+# (by name, so there is no import cycle). Note this is NOT the REST logger
+# that quiet_expected_error() suppresses, and _error_logger has propagate=False,
+# so records written here are unaffected by either.
+_readback_logger = logging.getLogger("agent-chat-gateway.admin.errors")
+
 
 @contextlib.contextmanager
 def readback_after_write(what_the_write_reported: str):
@@ -54,17 +60,37 @@ def readback_after_write(what_the_write_reported: str):
     Only httpx.HTTPStatusError is caught — a VerificationError raised by the
     read-back's own logic (e.g. "delete_at is still unset") is already specific
     and passes through untouched.
+
+    The full response body is logged HERE, before wrapping. Wrapping in
+    VerificationError means cli._run() takes its generic `except Exception` arm
+    instead of the httpx one, so it never calls log_error_response() itself —
+    and for every read-back that goes through _get_user_or_none()/
+    _get_channel_or_none(), the REST client's own error line is suppressed too,
+    because those probes run inside quiet_expected_error(). Measured before
+    fixing: a 403 on a post-create read-back left the log file at **0 bytes**,
+    losing `detailed_error` and `request_id` — precisely the fields
+    friendly_error_message() drops. That is a hole in this package's advertised
+    contract ("short message on the console, full detail in --log-file"), so the
+    logging has to happen at the wrap site rather than relying on a caller that
+    structurally cannot reach it.
+
+    A note on the one overlap: for the few read-backs NOT routed through those
+    quieted helpers, the REST client has already logged its own 500-char
+    truncation. The entry written here is the untruncated one, so the
+    duplication costs a line and gains the whole body.
     """
     try:
         yield
     except httpx.HTTPStatusError as e:
+        log_error_response(_readback_logger, e)
         raise VerificationError(
             f"{what_the_write_reported}, but the follow-up verification request "
             f"failed: {friendly_error_message(e)} — so whether the change "
             "actually landed is UNKNOWN. Check the current state on the server "
             "before deciding whether to re-run: these platforms can report "
             "success without applying a write, and re-running may not be "
-            "idempotent if it did land."
+            "idempotent if it did land. The full API response was written to "
+            "the --log-file."
         ) from e
 
 
