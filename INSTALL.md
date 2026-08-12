@@ -22,7 +22,7 @@ curl -fsSL https://raw.githubusercontent.com/HammerMei/agent-chat-gateway/main/i
 This will:
 1. Clone the repo to `~/agent-chat-gateway`
 2. Install dependencies with `uv sync`
-3. Create a symlink at `~/.local/bin/agent-chat-gateway`
+3. Create symlinks at `~/.local/bin/agent-chat-gateway` and `~/.local/bin/acg-provision`
 4. Launch the interactive setup wizard
 
 ### Option B: AI-guided install with Claude Code
@@ -122,12 +122,20 @@ git clone https://github.com/HammerMei/agent-chat-gateway.git ~/.agent-chat-gate
 uv sync --project ~/.agent-chat-gateway/repo
 ```
 
-### 3. Create the symlink
+### 3. Create the symlinks
 
 ```bash
 mkdir -p ~/.local/bin
 ln -sf ~/.agent-chat-gateway/repo/.venv/bin/agent-chat-gateway ~/.local/bin/agent-chat-gateway
+
+# acg-provision — creates RC/Mattermost accounts and channels. Optional; skip
+# this link if you don't need it.
+ln -sf ~/.agent-chat-gateway/repo/.venv/bin/acg-provision ~/.local/bin/acg-provision
 ```
+
+> **Note:** `ln -sf` overwrites whatever is already at those paths. If you keep a
+> hand-written wrapper there, link to a different name instead — the installer
+> script refuses to clobber a non-symlink, but these manual commands will not.
 
 Add `~/.local/bin` to your PATH if needed (add to `~/.zshrc` or `~/.bashrc`):
 ```bash
@@ -184,8 +192,9 @@ This stops the daemon, runs `git pull` + `uv sync`, and restarts the daemon auto
 # Stop the daemon
 agent-chat-gateway stop
 
-# Remove the symlink
+# Remove the symlinks
 rm -f ~/.local/bin/agent-chat-gateway
+rm -f ~/.local/bin/acg-provision
 
 # Remove all data — repo, config, logs (this deletes everything!)
 rm -rf ~/.agent-chat-gateway

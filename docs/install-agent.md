@@ -33,7 +33,7 @@ This will:
 2. Clone the repo to `~/.agent-chat-gateway/repo`
 3. Install dependencies with `uv sync`
 4. Copy bundled context files to `~/.agent-chat-gateway/contexts/`
-5. Create a symlink at `~/.local/bin/agent-chat-gateway`
+5. Create symlinks at `~/.local/bin/agent-chat-gateway` and `~/.local/bin/acg-provision`
 6. Add `~/.local/bin` to PATH in `~/.bashrc` / `~/.zshrc` if needed
 
 After the installer finishes, it will print:
