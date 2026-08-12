@@ -116,11 +116,21 @@ uv sync --project "$REPO_DIR"
 # link_console_script <target> <link>
 #   Points <link> at <target>, never destroying anything the user put there.
 #
-#   already exactly this link -> nothing to do
-#   dangling symlink         -> removed (the thing it pointed at is gone; a
-#                               broken link has nothing to preserve)
-#   anything else            -> moved aside to <link>.bak (or .bak.N) and
-#                               reported, THEN replaced
+#   already exactly this link -> nothing to do. Compares the readlink TEXT, so a
+#                                relative or differently-spelled link to the same
+#                                file counts as "not ours" and gets rewritten.
+#                                (upgrade.py compares resolve() instead and would
+#                                leave it alone — same end state, one extra
+#                                rewrite here.)
+#   any other symlink        -> removed and its old target reported. Nothing is
+#                               preserved by keeping it: the file it pointed at is
+#                               untouched, and a .bak symlink would accumulate on
+#                               every re-run.
+#   a real file or directory -> moved aside to <link>.<YYYYmmddHHMMSS>.bak — or
+#                               <link>.<ts>-N.bak if that name is taken — and
+#                               reported, THEN replaced. Note the timestamp comes
+#                               BEFORE .bak: a cleanup glob is `*.bak`, never
+#                               `*.bak.*`.
 #
 #   Backing up rather than refusing is deliberate. Refusing sounds safer but
 #   leaves a worse state: install_meta.json is written unconditionally further
@@ -225,10 +235,15 @@ if ! link_console_script "$VENV_BIN" "$HOME/.local/bin/agent-chat-gateway"; then
   error "Could not install ~/.local/bin/agent-chat-gateway"
 fi
 
-# acg-provision (RC/MM account & channel provisioning). Deliberately a WARNING
-# rather than error() if absent: unlike the main entrypoint, a missing
-# provisioning CLI must not abort an otherwise-successful install — the gateway
-# itself is fully usable without it.
+# acg-provision (RC/MM account & channel provisioning). A first-class command, not
+# an optional extra: it is linked here and kept current by `agent-chat-gateway
+# upgrade`, and INSTALL.md documents both links together.
+#
+# Deliberately a WARNING rather than error() if absent, which is about INSTALL
+# CRITICALITY and not about the command being dispensable: the gateway daemon can
+# start and serve without it, so a missing or unlinkable provisioning CLI must not
+# throw away an install that otherwise succeeded. A missing ENTRYPOINT is fatal
+# because nothing works without that one.
 PROVISION_BIN="$REPO_DIR/.venv/bin/acg-provision"
 PROVISION_LINK="$HOME/.local/bin/acg-provision"
 PROVISION_LINKED=false
@@ -237,9 +252,8 @@ if [ ! -f "$PROVISION_BIN" ]; then
 elif link_console_script "$PROVISION_BIN" "$PROVISION_LINK"; then
   PROVISION_LINKED=true
 else
-  # NOT fatal, unlike the entrypoint above: the gateway is fully usable without
-  # the provisioning CLI, so a link that cannot be written must not throw away
-  # an install that otherwise succeeded.
+  # NOT fatal, unlike the entrypoint above — see the criticality note at the top
+  # of this block. The command still exists; only its PATH entry is missing.
   warn "  Run it directly at $PROVISION_BIN, or link it manually later."
 fi
 

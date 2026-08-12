@@ -191,17 +191,25 @@ def _ensure_local_bin_symlinks(repo_path: Path) -> None:
     (Only the `git` upgrade method reaches this — brew and pip manage their own
     shims.) "Present" deliberately includes a *dangling* symlink; see the gate.
 
-    What happens at an occupied destination, matching install.sh's
-    link_console_script() so the two never disagree about the same path:
+    What happens at an occupied destination, following the same policy as
+    install.sh's link_console_script():
 
-      already exactly this link  -> nothing
-      any other symlink          -> repointed, printing the old target (nothing
-                                    is preserved by keeping it — the file it
-                                    pointed at is untouched — but the change is
-                                    reported rather than silent)
-      a real file or directory   -> moved aside to <name>.<timestamp>.bak, then
-                                    linked; that cannot be reconstructed from a
-                                    printed path, so it is kept
+      a link that already RESOLVES  -> nothing. Note "resolves to the same file",
+        to the same file                not "has the same target string": the check
+                                        below compares Path.resolve(), so a
+                                        relative or differently-spelled link to
+                                        the same file is left alone here while
+                                        install.sh — which compares readlink text
+                                        — would rewrite it. Same outcome, one
+                                        needless rewrite; the two are not
+                                        byte-identical predicates.
+      any other symlink             -> repointed, printing the old target (nothing
+                                       is preserved by keeping it — the file it
+                                       pointed at is untouched — but the change is
+                                       reported rather than silent)
+      a real file or directory      -> moved aside to <name>.<timestamp>.bak, then
+                                       linked; that cannot be reconstructed from a
+                                       printed path, so it is kept
 
     Replacing a real file rather than skipping it is deliberate. Skipping looks
     safer but leaves a worse state: install_meta.json points `upgrade` at
@@ -285,26 +293,41 @@ def _ensure_local_bin_symlinks(repo_path: Path) -> None:
             # Reporting after the fact means a broken pipe can only cost the
             # MESSAGE, never the state: by this point the link exists and the
             # backup is beside it.
+            # markup=False on every line that interpolates a PATH. rich parses
+            # [...] as a style tag and drops it, so a symlink to
+            # /opt/tools[old]/bin/x was reported as /opt/tools/bin/x. That is not
+            # cosmetic here: the justification for deleting a foreign symlink
+            # instead of backing it up is that its target gets reported, and by
+            # this point the link is already gone — the printed path is the user's
+            # only record of what to restore. A plausible-looking wrong path is
+            # worse than no path.
             if displaced_target is not None:
                 console.print(
-                    f"  ~/.local/bin/{script} pointed at {displaced_target} — repointed it"
+                    f"  ~/.local/bin/{script} pointed at {displaced_target} — repointed it",
+                    markup=False,
                 )
             if displaced_backup is not None:
                 console.print(
                     "  ~/.local/bin/"
-                    f"{script} was not a symlink — backed it up as {displaced_backup.name}"
+                    f"{script} was not a symlink — backed it up as {displaced_backup.name}",
+                    markup=False,
                 )
-            console.print(f"  Linked ~/.local/bin/{script} -> {target}")
+            console.print(f"  Linked ~/.local/bin/{script} -> {target}", markup=False)
         except (OSError, RuntimeError) as e:
             # RuntimeError is not redundant: on Python 3.12 a symlink cycle makes
             # Path.resolve() raise RuntimeError("Symlink loop from ...") — which is
             # NOT an OSError subclass, so `except OSError` alone lets it escape.
             # (Verified: 3.12 raises, 3.13 returns the path without raising.)
-            # Escaping matters far more than the cosmetic traceback: this runs
-            # inside do_git_upgrade(), which run_upgrade() calls between
-            # stop_daemon() and start_daemon() with no try/finally — so an
-            # exception here strands a stopped daemon after a pull that SUCCEEDED,
-            # and skips the install_meta version bump. Honour "never fatal".
+            #
+            # This function now runs only in the post-upgrade CHILD, so an escape
+            # here does NOT strand the daemon — it exits the child non-zero and the
+            # parent warns. (An earlier version of this comment claimed otherwise;
+            # it predated the hook and was left stale by it.) The reason to catch
+            # is narrower but still real: the child is the only thing that links
+            # the console scripts, so letting it die means PATH is silently not
+            # fixed, and a partial rename would go unrolled-back. The
+            # daemon-stranding guarantee belongs to _run_post_upgrade_hook() in the
+            # parent; see issue #83 for the window it sits in.
             console.print(
                 f"  [yellow]Warning:[/yellow] could not link ~/.local/bin/{script}: {e}"
             )
@@ -313,7 +336,7 @@ def _ensure_local_bin_symlinks(repo_path: Path) -> None:
             # LESS than they started with: their working command moved into a
             # .bak and nothing on PATH. Suppressed rather than raised because
             # this handler exists to keep the function non-fatal — a failed
-            # rollback must not become the exception that strands the daemon.
+            # rollback must not turn a missing link into a lost file as well.
             with contextlib.suppress(OSError):
                 if displaced_backup is not None and displaced_backup.exists():
                     displaced_backup.rename(link)
@@ -335,9 +358,18 @@ def run_post_upgrade(repo_path: Path, from_version: str = "") -> None:
     _run_post_upgrade_hook()).
 
     `from_version` is the version recorded in install_meta.json BEFORE this
-    upgrade (or "" if unknown), so version-aware work belongs here too. It is
-    passed in rather than read from install_meta.json to keep the child from
-    depending on when the caller happens to rewrite that file.
+    upgrade, so version-aware work belongs here too. It is passed in rather than
+    read from install_meta.json to keep the child from depending on when the
+    caller happens to rewrite that file.
+
+    Two non-version values can arrive, and NEITHER is empty:
+      "unknown" — install_meta.json had no `version` key (run_upgrade's own
+                  default), so this is what the real caller sends today;
+      ""        — the calling release's bootstrap omitted the argument, which only
+                  the signature default below can produce.
+    So compare against the versions you care about (`if from_version == "0.5.1"`)
+    and never test for falsiness — `if not from_version:` misses the actual
+    unknown case, which is the one such a guard is usually reaching for.
 
     Do NOT put version-aware work in run_migrations() instead: that runs in the
     pre-pull process, so a migration added to it never executes for the upgrade

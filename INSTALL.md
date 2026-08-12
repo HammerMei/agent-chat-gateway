@@ -146,11 +146,16 @@ done
 
 ln -s ~/.agent-chat-gateway/repo/.venv/bin/agent-chat-gateway ~/.local/bin/agent-chat-gateway
 
-# acg-provision — creates RC/Mattermost accounts and channels. Optional; skip
-# this line if you don't need it.
+# acg-provision — creates Rocket.Chat / Mattermost users and channels.
 ln -s ~/.agent-chat-gateway/repo/.venv/bin/acg-provision ~/.local/bin/acg-provision
 ```
 
+> **Both commands are part of the installation.** `acg-provision` is not an
+> optional extra: `install.sh` links it alongside the gateway, and
+> `agent-chat-gateway upgrade` keeps both links current. Leaving it out here does
+> not stick — the next upgrade creates it — so link both, or link neither and use
+> `<repo>/.venv/bin/<command>` directly.
+>
 > **Note:** a real file or directory that was at either path is now
 > `<name>.<timestamp>.bak` beside it — nothing is deleted, but nothing cleans
 > those up for you either. `ls -l ~/.local/bin/*.bak` to see them.

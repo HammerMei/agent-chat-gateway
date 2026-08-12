@@ -227,6 +227,61 @@ class TestRunUpgrade:
         updated = json.loads(meta_file.read_text())
         assert updated["version"] == "0.2.0"
 
+    def test_run_upgrade_forwards_the_pre_upgrade_version(self, tmp_path: Path):
+        """The version handed to do_git_upgrade must be the one from BEFORE the bump.
+
+        This is the link 5ca8795 rests on and nothing covered it. Two mutations
+        survived the whole suite: dropping the argument (version-aware post-upgrade
+        steps then always receive ""), and moving the install_meta.json bump above
+        the call so the child receives the NEW version — the exact shape of the
+        permanently-missed-migration bug the hook exists to prevent.
+        """
+        from gateway.upgrade import run_upgrade
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "pyproject.toml").write_text('version = "0.2.0"\n')
+        meta_file = tmp_path / "install_meta.json"
+        meta_file.write_text(json.dumps({
+            "method": "git", "repo_path": str(repo), "version": "0.1.0",
+        }))
+
+        with (
+            patch("gateway.upgrade.META_FILE", meta_file),
+            patch("gateway.upgrade.is_running", return_value=(False, None)),
+            patch("gateway.upgrade.do_git_upgrade") as do_upgrade,
+        ):
+            run_upgrade()
+
+        do_upgrade.assert_called_once_with(repo, "0.1.0")
+        # And the bump really did happen afterwards, so "0.1.0" was the pre-upgrade
+        # value rather than simply a version that was never written.
+        assert json.loads(meta_file.read_text())["version"] == "0.2.0"
+
+    def test_run_upgrade_forwards_unknown_when_meta_has_no_version(self, tmp_path: Path):
+        """Pins the sentinel the caller actually sends.
+
+        run_post_upgrade's contract documents this: the unknown case arrives as the
+        literal "unknown", never as "", so a version-aware step must not test for
+        falsiness.
+        """
+        from gateway.upgrade import run_upgrade
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "pyproject.toml").write_text('version = "0.2.0"\n')
+        meta_file = tmp_path / "install_meta.json"
+        meta_file.write_text(json.dumps({"method": "git", "repo_path": str(repo)}))
+
+        with (
+            patch("gateway.upgrade.META_FILE", meta_file),
+            patch("gateway.upgrade.is_running", return_value=(False, None)),
+            patch("gateway.upgrade.do_git_upgrade") as do_upgrade,
+        ):
+            run_upgrade()
+
+        do_upgrade.assert_called_once_with(repo, "unknown")
+
     def test_run_upgrade_git_success_daemon_running(self, tmp_path: Path):
         """When daemon is running, it is stopped then restarted."""
         from gateway.upgrade import run_upgrade
@@ -1003,8 +1058,9 @@ class TestEnsureLocalBinSymlinks:
 
         assert not (local_bin / "acg-provision").exists()
 
-    def test_symlink_failure_is_not_fatal(self, tmp_path: Path):
-        # A failure here must not invalidate an upgrade that already succeeded.
+    def test_symlink_failure_is_not_fatal(self, tmp_path: Path, capsys):
+        # A failure here must not invalidate an upgrade that already succeeded —
+        # but it must SAY so, or PATH is silently left unfixed.
         home, _, repo, _ = self._setup(
             tmp_path, installed=True, scripts=("agent-chat-gateway", "acg-provision")
         )
@@ -1012,6 +1068,10 @@ class TestEnsureLocalBinSymlinks:
         with patch("gateway.upgrade.Path.home", return_value=home), \
              patch("gateway.upgrade.Path.symlink_to", side_effect=OSError("read-only fs")):
             _ensure_local_bin_symlinks(repo)  # must not raise
+
+        out = capsys.readouterr().out
+        assert "Warning" in out
+        assert "read-only fs" in out, "the cause must reach the user, not just a generic warning"
 
     def test_a_symlink_cycle_at_the_destination_is_not_fatal(self, tmp_path: Path):
         """A cyclic symlink must not escape as an exception.
@@ -1142,13 +1202,17 @@ class TestPostUpgradeHook:
         assert result.returncode == 0, result.stderr
         assert result.stdout.strip() == f"GOT {tmp_path} | 0.4.2"
 
-    def test_missing_interpreter_warns_and_does_not_spawn(self, tmp_path: Path):
+    def test_missing_interpreter_warns_and_does_not_spawn(self, tmp_path: Path, capsys):
         repo = self._repo(tmp_path, with_python=False)
 
         with patch("gateway.upgrade.subprocess.run") as run:
             _run_post_upgrade_hook(repo)
 
         run.assert_not_called()
+        # The warning is the whole user-visible contract of this branch: without it
+        # the upgrade prints a clean "Upgrade complete!" while the post-upgrade
+        # steps never ran and ~/.local/bin was never fixed.
+        assert "Warning" in capsys.readouterr().out
 
     @pytest.mark.parametrize(
         "outcome",
@@ -1159,15 +1223,22 @@ class TestPostUpgradeHook:
         ],
         ids=["nonzero-exit", "timeout", "oserror"],
     )
-    def test_failures_are_never_fatal(self, tmp_path: Path, outcome: dict):
+    def test_failures_are_never_fatal(self, tmp_path: Path, outcome: dict, capsys):
         """A pull + sync that already succeeded must not be reported as a failure,
         and nothing may escape: this runs between stop_daemon() and start_daemon()
         in run_upgrade(), which has no try/finally (issue #83), so an exception
-        here would strand a stopped daemon."""
+        here would strand a stopped daemon.
+
+        Also asserts the warning, not only the absence of an exception. Silently
+        swallowing these produces the worst outcome available: "Upgrade complete!"
+        with the post-upgrade steps never having run.
+        """
         repo = self._repo(tmp_path)
 
         with patch("gateway.upgrade.subprocess.run", **outcome):
             _run_post_upgrade_hook(repo)  # must not raise
+
+        assert "Warning" in capsys.readouterr().out
 
     def test_run_post_upgrade_ensures_the_console_script_links(self, tmp_path: Path):
         repo = tmp_path / "repo"
@@ -1207,3 +1278,34 @@ class TestPostUpgradeHook:
 
         hook.assert_called_once_with(repo, "0.5.1")
         ensure.assert_not_called()
+
+    def test_the_hook_runs_after_uv_sync_not_before(self, tmp_path: Path):
+        """Position is part of the mechanism, so pinning the call alone is not enough.
+
+        The child links whatever console scripts exist in .venv/bin. Run it before
+        `uv sync` and the pulled release's newly added scripts are not built yet, so
+        `if not target.exists(): continue` links nothing — and silently, since the
+        function warns only on failure. Verified that the previous assertions did not
+        catch this: moving the call above `_find_uv()` left the suite fully green.
+        """
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        events: list[str] = []
+
+        def record_run(argv, **kwargs):
+            events.append(f"run:{argv[0]}")
+            return MagicMock(returncode=0)
+
+        with patch("gateway.upgrade.subprocess.run", side_effect=record_run), \
+             patch("gateway.upgrade._find_uv", return_value="uv"), \
+             patch("gateway.upgrade._snapshot_context_hashes", return_value={}), \
+             patch("gateway.upgrade._sync_context_files"), \
+             patch(
+                 "gateway.upgrade._run_post_upgrade_hook",
+                 side_effect=lambda *a, **k: events.append("hook"),
+             ):
+            do_git_upgrade(repo, "0.5.1")
+
+        assert events == ["run:git", "run:uv", "hook"], (
+            f"the hook must run after both git pull and uv sync, got {events}"
+        )
