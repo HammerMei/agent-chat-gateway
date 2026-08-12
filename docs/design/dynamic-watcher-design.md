@@ -1,7 +1,8 @@
 # Dynamic watcher design
 
-Status: **design, not implemented.** Two assumptions require verification
-against live servers before implementation begins (§6).
+Status: **design, not implemented.** Both connector assumptions have been
+verified against live Rocket.Chat and Mattermost servers — see §6 for the
+observed behaviour and what it settles.
 
 ---
 
@@ -333,17 +334,24 @@ Membership events are a separate, optional capability: they register a record
 early but never start a watcher, so a connector without them behaves
 identically once the first message arrives.
 
-**Mattermost** already receives every channel the bot belongs to on one
-socket; the connector currently discards events for unknown channels. It
-needs room resolution *by id*, which it lacks.
+**Mattermost** already receives, on one socket, every channel the bot is a
+member of — and *only* those, verified in §6.2. The connector currently
+discards events for channels it has no state for; that discard becomes the
+routing hook. Because delivery follows membership, no membership gate is
+needed, and the event itself carries channel name, type and team id, so
+routing needs no REST lookup for ordinary channels.
 
 **RocketChat** can receive messages for rooms it has not per-room-subscribed
 to, using `stream-room-messages` with the reserved room id
-`__my_messages__`. The server emits every message to such subscribers,
-filters per message via a room-access check, and returns a `roomParticipant`
-flag distinguishing membership from mere readability — a signal Mattermost
-does not have and must approximate. Reaching that requires real work in the
-RC connector (§5.2) and is gated on §6.
+`__my_messages__`. Verified working in §6.1. The server emits every message
+to such subscribers, filters per message via an access check, and attaches a
+`roomParticipant` flag distinguishing membership from mere readability — here
+the gate *is* required, precisely because subscribe-all also delivers public
+channels the account can only read. The access object also carries room type
+and name, so ordinary channels need no REST lookup either; direct messages
+are the exception, since they have no name to carry. Reaching this requires
+real work in the RC connector (§5.2) — most of all splitting a key space that
+subscribe-all otherwise collapses onto a single entry.
 
 **Script and Voice have no inbound stream to discover from.** Script's
 messages arrive through direct injection that bypasses the connector
@@ -368,10 +376,12 @@ Ordering, which is where the cost and the correctness both live:
    messages, own-message echoes, and the sender/allow-list/mention gate.
    These filters are synchronous; run them with no turn store so the
    precheck does not consume the agent-chain budget.
-2. **Membership gate**: `roomParticipant` on RocketChat; on Mattermost,
-   team scope plus the allow-list precheck, treating
-   delivery-implies-membership as an assumption to verify (§6) rather than
-   a guarantee.
+2. **Membership gate**: on RocketChat, the `roomParticipant` flag the server
+   computes per message — required, since subscribe-all also delivers public
+   channels the account can merely read. On Mattermost, none is needed:
+   delivery *is* the membership signal, verified rather than assumed (§6.2).
+   Team scope is still worth checking, since one connector serves one team
+   while the socket spans the account's teams.
 3. **Creation runs off the connector's handler path**, with the triggering
    message held in a **bounded** per-room buffer and replayed into the new
    processor. Creation is expensive — room resolution, session creation, a
@@ -723,22 +733,34 @@ class Connector(ABC):
 (§2.7). Mattermost and RocketChat implement it; the base is a no-op, so a
 connector without a membership stream needs no carve-out.
 
-- **Mattermost**: add `resolve_room_by_id`; reconcile the two room-identity
-  paths (name-based resolution stores the configured string and cannot
-  report DM type; id-based resolution returns the server's name) so one
-  canonical form reaches the prompt prefix, session title and history;
-  replace the unknown-channel drop with the routing hook; hoist the
-  system-message and own-message checks above the state lookup; add channel
-  reaping.
+- **Mattermost**: replace the unknown-channel discard with the routing hook;
+  hoist the system-message and own-message checks above the state lookup
+  (both kinds are delivered, §6.2); take channel name, type and team id from
+  the event rather than a REST call, treating an empty `data.team_id` as
+  "not a team channel" (DMs) rather than a failure; use
+  `channel_display_name` for a DM's identity, since `channel_name` is the
+  opaque `<id>__<id>` form; add channel reaping. `resolve_room_by_id` is
+  still needed, but as a fallback rather than on the hot path — and adding it
+  means reconciling the two room-identity paths, since name-based resolution
+  stores the configured string and cannot report DM type while id-based
+  resolution returns the server's name, and only one form may reach the
+  prompt prefix, session title and history.
 - **RocketChat**: make `rid` authoritative rather than the DDP stream event
-  name, which today collapses every room onto one queue key; split the
-  single room-id key space into a subscription registry keyed by stream and
-  a dispatch registry keyed by room; thread the emit's access object through
-  instead of discarding it, since it carries `roomParticipant`; make
-  subscribe local-only and never send a stream-level unsubscribe from a
-  per-room call; add a system-message filter, which the REST path has and
-  the live path does not; attempt subscribe-all with a clean per-room
-  fallback when the server refuses it.
+  name — confirmed necessary, since the event name is the literal reserved id
+  and would otherwise collapse every room onto one queue and worker (§6.1);
+  split the single room-id key space into a subscription registry keyed by
+  stream and a dispatch registry keyed by room; thread the access object
+  through instead of discarding it — it carries `roomParticipant` for the
+  membership gate plus room type and name, which is what spares the routing
+  path a REST lookup; map the raw `c`/`p`/`d` type letters onto the internal
+  channel/group/dm vocabulary that history fetching depends on; resolve a DM's
+  display identity separately, since the access object omits `roomName` for
+  type `d`; **add a system-message filter to the live path** — the REST path
+  has one and the live path does not, and under subscribe-all every
+  join/leave/rename in every readable room now arrives (`t: "au"` observed);
+  make subscribe local-only and never send a stream-level unsubscribe from a
+  per-room call; attempt subscribe-all with a clean per-room fallback on
+  `nosub`.
 - **Voice**: default-deny unknown rooms; replace the busy reply for a
   routing miss; evict room state on expiry.
 - **Script**: make the reply queue per-room before a rule may match more
@@ -839,34 +861,65 @@ what makes §5.1's corruption reachable.
 
 ---
 
-## 6. Unverified assumptions
+## 6. Verified platform behaviour
 
-Both gate a connector's viability. Neither can be settled from this
-repository.
+Both connector assumptions were resolved against a live Rocket.Chat and
+Mattermost instance. Reproducible with `scripts/probe_a1_rc.py`,
+`scripts/probe_a1_rc_followup.py` and `scripts/probe_a2_mm.py`.
 
-**A1 — RocketChat's subscribe-all frame shape.** Capture one raw `changed`
-frame from a live `__my_messages__` subscription. It answers: whether the
-stream event name carries the literal reserved id or the originating room id
-(which decides whether the existing fan-out collapses every room onto one
-key); whether the message payload is still the first argument, so current
-parsing survives; and **exactly what the access object carries — if it
-includes room type and name alongside `roomParticipant`, no new REST call is
-needed on the routing path; if only `roomParticipant`, a by-id room resolver
-is mandatory.** Also worth capturing in the same session: whether own
-messages and system messages are included, and whether `roomParticipant`
-appears on every emit.
+### 6.1 Rocket.Chat: `__my_messages__` works, and carries what routing needs
 
-**A2 — Mattermost's socket scope.** Whether the socket delivers `posted`
-for exactly the channels the bot is a *member* of, across teams. This is
-currently a docstring claim with no fixture or test behind it, and the whole
-Mattermost approach rests on it. If delivery tracks readability rather than
-membership, Mattermost needs a membership gate for which it has no signal.
+The subscription is accepted (`ready`, never `nosub`) and delivers messages
+for rooms the account never per-room-subscribed to. Frame shape:
 
-Secondary, not gating: whether the decoded event's channel name, type and
-team id are reliably populated (if so, routing can skip a REST call, which
-matters for keeping work off the handler path — treat as an optimisation
-with the REST resolver as fallback); which RocketChat versions support the
-reserved subscription and whether an admin can disable it (a refusal is
-detectable at subscribe time, so a per-room fallback is safe either way);
-and which single RocketChat REST endpoint returns both room type and a
-per-user display name by id.
+```json
+{"msg":"changed","collection":"stream-room-messages","id":"id",
+ "fields":{"eventName":"__my_messages__",
+           "args":[ {...message...},
+                    {"roomParticipant":true,"roomType":"p","roomName":"sandbox"} ]}}
+```
+
+| Observed | Design consequence |
+|---|---|
+| `fields.eventName` is the **literal** `"__my_messages__"`, not the originating room id | **The key-space split is required.** Current fan-out reads `eventName or rid` with eventName winning, so every room would collapse onto one queue and worker. |
+| `args` has length 2 — message first, access object second | `args[0]` parsing survives unchanged; `args[1]` must be threaded through rather than discarded. |
+| The access object carries `roomParticipant`, `roomType` **and** `roomName` | **No by-id REST resolver is needed on the routing path** for channels and groups — type and name arrive with the message. |
+| For a DM the access object is `{"roomParticipant":true,"roomType":"d"}` — **`roomName` is absent** | A DM has no name to carry, so a display identity must be resolved another way (REST lookup, or derived from the sender). This is the one case that still needs a resolver. |
+| `roomParticipant` is `true` for a room the account belongs to and `false` for a public channel it can merely read | This is the membership gate, server-computed per message, exactly as needed. |
+| Own messages **are** delivered | Own-message filtering is required (already present). |
+| System messages **are** delivered — observed `t: "au"` for a member-added event | **A `t`-field filter is required on the live path.** Only the REST history path filters system messages today; under subscribe-all every join/leave/rename in every readable room arrives. |
+| `roomType` uses Rocket.Chat's raw letters: `c` public channel, `p` private group, `d` direct | Needs mapping to the internal `channel`/`group`/`dm` vocabulary that history fetching depends on. |
+| Second `sub` parameter `false` (what ACG sends) vs `true` (what Rocket.Chat's own SDK sends) | No observable difference in the emitted frames. No change needed. |
+
+### 6.2 Mattermost: delivery tracks membership, not readability
+
+The docstring claim holds. With the probe account a **non-member** of a public
+channel it could nonetheless read — membership lookup returning 404 while the
+channel appeared in its own visible channel list — a post in that channel
+produced **no `posted` event at all**, while posts in a channel it belonged to
+arrived normally.
+
+| Observed | Design consequence |
+|---|---|
+| No event for a readable-but-not-joined public channel | Delivery **is** the membership signal. No additional membership gate is needed, and the creation path does not need a REST membership check. |
+| `data.channel_name`, `data.channel_type` and `data.team_id` are all populated for channel posts | Routing can resolve name, type and team **from the event**, skipping a REST call — which matters for keeping work off the semaphore-held handler path. |
+| `data.team_id` is empty for DMs; `broadcast.team_id` is empty always | Use `data.team_id`, and treat empty as "not a team channel" rather than a lookup failure. |
+| DM `channel_name` is the opaque `<userid>__<userid>` form, but `channel_display_name` is the counterpart handle | Mattermost supplies a usable DM display name where Rocket.Chat does not. |
+| Own messages and system messages (`system_join_channel`, `system_leave_channel`) are delivered | Both filters are required; the existing non-empty-`type` check covers the system case. |
+
+### 6.3 Still open
+
+None of these gate the design.
+
+- **Group DMs** were not exercised on either platform. Rocket.Chat reports
+  them as type `d` like a 1:1, and Mattermost as type `G`; neither has a
+  stable display identity, which is why they are a separate opt-in (§2.7).
+- **Which Rocket.Chat versions support the reserved subscription**, and
+  whether an administrator can disable it. A refusal arrives as `nosub` at
+  subscribe time, so attempting it with a per-room fallback is safe
+  regardless; this only decides how long the fallback must be kept.
+- **Server-side cost of subscribe-all on a large workspace**, given the
+  access check runs per message per subscriber.
+- **Cross-team delivery on Mattermost** — the probe ran within a single team,
+  so "across every team the bot belongs to" is still only a docstring claim.
+  Team scope is available on the event either way (§6.2).
