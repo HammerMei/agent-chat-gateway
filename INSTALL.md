@@ -133,9 +133,13 @@ ln -sf ~/.agent-chat-gateway/repo/.venv/bin/agent-chat-gateway ~/.local/bin/agen
 ln -sf ~/.agent-chat-gateway/repo/.venv/bin/acg-provision ~/.local/bin/acg-provision
 ```
 
-> **Note:** `ln -sf` overwrites whatever is already at those paths. If you keep a
-> hand-written wrapper there, link to a different name instead — the installer
-> script refuses to clobber a non-symlink, but these manual commands will not.
+> **Note:** `ln -sf` deletes whatever is already at those paths — including a
+> hand-written wrapper of your own. If you keep one there, link to a different
+> name instead, or check the path first with `ls -l ~/.local/bin/<name>`.
+>
+> `install.sh` guards only the `acg-provision` link, where it refuses to replace
+> anything that is not a symlink. Its `agent-chat-gateway` link, and both of the
+> manual commands above, still overwrite unconditionally.
 
 Add `~/.local/bin` to your PATH if needed (add to `~/.zshrc` or `~/.bashrc`):
 ```bash
