@@ -222,6 +222,28 @@ mm-eng-gdm-a3f9c1b2      cib3hjsrgpydtf6tyac7frcu6o  active  @alice, @bob
 has a stable handle even for a room whose label is a hash — and pasting an id
 straight from `list` always works.
 
+**The participants column is not decoration; it is how a group DM is
+identified.** An opaque label is only acceptable because something else in the
+same view answers "which group is this". Removing that column later as
+redundant would leave group DMs genuinely unidentifiable, so it belongs in the
+minimum `list` output rather than behind a verbose flag. A substring filter on
+`list` (find the group containing `alice`) is the natural companion and cheap
+to add.
+
+**Second, independent route: ask the agent in the room.** The durable identity
+header supplies `**Watcher name:**` to the agent on every turn, so an agent in
+a group DM can simply be asked what its watcher name is. This is not a
+workaround — it is the agent reading its own injected identity, and it stays
+correct even if the label changes.
+
+That route only works if the header is meaningful, which forces one detail:
+**for a group DM, the header's room line carries the participants, not the
+label.** A materialized config needs *something* in its `room` field and a
+group DM has no name, so the choice is between the hash and the member list.
+The member list is strictly better here — it is what makes the agent's own
+sense of place accurate, and it is what makes the answer useful when an
+operator asks. The hash remains the label; the header describes the room.
+
 One consequence worth stating: a Mattermost group DM's `channel_name` is itself
 a stable hash, so it *could* serve as the label. It is not used, because it is
 40 characters and Rocket.Chat has no counterpart — deriving the label from
@@ -254,8 +276,10 @@ persisted config, not the current rule.
 the rule.** At creation the rule is copied and two fields are overwritten
 before anything is persisted:
 
-- `name` → the derived watcher name
-- `room` → the **concrete room name**, never the pattern
+- `name` → the derived watcher label
+- `room` → a **concrete room description**, never the pattern: the channel
+  name for a channel, the counterpart for a 1:1 DM, and the participant list
+  for a group DM, which has no name of its own (§2.3)
 
 This matters because `WatcherConfig.room` is consumed as a concrete room in
 at least five places, and the most damaging is the durable identity header
@@ -266,6 +290,14 @@ others: room resolution on the creation path and in `fetch-history`, the
 backend session title, the reported room in `list`, and the scheduler's
 label fallback. Worth an assertion and a round-trip test that a persisted
 config's `room` never contains pattern metacharacters.
+
+Note the split of duties this creates, deliberately: the **label** is a stable
+handle for addressing a watcher, while `room` is a human-meaningful
+*description* of where it lives. For a channel they coincide. For a group DM
+they diverge — label `gdm-a3f9c1b2`, room `@alice, @bob` — and the resolution
+paths that consume `room` must therefore not treat it as a lookup key. Room
+resolution already goes by `room_id` (§2.3), so the only requirement is that
+nothing regresses to resolving by this field.
 
 **`session_id` must not be settable on a rule.** Session provisioning gives
 a config-pinned session id absolute priority and returns it unconditionally,
@@ -1023,6 +1055,12 @@ class Connector(ABC):
 `MembershipHook` receives added/removed events for the bot's own membership
 (§2.7). Mattermost and RocketChat implement it; the base is a no-op, so a
 connector without a membership stream needs no carve-out.
+
+**Every path that resolves a room must take `room_id`, not a name.** Two
+callers resolve by name today — the creation path and `fetch-history` — and
+both break for a group DM, which has no name to resolve. `resolve_room_by_id`
+is what they move to; `resolve_room(name)` survives only for the one case that
+genuinely starts from a name, an eager rule with a literal room list (§2.6).
 
 - **Mattermost**: replace the unknown-channel discard with the routing hook;
   hoist the system-message and own-message checks above the state lookup
