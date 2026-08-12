@@ -29,12 +29,37 @@ class StateStore:
         """Load persisted state records, keyed by watcher_name."""
         return {ws.watcher_name: ws for ws in load_state(self._state_name)}
 
-    def save(self, states: dict[str, WatcherState]) -> None:
-        """Pull live watermarks from connector and persist all state records.
+    def save(
+        self, states: dict[str, WatcherState], *, prune: set[str] | None = None
+    ) -> None:
+        """Merge ``states`` into the persisted records and write the result.
 
-        Watermark reads are best-effort: if the connector is partially torn
+        **This merges rather than replaces.**  ``save_state`` rewrites the whole
+        file, so passing it only the caller's dict silently discards every
+        record the caller does not happen to hold — and callers routinely hold a
+        subset.  ``sync_watchers`` seeds its map only from *configured* watchers,
+        so a watcher skipped because its agent was unavailable (a fail-closed
+        guard, not a removal) or one whose start raised would have its session
+        id, watermark and paused flag erased.  Both are silent, and the session
+        id is unrecoverable.
+
+        Merging inverts that failure mode: the worst case becomes a record that
+        outlives its config, which ``config_validate`` already warns about,
+        instead of a session that cannot be resumed.
+
+        Removal is therefore explicit.  Pass ``prune`` to drop records
+        deliberately — currently only ``sync_watchers``, for watchers no longer
+        in ``config.yaml``.
+
+        Read-modify-write is safe here because this method is synchronous: it
+        contains no ``await``, so no other coroutine can interleave between the
+        read and the write.  Keep it that way.
+
+        Watermark reads are best-effort — if the connector is partially torn
         down (e.g. during shutdown), a failure for one room is logged and
-        skipped rather than aborting the entire save.
+        skipped rather than aborting the save.  Only the live records are
+        polled; a record read back from disk has no connector-side room state to
+        consult.
         """
         for ws in states.values():
             if ws.room_id:
@@ -48,4 +73,15 @@ class StateStore:
                         "persisting last known value instead",
                         ws.room_id, e,
                     )
-        save_state(self._state_name, list(states.values()))
+
+        # Start from disk so records this process never touched survive.  A
+        # corrupt or missing file loads as empty (see load_state), which
+        # degrades to the old replace behaviour rather than raising.
+        merged = self.load()
+        merged.update(states)
+
+        for name in prune or ():
+            if merged.pop(name, None) is not None:
+                logger.info("Pruned persisted state for watcher '%s'", name)
+
+        save_state(self._state_name, list(merged.values()))

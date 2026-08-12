@@ -145,21 +145,17 @@ class WatcherLifecycle:
                 logger.error(msg)
                 errors.append(msg)
 
-        # Note: state entries for watchers removed from config are not actively
-        # deleted from the persisted file here.  The next save() call (line below)
-        # only persists self._states, which only contains watchers that were
-        # started or are paused in this run — removed watchers are implicitly
-        # dropped from the next save.  Log at debug level to avoid misleading
-        # "pruning" messages when no actual deletion is performed yet.
+        # Dropping a removed watcher's state is deliberate, so say so explicitly
+        # rather than relying on its absence from self._states.  StateStore.save
+        # now merges, precisely so that a watcher we *failed* to start — or
+        # skipped because its agent was unavailable — keeps its session id
+        # instead of being erased.  That protection would also resurrect a
+        # watcher the operator genuinely deleted from config, so removal has to
+        # be named.
         config_names = {wc.name for wc in self._watcher_configs}
-        for name in list(persisted):
-            if name not in config_names:
-                logger.debug(
-                    "Watcher '%s' not in current config — will be omitted from next state save",
-                    name,
-                )
+        prune = {name for name in persisted if name not in config_names}
 
-        self._state_store.save(self._states)
+        self._state_store.save(self._states, prune=prune)
         return errors
 
     def _get_watcher_lock(self, name: str) -> asyncio.Lock:

@@ -24,6 +24,7 @@ from gateway.config import AgentConfig, WatcherConfig
 from gateway.connectors.script import ScriptConnector
 from gateway.core.config import CoreConfig
 from gateway.core.session_manager import SessionManager
+from gateway.core.state import WatcherState
 from tests.helpers import IsolatedTestCase
 
 # Patch load_state/save_state globally so tests never touch live state files.
@@ -871,6 +872,83 @@ class TestUnavailableAgentsBlocksWatchers(IsolatedTestCase):
         self.assertEqual(errors, [])
 
         await manager.shutdown()
+
+
+class TestSyncWatchersPrunesOnlyRemovedWatchers(unittest.IsolatedAsyncioTestCase):
+    """sync_watchers() must name what it deletes, and delete only that.
+
+    StateStore.save() merges, so a record the run did not touch survives on its
+    own.  That protection would also resurrect a watcher the operator deleted
+    from config, so sync_watchers has to pass an explicit prune set.  These pin
+    which names land in it — the distinction between "we chose to forget this"
+    and "we failed to start this" is exactly what used to be lost.
+    """
+
+    async def test_a_watcher_removed_from_config_is_pruned(self):
+        lc, _wcs, connector, _agent = _make_lifecycle_r14(watcher_names=["kept"])
+        lc._state_store.load = MagicMock(
+            return_value={
+                "kept": WatcherState(watcher_name="kept", session_id="s1", room_id="r1"),
+                "deleted-from-config": WatcherState(
+                    watcher_name="deleted-from-config", session_id="s2", room_id="r2"
+                ),
+            }
+        )
+
+        await lc.sync_watchers()
+
+        prune = lc._state_store.save.call_args.kwargs["prune"]
+        self.assertEqual(prune, {"deleted-from-config"})
+
+    async def test_a_watcher_skipped_for_an_unavailable_agent_is_not_pruned(self):
+        """The regression. A fail-closed skip is not a removal — its session id,
+        watermark and paused flag must all survive, and merging only saves them
+        if the name stays out of the prune set."""
+        lc, _wcs, connector, _agent = _make_lifecycle_r14(watcher_names=["blocked"])
+        lc._state_store.load = MagicMock(
+            return_value={
+                "blocked": WatcherState(
+                    watcher_name="blocked",
+                    session_id="precious-session",
+                    room_id="r1",
+                    last_processed_ts="2025-01-01T00:00:09Z",
+                )
+            }
+        )
+
+        errors = await lc.sync_watchers(unavailable_agents={"default"})
+
+        self.assertTrue(any("unavailable" in e for e in errors), "should report the skip")
+        prune = lc._state_store.save.call_args.kwargs["prune"]
+        self.assertEqual(prune, set(), "a blocked watcher must not be pruned")
+
+    async def test_a_watcher_whose_start_raised_is_not_pruned(self):
+        lc, _wcs, connector, _agent = _make_lifecycle_r14(watcher_names=["broken"])
+        lc._state_store.load = MagicMock(
+            return_value={
+                "broken": WatcherState(
+                    watcher_name="broken", session_id="precious-session", room_id="r1"
+                )
+            }
+        )
+        connector.resolve_room = AsyncMock(side_effect=RuntimeError("room gone"))
+
+        errors = await lc.sync_watchers()
+
+        self.assertTrue(any("failed to start" in e for e in errors))
+        prune = lc._state_store.save.call_args.kwargs["prune"]
+        self.assertEqual(prune, set(), "a failed start must not be pruned")
+
+    async def test_nothing_is_pruned_when_config_and_state_agree(self):
+        lc, _wcs, connector, _agent = _make_lifecycle_r14(watcher_names=["a"])
+        lc._state_store.load = MagicMock(
+            return_value={"a": WatcherState(watcher_name="a", session_id="s", room_id="r")}
+        )
+
+        await lc.sync_watchers()
+
+        self.assertEqual(lc._state_store.save.call_args.kwargs["prune"], set())
+
 
 
 if __name__ == "__main__":
