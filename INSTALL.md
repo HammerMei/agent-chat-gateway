@@ -127,17 +127,21 @@ uv sync --project ~/.agent-chat-gateway/repo
 ```bash
 mkdir -p ~/.local/bin
 
-# Move aside anything already at these paths, then link. This mirrors what
-# install.sh does, and it is why the step is not just `ln -sf`:
-#   * `ln -sf` onto a symlink that points at a DIRECTORY follows it and creates
-#     the link *inside* that directory, leaving the command path unusable.
-#   * `rm -f` does not remove a directory, so clearing the path that way fails
-#     and then `ln -s` links inside the directory for the same reason.
-#   * `mv` handles a file, a directory, and a symlink alike, and destroys nothing.
+# Clear each path, then link. Same policy as install.sh:
+#   * a real file or directory is MOVED ASIDE, because you made it and it cannot
+#     be reconstructed;
+#   * a symlink is just removed — the file it pointed at is untouched, so there
+#     is nothing to preserve, and backing links up would litter a .bak on every
+#     re-run.
+# Why not `ln -sf`, and why not `rm -f` alone: `ln -sf` onto a symlink that points
+# at a DIRECTORY follows it and creates the link *inside* that directory, and
+# `rm -f` refuses a directory outright and then `ln -s` does the same thing.
 for cmd in agent-chat-gateway acg-provision; do
-  if [ -e ~/.local/bin/"$cmd" ] || [ -L ~/.local/bin/"$cmd" ]; then
-    mv ~/.local/bin/"$cmd" ~/.local/bin/"$cmd.$(date +%Y%m%d%H%M%S).bak"
+  link=~/.local/bin/"$cmd"
+  if [ ! -L "$link" ] && [ -e "$link" ]; then
+    mv "$link" "$link.$(date +%Y%m%d%H%M%S).bak"
   fi
+  rm -f "$link"            # absent or a symlink by now, so this always works
 done
 
 ln -s ~/.agent-chat-gateway/repo/.venv/bin/agent-chat-gateway ~/.local/bin/agent-chat-gateway
@@ -147,13 +151,12 @@ ln -s ~/.agent-chat-gateway/repo/.venv/bin/agent-chat-gateway ~/.local/bin/agent
 ln -s ~/.agent-chat-gateway/repo/.venv/bin/acg-provision ~/.local/bin/acg-provision
 ```
 
-> **Note:** anything that was at those paths is now at
-> `<name>.<timestamp>.bak` in the same directory — nothing is deleted, but nothing
-> cleans those up for you either. `ls -l ~/.local/bin/*.bak` to see them.
+> **Note:** a real file or directory that was at either path is now
+> `<name>.<timestamp>.bak` beside it — nothing is deleted, but nothing cleans
+> those up for you either. `ls -l ~/.local/bin/*.bak` to see them.
 >
-> `install.sh` applies the same policy with one difference: it repoints an existing
-> **symlink** instead of backing it up (printing the old target), because a symlink
-> has nothing to preserve — the file it pointed at is untouched.
+> Re-running the block is safe: the second run finds a symlink it created itself,
+> removes it, and links again, so it never backs up its own work.
 
 Add `~/.local/bin` to your PATH if needed (add to `~/.zshrc` or `~/.bashrc`):
 ```bash
@@ -209,17 +212,26 @@ post-upgrade steps, and restarts the daemon automatically.
 > after upgrading, link it once:
 >
 > ```bash
+> # Ask the installer where it actually put the repo. Do NOT assume
+> # ~/.agent-chat-gateway/repo: running `./install.sh` from a local checkout uses
+> # that checkout as the repo and records it here, and those are exactly the
+> # installs this note is for.
+> repo=$(python3 -c 'import json,pathlib; print(json.loads((pathlib.Path.home()/".agent-chat-gateway/install_meta.json").read_text())["repo_path"])')
+> echo "$repo"
+>
 > link=~/.local/bin/acg-provision
-> # Move aside, don't rm: `rm -f` refuses a directory, and `ln -s` would then
-> # create the link inside it. Same form as "Create the symlinks" above.
-> if [ -e "$link" ] || [ -L "$link" ]; then
+> # Same policy as install.sh: move a real file/directory aside, but just remove a
+> # symlink (nothing to preserve, and this way re-running never backs up its own
+> # link into the same timestamped name).
+> if [ ! -L "$link" ] && [ -e "$link" ]; then
 >   mv "$link" "$link.$(date +%Y%m%d%H%M%S).bak"
 > fi
-> ln -s ~/.agent-chat-gateway/repo/.venv/bin/acg-provision "$link"
+> rm -f "$link"
+> ln -s "$repo/.venv/bin/acg-provision" "$link"
 > ```
 >
-> Or run it without linking anything at all:
-> `~/.agent-chat-gateway/repo/.venv/bin/python -m gateway.admin --help`.
+> Or run it without linking anything at all — same `$repo` as above:
+> `"$repo/.venv/bin/python" -m gateway.admin --help`.
 > Later upgrades handle new commands on their own.
 
 ---
