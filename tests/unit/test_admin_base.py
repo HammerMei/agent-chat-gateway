@@ -8,8 +8,10 @@ import unittest
 
 from gateway.admin.base import (
     AdminChannel,
+    AdminError,
     AdminUser,
     ChannelAlreadyExistsError,
+    ChannelArchivedError,
     PlatformAdmin,
     UserAlreadyExistsError,
     emails_match,
@@ -110,6 +112,25 @@ class TestExceptionPayloads(unittest.TestCase):
         self.assertEqual(err.name, "general")
         self.assertIs(err.existing, existing)
         self.assertIn("general", str(err))
+
+
+class TestArchivedChannelError(unittest.TestCase):
+    def test_is_not_a_channel_already_exists_subclass(self):
+        # Load-bearing, same as UserDeactivatedError: cli.py catches
+        # ChannelAlreadyExistsError and prints an idempotent "skipping" with
+        # exit 0. Subclassing would silently reinstate the bug.
+        self.assertFalse(issubclass(ChannelArchivedError, ChannelAlreadyExistsError))
+        self.assertTrue(issubclass(ChannelArchivedError, AdminError))
+
+    def test_carries_the_existing_channel_and_says_archived(self):
+        existing = AdminChannel(id="c1", name="eng", is_private=False, archived=True)
+        err = ChannelArchivedError("eng", existing=existing)
+        self.assertEqual(err.name, "eng")
+        self.assertIs(err.existing, existing)
+        self.assertIn("archived", str(err))
+
+    def test_archived_defaults_false_and_is_keyword_safe(self):
+        self.assertFalse(AdminChannel(id="c1", name="eng", is_private=False).archived)
 
 
 class _DummyAdmin(PlatformAdmin):

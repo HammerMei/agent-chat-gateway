@@ -24,9 +24,11 @@ from gateway.admin.base import (
     AdminChannel,
     AdminUser,
     ChannelAlreadyExistsError,
+    ChannelArchivedError,
     ChannelNotFoundError,
     PlatformAdmin,
     UserAlreadyExistsError,
+    UserDeactivatedError,
     UserNotFoundError,
     VerificationError,
 )
@@ -68,6 +70,14 @@ class RocketChatAdmin(PlatformAdmin):
     ) -> AdminUser:
         existing = await self._get_user_or_none(username)
         if existing is not None:
+            if existing.deactivated:
+                # Same rule as Mattermost: an existing-but-deactivated account
+                # means the requested "an active user exists" state was NOT
+                # achieved, so it must not be reported as an idempotent skip.
+                # Unlike MM this state is never self-inflicted (RC's
+                # delete_user hard-deletes), so it always comes from an admin
+                # having deactivated the account out-of-band.
+                raise UserDeactivatedError(username, existing=existing)
             # RC has no team/repair concept, so identity_matches doesn't
             # gate any action here the way it does for Mattermost — it's
             # still computed and passed through so the CLI layer (which
@@ -105,11 +115,31 @@ class RocketChatAdmin(PlatformAdmin):
                 f"Rocket.Chat reported user '{username}' created but a "
                 "read-back lookup could not find it."
             )
+        if created.deactivated:
+            # First-run false success, not just a re-run concern: with
+            # Accounts_ManuallyApproveNewUsers enabled, users.create succeeds
+            # but the account is created INACTIVE and cannot log in. Reporting
+            # "Created user X" + exit 0 there is exactly the silent wrong
+            # state VerificationError exists to prevent.
+            raise VerificationError(
+                f"Rocket.Chat user '{username}' was created but is not active — "
+                "the server is likely configured with "
+                "Accounts_ManuallyApproveNewUsers, so the account cannot log in "
+                "until an admin approves it."
+            )
         return created
 
     async def create_channel(self, name: str, *, is_private: bool = False) -> AdminChannel:
         existing = await self._get_channel_or_none(name)
         if existing is not None:
+            if existing.archived:
+                # Checked before the already-exists path: an archived channel
+                # means the requested usable-channel state was NOT achieved, so
+                # it must not be reported as an idempotent skip. See
+                # ChannelArchivedError (which is deliberately not a
+                # ChannelAlreadyExistsError subclass, or cli.py would swallow
+                # it back into exit 0).
+                raise ChannelArchivedError(name, existing=existing)
             raise ChannelAlreadyExistsError(name, existing=existing)
 
         endpoint = "groups.create" if is_private else "channels.create"
@@ -162,7 +192,17 @@ class RocketChatAdmin(PlatformAdmin):
 
         members_endpoint = "groups.members" if channel.is_private else "channels.members"
         with readback_after_write(f"'{username}' was added to channel '{channel_name}'"):
-            is_member = await self._is_channel_member(members_endpoint, channel.id, username)
+            # user.username, NOT the caller's input: the invite above is keyed
+            # on the immutable user.id, so it succeeds even when the string the
+            # caller passed isn't the account's canonical username (an account
+            # renamed between the lookup and here, or an id passed where a
+            # username was expected). Matching the member list against the raw
+            # input would then report a VerificationError for a membership that
+            # was in fact created. Same principle as matching every address in
+            # AdminUser.emails rather than emails[0].
+            is_member = await self._is_channel_member(
+                members_endpoint, channel.id, user.username
+            )
         if not is_member:
             raise VerificationError(
                 f"Added '{username}' to channel '{channel_name}' but a "
@@ -241,6 +281,12 @@ class RocketChatAdmin(PlatformAdmin):
         return AdminUser(
             id=user["_id"],
             username=user["username"],
+            # RC admins can deactivate an account without deleting it, and
+            # `users.create` itself yields an INACTIVE account when the server
+            # has Accounts_ManuallyApproveNewUsers on. Discarding this made
+            # both the "already exists" skip and the post-create read-back
+            # report success over an account that cannot log in.
+            deactivated=user.get("active") is False,
             # First address stays the display/primary one, matching what RC
             # itself presents; matching no longer depends on this choice.
             email=addresses[0] if addresses else "",
@@ -255,7 +301,13 @@ class RocketChatAdmin(PlatformAdmin):
                 )
             if result.get("success") and "channel" in result:
                 ch = result["channel"]
-                return AdminChannel(id=ch["_id"], name=ch.get("name", name), is_private=False)
+                return AdminChannel(
+                    id=ch["_id"], name=ch.get("name", name), is_private=False,
+                    # RC omits `archived` entirely on non-archived rooms, so a
+                    # plain .get() (not a truthiness check on a default) is the
+                    # correct read here.
+                    archived=bool(ch.get("archived")),
+                )
         except httpx.HTTPStatusError as e:
             if e.response.status_code not in _NOT_FOUND_STATUSES:
                 raise
@@ -267,7 +319,10 @@ class RocketChatAdmin(PlatformAdmin):
                 )
             if result.get("success") and "group" in result:
                 grp = result["group"]
-                return AdminChannel(id=grp["_id"], name=grp.get("name", name), is_private=True)
+                return AdminChannel(
+                    id=grp["_id"], name=grp.get("name", name), is_private=True,
+                    archived=bool(grp.get("archived")),
+                )
         except httpx.HTTPStatusError as e:
             if e.response.status_code not in _NOT_FOUND_STATUSES:
                 raise

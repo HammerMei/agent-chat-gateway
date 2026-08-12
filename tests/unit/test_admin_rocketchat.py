@@ -16,8 +16,10 @@ import httpx
 
 from gateway.admin.base import (
     ChannelAlreadyExistsError,
+    ChannelArchivedError,
     ChannelNotFoundError,
     UserAlreadyExistsError,
+    UserDeactivatedError,
     UserNotFoundError,
     VerificationError,
 )
@@ -230,6 +232,153 @@ class TestCreateUser(unittest.IsolatedAsyncioTestCase):
             await admin.create_user("alice", "a@x.com", "pw")
 
 
+class TestDeactivatedRocketChatUsers(unittest.IsolatedAsyncioTestCase):
+    """RC exposes `active`; discarding it made both the already-exists skip and
+    the post-create read-back claim success over an account that cannot log in."""
+
+    async def test_active_state_is_propagated_from_users_info(self):
+        admin = _admin_with_mock_rest()
+        admin._rest._request = AsyncMock(
+            return_value={
+                "success": True,
+                "user": {"_id": "u1", "username": "alice", "emails": [], "active": False},
+            }
+        )
+
+        user = await admin._get_user_or_none("alice")
+
+        self.assertTrue(user.deactivated)
+
+    async def test_active_true_is_not_reported_as_deactivated(self):
+        admin = _admin_with_mock_rest()
+        admin._rest._request = AsyncMock(
+            return_value={
+                "success": True,
+                "user": {"_id": "u1", "username": "alice", "emails": [], "active": True},
+            }
+        )
+
+        user = await admin._get_user_or_none("alice")
+
+        self.assertFalse(user.deactivated)
+
+    async def test_missing_active_field_is_not_reported_as_deactivated(self):
+        # Only an explicit `active: false` counts — an absent field must not
+        # be read as deactivated.
+        admin = _admin_with_mock_rest()
+        admin._rest._request = AsyncMock(
+            return_value={
+                "success": True,
+                "user": {"_id": "u1", "username": "alice", "emails": []},
+            }
+        )
+
+        user = await admin._get_user_or_none("alice")
+
+        self.assertFalse(user.deactivated)
+
+    async def test_existing_deactivated_user_raises_instead_of_skipping(self):
+        admin = _admin_with_mock_rest()
+        admin._rest._request = AsyncMock(
+            return_value={
+                "success": True,
+                "user": {"_id": "u1", "username": "alice", "emails": [], "active": False},
+            }
+        )
+
+        with self.assertRaises(UserDeactivatedError) as ctx:
+            await admin.create_user("alice", "a@x.com", "pw")
+        self.assertTrue(ctx.exception.existing.deactivated)
+
+    async def test_newly_created_but_inactive_account_is_a_verification_error(self):
+        """The worse half: a FIRST-run false success.
+
+        With Accounts_ManuallyApproveNewUsers enabled, users.create succeeds but
+        the account is created inactive, so the old code printed
+        "Created user alice" and exited 0 over an account that cannot log in.
+        """
+        admin = _admin_with_mock_rest()
+        admin._rest._request = AsyncMock(
+            side_effect=[
+                _http_error(400),  # pre-check: does not exist
+                {"success": True, "user": {"_id": "u1", "username": "alice", "emails": []}},
+                # read-back: created, but inactive
+                {
+                    "success": True,
+                    "user": {"_id": "u1", "username": "alice", "emails": [], "active": False},
+                },
+            ]
+        )
+
+        with self.assertRaises(VerificationError) as ctx:
+            await admin.create_user("alice", "a@x.com", "pw")
+        self.assertIn("not active", str(ctx.exception))
+        self.assertIn("ManuallyApproveNewUsers", str(ctx.exception))
+
+
+class TestArchivedRocketChatChannels(unittest.IsolatedAsyncioTestCase):
+    async def test_archived_state_is_propagated_for_public_channels(self):
+        admin = _admin_with_mock_rest()
+        admin._rest._request = AsyncMock(
+            return_value={
+                "success": True,
+                "channel": {"_id": "c1", "name": "eng", "archived": True},
+            }
+        )
+
+        channel = await admin._get_channel_or_none("eng")
+
+        self.assertTrue(channel.archived)
+        self.assertFalse(channel.is_private)
+
+    async def test_archived_state_is_propagated_for_private_groups(self):
+        admin = _admin_with_mock_rest()
+        admin._rest._request = AsyncMock(
+            side_effect=[
+                _http_error(400),  # channels.info miss
+                {"success": True, "group": {"_id": "g1", "name": "secret", "archived": True}},
+            ]
+        )
+
+        channel = await admin._get_channel_or_none("secret")
+
+        self.assertTrue(channel.archived)
+        self.assertTrue(channel.is_private)
+
+    async def test_absent_archived_field_means_not_archived(self):
+        # RC omits `archived` entirely on live rooms.
+        admin = _admin_with_mock_rest()
+        admin._rest._request = AsyncMock(
+            return_value={"success": True, "channel": {"_id": "c1", "name": "eng"}}
+        )
+
+        channel = await admin._get_channel_or_none("eng")
+
+        self.assertFalse(channel.archived)
+
+    async def test_create_channel_over_an_archived_channel_raises(self):
+        admin = _admin_with_mock_rest()
+        admin._rest._request = AsyncMock(
+            return_value={
+                "success": True,
+                "channel": {"_id": "c1", "name": "eng", "archived": True},
+            }
+        )
+
+        with self.assertRaises(ChannelArchivedError) as ctx:
+            await admin.create_channel("eng")
+        self.assertTrue(ctx.exception.existing.archived)
+
+    async def test_live_channel_still_takes_the_already_exists_path(self):
+        admin = _admin_with_mock_rest()
+        admin._rest._request = AsyncMock(
+            return_value={"success": True, "channel": {"_id": "c1", "name": "eng"}}
+        )
+
+        with self.assertRaises(ChannelAlreadyExistsError):
+            await admin.create_channel("eng")
+
+
 class TestCreateChannel(unittest.IsolatedAsyncioTestCase):
     async def test_public_channel_uses_channels_create(self):
         admin = _admin_with_mock_rest()
@@ -334,6 +483,26 @@ class TestAddUserToChannel(unittest.IsolatedAsyncioTestCase):
         )
 
         await admin.add_user_to_channel("alice", "eng")  # must not raise
+
+    async def test_membership_is_verified_by_the_resolved_username(self):
+        # The invite is keyed on the immutable user.id, so it succeeds even when
+        # the caller's string isn't the account's canonical username. Verifying
+        # against the raw input would then report a VerificationError for a
+        # membership that WAS created.
+        admin = _admin_with_mock_rest()
+        admin._rest._request = AsyncMock(
+            side_effect=[
+                # users.info resolves to a different canonical username
+                {"success": True,
+                 "user": {"_id": "u1", "username": "canonical.alice", "emails": []}},
+                {"success": True, "channel": {"_id": "c1", "name": "eng"}},
+                {"success": True},  # channels.invite
+                # member list carries the canonical username, not the input
+                {"success": True, "members": [{"username": "canonical.alice"}]},
+            ]
+        )
+
+        await admin.add_user_to_channel("u1", "eng")  # must not raise
 
     async def test_400_without_already_in_body_still_raises(self):
         admin = _admin_with_mock_rest()

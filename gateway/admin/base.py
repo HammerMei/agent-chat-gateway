@@ -107,13 +107,18 @@ class UserDeactivatedError(AdminError):
     it and reinstate the exact bug this exists to fix — a CLI reporting
     success for an account that cannot log in.
 
-    Reachable using nothing but this tool's own documented commands, in its
-    own primary workflow: MattermostAdmin.delete_user() only SOFT-deactivates
-    (Mattermost's DELETE /users/{id} sets delete_at rather than removing the
-    row), and Mattermost's username lookup still returns soft-deleted
-    accounts — so `delete-user bob` followed by `create-user bob ...` while
-    reseeding a lab environment would otherwise report a clean skip over a
-    dead account.
+    Reachable on BOTH platforms, for different reasons:
+
+    - Mattermost, self-inflicted: delete_user() only SOFT-deactivates (DELETE
+      /users/{id} sets delete_at rather than removing the row) and the username
+      lookup still returns such accounts, so `delete-user bob` then
+      `create-user bob ...` while reseeding would otherwise report a clean skip
+      over a dead account.
+    - Rocket.Chat, out-of-band: delete_user() there hard-deletes, so this state
+      only arises from an admin deactivating the account (`active: false`)
+      directly. RocketChatAdmin ALSO raises this from its post-create read-back,
+      because a server with Accounts_ManuallyApproveNewUsers creates accounts
+      inactive — a first-run false success, not merely a re-run concern.
 
     Does NOT auto-reactivate: silently resurrecting an account someone
     deliberately deactivated is a bigger surprise than failing loudly, and
@@ -133,6 +138,51 @@ class UserDeactivatedError(AdminError):
 
 class ChannelNotFoundError(AdminError):
     """Raised when an operation references a channel name that does not exist."""
+
+
+class ChannelArchivedError(AdminError):
+    """Raised by create_channel() when the name belongs to an existing but
+    ARCHIVED channel, so the requested "a usable channel exists" state was not
+    achieved.
+
+    Subclasses AdminError directly and deliberately NOT
+    ChannelAlreadyExistsError — for the same reason UserDeactivatedError does
+    not subclass UserAlreadyExistsError: gateway/admin/cli.py catches that and
+    prints an idempotent "already exists — skipping" with exit 0, so
+    subclassing would silently reinstate the bug this exists to report.
+
+    Rocket.Chat only. Archiving is a normal one-click RC admin action, but this
+    tool cannot create the state itself (its RC delete_channel hard-deletes),
+    so it always originates out-of-band. Mattermost is unaffected: its channel
+    lookup hits GET teams/{id}/channels/name/{name}, whose include_deleted
+    parameter defaults to false, so an archived MM channel simply 404s and
+    create_channel proceeds normally.
+
+    UNCONFIRMED PREMISE, stated plainly: this only ever fires if RC's
+    channels.info/groups.info actually RETURN an archived room (carrying
+    ``archived: true``) rather than reporting it as not-found. That could not be
+    confirmed from RC's public docs, and the behavior was never observed against
+    a live server — only against a stubbed transport, which assumes the very
+    response shape in question. If RC instead reports archived rooms as
+    not-found, this branch is simply unreachable and create_channel proceeds to
+    channels.create, which fails loudly on the name collision — an acceptable
+    outcome, and the reason shipping this guard is safe either way. Settle it
+    with one command against a live server if it ever matters:
+    archive a channel, then run `create-channel <that name>`.
+
+    Does NOT auto-unarchive, matching UserDeactivatedError's reasoning:
+    silently resurrecting something an admin deliberately archived is a bigger
+    surprise than failing loudly.
+    """
+
+    def __init__(self, name: str, existing: "AdminChannel"):
+        super().__init__(
+            f"Channel '{name}' already exists but is archived (id={existing.id}) — "
+            "the requested usable-channel state was not achieved. Unarchive it on "
+            "the server, or pick a different name."
+        )
+        self.name = name
+        self.existing = existing
 
 
 class VerificationError(AdminError):
@@ -155,12 +205,14 @@ class AdminUser:
     # Primary/display address. Used in human-facing messages; identity
     # matching must go through matches_email(), never this field alone.
     email: str
-    # Whether the platform reports this account as deactivated/soft-deleted.
+    # Whether the platform reports this account as deactivated/inactive.
     # Defaults False and is keyword-safe for every existing construction site.
-    # Only Mattermost populates it today (its delete_user() soft-deactivates,
-    # and its username lookup still returns such accounts — see
-    # UserDeactivatedError); Rocket.Chat's delete_user() hard-deletes, so a
-    # deleted RC account simply stops resolving.
+    # Populated by BOTH admins: Mattermost from delete_at (its delete_user()
+    # soft-deactivates and its lookup still returns such accounts), Rocket.Chat
+    # from `active: false`. RC's delete_user() does hard-delete, so a *deleted*
+    # RC account stops resolving entirely — but a *deactivated* one still
+    # resolves, and RC also creates inactive accounts when the server has
+    # Accounts_ManuallyApproveNewUsers. See UserDeactivatedError.
     deactivated: bool = False
     # EVERY address the platform reports for this account, not just the first.
     # Rocket.Chat's users.info returns `emails` as an array and an account can
@@ -197,6 +249,11 @@ class AdminChannel:
     id: str
     name: str
     is_private: bool
+    # Whether the platform reports this channel as archived. Defaults False
+    # and is keyword-safe at every existing construction site. Rocket.Chat
+    # only — see ChannelArchivedError for why Mattermost cannot reach this
+    # state through this tool's lookup.
+    archived: bool = False
 
 
 class PlatformAdmin(ABC):

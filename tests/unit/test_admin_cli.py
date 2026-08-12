@@ -26,6 +26,7 @@ from gateway.admin.base import (
     AdminChannel,
     AdminUser,
     ChannelAlreadyExistsError,
+    ChannelArchivedError,
     UserAlreadyExistsError,
     UserDeactivatedError,
     UserNotFoundError,
@@ -238,6 +239,30 @@ class TestRunDispatch(unittest.IsolatedAsyncioTestCase):
             code = await _run(args)
 
         self.assertEqual(code, 0)
+
+    async def test_create_channel_archived_is_an_error_not_a_skip(self):
+        # End-to-end proof of the property ChannelArchivedError's docstring
+        # relies on: because it is NOT a ChannelAlreadyExistsError subclass, it
+        # falls through to _run()'s broad handler and exits 1 rather than being
+        # reported as an idempotent skip over an unusable channel.
+        mock_admin = AsyncMock()
+        existing = AdminChannel(id="c1", name="eng", is_private=False, archived=True)
+        mock_admin.create_channel = AsyncMock(
+            side_effect=ChannelArchivedError("eng", existing=existing)
+        )
+        stderr = io.StringIO()
+        with patch("gateway.admin.cli.load_profiles", return_value={}), \
+             patch("gateway.admin.cli.get_profile", return_value=object()), \
+             patch("gateway.admin.cli.admin_factory", return_value=mock_admin), \
+             contextlib.redirect_stderr(stderr):
+            args = _args(["p", "create-channel", "eng"])
+            code = await _run(args)
+
+        self.assertEqual(code, 1)
+        output = stderr.getvalue()
+        self.assertIn("archived", output)
+        self.assertNotIn("skipping", output)
+        mock_admin.close.assert_awaited_once()
 
     async def test_not_found_error_returns_1_and_still_closes(self):
         mock_admin = AsyncMock()
