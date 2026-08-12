@@ -825,3 +825,33 @@ class TestEnsureLocalBinSymlinks:
         with patch("gateway.upgrade.Path.home", return_value=home), \
              patch("gateway.upgrade.Path.symlink_to", side_effect=OSError("read-only fs")):
             _ensure_local_bin_symlinks(repo)  # must not raise
+
+    def test_a_symlink_cycle_at_the_destination_is_not_fatal(self, tmp_path: Path):
+        """A cyclic symlink must not escape as an exception.
+
+        Path.resolve() is version-dependent here: on Python 3.12 a cycle raises
+        RuntimeError("Symlink loop from ..."), which is NOT an OSError subclass;
+        on 3.13 it returns the path without raising. This project supports both,
+        so the only assertion that is meaningful on both legs is the contract
+        itself: the call returns instead of propagating. Deliberately does NOT
+        assert on console output or on the resulting link state — those legitimately
+        differ between 3.12 (warns, leaves the cycle) and 3.13 (falls through and
+        relinks), and pinning either would red one CI leg for no defect.
+
+        Why it matters beyond a stray traceback: this runs inside do_git_upgrade(),
+        which run_upgrade() calls between stop_daemon() and start_daemon() with no
+        try/finally — so anything escaping here leaves the daemon stopped after a
+        pull that already succeeded.
+        """
+        home, local_bin, repo, _ = self._setup(
+            tmp_path, installed=True, scripts=("agent-chat-gateway", "acg-provision")
+        )
+        # Two symlinks pointing at each other => resolving either one loops.
+        a = local_bin / "acg-provision"
+        b = local_bin / "acg-provision-cycle"
+        a.symlink_to(b)
+        b.symlink_to(a)
+        assert a.is_symlink()
+
+        with patch("gateway.upgrade.Path.home", return_value=home):
+            _ensure_local_bin_symlinks(repo)  # must not raise on any Python we support

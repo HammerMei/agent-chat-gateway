@@ -195,7 +195,16 @@ def _ensure_local_bin_symlinks(repo_path: Path) -> None:
             link.unlink(missing_ok=True)
             link.symlink_to(target)
             console.print(f"  Linked ~/.local/bin/{script} -> {target}")
-        except OSError as e:
+        except (OSError, RuntimeError) as e:
+            # RuntimeError is not redundant: on Python 3.12 a symlink cycle makes
+            # Path.resolve() raise RuntimeError("Symlink loop from ...") — which is
+            # NOT an OSError subclass, so `except OSError` alone lets it escape.
+            # (Verified: 3.12 raises, 3.13 returns the path without raising.)
+            # Escaping matters far more than the cosmetic traceback: this runs
+            # inside do_git_upgrade(), which run_upgrade() calls between
+            # stop_daemon() and start_daemon() with no try/finally — so an
+            # exception here strands a stopped daemon after a pull that SUCCEEDED,
+            # and skips the install_meta version bump. Honour "never fatal".
             console.print(
                 f"  [yellow]Warning:[/yellow] could not link ~/.local/bin/{script}: {e}"
             )

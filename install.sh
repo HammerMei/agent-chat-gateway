@@ -127,11 +127,25 @@ success "Symlink created: ~/.local/bin/agent-chat-gateway → $VENV_BIN"
 # provisioning CLI must not abort an otherwise-successful install — the gateway
 # itself is fully usable without it.
 PROVISION_BIN="$REPO_DIR/.venv/bin/acg-provision"
-if [ -f "$PROVISION_BIN" ]; then
-  ln -sf "$PROVISION_BIN" "$HOME/.local/bin/acg-provision"
-  success "Symlink created: ~/.local/bin/acg-provision → $PROVISION_BIN"
-else
+PROVISION_LINK="$HOME/.local/bin/acg-provision"
+PROVISION_LINKED=false
+if [ ! -f "$PROVISION_BIN" ]; then
   warn "acg-provision not found at $PROVISION_BIN — skipping its symlink."
+elif [ -e "$PROVISION_LINK" ] && [ ! -L "$PROVISION_LINK" ]; then
+  # Something that is NOT a symlink already occupies the destination — almost
+  # certainly a hand-written wrapper (e.g. one that pins a specific interpreter).
+  # `ln -sf` would delete it with no trace, so refuse and tell the user instead.
+  # Warned here rather than skipped silently as in upgrade.py's helper: an
+  # install is a rare, deliberate act, so a one-off notice is signal, whereas
+  # the same message on every routine upgrade would be noise.
+  # A *broken* symlink deliberately falls through to the relink below
+  # ( -e is false / -L is true for it), since replacing it loses nothing.
+  warn "$PROVISION_LINK already exists and is not a symlink — leaving it untouched."
+  warn "  Remove it and re-run this installer if you want the managed symlink."
+else
+  ln -sf "$PROVISION_BIN" "$PROVISION_LINK"
+  PROVISION_LINKED=true
+  success "Symlink created: ~/.local/bin/acg-provision → $PROVISION_BIN"
 fi
 
 # ---------------------------------------------------------------------------
@@ -220,8 +234,12 @@ success "Installation complete!"
 printf '\n'
 printf '  Repository cloned to:    ~/.agent-chat-gateway/repo\n'
 printf '  Executable installed at: ~/.local/bin/agent-chat-gateway\n'
-if [ -f "$PROVISION_BIN" ]; then
+if [ "$PROVISION_LINKED" = true ]; then
   printf '  Provisioning CLI:        ~/.local/bin/acg-provision\n'
+elif [ -f "$PROVISION_BIN" ]; then
+  # Built but not linked (destination occupied) — point at the real binary so
+  # the command is still discoverable.
+  printf '  Provisioning CLI:        %s\n' "$PROVISION_BIN"
 fi
 printf '\n'
 printf '  To use agent-chat-gateway in your current shell, run:\n'
