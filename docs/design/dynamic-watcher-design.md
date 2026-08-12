@@ -440,13 +440,84 @@ the sender is wrong — it would change with whoever speaks.
 
 Two things make DMs structurally unlike channels, both verified in §6.3:
 
-- **A DM has no team**, so it arrives with an empty team id and the
-  Mattermost team gate cannot classify it. The gate must treat "no team" as
-  "not a team channel, evaluate on its own merits" rather than as a
-  non-matching team — otherwise enabling the gate silently disables DMs.
-- **A DM reaches every socket the bot account has open**, so exactly one
-  connector per account may own DM handling (§4.5). Without that, a bot
-  serving two teams answers every DM twice.
+- **A DM has no team**, so the Mattermost team gate cannot classify it.
+- **A DM reaches every socket the bot account has open.** There is nothing to
+  withhold at the transport: Mattermost has no per-room subscribe on the wire
+  at all — `subscribe_room` is pure in-memory bookkeeping with zero I/O — and
+  the server pushes account-level events to every session. So two connectors
+  sharing an account *both* receive every DM, unavoidably, and the
+  de-duplication has to happen in routing.
+
+**DMs cannot be expressed as a name pattern.** Mattermost's DM
+`channel_name` is the opaque `<userid>__<userid>` form and Rocket.Chat omits
+the room name for DMs entirely, so no `include:` pattern can match one on
+either platform. They need a distinct key:
+
+```yaml
+connectors:
+  - name: mm-eng                     # same bot account, different teams
+    type: mattermost
+    server_url: https://mm.example.com
+    team: eng
+    username: acg-bot
+  - name: mm-sales
+    type: mattermost
+    server_url: https://mm.example.com
+    team: sales
+    username: acg-bot
+
+watchers:
+  - name: eng-channels
+    connector: mm-eng
+    agent: claude-eng
+    rooms:
+      include: ["eng-*", "incident-*"]
+      exclude: ["eng-archive"]
+
+  - name: direct-messages            # exactly one rule per bot account
+    connector: mm-eng                # may opt into DMs
+    agent: claude-assistant
+    rooms:
+      direct: true                   # 1:1 DMs. Default false.
+      # group_direct: true           # separate opt-in — no stable identity
+
+  - name: sales-channels
+    connector: mm-sales
+    agent: claude-sales
+    rooms:
+      include: ["sales-*"]
+      # no `direct:` key, so mm-sales never routes a DM
+```
+
+**The opt-in is the gate.** Routing classifies the room first, then applies
+the gate that fits it:
+
+```
+inbound message
+├─ DM?  (channel type D/G, or Rocket.Chat room type d)
+│    └─ any rule on THIS connector with rooms.direct / group_direct?
+│         yes → first such rule
+│         no  → drop
+└─ team channel?
+     └─ event's team == this connector's team?
+          no  → drop
+          yes → first rule whose include/exclude matches the channel name
+```
+
+Classifying before gating avoids a "an empty team id means pass" special
+case, which is subtle and easy to regress.
+
+So in the example above `mm-sales` receives every DM on its socket and drops
+each one, because none of its rules opts in — no special-case code, just an
+absence of a matching rule. The config-load check in §4.5 is therefore not
+what makes the normal path correct; it exists to catch the *misconfiguration*
+where an operator sets `direct: true` under both connectors of one account,
+which routing alone cannot detect since each connector sees only its own
+rules.
+
+A DM-only connector is not expressible as an alternative: `team` is a
+required field on a Mattermost connector, so DM ownership has to attach to one
+of the team connectors.
 
 #### Membership events: register on join, do not start
 
@@ -843,6 +914,8 @@ presence.
 
 - `watchers[].room` / `.rooms` → `watchers[].rooms.include` /
   `.rooms.exclude`, patterns, order-significant.
+- New `watchers[].rooms.direct` and `.group_direct` booleans, both defaulting
+  to false — DMs cannot be matched by name pattern on either platform (§2.7).
 - `session_idle_days` / `session_expire_days` move from the agent to the
   rule, so two rules sharing an agent can differ.
 - `session_id` rejected on a rule.
