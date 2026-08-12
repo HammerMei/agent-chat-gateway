@@ -328,24 +328,37 @@ def _ensure_local_bin_symlinks(repo_path: Path) -> None:
             # fixed, and a partial rename would go unrolled-back. The
             # daemon-stranding guarantee belongs to _run_post_upgrade_hook() in the
             # parent; see issue #83 for the window it sits in.
-            console.print(
-                f"  [yellow]Warning:[/yellow] could not link ~/.local/bin/{script}: {e}"
-            )
-            # Put back whatever was displaced. Without this, a failure between
-            # clearing the destination and creating the link leaves the user with
-            # LESS than they started with: their working command moved into a
-            # .bak and nothing on PATH. Suppressed rather than raised because
-            # this handler exists to keep the function non-fatal — a failed
-            # rollback must not turn a missing link into a lost file as well.
+            # ROLL BACK FIRST, REPORT SECOND — for exactly the reason the success
+            # path above reports last. A print here can raise SystemExit on a broken
+            # pipe, and SystemExit is a BaseException, so it would skip the rollback
+            # entirely and leave the user's command in a .bak with nothing on PATH:
+            # the same data loss, reached through the failure path instead of the
+            # happy one. Restoring before printing means the worst a dead reader can
+            # do is hide the explanation.
+            #
+            # Without this rollback at all, a failure between clearing the
+            # destination and creating the link leaves the user with LESS than they
+            # started with. Suppressed rather than raised because a failed rollback
+            # must not turn a missing link into a lost file as well.
+            restored = ""
             with contextlib.suppress(OSError):
                 if displaced_backup is not None and displaced_backup.exists():
                     displaced_backup.rename(link)
-                    console.print(f"  Restored the previous ~/.local/bin/{script}")
+                    restored = "file"
                 elif displaced_target is not None and not link.is_symlink():
                     link.symlink_to(displaced_target)
-                    console.print(
-                        f"  Restored ~/.local/bin/{script} -> {displaced_target}"
-                    )
+                    restored = "link"
+
+            console.print(
+                f"  [yellow]Warning:[/yellow] could not link ~/.local/bin/{script}: {e}"
+            )
+            if restored == "file":
+                console.print(f"  Restored the previous ~/.local/bin/{script}")
+            elif restored == "link":
+                console.print(
+                    f"  Restored ~/.local/bin/{script} -> {displaced_target}",
+                    markup=False,
+                )
 
 
 def run_post_upgrade(repo_path: Path, from_version: str = "") -> None:

@@ -994,6 +994,33 @@ class TestEnsureLocalBinSymlinks:
         assert len(backups) == 1, f"expected the backup to survive, got {backups}"
         assert backups[0].read_text() == "# my own wrapper\n"
 
+    def test_rollback_completes_before_the_failure_is_reported(self, tmp_path: Path):
+        """The failure path carried the same hazard the success path was fixed for.
+
+        Both conditions together, and each is independently plausible: symlink_to()
+        fails after the rename (read-only fs, no inodes), and the warning print then
+        hits a broken pipe. SystemExit is a BaseException, so reporting before
+        restoring skipped the rollback and left the command only in the .bak — the
+        identical data loss, reached through the error handler instead of the happy
+        path. State first, message second, on both paths.
+        """
+        home, local_bin, repo, _ = self._setup(
+            tmp_path, installed=True, scripts=("agent-chat-gateway", "acg-provision")
+        )
+        own = local_bin / "acg-provision"
+        own.write_text("# my own wrapper\n")
+
+        with patch("gateway.upgrade.Path.home", return_value=home), \
+             patch("gateway.upgrade.Path.symlink_to", side_effect=OSError("read-only fs")), \
+             patch("gateway.upgrade.console.print", side_effect=SystemExit(1)), \
+             pytest.raises(SystemExit):
+            _ensure_local_bin_symlinks(repo)
+
+        assert own.exists(), "the wrapper was not restored before the failing print"
+        assert not own.is_symlink()
+        assert own.read_text() == "# my own wrapper\n"
+        assert list(local_bin.glob("acg-provision.*.bak")) == [], "backup left behind"
+
     def test_backups_do_not_clobber_each_other(self, tmp_path: Path):
         """Two runs must not have the second backup overwrite the first.
 
