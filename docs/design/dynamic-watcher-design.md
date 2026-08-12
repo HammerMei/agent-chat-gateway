@@ -103,11 +103,45 @@ never unsubscribes for lifecycle reasons. Per inbound message:
 
 ```
 message → connector (no lifecycle knowledge)
-        → router: first matching rule, in config order
+        → router: resolve a RoomRef (id, kind, name-or-participants)
+        → first matching rule, in config order
             no match  → drop
-            match     → manager.get_or_create(connector, room_id)
+            match     → manager.get_or_create(connector, room_ref)
                           → deliver
 ```
+
+**Resolving the `RoomRef` is not always synchronous, and that shapes the
+flow.** Mattermost supplies everything on the event — id, type, name, and for
+a DM the counterpart via `channel_display_name` — so its resolution is pure
+local work. Rocket.Chat supplies id and a type letter, but reports **both** DM
+kinds as `d` (§6.4), so distinguishing a 1:1 from a group DM needs a
+participant lookup over REST.
+
+That matters because the kind is needed *before* rule matching: a rule with
+`direct: true` and no `group_direct` must not match a group DM. So on
+Rocket.Chat even the decision to **drop** a DM can require a network call,
+which cannot sit on the semaphore-held handler path (§2.7). The ordering is
+therefore:
+
+1. Cheap synchronous rejects that need no room metadata at all — own-message
+   echoes, system messages, the sender allow-list.
+2. Classify. Free on Mattermost. On Rocket.Chat, if the room is type `d` and
+   its kind is not already cached, hand off to the off-handler task with the
+   message buffered, and classify there.
+3. Match rules against the now-known kind, then create or drop.
+
+Two consequences to implement deliberately:
+
+- **Cache the kind per room id.** A room's kind does not change, with one
+  exception: a 1:1 DM that gains members becomes a group DM, which must
+  invalidate rather than be served stale (§6.4).
+- **A drop decided *after* classification still has to account for the
+  message.** The trigger's dedup id was registered optimistically before the
+  handler; a post-classification drop is a *deliberate* outcome, so the id
+  stays registered and the watermark advances — unlike a creation *failure*,
+  where both must be rolled back so the message can be redelivered (§2.7).
+  Conflating the two either re-delivers dropped messages forever or silently
+  loses failed ones.
 
 An unmatched message is dropped deliberately. The connector knows nothing
 about watcher lifecycle, which is both the correct separation and the reason
@@ -244,6 +278,15 @@ The member list is strictly better here — it is what makes the agent's own
 sense of place accurate, and it is what makes the answer useful when an
 operator asks. The hash remains the label; the header describes the room.
 
+**The header sources that description from the state record, not the frozen
+config.** The materialized config is a snapshot taken at creation (§2.4), so a
+group DM whose membership later changes would keep announcing its original
+members forever. `state.participants` is refreshed from inbound messages, so
+reading the header from there keeps the agent's stated sense of place true —
+which matters precisely because that header is also the "ask the agent which
+watcher this is" affordance. The frozen copy in the config stays as the drift
+baseline it exists to be; it is not what gets shown.
+
 One consequence worth stating: a Mattermost group DM's `channel_name` is itself
 a stable hash, so it *could* serve as the label. It is not used, because it is
 40 characters and Rocket.Chat has no counterpart — deriving the label from
@@ -378,6 +421,14 @@ message.
 expired. Once config no longer names rooms, pause is the only durable way to
 mute one, so expiring a paused record would erase an explicit instruction.
 For the same reason, `reset` must not silently clear `paused`.
+
+**A room the gateway has never seen cannot be paused.** Pause acts on a
+record, and an unobserved room has none — no id, no kind, nothing to key on.
+The request is rejected with a message pointing at the rule's `exclude:` list,
+which is where "never engage with this room" belongs: declarative, effective
+before the first message rather than after it, and not dependent on the room
+having been observed. (Today's behaviour is to fabricate an empty record for
+such a name; §5.3 covers retiring those.)
 
 **Resume returns a paused watcher to active and restarts its clock.**
 `last_activity_at` is set at the moment of resume, so a watcher paused for
@@ -768,20 +819,48 @@ one; they never drive creation, idling or expiry.
 ```python
 WatcherKey = tuple[str, str]          # (connector, room_id)
 
+class RoomKind(Enum):
+    CHANNEL = "channel"      # public channel
+    GROUP = "group"          # private group
+    DM = "dm"                # 1:1 direct message
+    GROUP_DM = "group_dm"    # multi-party direct message
+
+@dataclass(frozen=True)
+class RoomRef:
+    """Everything creation needs about a room, resolved once by the caller.
+
+    `name` is the platform's own name and is empty for both DM kinds.
+    `participants` is populated for the DM kinds and empty otherwise. Between
+    them they supply the label (§2.3), the materialized config's room
+    description (§2.4) and the state record's room_kind/participants (§5.3) —
+    which is why this is a struct and not a name string.
+    """
+    id: str
+    kind: RoomKind
+    name: str = ""
+    participants: tuple[str, ...] = ()
+
 class WatcherManager:
     # resolution — the only place a display reference becomes a key
     def resolve(self, ref: str, connector: str | None = None) -> WatcherKey
-        """Accepts a derived display name, or a room name/id plus a
-        connector. Raises on unknown or ambiguous input."""
+        """Accepts a label, or a room name/id plus a connector. Raises on
+        unknown or ambiguous input."""
 
     # the two ways to obtain a watcher
     async def get(self, key: WatcherKey) -> Watcher | None
         """A READY watcher. Recreates from the persisted record if the
         watcher is idle — callers never observe idleness. Returns None only
-        when there is no record and no matching rule."""
-    async def get_or_create(self, key: WatcherKey, room_name: str) -> Watcher | None
+        when there is no record and no matching rule. Needs no RoomRef: a
+        record already carries everything recreation requires."""
+    async def get_or_create(self, connector: str, room: RoomRef) -> Watcher | None
         """As get(), and additionally creates a first-ever watcher from a
-        matching rule. The message path. None when no rule matches."""
+        matching rule. The message path. None when no rule matches.
+
+        Takes a RoomRef rather than a key plus a name because creating a
+        watcher requires the room's kind and participants, not just its id:
+        the kind selects the label form and decides whether require_mention
+        applies, and for a group DM the participants ARE the room's
+        description. The key is (connector, room.id)."""
 
     # views and verbs
     def list(self, state: StateFilter = StateFilter.OPERABLE) -> list[WatcherView]
@@ -790,6 +869,13 @@ class WatcherManager:
     async def reset(self, key: WatcherKey) -> None
     async def expire(self, key: WatcherKey) -> None
 ```
+
+The asymmetry between the two getters is deliberate and worth stating: `get`
+works from a key alone because a persisted record is self-sufficient, while
+`get_or_create` needs a `RoomRef` because there is nothing persisted yet to
+read the room's kind out of. That places the burden of resolving room metadata
+on the routing layer, which is where the platform-specific knowledge already
+lives (§2.2) — the manager stays connector-agnostic.
 
 **Idleness is invisible to callers.** `get` returns a watcher that is ready
 to use; if the record is idle it is recreated first. There is deliberately
@@ -1092,6 +1178,13 @@ genuinely starts from a name, an eager rule with a literal room list (§2.6).
   make subscribe local-only and never send a stream-level unsubscribe from a
   per-room call; attempt subscribe-all with a clean per-room fallback on
   `nosub`.
+- **Both message filters**: the mention requirement is currently skipped on
+  the test `room_type != "dm"`, which was written when `dm` meant 1:1. With
+  `group_dm` as a distinct kind (§2.7), that test must send `group_dm` down
+  the **mention-required** side — otherwise the agent answers every message
+  from anyone in a group chat, which is the behaviour the whole 1:1/group
+  distinction exists to prevent. Small change, easy to miss, and the reason
+  the distinction is not merely cosmetic.
 - **Voice**: default-deny unknown rooms; replace the busy reply for a
   routing miss; evict room state on expiry.
 - **Script**: make the reply queue per-room before a rule may match more
@@ -1123,6 +1216,47 @@ addition here carries one.
 `config` and `rule` are both nested structures rather than scalars, so the
 serialization test must cover nesting and the empty/absent cases, not just
 presence.
+
+#### Migrating existing state files
+
+Re-keying from `watcher_name` to `(connector, room_id)` makes this a new
+on-disk format, so first boot after the upgrade must handle the old one.
+Unlike the config migration (§5.4), this **is** automatic — an operator cannot
+reasonably hand-edit runtime state, and the alternative is silently losing
+every live session.
+
+It is mechanical, because the information needed is already present: legacy
+records carry `room_id`, and the connector comes from the file name
+(`state.<connector>.json`). So the new key is derivable with no network calls
+and no guessing. Fields the old format lacks take conservative defaults:
+
+| New field | Value for a migrated record |
+|---|---|
+| `room_kind` | inferred from the existing `room_type`, which already distinguishes channel / group / dm; a legacy `dm` becomes `dm` (never `group_dm`, since the old model could not name one) |
+| `participants` | empty, and refilled on the next inbound message |
+| `created_at` | the migration timestamp, flagged as unknown rather than fabricated |
+| `last_activity_at` | seeded from `last_processed_ts` — the closest available truth, and it errs toward "recently active", which delays reclamation rather than hastening it |
+| `dropped_at` | empty, so every migrated record is treated as active and gets recreated at boot, matching today's behaviour |
+| `config`, `rule`, `rule_name` | empty. A migrated watcher has no originating rule, so it recreates from its own config until it next materializes — see below |
+
+**One legacy shape cannot be migrated: a record with an empty `room_id`.**
+That is produced by pausing a name that had never started, which fabricates a
+record with no session and no room. It has no room identity to re-key on.
+
+Its fate: **dropped, with a warning naming each one**, and the same decision
+answers the open question of whether pausing an unseen room is expressible at
+all — it is not. Nothing of value is lost (such a record holds neither a
+session nor a watermark, only the intent), and the intent has a better home
+under this design: a room the gateway should never engage with belongs in a
+rule's `exclude:` list, which is declarative, survives restarts, and does not
+require the room to have been observed first. Pre-emptive `pause` on an
+unseen room is therefore rejected with a message pointing at `exclude:`.
+
+**Migrated records have no `rule`, which the drift check must tolerate.** A
+record whose `rule_name` is empty predates rules entirely, so §2.4's
+comparison has no baseline to diff against. Treat it as "adopted, unknown
+provenance" and leave it alone rather than reporting spurious drift; it
+acquires a rule the first time it is legitimately re-materialized.
 
 ### 5.4 Config schema
 
@@ -1180,7 +1314,10 @@ what makes §5.1's corruption reachable.
 1. §5.1 prerequisites.
 2. Rule parsing: patterns, include/exclude, order preservation,
    literal-only enforcement, shadowing detection.
-3. State schema and its serialization tests.
+3. State schema, its serialization tests, and the automatic migration of
+   existing state files (§5.3) — including a test that a legacy record with a
+   populated `room_id` re-keys losslessly and one that an empty-`room_id`
+   record is dropped with a warning rather than crashing the load.
 4. **Re-key the system-prompt file and attachment workspace on `room_id`**
    (§2.3). Independent of everything else, and it must land before labels can
    change freely — which the group-DM and rename cases both require. Existing
