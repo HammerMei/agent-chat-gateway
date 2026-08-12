@@ -128,31 +128,37 @@ uv sync --project ~/.agent-chat-gateway/repo
 mkdir -p ~/.local/bin
 repo=~/.agent-chat-gateway/repo
 
-# Same policy as install.sh, one command at a time:
-#   * a real file or directory is MOVED ASIDE, because you made it and it cannot
-#     be reconstructed;
-#   * a symlink is just removed — the file it pointed at is untouched, so there
-#     is nothing to preserve, and backing links up would litter a .bak on every
-#     re-run.
-# Why not `ln -sf`, and why not `rm -f` alone: `ln -sf` onto a symlink that points
-# at a DIRECTORY follows it and creates the link *inside* that directory, and
-# `rm -f` refuses a directory outright and then `ln -s` does the same thing.
+# Deliberately refuses rather than replaces: it never moves or deletes anything, so
+# there is no state in which your command could go missing. If a path is occupied,
+# it shows you what is there and leaves it alone — decide yourself, then re-run.
 for cmd in agent-chat-gateway acg-provision; do
   link=~/.local/bin/"$cmd"
-  if [ ! -L "$link" ] && [ -e "$link" ]; then
-    # `|| continue` is the important part: if the backup cannot be made, skip this
-    # command entirely. Without it the `rm -f` below still runs and deletes the very
-    # file the move was meant to preserve.
-    mv "$link" "$link.$(date +%Y%m%d%H%M%S).bak" || {
-      echo "skipped $cmd: could not back up $link"; continue
-    }
+  if [ -e "$link" ] || [ -L "$link" ]; then
+    echo "already exists, leaving it alone:"
+    ls -ld "$link"
+    continue
   fi
-  rm -f "$link" && ln -s "$repo/.venv/bin/$cmd" "$link"
+  ln -s "$repo/.venv/bin/$cmd" "$link"
 done
 ```
 
 `acg-provision` creates Rocket.Chat / Mattermost users and channels; the loop links
 it alongside the gateway.
+
+> **Occupied path?** Look at what `ls -ld` printed. A stale symlink can just be
+> deleted (`rm ~/.local/bin/<name>`) — the file it pointed at is untouched. Something
+> you wrote should be moved somewhere you choose, not deleted. Then re-run the block.
+>
+> `install.sh` does replace an occupied path — it moves a real file to
+> `<name>.<timestamp>.bak` and reports where it went. This block does not try to
+> match that: a snippet pasted into a shell cannot be made reliably transactional,
+> and refusing is both shorter and impossible to get wrong.
+>
+> **If a link ends up missing or wrong** — a full disk, a read-only home, an
+> interrupted run — nothing here needs unpicking by hand. Re-run `bash install.sh`
+> from the repo, or `agent-chat-gateway upgrade` on an existing install: both are
+> idempotent and will put the links right. `ls -l ~/.local/bin/*.bak` shows anything
+> that was moved aside.
 
 > **Both commands are part of the installation.** `acg-provision` is not an
 > optional extra: `install.sh` links it alongside the gateway, and
@@ -237,21 +243,12 @@ post-upgrade steps, and restarts the daemon automatically.
 > echo "$bin"          # sanity-check this before continuing
 >
 > link=~/.local/bin/acg-provision
-> backed_up=yes
-> # Same policy as install.sh: move a real file/directory aside, but just remove a
-> # symlink (nothing to preserve, and this way re-running never backs up its own
-> # link into the same timestamped name).
-> if [ ! -L "$link" ] && [ -e "$link" ]; then
->   mv "$link" "$link.$(date +%Y%m%d%H%M%S).bak" || backed_up=no
-> fi
->
-> # Only replace what was successfully preserved — otherwise the `rm -f` would
-> # delete the very file the move was meant to save.
-> if [ "$backed_up" = yes ]; then
->   rm -f "$link"
->   ln -s "$bin/acg-provision" "$link"
+> # Refuses rather than replaces, like the manual setup block above: nothing is moved
+> # or deleted, so nothing can go missing.
+> if [ -e "$link" ] || [ -L "$link" ]; then
+>   echo "already exists, leaving it alone:"; ls -ld "$link"
 > else
->   echo "could not back up $link — left it alone, nothing changed"
+>   ln -s "$bin/acg-provision" "$link"
 > fi
 > ```
 >
