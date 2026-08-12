@@ -909,6 +909,36 @@ class TestEnsureLocalBinSymlinks:
         assert link.readlink() == foreign
         assert foreign.read_text() == "#!/bin/sh\n"
 
+    def test_a_broken_pipe_cannot_cost_the_user_their_command(self, tmp_path: Path):
+        """A dead stdout reader may cost the MESSAGE, never the state.
+
+        rich's Console.print() raises SystemExit(1) when stdout is a broken pipe.
+        SystemExit is a BaseException, so `except (OSError, RuntimeError)` does not
+        catch it and the rollback does not run. With a print between rename() and
+        symlink_to(), `agent-chat-gateway upgrade | head -4` left the user's own
+        wrapper in a .bak with nothing on PATH — silently, because SystemExit(1)
+        prints nothing. Hence all filesystem work happens before any output.
+
+        Asserts state, not ordering, so it stays true if the messages are reworded:
+        whatever the print does, the link must exist and the backup must survive.
+        """
+        home, local_bin, repo, venv_bin = self._setup(
+            tmp_path, installed=True, scripts=("agent-chat-gateway", "acg-provision")
+        )
+        own = local_bin / "acg-provision"
+        own.write_text("# my own wrapper\n")
+
+        with patch("gateway.upgrade.Path.home", return_value=home), \
+             patch("gateway.upgrade.console.print", side_effect=SystemExit(1)), \
+             pytest.raises(SystemExit):
+            _ensure_local_bin_symlinks(repo)
+
+        assert own.is_symlink(), "link was not created before the failing print"
+        assert own.resolve() == (venv_bin / "acg-provision").resolve()
+        backups = list(local_bin.glob("acg-provision.*.bak"))
+        assert len(backups) == 1, f"expected the backup to survive, got {backups}"
+        assert backups[0].read_text() == "# my own wrapper\n"
+
     def test_backups_do_not_clobber_each_other(self, tmp_path: Path):
         """Two runs must not have the second backup overwrite the first.
 

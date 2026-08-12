@@ -249,9 +249,6 @@ def _ensure_local_bin_symlinks(repo_path: Path) -> None:
                 # prints something useful for a dangling or looping link — and
                 # needs no new import.
                 displaced_target = link.readlink()
-                console.print(
-                    f"  ~/.local/bin/{script} pointed at {displaced_target} — repointing it"
-                )
             elif link.exists():
                 # A real file or directory the user made by hand (observed in
                 # the wild: a wrapper setting PYTHONPATH and pinning a specific
@@ -265,12 +262,38 @@ def _ensure_local_bin_symlinks(repo_path: Path) -> None:
                 # command working and still loses nothing.
                 displaced_backup = _backup_path(link)
                 link.rename(displaced_backup)
+            link.unlink(missing_ok=True)
+            link.symlink_to(target)
+
+            # Everything above is filesystem work with NO stdout writes, and that
+            # ordering is load-bearing rather than stylistic.
+            #
+            # rich's Console.print() raises SystemExit(1) when stdout is a broken
+            # pipe (on_broken_pipe(), reached from _check_buffer's BrokenPipeError
+            # handler). SystemExit is a BaseException, so `except (OSError,
+            # RuntimeError)` below does NOT catch it and the rollback never runs.
+            # With a print between rename() and symlink_to(), `agent-chat-gateway
+            # upgrade | head -4` left the user's own wrapper in a .bak with NOTHING
+            # on PATH, silently — SystemExit(1) prints nothing at all. Reproduced
+            # end to end on 3.12 and 3.13.
+            #
+            # It is reachable rather than theoretical: real `uv sync` writes 0
+            # bytes to stdout, so from "Running uv sync ..." until here there are
+            # no stdout writes for seconds — ample time for a reader to go away
+            # (`| less` then q, an ssh drop, a dying tee).
+            #
+            # Reporting after the fact means a broken pipe can only cost the
+            # MESSAGE, never the state: by this point the link exists and the
+            # backup is beside it.
+            if displaced_target is not None:
+                console.print(
+                    f"  ~/.local/bin/{script} pointed at {displaced_target} — repointed it"
+                )
+            if displaced_backup is not None:
                 console.print(
                     "  ~/.local/bin/"
                     f"{script} was not a symlink — backed it up as {displaced_backup.name}"
                 )
-            link.unlink(missing_ok=True)
-            link.symlink_to(target)
             console.print(f"  Linked ~/.local/bin/{script} -> {target}")
         except (OSError, RuntimeError) as e:
             # RuntimeError is not redundant: on Python 3.12 a symlink cycle makes
