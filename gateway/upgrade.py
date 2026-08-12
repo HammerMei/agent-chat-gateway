@@ -148,6 +148,25 @@ def _find_uv() -> str:
 _LOCAL_BIN_SCRIPTS = ("agent-chat-gateway", "acg-provision")
 
 
+def _backup_path(link: Path) -> Path:
+    """Return an unused `<link>.<timestamp>.bak` path next to `link`.
+
+    Timestamped so repeated upgrades accumulate distinct backups rather than one
+    clobbering the next. The collision suffix only matters for two runs inside
+    the same second, but Path.rename() overwrites silently on POSIX, and losing
+    an earlier backup is exactly the data loss the caller is trying to avoid.
+    """
+    from datetime import datetime
+
+    stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    candidate = link.with_name(f"{link.name}.{stamp}.bak")
+    n = 1
+    while candidate.exists() or candidate.is_symlink():
+        candidate = link.with_name(f"{link.name}.{stamp}-{n}.bak")
+        n += 1
+    return candidate
+
+
 def _ensure_local_bin_symlinks(repo_path: Path) -> None:
     """Ensure ~/.local/bin has a symlink for each console script.
 
@@ -165,6 +184,25 @@ def _ensure_local_bin_symlinks(repo_path: Path) -> None:
     manual-venv install would suddenly acquire symlinks it never asked for.
     (Only the `git` upgrade method reaches this — brew and pip manage their own
     shims.) "Present" deliberately includes a *dangling* symlink; see the gate.
+
+    What happens at an occupied destination, matching install.sh's
+    link_console_script() so the two never disagree about the same path:
+
+      already exactly this link  -> nothing
+      any other symlink          -> repointed, printing the old target (nothing
+                                    is preserved by keeping it — the file it
+                                    pointed at is untouched — but the change is
+                                    reported rather than silent)
+      a real file or directory   -> moved aside to <name>.<timestamp>.bak, then
+                                    linked; that cannot be reconstructed from a
+                                    printed path, so it is kept
+
+    Replacing a real file rather than skipping it is deliberate. Skipping looks
+    safer but leaves a worse state: install_meta.json points `upgrade` at
+    repo_path while PATH runs the occupant, so the tool manages a repo whose code
+    never executes. Backing up keeps the managed command working and still loses
+    nothing. Nothing else cleans up the .bak files; INSTALL.md's uninstall
+    section tells the user to look for them.
 
     Stale symlinks are re-pointed, which covers the repo-moved case — including
     when the move left the old symlink dangling rather than merely stale.
@@ -193,15 +231,32 @@ def _ensure_local_bin_symlinks(repo_path: Path) -> None:
             if link.is_symlink():
                 if link.resolve() == target.resolve():
                     continue  # already correct
+                # A symlink, but not ours. Replace it — nothing is preserved by
+                # keeping it, since the file it points at is untouched and a
+                # stale .bak symlink is pure litter — but REPORT what it was.
+                # The objection to the old behaviour was the silence, not the
+                # replacement. Path.readlink(), not resolve(), so this still
+                # prints something useful for a dangling or looping link — and
+                # needs no new import.
+                console.print(
+                    f"  ~/.local/bin/{script} pointed at {link.readlink()} — repointing it"
+                )
             elif link.exists():
-                # A regular file, not a symlink — e.g. a hand-written wrapper
-                # (observed in the wild: one that sets PYTHONPATH and pins a
-                # specific interpreter). The command is already reachable on
-                # PATH, which is the entire goal here, so there is nothing to
-                # do. Skipped SILENTLY on purpose: replacing it would be
-                # destructive, and warning about a working setup on every
-                # single upgrade is noise about a non-problem.
-                continue
+                # A real file or directory the user made by hand (observed in
+                # the wild: a wrapper setting PYTHONPATH and pinning a specific
+                # interpreter). Unlike a symlink this cannot be reconstructed
+                # from a printed path, so it is moved aside rather than deleted.
+                #
+                # Replacing rather than skipping is deliberate. Skipping leaves
+                # a worse state than it looks: install_meta.json points `upgrade`
+                # at repo_path while PATH runs the occupant, so the tool manages
+                # a repo whose code never executes. Backing up keeps the managed
+                # command working and still loses nothing.
+                backup = _backup_path(link)
+                link.rename(backup)
+                console.print(
+                    f"  ~/.local/bin/{script} was not a symlink — backed it up as {backup.name}"
+                )
             link.unlink(missing_ok=True)
             link.symlink_to(target)
             console.print(f"  Linked ~/.local/bin/{script} -> {target}")

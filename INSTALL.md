@@ -141,12 +141,13 @@ ln -s ~/.agent-chat-gateway/repo/.venv/bin/acg-provision ~/.local/bin/acg-provis
 
 > **Note:** those `rm -f` lines delete whatever is already at those paths —
 > including a hand-written wrapper of your own. Check first with
-> `ls -l ~/.local/bin/agent-chat-gateway ~/.local/bin/acg-provision`, and link to
-> a different name if you want to keep what is there.
+> `ls -l ~/.local/bin/agent-chat-gateway ~/.local/bin/acg-provision`.
 >
-> `install.sh` is stricter than these manual commands: for `acg-provision` it
-> refuses to replace anything that is not a symlink. Its `agent-chat-gateway`
-> link still overwrites unconditionally.
+> `install.sh` is safer than these manual commands. For **both** links, if the
+> destination is a real file or directory rather than a symlink, it moves it aside
+> to `<name>.<timestamp>.bak` before creating the link, and tells you where it
+> went. An existing symlink is repointed (and the old target printed), since a
+> symlink has nothing to preserve.
 
 Add `~/.local/bin` to your PATH if needed (add to `~/.zshrc` or `~/.bashrc`):
 ```bash
@@ -205,10 +206,13 @@ agent-chat-gateway stop
 
 # Remove the symlinks this install created. The -L test leaves a hand-written
 # wrapper of your own at either path alone — uninstalling should remove what was
-# installed, not something you wrote. (install.sh itself only refuses to replace
-# a non-symlink for acg-provision; see the note under "Create the symlinks".)
+# installed, not something you wrote.
 if [ -L ~/.local/bin/agent-chat-gateway ]; then rm -f ~/.local/bin/agent-chat-gateway; fi
 if [ -L ~/.local/bin/acg-provision ];     then rm -f ~/.local/bin/acg-provision;     fi
+
+# If the installer ever moved something of yours aside, it is still here. Check
+# before deleting — this is the only copy, and nothing else cleans it up.
+ls -l ~/.local/bin/*.bak 2>/dev/null
 
 # Remove all data — repo, config, logs (this deletes everything!)
 rm -rf ~/.agent-chat-gateway

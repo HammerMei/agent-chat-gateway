@@ -112,15 +112,98 @@ uv sync --project "$REPO_DIR"
 
 # ---------------------------------------------------------------------------
 # Symlink into ~/.local/bin
+#
+# link_console_script <target> <link>
+#   Points <link> at <target>, never destroying anything the user put there.
+#
+#   already exactly this link -> nothing to do
+#   dangling symlink         -> removed (the thing it pointed at is gone; a
+#                               broken link has nothing to preserve)
+#   anything else            -> moved aside to <link>.bak (or .bak.N) and
+#                               reported, THEN replaced
+#
+#   Backing up rather than refusing is deliberate. Refusing sounds safer but
+#   leaves a worse state: install_meta.json is written unconditionally further
+#   down, so `agent-chat-gateway upgrade` would manage $REPO_DIR while PATH ran
+#   whatever occupied the destination — a repo whose code never executes.
+#   Backing up keeps the managed command working AND loses nothing.
+#
+#   `mv` on a symlink moves the link itself, it does not follow it, so the file
+#   a foreign symlink pointed at is never touched.
+#
+#   `rm -f` + `ln -s` rather than `ln -sf`: when the destination is a symlink to
+#   a DIRECTORY, `ln -sf` dereferences it and creates the link *inside* that
+#   directory, then reports success while the path still resolves to a
+#   directory. Reproduced on both BSD/macOS and GNU ln. `-n`/`-h` also fix it
+#   but are not in POSIX, so the explicit unlink is the portable form.
+#
+#   Returns 0 if <link> now points at <target>, 1 otherwise. Every step is
+#   tested inside an `if` because of `set -e`: run bare, a failing mv or ln
+#   would abort the installer outright, and only the CALLER knows whether that
+#   is warranted (fatal for the entrypoint, survivable for acg-provision).
 # ---------------------------------------------------------------------------
+link_console_script() {
+  local target="$1" link="$2" bak n ts
+
+  if [ -L "$link" ] && [ "$(readlink "$link")" = "$target" ]; then
+    success "Symlink already current: $link → $target"
+    return 0
+  fi
+
+  if [ -L "$link" ]; then
+    # A symlink, but not ours. Nothing is preserved by backing it up: the file
+    # it points at is not touched, and a stale .bak symlink is pure litter. So
+    # replace it — but SAY what it pointed at, because the actual complaint
+    # about the old behaviour was that the change was silent, not that it
+    # happened. Covers a dangling link too (readlink still reports the target).
+    warn "$link pointed at $(readlink "$link") — repointing it"
+    if ! rm -f "$link"; then
+      warn "Could not remove the existing symlink at $link"
+      return 1
+    fi
+  elif [ -e "$link" ]; then
+    # A real file or directory — something the user made by hand. This is what
+    # gets preserved, because it cannot be reconstructed from a printed path.
+    # Timestamped so repeated installs accumulate distinct backups instead of
+    # one clobbering the next. The collision loop only matters for two runs
+    # inside the same second, but `mv` overwrites silently, and losing a
+    # previous backup is exactly the data loss this branch exists to prevent.
+    ts="$(date +%Y%m%d%H%M%S)"
+    bak="$link.$ts.bak"
+    n=1
+    while [ -e "$bak" ] || [ -L "$bak" ]; do
+      bak="$link.$ts-$n.bak"
+      n=$((n + 1))
+    done
+    if mv "$link" "$bak"; then
+      warn "$link was not a symlink — backed it up before replacing:"
+      warn "  $link → $bak"
+    else
+      warn "Could not back up $link — leaving it untouched."
+      return 1
+    fi
+  fi
+
+  if rm -f "$link" && ln -s "$target" "$link"; then
+    success "Symlink created: $link → $target"
+    return 0
+  fi
+  warn "Could not create $link"
+  return 1
+}
+
 VENV_BIN="$REPO_DIR/.venv/bin/agent-chat-gateway"
 if [ ! -f "$VENV_BIN" ]; then
   error "Expected binary not found: $VENV_BIN"
 fi
 
 mkdir -p "$HOME/.local/bin"
-ln -sf "$VENV_BIN" "$HOME/.local/bin/agent-chat-gateway"
-success "Symlink created: ~/.local/bin/agent-chat-gateway → $VENV_BIN"
+# Fatal for the entrypoint: an install whose primary command is not on the PATH
+# it just configured has not succeeded, and install_meta.json written below would
+# describe a repo the user cannot invoke.
+if ! link_console_script "$VENV_BIN" "$HOME/.local/bin/agent-chat-gateway"; then
+  error "Could not install ~/.local/bin/agent-chat-gateway"
+fi
 
 # acg-provision (RC/MM account & channel provisioning). Deliberately a WARNING
 # rather than error() if absent: unlike the main entrypoint, a missing
@@ -131,42 +214,13 @@ PROVISION_LINK="$HOME/.local/bin/acg-provision"
 PROVISION_LINKED=false
 if [ ! -f "$PROVISION_BIN" ]; then
   warn "acg-provision not found at $PROVISION_BIN — skipping its symlink."
-elif [ -e "$PROVISION_LINK" ] && [ ! -L "$PROVISION_LINK" ]; then
-  # Something that is NOT a symlink already occupies the destination — almost
-  # certainly a hand-written wrapper (e.g. one that pins a specific interpreter).
-  # `ln -sf` would delete it with no trace, so refuse and tell the user instead.
-  # Warned here rather than skipped silently as in upgrade.py's helper: an
-  # install is a rare, deliberate act, so a one-off notice is signal, whereas
-  # the same message on every routine upgrade would be noise.
-  # A *broken* symlink deliberately falls through to the relink below
-  # ( -e is false / -L is true for it), since replacing it loses nothing.
-  warn "$PROVISION_LINK already exists and is not a symlink — leaving it untouched."
-  warn "  Remove it and re-run this installer if you want the managed symlink."
+elif link_console_script "$PROVISION_BIN" "$PROVISION_LINK"; then
+  PROVISION_LINKED=true
 else
-  # `rm -f` + `ln -s` rather than `ln -sf`: when the destination is a symlink to
-  # a DIRECTORY, `ln -sf` dereferences it and creates the link *inside* that
-  # directory, leaving the original symlink in place — and then reports success
-  # while the path still resolves to a directory. Reproduced on both BSD/macOS
-  # and GNU ln. `-n`/`-h` also fixes it but is not in POSIX, so the explicit
-  # unlink is the portable form. Safe here because the branch above already
-  # refused every non-symlink, so this can only remove an absent path or a
-  # symlink — never a real file or directory.
-  #
-  # Wrapped in an `if` condition, not run bare, because of `set -e` at the top
-  # of this script: a bare `ln -s` that fails (unwritable ~/.local/bin, or a
-  # race that recreated the path between the rm and the ln) would abort the
-  # whole installer here — after uv sync, but before PATH setup, install_meta
-  # and the onboard wizard. That directly contradicts this block's premise that
-  # the provisioning CLI must never break an otherwise-successful install, and
-  # matches how upgrade.py's helper treats the same failure: warn and continue.
-  # Commands inside an `if` test are exempt from set -e, so both are checked.
-  if rm -f "$PROVISION_LINK" && ln -s "$PROVISION_BIN" "$PROVISION_LINK"; then
-    PROVISION_LINKED=true
-    success "Symlink created: ~/.local/bin/acg-provision → $PROVISION_BIN"
-  else
-    warn "Could not create $PROVISION_LINK — continuing without it."
-    warn "  Run it directly at $PROVISION_BIN, or link it manually later."
-  fi
+  # NOT fatal, unlike the entrypoint above: the gateway is fully usable without
+  # the provisioning CLI, so a link that cannot be written must not throw away
+  # an install that otherwise succeeded.
+  warn "  Run it directly at $PROVISION_BIN, or link it manually later."
 fi
 
 # ---------------------------------------------------------------------------

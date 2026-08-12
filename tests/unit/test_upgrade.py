@@ -815,13 +815,19 @@ class TestEnsureLocalBinSymlinks:
 
         assert (local_bin / "acg-provision").resolve() == first
 
-    def test_leaves_a_users_own_regular_file_alone(self, tmp_path: Path):
-        # Overwriting a real file the user placed there would be destructive.
-        # Observed in the wild: a hand-written wrapper that sets PYTHONPATH and
-        # pins a specific interpreter. It already makes the command reachable on
-        # PATH, so this is skipped silently rather than warned about on every
-        # upgrade.
-        home, local_bin, repo, _ = self._setup(
+    def test_backs_up_a_users_own_regular_file_then_links(self, tmp_path: Path):
+        """A real file the user made is preserved, but does not block the link.
+
+        Observed in the wild: a hand-written wrapper that sets PYTHONPATH and pins
+        a specific interpreter. An earlier version skipped it silently on the
+        grounds that the command was already reachable — but that leaves a worse
+        state than it looks, because install_meta.json points `upgrade` at
+        repo_path while PATH runs the occupant, so the tool manages a repo whose
+        code never executes. Moving it aside keeps the managed command working
+        AND loses nothing, which is why replacing beats both skipping (stale
+        command) and deleting (destructive).
+        """
+        home, local_bin, repo, venv_bin = self._setup(
             tmp_path, installed=True, scripts=("agent-chat-gateway", "acg-provision")
         )
         own = local_bin / "acg-provision"
@@ -830,8 +836,67 @@ class TestEnsureLocalBinSymlinks:
         with patch("gateway.upgrade.Path.home", return_value=home):
             _ensure_local_bin_symlinks(repo)
 
-        assert not own.is_symlink()
-        assert own.read_text() == "# my own wrapper\n"
+        # The managed link now exists and works.
+        assert own.is_symlink()
+        assert own.resolve() == (venv_bin / "acg-provision").resolve()
+        # And the user's file survived, byte-for-byte, under a timestamped name.
+        backups = list(local_bin.glob("acg-provision.*.bak"))
+        assert len(backups) == 1, f"expected exactly one backup, got {backups}"
+        assert backups[0].read_text() == "# my own wrapper\n"
+        assert not backups[0].is_symlink()
+
+    def test_backups_do_not_clobber_each_other(self, tmp_path: Path):
+        """Two runs must not have the second backup overwrite the first.
+
+        Path.rename() overwrites silently on POSIX, so a fixed `.bak` name would
+        destroy the earlier backup — the exact data loss the backup exists to
+        prevent. Runs inside the same second are resolved by a numeric suffix, so
+        this holds regardless of how fast the two calls land.
+        """
+        home, local_bin, repo, _ = self._setup(
+            tmp_path, installed=True, scripts=("agent-chat-gateway", "acg-provision")
+        )
+        own = local_bin / "acg-provision"
+
+        own.write_text("first\n")
+        with patch("gateway.upgrade.Path.home", return_value=home):
+            _ensure_local_bin_symlinks(repo)
+        # Simulate the user putting a second wrapper back afterwards.
+        own.unlink()
+        own.write_text("second\n")
+        with patch("gateway.upgrade.Path.home", return_value=home):
+            _ensure_local_bin_symlinks(repo)
+
+        backups = sorted(p.read_text() for p in local_bin.glob("acg-provision.*.bak"))
+        assert backups == ["first\n", "second\n"], backups
+
+    def test_reports_the_old_target_when_repointing_a_foreign_symlink(
+        self, tmp_path: Path, capsys
+    ):
+        """A symlink that is not ours is replaced, but never silently.
+
+        No backup for this case on purpose: the file it points at is untouched, so
+        a `.bak` symlink preserves nothing and just accumulates. The reported
+        problem was that the replacement was invisible, so the old target is
+        printed instead.
+        """
+        home, local_bin, repo, venv_bin = self._setup(
+            tmp_path, installed=True, scripts=("agent-chat-gateway", "acg-provision")
+        )
+        foreign_target = tmp_path / "mine" / "my-provisioner.sh"
+        foreign_target.parent.mkdir()
+        foreign_target.write_text("#!/bin/sh\n")
+        (local_bin / "acg-provision").symlink_to(foreign_target)
+
+        with patch("gateway.upgrade.Path.home", return_value=home):
+            _ensure_local_bin_symlinks(repo)
+
+        out = capsys.readouterr().out
+        assert "my-provisioner.sh" in out.replace("\n", "")
+        assert (local_bin / "acg-provision").resolve() == (venv_bin / "acg-provision").resolve()
+        # The file it used to point at is untouched, and no litter was created.
+        assert foreign_target.read_text() == "#!/bin/sh\n"
+        assert list(local_bin.glob("acg-provision.*.bak")) == []
 
     def test_skips_scripts_absent_from_this_release(self, tmp_path: Path):
         # An older release where acg-provision does not exist in .venv/bin.
