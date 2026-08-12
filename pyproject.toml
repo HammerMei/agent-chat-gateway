@@ -40,6 +40,7 @@ Changelog = "https://github.com/HammerMei/agent-chat-gateway/releases"
 [project.scripts]
 agent-chat-gateway = "gateway.cli:main"
 gateway-tui = "gateway.tools.tui:main"
+msg-admin = "gateway.admin.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["gateway"]
