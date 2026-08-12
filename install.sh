@@ -143,7 +143,7 @@ uv sync --project "$REPO_DIR"
 #   is warranted (fatal for the entrypoint, survivable for acg-provision).
 # ---------------------------------------------------------------------------
 link_console_script() {
-  local target="$1" link="$2" bak n ts
+  local target="$1" link="$2" bak="" n ts oldtarget=""
 
   if [ -L "$link" ] && [ "$(readlink "$link")" = "$target" ]; then
     success "Symlink already current: $link → $target"
@@ -156,7 +156,8 @@ link_console_script() {
     # replace it — but SAY what it pointed at, because the actual complaint
     # about the old behaviour was that the change was silent, not that it
     # happened. Covers a dangling link too (readlink still reports the target).
-    warn "$link pointed at $(readlink "$link") — repointing it"
+    oldtarget="$(readlink "$link")"
+    warn "$link pointed at $oldtarget — repointing it"
     if ! rm -f "$link"; then
       warn "Could not remove the existing symlink at $link"
       return 1
@@ -188,7 +189,26 @@ link_console_script() {
     success "Symlink created: $link → $target"
     return 0
   fi
+
+  # Roll back. Getting here means the destination was cleared but the new link
+  # could not be made (no inodes, a filesystem without symlinks, a race), so
+  # without this the user is left with LESS than they started with — their
+  # working command moved into a .bak, and for the entrypoint the caller then
+  # aborts the install outright. A failure must never cost them the command.
   warn "Could not create $link"
+  if [ -n "$bak" ]; then
+    if mv "$bak" "$link"; then
+      warn "  Restored what was there before: $link"
+    else
+      warn "  Could not restore it — your original is still at $bak"
+    fi
+  elif [ -n "$oldtarget" ]; then
+    if ln -s "$oldtarget" "$link"; then
+      warn "  Restored the previous symlink: $link → $oldtarget"
+    else
+      warn "  Could not restore the previous symlink to $oldtarget"
+    fi
+  fi
   return 1
 }
 

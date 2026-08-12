@@ -1,5 +1,6 @@
 """Upgrade logic for agent-chat-gateway."""
 
+import contextlib
 import json
 import subprocess
 import sys
@@ -227,6 +228,10 @@ def _ensure_local_bin_symlinks(repo_path: Path) -> None:
         if not target.exists():
             # Script not built in this release — nothing to link.
             continue
+        # What was displaced, so a later failure can put it back. Exactly one of
+        # these is ever set.
+        displaced_backup: Path | None = None
+        displaced_target: Path | None = None
         try:
             if link.is_symlink():
                 if link.resolve() == target.resolve():
@@ -238,8 +243,9 @@ def _ensure_local_bin_symlinks(repo_path: Path) -> None:
                 # replacement. Path.readlink(), not resolve(), so this still
                 # prints something useful for a dangling or looping link — and
                 # needs no new import.
+                displaced_target = link.readlink()
                 console.print(
-                    f"  ~/.local/bin/{script} pointed at {link.readlink()} — repointing it"
+                    f"  ~/.local/bin/{script} pointed at {displaced_target} — repointing it"
                 )
             elif link.exists():
                 # A real file or directory the user made by hand (observed in
@@ -252,10 +258,11 @@ def _ensure_local_bin_symlinks(repo_path: Path) -> None:
                 # at repo_path while PATH runs the occupant, so the tool manages
                 # a repo whose code never executes. Backing up keeps the managed
                 # command working and still loses nothing.
-                backup = _backup_path(link)
-                link.rename(backup)
+                displaced_backup = _backup_path(link)
+                link.rename(displaced_backup)
                 console.print(
-                    f"  ~/.local/bin/{script} was not a symlink — backed it up as {backup.name}"
+                    "  ~/.local/bin/"
+                    f"{script} was not a symlink — backed it up as {displaced_backup.name}"
                 )
             link.unlink(missing_ok=True)
             link.symlink_to(target)
@@ -273,6 +280,21 @@ def _ensure_local_bin_symlinks(repo_path: Path) -> None:
             console.print(
                 f"  [yellow]Warning:[/yellow] could not link ~/.local/bin/{script}: {e}"
             )
+            # Put back whatever was displaced. Without this, a failure between
+            # clearing the destination and creating the link leaves the user with
+            # LESS than they started with: their working command moved into a
+            # .bak and nothing on PATH. Suppressed rather than raised because
+            # this handler exists to keep the function non-fatal — a failed
+            # rollback must not become the exception that strands the daemon.
+            with contextlib.suppress(OSError):
+                if displaced_backup is not None and displaced_backup.exists():
+                    displaced_backup.rename(link)
+                    console.print(f"  Restored the previous ~/.local/bin/{script}")
+                elif displaced_target is not None and not link.is_symlink():
+                    link.symlink_to(displaced_target)
+                    console.print(
+                        f"  Restored ~/.local/bin/{script} -> {displaced_target}"
+                    )
 
 
 def do_git_upgrade(repo_path: Path) -> None:

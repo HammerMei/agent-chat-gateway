@@ -845,6 +845,64 @@ class TestEnsureLocalBinSymlinks:
         assert backups[0].read_text() == "# my own wrapper\n"
         assert not backups[0].is_symlink()
 
+    def test_restores_the_backup_when_the_new_symlink_cannot_be_made(self, tmp_path: Path):
+        """A failure after the backup must not cost the user their command.
+
+        The destination is cleared before the new link is created, so if
+        symlink_to() fails (no inodes, a filesystem without symlink support, a
+        race) the user is left with LESS than they started with: a working command
+        moved into a .bak and nothing on PATH. install.sh's caller then aborts the
+        whole install for the entrypoint, so the rollback is what keeps a failure
+        from being worse than never having run.
+        """
+        home, local_bin, repo, _ = self._setup(
+            tmp_path, installed=True, scripts=("agent-chat-gateway", "acg-provision")
+        )
+        own = local_bin / "acg-provision"
+        own.write_text("# my own wrapper\n")
+
+        with patch("gateway.upgrade.Path.home", return_value=home), \
+             patch("gateway.upgrade.Path.symlink_to", side_effect=OSError("no inodes")):
+            _ensure_local_bin_symlinks(repo)  # must not raise
+
+        # The user's command is back where it was, byte-for-byte...
+        assert own.exists(), "the wrapper was not restored"
+        assert not own.is_symlink()
+        assert own.read_text() == "# my own wrapper\n"
+        # ...and the backup was consumed rather than left as a duplicate.
+        assert list(local_bin.glob("acg-provision.*.bak")) == []
+
+    def test_restores_a_displaced_foreign_symlink_when_relinking_fails(self, tmp_path: Path):
+        """Same guarantee for the symlink branch, which keeps no backup file."""
+        home, local_bin, repo, _ = self._setup(
+            tmp_path, installed=True, scripts=("agent-chat-gateway", "acg-provision")
+        )
+        foreign = tmp_path / "mine" / "my-provisioner.sh"
+        foreign.parent.mkdir()
+        foreign.write_text("#!/bin/sh\n")
+        link = local_bin / "acg-provision"
+        link.symlink_to(foreign)
+
+        real_symlink_to = Path.symlink_to
+        calls = {"n": 0}
+
+        def fail_first(self, target, target_is_directory=False):
+            # Fail the attempt to install OUR link, but let the rollback's own
+            # symlink_to succeed — otherwise the test cannot tell a restored link
+            # from one that was never removed.
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("no inodes")
+            return real_symlink_to(self, target)
+
+        with patch("gateway.upgrade.Path.home", return_value=home), \
+             patch("gateway.upgrade.Path.symlink_to", new=fail_first):
+            _ensure_local_bin_symlinks(repo)  # must not raise
+
+        assert link.is_symlink()
+        assert link.readlink() == foreign
+        assert foreign.read_text() == "#!/bin/sh\n"
+
     def test_backups_do_not_clobber_each_other(self, tmp_path: Path):
         """Two runs must not have the second backup overwrite the first.
 
