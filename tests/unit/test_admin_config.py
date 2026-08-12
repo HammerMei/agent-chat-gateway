@@ -345,6 +345,53 @@ class TestDuplicateKeys(unittest.TestCase):
                 "    username: u\n    password: p\n"
             )
 
+    def test_yaml_merge_keys_still_work(self):
+        """Regression: the first version of the strict loader reimplemented the
+        construction loop and so dropped SafeConstructor's flatten_mapping()
+        call, breaking `<<: *anchor` entirely with "could not determine a
+        constructor for the tag 'tag:yaml.org,2002:merge'". That idiom is a
+        natural fit for this file (several profiles sharing a type and
+        credentials), so it has to keep working."""
+        profiles = self._load(
+            "_defaults: &rc\n  type: rocketchat\n  username: admin\n  password: pw\n"
+            "profiles:\n"
+            "  rc-a:\n    <<: *rc\n    server_url: https://a.example.com\n"
+            "  rc-b:\n    <<: *rc\n    server_url: https://b.example.com\n"
+        )
+        self.assertEqual(set(profiles), {"rc-a", "rc-b"})
+        self.assertEqual(profiles["rc-a"].username, "admin")
+        self.assertEqual(profiles["rc-b"].server_url, "https://b.example.com")
+
+    def test_explicit_key_overriding_a_merged_one_is_not_a_duplicate(self):
+        # Overriding an inherited value is the entire point of a merge key, and
+        # YAML specifies the explicit key wins — so duplicate detection must run
+        # on the literally-written keys, BEFORE merge expansion.
+        profiles = self._load(
+            "_defaults: &rc\n  type: rocketchat\n  username: shared\n  password: pw\n"
+            "profiles:\n  rc-a:\n    <<: *rc\n    username: overridden\n"
+            "    server_url: https://a.example.com\n"
+        )
+        self.assertEqual(profiles["rc-a"].username, "overridden")
+
+    def test_multiple_merge_sources_still_work(self):
+        profiles = self._load(
+            "_a: &a\n  type: rocketchat\n  username: admin\n"
+            "_b: &b\n  password: pw\n"
+            "profiles:\n  rc-a:\n    <<: [*a, *b]\n    server_url: https://a.example.com\n"
+        )
+        self.assertEqual(profiles["rc-a"].password, "pw")
+        self.assertEqual(profiles["rc-a"].username, "admin")
+
+    def test_duplicate_field_inside_a_merged_mapping_is_still_rejected(self):
+        # The merge key must not become a blanket exemption from the check.
+        with self.assertRaises(AdminConfigError) as ctx:
+            self._load(
+                "_defaults: &rc\n  type: rocketchat\n  username: admin\n  password: pw\n"
+                "profiles:\n  rc-a:\n    <<: *rc\n"
+                "    server_url: https://one\n    server_url: https://two\n"
+            )
+        self.assertIn("duplicate key", str(ctx.exception))
+
     def test_a_config_without_duplicates_still_loads(self):
         profiles = self._load(
             "profiles:\n  rc-lab:\n    type: rocketchat\n    server_url: https://rc\n"

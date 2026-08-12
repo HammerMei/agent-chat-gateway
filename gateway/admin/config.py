@@ -67,23 +67,52 @@ class _StrictLoader(yaml.SafeLoader):
     """
 
 
+_MERGE_TAG = "tag:yaml.org,2002:merge"
+
+
 def _no_duplicate_keys(loader, node, deep=False):
-    mapping = {}
-    for key_node, value_node in node.value:
+    """Reject duplicate keys, then hand construction back to PyYAML unchanged.
+
+    Only the CHECK is added here; the mapping itself is still built by
+    SafeConstructor.construct_mapping. An earlier version of this reimplemented
+    the construction loop, which silently dropped the merge-key handling
+    SafeConstructor does via flatten_mapping() — so `<<: *anchor` stopped
+    working entirely and raised "could not determine a constructor for the tag
+    'tag:yaml.org,2002:merge'". That idiom is a natural fit for this very file
+    (several profiles sharing a type and credentials), so delegating is not just
+    tidier, it is the difference between working and broken.
+
+    Duplicates are checked against the keys as LITERALLY WRITTEN in this
+    mapping, deliberately BEFORE merge expansion:
+
+      - `<<: *base` plus an explicit key that also appears in *base* is not a
+        duplicate — overriding an inherited value is the entire point of a merge
+        key, and YAML specifies the explicit key wins.
+      - the merge key itself is skipped rather than constructed: its node carries
+        the merge tag, which has no scalar constructor, so constructing it is
+        what produced the error above. Multiple merges (`<<: [*a, *b]`, or `<<`
+        appearing twice) are left to PyYAML, which supports them.
+    """
+    seen = set()
+    for key_node, _value_node in node.value:
+        if key_node.tag == _MERGE_TAG:
+            continue
         key = loader.construct_object(key_node, deep=deep)
         # No guard for an unhashable key (a YAML complex key such as
         # `? [a, b]`): the membership test below raises TypeError, which
         # load_profiles()'s backstop arm already turns into a clean
         # AdminConfigError naming the real cause. An explicit try/except here
-        # produced the identical message from the dict assignment one line
-        # later, so it was five lines that changed nothing.
-        if key in mapping:
+        # produced the identical message one line later, so it was five lines
+        # that changed nothing.
+        if key in seen:
             raise _DuplicateKeyError(
                 f"duplicate key {key!r} at line {key_node.start_mark.line + 1} "
                 "— refusing to guess which value was intended"
             )
-        mapping[key] = loader.construct_object(value_node, deep=deep)
-    return mapping
+        seen.add(key)
+    # yaml.SafeLoader.construct_mapping is SafeConstructor's implementation,
+    # which is what calls flatten_mapping() to resolve the merge keys.
+    return yaml.SafeLoader.construct_mapping(loader, node, deep=deep)
 
 
 _StrictLoader.add_constructor(

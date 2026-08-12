@@ -7,6 +7,7 @@ only the CLI's own dispatch/error-handling logic, not real network calls.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import io
 import logging
@@ -331,6 +332,60 @@ class TestRunDispatch(unittest.IsolatedAsyncioTestCase):
             code = await _run(args)
 
         self.assertEqual(code, 1)
+
+
+class TestCloseFailureDoesNotChangeTheOutcome(unittest.IsolatedAsyncioTestCase):
+    """`finally: await admin.close()` sits outside _run()'s handlers, so a
+    close() failure used to replace the real outcome and escape as a traceback.
+
+    Reported as a secondary Warning instead, never as an "Error:" (which paired
+    with exit 0 would break the contract's Error-implies-exit-1 pairing — the
+    flaw that sank an earlier attempt at this fix)."""
+
+    async def _run_with_close_error(self, *, op_fails: bool):
+        mock_admin = AsyncMock()
+        mock_admin.close = AsyncMock(side_effect=RuntimeError("transport died on shutdown"))
+        if op_fails:
+            mock_admin.delete_user = AsyncMock(side_effect=UserNotFoundError("no such user"))
+        stderr = io.StringIO()
+        with patch("gateway.admin.cli.load_profiles", return_value={}), \
+             patch("gateway.admin.cli.get_profile", return_value=object()), \
+             patch("gateway.admin.cli.admin_factory", return_value=mock_admin), \
+             patch("gateway.admin.cli._configure_error_log"), \
+             contextlib.redirect_stderr(stderr):
+            args = _args(["p", "delete-user", "alice"])
+            code = await _run(args)
+        return code, stderr.getvalue()
+
+    async def test_close_failure_does_not_turn_success_into_a_traceback(self):
+        code, out = await self._run_with_close_error(op_fails=False)
+
+        self.assertEqual(code, 0)  # the operation succeeded; keep that outcome
+        self.assertIn("Warning:", out)
+        self.assertIn("transport died on shutdown", out)
+        # An "Error:" line alongside exit 0 would break the CLI contract.
+        self.assertNotIn("Error:", out)
+
+    async def test_close_failure_does_not_mask_the_real_error(self):
+        code, out = await self._run_with_close_error(op_fails=True)
+
+        self.assertEqual(code, 1)
+        self.assertIn("no such user", out)      # original failure preserved
+        self.assertIn("Warning:", out)          # cleanup problem still surfaced
+
+    async def test_cancellation_during_close_still_propagates(self):
+        # BaseException must NOT be downgraded to a warning — matching
+        # PlatformAdmin.__aenter__'s contextlib.suppress(Exception).
+        mock_admin = AsyncMock()
+        mock_admin.close = AsyncMock(side_effect=asyncio.CancelledError())
+        with patch("gateway.admin.cli.load_profiles", return_value={}), \
+             patch("gateway.admin.cli.get_profile", return_value=object()), \
+             patch("gateway.admin.cli.admin_factory", return_value=mock_admin), \
+             patch("gateway.admin.cli._configure_error_log"), \
+             contextlib.redirect_stderr(io.StringIO()):
+            args = _args(["p", "delete-user", "alice"])
+            with self.assertRaises(asyncio.CancelledError):
+                await _run(args)
 
 
 class TestConfigureErrorLog(unittest.TestCase):

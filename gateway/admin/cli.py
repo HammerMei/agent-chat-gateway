@@ -289,7 +289,28 @@ async def _run(args: argparse.Namespace) -> int:
         print(f"Error: {e}", file=sys.stderr)
         return 1
     finally:
-        await admin.close()
+        # This finally sits OUTSIDE the handlers above, so an exception from
+        # close() would replace whatever the operation actually returned — a
+        # successful exit 0, or an already-formatted "Error: ..." + exit 1 —
+        # and escape asyncio.run() as a raw traceback. Cleanup must never
+        # outrank the result it is cleaning up after, so a close failure is
+        # reported as a secondary Warning and the real outcome is preserved.
+        #
+        # Reported as "Warning:", not "Error:", deliberately: an "Error:" line
+        # paired with exit 0 would break the CLI contract's "Error implies
+        # exit 1" pairing, which is what sank an earlier attempt at this.
+        #
+        # Exception, not BaseException — matching
+        # PlatformAdmin.__aenter__'s contextlib.suppress(Exception): a
+        # CancelledError/KeyboardInterrupt arriving here must still propagate
+        # rather than be downgraded to a warning.
+        try:
+            await admin.close()
+        except Exception as close_error:  # noqa: BLE001 - see comment above
+            print(
+                f"Warning: failed to release HTTP resources cleanly: {close_error}",
+                file=sys.stderr,
+            )
 
     return 0
 
