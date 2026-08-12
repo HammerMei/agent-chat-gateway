@@ -87,12 +87,13 @@ Consequences that must be implemented rather than assumed:
   present to fix it.
 - **Config order is load-bearing.** Any tool that rewrites `config.yaml`
   must preserve watcher entry order; reordering silently re-routes rooms.
-- A rule that can never fire must be reported at load, in both forms: a
-  pattern matching nothing, and a rule **fully shadowed** by an earlier
-  rule whose pattern subsumes it. Both are invisible at runtime, because
-  first-match means a shadowed rule never participates in any decision.
-  Where shadowing cannot be decided statically, expose a per-rule match
-  count so `list` can show a rule that has matched zero rooms.
+- A rule that can never fire must be reported at load, in three forms: a
+  pattern matching nothing; a rule **fully shadowed** by an earlier rule whose
+  pattern subsumes it; and a DM opt-in shadowed by an earlier rule that
+  already claimed the direct or group-direct class (§2.7). All are invisible
+  at runtime, because first-match means a shadowed rule never participates in
+  any decision. Where shadowing cannot be decided statically, expose a
+  per-rule match count so `list` can show a rule that has matched zero rooms.
 - `session_id` is **rejected on a rule** (§2.4).
 
 ### 2.2 Routing
@@ -518,6 +519,47 @@ rules.
 A DM-only connector is not expressible as an alternative: `team` is a
 required field on a Mattermost connector, so DM ownership has to attach to one
 of the team connectors.
+
+**`direct` and `include` may be combined in one rule.** A room is either a DM
+or a team channel, never both, so the two selectors address disjoint classes
+and cannot produce a matching ambiguity. Two consequences follow:
+
+- **Shadowing detection must treat `direct` and `group_direct` as claimable
+  classes**, not only patterns (§2.1). Given an earlier rule with
+  `direct: true`, a later rule's `direct: true` is dead — the DM class is
+  already claimed — and that is exactly as invisible at runtime as a shadowed
+  pattern.
+- **The single-owner check counts any rule with DMs enabled**, wherever it
+  appears (§4.5). Folding `direct: true` into a channel rule for convenience
+  still consumes the account's one DM opt-in.
+
+Separate rules are nevertheless the better practice, and the example above
+uses them: a DM is one human, a channel is a group, and they usually want a
+different agent, different history-handoff behaviour and different TTLs.
+That is a recommendation, not a constraint.
+
+**Per-DM include/exclude is deliberately not part of this design.** The
+obvious motivation — restricting which people may DM the agent — is
+authorization, and it already has a mechanism: each connector carries
+`owners:` and `guests:` lists, and every message is gated on the sender being
+in one of them. That gate applies uniformly to channels and DMs, at message
+level, on both platforms.
+
+Two further reasons not to duplicate it as room matching:
+
+- **The identity source is asymmetric.** Mattermost supplies the counterpart
+  free in `channel_display_name`, but Rocket.Chat's per-message access object
+  omits the room name for DMs entirely (§6.1), so a pattern would need a REST
+  lookup or a derivation from the sender — and the sender of a DM is the
+  counterpart *or* the bot itself, so it does not reliably identify the room.
+- **Group DMs have no stable identity on either platform**, so a pattern
+  could not be relied on for them at all.
+
+The one thing the allow-list genuinely cannot express is routing different
+counterparts to *different agents* — alice's DMs to one agent, bob's to
+another. That is routing rather than authorization, but it is speculative, and
+adding it later is additive rather than breaking: `direct: true` becomes sugar
+for `direct: {include: ["*"]}`.
 
 #### Membership events: register on join, do not start
 
