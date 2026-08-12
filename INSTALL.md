@@ -203,9 +203,10 @@ This stops the daemon, runs `git pull` + `uv sync`, and restarts the daemon auto
 # Stop the daemon
 agent-chat-gateway stop
 
-# Remove the symlinks this install created. The -L test means a hand-written
-# wrapper of your own at either path is left alone: install.sh refuses to
-# replace one, so uninstalling should not delete one either.
+# Remove the symlinks this install created. The -L test leaves a hand-written
+# wrapper of your own at either path alone — uninstalling should remove what was
+# installed, not something you wrote. (install.sh itself only refuses to replace
+# a non-symlink for acg-provision; see the note under "Create the symlinks".)
 if [ -L ~/.local/bin/agent-chat-gateway ]; then rm -f ~/.local/bin/agent-chat-gateway; fi
 if [ -L ~/.local/bin/acg-provision ];     then rm -f ~/.local/bin/acg-provision;     fi
 
