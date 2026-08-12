@@ -383,7 +383,7 @@ class TestEditAgent:
     async def test_session_idle_and_expire_days_fields_are_editable_and_save(
         self, tmp_path, work_dir
     ):
-        """docs/design/on-the-fly-watchers.md: AgentConfig.session_idle_days/
+        """docs/design/dynamic-watcher-design.md: AgentConfig.session_idle_days/
         session_expire_days must be reachable through the TUI form, not just
         by hand-editing config.yaml — same as every other AgentConfig field."""
         config_path = _write_config(tmp_path, _config_with_one_agent(work_dir))

@@ -627,7 +627,7 @@ class TestClaudeBackendEnsureDurableInstructions(unittest.IsolatedAsyncioTestCas
 
 
 class TestClaudeBackendTypicalSessionRetentionDays(unittest.TestCase):
-    """docs/design/on-the-fly-watchers.md: Claude Code's default cleanupPeriodDays."""
+    """docs/design/dynamic-watcher-design.md: Claude Code's default cleanupPeriodDays."""
 
     def test_returns_30(self):
         backend = _make_backend()

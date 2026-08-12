@@ -460,7 +460,7 @@ agents:
 | `permissions.enabled` | boolean | No | Enable human-in-the-loop tool approval |
 | `permissions.timeout` | integer | No | Seconds before auto-denying unanswered requests (must be < agent `timeout`) |
 | `permissions.skip_owner_approval` | boolean | No | If `true`, owners bypass approval prompts (guests still enforced); only use in trusted sandbox environments |
-| `session_idle_days` | integer | No | **Schema defined, not yet acted on at runtime** (see `docs/design/on-the-fly-watchers.md`). Will control how many days of inactivity before a watcher's in-memory object is dropped (session kept). Must be strictly less than `session_expire_days` when both are set. |
+| `session_idle_days` | integer | No | **Schema defined, not yet acted on at runtime** (see `docs/design/dynamic-watcher-design.md`). Will control how many days of inactivity before a watcher's in-memory object is dropped (session kept). Must be strictly less than `session_expire_days` when both are set. |
 | `session_expire_days` | integer | No | **Schema defined, not yet acted on at runtime** — same design doc. Will control how many days of inactivity before the session itself is dropped too. |
 
 ### Watchers

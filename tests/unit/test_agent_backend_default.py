@@ -138,7 +138,7 @@ class TestSendOnceAsDurableFallback(unittest.IsolatedAsyncioTestCase):
 
 
 class TestTypicalSessionRetentionDaysDefault(unittest.TestCase):
-    """docs/design/on-the-fly-watchers.md: a backend with no automatic expiry
+    """docs/design/dynamic-watcher-design.md: a backend with no automatic expiry
     of its own need not override typical_session_retention_days() — the
     AgentBackend default is None ("unknown"/"no limit"), not 0 or an error."""
 

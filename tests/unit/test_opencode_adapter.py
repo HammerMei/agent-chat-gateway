@@ -3096,7 +3096,7 @@ class TestBuildSafeOpencodeConfig(unittest.TestCase):
 
 
 class TestOpenCodeBackendTypicalSessionRetentionDays(unittest.TestCase):
-    """docs/design/on-the-fly-watchers.md: OpenCode has no automatic session expiry."""
+    """docs/design/dynamic-watcher-design.md: OpenCode has no automatic session expiry."""
 
     def test_returns_none(self):
         backend = _make_backend()

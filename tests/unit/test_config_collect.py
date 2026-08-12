@@ -467,7 +467,7 @@ class TestCollectConfigQueueSchedulerSessionId(_CollectConfigTestBase):
 
 class TestCollectConfigOnTheFlyWatcherFields(_CollectConfigTestBase):
     """session_idle_days/session_expire_days (AgentConfig) and exclude_room/
-    room: "*" (WatcherConfig) — docs/design/on-the-fly-watchers.md. Same
+    room: "*" (WatcherConfig) — docs/design/dynamic-watcher-design.md. Same
     class of requirement as the fields above: a bad value must surface as a
     collected, per-entity ConfigIssue through collect_config(), never an
     uncaught exception that aborts the whole file."""
