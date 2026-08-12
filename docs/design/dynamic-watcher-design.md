@@ -435,9 +435,19 @@ again as the live prompt. Buffering alone does not fix this.
 operator-initiated pause and resume. Otherwise every idle room announces the
 agent offline each idle period and online on each burst.
 
-**DMs are opt-in per rule**, with 1:1 and group DMs distinguished. Group DMs
-have no stable display identity on either platform, so deriving a name from
-the sender is wrong — it would change with whoever speaks.
+**DMs are opt-in per rule**, with 1:1 and group DMs distinguished — because
+the two behave differently, not merely because they look different.
+`require_mention` is skipped whenever a room's type is `dm`, so a group DM
+misclassified as a plain DM makes the agent reply to **every** message from
+**anyone** in that group chat. That is the cost of getting it wrong, and it is
+why `group_direct` is its own opt-in.
+
+Classifying them is asymmetric (§6.4). Mattermost marks a group DM
+`channel_type: "G"`, distinct from `"D"`. Rocket.Chat reports **both** as
+`roomType: "d"` with no participant information in the frame at all, so
+honouring `group_direct` there needs a participant-count lookup the first time
+a DM room is seen — cacheable, but a lookup, and a DM that later gains members
+has to be re-classified rather than served from a stale cache.
 
 Two things make DMs structurally unlike channels, both verified in §6.3:
 
@@ -600,8 +610,11 @@ known rather than discovered:
   needs a REST lookup or a derivation from the sender — and the sender of a DM
   is the counterpart *or* the bot itself, so it does not reliably identify the
   room.
-- **Group DMs have no stable identity on either platform**, so patterns could
-  not be relied on for `group_direct` even once they work for 1:1.
+- **A group DM has no name a pattern could usefully match.** Mattermost's
+  `channel_display_name` is the member list, which moves as membership changes,
+  and Rocket.Chat supplies nothing at all (§6.4). Patterns would work for 1:1
+  before they work for `group_direct`, so the extension may well have to land
+  in two stages.
 
 Neither is a reason to avoid the extension; both are reasons it is more than a
 parsing change, which is why it is not being done speculatively.
@@ -958,7 +971,9 @@ connector without a membership stream needs no carve-out.
   stream and a dispatch registry keyed by room; thread the access object
   through instead of discarding it — it carries `roomParticipant` for the
   membership gate plus room type and name, which is what spares the routing
-  path a REST lookup; map the raw `c`/`p`/`d` type letters onto the internal
+  path a REST lookup; add a participant-count lookup to tell a 1:1 DM from a
+  group DM, since both report type `d` (§6.4) and the difference decides
+  whether `require_mention` applies; map the raw `c`/`p`/`d` type letters onto the internal
   channel/group/dm vocabulary that history fetching depends on; resolve a DM's
   display identity separately, since the access object omits `roomName` for
   type `d`; **add a system-message filter to the live path** — the REST path
@@ -1149,19 +1164,60 @@ one-watcher-per-room dedup never sees the collision. The result is two agents
 answering one DM — an R4 violation invisible to every existing check. Closed
 by §4.5.
 
-### 6.4 Still open
+### 6.4 Group direct messages, and Mattermost cross-team delivery
+
+**Mattermost distinguishes group DMs; Rocket.Chat does not.**
+
+| | Mattermost group DM | Rocket.Chat group DM |
+|---|---|---|
+| type on the wire | `channel_type: "G"` — distinct from `"D"` | `roomType: "d"` — **identical to a 1:1** |
+| stable identifier | `channel_name` is a stable opaque hash (e.g. `1b4c4b32…`) | none in the frame |
+| human-readable name | `channel_display_name` is the member list, e.g. `"glin, probe-bot, probe-extra"` | absent |
+| team | empty, as for a 1:1 | n/a |
+
+Two corrections to earlier wording follow. Mattermost group DMs *do* have a
+stable identifier — it is `channel_name`, which is opaque but does not move;
+what is unstable is `channel_display_name`, since it is derived from the member
+list and includes the bot itself. And on Rocket.Chat a group DM is
+indistinguishable from a 1:1 **from the frame alone**: the participant list
+exists only over REST, so classifying the two requires a lookup per DM room
+(cacheable, but a lookup).
+
+**Why the distinction has to be kept anyway.** It is not about display names.
+`require_mention` is skipped entirely when a room's type is `dm` — on both
+platforms — so a group DM classified as a plain DM makes the agent answer
+*every* message from *anyone* in that group chat. That is the real cost of
+getting the classification wrong, and it is why `group_direct` is a separate
+opt-in (§2.7) rather than folded into `direct`.
+
+Consequence for Rocket.Chat: honouring a separate `group_direct` there needs a
+participant-count lookup when a DM room is first seen. A DM that later gains
+members would need re-classifying, which the cache must not prevent.
+
+**Cross-team delivery is real, and the team gate is load-bearing.** With the
+probe account added to a second team, a post in that team's channel arrived on
+the same socket, carrying `data.team_id` for the second team. The channel was
+also named `sandbox` — the same name as the first team's channel — so a single
+socket delivered two *different* rooms whose names are identical. Without the
+team gate a connector would derive one watcher name for both, which is the
+collision §4.5 exists to prevent, now demonstrated end to end rather than
+argued.
+
+### 6.5 Still open
 
 None of these gate the design.
 
-- **Group DMs** were not exercised on either platform. Rocket.Chat reports
-  them as type `d` like a 1:1, and Mattermost as type `G`; neither has a
-  stable display identity, which is why they are a separate opt-in (§2.7).
-- **Which Rocket.Chat versions support the reserved subscription**, and
-  whether an administrator can disable it. A refusal arrives as `nosub` at
-  subscribe time, so attempting it with a per-room fallback is safe
-  regardless; this only decides how long the fallback must be kept.
-- **Server-side cost of subscribe-all on a large workspace**, given the
-  access check runs per message per subscriber.
-- **Cross-team delivery on Mattermost** — the probe ran within a single team,
-  so "across every team the bot belongs to" is still only a docstring claim.
-  Team scope is available on the event either way (§6.2).
+- **Which Rocket.Chat versions support `__my_messages__`, and whether an
+  administrator can disable it.** Confirmed working on **8.5**; that is a
+  floor, not a range. A refusal arrives as `nosub` at subscribe time, so
+  attempting it with a per-room fallback is safe regardless — this only
+  decides how long the fallback must be kept.
+- **Server-side cost of subscribe-all on a large workspace**, given the access
+  check runs per message per subscriber. Not measurable on a lab with no load;
+  wants observation on a real deployment before wide rollout.
+- **Whether a Mattermost group DM's `channel_name` hash is stable across
+  membership changes.** It is stable across the observed session, and its
+  construction suggests it is derived from the member set — which would mean
+  adding a member yields a *different* channel entirely rather than mutating
+  this one. Worth confirming before relying on it as a durable key, though
+  `room_id` is the actual key regardless (§2.3).
