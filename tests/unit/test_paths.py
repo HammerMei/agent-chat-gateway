@@ -28,6 +28,7 @@ from gateway.core.paths import (
     remove_workspace_link,
     resolve_under,
     room_path_key,
+    watcher_prompt_key,
 )
 
 
@@ -109,6 +110,70 @@ class TestTheKeyIsStable(unittest.TestCase):
                 self.assertEqual(len(key), 32)
                 self.assertTrue(key.isalnum(), key)
                 self.assertEqual(Path(key).name, key, "not a single path component")
+
+
+class TestThePromptKeyIsScopedToTheWatcher(unittest.TestCase):
+    """Two watchers can share a room, and their durable instructions differ.
+
+    A room-only key made the later watcher overwrite the first one's identity and
+    context, after which both processors used the overwritten file on every turn —
+    silently, and only in a configuration the static shape still permits: two watchers
+    binding different agents to one connector+room, which loads today and which
+    `MessageDispatcher` fans messages out to. The content is built from the agent and the
+    watcher's own context files, so it is not room-determined while that is expressible.
+
+    This is a deliberate deviation from §2.3, which lists both artifacts under one
+    room-scoped key — correct once a room has exactly one watcher, which is the manager's
+    model rather than today's.
+    """
+
+    def test_two_watchers_in_one_room_get_different_prompt_keys(self):
+        a = watcher_prompt_key("rc", "ROOM1", "w-agent-a")
+        b = watcher_prompt_key("rc", "ROOM1", "w-agent-b")
+        self.assertNotEqual(a, b)
+
+    def test_the_same_watcher_always_gets_the_same_prompt_key(self):
+        self.assertEqual(
+            watcher_prompt_key("rc", "ROOM1", "w"),
+            watcher_prompt_key("rc", "ROOM1", "w"),
+        )
+
+    def test_the_same_name_in_two_rooms_cannot_collide(self):
+        """The residual risk of putting a name back in the key would be a collision; the
+        room is in the digest, so there isn't one."""
+        self.assertNotEqual(
+            watcher_prompt_key("rc", "ROOM1", "w"),
+            watcher_prompt_key("rc", "ROOM2", "w"),
+        )
+
+    def test_it_differs_from_the_room_key(self):
+        """The attachment workspace keys on the room — shared by definition, since the
+        cache it links to is per room. The two keys must not be interchangeable."""
+        self.assertNotEqual(
+            watcher_prompt_key("rc", "ROOM1", "w"),
+            room_path_key("rc", "ROOM1"),
+        )
+
+    def test_the_encoding_stays_unambiguous_with_three_parts(self):
+        self.assertNotEqual(
+            watcher_prompt_key("rc", "a", "bc"),
+            watcher_prompt_key("rc", "ab", "c"),
+        )
+
+    def test_golden_vector(self):
+        """Pinned for the same reason as the room key: this digest is the identity of a
+        file on disk, so a change to the derivation orphans every existing one."""
+        self.assertEqual(
+            watcher_prompt_key("rc-home", "GENERAL123", "rc-home-general"),
+            "018ecbde0cb23711a071b2816270888a",
+        )
+
+    def test_a_hostile_watcher_name_yields_one_safe_component(self):
+        for name in ("../escape", "/abs", "a" * 5000, "nul\x00", ""):
+            with self.subTest(name=name[:16]):
+                key = watcher_prompt_key("rc", "r", name)
+                self.assertEqual(len(key), 32)
+                self.assertTrue(key.isalnum())
 
 
 class TestContainment(unittest.TestCase):

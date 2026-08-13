@@ -29,7 +29,7 @@ from .attachment_workspace import localize_attachment_paths
 from .config import CoreConfig, WatcherConfig
 from .connector import Attachment, Connector, IncomingMessage, Room, UserRole
 from .injected_context_builder import InjectedContextBuilder
-from .paths import room_path_key
+from .paths import watcher_prompt_key
 from .prompt_builder import build_catchup_prompt, build_prompt
 from .session_maps import SessionMaps
 from .state import WatcherState
@@ -625,10 +625,12 @@ class MessageProcessor:
             self._config.timeout_for(self._agent_name),
             watcher_name=self._watcher_id,
             # Must be the SAME key the watcher start used, or the retry would write a
-            # second prompt file for one room. Derived from (connector, room_id) here
-            # too, rather than threaded down from the caller, so the two cannot drift
-            # apart — the derivation is the single source (§2.3).
-            path_key=room_path_key(self._connector_name, self._room.id),
+            # second file. Derived here rather than threaded down from the caller so the
+            # two sites cannot drift apart — the derivation is the single source. Scoped
+            # to the watcher, not just the room: see watcher_prompt_key.
+            path_key=watcher_prompt_key(
+                self._connector_name, self._room.id, self._watcher_id
+            ),
             content=content,
         )
         if to_repeat is not None:

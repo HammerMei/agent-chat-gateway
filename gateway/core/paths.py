@@ -51,6 +51,36 @@ def room_path_key(connector: str, room_id: str) -> str:
     return hashlib.sha256(canonical).hexdigest()[:_KEY_WIDTH]
 
 
+def watcher_prompt_key(connector: str, room_id: str, watcher_name: str) -> str:
+    """Return the filesystem key for one watcher's durable-instructions file.
+
+    **Separate from `room_path_key` on purpose, and this is a deviation from §2.3's
+    single-key framing.** The design lists the prompt file and the attachment workspace
+    together under `hash(connector, room_id)`, which is right once a room has exactly
+    one watcher — the model the manager introduces. It is wrong while the static shape
+    still permits several.
+
+    Two watchers may bind different agents to one connector+room today; the config loads,
+    and `MessageDispatcher` fans a message out to both processors. Their durable
+    instructions differ (the content is built from the agent and the watcher's own
+    context files, not from the room), so a room-only key makes the later watcher
+    overwrite the first one's identity and context, and both then use the overwritten
+    file on every turn. Silently.
+
+    The attachment workspace keys on the room correctly, because the cache it links to is
+    per room and shared by definition.
+
+    Residual cost, which is smaller than what it replaces: renaming a watcher orphans one
+    prompt file. It can no longer *collide* — the room is in the digest — and under the
+    dynamic model the name is derived from the room, so the key becomes
+    room-determined anyway.
+    """
+    canonical = json.dumps(
+        [connector, room_id, watcher_name], separators=(",", ":")
+    ).encode()
+    return hashlib.sha256(canonical).hexdigest()[:_KEY_WIDTH]
+
+
 def resolve_under(root: Path | str, *parts: str) -> Path:
     """Join `parts` under `root` and assert the result stays inside it.
 
