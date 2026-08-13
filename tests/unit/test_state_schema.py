@@ -32,6 +32,7 @@ import dataclasses
 import json
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 from unittest.mock import patch
 
@@ -192,6 +193,12 @@ class TestRoundTrip(_RealStateFileTestCase):
         self.assertEqual(load_state("never-written"), [])
 
 
+    def test_a_round_trip_through_save_is_accepted(self):
+        """The obvious one, stated because it is what makes the refusal safe: files
+        this build writes are readable by it."""
+        save_state("rc", [WatcherState(watcher_name="w", session_id="s", room_id="r")])
+        self.assertEqual(len(load_state("rc")), 1)
+
 class TestLegacyRefusal(_RealStateFileTestCase):
     LEGACY_NEW_STYLE = {
         "watchers": [{
@@ -308,6 +315,27 @@ class TestLegacyRefusal(_RealStateFileTestCase):
         self.assertTrue(issubclass(LegacyStateError, StateFormatError))
         self.assertTrue(issubclass(FutureStateError, StateFormatError))
 
+    def test_the_recovery_advice_is_followable_in_the_situation_it_describes(self):
+        """Third round on this one message, and the sharpest of the three.
+
+        It previously told the operator to run `agent-chat-gateway list` to take an
+        inventory. That command queries the running daemon — and the daemon is what
+        just refused to start, so the instruction is impossible *by construction* in
+        the only situation that produces this error. Not mis-ordered: unfollowable.
+
+        The advice now points at the file itself, which is always available and in fact
+        richer: it carries each watcher's name, session id, paused flag and watermark.
+        """
+        self.write_raw({"watchers": []})
+        with self.assertRaises(LegacyStateError) as cm:
+            load_state("rc")
+        msg = str(cm.exception)
+        self.assertIn("the file IS", msg)
+        self.assertIn("paused flag", msg)
+        # It may *mention* the command in order to warn against it, but must not
+        # prescribe it as a step.
+        self.assertNotIn("run 'agent-chat-gateway list'", msg)
+
     def test_deeply_nested_json_is_corruption_not_a_refusal(self):
         """`json.loads` raises RecursionError, not ValueError, on ~100k nesting. With
         the except narrowed to (OSError, ValueError) it escaped — turning a corrupt
@@ -363,6 +391,96 @@ class TestPreflightCoversFilesNotConnectors(_RealStateFileTestCase):
     def test_no_files_at_all_is_fine(self):
         check_state_formats()
 
+class TestTheReaderChecksTypes(_RealStateFileTestCase):
+    """A value read without checking its type is the ninth instance of that shape here.
+
+    This one escaped the file layer entirely: `{"watcher_name": []}` was accepted, and
+    `StateStore.load()` then built `{ws.watcher_name: ws}` and raised
+    `TypeError: unhashable type: 'list'` — aborting startup from a *caller*, so nothing
+    inside `load_state` could have caught it, and contradicting the graceful-corruption
+    contract this module documents.
+
+    So the reader validates every field against the dataclass's own annotations rather
+    than the one field that was reported.
+    """
+
+    def _one(self, record: dict):
+        self.write_raw({"version": STATE_FORMAT_VERSION, "watchers": [record]})
+        return load_state("rc")
+
+    def test_a_non_string_watcher_name_is_skipped_not_returned(self):
+        for bad in ([], {}, 7, None, True, ""):
+            with self.subTest(name=bad):
+                self.assertEqual(
+                    self._one({"watcher_name": bad, "session_id": "s", "room_id": "r"}),
+                    [],
+                )
+
+    def test_a_skipped_record_cannot_crash_statestore(self):
+        """The actual failure, at the layer it happened: StateStore keys on the name."""
+        from gateway.core.state_store import StateStore
+
+        self.write_raw({"version": STATE_FORMAT_VERSION, "watchers": [
+            {"watcher_name": [], "session_id": "s", "room_id": "r"},
+            {"watcher_name": "good", "session_id": "s2", "room_id": "r2"},
+        ]})
+        connector = unittest.mock.MagicMock()
+        connector.get_last_processed_ts.return_value = None
+        loaded = StateStore("rc", connector).load()
+        self.assertEqual(list(loaded), ["good"])
+
+    def test_every_declared_field_rejects_a_wrong_type(self):
+        """Enumerated from `_FIELD_TYPES`, so a field added to the dataclass is covered
+        without anyone adding a case here."""
+        from gateway.core.state import _FIELD_TYPES
+
+        wrong: dict[type, object] = {
+            str: [], bool: "yes", int: "seven", list: {"a": 1}, dict: ["a"],
+        }
+        for field_name, want in _FIELD_TYPES.items():
+            with self.subTest(field=field_name, want=want.__name__):
+                self.assertEqual(
+                    self._one({
+                        "watcher_name": "w", "session_id": "s", "room_id": "r",
+                        field_name: wrong[want],
+                    }),
+                    [],
+                    f"'{field_name}' accepted a {type(wrong[want]).__name__}",
+                )
+
+    def test_bool_and_int_are_not_interchangeable(self):
+        """bool subclasses int, so each direction needs its own check."""
+        self.assertEqual(
+            self._one({"watcher_name": "w", "session_id": "s", "room_id": "r",
+                       "paused": 1}),
+            [],
+            "'paused: 1' was accepted as a boolean",
+        )
+
+    def test_a_valid_record_beside_a_broken_one_still_loads(self):
+        """One bad record is skipped, not the whole file: the others are real sessions,
+        and discarding them would abandon more than the corruption did."""
+        self.write_raw({"version": STATE_FORMAT_VERSION, "watchers": [
+            {"watcher_name": "broken", "paused": "yes"},
+            {"watcher_name": "fine", "session_id": "s", "room_id": "r"},
+        ]})
+        loaded = load_state("rc")
+        self.assertEqual([ws.watcher_name for ws in loaded], ["fine"])
+
+    def test_a_required_field_omitted_reads_as_empty(self):
+        """What the previous reader did via per-field defaults, preserved: the
+        dataclass keeps `session_id`/`room_id` required so no construction site can
+        forget them, and the reader supplies the empty value instead."""
+        (record,) = self._one({"watcher_name": "w"})
+        self.assertEqual((record.session_id, record.room_id), ("", ""))
+
+    def test_the_preflight_does_not_refuse_a_file_over_one_bad_record(self):
+        self.write_raw({"version": STATE_FORMAT_VERSION,
+                        "watchers": [{"watcher_name": []}]})
+        check_state_formats()  # must not raise
+
+
+class TestCorruptionStaysGraceful(_RealStateFileTestCase):
     def test_a_corrupt_file_still_degrades_gracefully(self):
         """Deliberately *not* a refusal. A corrupt file holds no recoverable state
         either way, so refusing to boot over it would trade a graceful degradation for
@@ -377,12 +495,6 @@ class TestPreflightCoversFilesNotConnectors(_RealStateFileTestCase):
     def test_a_versioned_file_with_a_junk_record_degrades_rather_than_raising(self):
         self.write_raw({"version": STATE_FORMAT_VERSION, "watchers": ["nonsense", 7]})
         self.assertEqual(load_state("rc"), [])
-
-    def test_a_round_trip_through_save_is_accepted(self):
-        """The obvious one, stated because it is what makes the refusal safe: files
-        this build writes are readable by it."""
-        save_state("rc", [WatcherState(watcher_name="w", session_id="s", room_id="r")])
-        self.assertEqual(len(load_state("rc")), 1)
 
 
 if __name__ == "__main__":

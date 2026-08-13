@@ -13,8 +13,9 @@ converted** — see ``load_state`` and ``LegacyStateError``.
 import json
 import logging
 import os
-from dataclasses import asdict, dataclass, field
+from dataclasses import MISSING, asdict, dataclass, field, fields
 from pathlib import Path
+from typing import get_origin
 
 logger = logging.getLogger("agent-chat-gateway.state")
 
@@ -62,9 +63,11 @@ class LegacyStateError(StateFormatError):
             "would have to guess which rule now owns the room — the silent re-binding "
             "the design exists to prevent (docs/design/dynamic-watcher-design.md "
             "§5.3).\n"
-            "To proceed: stop the gateway, run 'agent-chat-gateway list' to record "
-            "what exists and what is paused, move the state file(s) aside or delete "
-            f"them ('{path}'), then start again. Your config.yaml does NOT need "
+            f"To proceed: move '{path}' aside — keep the copy, because the file IS "
+            "the inventory: it lists each watcher's name, session id, paused flag and "
+            "message watermark in plain JSON. Then start again. Do not reach for "
+            "'agent-chat-gateway list' at this point: it queries the running daemon, "
+            "and the daemon is what just refused to start. Your config.yaml does NOT need "
             "rewriting for this: rule-shaped watchers are not active yet, so the "
             "§5.3 procedure's config rewrite belongs to the later cutover, not to "
             "this step.\n"
@@ -159,9 +162,32 @@ class WatcherState:
     rule: dict = field(default_factory=dict)
 
 
-# Every field the reader below restores, so a field added to the dataclass without
-# a reader entry fails a test rather than silently loading as its default forever.
-# Scalars only; the two nested fields and the list are handled beside it.
+# The type each persisted field must have, derived from WatcherState's own annotations
+# so there is no second hand-maintained table to drift out of step. `watcher_name` is
+# excluded: it is required rather than defaulted, and checked separately.
+_FIELD_TYPES: dict[str, type] = {
+    # get_origin() unwraps a parameterised annotation (list[str] -> list) and returns
+    # None for a plain one, so this needs no name-to-type table of its own — the first
+    # attempt used one, and it raised KeyError on `list[str]` because its `__name__`
+    # is "list", not "list[str]".
+    f.name: get_origin(f.type) or f.type
+    for f in fields(WatcherState)
+    if f.name != "watcher_name"
+}
+
+# Fields with neither a default nor a default_factory: the dataclass requires them, so
+# the reader has to supply something when the payload omits them.
+_REQUIRED_FIELDS: frozenset[str] = frozenset(
+    f.name
+    for f in fields(WatcherState)
+    if f.name != "watcher_name"
+    and f.default is MISSING
+    and f.default_factory is MISSING
+)
+
+_EMPTY: dict[type, object] = {str: "", bool: False, int: 0, list: [], dict: {}}
+
+# Retained for the round-trip coupling test: every field the reader restores.
 _SCALAR_FIELDS: tuple[tuple[str, object], ...] = (
     ("session_id", ""),
     ("room_id", ""),
@@ -213,15 +239,59 @@ def ensure_runtime_dir() -> None:
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 
 
+class _MalformedRecord(ValueError):
+    """One record is unusable. It is skipped with the field named, not fatal."""
+
+
 def _record_from_dict(w: dict) -> WatcherState:
-    """Build a WatcherState from one persisted record."""
-    return WatcherState(
-        watcher_name=w["watcher_name"],
-        participants=list(w.get("participants") or []),
-        config=dict(w.get("config") or {}),
-        rule=dict(w.get("rule") or {}),
-        **{name: w.get(name, default) for name, default in _SCALAR_FIELDS},
-    )
+    """Build a WatcherState from one persisted record, checking every field's type.
+
+    The reader validates rather than trusts, because a value read and used without
+    checking it is the type the reader assumed is the defect shape this loader family
+    keeps producing — and here it escaped the file layer entirely. A `watcher_name` of
+    `[]` was accepted, and `StateStore.load()` then built `{ws.watcher_name: ws}` and
+    raised `TypeError: unhashable type`, aborting startup: a crash in a caller, so no
+    amount of care inside `load_state` could have caught it, and it contradicted the
+    graceful-corruption contract stated in this module's own docstring.
+
+    Types come from `_FIELD_TYPES`, derived from the dataclass's annotations, so a
+    field added there is validated without anyone having to remember.
+    """
+    name = w.get("watcher_name")
+    if not isinstance(name, str) or not name:
+        raise _MalformedRecord(
+            f"'watcher_name' must be a non-empty string (got {type(name).__name__})"
+        )
+
+    values: dict[str, object] = {}
+    for field_name, want in _FIELD_TYPES.items():
+        if field_name not in w:
+            continue
+        value = w[field_name]
+        # bool before int: bool subclasses int, so an int field must reject True and a
+        # bool field must not accept 0/1.
+        if want is bool:
+            ok = isinstance(value, bool)
+        elif want is int:
+            ok = isinstance(value, int) and not isinstance(value, bool)
+        else:
+            ok = isinstance(value, want)
+        if not ok:
+            raise _MalformedRecord(
+                f"'{field_name}' must be {want.__name__} (got {type(value).__name__})"
+            )
+        # Copy the containers so a record never aliases the payload it came from.
+        values[field_name] = (
+            dict(value) if want is dict else list(value) if want is list else value
+        )
+    # A required field absent from the payload reads as empty, which is what the
+    # previous reader did via its per-field defaults. Derived from `fields()` rather
+    # than a hand-written list of "the required ones", and deliberately not solved by
+    # giving those fields dataclass defaults: that would loosen a real constraint on
+    # every construction site to serve the reader alone.
+    for field_name in _REQUIRED_FIELDS - values.keys():
+        values[field_name] = _EMPTY[_FIELD_TYPES[field_name]]
+    return WatcherState(watcher_name=name, **values)
 
 
 def load_state(connector_name: str) -> list[WatcherState]:
@@ -276,18 +346,28 @@ def load_state(connector_name: str) -> list[WatcherState]:
             f"format {version!r}" if version is not None else "no version marker",
         )
 
-    try:
-        watchers = [
-            _record_from_dict(w)
-            for w in data.get("watchers", [])
-            if isinstance(w, dict) and "watcher_name" in w
-        ]
-    except (TypeError, ValueError) as e:
+    raw_records = data.get("watchers", [])
+    if not isinstance(raw_records, list):
         logger.warning(
-            "[%s] Malformed record in state file, starting fresh: %s",
-            connector_name, e,
+            "[%s] State file's 'watchers' is not a list, starting fresh", connector_name
         )
         return []
+    watchers = []
+    for w in raw_records:
+        if not isinstance(w, dict):
+            logger.warning(
+                "[%s] Skipping a non-mapping entry in the state file", connector_name
+            )
+            continue
+        try:
+            watchers.append(_record_from_dict(w))
+        except (_MalformedRecord, TypeError, ValueError) as e:
+            # One bad record is skipped rather than discarding the file: the others are
+            # real sessions, and dropping them would abandon more than the corruption
+            # did. The field is named so the operator can repair or delete by hand.
+            logger.warning(
+                "[%s] Skipping malformed state record: %s", connector_name, e
+            )
     logger.info(
         "[%s] Loaded %d watcher states from disk", connector_name, len(watchers)
     )
