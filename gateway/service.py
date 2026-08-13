@@ -21,7 +21,7 @@ import logging
 import os
 from dataclasses import dataclass
 
-from .agents import AgentBackend, GatewayBrokerConfig
+from .agents import AgentBackend, GatewayBrokerConfig, check_backend_signatures
 from .agents.claude import ClaudeBackend
 from .agents.opencode import OpenCodeBackend
 from .config import AgentConfig, GatewayConfig
@@ -277,6 +277,11 @@ class GatewayService:
             name: _build_agent_backend(agent_cfg)
             for name, agent_cfg in config.agents.items()
         }
+        # Fail here rather than at the first watcher start: a backend implementing the
+        # pre-rename signature would otherwise raise a bare TypeError deep in the
+        # lifecycle, which rolls the startup back and says nothing about what to change.
+        check_backend_signatures(agents)
+
         self._runtime_manager = AgentRuntimeManager(agents)
 
         self._entries: list[ConnectorEntry] = []

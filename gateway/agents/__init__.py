@@ -41,6 +41,52 @@ class GatewayBrokerConfig:
     skip_owner_approval: bool = False  # when True, bypass owner approval for all tool calls
 
 
+def check_backend_signatures(backends) -> None:
+    """Refuse to start if a backend still implements the pre-rename signature.
+
+    `ensure_durable_instructions`'s `watcher_name` parameter became `path_key`, and the
+    two are not interchangeable: the value is now scoped to the watcher in a room, so a
+    backend keying a file on it as if it were a display name reintroduces the overwrite
+    between same-room watchers (see gateway/core/paths.py).
+
+    Deliberately a preflight rather than a compatibility shim. `AgentBackend` is a
+    documented extension point, but registering one requires editing
+    `service.py`'s `_build_agent_backend`, so a custom backend is a fork rather than a
+    plugin — and a fork rebasing onto this branch already meets a removed config field and
+    a refused state format. Accepting both spellings would keep two names for one
+    parameter alive in a contract, which is the ambiguity this rename removed.
+
+    What the shim would genuinely have bought is a better failure than
+    `TypeError: unexpected keyword argument 'path_key'` at the first watcher start. This
+    buys that directly, and earlier: the base method's own `NotImplementedError` shows the
+    established standard here is a call-time failure carrying an actionable message, so the
+    defect in the raw TypeError was the message, not the timing.
+
+    Checked by signature rather than by calling anything, so a backend that never
+    exercises this path is unaffected.
+    """
+    import inspect
+
+    for name, backend in sorted(getattr(backends, "items", lambda: [])()):
+        impl = type(backend).ensure_durable_instructions
+        if impl is AgentBackend.ensure_durable_instructions:
+            continue  # not overridden; the base raises with its own message
+        params = inspect.signature(impl).parameters
+        if "path_key" in params:
+            continue
+        if "watcher_name" in params:
+            raise TypeError(
+                f"Agent backend '{name}' ({type(backend).__name__}) implements "
+                "ensure_durable_instructions() with the old 'watcher_name' parameter. "
+                "It was renamed to 'path_key' and the meaning changed: the value is an "
+                "opaque key scoped to the watcher in a room, not a display name. Rename "
+                "the parameter and use it verbatim as the file name — do not derive "
+                "anything from it, and do not substitute room_path_key, which belongs to "
+                "the attachment workspace. See gateway/core/paths.py and "
+                "docs/architecture.md's 'Adding a New Agent Backend'."
+            )
+
+
 class AgentBackend(ABC):
     """Abstract backend that creates sessions and sends messages to an agent."""
 

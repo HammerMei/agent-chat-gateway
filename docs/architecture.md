@@ -816,12 +816,34 @@ class AnthropicAPIBackend(AgentBackend):
         # POST message to API, stream response, return AgentResponse
         ...
 
+    async def ensure_durable_instructions(
+        self, session_id, working_directory, timeout, content, *,
+        path_key, already_delivered,
+    ) -> str | None:
+        # Required in practice, though not @abstractmethod: the base raises
+        # NotImplementedError, because a backend must choose *how* content reaches the
+        # model rather than inherit a fallback that is not compaction-resistant.
+        #
+        # `path_key` is OPAQUE — use it verbatim as a file name and derive nothing from
+        # it. It is scoped to the watcher in a room, so two watchers bound to one room do
+        # not overwrite each other's instructions. Do not substitute
+        # gateway.core.paths.room_path_key: that one keys the attachment workspace, which
+        # is per room by design.
+        #
+        # Return None if this backend delivered the content itself (a one-time side
+        # effect); return a path/value for the caller to re-supply on every turn.
+        ...
+
     async def start(self) -> None:
         ...
 
     async def stop(self) -> None:
         ...
 ```
+
+`GatewayService` preflights every backend's `ensure_durable_instructions` signature at
+startup, so an implementation left on the pre-rename `watcher_name` parameter fails with
+an actionable message instead of a bare `TypeError` on the first watcher start.
 
 Register in `service.py`:
 
