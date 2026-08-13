@@ -249,15 +249,16 @@ class WatcherLifecycle:
             # immediately re-enter that state after reset (the old failure_count
             # is still at ``_MAX_INJECT_ATTEMPTS``, so one more failure tips it
             # over again).
-            # NOTE: computed OUTSIDE the `if state:` guard — a pinned wc.session_id
-            # must be reset even when state is None (watcher failed before any
-            # state was persisted).
-            old_session_id = wc.session_id or (state.session_id if state else "")
+            # The old note here explained why this sat outside the `if state:`
+            # guard: a config-pinned session id had to be reset even with no
+            # persisted state. Config pinning is gone, so the only id that can
+            # exist is the persisted one — and reset now always clears it, with no
+            # exemption.
+            old_session_id = state.session_id if state else ""
             if old_session_id:
                 self._injector.reset_session(old_session_id)
             if state:
-                if not wc.session_id:
-                    state.session_id = ""
+                state.session_id = ""
                 state.context_injected = False
                 state.paused = False
 
@@ -275,7 +276,7 @@ class WatcherLifecycle:
         for wc in self._watcher_configs:
             state = self._states.get(wc.name)
             processor = self._processors.get(wc.name)
-            effective_session = wc.session_id or (state.session_id if state else "")
+            effective_session = state.session_id if state else ""
             result.append(
                 {
                     "watcher_name": wc.name,
@@ -377,7 +378,7 @@ class WatcherLifecycle:
         # 3. Build state and register maps
         ws = WatcherState(
             watcher_name=wc.name,
-            session_id=wc.session_id or session_id,
+            session_id=session_id,
             room_id=room.id,
             room_type=room.type,
             context_injected=state.context_injected if state else False,
@@ -526,7 +527,7 @@ class WatcherLifecycle:
             cleaned = await self._cleanup_startup_session_best_effort(
                 agent, session_id, created_new_session, wc.name
             )
-            if cleaned and created_new_session and not wc.session_id:
+            if cleaned and created_new_session:
                 ws.session_id = ""
                 # The session that received context injection was destroyed, so
                 # the next _start_watcher will create a brand-new session that
@@ -574,15 +575,15 @@ class WatcherLifecycle:
         agent: AgentBackend,
         agent_cfg,
     ) -> tuple[str, bool]:
-        """Determine the session ID: reuse from config/state, or create a new one.
+        """Determine the session ID: reuse the persisted one, or create a new one.
 
         Priority:
-          1. Explicit ``wc.session_id`` from config (pinned session).
-          2. Persisted ``state.session_id`` from a previous run.
-          3. Create a new session via the agent backend.
+          1. Persisted ``state.session_id`` from a previous run.
+          2. Create a new session via the agent backend.
+
+        There is no config-pinned option: `watchers[].session_id` is removed, so
+        every session id the gateway uses is one it assigned itself.
         """
-        if wc.session_id:
-            return wc.session_id, False
         if state and state.session_id:
             return state.session_id, False
         session_title = (
@@ -669,7 +670,6 @@ class WatcherLifecycle:
         """
         processor = self._processors.pop(name, None)
         state = self._states.get(name)
-        wc = next((w for w in self._watcher_configs if w.name == name), None)
         errors: list[str] = []
 
         # Step 1: Remove from dispatcher so no new messages are routed to this processor.
@@ -709,12 +709,10 @@ class WatcherLifecycle:
                 logger.error("Watcher '%s': processor stop failed: %s", name, e)
 
         # Step 5: Clean up session maps.
-        # Convention: empty string "" in session_id means "no session" (auto-create
-        # mode, not yet assigned).  The falsy guard below skips cleanup in that case.
+        # Convention: empty string "" in session_id means "no session" (not yet
+        # assigned).  The falsy guard below skips cleanup in that case.
         if state:
-            effective_session = (
-                wc.session_id if wc and wc.session_id else state.session_id
-            )
+            effective_session = state.session_id
             if effective_session:
                 if self._permission_registry:
                     self._permission_registry.cancel_session(effective_session)

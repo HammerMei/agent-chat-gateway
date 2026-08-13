@@ -119,7 +119,6 @@ def _make_lifecycle_r14(watcher_names=None):
         wc.room = f"#{name}"
         wc.connector = "rc"
         wc.agent = None
-        wc.session_id = None
         wc.online_notification = None
         wc.offline_notification = None
         watcher_configs.append(wc)
@@ -483,7 +482,14 @@ class TestContextInjectedResetOnSubscribeFailure(unittest.IsolatedAsyncioTestCas
         self.assertFalse(saved_ws.context_injected)
 
     async def test_context_injected_preserved_when_no_new_session(self):
-        """If wc.session_id is sticky (not empty), context_injected must be preserved."""
+        """When no new session was created, the id must survive a failed startup.
+
+        Previously staged with a config-pinned `wc.session_id`; that field is gone, so
+        the scenario is now driven by the case that still produces
+        `created_new_session=False` — a session reused from persisted state. The
+        property under test is unchanged: `ws.session_id` must not be blanked when the
+        session was not this startup's to destroy.
+        """
         from gateway.core.watcher_lifecycle import WatcherLifecycle
 
         lc = WatcherLifecycle.__new__(WatcherLifecycle)
@@ -525,13 +531,13 @@ class TestContextInjectedResetOnSubscribeFailure(unittest.IsolatedAsyncioTestCas
 
         wc = WatcherConfig(
             name="test-watcher2", connector="rc", room="general", agent="default",
-            session_id="sticky-session",
         )
 
         with (
             patch.object(lc, "_resolve_agent_name", return_value="default"),
+            # False = the session was reused, not created here.
             patch.object(lc, "_provision_session", new_callable=AsyncMock,
-                         return_value=("sticky-session", False)),
+                         return_value=("persisted-session", False)),
             patch.object(lc, "_cleanup_startup_session_best_effort",
                          new_callable=AsyncMock, return_value=True),
             patch("gateway.core.watcher_lifecycle.asyncio.to_thread",
@@ -542,7 +548,7 @@ class TestContextInjectedResetOnSubscribeFailure(unittest.IsolatedAsyncioTestCas
 
         saved_ws = lc._states.get("test-watcher2")
         self.assertIsNotNone(saved_ws)
-        self.assertEqual(saved_ws.session_id, "sticky-session")
+        self.assertEqual(saved_ws.session_id, "persisted-session")
 
 
 # ── Tests from test_round14_fixes.py ──────────────────────────────────────────

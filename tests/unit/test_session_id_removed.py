@@ -18,10 +18,11 @@ missing memory. And unlike the TTLs, `session_id` **shipped** — it is document
 `v0.5.1`'s own `config.example.yaml`, so silence would have landed on real
 deployments. The JSON schema does not cover this either: it is not enforced at load.
 
-This PR is the config half. `WatcherConfig.session_id` still exists as a field that
-can now only ever be `None`, which makes the runtime's pinned-session branches dead
-code; removing those is the second half, and separating them keeps that removal
-provably behaviour-neutral.
+Landed in two PRs. The first refused the key while keeping
+`WatcherConfig.session_id` as a field that could only ever be `None`, which made the
+runtime's pinned-session branches unreachable; the second removed those branches and
+the field. Splitting it that way is what let the runtime removal be argued as dead
+code rather than as a behaviour change.
 
 Run with:
     uv run python -m pytest tests/unit/test_session_id_removed.py -v
@@ -98,7 +99,14 @@ class TestTheKeyIsRefusedNotIgnored(unittest.TestCase):
     def test_a_config_without_it_is_unaffected(self):
         cfg = GatewayConfig.from_file(write_config("- {room: general, name: w1}\n"))
         self.assertEqual([w.name for w in cfg.watchers], ["w1"])
-        self.assertIsNone(cfg.watchers[0].session_id)
+
+    def test_a_materialized_watcher_has_no_such_attribute(self):
+        """The field is gone from `WatcherConfig`, not merely always None — so the
+        runtime cannot read it even by accident. The config half of this change kept
+        it as an always-None field so the runtime branches could be removed
+        separately; this asserts the second half landed."""
+        cfg = GatewayConfig.from_file(write_config("- {room: general, name: w1}\n"))
+        self.assertFalse(hasattr(cfg.watchers[0], "session_id"))
 
 
 class TestItCannotArriveByInheritance(unittest.TestCase):
