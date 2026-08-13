@@ -171,7 +171,9 @@ watchers:
 #### Persistence & Recovery
 - ✅ Persistent watcher state across daemon restarts (`state.json`)
 - ✅ Auto-created session IDs retained across restarts
-- ✅ Fixed (sticky) session IDs preserved across reset operations
+- ❌ Pinning a session ID from config (`watchers[].session_id`) — removed; setting it
+  is a load error. Carry context into a session with a handoff file instead
+  (`context_inject_files`), which also survives the backend expiring the session
 - ✅ Graceful recovery from corrupted state files
 
 #### Session Operations
@@ -319,9 +321,12 @@ watchers:
 - ✅ Default agent must reference existing agent (if specified)
 - ✅ Required paths must exist at validation time
 - ✅ Queue depth settings reject invalid values
-- ✅ Sticky session IDs validated for uniqueness
-- ✅ `*_defaults` blocks reject identity fields (e.g. `name`, `room`/`rooms`,
-  `session_id`) that must be set per-entry, not inherited
+- ✅ A `watchers[].session_id` left over from an earlier version is rejected with the
+  replacement named, never silently ignored (the cross-watcher uniqueness check it
+  used to need is gone with the field)
+- ✅ `*_defaults` blocks reject identity fields (`name`, `room`/`rooms`) that must be
+  set per-entry, not inherited — and the removed `session_id`, reported as removed
+  rather than as "set it per-entry"
 - ✅ `tool_presets` are regex-validated eagerly at load, even if unused
 - ✅ `agent-chat-gateway config validate [--lint]` — checks config.yaml
   without starting the daemon: structural validation, per-connector-type

@@ -126,8 +126,8 @@ A `rooms: [a, b, c]` entry in `config.yaml` expands into several
 independent watchers that all share one underlying entry — the Watchers tab
 always shows them as separate rows, one per room.
 
-- **Editing a shared setting** (connector, agent, room, session ID,
-  notifications, `inherits`, ...) on one room splits it out into its own
+- **Editing a shared setting** (connector, agent, room, notifications,
+  `inherits`, ...) on one room splits it out into its own
   entry; the other rooms in the group are untouched. The only field that
   edits the whole group in place is **Description** (a free-text note with
   no effect on behavior).

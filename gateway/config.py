@@ -447,10 +447,17 @@ def _parse_templates_block(
                     "be set per-entry, not inherited"
                 )
             if removed:
+                # The replacement is spelled out here rather than deferred to "the
+                # per-entry error": this branch raises BEFORE inheritance, so that
+                # error never runs for a template-supplied key. Pointing at an error
+                # the operator will never see is worse than saying nothing.
                 verb = "does" if len(removed) == 1 else "do"
                 parts.append(
-                    f"{_key_list(removed)} {verb} not exist at all any more — the "
-                    "per-entry error names the replacement"
+                    f"{_key_list(removed)} {verb} not exist at all any more. "
+                    "Sessions are no longer pinned from config; to carry context "
+                    "into a new session, have the agent summarise its session to a "
+                    "file and read that file back in the new one (see "
+                    "docs/user-guide.md)"
                 )
             raise ValueError(
                 f"{key}['{name}'] must not set {_key_list(bad)} — " + "; ".join(parts) + "."

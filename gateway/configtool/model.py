@@ -582,7 +582,18 @@ class EditableConfig:
             # gone at the next daemon start.
             if not (entry.get("room") or entry.get("rooms")):
                 continue
-            if entry.get("name") or entry.get("session_id"):
+            # PRESENCE, not truthiness. `entry.get(k)` cannot tell "absent" from
+            # "present but falsy" — and present-but-falsy is exactly what a broken
+            # entry looks like: `session_id: null` (the shape the Docker example and
+            # the old docs shipped) and `name: no` (YAML resolves it to False) are
+            # both refused by the loader, yet both read as absent here, making the
+            # entry eligible as a merge target. Folding a room into an entry that
+            # cannot load writes a corruption to disk, because `save()`'s gate blocks
+            # only NEWLY introduced errors and this leaves the existing one in place.
+            #
+            # Erring the other way is safe: an entry carrying a pointless explicit
+            # null simply gets a new entry of its own instead of a merge.
+            if "name" in entry or "session_id" in entry:
                 continue
             if entry.get("connector") != connector or entry.get("agent") != agent:
                 continue

@@ -1047,7 +1047,7 @@ agent-chat-gateway reset <watcher-name> [--connector NAME]
 ```
 
 This:
-- Clears the stored session ID (if not sticky)
+- Clears the stored session ID
 - Creates a new session on the next message
 - Preserves watcher configuration
 

@@ -245,7 +245,8 @@ The gateway SHALL:
 4. Validate every defined tool preset's rules at configuration load time, regardless of whether any agent references it
 5. Reject a tool preset whose rule list itself references another preset by name (presets SHALL be flat)
 6. Support a watcher `rooms` list as an alias that expands one watcher entry into one watcher per listed room, each with an automatically derived name of the form `<connector>-<sanitized-room>`
-7. Reject a watcher entry that sets both `room` and `rooms`, or that sets `name` or `session_id` while `rooms` contains more than one room
+7. Reject a watcher entry that sets both `room` and `rooms`, or that sets `name` while `rooms` contains more than one room
+7a. Reject a watcher entry that sets `session_id` at all — the field is removed, and the error SHALL name the handoff replacement rather than being silently ignored (a watcher entry's unknown keys are otherwise dropped, and this field was documented in v0.5.1)
 8. Apply the same watcher-name uniqueness requirement to names produced by room expansion as to explicitly configured names
 9. Reject a leftover top-level `connector_defaults`, `agent_defaults`, or `watcher_defaults` key immediately, with an error naming the replacement (`connector_templates`/`agent_templates`/`watcher_templates`) — never silently ignore it, since a silent no-op would silently drop whatever settings an operator still believes are shared
 10. Reject an `inherits:` field naming a template that does not exist in the matching `*_templates` block, and reject a named template that itself sets `inherits:` (no nested templates)
