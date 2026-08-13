@@ -135,6 +135,14 @@ class GatewayConfig:
     agents: dict[str, AgentConfig]
     default_agent: str
     watchers: list[WatcherConfig] = field(default_factory=list)
+    # Rule-shaped `watchers:` entries, beside — not instead of — the static ones.
+    # The two shapes are different types, not two spellings of one: a rule names no
+    # room and is matched against rooms at runtime, while a WatcherConfig names one
+    # concrete room. Until the watcher manager lands, an old-shape config must keep
+    # loading and running byte-identically, so both lists are populated from the
+    # same `watchers:` block and routed by shape (`entry_is_watcher_rule`). Nothing
+    # consumes this list yet; the manager is what gives rules runtime effect.
+    watcher_rules: list[WatcherRule] = field(default_factory=list)
     max_queue_depth: int = 100  # max pending messages per room queue; 0 = unbounded
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
 
@@ -261,6 +269,7 @@ class GatewayConfig:
 
         connector_names = {c.name for c in connectors}
         watchers: list[WatcherConfig] = []
+        watcher_rules: list[WatcherRule] = []
         watchers_raw = raw.get("watchers", [])
         if watchers_raw and not isinstance(watchers_raw, list):
             raise ValueError(
@@ -271,8 +280,27 @@ class GatewayConfig:
             raw, "watcher_templates", TEMPLATE_FORBIDDEN_KEYS["watcher"]
         )
 
+        # One `watchers:` block, two shapes, routed per entry. The name sets stay
+        # separate because they identify different things: a WatcherConfig name is a
+        # single room's runtime handle, a rule name is the rule's identity in
+        # persisted state and in shadowing warnings.
         seen_watcher_names: set[str] = set()
+        seen_rule_names: set[str] = set()
         for i, wc_raw in enumerate(watchers_raw):
+            if entry_is_watcher_rule(wc_raw):
+                watcher_rules.append(
+                    _parse_one_watcher_rule(
+                        wc_raw, i,
+                        connectors=connectors,
+                        connector_names=connector_names,
+                        agents=agents,
+                        default_agent=default_agent,
+                        config_dir=config_dir,
+                        templates=watcher_templates,
+                        seen_rule_names=seen_rule_names,
+                    )
+                )
+                continue
             watchers.extend(
                 _parse_one_watcher_entry(
                     wc_raw, i, watcher_templates, connector_names, connectors, agents,
@@ -304,6 +332,7 @@ class GatewayConfig:
             agents=agents,
             default_agent=default_agent,
             watchers=watchers,
+            watcher_rules=watcher_rules,
             max_queue_depth=max_queue_depth,
             scheduler=scheduler_cfg,
         )
@@ -2134,6 +2163,7 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
         )
 
     watchers: list[WatcherConfig] = []
+    watcher_rules: list[WatcherRule] = []
     watchers_raw = raw.get("watchers", [])
     if watchers_raw and not isinstance(watchers_raw, list):
         # Connectors AND agents have already parsed successfully by this
@@ -2169,14 +2199,35 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
             issues,
         )
 
+    # Mirrors from_file()'s routing, per entry and by shape — one `seen_*` set each
+    # per load, for the whole loop rather than per entry.
     seen_watcher_names: set[str] = set()
+    seen_rule_names: set[str] = set()
     for i, wc_raw in enumerate(watchers_raw):
         # See the identical connector-loop comment above: only ever use
         # name_hint when it's genuinely a usable string.
         name_hint = wc_raw.get("name") if isinstance(wc_raw, Mapping) else None
         if not isinstance(name_hint, str) or not name_hint:
             name_hint = None
+        # Every failure inside either parser is a ValueError and never a TypeError
+        # precisely so this `except` can attribute it to one entry and keep going;
+        # a TypeError escaping here would abort the whole validation pass and report
+        # one global error instead of one bad entry among many good ones.
         try:
+            if entry_is_watcher_rule(wc_raw):
+                watcher_rules.append(
+                    _parse_one_watcher_rule(
+                        wc_raw, i,
+                        connectors=connectors,
+                        connector_names=connector_names,
+                        agents=agents,
+                        default_agent=default_agent,
+                        config_dir=config_dir,
+                        templates=watcher_templates,
+                        seen_rule_names=seen_rule_names,
+                    )
+                )
+                continue
             watchers.extend(
                 _parse_one_watcher_entry(
                     wc_raw, i, watcher_templates, connector_names, connectors, agents,
@@ -2217,6 +2268,7 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
         agents=agents,
         default_agent=default_agent,
         watchers=watchers,
+        watcher_rules=watcher_rules,
         max_queue_depth=max_queue_depth,
         scheduler=scheduler_cfg,
     )
