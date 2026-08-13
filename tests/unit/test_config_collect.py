@@ -284,7 +284,12 @@ class TestCollectConfigNonStringScalarFields(_CollectConfigTestBase):
         """)
         config, issues = collect_config(config_path)
         self.assertIsNotNone(config)
-        self.assertTrue(any("'session_id' must be a string" in i.message for i in issues))
+        # Inverted with the field's removal: the key is refused whatever its value,
+        # and the refusal must still arrive as an attributed issue rather than an
+        # exception that aborts the pass.
+        watcher_issues = [i for i in issues if i.entity_kind == "watcher"]
+        self.assertEqual(len(watcher_issues), 1, [i.message for i in issues])
+        self.assertIn("'session_id' is no longer supported", watcher_issues[0].message)
 
     def test_non_string_default_agent_is_a_collected_issue(self):
         config_path = self._write(f"""\
@@ -437,7 +442,11 @@ class TestCollectConfigQueueSchedulerSessionId(_CollectConfigTestBase):
         self.assertEqual(config.scheduler.completed_job_ttl_days, 7)  # dataclass default
         self.assertTrue(any("scheduler" in i.message for i in issues))
 
-    def test_duplicate_session_id_across_watchers_is_an_issue_not_a_discard(self):
+    def test_each_watcher_carrying_session_id_is_its_own_attributed_issue(self):
+        """Replaces the duplicate-sticky-session_id case: the field is removed, so two
+        watchers cannot share one and the cross-watcher pass is gone with it. What
+        matters now is that each offending entry is reported on its own — the property
+        the old test was really pinning (an issue per entry, not one discard)."""
         config_path = self._write(f"""\
             connectors:
               - name: rc
@@ -458,11 +467,21 @@ class TestCollectConfigQueueSchedulerSessionId(_CollectConfigTestBase):
                 agent: default
                 room: dev
                 session_id: sticky-1
+              - name: w3
+                connector: rc
+                agent: default
+                room: ops
         """)
         config, issues = collect_config(config_path)
         self.assertIsNotNone(config)
-        self.assertEqual([w.name for w in config.watchers], ["w1", "w2"])
-        self.assertTrue(any("Duplicate sticky session_id" in i.message for i in issues))
+        self.assertEqual(
+            [(i.entity_kind, i.entity_name) for i in issues],
+            [("watcher", "w1"), ("watcher", "w2")],
+        )
+        for issue in issues:
+            self.assertIn("'session_id' is no longer supported", issue.message)
+        # The clean entry either side still parses — the "not a discard" half.
+        self.assertEqual([w.name for w in config.watchers], ["w3"])
 
 
 class TestCollectConfigOnTheFlyWatcherFields(_CollectConfigTestBase):

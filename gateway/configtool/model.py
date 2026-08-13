@@ -548,10 +548,16 @@ class EditableConfig:
         is deliberately never a merge candidate, since that fallback can
         shift if connectors/agents are later added or reordered) and whose
         `_watcher_shared_fields()` deep-equal `shared`, AND that has no
-        explicit `name:`/`session_id:` of its own (those are only legal on
-        a single-room entry — gateway/config.py forbids them the moment an
-        entry becomes multi-room, so an entry that already has one can
-        never legally accept another room). Returns the matching raw dict
+        explicit `name:` of its own (only legal on a single-room entry —
+        gateway/config.py forbids it the moment an entry becomes multi-room, so
+        an entry that already has one can never legally accept another room).
+
+        `session_id:` is still skipped even though the field is removed: an entry
+        carrying one no longer loads at all, and merging a room into an
+        already-broken entry is how a corruption reaches disk — `save()`'s gate
+        blocks only *newly introduced* errors, so an edit that leaves an existing
+        error in place is permitted. Same hazard as the roomless-entry case above.
+        Returns the matching raw dict
         (by identity, live in `self.document["watchers"]`), or None."""
         for entry in self.watchers_raw:
             # An entry with no room of its own is never a merge target.  It
@@ -701,9 +707,9 @@ def _watcher_shared_fields(entry: dict) -> dict:
     expanded room in a `rooms:` group, never per-room. Two entries with
     equal `_watcher_shared_fields()` (plus equal connector/agent) can
     legally be merged into one `rooms:` group. Deliberately does NOT
-    include `name`/`session_id` — those are per-room, single-room-only,
-    and already excluded from merge-eligibility by
-    `find_mergeable_watcher_entry()`'s own separate check."""
+    include `name` — per-room, single-room-only, and already excluded from
+    merge-eligibility by `find_mergeable_watcher_entry()`'s own separate check,
+    which also still skips the removed `session_id`."""
     return {
         key: entry[key]
         for key in (

@@ -77,11 +77,21 @@ _REMOVED_DEFAULTS_KEYS: dict[str, str] = {
 #
 # Kind strings are plain ("agent"/"connector"/"watcher"), not the
 # `<kind>_templates` block names, and not the retired `*_defaults` names above.
+#
+# `session_id` stays listed although the field is removed. A template is resolved
+# into each entry before the entry is parsed, so dropping it would report the
+# removal error against every entry that inherits the template and never against the
+# template that actually carries it. Keeping it here reports the template.
 TEMPLATE_FORBIDDEN_KEYS: dict[str, frozenset[str]] = {
     "connector": frozenset({"name"}),
     "agent": frozenset(),
     "watcher": frozenset({"name", "room", "rooms", "session_id"}),
 }
+
+# Of the keys above, the ones that are removed rather than merely per-entry. The
+# template error distinguishes them, because "set it per-entry" is wrong advice for a
+# field nothing accepts any more.
+REMOVED_ENTRY_KEYS: frozenset[str] = frozenset({"session_id"})
 
 # Single source of truth for history_handoff's per-field defaults: read from
 # HistoryHandoffConfig's OWN dataclass field defaults below, not re-typed as
@@ -316,18 +326,13 @@ class GatewayConfig:
                 )
             )
 
-        # Validate no duplicate sticky session IDs across watchers — duplicate IDs
-        # cause silent overwrite of session→room / session→connector routing maps,
-        # leading to permission notifications landing in the wrong room.
-        seen_session_ids: set[str] = set()
-        for wc in watchers:
-            if wc.session_id:
-                if wc.session_id in seen_session_ids:
-                    raise ValueError(
-                        f"Duplicate sticky session_id '{wc.session_id}' found across "
-                        f"watchers. Each watcher must use a unique session_id."
-                    )
-                seen_session_ids.add(wc.session_id)
+        # The cross-watcher duplicate-session_id pass that used to sit here is gone
+        # with the field: `session_id:` is refused per entry above, so no watcher can
+        # carry one and a duplicate cannot exist. The hazard it guarded — two
+        # watchers sharing one id, silently overwriting the session→room and
+        # session→connector routing maps so permission notifications land in the
+        # wrong room — now has no way to arise from config. The runtime-assigned
+        # `WatcherState.session_id` is unaffected and stays unique by construction.
 
         max_queue_depth = _parse_max_queue_depth(raw)
 
@@ -427,9 +432,28 @@ def _parse_templates_block(
             )
         bad = sorted(forbidden_keys & block.keys())
         if bad:
+            # "set it per-entry" is the right advice for name/room/rooms and the
+            # wrong advice for a key that has been removed outright, so the removed
+            # ones are named separately rather than swept into one sentence. A
+            # correct attribution carrying a wrong instruction is worse than no
+            # detail: it sends the operator to move a field that nothing accepts.
+            removed = sorted(k for k in bad if k in REMOVED_ENTRY_KEYS)
+            identity = [k for k in bad if k not in REMOVED_ENTRY_KEYS]
+            parts = []
+            if identity:
+                verb = "identifies" if len(identity) == 1 else "identify"
+                parts.append(
+                    f"{_key_list(identity)} {verb} an individual entry and must "
+                    "be set per-entry, not inherited"
+                )
+            if removed:
+                verb = "does" if len(removed) == 1 else "do"
+                parts.append(
+                    f"{_key_list(removed)} {verb} not exist at all any more — the "
+                    "per-entry error names the replacement"
+                )
             raise ValueError(
-                f"{key}['{name}'] must not set {bad} — these fields identify "
-                "an individual entry and must be set per-entry, not inherited."
+                f"{key}['{name}'] must not set {_key_list(bad)} — " + "; ".join(parts) + "."
             )
         result = dict(block)
         result.pop("description", None)
@@ -1265,29 +1289,39 @@ def _parse_one_watcher_entry(
             "docs/design/dynamic-watcher-design.md."
         )
 
-    # 'name' / 'session_id' pin a single sticky identity — only meaningful
-    # when the entry expands to exactly one watcher. Both used to type-check
-    # only the truthy half; see _validated_optional_name() for why the falsy
-    # half was the worse of the two.
+    # 'name' pins a single sticky identity — only meaningful when the entry
+    # expands to exactly one watcher. It used to type-check only the truthy half;
+    # see _validated_optional_name() for why the falsy half was the worse of the two.
     where = f"Watcher entry at index {index}"
     explicit_name = _validated_optional_name(wc.get("name", _MISSING_FIELD), where, "name")
-    explicit_session_id = _validated_optional_name(
-        wc.get("session_id", _MISSING_FIELD), where, "session_id"
-    )
-    if len(rooms_list) > 1:
-        if explicit_name:
-            raise ValueError(
-                f"Watcher entry at index {index}: 'name' can only be set when "
-                f"there is exactly one room (found {len(rooms_list)} in "
-                "'rooms') — remove 'name' or split into single-room entries."
-            )
-        if explicit_session_id:
-            raise ValueError(
-                f"Watcher entry at index {index}: 'session_id' can only be set "
-                f"when there is exactly one room (found {len(rooms_list)} in "
-                "'rooms') — remove 'session_id' or split into single-room "
-                "entries."
-            )
+    if len(rooms_list) > 1 and explicit_name:
+        raise ValueError(
+            f"Watcher entry at index {index}: 'name' can only be set when "
+            f"there is exactly one room (found {len(rooms_list)} in "
+            "'rooms') — remove 'name' or split into single-room entries."
+        )
+
+    # `session_id:` is removed, and refused rather than ignored. Unknown keys on a
+    # watcher entry are silently dropped by every `.get()` here — deliberately, so
+    # `description:` and the like need no handling — which means deleting this field
+    # quietly would demote a released, load-bearing setting to a no-op: the config
+    # would still parse, the session would no longer be pinned, and the operator
+    # would find out from the agent's missing memory. Unlike the fields #97 moved,
+    # this one shipped in v0.5.1 and is documented in its config.example.yaml, so
+    # silence here would land on real deployments.
+    #
+    # There is no replacement field, because pinning was the wrong mechanism rather
+    # than the wrong spelling: with a watcher created per discovered room, nothing
+    # can supply one id, and a pinned id dies anyway once the backend expires the
+    # session it names. A handoff survives that, so the error names it.
+    if "session_id" in wc:
+        raise ValueError(
+            f"Watcher entry at index {index}: 'session_id' is no longer supported. "
+            "Sessions are no longer pinned from config. To carry context into a new "
+            "session, have the agent summarise its session to a file and read that "
+            "file back in the new one — a handoff survives the backend expiring a "
+            "session, which pinning never did. See docs/user-guide.md."
+        )
 
     resolved_connector = _resolve_watcher_connector(
         wc, where, connectors, connector_names
@@ -1358,7 +1392,6 @@ def _parse_one_watcher_entry(
                 connector=resolved_connector,
                 room=room,
                 agent=watcher_agent,
-                session_id=explicit_session_id,
                 context_inject_files=ctx_files,
                 online_notification=online_notification,
                 offline_notification=offline_notification,
@@ -2277,21 +2310,8 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
         except ValueError as exc:
             issues.append(ConfigIssue("watcher", name_hint or f"(index {i})", str(exc)))
 
-    # Cross-watcher duplicate session_id check — needs the full list, same
-    # as from_file()'s own post-loop pass.
-    seen_session_ids: set[str] = set()
-    for wc in watchers:
-        if wc.session_id:
-            if wc.session_id in seen_session_ids:
-                issues.append(
-                    ConfigIssue(
-                        "global", None,
-                        f"Duplicate sticky session_id '{wc.session_id}' found across "
-                        f"watchers. Each watcher must use a unique session_id.",
-                    )
-                )
-            else:
-                seen_session_ids.add(wc.session_id)
+    # No cross-watcher duplicate-session_id pass here either — see from_file()'s
+    # note where the same loop used to be.
 
     # max_queue_depth/scheduler: don't gate any single entity's validity —
     # collected as issues, falling back to safe defaults for the returned

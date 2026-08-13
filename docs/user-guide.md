@@ -242,75 +242,63 @@ watchers:
 
 ---
 
-### Use Case 3 — Continue an Existing Agent Session Remotely
+### Use Case 3 — Carry an Existing Agent Session's Context into Chat
 
-If you have a long-running agent session already in progress (e.g., a Claude session you started locally), pin a watcher to that session ID so your messaging app picks up exactly where you left off. The session context, memory, and history are all preserved.
+If you have a long-running agent session already in progress (e.g. a Claude session
+you started locally), hand its context over to a watcher so your messaging app picks
+up where you left off.
 
 > **Similar to Claude Code's Remote Control:** Claude Code's [Remote Control](https://code.claude.com/docs/en/remote-control) feature (`claude --remote-control`) lets you drive a local session from `claude.ai/code` or the Claude mobile app. `agent-chat-gateway` takes a complementary approach: instead of a personal remote interface, your session becomes accessible from your team's shared chat room — with RBAC and permission approval so others can interact safely too.
 
-**Example: Resume an existing Claude session by session ID**
+**Use a handoff, not a pinned session id.** Earlier versions accepted
+`watchers[].session_id` to attach a watcher to one specific backend session.
+That field has been removed, and setting it is now a config error. Two reasons:
+
+- **It could not survive the backend.** A pinned id names a session the backend is
+  free to expire — Claude Code's default `cleanupPeriodDays` is 30 days. Once that
+  happens the id refers to nothing, and the watcher starts empty with no warning.
+- **There is nothing to pin it to.** A watcher is created per room as rooms are
+  discovered, so a single id in config cannot say which room it belongs to.
+
+A handoff has neither problem: it is a file, so it outlives any session, and each
+watcher reads it on its own first turn.
+
+**Example: hand off a local session's context**
+
+```bash
+# 1. In your existing local session, ask the agent to summarise itself to a file.
+claude -p "Summarise everything we have established in this session — decisions,
+constraints, open questions, and where we left off — into ./HANDOFF.md. Write it
+for another instance of yourself with no memory of this conversation."
+```
 
 ```yaml
-connectors:
-  - name: rc-home
-    type: rocketchat
-    server:
-      url: "${RC_URL}"
-      username: "${RC_BOT_USER}"
-      password: "${RC_BOT_PASS}"
-    allowed_users:
-      owners:
-        - alice
-
-default_agent: claude
-
-agents:
-  claude:
-    type: claude
-    command: claude
-    working_directory: ~/my-project
-    timeout: 360
-    permissions:
-      enabled: true
-      timeout: 300
-
+# 2. Point the watcher at that file. Context files are read and sent to the agent
+#    on session start, so it begins with the context rather than discovering it.
 watchers:
   - name: my-project
     connector: rc-home
     room: "@alice"
     agent: claude
-    session_id: "ses_abc123def456"    # Pin to your existing session
+    context_inject_files:
+      - ./HANDOFF.md
 ```
-
-**How to find your existing session ID:**
-
-For Claude CLI, session IDs appear in the output when you run `claude -p`:
-```
-{"type": "result", "session_id": "ses_abc123def456", ...}
-```
-
-Or check your Claude session history directly.
-
-**Key settings for this use case:**
-- Set `session_id` to your existing session's ID to resume it from your messaging app
-- The gateway will never overwrite a sticky `session_id` — it survives daemon restarts and `reset` commands
-- If you want to start fresh later, either remove the `session_id` field or run `agent-chat-gateway reset <watcher>` (only affects non-sticky sessions)
-
-**Tip — Resume workflow:**
 
 ```bash
-# 1. Start a session locally and note the session ID
-claude -p "Let's start working on the auth module"
-# → {"session_id": "ses_abc123def456", ...}
-
-# 2. Add that session ID to your config.yaml under the watcher
-# 3. Start the gateway
+# 3. Start the gateway and continue from your messaging app.
 agent-chat-gateway start
-
-# 4. Continue the conversation from Rocket.Chat on your phone or another machine
 ```
 
----
+**Notes:**
+
+- `context_inject_files` paths are resolved relative to `config.yaml`'s directory.
+- Context files are re-read on every watcher start, so rewriting `HANDOFF.md` takes
+  effect the next time the watcher starts. Run `agent-chat-gateway reset <watcher>`
+  as well if you want the updated context to open a *fresh* conversation instead of
+  continuing the existing one.
+- Session *continuity* across daemon restarts needs no configuration: the gateway
+  persists each watcher's runtime session id in its state file and resumes it. The
+  removed field was only ever about pinning a session id chosen by hand.
 
 ## Configuration Reference
 
@@ -486,9 +474,9 @@ watchers:
     # -> rc-main-general, rc-main-dev, rc-main-dm-alice
 ```
 
-`name:` and `session_id:` may only be set when the entry has exactly one
-room (via `room:`, or a single-item `rooms:`) — they pin a specific
-watcher's identity, which is ambiguous across an expanded multi-room entry.
+`name:` may only be set when the entry has exactly one room (via `room:`, or a
+single-item `rooms:`) — it pins a specific watcher's identity, which is ambiguous
+across an expanded multi-room entry.
 
 > ⚠️ **Watcher names are persistent identifiers** — they key session state
 > in `state.<connector>.json`, attachment cache directories, and injected
@@ -508,7 +496,6 @@ watcher's identity, which is ambiguous across an expanded multi-room entry.
 | `room` | string | One of `room`/`rooms` | Room/channel name (as known to the `connector` named above) or `@username` for DMs |
 | `rooms` | list[string] | One of `room`/`rooms` | Bind this connector+agent pair to several rooms at once; expands into one watcher per room |
 | `agent` | string | No | Agent backend to use; falls back to `default_agent` if omitted |
-| `session_id` | string | No | Optional sticky session ID (e.g., `ses_abc123`); `null` = auto-create. Only settable on a single-room entry. |
 | `context_inject_files` | list | No | Watcher-specific context files |
 | `online_notification` | string | No | Message posted when this watcher starts; default `null` (no message) |
 | `offline_notification` | string | No | Message posted when this watcher stops; default `null` (no message) |
@@ -1027,23 +1014,19 @@ Files are cached globally in the `cache_dir` and symlinked into each watcher's w
 
 By default, each watcher creates its own persistent session with the agent backend. The session ID is stored in `~/.agent-chat-gateway/state.<connector>.json` and reused across daemon restarts.
 
-```yaml
-watchers:
-  - name: general
-    session_id: null  # Gateway auto-creates and persists
-```
+No configuration is involved: a watcher's session id is assigned by the backend and
+persisted by the gateway, never written by hand.
 
-### Sticky Sessions
+### Pinned Sessions Are Removed
 
-You can explicitly tie a watcher to a specific session (e.g., a long-running agent session):
+`watchers[].session_id` used to tie a watcher to one specific backend session.
+Setting it is now a config error. A pinned id names a session the backend is free to
+expire (Claude Code's default `cleanupPeriodDays` is 30 days), after which the
+watcher silently starts empty — and with watchers created per room, one id in config
+cannot say which room it belongs to.
 
-```yaml
-watchers:
-  - name: research
-    session_id: "ses_abc123def456"  # Always use this session
-```
-
-Sticky sessions are never cleared by the `reset` command — the watcher will reconnect to the same session if it's still alive.
+To carry context into a session, use a handoff file instead — see
+[Use Case 3](#use-case-3--carry-an-existing-agent-sessions-context-into-chat).
 
 ### Resetting State
 
@@ -1124,7 +1107,6 @@ cat ~/.agent-chat-gateway/state.rc-main.json | jq .
 1. Check agent logs for repeated context injection: `grep "context_inject" ~/.agent-chat-gateway/gateway.log`
 2. Reduce context file sizes (keep under 256 KB per file, 512 KB total)
 3. Consider disabling context for specific watchers: set `context_inject_files: []`
-4. Use sticky sessions (`session_id: "ses_..."`) to maintain conversation history
 
 ### Connection failures
 

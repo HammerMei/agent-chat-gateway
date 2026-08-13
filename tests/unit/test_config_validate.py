@@ -471,7 +471,7 @@ class TestValidateConfigLint(_ValidateConfigTestBase):
               - name: [a, b]
                 connector: rc
                 room: general
-                session_id: null
+                online_notification: null
         """)
         result = self._validate(cfg, lint=True)  # must not raise
         watcher_findings = [f for f in result.findings if f.entity_kind == "watcher"]

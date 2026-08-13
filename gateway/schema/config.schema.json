@@ -341,10 +341,6 @@
           "description": "Only meaningful once room: \"*\" (rule-based room matching) is implemented; the loader currently rejects room: \"*\" outright with a 'not implemented yet' error regardless of this field. See docs/design/dynamic-watcher-design.md."
         },
         "agent": { "type": "string" },
-        "session_id": {
-          "type": ["string", "null"],
-          "description": "Only allowed when the entry has exactly one room."
-        },
         "context_inject_files": {
           "type": "array",
           "items": { "type": "string" }
