@@ -56,6 +56,25 @@ _REMOVED_DEFAULTS_KEYS: dict[str, str] = {
     "watcher_defaults": "watcher_templates",
 }
 
+# Single source of truth for the identity keys a named `*_templates:` block may
+# not set — the keys that identify one specific entry, and so cannot be shared
+# by everything inheriting the template.  Passed to _parse_templates_block().
+#
+# This existed as four byte-identical `frozenset({"name", "room", "rooms",
+# "session_id"})` literals (two here, one in config_validate, one inline in the
+# config tool) plus a fifth copy in a dict there, with a comment claiming unit
+# tests kept them in sync.  No such test existed, and nothing imported anything
+# — they were four hand-maintained copies of one rule.  The connector and agent
+# sets were duplicated the same way.
+#
+# Kind strings are plain ("agent"/"connector"/"watcher"), not the
+# `<kind>_templates` block names, and not the retired `*_defaults` names above.
+TEMPLATE_FORBIDDEN_KEYS: dict[str, frozenset[str]] = {
+    "connector": frozenset({"name"}),
+    "agent": frozenset(),
+    "watcher": frozenset({"name", "room", "rooms", "session_id"}),
+}
+
 # Single source of truth for history_handoff's per-field defaults: read from
 # HistoryHandoffConfig's OWN dataclass field defaults below, not re-typed as
 # separate literals here. These two drifted apart once, for over two months
@@ -175,7 +194,7 @@ class GatewayConfig:
             )
 
         connector_templates = _parse_templates_block(
-            raw, "connector_templates", frozenset({"name"})
+            raw, "connector_templates", TEMPLATE_FORBIDDEN_KEYS["connector"]
         )
 
         connectors: list[ConnectorConfig] = []
@@ -195,7 +214,7 @@ class GatewayConfig:
             )
         default_agent = raw.get("default_agent", "")
 
-        agent_templates = _parse_templates_block(raw, "agent_templates", frozenset())
+        agent_templates = _parse_templates_block(raw, "agent_templates", TEMPLATE_FORBIDDEN_KEYS["agent"])
         tool_presets = _parse_tool_presets(raw)
 
         agents: dict[str, AgentConfig] = {}
@@ -237,7 +256,7 @@ class GatewayConfig:
             )
 
         watcher_templates = _parse_templates_block(
-            raw, "watcher_templates", frozenset({"name", "room", "rooms", "session_id"})
+            raw, "watcher_templates", TEMPLATE_FORBIDDEN_KEYS["watcher"]
         )
 
         seen_watcher_names: set[str] = set()
@@ -1347,7 +1366,7 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
 
     try:
         connector_templates = _parse_templates_block(
-            raw, "connector_templates", frozenset({"name"})
+            raw, "connector_templates", TEMPLATE_FORBIDDEN_KEYS["connector"]
         )
     except ValueError as exc:
         return None, [ConfigIssue("global", None, str(exc))]
@@ -1402,7 +1421,7 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
     default_agent = raw.get("default_agent", "")
 
     try:
-        agent_templates = _parse_templates_block(raw, "agent_templates", frozenset())
+        agent_templates = _parse_templates_block(raw, "agent_templates", TEMPLATE_FORBIDDEN_KEYS["agent"])
         tool_presets = _parse_tool_presets(raw)
     except ValueError as exc:
         issues.append(ConfigIssue("global", None, str(exc)))
@@ -1547,7 +1566,7 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
 
     try:
         watcher_templates = _parse_templates_block(
-            raw, "watcher_templates", frozenset({"name", "room", "rooms", "session_id"})
+            raw, "watcher_templates", TEMPLATE_FORBIDDEN_KEYS["watcher"]
         )
     except ValueError as exc:
         issues.append(ConfigIssue("global", None, str(exc)))

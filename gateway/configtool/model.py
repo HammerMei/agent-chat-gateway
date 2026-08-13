@@ -42,6 +42,7 @@ from pathlib import Path
 import yaml
 
 from ..config import (
+    TEMPLATE_FORBIDDEN_KEYS,
     GatewayConfig,
     WatcherConfig,
     _parse_one_watcher_entry,
@@ -51,22 +52,22 @@ from ..config import (
 )
 from ..config_validate import Finding, ValidationResult, validate_config
 
-# kind -> the top-level *_templates: key it reads, and the forbidden-key set
-# _parse_templates_block enforces for a named template of that kind. Mirrors
-# gateway/config.py's own three call sites exactly (kept in sync by unit
-# tests importing both from the same source, not by hand). Kind strings here
-# are plain ("agent"/"connector"/"watcher") — not "agent_defaults" etc. —
-# since these are template kinds, not defaults-block kinds.
+# kind -> the top-level *_templates: key it reads. Kind strings are plain
+# ("agent"/"connector"/"watcher") — not "agent_defaults" etc. — since these are
+# template kinds, not defaults-block kinds.
 _TEMPLATES_KEY: dict[str, str] = {
     "connector": "connector_templates",
     "agent": "agent_templates",
     "watcher": "watcher_templates",
 }
-_TEMPLATES_FORBIDDEN_KEYS: dict[str, frozenset[str]] = {
-    "connector": frozenset({"name"}),
-    "agent": frozenset(),
-    "watcher": frozenset({"name", "room", "rooms", "session_id"}),
-}
+
+# The forbidden-key sets are the LOADER's rule, so they are imported rather than
+# re-typed here.  This module used to hold its own copy, above a comment
+# claiming unit tests kept the two in sync "by importing both from the same
+# source, not by hand" — neither half of which was true: nothing imported
+# anything, and no such test existed.  Aliased rather than replaced at the use
+# sites so the local name keeps working.
+_TEMPLATES_FORBIDDEN_KEYS = TEMPLATE_FORBIDDEN_KEYS
 
 
 class Provenance(Enum):
@@ -476,7 +477,7 @@ class EditableConfig:
         try:
             watcher_templates = _parse_templates_block(
                 disk_raw, "watcher_templates",
-                frozenset({"name", "room", "rooms", "session_id"}),
+                TEMPLATE_FORBIDDEN_KEYS["watcher"],
             )
         except ValueError:
             # PR review finding: a malformed `watcher_templates:` block is
