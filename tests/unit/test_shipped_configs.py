@@ -150,5 +150,70 @@ class TestGeneratedConfigsCarryNoRemovedKeys(unittest.TestCase):
                     )
 
 
+class TestDocumentedYamlExamplesCarryNoRemovedKeys(unittest.TestCase):
+    """A copy-pasteable example must not produce a config that refuses to load.
+
+    Scope is deliberately narrow, and the boundary is worth stating rather than
+    implying. The documentation problems found alongside the Docker one were *prose*
+    claims — "sticky session IDs preserved across reset operations" — and prose drift
+    is not mechanically checkable; it stays a human sweep, done case-insensitively and
+    across all file types. What IS checkable is the subset with the same failure path
+    as the shipped configs: a fenced YAML block a reader copies verbatim.
+
+    Historical migration guides are exempt: their whole purpose is to show the shape a
+    past version used.
+    """
+
+    REMOVED_WATCHER_KEYS = ("session_id",)
+    HISTORICAL = ("docs/migration-0.2.md", "docs/migration-0.3.md")
+
+    def test_no_fenced_yaml_example_sets_a_removed_key(self):
+        pattern = re.compile(
+            r"^\s*(?:-\s*)?(?:" + "|".join(self.REMOVED_WATCHER_KEYS) + r")\s*:",
+        )
+        tracked = subprocess.run(
+            ["git", "ls-files", "-z", "*.md"],
+            cwd=REPO, capture_output=True, text=True, check=True,
+        ).stdout.split("\0")
+
+        offenders: list[str] = []
+        for name in [n for n in tracked if n.endswith(".md")]:
+            if name in self.HISTORICAL:
+                continue
+            text = (REPO / name).read_text()
+            # Only inside ```yaml fences: elsewhere the same token is prose, or a
+            # Python annotation in an architecture sample.
+            for fence in re.findall(r"```ya?ml\n(.*?)```", text, re.S):
+                for i, line in enumerate(fence.splitlines(), 1):
+                    if line.lstrip().startswith("#"):
+                        continue
+                    if pattern.match(line):
+                        offenders.append(f"{name}: {line.strip()}")
+        self.assertEqual(
+            offenders,
+            [],
+            "a documented YAML example sets a key the loader now refuses, so a reader "
+            "copying it gets a config that will not start",
+        )
+
+    def test_the_matcher_behaves_as_the_sweep_assumes(self):
+        """Without this, a broken matcher would report clean forever — the same reason
+        the shipped-config sweep has its own completeness test.
+
+        The last case is the one that explains the fence scoping: the pattern *does*
+        match a Python type annotation (`session_id: str,` in an architecture sample),
+        so it is the ```yaml fence — not the pattern — that keeps those out. Scoping is
+        load-bearing, not tidiness."""
+        pattern = re.compile(r"^\s*(?:-\s*)?session_id\s*:")
+        self.assertIsNotNone(pattern.match("    session_id: ses_abc"))
+        self.assertIsNotNone(pattern.match("  - session_id: null"))
+        self.assertIsNone(pattern.match("  # session_id: explained in prose"))
+        self.assertIsNotNone(
+            pattern.match("        session_id: str,"),
+            "if this stops matching, the fence scoping is no longer what excludes "
+            "Python annotations and the comment above is wrong",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
