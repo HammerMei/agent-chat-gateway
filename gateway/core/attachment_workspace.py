@@ -100,32 +100,69 @@ class AttachmentWorkspace:
         cache_path = Path(cache_dir)
         cache_path.mkdir(parents=True, exist_ok=True)
 
-        if link.is_symlink():
-            if link.resolve() != cache_path.resolve():
-                link.unlink()
-                link.symlink_to(cache_path)
-                logger.info("Updated attachment symlink: %s → %s", link, cache_path)
-        elif link.exists():
-            logger.warning(
-                "Attachment path %s exists but is not a symlink — skipping", link
-            )
+        if not self._ensure_link(link, cache_path):
             return None
-        else:
-            try:
-                link.symlink_to(cache_path)
-            except FileExistsError:
-                # Two watchers in one room now SHARE this link, because it keys on the
-                # room rather than on the watcher name. The per-watcher lifecycle locks
-                # do not serialize them, so both can pass the checks above and both
-                # reach this line; the loser used to raise and roll its whole watcher
-                # startup back. A link that already points where this call wanted it is
-                # success, not a conflict — the operation is idempotent by nature.
-                if not (link.is_symlink() and link.resolve() == cache_path.resolve()):
-                    raise
-                logger.debug(
-                    "Attachment symlink %s created concurrently — reusing it", link
-                )
-            else:
-                logger.info("Created attachment symlink: %s → %s", link, cache_path)
 
         return str(link)
+
+    @staticmethod
+    def _ensure_link(link: Path, cache_path: Path) -> bool:
+        """Make `link` a symlink to `cache_path`, tolerating a concurrent writer.
+
+        One operation rather than three independent branches, because the room-keyed link
+        is *shared* by a room's watchers and the lifecycle locks are per watcher. Every
+        step here is a check followed by an act, and another thread can intervene between
+        them:
+
+        * both observe it absent, and one `symlink_to` loses;
+        * both observe a stale target, and one `unlink` loses (`FileNotFoundError`) or one
+          `symlink_to` loses (`FileExistsError`).
+
+        The first version of this fix handled only the absent case — patching the branch
+        that was reported and leaving its twin, which is the mistake this file is now
+        arranged to prevent. So the whole sequence retries once and then judges by the
+        end state: what matters is that the link points at `cache_path` when this returns,
+        not which thread put it there.
+
+        Returns False (without raising) only for the one case that is not a race: a real
+        file or directory occupying the path, which is an operator problem rather than a
+        concurrent writer.
+        """
+        for _ in range(2):
+            if link.is_symlink():
+                if link.resolve() == cache_path.resolve():
+                    return True
+                try:
+                    link.unlink()
+                except FileNotFoundError:
+                    # Another thread removed it first; re-evaluate rather than assume.
+                    continue
+                logger.info("Repointing attachment symlink: %s → %s", link, cache_path)
+            elif link.exists():
+                logger.warning(
+                    "Attachment path %s exists but is not a symlink — skipping", link
+                )
+                return False
+            try:
+                link.symlink_to(cache_path)
+                logger.info("Created attachment symlink: %s → %s", link, cache_path)
+                return True
+            except FileExistsError:
+                # Someone created it between the check and here. If it is already what
+                # this call wanted, that is success; otherwise loop to re-evaluate.
+                if link.is_symlink() and link.resolve() == cache_path.resolve():
+                    logger.debug(
+                        "Attachment symlink %s created concurrently — reusing it", link
+                    )
+                    return True
+
+        # Judged by the end state after the bounded retry: a third writer would have to
+        # be actively fighting for this path, and reporting the truth beats looping.
+        ok = link.is_symlink() and link.resolve() == cache_path.resolve()
+        if not ok:
+            logger.warning(
+                "Could not establish attachment symlink %s → %s after a retry",
+                link, cache_path,
+            )
+        return ok
+

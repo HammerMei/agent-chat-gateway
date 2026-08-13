@@ -100,20 +100,62 @@ class TestAttachmentWorkspaceSetup(unittest.TestCase):
 
         self.assertEqual(got, str(acg / "ROOMKEY"))
 
-    def test_a_concurrently_created_link_pointing_elsewhere_still_raises(self):
-        """The tolerance is narrow on purpose: only a link that already points where this
-        call wanted it counts as success. Anything else is a real conflict and must not be
-        swallowed, or a watcher would silently read another room's attachments."""
+    def test_a_concurrently_created_link_pointing_elsewhere_is_repointed(self):
+        """Repointed, not refused — the same thing that happens without a race.
+
+        An earlier version of this fix raised here, on the reasoning that a link aimed
+        elsewhere must not be swallowed. That was inconsistent: the non-concurrent path
+        already repoints a stale link (see the test below), so the outcome would have
+        depended on *when* the wrong target was noticed.
+
+        And repointing is not swallowing. `attachment_cache_dir` depends only on
+        (connector, room id), so two watchers in one room cannot genuinely disagree about
+        the target; a wrong one means the link is stale — after `cache_dir_global`
+        changed, say — which is precisely what repointing is for. The watcher ends up
+        reading its own room's cache either way, which was the actual concern.
+        """
         acg = self.work / ".acg-attachments"
         acg.mkdir()
-        wrong = self.tmp / "someone-elses-cache"
-        wrong.mkdir()
-        (acg / "ROOMKEY").symlink_to(wrong)
+        stale = self.tmp / "old-cache-location"
+        stale.mkdir()
+        (acg / "ROOMKEY").symlink_to(stale)
 
         with patch.object(Path, "is_symlink", _blind_once("ROOMKEY", Path.is_symlink)), \
              patch.object(Path, "exists", _blind_once("ROOMKEY", Path.exists)):
-            with self.assertRaises(FileExistsError):
-                self.workspace.setup("ROOMKEY", "room1", str(self.work))
+            got = self.workspace.setup("ROOMKEY", "room1", str(self.work))
+
+        self.assertEqual(got, str(acg / "ROOMKEY"))
+        self.assertEqual((acg / "ROOMKEY").resolve(), self.cache.resolve())
+
+    def test_a_stale_link_removed_underneath_is_not_an_error(self):
+        """The twin of the absent-link race, in the *update* branch.
+
+        Two same-room watchers resumed while the link is stale can both enter the
+        wrong-target branch; one `unlink` then loses with `FileNotFoundError`. The first
+        version of this fix covered only the create branch — patching the reported case
+        and leaving its sibling, which is the shape this file now guards against.
+        """
+        acg = self.work / ".acg-attachments"
+        acg.mkdir()
+        stale = self.tmp / "old-cache-location"
+        stale.mkdir()
+        link = acg / "ROOMKEY"
+        link.symlink_to(stale)
+
+        real_unlink = Path.unlink
+
+        def unlink_then_vanish(self, *a, **kw):  # noqa: ANN001 - patched method
+            if self.name == "ROOMKEY":
+                real_unlink(self, *a, **kw)
+                # Simulate the losing thread: the link is already gone when it tries.
+                raise FileNotFoundError(2, "No such file or directory", str(self))
+            return real_unlink(self, *a, **kw)
+
+        with patch.object(Path, "unlink", unlink_then_vanish):
+            got = self.workspace.setup("ROOMKEY", "room1", str(self.work))
+
+        self.assertEqual(got, str(link))
+        self.assertEqual(link.resolve(), self.cache.resolve())
 
     def test_an_existing_link_to_the_wrong_target_is_repointed(self):
         acg = self.work / ".acg-attachments"
@@ -130,6 +172,29 @@ class TestAttachmentWorkspaceSetup(unittest.TestCase):
         acg.mkdir()
         (acg / "ROOMKEY").mkdir()
         self.assertIsNone(self.workspace.setup("ROOMKEY", "room1", str(self.work)))
+
+    def test_the_refusal_says_what_is_actually_wrong(self):
+        """Asserted on the message, because the *outcome* alone cannot distinguish this
+        from a lost race.
+
+        Removing the explicit not-a-symlink branch still returns None — the bounded retry
+        exhausts and the end-state check refuses — so a test on the return value alone
+        passes either way. What degrades is diagnosability: an operator told "could not
+        establish after a retry" looks for a concurrent writer, when the real cause is a
+        stray directory they can simply remove. That difference is the whole value of the
+        branch, so it is what gets asserted.
+        """
+        acg = self.work / ".acg-attachments"
+        acg.mkdir()
+        (acg / "ROOMKEY").mkdir()
+        with self.assertLogs(
+            "agent-chat-gateway.core.attachment_workspace", level="WARNING"
+        ) as logs:
+            self.workspace.setup("ROOMKEY", "room1", str(self.work))
+        self.assertTrue(
+            any("not a symlink" in line for line in logs.output),
+            f"the refusal did not name the cause: {logs.output}",
+        )
 
     def test_a_connector_without_attachment_support_gets_no_workspace(self):
         workspace = AttachmentWorkspace(_FakeConnector(None))
