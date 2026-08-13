@@ -18,7 +18,6 @@ why the display name is not used here.
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 
 from .connector import Attachment, Connector
@@ -110,74 +109,32 @@ class AttachmentWorkspace:
         cache_path = Path(cache_dir)
         cache_path.mkdir(parents=True, exist_ok=True)
 
-        if not self._ensure_link(link, cache_path):
+        # Deliberately a plain check-then-act, with no synchronisation.
+        #
+        # Two watchers share this link only when they share a connector AND a room — the
+        # same bot account in the same room, which CLAUDE.md records as a degenerate case
+        # with no practical use beyond framework-level testing. In that configuration two
+        # concurrent starts can race here and one raises, failing that watcher's startup
+        # loudly.
+        #
+        # That is accepted rather than fixed. `impl/uniqueness` (design §4.1) makes one
+        # watcher per room the rule, and `impl/manager` moves the lifecycle lock to
+        # `(connector, room_id)` — the same granularity as this link — so the race
+        # disappears with its precondition rather than needing a guard. Tolerating the
+        # collision now would mean code whose only job is to survive a state that is about
+        # to become impossible, and which someone would then have to remember to remove.
+        if link.is_symlink():
+            if link.resolve() != cache_path.resolve():
+                link.unlink()
+                link.symlink_to(cache_path)
+                logger.info("Updated attachment symlink: %s → %s", link, cache_path)
+        elif link.exists():
+            logger.warning(
+                "Attachment path %s exists but is not a symlink — skipping", link
+            )
             return None
+        else:
+            link.symlink_to(cache_path)
+            logger.info("Created attachment symlink: %s → %s", link, cache_path)
 
         return str(link)
-
-    @staticmethod
-    def _ensure_link(link: Path, cache_path: Path) -> bool:
-        """Point `link` at `cache_path`, atomically, tolerating a concurrent writer.
-
-        The room-keyed link is *shared* by a room's watchers while the lifecycle locks are
-        per watcher, so another thread can act between any check and the act that follows
-        it. Three ways that bites, and the third is why this uses a rename:
-
-        * both observe it absent, and one `symlink_to` loses;
-        * both observe a stale target, and one `unlink` loses;
-        * one observes a stale target, **pauses**, the other replaces the link and starts
-          its watcher — and the paused thread then unlinks a link that is now correct.
-          The second watcher can localize an attachment during that gap and fall back to
-          the out-of-project cache path, which is what triggers the permission prompts
-          this symlink exists to avoid.
-
-        No amount of exception handling fixes the third: nothing raises. The window is
-        what has to go, so the replacement is a `symlink` to a temporary name followed by
-        `os.replace`, which swaps it in atomically — there is never a moment with no link.
-        An earlier version of this method unlinked and re-created, which is exactly that
-        window.
-        """
-        target = str(cache_path)
-        for _ in range(2):
-            if link.is_symlink():
-                if os.readlink(link) == target or link.resolve() == cache_path.resolve():
-                    return True
-            elif link.exists():
-                logger.warning(
-                    "Attachment path %s exists but is not a symlink — skipping", link
-                )
-                return False
-
-            # Unique per attempt and per process so two writers never collide on the
-            # temporary name itself.
-            tmp = link.with_name(f".{link.name}.{os.getpid()}.{id(link):x}.tmp")
-            try:
-                tmp.symlink_to(cache_path)
-            except FileExistsError:
-                tmp.unlink(missing_ok=True)
-                tmp.symlink_to(cache_path)
-            try:
-                # Atomic on POSIX when both paths are in one directory: the link either
-                # points at the old target or the new one, never at nothing.
-                os.replace(tmp, link)
-            except OSError as e:
-                tmp.unlink(missing_ok=True)
-                # A directory in the way is the one non-race case; report it as such
-                # rather than retrying.
-                if link.exists() and not link.is_symlink():
-                    logger.warning(
-                        "Attachment path %s exists but is not a symlink — skipping", link
-                    )
-                    return False
-                logger.debug("Attachment symlink swap for %s failed (%s) — retrying", link, e)
-                continue
-            logger.info("Attachment symlink ready: %s → %s", link, cache_path)
-            return True
-
-        ok = link.is_symlink() and link.resolve() == cache_path.resolve()
-        if not ok:
-            logger.warning(
-                "Could not establish attachment symlink %s → %s after a retry",
-                link, cache_path,
-            )
-        return ok
