@@ -2,9 +2,14 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, feature/dynamic-watcher-implementation]
   pull_request:
-    branches: [main]
+    # The dynamic-watcher work lands as ~14 increments that each PR into the
+    # integration branch rather than main, so without it listed here every one
+    # of those PRs would merge with no CI at all and the whole phase would only
+    # be verified once, in the final PR to main -- the single flag-day the
+    # increments exist to avoid.
+    branches: [main, feature/dynamic-watcher-implementation]
 
 jobs:
   lint:
