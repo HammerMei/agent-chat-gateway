@@ -25,7 +25,7 @@ happens to resemble a placeholder is never silently misinterpreted.
 import logging
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -41,6 +41,13 @@ from .core.config import (  # noqa: F401 — re-exports
     ToolRule,
     WatcherConfig,
 )
+from .core.room_pattern import (
+    InvalidRoomPattern,
+    RoomPattern,
+    union_intersects,
+    union_subsumes,
+)
+from .core.watcher_rule import RoomMatcher, WatcherRule
 
 # v0.2's global `*_defaults:` blocks (removed in v0.3 — see docs/migration-0.3.md) merged
 # flatly and unconditionally into EVERY entry of a kind, regardless of type: setting
@@ -81,6 +88,11 @@ TEMPLATE_FORBIDDEN_KEYS: dict[str, frozenset[str]] = {
 # (commit 31f966d flipped only the dataclass default to enabled=True — opt-out,
 # not opt-in — and missed this loader, which stayed hardcoded at enabled=False).
 _HH_DEFAULTS = HistoryHandoffConfig()
+
+# Distinguishes "key absent" from "key present with a falsy value". Needed
+# wherever an explicit `null` means something different from omission, and
+# wherever a falsy non-string must be rejected rather than read as "not set".
+_MISSING_FIELD = object()
 
 # Per-type fallback for `command` when an agent (or its template) sets `type`
 # but not `command`. Deliberately NOT a single hardcoded string (e.g. always
@@ -546,10 +558,33 @@ def _auto_watcher_name(connector: str, room: str) -> str:
     return f"{connector}-{_sanitize_room_for_name(room)}"
 
 
-def _resolve_paths(paths: list, base_dir: Path) -> list[str]:
-    """Resolve a list of path strings relative to base_dir."""
+def _resolve_paths(paths: object, base_dir: Path, label: str = "context_inject_files") -> list[str]:
+    """Resolve a list of path strings relative to base_dir.
+
+    Validates the container before iterating it, because iterating the wrong type
+    fails in two quiet ways. A bare string is iterated **per character**, so
+    `context_inject_files: notes.md` becomes eight paths ending `/n`, `/o`, `/t`
+    … rather than one error — a config that looks accepted and injects nothing.
+    A non-string element reaches `Path()` and raises `TypeError`, which
+    `collect_config()` does not catch (it catches `ValueError`), so a single bad
+    entry aborts the whole validation pass instead of being reported as one issue
+    with the other entries still checked.
+
+    The check lives here rather than at each call site because this is the
+    function that iterates, and all three context layers -- connector, agent and
+    watcher -- were affected identically.
+    """
+    if isinstance(paths, str) or not isinstance(paths, Sequence):
+        raise ValueError(
+            f"{label} must be a list of paths (got {type(paths).__name__}); "
+            "a bare string would be read one character at a time."
+        )
     resolved = []
     for p in paths:
+        if not isinstance(p, str):
+            raise ValueError(
+                f"{label} entries must be strings (got {type(p).__name__})."
+            )
         if p and not Path(p).is_absolute():
             resolved.append(str((base_dir / p).resolve()))
         elif p:
@@ -681,7 +716,7 @@ def _parse_one_connector(
 
     # Resolve connector-level context_inject_files
     raw_ctx = cc.get("context_inject_files", [])
-    ctx_files = _resolve_paths(raw_ctx, config_dir)
+    ctx_files = _resolve_paths(raw_ctx, config_dir, f"Connector '{name}': 'context_inject_files'")
 
     # Resolve attachments.cache_dir_global relative to config dir
     # (consistent with working_directory resolution below)
@@ -741,7 +776,7 @@ def _parse_one_agent(
 
     # Resolve context_inject_files (list) relative to the config file's directory
     raw_ctx = agent_raw.get("context_inject_files", [])
-    ctx_files = _resolve_paths(raw_ctx, config_dir)
+    ctx_files = _resolve_paths(raw_ctx, config_dir, f"Agent '{agent_name}': 'context_inject_files'")
 
     # Resolve working_directory: expand a leading ~ first (matching
     # the cache_dir_global handling above), then resolve relative to
@@ -1061,16 +1096,29 @@ def _parse_one_watcher_entry(
                 "entries."
             )
 
-    watcher_connector = wc.get("connector", "")
-    if watcher_connector and not isinstance(watcher_connector, str):
-        # PR review finding: same class of bug as 'name'/'session_id' above
-        # — a truthy-but-non-string 'connector' (e.g. a YAML list) reached
-        # `watcher_connector not in connector_names` (a set) unchecked,
-        # crashing with an uncaught TypeError instead of a clean ValueError.
+    # The type check must come BEFORE any truthiness test. An earlier review
+    # fixed only the truthy half of this — a YAML list reaching a set-membership
+    # test and crashing — and the `and` it used left the falsy half open:
+    # `connector: false`, `0`, or `[]` skipped the check, then read as falsy and
+    # fell through to `connectors[0]`. That is worse than the crash it was
+    # guarding, because it binds the watcher to the wrong account *silently*, and
+    # the canonical multi-agent setup gives every agent its own account.
+    #
+    # `null` and an absent key are the two spellings of "no value here", and both
+    # legitimately mean "use the default": `connector:` is permitted in a
+    # `watcher_templates:` entry, so an explicit null is how an entry declines an
+    # inherited one. Every other non-string is a mistake.
+    _MISSING = object()
+    raw_connector = wc.get("connector", _MISSING)
+    if raw_connector is _MISSING or raw_connector is None:
+        watcher_connector = ""
+    elif not isinstance(raw_connector, str):
         raise ValueError(
             f"Watcher entry at index {index}: 'connector' must be a string "
-            f"(got {type(watcher_connector).__name__})."
+            f"(got {type(raw_connector).__name__})."
         )
+    else:
+        watcher_connector = raw_connector
     if watcher_connector and watcher_connector not in connector_names:
         raise ValueError(
             f"Watcher entry at index {index} references unknown connector "
@@ -1111,10 +1159,30 @@ def _parse_one_watcher_entry(
 
     # Resolve watcher-level context_inject_files (shared across expanded rooms)
     raw_ctx = wc.get("context_inject_files", [])
-    ctx_files = _resolve_paths(raw_ctx, config_dir)
+    ctx_files = _resolve_paths(
+        raw_ctx, config_dir, f"Watcher entry at index {index}: 'context_inject_files'"
+    )
 
     # Defaults sourced from module-level _HH_DEFAULTS — see its docstring above.
-    hh_raw = wc.get("history_handoff", {}) or {}
+    #
+    # `or {}` swallowed two different mistakes. A non-mapping truthy value
+    # (`history_handoff: yes`, or a list) passed straight through and then raised
+    # AttributeError on `.get` — and collect_config() only catches ValueError, so
+    # one malformed entry aborted the whole validation pass instead of being
+    # reported as one issue with the rest still checked. A falsy non-mapping
+    # (`history_handoff: false`) was quietly replaced by `{}`, which means the
+    # *defaults* — so writing `false` to switch the feature off silently switched
+    # it on, since `enabled` defaults to True. Both are now load errors naming the
+    # field; `enabled: false` is the way to disable it.
+    hh_raw = wc.get("history_handoff")
+    if hh_raw is None:
+        hh_raw = {}
+    elif not isinstance(hh_raw, Mapping):
+        raise ValueError(
+            f"Watcher entry at index {index}: 'history_handoff' must be a mapping "
+            f"(got {type(hh_raw).__name__}). To turn it off, set "
+            "'history_handoff: {enabled: false}'."
+        )
     history_handoff = HistoryHandoffConfig(
         enabled=hh_raw.get("enabled", _HH_DEFAULTS.enabled),
         fetch_count=hh_raw.get("fetch_count", _HH_DEFAULTS.fetch_count),
@@ -1177,6 +1245,541 @@ def _parse_one_watcher_entry(
         )
     seen_watcher_names.update(staged_names)
     return result
+
+
+def entry_is_watcher_rule(entry: object) -> bool:
+    """Whether a raw `watchers:` entry uses the rule shape rather than the
+    static one.
+
+    The discriminator is the *type* of `rooms:`, which makes the two shapes
+    unambiguous rather than merely different: a mapping is a rule
+    (`rooms: {include: [...]}`), a list is the old multi-room shorthand
+    (`rooms: [a, b]`). `room:` is static-only. Neither shape can be mistaken for
+    the other, so no heuristics and no config flag are needed to decide which
+    parser an entry belongs to.
+    """
+    return isinstance(entry, Mapping) and isinstance(entry.get("rooms"), Mapping)
+
+
+def _parse_pattern_list(
+    raw: object, index: int, field_name: str
+) -> tuple[RoomPattern, ...]:
+    """Validate and compile one glob list from a rule's `rooms:` block.
+
+    Patterns are compiled here, at load, so an invalid pattern can never surface
+    on the message-delivery path where no operator is present to fix it (§2.1).
+    """
+    if raw is None:
+        return ()
+    if isinstance(raw, str) or not isinstance(raw, Sequence):
+        raise ValueError(
+            f"Watcher rule at index {index}: 'rooms.{field_name}' must be a list "
+            f"of patterns (got {type(raw).__name__})."
+        )
+    out: list[RoomPattern] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, str) or not item:
+            raise ValueError(
+                f"Watcher rule at index {index}: 'rooms.{field_name}' entries "
+                "must be non-empty strings."
+            )
+        if item in seen:
+            raise ValueError(
+                f"Watcher rule at index {index}: 'rooms.{field_name}' contains "
+                f"duplicate pattern '{item}'."
+            )
+        seen.add(item)
+        try:
+            out.append(RoomPattern(item))
+        except InvalidRoomPattern as e:
+            raise ValueError(
+                f"Watcher rule at index {index}: 'rooms.{field_name}' pattern "
+                f"'{item}' is not valid: {e}"
+            ) from e
+    return tuple(out)
+
+
+def _parse_dm_flag(rooms_raw: Mapping, index: int, field_name: str) -> bool:
+    """Read `rooms.direct` / `rooms.group_direct`.
+
+    Only the boolean form is accepted. §2.7 reserves the object form
+    (`direct: {include: [...], except_for: [...]}`) for when per-DM control is
+    genuinely needed, and the JSON schema leaves room for it so that adding it
+    later is additive. Until then a mapping here is rejected explicitly rather
+    than being silently truthy — which is exactly how `direct: {}` would
+    otherwise read as "DMs enabled".
+    """
+    value = rooms_raw.get(field_name, False)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, Mapping):
+        raise ValueError(
+            f"Watcher rule at index {index}: 'rooms.{field_name}' does not yet "
+            "accept the object form; use true or false. Per-DM include/except_for "
+            "is a planned extension."
+        )
+    raise ValueError(
+        f"Watcher rule at index {index}: 'rooms.{field_name}' must be true or "
+        f"false (got {type(value).__name__})."
+    )
+
+
+def _parse_rule_ttl(wc: Mapping, index: int, field_name: str) -> int | None:
+    """Read a per-rule session TTL.
+
+    These live on the rule rather than the agent so two rules sharing one agent
+    can differ (§5.4).
+    """
+    value = wc.get(field_name)
+    if value is None:
+        return None
+    # bool is an int subclass; `session_idle_days: true` is a mistake, not a 1.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(
+            f"Watcher rule at index {index}: '{field_name}' must be a positive "
+            f"integer (got {type(value).__name__})."
+        )
+    if value <= 0:
+        raise ValueError(
+            f"Watcher rule at index {index}: '{field_name}' must be a positive "
+            f"integer (got {value})."
+        )
+    return value
+
+
+# Every key a rule entry may carry. Kept in step with $defs/watcherRule in
+# gateway/schema/config.schema.json by tests/unit/test_watcher_rule.py, because
+# `acg config validate` never runs the schema and would otherwise accept typos the
+# schema rejects.
+WATCHER_RULE_KEYS: frozenset[str] = frozenset({
+    "description",
+    "inherits",
+    "name",
+    "connector",
+    "agent",
+    "rooms",
+    "session_idle_days",
+    "session_expire_days",
+    "context_inject_files",
+    "online_notification",
+    "offline_notification",
+    "history_handoff",
+})
+
+
+def _key_list(keys) -> str:
+    """Format a key set for an error message.
+
+    Stringifies before sorting because YAML keys need not be strings: `1: value`
+    on a rule would otherwise make `sorted()` compare int with str, or
+    `", ".join()` receive an int — raising TypeError out of the *error path* and
+    escaping collect_config()'s `except ValueError`, so a malformed entry would
+    abort the whole validation pass instead of being reported.
+    """
+    return ", ".join(sorted(str(k) for k in keys))
+
+
+def _validated_notification(raw: object, index: int, field_name: str) -> str | None:
+    """Check a notification field against its declared `str | None` contract.
+
+    Copied unchecked, a YAML boolean or number reaches the platform REST client's
+    message field much later, where the send fails and is only logged as a
+    warning — so the operator's status message silently never appears. An
+    actionable load error is the whole point of checking it here.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ValueError(
+            f"Watcher rule at index {index}: '{field_name}' must be a string or "
+            f"null (got {type(raw).__name__})."
+        )
+    return raw
+
+
+_HH_FIELD_TYPES: dict[str, type] = {
+    "enabled": bool,
+    "fetch_count": int,
+    "verbatim_tail": int,
+}
+
+
+def _parse_history_handoff(raw: object, index: int) -> HistoryHandoffConfig:
+    """Validate a `history_handoff:` block, keys and values.
+
+    Validating only the outer mapping was not enough, and the gap had the same
+    shape as the bug it replaced: `history_handoff: {enable: false}` -- one letter
+    short -- was silently ignored, leaving handoff **enabled**, which is the exact
+    inversion that `history_handoff: false` used to produce. Since `enabled`
+    defaults to True, every typo in this block fails in the direction the operator
+    did not want.
+
+    Types are enforced too: `enabled: "false"` is a truthy string, and a negative
+    or non-integer count would reach lifecycle code unchallenged.
+    """
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, Mapping):
+        raise ValueError(
+            f"Watcher rule at index {index}: 'history_handoff' must be a mapping "
+            f"(got {type(raw).__name__}). To turn it off, set "
+            "'history_handoff: {enabled: false}'."
+        )
+    unknown = set(raw) - set(_HH_FIELD_TYPES)
+    if unknown:
+        raise ValueError(
+            f"Watcher rule at index {index}: unknown key(s) in 'history_handoff': "
+            f"{_key_list(unknown)}. Valid keys are {_key_list(_HH_FIELD_TYPES)}."
+        )
+    values: dict[str, object] = {}
+    for key, want in _HH_FIELD_TYPES.items():
+        if key not in raw:
+            continue
+        value = raw[key]
+        # bool is a subclass of int, so an int field must reject it explicitly and
+        # a bool field must not accept 0/1.
+        if want is bool and not isinstance(value, bool):
+            raise ValueError(
+                f"Watcher rule at index {index}: 'history_handoff.{key}' must be "
+                f"true or false (got {type(value).__name__})."
+            )
+        if want is int and (isinstance(value, bool) or not isinstance(value, int)):
+            raise ValueError(
+                f"Watcher rule at index {index}: 'history_handoff.{key}' must be "
+                f"an integer (got {type(value).__name__})."
+            )
+        if want is int and value < 0:
+            raise ValueError(
+                f"Watcher rule at index {index}: 'history_handoff.{key}' must not "
+                f"be negative (got {value})."
+            )
+        values[key] = value
+    return HistoryHandoffConfig(
+        enabled=values.get("enabled", _HH_DEFAULTS.enabled),
+        fetch_count=values.get("fetch_count", _HH_DEFAULTS.fetch_count),
+        verbatim_tail=values.get("verbatim_tail", _HH_DEFAULTS.verbatim_tail),
+    )
+
+
+def _parse_one_watcher_rule(
+    entry: object,
+    index: int,
+    *,
+    connectors: list[ConnectorConfig],
+    connector_names: set[str],
+    agents: dict,
+    default_agent: str,
+    config_dir: Path,
+    templates: dict,
+    seen_rule_names: set[str],
+) -> WatcherRule:
+    """Parse one rule-shaped `watchers:` entry into a `WatcherRule`.
+
+    Runs alongside `_parse_one_watcher_entry` rather than replacing it: until the
+    watcher manager lands, an old-shape config must keep loading and running
+    byte-identically, so neither parser may assume the other is gone.
+
+    Unlike the static parser this returns exactly one object, because a rule is
+    one thing — the expansion that used to turn `rooms: [a, b]` into several
+    watchers now happens at runtime, per discovered room.
+    """
+    if not isinstance(entry, Mapping):
+        raise ValueError(
+            f"Watcher rule at index {index} must be a mapping "
+            f"(got {type(entry).__name__})."
+        )
+    wc = _resolve_inherits(
+        entry, templates, "watcher_templates", f"Watcher rule at index {index}",
+        "watcher",
+    )
+
+    # ── name: the RULE's identity, required and unique ──────────────────────
+    # Required, unlike the static shape where it could be derived from the room.
+    # A rule has no room to derive from, and the name is what shadowing warnings
+    # and `rule_name` in persisted state refer to (§5.3).
+    raw_name = wc.get("name")
+    if not isinstance(raw_name, str) or not raw_name.strip():
+        raise ValueError(
+            f"Watcher rule at index {index}: 'name' is required and must be a "
+            "non-empty string. Rules are not auto-named: there is no single room "
+            "to derive a name from."
+        )
+    rule_name = raw_name.strip()
+    if rule_name in seen_rule_names:
+        raise ValueError(f"Duplicate watcher rule name '{rule_name}'")
+
+    if "room" in wc:
+        raise ValueError(
+            f"Watcher rule at index {index}: 'room' cannot be combined with a "
+            "'rooms:' block. Move the room into 'rooms.include'."
+        )
+    if "session_id" in wc:
+        raise ValueError(
+            f"Watcher rule at index {index}: 'session_id' is no longer "
+            "supported. To carry context into a new session, have the agent "
+            "summarise the session to a file and read it back — a handoff "
+            "survives the backend expiring a session, which pinning never did."
+        )
+
+    # entry_is_watcher_rule() guarantees this for entries routed here by the
+    # loader, but this function is also callable directly (the config tool calls
+    # the static parser that way), so it is checked rather than asserted — an
+    # assert would vanish under -O and leave a TypeError instead.
+    # The schema sets additionalProperties: false on a rule, but `acg config
+    # validate` runs collect_config() rather than the JSON Schema, so a typo like
+    # `session_expire_day: 30` would otherwise be silently ignored and the rule
+    # would quietly have no expiry. Checked here so both paths agree; a test pins
+    # this set against the schema so the two cannot drift.
+    unknown_top = set(wc) - WATCHER_RULE_KEYS
+    if unknown_top:
+        raise ValueError(
+            f"Watcher rule at index {index} ('{rule_name}'): unknown key(s) "
+            f"{_key_list(unknown_top)}. Valid keys are "
+            f"{_key_list(WATCHER_RULE_KEYS)}."
+        )
+
+    rooms_raw = wc.get("rooms")
+    if not isinstance(rooms_raw, Mapping):
+        raise ValueError(
+            f"Watcher rule at index {index}: 'rooms' must be a mapping with "
+            f"include/except_for/direct/group_direct (got "
+            f"{type(rooms_raw).__name__})."
+        )
+    unknown = set(rooms_raw) - {"include", "except_for", "direct", "group_direct"}
+    if unknown:
+        raise ValueError(
+            f"Watcher rule at index {index}: unknown key(s) in 'rooms': "
+            f"{_key_list(unknown)}. "
+            "Valid keys are include, except_for, direct, group_direct."
+        )
+
+    matcher = RoomMatcher(
+        include=_parse_pattern_list(rooms_raw.get("include"), index, "include"),
+        except_for=_parse_pattern_list(rooms_raw.get("except_for"), index, "except_for"),
+        direct=_parse_dm_flag(rooms_raw, index, "direct"),
+        group_direct=_parse_dm_flag(rooms_raw, index, "group_direct"),
+    )
+    # An empty include is a hard error unless the rule is DM-only: with no
+    # patterns and no DM opt-in the rule can never match anything, which is a
+    # typo rather than an intention (§2.1).
+    if not matcher.include and not matcher.claims_only_direct:
+        raise ValueError(
+            f"Watcher rule at index {index} ('{rule_name}') can never match any "
+            "room: 'rooms.include' is empty and neither 'rooms.direct' nor "
+            "'rooms.group_direct' is set."
+        )
+    if matcher.except_for and not matcher.include:
+        raise ValueError(
+            f"Watcher rule at index {index} ('{rule_name}'): 'rooms.except_for' has "
+            "no effect without 'rooms.include' — it filters named rooms, "
+            "and DM opt-ins are not name-matched."
+        )
+    # An except_for pattern that cannot overlap the include union is dead config
+    # *reads* like protection. Excluding a room this rule never claimed does not
+    # keep a later rule from claiming it, because a name the include misses is
+    # NO_MATCH and falls through — so the operator who wrote it to block a room
+    # got the opposite of what they intended, silently. Same typo class as the
+    # empty-include error above, so it is refused the same way.
+    for pattern in matcher.except_for:
+        if not union_intersects([pattern], matcher.include):
+            raise ValueError(
+                f"Watcher rule at index {index} ('{rule_name}'): "
+                f"'rooms.except_for' pattern '{pattern.raw}' can never match any "
+                "room this rule includes, so it does nothing. 'except_for' "
+                "subtracts from this rule's own 'include' — it does not stop a "
+                "*later* rule from claiming a room, because a room this rule "
+                "does not include simply falls through to the next one. To keep "
+                "a room away from every rule, name it in 'include' and in "
+                "'except_for': this rule then claims it and declines it, and no "
+                "later rule sees it."
+            )
+
+    # Type-check before any truthiness test, or falsy non-strings
+    # (`connector: false`, `0`, `[]`) skip the check, read as falsy, and fall
+    # through to connectors[0] — silently binding the rule to the wrong account.
+    # `null` and an absent key both legitimately mean "use the default", since
+    # `connector:` is permitted in a `watcher_templates:` entry and an explicit
+    # null is how an entry declines an inherited one.
+    #
+    # The static parser has the same two value checks; they are fixed separately
+    # there (that copy is reachable in a released version, this one is not yet).
+    # De-duplicating them is deliberately left until that fix reaches this branch,
+    # rather than entangling the two changes.
+    raw_connector = wc.get("connector", _MISSING_FIELD)
+    if raw_connector is _MISSING_FIELD or raw_connector is None:
+        watcher_connector = ""
+    elif not isinstance(raw_connector, str):
+        raise ValueError(
+            f"Watcher rule at index {index}: 'connector' must be a string "
+            f"(got {type(raw_connector).__name__})."
+        )
+    else:
+        watcher_connector = raw_connector
+    if watcher_connector and watcher_connector not in connector_names:
+        raise ValueError(
+            f"Watcher rule at index {index} references unknown connector "
+            f"'{watcher_connector}'"
+        )
+    if not watcher_connector and not connectors:
+        raise ValueError(
+            f"Watcher rule at index {index} has no explicit 'connector' set "
+            "and no connectors are configured to default to."
+        )
+    resolved_connector = watcher_connector or connectors[0].name
+
+    watcher_agent = wc.get("agent", default_agent)
+    if not isinstance(watcher_agent, str):
+        raise ValueError(
+            f"Watcher rule at index {index}: 'agent' must be a string "
+            f"(got {type(watcher_agent).__name__})."
+        )
+    if watcher_agent not in agents:
+        raise ValueError(
+            f"Watcher rule at index {index} references unknown agent "
+            f"'{watcher_agent}'"
+        )
+
+    idle_days = _parse_rule_ttl(wc, index, "session_idle_days")
+    expire_days = _parse_rule_ttl(wc, index, "session_expire_days")
+    if idle_days is not None and expire_days is not None and idle_days >= expire_days:
+        raise ValueError(
+            f"Watcher rule at index {index} ('{rule_name}'): "
+            f"'session_idle_days' ({idle_days}) must be strictly less than "
+            f"'session_expire_days' ({expire_days})."
+        )
+
+    history_handoff = _parse_history_handoff(wc.get("history_handoff"), index)
+
+    # Construct fully BEFORE registering the name. The static parser stages names
+    # for exactly this reason, with a comment explaining it, and that lesson was
+    # not carried over here: with the name added first, a rule that then failed
+    # validation left its name registered even though no rule was returned, so a
+    # later valid rule with the same name was rejected as a duplicate of something
+    # that does not exist. Harmless under from_file()'s fail-fast loading, wrong
+    # under collect_config(), which keeps going after a failed entry.
+    rule = WatcherRule(
+        name=rule_name,
+        connector=resolved_connector,
+        agent=watcher_agent,
+        rooms=matcher,
+        session_idle_days=idle_days,
+        session_expire_days=expire_days,
+        # _resolve_paths validates the container and every element itself, so
+        # there is one implementation of this check rather than a rule-shaped copy
+        # beside a static-shaped one.
+        context_inject_files=_resolve_paths(
+            wc.get("context_inject_files", []),
+            config_dir,
+            f"Watcher rule at index {index}: 'context_inject_files'",
+        ),
+        online_notification=_validated_notification(
+            wc.get("online_notification"), index, "online_notification"
+        ),
+        offline_notification=_validated_notification(
+            wc.get("offline_notification"), index, "offline_notification"
+        ),
+        history_handoff=history_handoff,
+    )
+    seen_rule_names.add(rule_name)
+    return rule
+
+
+@dataclass(frozen=True)
+class ShadowFinding:
+    """One reach of one rule that an earlier rule has already taken.
+
+    `scope` says how much of the rule is dead, because a rule can reach rooms in
+    up to three independent ways and lose only some of them:
+
+    * `"rule"` — every reach it has is already claimed; the rule can never fire.
+    * `"named"` / `"direct"` / `"group_direct"` — that one reach is dead while the
+      rule remains live for the others. Reported separately because a hybrid rule
+      whose DM opt-in is dead looks perfectly healthy otherwise, and §2.1 asks for
+      a warning when an earlier rule already claimed a DM class.
+    """
+
+    rule: WatcherRule
+    shadowed_by: WatcherRule
+    scope: str
+
+
+def find_shadowed_rules(rules: list[WatcherRule]) -> list[ShadowFinding]:
+    """Find reaches that can never fire because an earlier rule already takes them.
+
+    Under first-match precedence a rule only ever sees rooms no earlier rule
+    stopped, so anything already taken upstream is dead config — nearly always a
+    mistake in ordering.
+
+    **An earlier rule's blocking language is its `include`, not its
+    `include` minus its `except_for`.** This is the part that is easy to get
+    backwards. `except_for` produces `DECLINED`, which halts routing rather than
+    falling through (§2.1) — so a room the earlier rule declines never reaches a
+    later rule either. An earlier rule therefore blocks everything its `include`
+    matches, whether it goes on to claim or decline it, and its own `except_for`
+    is irrelevant to what it shadows. A deny rule (`include: [X]`,
+    `except_for: [X]`) shadows later rules for `X` completely, which is precisely
+    its purpose.
+
+    DM classes are claimed by flag rather than by pattern, so an earlier rule
+    takes this one's DM reach only by opting into the same class.
+
+    Reported as warnings, never errors, and still deliberately under-reported in
+    one case: a shadow formed only by **several** earlier rules together — `a*`
+    plus `b*` covering `[ab]*` — is not reported, even though `union_subsumes`
+    could prove it, because comparing one earlier rule at a time keeps each
+    warning pointed at a single rule someone can go and read. A vaguer "these four
+    rules collectively cover this one" is worth less than silence. Under-reporting
+    is the right direction: a missed warning costs nothing, a false one sends
+    someone hunting a rule that works.
+    """
+    out: list[ShadowFinding] = []
+    for i, rule in enumerate(rules):
+        earlier_rules = [e for e in rules[:i] if e.connector == rule.connector]
+
+        # Which reaches this rule has, and the first earlier rule taking each.
+        blockers: dict[str, WatcherRule] = {}
+        if rule.rooms.include:
+            blockers["named"] = next(
+                (
+                    e
+                    for e in earlier_rules
+                    if e.rooms.include
+                    and union_subsumes(e.rooms.include, rule.rooms.include)
+                ),
+                None,
+            )
+        if rule.rooms.direct:
+            blockers["direct"] = next(
+                (e for e in earlier_rules if e.rooms.direct), None
+            )
+        if rule.rooms.group_direct:
+            blockers["group_direct"] = next(
+                (e for e in earlier_rules if e.rooms.group_direct), None
+            )
+
+        if not blockers:  # unreachable post-validation, but do not crash on it
+            continue
+        all_blocked = all(b is not None for b in blockers.values())
+        one_blocker = len({id(b) for b in blockers.values()}) == 1
+        if all_blocked and one_blocker:
+            # A single earlier rule takes every reach, so "this rule is dead, see
+            # that one" is both true and actionable.
+            out.append(
+                ShadowFinding(
+                    rule=rule, shadowed_by=next(iter(blockers.values())), scope="rule"
+                )
+            )
+        else:
+            # Different earlier rules take different reaches. The rule is still
+            # entirely dead when all_blocked, but collapsing would attribute it to
+            # one blocker that does not claim the other reaches — a warning whose
+            # suggested remedy would be wrong. Keep them separate so each points at
+            # the rule actually responsible.
+            for scope, by in blockers.items():
+                if by is not None:
+                    out.append(ShadowFinding(rule=rule, shadowed_by=by, scope=scope))
+    return out
 
 
 def _parse_max_queue_depth(raw: dict) -> int:

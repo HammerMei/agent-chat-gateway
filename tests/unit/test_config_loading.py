@@ -2453,3 +2453,170 @@ class TestDescriptionField(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestWatcherEntryScalarValidation(unittest.TestCase):
+    """A malformed scalar on a watcher entry must be a load error, not a guess.
+
+    Both cases here were silent: the value did not look like what it was, and the
+    loader picked a default instead of complaining. Silent beats loud for
+    severity, so both are now hard errors naming the field.
+    """
+
+    def _write_config(self, watcher_body: str) -> str:
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(textwrap.dedent(f"""\
+                connectors:
+                  - name: rc-first
+                    type: rocketchat
+                    server: {{url: http://localhost:3000, username: bot, password: pw}}
+                  - name: mm-second
+                    type: mattermost
+                    server: {{url: http://localhost:8065, token: t, team: lab}}
+                agents:
+                  default:
+                    type: claude
+                    working_directory: /tmp
+                watchers:
+                {textwrap.indent(textwrap.dedent(watcher_body), "                  ")}
+            """))
+            return f.name
+
+    def _load_one(self, watcher_body: str):
+        return GatewayConfig.from_file(self._write_config(watcher_body)).watchers[0]
+
+    def _rejects(self, watcher_body: str, needle: str) -> str:
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(self._write_config(watcher_body))
+        self.assertIn(needle, str(ctx.exception))
+        return str(ctx.exception)
+
+    # ── connector ────────────────────────────────────────────────────────────
+    def test_omitted_connector_defaults_to_the_first(self):
+        self.assertEqual(self._load_one("- {room: general}").connector, "rc-first")
+
+    def test_explicit_null_connector_also_defaults(self):
+        """`connector:` is legal in a watcher_templates entry, so an explicit
+        null is how an entry declines an inherited one."""
+        self.assertEqual(self._load_one("- {room: general, connector: null}").connector, "rc-first")
+
+    def test_a_falsy_non_string_connector_is_rejected_not_defaulted(self):
+        """The bug: these skipped the type check because it was guarded by
+        truthiness, then read as falsy and bound to connectors[0] — silently
+        attaching the watcher to the wrong account."""
+        for literal in ("false", "0", "[]", "{}"):
+            with self.subTest(literal=literal):
+                self._rejects(
+                    f"- {{room: general, connector: {literal}}}",
+                    "'connector' must be a string",
+                )
+
+    def test_a_truthy_non_string_connector_is_still_rejected(self):
+        self._rejects("- {room: general, connector: [rc-first]}", "'connector' must be a string")
+
+    def test_a_valid_connector_is_honoured(self):
+        self.assertEqual(
+            self._load_one("- {room: general, connector: mm-second}").connector, "mm-second"
+        )
+
+    # ── history_handoff ──────────────────────────────────────────────────────
+    def test_omitted_history_handoff_uses_defaults(self):
+        self.assertTrue(self._load_one("- {room: general}").history_handoff.enabled)
+
+    def test_null_and_empty_mapping_use_defaults(self):
+        for literal in ("null", "{}"):
+            with self.subTest(literal=literal):
+                w = self._load_one(f"- {{room: general, history_handoff: {literal}}}")
+                self.assertTrue(w.history_handoff.enabled)
+
+    def test_a_non_mapping_history_handoff_is_rejected(self):
+        """`true`/a list raised AttributeError, which collect_config() does not
+        catch — so one bad entry aborted the whole validation pass."""
+        for literal in ("true", "[1]", "'yes'"):
+            with self.subTest(literal=literal):
+                msg = self._rejects(
+                    f"- {{room: general, history_handoff: {literal}}}",
+                    "'history_handoff' must be a mapping",
+                )
+                self.assertIn("enabled: false", msg)
+
+    def test_history_handoff_false_is_rejected_rather_than_silently_enabling(self):
+        """The nastiest of the pair: `false` was replaced by `{}`, which means the
+        defaults — and `enabled` defaults to True. Writing `false` to switch the
+        feature off switched it on."""
+        self._rejects(
+            "- {room: general, history_handoff: false}", "'history_handoff' must be a mapping"
+        )
+
+    def test_enabled_false_is_the_supported_way_to_disable(self):
+        w = self._load_one("- {room: general, history_handoff: {enabled: false}}")
+        self.assertFalse(w.history_handoff.enabled)
+
+
+class TestContextInjectFileListValidation(unittest.TestCase):
+    """A bare string where a list belongs must be an error, not eight paths.
+
+    `_resolve_paths` iterates what it is given, so `context_inject_files: notes.md`
+    silently became one path per character — a config that loads clean and injects
+    nothing. All three context layers shared the defect, so the check lives in
+    `_resolve_paths` rather than at each call site.
+    """
+
+    BASE = """\
+        connectors:
+          - name: rc
+            type: rocketchat
+            server: {{url: http://localhost:3000, username: bot, password: pw}}
+        {conn}
+        agents:
+          default:
+            type: claude
+            working_directory: /tmp
+        {agent}
+        watchers:
+          - room: general
+        {watcher}
+        """
+
+    def _write(self, *, conn="", agent="", watcher="") -> str:
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(textwrap.dedent(self.BASE).format(conn=conn, agent=agent, watcher=watcher))
+            return f.name
+
+    def _rejects(self, needle: str, **kw) -> str:
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(self._write(**kw))
+        self.assertIn(needle, str(ctx.exception))
+        return str(ctx.exception)
+
+    def test_a_bare_string_is_rejected_on_a_connector(self):
+        msg = self._rejects("Connector 'rc': 'context_inject_files'",
+                            conn="    context_inject_files: c.md")
+        self.assertIn("one character at a time", msg)
+
+    def test_a_bare_string_is_rejected_on_an_agent(self):
+        self._rejects("Agent 'default': 'context_inject_files'",
+                      agent="    context_inject_files: a.md")
+
+    def test_a_bare_string_is_rejected_on_a_watcher(self):
+        self._rejects("Watcher entry at index 0: 'context_inject_files'",
+                      watcher="    context_inject_files: w.md")
+
+    def test_a_non_string_element_is_a_value_error_not_a_type_error(self):
+        """TypeError would escape collect_config()'s `except ValueError` and abort
+        the whole validation pass rather than reporting one entry."""
+        self._rejects("entries must be strings", watcher="    context_inject_files: [ok.md, 3]")
+
+    def test_valid_lists_still_load_on_all_three_layers(self):
+        cfg = GatewayConfig.from_file(self._write(
+            conn="    context_inject_files: [c.md]",
+            agent="    context_inject_files: [a.md]",
+            watcher="    context_inject_files: [w.md]",
+        ))
+        self.assertEqual(len(cfg.connectors[0].context_inject_files), 1)
+        self.assertEqual(len(cfg.agents["default"].context_inject_files), 1)
+        self.assertEqual(len(cfg.watchers[0].context_inject_files), 1)
+
+    def test_omitting_them_entirely_still_loads(self):
+        cfg = GatewayConfig.from_file(self._write())
+        self.assertEqual(cfg.watchers[0].context_inject_files, [])
