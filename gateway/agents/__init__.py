@@ -71,7 +71,7 @@ class AgentBackend(ABC):
         of anything ACG configures.
 
         Used by the on-the-fly-watcher idle/expire lifecycle
-        (docs/design/on-the-fly-watchers.md) to compute an effective
+        (docs/design/dynamic-watcher-design.md) to compute an effective
         ``session_expire_days`` of ``min(configured value, this value)`` when
         the agent declares one — there's no point in ACG holding onto a
         session reference the backend has already thrown away.

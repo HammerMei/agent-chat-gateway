@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Config schema groundwork for on-the-fly watchers** (see
-  `docs/design/on-the-fly-watchers.md`) — purely additive, no runtime
+  `docs/design/dynamic-watcher-design.md`) — purely additive, no runtime
   behavior change yet:
   - `AgentConfig.session_idle_days` / `session_expire_days` — optional TTL
     settings for the upcoming idle/expire watcher lifecycle, inheritable via

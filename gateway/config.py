@@ -773,7 +773,7 @@ def _parse_one_agent(
     )
 
     # session_idle_days / session_expire_days: on-the-fly watcher lifecycle
-    # (docs/design/on-the-fly-watchers.md). Both optional; None means the
+    # (docs/design/dynamic-watcher-design.md). Both optional; None means the
     # idle/expire lifecycle is off. When both are set, idle must be strictly
     # less than expire — otherwise a watcher jumps straight from active to
     # gone, skipping the back-burner state entirely. This only covers the
@@ -963,7 +963,7 @@ def _parse_one_watcher_entry(
         )
 
     # ── exclude_room: only meaningful alongside room: "*" ──────────────────
-    # (docs/design/on-the-fly-watchers.md). Shape is validated now so this
+    # (docs/design/dynamic-watcher-design.md). Shape is validated now so this
     # field is test-covered ahead of the actual rule-matching engine, but
     # room: "*" itself is rejected below — accepting it today would let a
     # user configure a watcher the runtime has no way to act on correctly
@@ -999,7 +999,7 @@ def _parse_one_watcher_entry(
             f"Watcher entry at index {index}: room: \"*\" (rule-based room "
             "matching / on-the-fly watchers) is not implemented yet — use an "
             "explicit 'room:' or 'rooms:' list for now. See "
-            "docs/design/on-the-fly-watchers.md."
+            "docs/design/dynamic-watcher-design.md."
         )
 
     # 'name' / 'session_id' pin a single sticky identity — only meaningful

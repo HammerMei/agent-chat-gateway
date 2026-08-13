@@ -128,7 +128,7 @@ class TestSchemaCatchesKnownMistakes:
 
 
 class TestNullableTTLFields:
-    """docs/design/on-the-fly-watchers.md + PR #77 review: an explicit
+    """docs/design/dynamic-watcher-design.md + PR #77 review: an explicit
     `null` must validate even though the field is otherwise a positive
     integer — this is the loader-supported way to suppress a non-null value
     inherited from an agent_templates entry (_deep_merge()'s documented

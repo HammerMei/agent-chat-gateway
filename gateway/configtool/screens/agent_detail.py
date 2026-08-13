@@ -128,7 +128,7 @@ _FORM_FIELDS: list[FieldSpec] = [
     FieldSpec("new_session_args", "list", "New session args (comma-separated)"),
     FieldSpec("context_inject_files", "list", "Context inject files (comma-separated)"),
     FieldSpec("timeout", "int", "Timeout (seconds)"),
-    # On-the-fly watcher lifecycle (docs/design/on-the-fly-watchers.md) — the
+    # On-the-fly watcher lifecycle (docs/design/dynamic-watcher-design.md) — the
     # lazy-watcher runtime that actually acts on these isn't built yet, but
     # the schema exists now (gateway/core/config.py's AgentConfig), so the
     # form must be able to show/edit them like any other optional int field.

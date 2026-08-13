@@ -1621,7 +1621,7 @@ class TestAgentTemplates(unittest.TestCase):
 
 
 class TestAgentSessionLifecycleConfig(unittest.TestCase):
-    """session_idle_days / session_expire_days (docs/design/on-the-fly-watchers.md)."""
+    """session_idle_days / session_expire_days (docs/design/dynamic-watcher-design.md)."""
 
     def _write_config(self, agent_block: str) -> str:
         cfg = textwrap.dedent(f"""\
@@ -2229,7 +2229,7 @@ class TestWatcherRoomsExpansion(unittest.TestCase):
 
     def test_wildcard_room_is_rejected_as_not_implemented_yet(self):
         """room: "*" (on-the-fly / rule-based room matching,
-        docs/design/on-the-fly-watchers.md) parses shape-wise but is
+        docs/design/dynamic-watcher-design.md) parses shape-wise but is
         rejected today — the runtime has no way to act on it yet."""
         path = self._write_config("""\
             - connector: rc-home

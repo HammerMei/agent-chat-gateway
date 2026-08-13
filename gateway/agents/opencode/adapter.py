@@ -322,7 +322,7 @@ class OpenCodeBackend(AgentBackend):
     def typical_session_retention_days(self) -> int | None:
         """OpenCode has no automatic session expiry of its own — sessions persist
         indefinitely in its SQLite store (confirmed via source, not just docs;
-        see docs/design/on-the-fly-watchers.md). Explicit override (rather than
+        see docs/design/dynamic-watcher-design.md). Explicit override (rather than
         relying on the AgentBackend default) so this is a visible, deliberate
         statement about OpenCode specifically, not an inherited default that
         happens to be correct.

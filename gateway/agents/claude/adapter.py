@@ -363,7 +363,7 @@ class ClaudeBackend(AgentBackend):
         JSONL session transcripts older than this are deleted at CLI startup.
         This is a documented default, not a guaranteed constant: a user can
         change it per-machine, and ACG has no way to read the actual configured
-        value from here (see docs/design/on-the-fly-watchers.md's open items).
+        value from here (see docs/design/dynamic-watcher-design.md's open items).
         """
         return 30
 
