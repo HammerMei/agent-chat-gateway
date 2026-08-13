@@ -511,6 +511,11 @@ class MattermostConnector(Connector):
 
     # ── History ──────────────────────────────────────────────────────────────
 
+    def supports_unsolicited_inbound(self) -> bool:
+        """Yes — one socket carries every channel the bot is a member of, and only
+        those (design §2.6, verified in §6.2)."""
+        return True
+
     def supports_history(self) -> bool:
         return True
 

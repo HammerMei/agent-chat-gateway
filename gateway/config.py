@@ -41,6 +41,7 @@ from .core.config import (  # noqa: F401 — re-exports
     ToolRule,
     WatcherConfig,
 )
+from .core.connector import TYPES_WITH_UNSOLICITED_INBOUND
 from .core.room_pattern import (
     InvalidRoomPattern,
     RoomPattern,
@@ -1446,6 +1447,69 @@ def _parse_dm_flag(rooms_raw: Mapping, index: int, field_name: str) -> bool:
     )
 
 
+def _enforce_literal_rooms(
+    matcher: RoomMatcher,
+    where: str,
+    rule_name: str,
+    resolved_connector: str,
+    connectors: list[ConnectorConfig],
+) -> None:
+    """Refuse rules a connector without unsolicited inbound could never materialize.
+
+    A rule is a *pattern*: it is matched against rooms as they turn up on the
+    transport. Script's messages arrive by direct injection that bypasses the
+    connector, and Voice's rooms arrive as HTTP path segments — neither has a stream
+    to discover rooms from (design §2.6). A wildcard include, or a DM opt-in, on such
+    a connector therefore describes rooms nothing will ever offer: the rule loads,
+    looks correct, and silently never fires. `RoomPattern.is_literal` was added for
+    exactly this check.
+
+    Refused, specifically: a non-literal `include` pattern, an include that resolves
+    to no literal room at all, and either DM opt-in. `except_for` is deliberately
+    *not* restricted — §2.6 requires literal `include` entries, and a non-literal
+    exclusion of rooms that are all literal is merely redundant, not unreachable.
+
+    The check reads the **resolved** connector, not the written one: a rule with no
+    `connector:` falls back to `connectors[0]`, so a config whose first connector is
+    a voice connector must be caught even though the rule names nothing.
+
+    An unrecognised connector type is treated as *not* having unsolicited inbound —
+    `config_validate` lets unknown types through (its validator map skips them), so
+    fail-closed here matches `Connector.supports_unsolicited_inbound()`'s default and
+    keeps the restriction on anything that has not declared otherwise.
+    """
+    connector_type = next(
+        (c.type for c in connectors if c.name == resolved_connector), None
+    )
+    if connector_type in TYPES_WITH_UNSOLICITED_INBOUND:
+        return
+
+    kind = f"'{connector_type}'" if connector_type else "of unknown type"
+    reason = (
+        f"{where} ('{rule_name}'): connector '{resolved_connector}' is {kind}, which "
+        "has no unsolicited inbound stream — it never reports a room the gateway did "
+        "not already name, so there is nothing for a pattern to match."
+    )
+    for pattern in matcher.include:
+        if not pattern.is_literal:
+            raise ValueError(
+                f"{reason} Replace the pattern '{pattern.raw}' in 'rooms.include' "
+                "with the literal room name(s) it was meant to cover. See "
+                "docs/design/dynamic-watcher-design.md §2.6."
+            )
+    if matcher.direct or matcher.group_direct:
+        raise ValueError(
+            f"{reason} 'rooms.direct' / 'rooms.group_direct' ask for rooms that only "
+            "an inbound stream can announce, so they cannot be used here — name the "
+            "rooms literally in 'rooms.include' instead."
+        )
+    if not matcher.include:
+        raise ValueError(
+            f"{reason} The rule names no room at all, so nothing can ever match it — "
+            "list the literal room name(s) in 'rooms.include'."
+        )
+
+
 def _parse_rule_ttl(wc: Mapping, index: int, field_name: str) -> int | None:
     """Read a per-rule session TTL.
 
@@ -1630,6 +1694,7 @@ def _parse_one_watcher_rule(
         wc, where, connectors, connector_names
     )
     watcher_agent = _validated_watcher_agent(wc, where, agents, default_agent)
+    _enforce_literal_rooms(matcher, where, rule_name, resolved_connector, connectors)
 
     idle_days = _parse_rule_ttl(wc, index, "session_idle_days")
     expire_days = _parse_rule_ttl(wc, index, "session_expire_days")
