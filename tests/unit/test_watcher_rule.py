@@ -703,6 +703,59 @@ class TestDmReachIsReportedIndependently(unittest.TestCase):
         )
 
 
+class TestSharedHelpersAttributeToTheRuleParser(unittest.TestCase):
+    """The messages must name the *rule* parser, not whatever last defined a helper.
+
+    This exists because of a merge, not a code change. The static and rule parsers
+    each grew their own copy of `_parse_history_handoff` / `_validated_notification`
+    / `_key_list`, in different parts of the file — so merging the branches was
+    textually clean and left two same-named module-level `def`s, where **the later
+    one silently wins**. `ruff` did not flag it (verified: `--select F811` reports
+    nothing on that file) and every existing assertion still passed, because they
+    all match substrings of the message body rather than its attribution. The only
+    visible symptom was a doubled prefix:
+
+        Watcher rule at index Watcher entry at index 0: unknown key(s) ...
+
+    So each parser now asserts its own prefix on a check that goes through a shared
+    helper. A future merge that reintroduces a shadowing copy fails here instead of
+    corrupting error messages silently. See the static counterpart in
+    tests/unit/test_config_loading.py.
+    """
+
+    def _msg(self, entry) -> str:
+        with self.assertRaises(ValueError) as cm:
+            parse(entry, index=3)
+        return str(cm.exception)
+
+    def test_history_handoff_error_names_the_rule_and_index(self):
+        msg = self._msg({**MINIMAL, "history_handoff": {"enable": False}})
+        self.assertTrue(
+            msg.startswith("Watcher rule at index 3:"),
+            f"expected a rule-parser prefix, got: {msg}",
+        )
+
+    def test_notification_error_names_the_rule_and_index(self):
+        msg = self._msg({**MINIMAL, "online_notification": True})
+        self.assertTrue(
+            msg.startswith("Watcher rule at index 3:"),
+            f"expected a rule-parser prefix, got: {msg}",
+        )
+
+    def test_connector_error_names_the_rule_and_index(self):
+        msg = self._msg({**MINIMAL, "connector": False})
+        self.assertTrue(
+            msg.startswith("Watcher rule at index 3:"),
+            f"expected a rule-parser prefix, got: {msg}",
+        )
+
+    def test_agent_error_names_the_rule_and_index(self):
+        msg = self._msg({**MINIMAL, "agent": 3})
+        self.assertTrue(
+            msg.startswith("Watcher rule at index 3:"),
+            f"expected a rule-parser prefix, got: {msg}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

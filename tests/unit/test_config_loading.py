@@ -2624,6 +2624,62 @@ class TestWatcherEntryScalarValidation(unittest.TestCase):
         self.assertIsNone(w.offline_notification)
 
 
+class TestSharedHelpersAttributeToTheStaticParser(unittest.TestCase):
+    """The messages must name the *static* parser, not whatever last defined a helper.
+
+    The rule parser shares `_parse_history_handoff`, `_validated_notification`,
+    `_resolve_watcher_connector` and `_validated_watcher_agent` with this one, each
+    taking the message prefix rather than an index so there is one implementation of
+    every check. Before that de-duplication the two parsers had their own copies in
+    different parts of the file, so merging the branches was textually clean and
+    left two same-named module-level `def`s — where **the later one silently wins**.
+    `ruff` did not flag it (verified: `--select F811` reports nothing on that file)
+    and every existing assertion still passed, because they match substrings of the
+    message body rather than its attribution. The symptom was a doubled prefix:
+
+        Watcher rule at index Watcher entry at index 0: unknown key(s) ...
+
+    Asserting the prefix is what makes that loud. See the rule-side counterpart in
+    tests/unit/test_watcher_rule.py.
+    """
+
+    def _msg(self, broken_entry: str) -> str:
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(textwrap.dedent(f"""\
+                connectors:
+                  - name: rc
+                    type: rocketchat
+                    server: {{url: http://localhost:3000, username: bot, password: pw}}
+                agents:
+                  default:
+                    type: claude
+                    working_directory: /tmp
+                watchers:
+                  - {{room: ok}}
+                  - {broken_entry}
+            """))
+            path = f.name
+        with self.assertRaises(ValueError) as cm:
+            GatewayConfig.from_file(path)
+        return str(cm.exception)
+
+    def test_each_shared_check_names_the_entry_and_index(self):
+        # A valid entry precedes the broken one, so a prefix that dropped the index
+        # would still read "index 0" and pass.
+        for body, label in (
+            ("{room: general, history_handoff: {enable: false}}", "history_handoff"),
+            ("{room: general, online_notification: true}", "notification"),
+            ("{room: general, connector: false}", "connector"),
+            ("{room: general, agent: 3}", "agent"),
+        ):
+            with self.subTest(check=label):
+                msg = self._msg(body)
+                self.assertTrue(
+                    msg.startswith("Watcher entry at index 1"),
+                    f"expected a static-parser prefix, got: {msg}",
+                )
+
+
 class TestEveryStaticWatcherFieldIsTypeChecked(unittest.TestCase):
     """The systematic guard, the static twin of the rule parser's.
 
@@ -2634,9 +2690,12 @@ class TestEveryStaticWatcherFieldIsTypeChecked(unittest.TestCase):
     `history_handoff: {enable: false}` ignored. Fixing them one at a time left no
     reason to believe the next one was covered.
 
-    The field surface comes from the JSON schema's `$defs/watcher`, which sets
-    `additionalProperties: false` and so is the declared list — a field added there
-    without validation here fails locally instead of in a sixth review round.
+    The field surface comes from the JSON schema's `$defs/staticWatcher`, which
+    sets `additionalProperties: false` and so is the declared list — a field added
+    there without validation here fails locally instead of in a sixth review round.
+    `$defs/watcher` is now a `oneOf` over the static and rule shapes while both are
+    accepted, so the static branch is named explicitly; this whole class retires
+    with the static parser at cutover.
     """
 
     # A wrong-typed value per field the parser reads.
@@ -2662,11 +2721,11 @@ class TestEveryStaticWatcherFieldIsTypeChecked(unittest.TestCase):
             (Path(__file__).resolve().parents[2]
              / "gateway" / "schema" / "config.schema.json").read_text()
         )
-        watcher = schema["$defs"]["watcher"]
+        watcher = schema["$defs"]["staticWatcher"]
         self.assertFalse(
             watcher.get("additionalProperties", True),
-            "the schema no longer closes the watcher field set, so it is no longer "
-            "the declared list this test enumerates",
+            "the schema no longer closes the static watcher field set, so it is no "
+            "longer the declared list this test enumerates",
         )
         self.assertEqual(
             set(self.WRONG_VALUE) | self.NOT_READ_HERE,
