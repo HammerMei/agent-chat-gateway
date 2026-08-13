@@ -23,7 +23,7 @@ from .message_processor import MessageProcessor
 from .paths import room_path_key, watcher_prompt_key
 from .permission import PermissionRegistry
 from .session_maps import SessionMaps
-from .state import WatcherState
+from .state import WatcherState, backend_identity
 from .state_store import StateStore
 
 logger = logging.getLogger("agent-chat-gateway.core.watcher_lifecycle")
@@ -371,10 +371,20 @@ class WatcherLifecycle:
         # 1. Resolve room
         room = await self._connector.resolve_room(wc.room)
 
-        # 2. Provision session
+        # 2. Provision session. The identity is computed once and both compared and
+        # stored below, so the value a later run compares against is the same string
+        # this run validated — not a second derivation that could drift from it.
+        identity = backend_identity(agent_cfg.type, agent_cfg.working_directory)
         session_id, created_new_session = await self._provision_session(
-            wc, state, agent, agent_cfg
+            wc, state, agent, agent_cfg, identity
         )
+        if created_new_session and state and state.session_id:
+            # The record survived but its session did not, so the bookkeeping keyed to
+            # the old id has to go with it — the same pairing `reset_watcher` makes when
+            # it clears a session id. Without this the retry counter for the abandoned
+            # session outlives it, and a watcher that had reached failed_degraded would
+            # carry that verdict into a session which has never been injected at all.
+            self._injector.reset_session(state.session_id)
 
         # 3. Build state and register maps
         ws = WatcherState(
@@ -382,9 +392,19 @@ class WatcherLifecycle:
             session_id=session_id,
             room_id=room.id,
             room_type=room.type,
-            context_injected=state.context_injected if state else False,
+            # False whenever the session is new, not merely when the record is:
+            # the flag describes what a *session* has received, and a replacement
+            # session has received nothing. `reset_watcher` already pairs "clear the
+            # session id" with "clear this flag"; an identity mismatch replaces the
+            # session without going through that path, so it has to pair them too.
+            context_injected=(
+                state.context_injected
+                if state and not created_new_session
+                else False
+            ),
             paused=False,
             last_processed_ts=state.last_processed_ts if state else "",
+            backend_identity=identity,
         )
         self._states[wc.name] = ws
         self._maps.bind_session(session_id, room.id, self._connector)
@@ -580,18 +600,54 @@ class WatcherLifecycle:
         state: WatcherState | None,
         agent: AgentBackend,
         agent_cfg,
+        identity: str,
     ) -> tuple[str, bool]:
         """Determine the session ID: reuse the persisted one, or create a new one.
 
         Priority:
-          1. Persisted ``state.session_id`` from a previous run.
+          1. Persisted ``state.session_id``, **if it was created against this same
+             backend identity** (§2.4).
           2. Create a new session via the agent backend.
 
         There is no config-pinned option: `watchers[].session_id` is removed, so
         every session id the gateway uses is one it assigned itself.
+
+        A session id is only meaningful inside the backend store that issued it, so a
+        record whose stored identity does not equal the current one is not reused —
+        replaying the id into a different store loses continuity silently, or matches an
+        unrelated session carrying the same id. An **empty** stored identity is treated
+        the same way, and that is the permanent rule rather than a migration allowance:
+        the field defaults to `""` and is not required, so a v2 file that omits it reads
+        as empty long after this branch ships. Both cases answer "can this id be verified
+        as belonging to this store?" with no, and unverifiable is not verified.
+
+        The abandoned id is **not** deleted. Deletion would run against the *current*
+        backend, where that id either means nothing or means someone else's session —
+        the precise confusion this comparison exists to avoid. It is dropped, and the
+        fresh session takes over; the old store keeps whatever it had.
         """
         if state and state.session_id:
-            return state.session_id, False
+            if state.backend_identity == identity:
+                return state.session_id, False
+            # The full id, deviating from the [:8] used for routine session logging.
+            # This record is about to be overwritten with the new session, so this line
+            # is the only place the abandoned id survives — and the one use it has left
+            # is being pasted into the backend's own resume command.
+            logger.warning(
+                "Watcher '%s': not reusing session %s — %s. Starting a fresh session; "
+                "the previous conversation stays in the backend it was created against "
+                "and can be resumed there by hand with this id. "
+                "Expected after changing an agent's type or working_directory.",
+                wc.name,
+                state.session_id,
+                (
+                    f"it was created against backend identity "
+                    f"'{state.backend_identity}', which is now '{identity}'"
+                    if state.backend_identity
+                    else f"it has no recorded backend identity to check against "
+                         f"'{identity}'"
+                ),
+            )
         session_title = (
             f"{agent_cfg.session_prefix}:{wc.room}"
             if agent_cfg.session_prefix

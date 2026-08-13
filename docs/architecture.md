@@ -660,6 +660,10 @@ All state files live in `~/.agent-chat-gateway/`:
 - **watermark** — Last processed message timestamp; used to skip duplicates on restart
 - **paused** — If true, messages are queued but not processed
 - **session_id** — Opaque string from agent backend; used to resume sessions
+- **backend_identity** — The backend type and working directory the session was
+  created against. Checked before `session_id` is resumed: an id is only meaningful
+  inside the store that issued it, so a mismatch starts a fresh session instead of
+  replaying the id into a different one
 
 ---
 

@@ -503,15 +503,24 @@ class TestWatcherLifecycleHistoryHandoff(unittest.IsolatedAsyncioTestCase):
 
     async def test_fetch_room_history_not_called_when_session_reused(self):
         """When a session is reused (not newly created), history must NOT be injected."""
-        from gateway.core.state import WatcherState
+        from gateway.core.state import WatcherState, backend_identity
 
         lifecycle, connector, wc = self._make_lifecycle(history_enabled=True)
-        # Simulate an existing session — _provision_session will return created_new_session=False
+        # Simulate an existing session — _provision_session will return created_new_session=False.
+        # The identity has to match the agent config for the session to be reusable at
+        # all (§2.4): a record that cannot be verified against the current backend is not
+        # a reused session, it is a fresh one, and it *should* get history. This fixture
+        # asserted "no history" while omitting the identity, so it began describing the
+        # opposite case the moment the comparison landed.
+        agent_cfg = lifecycle._config.agent_config(
+            lifecycle._resolve_agent_name(wc.agent))
         existing_state = WatcherState(
             watcher_name="w1",
             session_id="existing-session-id",
             room_id="r1",
             context_injected=True,
+            backend_identity=backend_identity(
+                agent_cfg.type, agent_cfg.working_directory),
         )
 
         with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:

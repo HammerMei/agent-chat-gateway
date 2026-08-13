@@ -10,6 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **A persisted session is only resumed against the backend that issued it.**
+  Watcher state records the resolved `backend_identity` (agent backend type plus
+  the **canonicalized** working directory — a deploy symlink repointed to a new
+  target is a different store, and a process launched there sees the physical
+  path) alongside the session id, and the two are compared before the
+  id is reused. Changing an agent's `type` or `working_directory` now starts a
+  fresh session, logged with the before/after identity, instead of replaying the
+  stored id into a different session store — where it finds nothing, or matches an
+  unrelated session that happens to carry the same id. The earlier conversation is
+  left intact in the backend it belongs to. A record with no stored identity is
+  treated the same way: an id that cannot be attributed to a store is not resumed.
 - **Config schema groundwork for on-the-fly watchers** (see
   `docs/design/dynamic-watcher-design.md`) — purely additive, no runtime
   behavior change yet:
