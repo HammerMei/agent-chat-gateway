@@ -68,7 +68,7 @@ async def driver(url, admin_user, admin_pw, member_room, extra_user, probe_user,
 
 
 async def listener(url, user, password, added_event, ready, seconds):
-    ws_url = url.replace("https://", "wss://").rstrip("/") + "/websocket"
+    ws_url = url.replace("https://", "wss://").replace("http://", "ws://").rstrip("/") + "/websocket"
     async with websockets.connect(ws_url) as ws:
         async def send(o):
             await ws.send(json.dumps(o))

@@ -189,11 +189,67 @@ Terminal outcomes each need a defined effect, and each needs a test:
 - duplicate arrives while the first copy is reserved → discard the duplicate,
   do not disturb the reservation
 - process exits mid-resolve → nothing was committed, so the watermark still
-  points before the message and replay redelivers it
+  points before the message — but **today nothing redelivers it**, and this
+  gap has to be closed for the abort guarantee to mean anything (below)
 
 The distinction that makes this coherent: **a reservation prevents duplicate
 *work*; only a commit prevents duplicate *delivery*.** The watermark is the
 durable record and moves once, at commit.
+
+##### Commits within a room must be ordered
+
+The watermark is a single timestamp per room, not a set of seen ids, so it
+cannot represent "committed the later message but not the earlier one". Once
+classification and creation may await, two messages from one room can be
+in flight together, and that representational limit becomes a lost message.
+Two rules are needed, and **neither is sufficient alone**:
+
+- **Resolution is serialized per room.** Messages for one room resolve in
+  arrival order, so commits advance the watermark monotonically. This does not
+  reintroduce the stall that moving creation off the handler path removed
+  (§2.7 step 3): the connector-wide permit is released either way, and only
+  that one room's later messages wait. It also matches what Mattermost's
+  per-channel worker already provides today.
+
+- **An abort halts that room's commit frontier.** Serialization alone still
+  loses the message: if an earlier message aborts and the queue simply moves
+  on, the next message's commit advances the watermark *past* the aborted one,
+  and replay — which starts after the watermark — can never return to it. The
+  abort guarantee "watermark unchanged" only holds if nothing else is allowed
+  to move it. So an abort blocks later commits for that room: the aborted
+  resolve is retried in place with bounded backoff, and if it keeps failing the
+  room parks with its watermark still below the aborted message, leaving it
+  redeliverable.
+
+The failing case to test explicitly: two messages arrive for one new room, the
+second resolves successfully while the first is still classifying, and the
+first then aborts. The first message must still be redeliverable afterwards.
+
+##### Abort is only retryable if something replays
+
+An abort leaves the watermark below the message so it *can* be redelivered, but
+nothing currently performs that redelivery after a restart. Both connectors
+replay history from `_on_ws_reconnect()`, which fires when an
+already-running connector's socket drops and reconnects; a process restart
+takes the initial `connect()` path, which registers that callback and never
+invokes it. So the window between the persisted watermark and the present is
+not pulled at startup — the connector simply resumes from the live socket.
+
+This is pre-existing rather than introduced here, but the transaction above
+*depends* on it, so it becomes in-scope: **an explicit startup replay is
+required.** Under lazy watchers it cannot be modelled on the reconnect path,
+which iterates live subscriptions — at startup nothing is subscribed yet. It
+has to iterate **persisted records**, replaying each from its own stored
+watermark, before or as rooms are recreated.
+
+One residual is accepted rather than fixed: a room that never produced a
+persisted record has no watermark to replay from, so a crash between the
+arrival of its very first message and that message's commit loses it. Making
+even that recoverable would mean persisting a reservation before any work — a
+disk write for every inbound message, including all the ones the rules are
+about to discard — which is out of proportion to a crash-only,
+first-message-of-a-never-seen-room window. It is called out here so the
+guarantee is not read as stronger than it is.
 
 This supersedes the "defer bookkeeping until accepted" phrasing in §2.7, which
 described only the success path.
@@ -487,6 +543,21 @@ shape what is worth storing:
   can all change without the rule changing. Complete drift detection has to
   consider the resolved agent config too.
 
+One part of that is **not** deferrable, because it is about resuming a session
+rather than detecting drift. A record stores the agent *name* and a
+`session_id`, and recreation resolves whatever `AgentConfig` that name means
+now. If the backend type or working directory changed while the record was idle
+— or across a restart — the stored id is replayed into a different backend and a
+different session store. That either silently loses continuity or, worse,
+matches an unrelated session that happens to carry the same id.
+
+So the record must also persist the **resolved backend identity** it was
+created against — backend type plus the working directory that scopes its
+session store — and compare it before resuming. On a mismatch the stored
+session is not reused: the watcher starts a fresh session, logged as an
+explicit reason rather than appearing as inexplicable amnesia. Storing the name
+alone is what makes sticky binding (§2.4) a weaker guarantee than it reads.
+
 At scale the same rule content is duplicated across every room it matched.
 For the expected range — tens to low hundreds of rooms — that is negligible
 and simpler than the alternative. If it ever matters, normalize into a
@@ -630,9 +701,20 @@ must say no route is configured rather than reporting backpressure.
 Ordering, which is where the cost and the correctness both live:
 
 1. **Cheap synchronous rejects, above the room-state lookup**: system
-   messages, own-message echoes, and the sender/allow-list/mention gate.
-   These filters are synchronous; run them with no turn store so the
+   messages, own-message echoes, and the sender allow-list. These filters are
+   synchronous and need no room metadata; run them with no turn store so the
    precheck does not consume the agent-chain budget.
+
+   The **mention gate is deliberately not in this step.** It is
+   kind-dependent — `require_mention` does not apply to a 1:1 DM but *does*
+   apply to a group DM (§6.4) — so running it before the kind is known would
+   accept an unmentioned group-DM message as though the room were a 1:1, and
+   the agent would answer every message in that group. The gate therefore runs
+   **after classification**, uniformly on both connectors: the kind is free on
+   Mattermost and only needs a lookup for Rocket.Chat type `d`, so this costs
+   nothing on Mattermost and is the only correct order on Rocket.Chat.
+   Deferring it does not spend the agent-chain budget either, since
+   classification still precedes any model turn.
 2. **Membership and scope gate**: on RocketChat, the `roomParticipant` flag
    the server computes per message — required, since subscribe-all also
    delivers public channels the account can merely read. On Mattermost no
@@ -924,6 +1006,24 @@ Three properties this must have:
   rather than a different one. And re-adding the bot afterwards is simply a
   fresh start: a new record, a new session, no continuity with what was
   reclaimed. That is the correct outcome, not a regression.
+
+  **"Discovered later as a REST failure" does not cover paused or idle
+  records**, which is the one case that needs its own mechanism. That discovery
+  depends on some future operation touching the room, and a paused record has
+  no timer reclamation (§2.5) and receives no inbound messages — so nothing
+  ever touches it. If the removal event was missed, the record, its session,
+  its jobs, its prompt file and its attachment directory persist indefinitely,
+  and `resume` keeps offering a room the bot cannot access — which is R3
+  violated by a different route than the one pause was protecting against.
+
+  So a **periodic membership reconciliation** is required for dormant records:
+  re-check membership for paused and idle records on a slow tick and reclaim
+  the ones that are gone. This is keyed on the connector declaring unsolicited
+  inbound (§2.6), **not** on Mattermost specifically — Rocket.Chat has the same
+  hole for a paused room, since its reconnect replay covers message history but
+  not membership, and no message arrives to provoke a REST failure either. It
+  is a slow tick: this is a correctness backstop for a missed event, not a
+  primary path.
 
 Connectors that declare no unsolicited inbound have no membership stream and
 are unaffected.
@@ -1421,6 +1521,7 @@ Records are keyed on `(connector, room_id)`. Added to each record:
 | `room_kind` | `channel` / `group` / `dm` / `group_dm` — decides the label form and whether `require_mention` applies (§2.7) |
 | `participants` | DM counterparts, for the `list` column; refreshed, never part of a key |
 | `connector`, `agent` | so a rule edit cannot silently re-point a dormant session |
+| `backend_identity` | the resolved backend type + working directory the session was created against; compared before a stored `session_id` is reused, and a mismatch forces a fresh session rather than replaying the id into a different session store (§2.4) |
 | `created_at` | audit |
 | `last_activity_at` | the idle clock (§2.5) |
 | `dropped_at` | distinguishes was-active from was-idle at boot |
@@ -1428,10 +1529,16 @@ Records are keyed on `(connector, room_id)`. Added to each record:
 | `rule_name` | which rule created this watcher |
 | `rule` | that rule as resolved at creation — the drift baseline (§2.4) |
 
-Each field lands in three places — dataclass, current-format branch, legacy
-branch — and **must ship with a round-trip serialization test**. This
-on-disk surface has no serialization test today, which is why every
-addition here carries one.
+Each field lands in two places — dataclass and current-format branch — and
+**must ship with a round-trip serialization test**. This on-disk surface has no
+serialization test today, which is why every addition here carries one.
+
+There is deliberately no third place: `load_state()`'s existing legacy branch is
+**deleted**, not extended. It best-effort reconstructs a record from
+`watcher_id`, which cannot supply any of the fields above — no materialized
+config, no originating rule, no agent identity, no lifecycle timestamps. Adding
+the new fields to it would manufacture incomplete records and quietly bypass the
+fail-closed refusal below, which is the actual contract.
 
 `config` and `rule` are both nested structures rather than scalars, so the
 serialization test must cover nesting and the empty/absent cases, not just
@@ -1581,14 +1688,22 @@ what makes §5.1's corruption reachable.
 8. Routing: connector subscribes to everything, router walks rules,
    unmatched dropped — with the pre-routing cost audit. Mattermost first,
    then RocketChat.
-9. The creation path in §2.7's ordering.
+9. The creation path in §2.7's ordering, including the dedup transaction with
+   **per-room serialized resolution and an abort that halts the room's commit
+   frontier** (§2.2) — the mention gate runs after classification, not with the
+   cheap rejects. Ships with the **startup replay** over persisted records that
+   the abort guarantee depends on, since the reconnect path does not run on a
+   fresh process.
 10. `list` with its state filter, in the control server and the CLI — before
    the idle tick, so there is a way to observe what idling does.
 11. The idle tick, for connectors declaring unsolicited inbound.
 12. Expiry, with full reclamation.
-13. Membership-event registration (join → idle record, leave → expire). Last
-    of the runtime work because it is an optimisation over the
-    message-triggered path, which must be correct on its own first.
+13. Membership-event registration (join → idle record, leave → expire), plus
+    the **periodic membership reconciliation** for paused and idle records
+    (§2.7) — the backstop for a removal event missed while disconnected, which
+    no message-triggered path can discover for a dormant room. Last of the
+    runtime work because it is an optimisation over the message-triggered path,
+    which must be correct on its own first.
 14. Config tooling.
 15. The migration guide, shipped with the release that lands the schema
     change.

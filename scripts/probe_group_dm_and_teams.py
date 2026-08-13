@@ -82,7 +82,7 @@ async def mm_listener(a, ready: asyncio.Event) -> int:
     token = r.headers["Token"]
     await c.aclose()
 
-    ws_url = a.url.replace("https://", "wss://").rstrip("/") + "/api/v4/websocket"
+    ws_url = a.url.replace("https://", "wss://").replace("http://", "ws://").rstrip("/") + "/api/v4/websocket"
     async with websockets.connect(ws_url) as ws:
         await ws.send(json.dumps({"seq": 1, "action": "authentication_challenge",
                                   "data": {"token": token}}))
@@ -143,7 +143,7 @@ async def rc_driver(a, ready: asyncio.Event) -> None:
 
 
 async def rc_listener(a, ready: asyncio.Event) -> int:
-    ws_url = a.url.replace("https://", "wss://").rstrip("/") + "/websocket"
+    ws_url = a.url.replace("https://", "wss://").replace("http://", "ws://").rstrip("/") + "/websocket"
     async with websockets.connect(ws_url) as ws:
         async def send(o):
             await ws.send(json.dumps(o))
