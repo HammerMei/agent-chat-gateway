@@ -542,6 +542,28 @@ class EditableConfig:
         never legally accept another room). Returns the matching raw dict
         (by identity, live in `self.document["watchers"]`), or None."""
         for entry in self.watchers_raw:
+            # An entry with no room of its own is never a merge target.  It
+            # cannot be one: gateway/config.py rejects an entry that has neither
+            # a non-empty `room` nor a non-empty `rooms`, so merging into it
+            # would be adopting whatever other keys it happens to carry.
+            #
+            # Worth spelling out why this needs an explicit guard rather than
+            # being caught downstream.  Such an entry is *invisible* here —
+            # expanded_watchers() swallows its ValueError, so it produces no row
+            # in the Watchers table and cannot be opened, edited or deleted
+            # through the TUI — yet it still appears in watchers_raw, and with
+            # none of the six shared keys `_watcher_shared_fields()` returns {},
+            # which compares equal to a fresh add's `shared={}`.  So it matched.
+            #
+            # And the resulting write was not merely permitted but actively so:
+            # save()'s gate blocks only errors this save *introduces*, and
+            # merging a room into a roomless entry REMOVES its pre-existing
+            # error, leaving an empty diff.  The corrupted document therefore
+            # reached disk, where it reads as a legal single-room entry — and
+            # every other room that should have been its own watcher is simply
+            # gone at the next daemon start.
+            if not (entry.get("room") or entry.get("rooms")):
+                continue
             if entry.get("name") or entry.get("session_id"):
                 continue
             if entry.get("connector") != connector or entry.get("agent") != agent:
