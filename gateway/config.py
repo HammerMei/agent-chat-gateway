@@ -1073,16 +1073,29 @@ def _parse_one_watcher_entry(
                 "entries."
             )
 
-    watcher_connector = wc.get("connector", "")
-    if watcher_connector and not isinstance(watcher_connector, str):
-        # PR review finding: same class of bug as 'name'/'session_id' above
-        # — a truthy-but-non-string 'connector' (e.g. a YAML list) reached
-        # `watcher_connector not in connector_names` (a set) unchecked,
-        # crashing with an uncaught TypeError instead of a clean ValueError.
+    # The type check must come BEFORE any truthiness test. An earlier review
+    # fixed only the truthy half of this — a YAML list reaching a set-membership
+    # test and crashing — and the `and` it used left the falsy half open:
+    # `connector: false`, `0`, or `[]` skipped the check, then read as falsy and
+    # fell through to `connectors[0]`. That is worse than the crash it was
+    # guarding, because it binds the watcher to the wrong account *silently*, and
+    # the canonical multi-agent setup gives every agent its own account.
+    #
+    # `null` and an absent key are the two spellings of "no value here", and both
+    # legitimately mean "use the default": `connector:` is permitted in a
+    # `watcher_templates:` entry, so an explicit null is how an entry declines an
+    # inherited one. Every other non-string is a mistake.
+    _MISSING = object()
+    raw_connector = wc.get("connector", _MISSING)
+    if raw_connector is _MISSING or raw_connector is None:
+        watcher_connector = ""
+    elif not isinstance(raw_connector, str):
         raise ValueError(
             f"Watcher entry at index {index}: 'connector' must be a string "
-            f"(got {type(watcher_connector).__name__})."
+            f"(got {type(raw_connector).__name__})."
         )
+    else:
+        watcher_connector = raw_connector
     if watcher_connector and watcher_connector not in connector_names:
         raise ValueError(
             f"Watcher entry at index {index} references unknown connector "
@@ -1126,7 +1139,25 @@ def _parse_one_watcher_entry(
     ctx_files = _resolve_paths(raw_ctx, config_dir)
 
     # Defaults sourced from module-level _HH_DEFAULTS — see its docstring above.
-    hh_raw = wc.get("history_handoff", {}) or {}
+    #
+    # `or {}` swallowed two different mistakes. A non-mapping truthy value
+    # (`history_handoff: yes`, or a list) passed straight through and then raised
+    # AttributeError on `.get` — and collect_config() only catches ValueError, so
+    # one malformed entry aborted the whole validation pass instead of being
+    # reported as one issue with the rest still checked. A falsy non-mapping
+    # (`history_handoff: false`) was quietly replaced by `{}`, which means the
+    # *defaults* — so writing `false` to switch the feature off silently switched
+    # it on, since `enabled` defaults to True. Both are now load errors naming the
+    # field; `enabled: false` is the way to disable it.
+    hh_raw = wc.get("history_handoff")
+    if hh_raw is None:
+        hh_raw = {}
+    elif not isinstance(hh_raw, Mapping):
+        raise ValueError(
+            f"Watcher entry at index {index}: 'history_handoff' must be a mapping "
+            f"(got {type(hh_raw).__name__}). To turn it off, set "
+            "'history_handoff: {enabled: false}'."
+        )
     history_handoff = HistoryHandoffConfig(
         enabled=hh_raw.get("enabled", _HH_DEFAULTS.enabled),
         fetch_count=hh_raw.get("fetch_count", _HH_DEFAULTS.fetch_count),
