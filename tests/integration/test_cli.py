@@ -432,8 +432,13 @@ class TestCLIConfigValidate(_CLITestBase):
               - name: w1
                 room: general
         """)
+        # Imported here, not at module scope: this file defers every gateway import
+        # (see _import_main) so the CLI's own import-time behaviour stays under test.
+        from gateway.core.state import STATE_FORMAT_VERSION
+
         self.runtime_dir.mkdir()
         (self.runtime_dir / "state.rc.json").write_text(json.dumps({
+            "version": STATE_FORMAT_VERSION,
             "watchers": [{"watcher_name": "stale-watcher", "session_id": "x", "room_id": "y"}]
         }))
 

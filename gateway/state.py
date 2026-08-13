@@ -8,6 +8,8 @@ these re-exports.
 
 from .core.state import (  # noqa: F401 — re-exports
     RUNTIME_DIR,
+    STATE_FORMAT_VERSION,
+    LegacyStateError,
     WatcherState,
     ensure_runtime_dir,
     load_state,

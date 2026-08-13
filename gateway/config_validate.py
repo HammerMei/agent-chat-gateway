@@ -43,7 +43,7 @@ from .config import (
 from .connectors.mattermost.config import MattermostConfig
 from .connectors.rocketchat.config import RocketChatConfig
 from .connectors.voice.config import VoiceConfig
-from .core.state import load_state
+from .core.state import StateFormatError, load_state, state_files
 
 # Connector types validated via their own dataclass parser. 'script' is
 # intentionally omitted — ScriptConnector never reads ConnectorConfig.raw
@@ -279,10 +279,35 @@ def _check_state_orphans(config: GatewayConfig, result: ValidationResult) -> Non
     for w in config.watchers:
         configured_by_connector.setdefault(w.connector, set()).add(w.name)
 
+    # Checked over the files on disk, not over config.connectors: a connector renamed
+    # or removed in config.yaml leaves its state file behind, and only iterating
+    # configured connectors would never open it — so an unreadable file belonging to a
+    # since-renamed connector would pass validation and then be abandoned silently at
+    # startup, which is the failure the refusal exists to prevent.
+    for path in state_files():
+        try:
+            load_state(path.name[len("state."):-len(".json")])
+        except StateFormatError as exc:
+            msg = str(exc)
+            result.errors.append(msg)
+            result.findings.append(
+                Finding("error", "global", None, None, msg)
+            )
+        except Exception:
+            # Handled inside load_state by starting fresh; nothing to report.
+            pass
+
     for connector in config.connectors:
         try:
             states = load_state(connector.name)
+        except StateFormatError:
+            # Already reported above, against the file rather than the connector.
+            continue
         except Exception:
+            # Anything else (unreadable file, malformed JSON) is handled inside
+            # load_state by starting fresh, so reaching here means something
+            # unexpected — skip this connector's orphan check rather than failing the
+            # whole validation over it.
             continue
         configured = configured_by_connector.get(connector.name, set())
         for st in states:

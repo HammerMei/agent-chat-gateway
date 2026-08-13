@@ -5,13 +5,17 @@ Moved from ``gateway.state`` into the core layer so that core modules
 without reaching up to the gateway application layer.
 
 ``gateway.state`` re-exports everything here for backward compatibility.
+
+**On-disk format is versioned, and an unversioned file is refused rather than
+converted** — see ``load_state`` and ``LegacyStateError``.
 """
 
 import json
 import logging
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import MISSING, asdict, dataclass, field, fields
 from pathlib import Path
+from typing import get_origin
 
 logger = logging.getLogger("agent-chat-gateway.state")
 
@@ -20,6 +24,78 @@ logger = logging.getLogger("agent-chat-gateway.state")
 # We define it here directly — runtime_lock.py is the canonical definition;
 # state.py keeps its own copy to avoid the cross-layer import.
 RUNTIME_DIR = Path.home() / ".agent-chat-gateway"
+
+# Current on-disk format. Bumped when a record gains fields that cannot be
+# defaulted from an older file — which is why this exists at all: the fields added
+# for on-the-fly watchers (the materialized config, the originating rule, the
+# backend identity) have no honest default, so a file without them cannot be read
+# as if it had them.
+STATE_FORMAT_VERSION = 2
+
+
+class StateFormatError(Exception):
+    """A state file this build cannot read.
+
+    Deliberately not a subclass of anything ``load_state``'s own ``except`` clause
+    catches: a refusal that gets swallowed and turned into "starting fresh" is the
+    precise failure this exists to prevent (design §5.3). Every caller of
+    ``load_state`` has to decide about it explicitly.
+
+    Split into two subclasses because the two directions need *opposite* advice, and
+    a message that gives the wrong one is worse than no message: an older file should
+    be deleted, and a newer file must not be.
+    """
+
+    def __init__(self, path: Path, message: str) -> None:
+        self.path = path
+        super().__init__(message)
+
+
+class LegacyStateError(StateFormatError):
+    """The file predates ``STATE_FORMAT_VERSION`` (or has no version marker)."""
+
+    def __init__(self, path: Path, detail: str) -> None:
+        super().__init__(
+            path,
+            f"State file '{path}' is in an older format this version cannot read "
+            f"({detail}). There is no automatic conversion: an old record carries no "
+            "agent, no materialized config and no originating rule, so converting it "
+            "would have to guess which rule now owns the room — the silent re-binding "
+            "the design exists to prevent (docs/design/dynamic-watcher-design.md "
+            "§5.3).\n"
+            f"To proceed: move '{path}' aside — keep the copy, because the file IS "
+            "the inventory: it lists each watcher's name, session id, paused flag and "
+            "message watermark in plain JSON. Then start again. Do not reach for "
+            "'agent-chat-gateway list' at this point: it queries the running daemon, "
+            "and the daemon is what just refused to start. Your config.yaml does NOT need "
+            "rewriting for this: rule-shaped watchers are not active yet, so the "
+            "§5.3 procedure's config rewrite belongs to the later cutover, not to "
+            "this step.\n"
+            "Accepted loss: each room starts a fresh agent session (history handoff "
+            "refetches recent room messages, so there is partial continuity), the "
+            "message watermark resets once per room, and any paused watcher comes "
+            "back active — re-pause it after start."
+        )
+
+
+class FutureStateError(StateFormatError):
+    """The file was written by a newer build than this one.
+
+    Kept separate from the legacy case on purpose. The legacy message says to delete
+    the file; following that here — during a rollback, say — would destroy perfectly
+    valid state *and* still leave this build unable to read it.
+    """
+
+    def __init__(self, path: Path, version: object) -> None:
+        super().__init__(
+            path,
+            f"State file '{path}' was written by a newer version of the gateway "
+            f"(format {version!r}; this build reads {STATE_FORMAT_VERSION}). "
+            "**Do not delete it** — it holds valid sessions, and deleting it would "
+            "not make this build able to read them. Either run the newer version "
+            "again, or, if this is an intentional rollback and losing those sessions "
+            f"is acceptable, move '{path}' aside first so it can be restored."
+        )
 
 
 def _state_file(connector_name: str) -> Path:
@@ -35,28 +111,205 @@ def _state_file(connector_name: str) -> Path:
 
 @dataclass
 class WatcherState:
-    """Runtime state for a single watcher.  Persisted across gateway restarts."""
+    """Runtime state for a single watcher.  Persisted across gateway restarts.
+
+    Every field here has to be written in two places — this dataclass and
+    ``load_state``'s reader — and each addition ships with a round-trip test, since
+    this on-disk surface had no serialization test at all before (design §5.3).
+    """
 
     watcher_name: str           # join key → WatcherConfig.name
-    session_id: str             # auto-created session ID; "" when config owns the session ID
+    session_id: str             # session id assigned by the agent backend; "" = none yet
     room_id: str                # resolved room ID (cached)
     room_type: str = "channel"  # "channel", "group", or "dm"
     context_injected: bool = False  # True once all context files have been injected
     paused: bool = False            # True if paused via CLI
-    last_processed_ts: str = ""     # ISO timestamp of last processed message
+    last_processed_ts: str = ""      # ISO timestamp of last processed message
+
+    # ── On-the-fly watcher fields (design §5.3) ──────────────────────────────
+    # Written by the watcher manager; empty on records the static path creates,
+    # which is why every one of them defaults rather than being required.
+
+    # The platform's own name for the room, refreshed from inbound messages.
+    # Empty for DMs, which have no name to carry.
+    room_name: str = ""
+    # channel / group / dm / group_dm — decides the label form and whether
+    # require_mention applies (§2.7). Distinct from `room_type` above, which is the
+    # connector's own three-way type and predates the group-DM distinction.
+    room_kind: str = ""
+    # DM counterparts, for the `list` column. Refreshed, and never part of a key:
+    # a member set is not an identity (§6.4).
+    participants: list[str] = field(default_factory=list)
+    # So a rule edit cannot silently re-point a dormant session at another
+    # connector or agent.
+    connector: str = ""
+    agent: str = ""
+    # The resolved backend type + working directory this session was created
+    # against, compared before the stored session_id is reused. A mismatch means
+    # the id would be replayed into a different session store, so it forces a
+    # fresh session instead (§2.4).
+    backend_identity: str = ""
+    created_at: str = ""          # audit
+    last_activity_at: str = ""    # the idle clock (§2.5)
+    # Distinguishes was-active from was-idle at boot. Empty = was active.
+    dropped_at: str = ""
+    # The materialized watcher config used to recreate this watcher, and the rule
+    # it came from. Nested structures, not scalars — which is what the round-trip
+    # test has to cover for nesting and for the empty case.
+    config: dict = field(default_factory=dict)
+    rule_name: str = ""
+    # The originating rule as resolved at creation: the drift baseline (§2.4).
+    rule: dict = field(default_factory=dict)
+
+
+# The type each persisted field must have, derived from WatcherState's own annotations
+# so there is no second hand-maintained table to drift out of step. `watcher_name` is
+# excluded: it is required rather than defaulted, and checked separately.
+_FIELD_TYPES: dict[str, type] = {
+    # get_origin() unwraps a parameterised annotation (list[str] -> list) and returns
+    # None for a plain one, so this needs no name-to-type table of its own — the first
+    # attempt used one, and it raised KeyError on `list[str]` because its `__name__`
+    # is "list", not "list[str]".
+    f.name: get_origin(f.type) or f.type
+    for f in fields(WatcherState)
+    if f.name != "watcher_name"
+}
+
+# Fields with neither a default nor a default_factory: the dataclass requires them, so
+# the reader has to supply something when the payload omits them.
+_REQUIRED_FIELDS: frozenset[str] = frozenset(
+    f.name
+    for f in fields(WatcherState)
+    if f.name != "watcher_name"
+    and f.default is MISSING
+    and f.default_factory is MISSING
+)
+
+_EMPTY: dict[type, object] = {str: "", bool: False, int: 0, list: [], dict: {}}
+
+# Retained for the round-trip coupling test: every field the reader restores.
+_SCALAR_FIELDS: tuple[tuple[str, object], ...] = (
+    ("session_id", ""),
+    ("room_id", ""),
+    ("room_type", "channel"),
+    ("context_injected", False),
+    ("paused", False),
+    ("last_processed_ts", ""),
+    ("room_name", ""),
+    ("room_kind", ""),
+    ("connector", ""),
+    ("agent", ""),
+    ("backend_identity", ""),
+    ("created_at", ""),
+    ("last_activity_at", ""),
+    ("dropped_at", ""),
+    ("rule_name", ""),
+)
+
+
+def state_files() -> list[Path]:
+    """Every persisted state file on disk, whichever connectors currently exist.
+
+    Enumerating the *files* rather than the configured connectors is the point. A
+    connector renamed or removed in config.yaml leaves `state.<old-name>.json` behind,
+    and a caller that iterates `config.connectors` never opens it — so a legacy file
+    belonging to a since-renamed connector would sail past the refusal and be
+    abandoned silently, which is the exact failure the refusal exists to prevent.
+    """
+    ensure_runtime_dir()
+    return sorted(RUNTIME_DIR.glob("state.*.json"))
+
+
+def check_state_formats() -> None:
+    """Raise on the first state file this build cannot read.
+
+    A preflight for callers that must not proceed past an unreadable file — the daemon
+    on startup, and `config validate`. Reading each file is cheap next to the cost of
+    the alternative: booting with an empty registry and abandoning every session while
+    looking successful.
+    """
+    for path in state_files():
+        # state.<name>.json → <name>. rsplit, because a connector name may contain
+        # dots; only the leading "state." and trailing ".json" are ours.
+        connector_name = path.name[len("state."):-len(".json")]
+        load_state(connector_name)
 
 
 def ensure_runtime_dir() -> None:
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 
 
+class _MalformedRecord(ValueError):
+    """One record is unusable. It is skipped with the field named, not fatal."""
+
+
+def _record_from_dict(w: dict) -> WatcherState:
+    """Build a WatcherState from one persisted record, checking every field's type.
+
+    The reader validates rather than trusts, because a value read and used without
+    checking it is the type the reader assumed is the defect shape this loader family
+    keeps producing — and here it escaped the file layer entirely. A `watcher_name` of
+    `[]` was accepted, and `StateStore.load()` then built `{ws.watcher_name: ws}` and
+    raised `TypeError: unhashable type`, aborting startup: a crash in a caller, so no
+    amount of care inside `load_state` could have caught it, and it contradicted the
+    graceful-corruption contract stated in this module's own docstring.
+
+    Types come from `_FIELD_TYPES`, derived from the dataclass's annotations, so a
+    field added there is validated without anyone having to remember.
+    """
+    name = w.get("watcher_name")
+    if not isinstance(name, str) or not name:
+        raise _MalformedRecord(
+            f"'watcher_name' must be a non-empty string (got {type(name).__name__})"
+        )
+
+    values: dict[str, object] = {}
+    for field_name, want in _FIELD_TYPES.items():
+        if field_name not in w:
+            continue
+        value = w[field_name]
+        # bool before int: bool subclasses int, so an int field must reject True and a
+        # bool field must not accept 0/1.
+        if want is bool:
+            ok = isinstance(value, bool)
+        elif want is int:
+            ok = isinstance(value, int) and not isinstance(value, bool)
+        else:
+            ok = isinstance(value, want)
+        if not ok:
+            raise _MalformedRecord(
+                f"'{field_name}' must be {want.__name__} (got {type(value).__name__})"
+            )
+        # Copy the containers so a record never aliases the payload it came from.
+        values[field_name] = (
+            dict(value) if want is dict else list(value) if want is list else value
+        )
+    # A required field absent from the payload reads as empty, which is what the
+    # previous reader did via its per-field defaults. Derived from `fields()` rather
+    # than a hand-written list of "the required ones", and deliberately not solved by
+    # giving those fields dataclass defaults: that would loosen a real constraint on
+    # every construction site to serve the reader alone.
+    for field_name in _REQUIRED_FIELDS - values.keys():
+        values[field_name] = _EMPTY[_FIELD_TYPES[field_name]]
+    return WatcherState(watcher_name=name, **values)
+
+
 def load_state(connector_name: str) -> list[WatcherState]:
     """Load watcher runtime state for the given connector from disk.
 
-    Supports two formats:
-      - New format: records have a 'watcher_name' key.
-      - Legacy format: records have a 'watcher_id' key (old WatcherInfo schema).
-        Legacy records are migrated: watcher_name is set to room_name (best-effort).
+    Raises:
+        LegacyStateError: If the file predates ``STATE_FORMAT_VERSION``.
+        FutureStateError: If it was written by a newer build. This is a
+            version check, not a converter — the legacy reader was deleted rather
+            than extended, because the fields added for on-the-fly watchers cannot
+            be reconstructed from an old record (design §5.3). Refusing is the point:
+            the alternative is booting with an empty registry, which abandons every
+            session and looks like a successful start.
+
+    A missing file is not an error (first run). A corrupted or unreadable one is
+    still handled by starting fresh, unchanged — it carries no recoverable state
+    either way, so refusing to boot over it would trade a graceful degradation for
+    an outage.
     """
     ensure_runtime_dir()
     state_file = _state_file(connector_name)
@@ -64,44 +317,61 @@ def load_state(connector_name: str) -> list[WatcherState]:
         return []
     try:
         data = json.loads(state_file.read_text())
-        watchers = []
-        for w in data.get("watchers", []):
-            if "watcher_name" in w:
-                # New format
-                watchers.append(WatcherState(
-                    watcher_name=w["watcher_name"],
-                    session_id=w.get("session_id", ""),
-                    room_id=w.get("room_id", ""),
-                    room_type=w.get("room_type", "channel"),
-                    context_injected=w.get("context_injected", False),
-                    paused=w.get("paused", False),
-                    last_processed_ts=w.get("last_processed_ts", ""),
-                ))
-            elif "watcher_id" in w:
-                # Legacy format — migrate best-effort using room_name as watcher_name
-                watcher_name = w.get("room_name", w["watcher_id"])
-                logger.info(
-                    "Migrating legacy state entry watcher_id=%s → watcher_name=%s",
-                    w["watcher_id"][:8], watcher_name,
-                )
-                watchers.append(WatcherState(
-                    watcher_name=watcher_name,
-                    session_id=w.get("session_id", ""),
-                    room_id=w.get("room_id", ""),
-                    room_type=w.get("room_type", "channel"),
-                    context_injected=w.get("context_injected", False),
-                    paused=False,
-                    last_processed_ts=w.get("last_processed_ts", ""),
-                ))
-        logger.info(
-            "[%s] Loaded %d watcher states from disk", connector_name, len(watchers)
-        )
-        return watchers
-    except Exception as e:
+    except (OSError, ValueError, RecursionError) as e:
+        # RecursionError, not just ValueError: json.loads raises it on deeply nested
+        # input (~100k levels), which is corruption by any reasonable reading. Omitting
+        # it would let a corrupt file abort startup — regressing the "corrupted files
+        # start fresh" contract this function documents two paragraphs up, which is
+        # precisely the kind of contradiction between a docstring and its code that a
+        # narrowed `except` invites.
         logger.warning(
-            "[%s] Failed to load state file, starting fresh: %s", connector_name, e
+            "[%s] Failed to read state file, starting fresh: %s", connector_name, e
         )
         return []
+
+    # The version check runs on parsed content and outside the try above, because a
+    # legacy file is perfectly valid JSON: catching it here would convert the
+    # refusal back into the silent "starting fresh" it exists to replace.
+    if not isinstance(data, dict):
+        logger.warning(
+            "[%s] State file is not a JSON object, starting fresh", connector_name
+        )
+        return []
+    version = data.get("version")
+    if version != STATE_FORMAT_VERSION:
+        if isinstance(version, int) and version > STATE_FORMAT_VERSION:
+            raise FutureStateError(state_file, version)
+        raise LegacyStateError(
+            state_file,
+            f"format {version!r}" if version is not None else "no version marker",
+        )
+
+    raw_records = data.get("watchers", [])
+    if not isinstance(raw_records, list):
+        logger.warning(
+            "[%s] State file's 'watchers' is not a list, starting fresh", connector_name
+        )
+        return []
+    watchers = []
+    for w in raw_records:
+        if not isinstance(w, dict):
+            logger.warning(
+                "[%s] Skipping a non-mapping entry in the state file", connector_name
+            )
+            continue
+        try:
+            watchers.append(_record_from_dict(w))
+        except (_MalformedRecord, TypeError, ValueError) as e:
+            # One bad record is skipped rather than discarding the file: the others are
+            # real sessions, and dropping them would abandon more than the corruption
+            # did. The field is named so the operator can repair or delete by hand.
+            logger.warning(
+                "[%s] Skipping malformed state record: %s", connector_name, e
+            )
+    logger.info(
+        "[%s] Loaded %d watcher states from disk", connector_name, len(watchers)
+    )
+    return watchers
 
 
 def save_state(connector_name: str, watchers: list[WatcherState]) -> None:
@@ -117,7 +387,10 @@ def save_state(connector_name: str, watchers: list[WatcherState]) -> None:
     # Use a PID-unique temp name to avoid two concurrent writers clobbering
     # each other's tmp file.
     tmp_file = state_file.with_name(f"{state_file.name}.{os.getpid()}.tmp")
-    data = {"watchers": [asdict(w) for w in watchers]}
+    data = {
+        "version": STATE_FORMAT_VERSION,
+        "watchers": [asdict(w) for w in watchers],
+    }
     try:
         tmp_file.write_text(json.dumps(data, indent=2))
         tmp_file.replace(state_file)

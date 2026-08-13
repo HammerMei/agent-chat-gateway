@@ -16,6 +16,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from gateway.config_validate import Finding, validate_config
+from gateway.core.state import STATE_FORMAT_VERSION
 
 
 class _ValidateConfigTestBase(unittest.TestCase):
@@ -236,6 +237,9 @@ class TestValidateConfigStateOrphans(_ValidateConfigTestBase):
         """)
         self.runtime_dir.mkdir()
         (self.runtime_dir / "state.rc.json").write_text(json.dumps({
+            # Version marker included deliberately rather than hardcoded: a file
+            # without one is now refused, and this fixture is a *current* file.
+            "version": STATE_FORMAT_VERSION,
             "watchers": [
                 {"watcher_name": "w1", "session_id": "keep", "room_id": "r1"},
                 {"watcher_name": "stale", "session_id": "x", "room_id": "r2"},
@@ -245,6 +249,97 @@ class TestValidateConfigStateOrphans(_ValidateConfigTestBase):
         self.assertTrue(result.ok)  # orphans are warnings, not errors
         self.assertEqual(len(result.warnings), 1)
         self.assertIn("stale", result.warnings[0])
+
+    def test_a_legacy_state_file_is_reported_as_an_error_not_skipped(self):
+        """The branch that reads state used to be `except Exception: continue`.
+
+        That would have swallowed the legacy-format refusal completely — and this
+        command is the first thing an upgrading operator runs, so it would have
+        reported a clean config while the daemon refused to boot on the same files.
+        Reported as an *error* rather than a warning, because the gateway will not
+        start until it is dealt with.
+        """
+        cfg = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                room: general
+        """)
+        self.runtime_dir.mkdir()
+        # No version marker — the shape written by every earlier release.
+        (self.runtime_dir / "state.rc.json").write_text(json.dumps({
+            "watchers": [{"watcher_name": "w1", "session_id": "s", "room_id": "r"}]
+        }))
+        result = self._validate(cfg)
+        self.assertFalse(result.ok, "a refused state file must not validate clean")
+        self.assertTrue(
+            any("state.rc.json" in e for e in result.errors), result.errors
+        )
+        # Attributed to the file, not to a connector: the check now enumerates state
+        # files rather than configured connectors, precisely because a file may belong
+        # to a connector that no longer exists in config.yaml. "global" is the honest
+        # entity for something the config does not mention.
+        findings = [
+            f for f in result.findings
+            if f.severity == "error" and f.entity_kind == "global"
+        ]
+        self.assertTrue(findings, result.findings)
+        self.assertIn("§5.3", findings[0].message)
+
+    def test_a_state_file_for_an_unconfigured_connector_is_reported_too(self):
+        """The hole this restructure closed: iterating `config.connectors` would never
+        open `state.retired.json`, so its sessions would be abandoned by a boot that
+        reported success."""
+        cfg = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                room: general
+        """)
+        self.runtime_dir.mkdir()
+        (self.runtime_dir / "state.retired.json").write_text(json.dumps({
+            "watchers": [{"watcher_name": "gone", "session_id": "s", "room_id": "r"}]
+        }))
+        result = self._validate(cfg)
+        self.assertFalse(result.ok)
+        self.assertTrue(
+            any("state.retired.json" in e for e in result.errors), result.errors
+        )
+
+    def test_a_corrupt_state_file_still_validates_clean(self):
+        """The contrast that keeps the error above meaningful: a corrupt file is
+        handled by starting fresh, so it is not a validation error."""
+        cfg = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                room: general
+        """)
+        self.runtime_dir.mkdir()
+        (self.runtime_dir / "state.rc.json").write_text("{ not json")
+        result = self._validate(cfg)
+        self.assertTrue(result.ok, result.errors)
 
     def test_no_state_file_produces_no_warnings(self):
         cfg = self._write(f"""\
@@ -681,6 +776,7 @@ class TestFindingsExtension(_ValidateConfigTestBase):
         """)
         self.runtime_dir.mkdir()
         (self.runtime_dir / "state.rc.json").write_text(json.dumps({
+            "version": STATE_FORMAT_VERSION,
             "watchers": [{"watcher_name": "stale", "session_id": "x", "room_id": "y"}]
         }))
         result = self._validate(cfg)

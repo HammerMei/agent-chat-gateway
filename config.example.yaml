@@ -405,7 +405,9 @@ watchers:
 # scheduler:
 #   completed_job_ttl_days: 7         # How long completed jobs are kept in data/jobs.json before purge.
 #                                     # 0 = delete immediately when a job completes.
-#                                     # Use "acg schedule list --all" to see completed jobs.
+#                                     # Use "agent-chat-gateway schedule list --all" to see
+#                                     # completed jobs. (The installed command is
+#                                     # `agent-chat-gateway`; there is no `acg` binary.)
 #
 # Note: timezone is now configured per-connector (see "timezone:" under each connector above).
 # When --tz is not supplied to "schedule create", the watcher's connector timezone is used,

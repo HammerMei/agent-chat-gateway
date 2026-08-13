@@ -74,9 +74,13 @@ class StateStore:
                         ws.room_id, e,
                     )
 
-        # Start from disk so records this process never touched survive.  A
-        # corrupt or missing file loads as empty (see load_state), which
-        # degrades to the old replace behaviour rather than raising.
+        # Start from disk so records this process never touched survive.  A missing
+        # or corrupt file still loads as empty (see load_state), degrading to the old
+        # replace behaviour rather than raising — but a *legacy-format* file now
+        # raises LegacyStateError instead, deliberately: it holds real records this
+        # merge would otherwise drop on the floor while looking successful.  Nothing
+        # catches it here, because a save that silently discarded persisted sessions
+        # is the outcome the refusal exists to prevent.
         merged = self.load()
         merged.update(states)
 
