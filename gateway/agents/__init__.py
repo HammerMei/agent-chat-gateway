@@ -156,12 +156,22 @@ class AgentBackend(ABC):
         such side effect (returning a value for the caller to re-supply)
         should ignore it and always return fresh content.
 
-        `path_key`: the filesystem key for this room, from
-        `gateway.core.paths.room_path_key(connector, room_id)`. It replaced a
-        `watcher_name` parameter, and the rename is the point: a display name is free to
-        change (a channel rename, a group DM's membership changing, a better sanitizer),
-        and using it as a path component made every such change orphan a file. Backends
-        must not derive anything human-facing from it — it is opaque by design (§2.3).
+        `path_key`: an **opaque** filesystem key for this file. Backends must treat it as
+        a name and derive nothing from it — not the room, not the watcher, nothing
+        human-facing.
+
+        Callers pass `gateway.core.paths.watcher_prompt_key(connector, room_id,
+        watcher_name)`, which is scoped to the *watcher in a room* rather than to the room
+        alone. That matters for anyone implementing this method: two watchers may bind
+        different agents to one connector+room, and a room-only key makes the second
+        overwrite the first one's instructions silently. The room-scoped
+        `room_path_key` exists for the attachment workspace, whose cache genuinely is per
+        room — do not reach for it here.
+
+        It replaced a `watcher_name` parameter, and the rename is the point: a display
+        name is free to change (a channel rename, a group DM's membership changing, a
+        better sanitizer), and using it directly as a path component made every such
+        change orphan a file and let two rooms collide (§2.3).
 
         There is deliberately NO usable default here — every backend must
         make an explicit choice, visible in its own source, about how it

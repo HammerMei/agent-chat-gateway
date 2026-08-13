@@ -2,9 +2,13 @@
 
 Design §2.3 moves two paths off the watcher's display name —
 `RUNTIME_DIR/system-prompts/<name>.md` and
-`{working_directory}/.acg-attachments/<name>` — onto a derived key, so that renaming a
-room, a group DM's membership changing, or an improved sanitizer stop orphaning files
-and stop being able to point two rooms at one path.
+`{working_directory}/.acg-attachments/<name>` — onto derived keys, so that a channel
+rename, a group DM's membership changing, or an improved sanitizer can no longer point
+two rooms at one path.
+
+The two keys differ, and `TestThePromptKeyIsScopedToTheWatcher` below is why: the
+attachment workspace keys on the room, while the prompt file keys on the watcher in a
+room, because two watchers may bind different agents to one room.
 
 The golden vector below is the load-bearing test in this file. Once these paths key on a
 digest, the digest *is* the persistent identity of the files: any change to how it is

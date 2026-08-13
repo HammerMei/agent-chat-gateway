@@ -181,9 +181,13 @@ class TestConfigValidationHardening(unittest.TestCase):
         self.assertIn("Duplicate watcher name 'same'", str(ctx.exception))
 
     def test_watcher_name_with_slash_raises(self):
-        """Watcher names become filesystem path components (.acg-attachments/<name>
-        under working_directory, system-prompts/<name>.md under RUNTIME_DIR) — a
-        '/' could escape the intended directory."""
+        """Watcher names are identifiers — state.json keys and the pause/resume/reset
+        handle — so a '/' in one is a mistake worth refusing.
+
+        They are no longer path components: per-room files key on a digest instead
+        (gateway/core/paths.py). The check stays because the reason changed, not because
+        it stopped mattering — this docstring used to give the old reason, which would
+        have taught the next reader that removing the check is now safe."""
         path = self._write_config("""\
             connectors:
               - name: rc

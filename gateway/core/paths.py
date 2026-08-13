@@ -4,17 +4,26 @@ Two paths used to be named after a watcher's *display* name —
 `RUNTIME_DIR/system-prompts/<name>.md` and
 `{working_directory}/.acg-attachments/<name>` — which made that name load-bearing.
 Every change to it was destructive: the old file and symlink were orphaned, and a
-collision repointed one room's attachment path at another room's files. Three separate
-things want to change a display name (a channel rename, a group DM's membership
-changing, a better sanitizer), so decoupling the paths from it is what makes all three
-harmless at once (design §2.3).
+collision repointed one room's attachment path at another room's files (design §2.3).
 
-Both now key on a **derived** value rather than the raw `room_id`. Derived matters
-because `room_id` is external connector data, and nothing constrains it to one safe
-path segment: today's platforms emit opaque alphanumerics, but a future connector — or a
-corrupted state file — could supply `/`, `..`, a leading dash, or something absurdly
-long, any of which escapes or collides inside these roots. A fixed-width digest is
-uniform and safe by construction; the raw id stays in state and in `list` output.
+**The two artifacts key on different things, because they identify different things:**
+
+* `room_path_key(connector, room_id)` — the attachment workspace. The cache it links to
+  is per room and shared by definition, so a rename cannot orphan it.
+* `watcher_prompt_key(connector, room_id, watcher_name)` — the durable-instructions
+  file. Its contents come from the agent and that watcher's own context files, and two
+  watchers may bind different agents to one room, so a room-only key would let the
+  second silently overwrite the first. A rename therefore *does* still orphan a prompt
+  file; what the digest removes is the collision between rooms. Once watchers are
+  created per room the name is derived from the room, and this key becomes
+  room-determined too.
+
+Both are **derived** rather than the raw `room_id`, which matters because `room_id` is
+external connector data and nothing constrains it to one safe path segment: today's
+platforms emit opaque alphanumerics, but a future connector — or a corrupted state file —
+could supply `/`, `..`, a leading dash, or something absurdly long, any of which escapes
+or collides inside these roots. A fixed-width digest is uniform and safe by
+construction; the raw id stays in state and in `list` output.
 """
 
 from __future__ import annotations

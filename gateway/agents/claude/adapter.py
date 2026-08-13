@@ -453,12 +453,14 @@ class ClaudeBackend(AgentBackend):
         accidental `git add` if that directory is a real user project under
         version control (a documented, real configuration — see
         docs/user-guide.md's ``working_directory: ~/my-project`` examples).
-        The file is named by ``path_key`` — a digest of (connector, room_id) — rather
-        than by the watcher's display name. That name used to be the path component,
-        which made it load-bearing: renaming a room orphaned the old file, and a
-        collision pointed two rooms at one file (§2.3). ``resolve_under`` re-checks
-        containment, because the key is derived from external connector data and a
-        path built from such data is validated rather than trusted.
+        The file is named by ``path_key``, which the caller derives — treat it as opaque.
+        It is scoped to the *watcher in a room*, not to the room alone: two watchers may
+        bind different agents to one connector+room, and a room-only key would make the
+        second overwrite the first one's instructions. The display name used to be the
+        path component outright, which made it load-bearing — a rename orphaned the file
+        and two rooms could collide (§2.3). ``resolve_under`` re-checks containment,
+        because the key is built from external connector data and a path from such data
+        is validated rather than trusted.
         """
         acg_dir = RUNTIME_DIR / "system-prompts"
         await asyncio.to_thread(acg_dir.mkdir, parents=True, exist_ok=True)

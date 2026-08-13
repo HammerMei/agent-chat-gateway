@@ -68,8 +68,9 @@ logger = logging.getLogger("agent-chat-gateway.agents.opencode")
 
 # ACG's own runtime state directory — same convention as
 # gateway/agents/claude/adapter.py's RUNTIME_DIR. Durable per-watcher
-# instructions files live under RUNTIME_DIR/system-prompts/<path_key>.md,
-# where path_key is a digest of (connector, room_id) — never the display name (§2.3)
+# instructions files live under RUNTIME_DIR/system-prompts/<path_key>.md, where
+# path_key is opaque to this adapter — the caller derives it per watcher-in-a-room
+# (gateway/core/paths.py's watcher_prompt_key), never from the display name (§2.3)
 # for both backends; watcher names are globally unique and forbidden from
 # containing "/" (see gateway/config.py), so paths never collide, and each
 # watcher only ever uses one backend type, so there's no cross-backend clash
