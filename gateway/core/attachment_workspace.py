@@ -111,7 +111,21 @@ class AttachmentWorkspace:
             )
             return None
         else:
-            link.symlink_to(cache_path)
-            logger.info("Created attachment symlink: %s → %s", link, cache_path)
+            try:
+                link.symlink_to(cache_path)
+            except FileExistsError:
+                # Two watchers in one room now SHARE this link, because it keys on the
+                # room rather than on the watcher name. The per-watcher lifecycle locks
+                # do not serialize them, so both can pass the checks above and both
+                # reach this line; the loser used to raise and roll its whole watcher
+                # startup back. A link that already points where this call wanted it is
+                # success, not a conflict — the operation is idempotent by nature.
+                if not (link.is_symlink() and link.resolve() == cache_path.resolve()):
+                    raise
+                logger.debug(
+                    "Attachment symlink %s created concurrently — reusing it", link
+                )
+            else:
+                logger.info("Created attachment symlink: %s → %s", link, cache_path)
 
         return str(link)

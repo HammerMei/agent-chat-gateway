@@ -30,20 +30,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the rule-matching engine that would give it meaning hasn't landed yet.
 
 ### Changed
-- **Per-room files no longer key on the watcher name.** The system-prompt file
-  (`<RUNTIME_DIR>/system-prompts/…`) and the attachment workspace
-  (`<working_directory>/.acg-attachments/…`) are now named by a digest of
-  `(connector, room id)` instead of the watcher's display name
-  (`docs/design/dynamic-watcher-design.md` §2.3). v0.5.1 documented watcher names as
+- **Per-room files are named by a digest instead of the watcher name.**
+  (`docs/design/dynamic-watcher-design.md` §2.3.) v0.5.1 documented watcher names as
   "persistent identifiers (state.json sessions, CLI pause/resume/reset, attachment/
-  system-prompt file paths)"; the last of those is no longer true, and that is the point
-  — a rename used to orphan both artifacts, and a name collision could point one room's
-  attachment path at another room's files.
+  system-prompt file paths)"; the last of those no longer holds.
 
-  *On upgrade:* one prompt file and one symlink per existing room are orphaned once.
-  They are internal artifacts and harmless to delete; automatic reclamation belongs to
-  the watcher-expiry work. Watcher names remain persistent identifiers for state records
-  and for `pause`/`resume`/`reset`.
+  The two artifacts key on different things, because they identify different things:
+
+  - the **attachment workspace** (`<working_directory>/.acg-attachments/…`) keys on
+    `(connector, room id)` — the cache it links to is per room and shared by definition.
+    A rename no longer orphans it, and a name collision can no longer point one room's
+    attachment path at another room's files;
+  - the **system-prompt file** (`<RUNTIME_DIR>/system-prompts/…`) keys on
+    `(connector, room id, watcher name)`, because its contents are built from the agent
+    and that watcher's own context files. Two watchers may bind different agents to one
+    room, and a room-only key would make the second silently overwrite the first.
+
+  So renaming a watcher still orphans its prompt file — unchanged from before, where that
+  file was named after the watcher outright. What the digest removes is the *collision*:
+  two rooms can no longer share one path. Once watchers are created per room, the name is
+  derived from the room and the prompt key becomes room-determined too.
+
+  *On upgrade:* one prompt file and one symlink per existing room are orphaned once. They
+  are internal artifacts and harmless to delete; automatic reclamation belongs to the
+  watcher-expiry work. Watcher names remain persistent identifiers for state records and
+  for `pause`/`resume`/`reset`.
 
 ### Removed
 - **BREAKING: `watchers[].session_id` (sticky sessions).** Setting it is now a
