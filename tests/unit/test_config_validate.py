@@ -282,12 +282,43 @@ class TestValidateConfigStateOrphans(_ValidateConfigTestBase):
         self.assertTrue(
             any("state.rc.json" in e for e in result.errors), result.errors
         )
+        # Attributed to the file, not to a connector: the check now enumerates state
+        # files rather than configured connectors, precisely because a file may belong
+        # to a connector that no longer exists in config.yaml. "global" is the honest
+        # entity for something the config does not mention.
         findings = [
             f for f in result.findings
-            if f.severity == "error" and f.entity_kind == "connector"
+            if f.severity == "error" and f.entity_kind == "global"
         ]
         self.assertTrue(findings, result.findings)
         self.assertIn("§5.3", findings[0].message)
+
+    def test_a_state_file_for_an_unconfigured_connector_is_reported_too(self):
+        """The hole this restructure closed: iterating `config.connectors` would never
+        open `state.retired.json`, so its sessions would be abandoned by a boot that
+        reported success."""
+        cfg = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                room: general
+        """)
+        self.runtime_dir.mkdir()
+        (self.runtime_dir / "state.retired.json").write_text(json.dumps({
+            "watchers": [{"watcher_name": "gone", "session_id": "s", "room_id": "r"}]
+        }))
+        result = self._validate(cfg)
+        self.assertFalse(result.ok)
+        self.assertTrue(
+            any("state.retired.json" in e for e in result.errors), result.errors
+        )
 
     def test_a_corrupt_state_file_still_validates_clean(self):
         """The contrast that keeps the error above meaningful: a corrupt file is

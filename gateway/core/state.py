@@ -32,26 +32,66 @@ RUNTIME_DIR = Path.home() / ".agent-chat-gateway"
 STATE_FORMAT_VERSION = 2
 
 
-class LegacyStateError(Exception):
-    """Raised when a state file predates ``STATE_FORMAT_VERSION``.
+class StateFormatError(Exception):
+    """A state file this build cannot read.
 
     Deliberately not a subclass of anything ``load_state``'s own ``except`` clause
     catches: a refusal that gets swallowed and turned into "starting fresh" is the
-    precise failure this class exists to prevent (design §5.3). Every caller of
+    precise failure this exists to prevent (design §5.3). Every caller of
     ``load_state`` has to decide about it explicitly.
+
+    Split into two subclasses because the two directions need *opposite* advice, and
+    a message that gives the wrong one is worse than no message: an older file should
+    be deleted, and a newer file must not be.
     """
 
-    def __init__(self, path: Path, detail: str) -> None:
+    def __init__(self, path: Path, message: str) -> None:
         self.path = path
+        super().__init__(message)
+
+
+class LegacyStateError(StateFormatError):
+    """The file predates ``STATE_FORMAT_VERSION`` (or has no version marker)."""
+
+    def __init__(self, path: Path, detail: str) -> None:
         super().__init__(
-            f"State file '{path}' is in a format this version cannot read ({detail}). "
-            "There is no automatic conversion: a legacy record carries no agent, no "
-            "materialized config and no originating rule, so converting it would have "
-            "to guess which rule now owns the room — the silent re-binding the design "
-            "exists to prevent. Follow the upgrade procedure in "
-            "docs/design/dynamic-watcher-design.md §5.3 ('Upgrading: a clean break'): "
-            "record what exists with 'acg list', rewrite config.yaml, then delete "
-            f"'{path}'."
+            path,
+            f"State file '{path}' is in an older format this version cannot read "
+            f"({detail}). There is no automatic conversion: an old record carries no "
+            "agent, no materialized config and no originating rule, so converting it "
+            "would have to guess which rule now owns the room — the silent re-binding "
+            "the design exists to prevent (docs/design/dynamic-watcher-design.md "
+            "§5.3).\n"
+            "To proceed: stop the gateway, run 'agent-chat-gateway list' to record "
+            "what exists and what is paused, move the state file(s) aside or delete "
+            f"them ('{path}'), then start again. Your config.yaml does NOT need "
+            "rewriting for this: rule-shaped watchers are not active yet, so the "
+            "§5.3 procedure's config rewrite belongs to the later cutover, not to "
+            "this step.\n"
+            "Accepted loss: each room starts a fresh agent session (history handoff "
+            "refetches recent room messages, so there is partial continuity), the "
+            "message watermark resets once per room, and any paused watcher comes "
+            "back active — re-pause it after start."
+        )
+
+
+class FutureStateError(StateFormatError):
+    """The file was written by a newer build than this one.
+
+    Kept separate from the legacy case on purpose. The legacy message says to delete
+    the file; following that here — during a rollback, say — would destroy perfectly
+    valid state *and* still leave this build unable to read it.
+    """
+
+    def __init__(self, path: Path, version: object) -> None:
+        super().__init__(
+            path,
+            f"State file '{path}' was written by a newer version of the gateway "
+            f"(format {version!r}; this build reads {STATE_FORMAT_VERSION}). "
+            "**Do not delete it** — it holds valid sessions, and deleting it would "
+            "not make this build able to read them. Either run the newer version "
+            "again, or, if this is an intentional rollback and losing those sessions "
+            f"is acceptable, move '{path}' aside first so it can be restored."
         )
 
 
@@ -141,6 +181,34 @@ _SCALAR_FIELDS: tuple[tuple[str, object], ...] = (
 )
 
 
+def state_files() -> list[Path]:
+    """Every persisted state file on disk, whichever connectors currently exist.
+
+    Enumerating the *files* rather than the configured connectors is the point. A
+    connector renamed or removed in config.yaml leaves `state.<old-name>.json` behind,
+    and a caller that iterates `config.connectors` never opens it — so a legacy file
+    belonging to a since-renamed connector would sail past the refusal and be
+    abandoned silently, which is the exact failure the refusal exists to prevent.
+    """
+    ensure_runtime_dir()
+    return sorted(RUNTIME_DIR.glob("state.*.json"))
+
+
+def check_state_formats() -> None:
+    """Raise on the first state file this build cannot read.
+
+    A preflight for callers that must not proceed past an unreadable file — the daemon
+    on startup, and `config validate`. Reading each file is cheap next to the cost of
+    the alternative: booting with an empty registry and abandoning every session while
+    looking successful.
+    """
+    for path in state_files():
+        # state.<name>.json → <name>. rsplit, because a connector name may contain
+        # dots; only the leading "state." and trailing ".json" are ours.
+        connector_name = path.name[len("state."):-len(".json")]
+        load_state(connector_name)
+
+
 def ensure_runtime_dir() -> None:
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -160,7 +228,8 @@ def load_state(connector_name: str) -> list[WatcherState]:
     """Load watcher runtime state for the given connector from disk.
 
     Raises:
-        LegacyStateError: If the file predates ``STATE_FORMAT_VERSION``. This is a
+        LegacyStateError: If the file predates ``STATE_FORMAT_VERSION``.
+        FutureStateError: If it was written by a newer build. This is a
             version check, not a converter — the legacy reader was deleted rather
             than extended, because the fields added for on-the-fly watchers cannot
             be reconstructed from an old record (design §5.3). Refusing is the point:
@@ -178,7 +247,13 @@ def load_state(connector_name: str) -> list[WatcherState]:
         return []
     try:
         data = json.loads(state_file.read_text())
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, RecursionError) as e:
+        # RecursionError, not just ValueError: json.loads raises it on deeply nested
+        # input (~100k levels), which is corruption by any reasonable reading. Omitting
+        # it would let a corrupt file abort startup — regressing the "corrupted files
+        # start fresh" contract this function documents two paragraphs up, which is
+        # precisely the kind of contradiction between a docstring and its code that a
+        # narrowed `except` invites.
         logger.warning(
             "[%s] Failed to read state file, starting fresh: %s", connector_name, e
         )
@@ -194,11 +269,11 @@ def load_state(connector_name: str) -> list[WatcherState]:
         return []
     version = data.get("version")
     if version != STATE_FORMAT_VERSION:
+        if isinstance(version, int) and version > STATE_FORMAT_VERSION:
+            raise FutureStateError(state_file, version)
         raise LegacyStateError(
             state_file,
-            f"version {version!r}, expected {STATE_FORMAT_VERSION}"
-            if version is not None
-            else "no version marker",
+            f"format {version!r}" if version is not None else "no version marker",
         )
 
     try:

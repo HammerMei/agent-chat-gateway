@@ -38,10 +38,14 @@ from unittest.mock import patch
 from gateway.core import state as state_mod
 from gateway.core.state import (
     STATE_FORMAT_VERSION,
+    FutureStateError,
     LegacyStateError,
+    StateFormatError,
     WatcherState,
+    check_state_formats,
     load_state,
     save_state,
+    state_files,
 )
 
 
@@ -253,8 +257,111 @@ class TestLegacyRefusal(_RealStateFileTestCase):
         """Not only older files: a version this build does not know cannot be read
         either, and guessing would be the same mistake in the other direction."""
         self.write_raw({"version": STATE_FORMAT_VERSION + 1, "watchers": []})
-        with self.assertRaises(LegacyStateError):
+        with self.assertRaises(FutureStateError):
             load_state("rc")
+
+    def test_a_future_file_is_not_told_to_be_deleted(self):
+        """The two directions need opposite advice, and one message cannot carry both.
+
+        The legacy message says to delete the file. Following that on a *newer* file —
+        during a rollback, say — destroys valid sessions and still leaves this build
+        unable to read them. So the future case is its own exception with its own
+        message, and this asserts the destructive instruction is absent from it.
+        """
+        self.write_raw({"version": STATE_FORMAT_VERSION + 1, "watchers": []})
+        with self.assertRaises(FutureStateError) as cm:
+            load_state("rc")
+        msg = str(cm.exception)
+        self.assertIn("Do not delete", msg)
+        self.assertIn("newer version", msg)
+        self.assertNotIn("move the state file(s) aside or delete", msg)
+
+    def test_the_legacy_message_does_not_prescribe_the_cutover_config_rewrite(self):
+        """§5.3's procedure rewrites concrete watchers into rules — and rules are not
+        consumed yet on this branch, so an operator who followed it here would restart
+        with **zero active watchers**. The message therefore says explicitly that the
+        config rewrite belongs to the later cutover, and names the losses that do
+        apply now."""
+        self.write_raw({"watchers": [{"watcher_name": "w", "session_id": "s",
+                                      "room_id": "r"}]})
+        with self.assertRaises(LegacyStateError) as cm:
+            load_state("rc")
+        msg = str(cm.exception)
+        self.assertIn("does NOT need rewriting", msg)
+        self.assertIn("cutover", msg)
+        self.assertIn("paused watcher comes back active", msg)
+
+    def test_the_recovery_command_is_one_that_exists(self):
+        """The installed entry points are `agent-chat-gateway` and `acg-provision`;
+        there is no `acg`. A recovery step that fails with command-not-found is worse
+        than no step, since it arrives exactly when startup is already blocked."""
+        self.write_raw({"watchers": []})
+        with self.assertRaises(LegacyStateError) as cm:
+            load_state("rc")
+        msg = str(cm.exception)
+        self.assertIn("agent-chat-gateway list", msg)
+        self.assertNotIn("'acg list'", msg)
+
+    def test_both_refusals_share_a_catchable_base(self):
+        """Callers decide once, not twice: `config validate` and the daemon preflight
+        both catch the base rather than enumerating subclasses."""
+        self.assertTrue(issubclass(LegacyStateError, StateFormatError))
+        self.assertTrue(issubclass(FutureStateError, StateFormatError))
+
+    def test_deeply_nested_json_is_corruption_not_a_refusal(self):
+        """`json.loads` raises RecursionError, not ValueError, on ~100k nesting. With
+        the except narrowed to (OSError, ValueError) it escaped — turning a corrupt
+        file into an aborted startup and contradicting the contract two paragraphs up
+        in load_state's own docstring."""
+        self.state_path().write_text("[" * 100_000 + "]" * 100_000)
+        self.assertEqual(load_state("rc"), [])
+
+
+class TestPreflightCoversFilesNotConnectors(_RealStateFileTestCase):
+    """The refusal has to be driven by what is on disk.
+
+    Every path that would otherwise notice an unreadable file is per-connector — both
+    `config validate`'s orphan check and `GatewayService`, which builds a session
+    manager per *configured* connector. So a state file whose connector was renamed or
+    removed in config.yaml is never opened, and the daemon starts successfully while
+    abandoning every session in it: exactly the outcome the refusal exists to prevent,
+    reached by a different route.
+    """
+
+    def test_state_files_lists_what_is_on_disk(self):
+        save_state("rc", [])
+        save_state("mm", [])
+        self.assertEqual(
+            [p.name for p in state_files()],
+            ["state.mm.json", "state.rc.json"],
+        )
+
+    def test_a_connector_name_containing_dots_round_trips(self):
+        """The name is recovered by stripping the fixed prefix and suffix, not by
+        splitting on '.', so a dotted connector name survives."""
+        save_state("rc.eu.prod", [WatcherState(
+            watcher_name="w", session_id="s", room_id="r")])
+        check_state_formats()  # must not raise
+        self.assertEqual(len(load_state("rc.eu.prod")), 1)
+
+    def test_the_preflight_refuses_a_file_for_an_unconfigured_connector(self):
+        save_state("rc", [])                      # current format
+        self.write_raw({"watchers": []}, "retired-connector")  # no version marker
+        with self.assertRaises(LegacyStateError) as cm:
+            check_state_formats()
+        self.assertIn("state.retired-connector.json", str(cm.exception))
+
+    def test_the_preflight_passes_when_every_file_is_current(self):
+        save_state("rc", [WatcherState(watcher_name="w", session_id="s", room_id="r")])
+        save_state("mm", [])
+        check_state_formats()  # must not raise
+
+    def test_the_preflight_ignores_a_corrupt_file(self):
+        self.state_path().write_text("{ not json")
+        check_state_formats()  # must not raise
+
+    def test_no_files_at_all_is_fine(self):
+        check_state_formats()
 
     def test_a_corrupt_file_still_degrades_gracefully(self):
         """Deliberately *not* a refusal. A corrupt file holds no recoverable state

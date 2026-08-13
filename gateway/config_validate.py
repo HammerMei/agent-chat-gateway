@@ -43,7 +43,7 @@ from .config import (
 from .connectors.mattermost.config import MattermostConfig
 from .connectors.rocketchat.config import RocketChatConfig
 from .connectors.voice.config import VoiceConfig
-from .core.state import LegacyStateError, load_state
+from .core.state import StateFormatError, load_state, state_files
 
 # Connector types validated via their own dataclass parser. 'script' is
 # intentionally omitted — ScriptConnector never reads ConnectorConfig.raw
@@ -279,21 +279,29 @@ def _check_state_orphans(config: GatewayConfig, result: ValidationResult) -> Non
     for w in config.watchers:
         configured_by_connector.setdefault(w.connector, set()).add(w.name)
 
-    for connector in config.connectors:
+    # Checked over the files on disk, not over config.connectors: a connector renamed
+    # or removed in config.yaml leaves its state file behind, and only iterating
+    # configured connectors would never open it — so an unreadable file belonging to a
+    # since-renamed connector would pass validation and then be abandoned silently at
+    # startup, which is the failure the refusal exists to prevent.
+    for path in state_files():
         try:
-            states = load_state(connector.name)
-        except LegacyStateError as exc:
-            # This branch used to be `except Exception: continue`, which would have
-            # swallowed the refusal entirely — and `acg config validate` is the first
-            # thing an upgrading operator runs, so it would have reported a clean
-            # config while the daemon refused to boot on the same files. Reported as
-            # an error rather than a warning: the gateway will not start until it is
-            # dealt with.
+            load_state(path.name[len("state."):-len(".json")])
+        except StateFormatError as exc:
             msg = str(exc)
             result.errors.append(msg)
             result.findings.append(
-                Finding("error", "connector", connector.name, None, msg)
+                Finding("error", "global", None, None, msg)
             )
+        except Exception:
+            # Handled inside load_state by starting fresh; nothing to report.
+            pass
+
+    for connector in config.connectors:
+        try:
+            states = load_state(connector.name)
+        except StateFormatError:
+            # Already reported above, against the file rather than the connector.
             continue
         except Exception:
             # Anything else (unreadable file, malformed JSON) is handled inside

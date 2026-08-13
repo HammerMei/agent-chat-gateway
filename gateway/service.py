@@ -39,6 +39,7 @@ from .core.permission import (
 from .core.scheduler import JobScheduler
 from .core.session_manager import SessionManager
 from .core.session_maps import SessionMaps
+from .core.state import check_state_formats
 
 logger = logging.getLogger("agent-chat-gateway.service")
 
@@ -251,6 +252,15 @@ class GatewayService:
     """
 
     def __init__(self, config: GatewayConfig) -> None:
+        # Preflight the persisted state BEFORE building anything. A state file this
+        # build cannot read holds real sessions, and every path that would notice it
+        # later is per-connector — so a file belonging to a connector no longer in
+        # config.yaml would never be opened, and the daemon would start successfully
+        # while abandoning every session in it. Raising here is the whole point of the
+        # version marker: an unreadable file must stop the boot, not be discovered as
+        # an absence. See gateway/core/state.py.
+        check_state_formats()
+
         core_config = CoreConfig.from_gateway_config(config)
 
         # Shared permission registry (one per gateway instance)
