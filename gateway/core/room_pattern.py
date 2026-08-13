@@ -1,0 +1,332 @@
+"""Glob patterns for matching room names in watcher rules.
+
+Implements the pattern language specified in `docs/design/dynamic-watcher-design.md`
+§2.1. It is deliberately smaller than `fnmatch` and smaller than regex:
+
+| | |
+|---|---|
+| syntax | `*` (any run, including empty), `?` (exactly one character), `[…]` character class. Nothing else — no alternation, no quantifiers, no anchors |
+| matched against | the room's **full** platform name, implicitly anchored at both ends |
+| case | sensitive; both platforms' slugs are lowercase by construction |
+| unicode | compared NFC-normalised, so a decomposed pattern matches a composed name |
+
+The constraint is not arbitrary: it is what makes *subsumption* decidable, which
+is what lets config load warn exactly when one rule is fully shadowed by an
+earlier one instead of guessing.
+
+**Matching and subsumption share one automaton.** It would be faster to compile
+to `re` for matching and keep the automaton only for subsumption, but then two
+implementations of the same language would have to agree forever — and the first
+time they disagreed, a rule would match a room at runtime that the load-time
+shadowing check believed unreachable. One semantics, one bug surface.
+
+Two consequences of the syntax being closed, both deliberate:
+
+* **There is no escape character.** `\\` is an ordinary literal, so a pattern
+  cannot match a room whose name really contains `*`, `?` or `[`. Both platforms
+  build room names as slugs that exclude those characters, and adding an escape
+  would widen the language that the subsumption check has to stay exact over.
+  A literal `[` is still reachable as `[[]`.
+* **`*` has no special case for any character.** Unlike a path glob it spans
+  `-`, `.` and `/` freely, because a room name is one flat token rather than a
+  path.
+"""
+
+from __future__ import annotations
+
+import unicodedata
+from dataclasses import dataclass
+from enum import Enum
+from typing import Iterable
+
+__all__ = [
+    "InvalidRoomPattern",
+    "RoomPattern",
+    "normalize_room_name",
+    "union_subsumes",
+]
+
+
+class InvalidRoomPattern(ValueError):
+    """A pattern is not valid glob syntax.
+
+    Raised at config load, never on the message-delivery path — an operator is
+    present to fix it at load time and absent at delivery time.
+    """
+
+
+def normalize_room_name(name: str) -> str:
+    """NFC-normalise a room name or pattern.
+
+    Applied to both sides of every comparison so a decomposed pattern matches a
+    composed name. Platform slugs are ASCII in practice, which is exactly why
+    this is cheap to do unconditionally rather than conditionally.
+    """
+    return unicodedata.normalize("NFC", name)
+
+
+class _Kind(Enum):
+    LITERAL = "literal"
+    ANY_ONE = "any_one"  # ?
+    ANY_RUN = "any_run"  # *
+    CLASS = "class"  # [...]
+
+
+@dataclass(frozen=True)
+class _Token:
+    kind: _Kind
+    char: str = ""
+    members: frozenset[str] = frozenset()
+    negated: bool = False
+
+    def accepts(self, ch: str) -> bool:
+        match self.kind:
+            case _Kind.LITERAL:
+                return ch == self.char
+            case _Kind.ANY_ONE:
+                return True
+            case _Kind.CLASS:
+                return (ch in self.members) != self.negated
+            case _:  # ANY_RUN consumes via its own loop, not here
+                return False
+
+
+# A character class listing more than this many members is not expanded for
+# subsumption purposes. Subsumption only drives a warning, so declining to
+# decide is safe; silently building a 65k-symbol alphabet is not.
+_MAX_CLASS_MEMBERS = 1024
+
+# Ceiling on the product construction below. Reaching it means "not proven
+# subsumed", never "subsumed".
+_MAX_PRODUCT_STATES = 20_000
+
+
+def _parse_class(pattern: str, i: int) -> tuple[_Token, int]:
+    """Parse a `[...]` class starting at the `[`. Returns the token and the
+    index just past the closing `]`."""
+    j = i + 1
+    negated = False
+    if j < len(pattern) and pattern[j] in "!^":
+        negated = True
+        j += 1
+    members: set[str] = set()
+    # A `]` immediately after the opening bracket (or its negation) is a literal
+    # `]`, matching POSIX and fnmatch. Otherwise it closes the class.
+    first = True
+    while j < len(pattern):
+        if pattern[j] == "]" and not first:
+            if not members:
+                raise InvalidRoomPattern(
+                    f"empty character class in pattern {pattern!r}"
+                )
+            return _Token(_Kind.CLASS, members=frozenset(members), negated=negated), j + 1
+        # range a-z
+        if (
+            j + 2 < len(pattern)
+            and pattern[j + 1] == "-"
+            and pattern[j + 2] != "]"
+        ):
+            lo, hi = pattern[j], pattern[j + 2]
+            if ord(lo) > ord(hi):
+                raise InvalidRoomPattern(
+                    f"reversed range {lo!r}-{hi!r} in pattern {pattern!r}"
+                )
+            if ord(hi) - ord(lo) + 1 > _MAX_CLASS_MEMBERS:
+                raise InvalidRoomPattern(
+                    f"character range {lo!r}-{hi!r} in pattern {pattern!r} spans "
+                    f"more than {_MAX_CLASS_MEMBERS} characters"
+                )
+            members.update(chr(c) for c in range(ord(lo), ord(hi) + 1))
+            j += 3
+        else:
+            members.add(pattern[j])
+            j += 1
+        first = False
+    raise InvalidRoomPattern(f"unterminated '[' in pattern {pattern!r}")
+
+
+def _parse(pattern: str) -> tuple[_Token, ...]:
+    tokens: list[_Token] = []
+    i = 0
+    while i < len(pattern):
+        ch = pattern[i]
+        if ch == "*":
+            # Collapse runs of `*`: `**` is the same language as `*`, and
+            # collapsing keeps the automaton and the subsumption search smaller.
+            if not tokens or tokens[-1].kind is not _Kind.ANY_RUN:
+                tokens.append(_Token(_Kind.ANY_RUN))
+            i += 1
+        elif ch == "?":
+            tokens.append(_Token(_Kind.ANY_ONE))
+            i += 1
+        elif ch == "[":
+            tok, i = _parse_class(pattern, i)
+            tokens.append(tok)
+        else:
+            tokens.append(_Token(_Kind.LITERAL, char=ch))
+            i += 1
+    return tuple(tokens)
+
+
+class RoomPattern:
+    """A compiled room-name glob.
+
+    Compilation happens at config load so an invalid pattern can never surface
+    on the delivery path.
+    """
+
+    __slots__ = ("raw", "_tokens")
+
+    def __init__(self, pattern: str) -> None:
+        if not isinstance(pattern, str):
+            raise InvalidRoomPattern(f"pattern must be a string, got {type(pattern).__name__}")
+        if pattern == "":
+            raise InvalidRoomPattern("pattern must not be empty")
+        self.raw = pattern
+        self._tokens = _parse(normalize_room_name(pattern))
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"RoomPattern({self.raw!r})"
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, RoomPattern) and self._tokens == other._tokens
+
+    def __hash__(self) -> int:
+        return hash(self._tokens)
+
+    @property
+    def is_literal(self) -> bool:
+        """True when the pattern contains no metacharacters.
+
+        Connectors that declare no unsolicited inbound require literal patterns,
+        since they cannot discover rooms to match against (§2.6).
+        """
+        return all(t.kind is _Kind.LITERAL for t in self._tokens)
+
+    def _closure(self, states: Iterable[int]) -> frozenset[int]:
+        """Add states reachable without consuming input.
+
+        `*` is the only source of epsilon moves: it may match the empty run and
+        so lets position i advance to i+1 for free.
+        """
+        out: set[int] = set()
+        stack = list(states)
+        while stack:
+            s = stack.pop()
+            if s in out:
+                continue
+            out.add(s)
+            if s < len(self._tokens) and self._tokens[s].kind is _Kind.ANY_RUN:
+                stack.append(s + 1)
+        return frozenset(out)
+
+    def _start(self) -> frozenset[int]:
+        return self._closure([0])
+
+    def _step(self, states: frozenset[int], ch: str) -> frozenset[int]:
+        nxt: set[int] = set()
+        for s in states:
+            if s >= len(self._tokens):
+                continue
+            tok = self._tokens[s]
+            if tok.kind is _Kind.ANY_RUN:
+                nxt.add(s)  # stay inside the run
+            elif tok.accepts(ch):
+                nxt.add(s + 1)
+        return self._closure(nxt)
+
+    def _accepts(self, states: frozenset[int]) -> bool:
+        return len(self._tokens) in states
+
+    def matches(self, name: str) -> bool:
+        """Whether this pattern matches a room name, anchored at both ends."""
+        states = self._start()
+        for ch in normalize_room_name(name):
+            states = self._step(states, ch)
+            if not states:
+                return False
+        return self._accepts(states)
+
+    def _alphabet_members(self) -> set[str]:
+        """Characters this pattern can distinguish."""
+        out: set[str] = set()
+        for t in self._tokens:
+            if t.kind is _Kind.LITERAL:
+                out.add(t.char)
+            elif t.kind is _Kind.CLASS:
+                out.update(t.members)
+        return out
+
+
+def _sentinel(used: set[str]) -> str:
+    """A character no pattern mentions, standing for "any other character".
+
+    Sound because every automaton here treats all unmentioned characters
+    identically — they can only be consumed by `?`, `*` or a negated class.
+    """
+    for cp in range(0xE000, 0xF900):  # private use area
+        ch = chr(cp)
+        if ch not in used:
+            return ch
+    for cp in range(0x10000, 0x10800):  # pragma: no cover - absurd input
+        ch = chr(cp)
+        if ch not in used:
+            return ch
+    raise InvalidRoomPattern("cannot allocate a sentinel character")  # pragma: no cover
+
+
+def union_subsumes(
+    outer: Iterable[RoomPattern], inner: Iterable[RoomPattern]
+) -> bool:
+    """Does every name matched by *any* `inner` pattern also match some `outer`?
+
+    This is the shadowing question: `outer` is an earlier rule's include list,
+    `inner` a later rule's. Under first-match precedence, a later rule whose
+    whole language is already claimed can never fire.
+
+    Decided exactly, by searching the product of both sides' automata for a name
+    the inner side accepts and the outer side rejects. The search is bounded; on
+    hitting the bound this returns `False`, which understates shadowing rather
+    than inventing it — a missed warning is a cosmetic loss, a false one sends an
+    operator hunting a rule that works.
+    """
+    outer = list(outer)
+    inner = list(inner)
+    if not inner:
+        return True  # an empty language is contained in anything
+    if not outer:
+        return False
+
+    used: set[str] = set()
+    for p in (*outer, *inner):
+        used |= p._alphabet_members()
+    if len(used) > _MAX_CLASS_MEMBERS:
+        return False
+    alphabet = sorted(used) + [_sentinel(used)]
+
+    start = (
+        tuple(p._start() for p in outer),
+        tuple(p._start() for p in inner),
+    )
+    seen = {start}
+    queue = [start]
+    while queue:
+        if len(seen) > _MAX_PRODUCT_STATES:
+            return False
+        o_states, i_states = queue.pop()
+        inner_accepts = any(p._accepts(s) for p, s in zip(inner, i_states))
+        outer_accepts = any(p._accepts(s) for p, s in zip(outer, o_states))
+        if inner_accepts and not outer_accepts:
+            return False  # witness found
+        for ch in alphabet:
+            nxt = (
+                tuple(p._step(s, ch) for p, s in zip(outer, o_states)),
+                tuple(p._step(s, ch) for p, s in zip(inner, i_states)),
+            )
+            # Once the inner side is dead no suffix can produce a witness.
+            if not any(nxt[1]):
+                continue
+            if nxt not in seen:
+                seen.add(nxt)
+                queue.append(nxt)
+    return True
