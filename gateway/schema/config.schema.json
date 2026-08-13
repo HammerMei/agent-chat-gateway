@@ -228,6 +228,85 @@
       }
     },
     "watcher": {
+      "description": "A 'watchers:' entry, in either shape. The two are told apart by the type of 'rooms': an object is a rule (docs/design/dynamic-watcher-design.md §2.1), an array is the static multi-room shorthand. Exactly one branch can match, so 'oneOf' is a discriminated union rather than a guess. Both are accepted while the rule path is being built; the static branch is removed at cutover.",
+      "oneOf": [
+        { "$ref": "#/$defs/staticWatcher" },
+        { "$ref": "#/$defs/watcherRule" }
+      ]
+    },
+    "dmOptIn": {
+      "description": "Opt in to a DM class. Only true/false is accepted by the loader today. The object form is reserved for per-DM include/exclude (§2.7) and is accepted here so that adding it later extends this union instead of changing the schema's shape — a config written against the newer loader still validates against this schema.",
+      "anyOf": [
+        { "type": "boolean" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "include": { "type": "array", "items": { "type": "string" } },
+            "exclude": { "type": "array", "items": { "type": "string" } }
+          }
+        }
+      ]
+    },
+    "watcherRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "rooms"],
+      "properties": {
+        "description": {
+          "type": "string",
+          "description": "Optional annotation for this rule (informational only; ignored at runtime)."
+        },
+        "inherits": {
+          "type": "string",
+          "description": "Name of a 'watcher_templates:' entry to deep-merge as this rule's base (this rule's own fields win on conflict)."
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The rule's identity — required and unique. Unlike the static shape there is no single room to derive a name from, and this is what shadowing warnings and persisted rule_name refer to."
+        },
+        "connector": { "type": "string" },
+        "agent": { "type": "string" },
+        "rooms": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Which rooms this rule claims. Patterns govern named rooms; the DM flags govern direct messages, which have no name to match on either platform. All four may appear together.",
+          "properties": {
+            "include": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Globs ('*', '?', '[...]') matched against the room's full name, anchored at both ends, case-sensitively. Required unless the rule opts into DMs only."
+            },
+            "exclude": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Evaluated after include, within this rule. An excluded room does NOT fall through to a later rule — this rule claimed it and then declined it."
+            },
+            "direct": { "$ref": "#/$defs/dmOptIn" },
+            "group_direct": { "$ref": "#/$defs/dmOptIn" }
+          }
+        },
+        "session_idle_days": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Days with no message before this watcher's runtime object is dropped (session kept). Lives on the rule rather than the agent so two rules sharing an agent can differ. Must be strictly less than session_expire_days when both are set."
+        },
+        "session_expire_days": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Days with no message before the session itself is dropped too."
+        },
+        "context_inject_files": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "online_notification": { "type": ["string", "null"] },
+        "offline_notification": { "type": ["string", "null"] },
+        "history_handoff": { "$ref": "#/$defs/historyHandoff" }
+      }
+    },
+    "staticWatcher": {
       "type": "object",
       "additionalProperties": false,
       "allOf": [

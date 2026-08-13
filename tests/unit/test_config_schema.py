@@ -77,6 +77,94 @@ class TestExampleAndFixtureConfigsMatchSchema:
         assert not errors, "\n".join(str(e) for e in errors)
 
 
+class TestRuleShapedWatchersValidate:
+    """The rule shape from docs/design/dynamic-watcher-design.md §2.1.
+
+    Both shapes are accepted while the rule path is being built, so these run
+    alongside the static-shape cases above rather than replacing them. `$defs`
+    discriminates on the *type* of `rooms:` — object means rule, array means the
+    old shorthand — so exactly one `oneOf` branch can ever match.
+    """
+
+    @pytest.fixture
+    def base_doc(self) -> dict:
+        return _load_yaml(REPO_ROOT / "config.example.yaml")
+
+    def _with_watcher(self, base_doc: dict, entry: dict) -> dict:
+        doc = copy.deepcopy(base_doc)
+        doc["watchers"] = [entry]
+        return doc
+
+    def _ok(self, validator, base_doc, entry):
+        errors = list(validator.iter_errors(self._with_watcher(base_doc, entry)))
+        assert not errors, "\n".join(str(e) for e in errors)
+
+    def _rejected(self, validator, base_doc, entry):
+        assert list(validator.iter_errors(self._with_watcher(base_doc, entry)))
+
+    def test_a_rule_with_include_patterns(self, validator, base_doc):
+        self._ok(validator, base_doc, {
+            "name": "eng", "connector": "rc-main", "agent": "my-agent",
+            "rooms": {"include": ["eng-*", "incident-*"], "exclude": ["eng-archive"]},
+        })
+
+    def test_a_dm_only_rule_needs_no_include(self, validator, base_doc):
+        self._ok(validator, base_doc, {
+            "name": "dms", "rooms": {"direct": True, "group_direct": True},
+        })
+
+    def test_per_rule_ttls(self, validator, base_doc):
+        self._ok(validator, base_doc, {
+            "name": "eng", "rooms": {"include": ["eng-*"]},
+            "session_idle_days": 7, "session_expire_days": 30,
+        })
+
+    def test_the_reserved_object_dm_form_validates_so_adding_it_stays_additive(
+        self, validator, base_doc
+    ):
+        """§5.4: the schema leaves room for `direct: {include: [...]}` even
+        though the loader rejects it today, so a config written against a later
+        loader still validates here rather than needing a schema change."""
+        self._ok(validator, base_doc, {
+            "name": "dms", "rooms": {"direct": {"include": ["alice"], "exclude": ["bob"]}},
+        })
+
+    def test_the_static_shape_still_validates(self, validator, base_doc):
+        self._ok(validator, base_doc, {"room": "general", "connector": "rc-main"})
+        self._ok(validator, base_doc, {"rooms": ["a", "b"], "connector": "rc-main"})
+
+    def test_a_rule_without_a_name_is_rejected(self, validator, base_doc):
+        self._rejected(validator, base_doc, {"rooms": {"include": ["eng-*"]}})
+
+    def test_an_empty_rule_name_is_rejected(self, validator, base_doc):
+        self._rejected(validator, base_doc, {"name": "", "rooms": {"include": ["a"]}})
+
+    def test_a_typo_inside_rooms_is_rejected(self, validator, base_doc):
+        self._rejected(validator, base_doc, {"name": "x", "rooms": {"includ": ["a"]}})
+
+    def test_a_non_positive_ttl_is_rejected(self, validator, base_doc):
+        self._rejected(validator, base_doc, {
+            "name": "x", "rooms": {"include": ["a"]}, "session_idle_days": 0,
+        })
+
+    def test_a_stray_key_on_a_rule_is_rejected(self, validator, base_doc):
+        self._rejected(validator, base_doc, {
+            "name": "x", "rooms": {"include": ["a"]}, "sesion_idle_days": 7,
+        })
+
+    def test_mixing_a_room_with_a_rooms_block_is_rejected(self, validator, base_doc):
+        """Neither branch matches: the static one forbids room+rooms together,
+        and the rule one has additionalProperties: false so `room` is unknown."""
+        self._rejected(validator, base_doc, {
+            "name": "x", "room": "general", "rooms": {"include": ["a"]},
+        })
+
+    def test_session_id_is_not_accepted_on_a_rule(self, validator, base_doc):
+        self._rejected(validator, base_doc, {
+            "name": "x", "rooms": {"include": ["a"]}, "session_id": "abc",
+        })
+
+
 class TestSchemaCatchesKnownMistakes:
     """Negative controls — if these stop failing, the schema became too
     permissive (e.g. a stray additionalProperties: true) to catch anything."""
