@@ -266,18 +266,27 @@ watcher reads it on its own session start.
 **Example: hand off a local session's context**
 
 ```bash
-# 1. Resume the existing session and ask it to summarise itself to a file.
-#    `--resume <id>` (or `-c` for the most recent session) is required: a bare
-#    `claude -p` starts a NEW session, which has none of the context you want.
-#    Write to an ABSOLUTE path — step 2 resolves the same path relative to
-#    config.yaml, which is usually a different directory.
+# 1. Resume the existing session, have it PRINT the summary, and redirect that to
+#    the file yourself.
+#
+#    Two details that both bite silently if you skip them:
+#    - `--resume <id>` (or `-c` for the most recent session) is required. A bare
+#      `claude -p` starts a NEW session — that is exactly how this project creates
+#      one — so it would summarise nothing, successfully.
+#    - Redirect stdout rather than asking Claude to write the file. In
+#      non-interactive `-p` mode the `Write` tool needs prior approval, so a run
+#      without it finishes without creating anything.
 claude --resume ses_abc123def456 -p "Summarise everything we have established in
-this session — decisions, constraints, open questions, and where we left off —
-into /Users/me/project/HANDOFF.md. Write it for another instance of yourself with
-no memory of this conversation."
+this session — decisions, constraints, open questions, and where we left off.
+Write it for another instance of yourself with no memory of this conversation.
+Output only the summary." > /Users/me/project/HANDOFF.md
 
-# Session ids are printed by `claude -p --output-format json`, and `claude -c -p`
+# Session ids are printed by `claude -p --output-format json`; `claude -c -p`
 # resumes the most recent session without needing one.
+
+# Check the contents, not just that the file is there: `>` creates the file before
+# the command runs, so a failed or wrong-session run still leaves one behind.
+wc -l /Users/me/project/HANDOFF.md && head -5 /Users/me/project/HANDOFF.md
 ```
 
 ```yaml

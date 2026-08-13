@@ -67,10 +67,19 @@ A watcher SHALL:
 ### 3.2 Session Identity
 
 The gateway SHALL:
-1. Support fixed session IDs (user-configured in watchers) and auto-created session IDs
-2. For auto-created session IDs, persist that session identity across daemon restarts so the same agent conversation continues
-3. For fixed session IDs, preserve them across reset operations
-4. When a watcher with an auto-created session ID is reset, create a fresh session on the next message
+1. Assign every watcher's session identity itself — from the agent backend on first
+   start, or by reusing the persisted one. Session IDs SHALL NOT be configurable:
+   `watchers[].session_id` is removed, and setting it SHALL be a load error naming
+   the replacement (see 8.3.7a)
+2. Persist that session identity across daemon restarts so the same agent
+   conversation continues
+3. When a watcher is reset, clear the stored session identity and create a fresh
+   session on the next message. There is no exemption from reset: the "fixed session
+   IDs preserved across reset" rule went with the removed field
+4. Support carrying context into a new session by file — an operator MAY have the
+   agent summarise a session to a file and list it in `context_inject_files`. This
+   replaces session pinning and, unlike it, survives the backend expiring the session
+   it was written from
 
 ### 3.3 Watcher State Persistence
 
@@ -234,7 +243,7 @@ The gateway SHALL:
 The gateway SHALL:
 1. Reject queue depth settings with negative values
 2. If permission timeouts are enabled, require that the overall agent timeout is greater than the permission timeout
-3. Prevent distinct watchers from reusing the same fixed session ID in a way that would create ambiguous routing
+3. Prevent two watchers from sharing one session identity in a way that would create ambiguous routing. Since session IDs are no longer configurable (3.2.1), this is now satisfied by construction at the configuration layer rather than by a cross-watcher check, and remains a runtime requirement on assignment
 
 ### 8.4 Templates, Tool Presets, and Watcher Room Expansion
 
