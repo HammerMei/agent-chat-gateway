@@ -9,6 +9,7 @@ that every connector in the tree answers the identity question deliberately.
 import inspect
 import pkgutil
 import unittest
+from pathlib import Path
 
 from gateway.core.bot_identity import (
     BotIdentity,
@@ -169,6 +170,42 @@ class TestEveryConnectorAnswersDeliberately(unittest.TestCase):
                 ):
                     found[name] = obj
         return found
+
+    def test_no_connector_lives_outside_the_package_this_walks(self):
+        """The walk above is scoped to `gateway.connectors`, and that scope is an
+        assumption — the same shape as anchoring a sweep on a hand-picked directory and
+        calling it exhaustive. This checks the assumption instead of trusting it: an
+        `ast` pass over the whole `gateway/` tree, needing no imports, so a connector
+        defined somewhere else fails here rather than silently inheriting "no account".
+        """
+        import ast
+
+        import gateway
+
+        # Anchored to the package's own location, not the working directory: a relative
+        # "gateway" path would find nothing when pytest runs from elsewhere, and the
+        # sweep would report a clean tree because it had read no files.
+        root = Path(gateway.__file__).parent
+        found = []
+        for path in root.rglob("*.py"):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if not isinstance(node, ast.ClassDef) or node.name == "Connector":
+                    continue
+                for base in node.bases:
+                    name = getattr(base, "id", None) or getattr(base, "attr", None)
+                    if name and "Connector" in name:
+                        found.append((str(path), node.name))
+
+        connectors_dir = str(root / "connectors")
+        outside = sorted(
+            f"{p}:{n}" for p, n in found if not p.startswith(connectors_dir))
+        self.assertEqual(
+            outside, [],
+            "a Connector subclass outside gateway/connectors/ is invisible to the walk "
+            "below, so it would never be asked for a bot identity — move it into the "
+            "package, or widen the walk",
+        )
+        self.assertTrue(found, "the ast sweep found no connectors at all; it is broken")
 
     def test_the_sweep_finds_the_known_connectors(self):
         """Guards the enumeration itself: a walk that silently found nothing would make
