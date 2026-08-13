@@ -164,9 +164,13 @@ class MessageProcessor:
           5. Cancel and await any in-flight background tasks.
           6. Transition to ``stopped``.
 
-        This ensures that watermark capture in ``_stop_processor()`` reflects
-        the last message the processor *actually processed*, not just the last
-        one that was enqueued.
+        Draining matters for user-visible ordering (point 4) and for not losing
+        queued work — but note it does **not** affect the persisted watermark.
+        Both connectors advance their watermark when a message is *accepted into
+        the queue*, not when it is handled, so draining never moves it.
+        ``_stop_processor()`` therefore captures it before unsubscribing, which
+        is the only point where the connector still holds the room entry it
+        lives in.
 
         Args:
             drain_timeout: Maximum seconds to wait for the queue to drain.
