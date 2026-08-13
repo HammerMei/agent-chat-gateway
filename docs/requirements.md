@@ -85,7 +85,9 @@ The gateway SHALL:
 
 The gateway SHALL:
 1. Persist watcher runtime state across restarts, including at minimum the active session identity and paused/unpaused status
-2. Recover gracefully from missing or corrupted state files rather than crashing
+2. Recover gracefully from missing or corrupted state files rather than crashing — such a file carries no recoverable state either way, so refusing to start over it would trade a graceful degradation for an outage
+3. Mark the persisted format with a version, and **refuse to start** on a state file whose version it cannot read, naming the file and the upgrade procedure. This is deliberately not case 2: a readable file in an older format holds real sessions, and reading it as empty would abandon them while looking like a successful boot. There SHALL be no automatic conversion — see docs/design/dynamic-watcher-design.md §5.3 for why one cannot be written honestly
+4. Report that refusal from `config validate` as an error rather than skipping it, since that command is what an operator runs before starting the gateway
 
 ---
 

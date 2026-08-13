@@ -43,7 +43,7 @@ from .config import (
 from .connectors.mattermost.config import MattermostConfig
 from .connectors.rocketchat.config import RocketChatConfig
 from .connectors.voice.config import VoiceConfig
-from .core.state import load_state
+from .core.state import LegacyStateError, load_state
 
 # Connector types validated via their own dataclass parser. 'script' is
 # intentionally omitted — ScriptConnector never reads ConnectorConfig.raw
@@ -282,7 +282,24 @@ def _check_state_orphans(config: GatewayConfig, result: ValidationResult) -> Non
     for connector in config.connectors:
         try:
             states = load_state(connector.name)
+        except LegacyStateError as exc:
+            # This branch used to be `except Exception: continue`, which would have
+            # swallowed the refusal entirely — and `acg config validate` is the first
+            # thing an upgrading operator runs, so it would have reported a clean
+            # config while the daemon refused to boot on the same files. Reported as
+            # an error rather than a warning: the gateway will not start until it is
+            # dealt with.
+            msg = str(exc)
+            result.errors.append(msg)
+            result.findings.append(
+                Finding("error", "connector", connector.name, None, msg)
+            )
+            continue
         except Exception:
+            # Anything else (unreadable file, malformed JSON) is handled inside
+            # load_state by starting fresh, so reaching here means something
+            # unexpected — skip this connector's orphan check rather than failing the
+            # whole validation over it.
             continue
         configured = configured_by_connector.get(connector.name, set())
         for st in states:
