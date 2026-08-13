@@ -590,7 +590,8 @@ GatewayService.run()
 │  └─ Connector.connect() [login, DDP WebSocket, etc.]
 ├─ identity barrier — Connector.bot_identity() for all, duplicates refused
 ├─ SessionManager.sync_only()     [every connector, concurrently]
-│  └─ resume persisted watchers, resolve rooms, subscribe
+│  ├─ resume persisted watchers, resolve rooms, subscribe
+│  └─ Connector.start_inbound() [begin reading; no-op where delivery is per-room]
 └─ ControlServer.run() [accept CLI commands]
 ```
 
@@ -605,7 +606,12 @@ GatewayService.run()
    checking something that is already happening. A connector that cannot report its own
    identity stops startup rather than starting unchecked (design §4.5)
 5. Watchers restore and subscribe fifth — can now safely dispatch messages to agents
-6. Control socket last — ready to accept CLI commands
+6. **Inbound stream starts last within that phase.** A connector whose transport
+   delivers every room the account can see (Mattermost) discards events for rooms it
+   has no state for, and nothing replays them — so reading before the restore turns
+   "not subscribed yet" into "lost". The socket is open throughout, so arrivals are
+   buffered rather than missed. Rocket.Chat gates delivery per room and needs nothing
+7. Control socket last — ready to accept CLI commands
 
 `SessionManager.run_once()` still runs both phases back to back, for a standalone
 single-connector embedding where there is no second connector to collide with.

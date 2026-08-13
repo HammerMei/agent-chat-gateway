@@ -196,7 +196,7 @@ class TestIdentityBarrier(unittest.IsolatedAsyncioTestCase):
         return service
 
     async def test_a_shared_account_is_refused_before_anything_subscribes(self):
-        same = BotIdentity("https://chat.example.com", "user-abc")
+        same = BotIdentity("rocketchat", "https://chat.example.com", "user-abc")
         service = self._service_with(same, same)
 
         with self.assertRaises(DuplicateBotIdentityError):
@@ -209,8 +209,8 @@ class TestIdentityBarrier(unittest.IsolatedAsyncioTestCase):
     async def test_distinct_accounts_reach_the_second_phase(self):
         """Otherwise the test above would pass against a barrier that refuses always."""
         service = self._service_with(
-            BotIdentity("https://chat.example.com", "user-a"),
-            BotIdentity("https://chat.example.com", "user-b"),
+            BotIdentity("rocketchat", "https://chat.example.com", "user-a"),
+            BotIdentity("rocketchat", "https://chat.example.com", "user-b"),
         )
         service._control.start = AsyncMock(side_effect=RuntimeError("stop here"))
 
@@ -223,8 +223,8 @@ class TestIdentityBarrier(unittest.IsolatedAsyncioTestCase):
     async def test_the_url_spelling_does_not_decide_it(self):
         """Two operators writing one server differently is a duplicate, not two."""
         service = self._service_with(
-            BotIdentity(canonical_origin("https://chat.example.com/"), "user-abc"),
-            BotIdentity(canonical_origin("https://chat.example.com:443"), "user-abc"),
+            BotIdentity("rocketchat", canonical_origin("https://chat.example.com/"), "user-abc"),
+            BotIdentity("rocketchat", canonical_origin("https://chat.example.com:443"), "user-abc"),
         )
 
         with self.assertRaises(DuplicateBotIdentityError):
@@ -232,7 +232,7 @@ class TestIdentityBarrier(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_connector_that_cannot_identify_itself_stops_startup(self):
         """Fail-closed: unanswerable cannot be compared, so it does not start."""
-        service = self._service_with(BotIdentity("https://s", "u1"))
+        service = self._service_with(BotIdentity("rocketchat", "https://s", "u1"))
         service._entries[0].connector.bot_identity = MagicMock(
             side_effect=ConnectorIdentityError("whoami failed"))
 
@@ -245,8 +245,8 @@ class TestIdentityBarrier(unittest.IsolatedAsyncioTestCase):
         """The exception's condition, wired: the connector names come from the service's
         own DM-owner set, which is derived from the rules at construction."""
         service = self._service_with(
-            BotIdentity("https://mm.example.com", "user-abc", scope="team-1"),
-            BotIdentity("https://mm.example.com", "user-abc", scope="team-2"),
+            BotIdentity("mattermost", "https://mm.example.com", "user-abc", scope="team-1"),
+            BotIdentity("mattermost", "https://mm.example.com", "user-abc", scope="team-2"),
             dm_owners={"c0", "c1"},
         )
 
@@ -256,8 +256,8 @@ class TestIdentityBarrier(unittest.IsolatedAsyncioTestCase):
 
     async def test_different_teams_without_dm_overlap_start_normally(self):
         service = self._service_with(
-            BotIdentity("https://mm.example.com", "user-abc", scope="team-1"),
-            BotIdentity("https://mm.example.com", "user-abc", scope="team-2"),
+            BotIdentity("mattermost", "https://mm.example.com", "user-abc", scope="team-1"),
+            BotIdentity("mattermost", "https://mm.example.com", "user-abc", scope="team-2"),
             dm_owners={"c0"},
         )
         service._control.start = AsyncMock(side_effect=RuntimeError("stop here"))

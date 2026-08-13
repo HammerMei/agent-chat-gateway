@@ -144,14 +144,27 @@ class MattermostConnector(Connector):
 
         self._ws.register_handler(self._on_posted_event)
         self._ws.set_reconnect_callback(self._on_ws_reconnect)
+        # The socket opens here; the listen loop starts in `start_inbound()`, after the
+        # watchers exist. Events arriving in between are buffered by the client rather
+        # than read and discarded for a channel this connector does not know yet.
         await self._ws.connect()
-        await self._ws.start()
         logger.info(
             "MattermostConnector connected to %s as %s (team=%s)",
             self._config.server_url,
             self._rest.bot_username,
             self._config.team,
         )
+
+    async def start_inbound(self) -> None:
+        """Start the listen loop, once `_channels` holds the rooms being watched.
+
+        `_on_posted_event` returns early for a channel with no state, and nothing
+        replays it afterwards — the initial watermark restore only covers channels that
+        already exist. Reading before the restore therefore turns "not yet subscribed"
+        into "permanently lost", which is why this is the last step of startup rather
+        than part of connecting.
+        """
+        await self._ws.start()
 
     async def disconnect(self) -> None:
         """Close the WebSocket and release HTTP client resources."""
@@ -433,7 +446,11 @@ class MattermostConnector(Connector):
                 f"cannot be established here."
             )
         return BotIdentity(
-            canonical_origin(self._config.server_url), user_id, scope=team_id)
+            platform="mattermost",
+            origin=canonical_origin(self._config.server_url),
+            user_id=user_id,
+            scope=team_id,
+        )
 
     @property
     def agent_username(self) -> str:

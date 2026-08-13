@@ -30,6 +30,7 @@ from .control import ControlServer
 from .core.bot_identity import (
     ConnectorIdentity,
     DuplicateBotIdentityError,
+    dm_owner_connectors,
     find_identity_conflicts,
 )
 from .core.config import CoreConfig
@@ -289,15 +290,15 @@ class GatewayService:
 
         self._runtime_manager = AgentRuntimeManager(agents)
 
-        # Connectors whose rules opt into direct messages (§2.7). Read once here
-        # rather than holding the whole config: the identity barrier needs only this,
-        # and config is immutable after load. A DM has no team, so it is the one thing
-        # the Mattermost different-teams exception cannot keep apart (§4.5).
-        self._dm_owner_connectors: set[str] = {
-            rule.connector
-            for rule in config.watcher_rules
-            if rule.rooms.direct or rule.rooms.group_direct
-        }
+        # Connectors that claim their account's direct-message stream — from rules that
+        # opt in AND from static watchers naming an `@someone` room, since both reach a
+        # DM and only the static form has runtime effect today. Read once here rather
+        # than holding the whole config: the identity barrier needs only this, and
+        # config is immutable after load. A DM has no team, so it is the one thing the
+        # Mattermost different-teams exception cannot keep apart (§4.5).
+        self._dm_owner_connectors: set[str] = dm_owner_connectors(
+            config.watchers, config.watcher_rules
+        )
         self._entries: list[ConnectorEntry] = []
         for cc in config.connectors:
             connector = connector_factory(cc)

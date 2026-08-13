@@ -20,7 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   may share an account, and at most **one** of them may enable direct messages (a DM has
   no team, so it reaches every connection the account has open).
   A connector that cannot establish its own identity stops startup rather than starting
-  unchecked. `acg config validate` reports the case config can see — two connectors
+  unchecked. Mattermost now opens its socket while connecting but starts reading it
+  only after watchers are restored, so messages arriving during startup are buffered
+  instead of discarded for a channel the connector does not know yet — a window that
+  already spanned each connector's watcher restore, and that the new barrier would
+  otherwise have widened. `acg config validate` reports the case config can see — two connectors
   naming one server and one username — without needing a restart.
 - **A persisted session is only resumed against the backend that issued it.**
   Watcher state records the resolved `backend_identity` (agent backend type plus

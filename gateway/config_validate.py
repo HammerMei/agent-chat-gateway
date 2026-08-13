@@ -47,6 +47,7 @@ from .core.bot_identity import (
     BotIdentity,
     ConnectorIdentity,
     canonical_origin,
+    dm_owner_connectors,
     find_identity_conflicts,
 )
 from .core.state import StateFormatError, load_state, state_files
@@ -236,11 +237,7 @@ def _check_declared_bot_accounts(config: GatewayConfig, result: ValidationResult
     are missed duplicates that the runtime check still catches — never a rejection of a
     configuration that would have worked.
     """
-    dm_owners = {
-        rule.connector
-        for rule in config.watcher_rules
-        if rule.rooms.direct or rule.rooms.group_direct
-    }
+    dm_owners = dm_owner_connectors(config.watchers, config.watcher_rules)
     declared: list[ConnectorIdentity] = []
     for connector in config.connectors:
         validator = _CONNECTOR_VALIDATORS.get(connector.type)
@@ -258,8 +255,9 @@ def _check_declared_bot_accounts(config: GatewayConfig, result: ValidationResult
             ConnectorIdentity(
                 connector_name=connector.name,
                 identity=BotIdentity(
-                    canonical_origin(server_url),
-                    username,
+                    platform=connector.type,
+                    origin=canonical_origin(server_url),
+                    user_id=username,
                     scope=getattr(cfg, "team", ""),
                 ),
                 owns_dms=connector.name in dm_owners,

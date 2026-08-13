@@ -23,6 +23,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
+from .room_pattern import is_direct_room_name
+
 _DEFAULT_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443}
 
 
@@ -40,7 +42,7 @@ class DuplicateBotIdentityError(Exception):
 
 
 def canonical_origin(url: str) -> str:
-    """`scheme://host[:port]` — comparable, from a URL a human typed.
+    """`scheme://host[:port][/path]` — comparable, from a URL a human typed.
 
     Two connectors pointing at one server routinely spell it differently:
     `https://mm.example.com`, the same with a trailing slash, and
@@ -49,17 +51,41 @@ def canonical_origin(url: str) -> str:
     canonicalizing a working directory before comparing session identity — a
     comparison is only as good as the normalisation in front of it.
 
-    The default port for the scheme is dropped rather than kept, so the explicit and
-    implicit spellings converge. Path, query and credentials are discarded: a server
-    origin is not a URL to a resource.
+    Normalisation has a second failure direction, and it is the worse one: collapsing
+    things that are genuinely different produces a *false* duplicate, and this check
+    responds to a duplicate by refusing to start.
+
+    * **The path is kept.** Two deployments can share a host under different prefixes
+      (`https://host/rc-one`, `https://host/rc-two`) — the REST and WebSocket clients
+      both build their URLs on that prefix, so those are two servers. Dropping it would
+      refuse a valid pair.
+    * **An IPv6 host keeps its brackets.** Without them `https://[::1]:8443` and
+      `https://[::1:8443]` both render as `https://::1:8443`, one address-and-port and
+      one address, indistinguishable.
+    * **An unparseable port is left alone rather than normalised.** `urlsplit().port`
+      raises on a non-numeric or out-of-range port, and this function is reached from
+      `acg config validate`, where a traceback replaces the attributed bad-URL finding
+      the operator needs. The malformed string becomes its own origin: it compares
+      equal only to an identical mistake, which is the harmless answer.
+
+    The default port for the scheme is dropped, so the explicit and implicit spellings
+    converge. Query and credentials are discarded: they address a request, not a server.
     """
     parsed = urlsplit(url if "//" in url else f"//{url}", scheme="https")
     scheme = (parsed.scheme or "https").lower()
     host = (parsed.hostname or "").lower()
-    port = parsed.port
+    if ":" in host:  # IPv6 literal — brackets are what make host and port separable
+        host = f"[{host}]"
+    try:
+        port = parsed.port
+    except ValueError:
+        # Not a number, or outside 1-65535. Nothing here can repair it, and raising
+        # would crash a validation run that exists to report exactly this kind of typo.
+        return f"{scheme}://{parsed.netloc.lower()}{parsed.path.rstrip('/')}"
     if port is not None and _DEFAULT_PORTS.get(scheme) == port:
         port = None
-    return f"{scheme}://{host}:{port}" if port else f"{scheme}://{host}"
+    authority = f"{host}:{port}" if port else host
+    return f"{scheme}://{authority}{parsed.path.rstrip('/')}"
 
 
 @dataclass(frozen=True)
@@ -76,8 +102,16 @@ class BotIdentity:
     An empty `scope` means the connector has no sub-scope to separate it from another on
     the same account, which is Rocket.Chat's situation: no team concept, so two
     connectors on one account duplicate everything.
+
+    `platform` is part of the key because user ids live in per-platform id spaces. A
+    Rocket.Chat and a Mattermost deployment reachable at one origin are two independent
+    authentication realms, and an id — or, at config-validation time, a conventional
+    username like `bot` — colliding across them is a coincidence, not one account. Two
+    connectors of different types can never be the same account, so keeping the platform
+    in the key costs nothing and removes a class of false refusals.
     """
 
+    platform: str
     origin: str
     user_id: str
     scope: str = ""
@@ -90,6 +124,29 @@ class ConnectorIdentity:
     connector_name: str
     identity: BotIdentity
     owns_dms: bool = False
+
+
+def dm_owner_connectors(watchers, watcher_rules) -> set[str]:
+    """Which connectors claim their account's direct-message stream.
+
+    Takes both watcher shapes because both can reach a DM, and only one of them can
+    reach anything at all today: a rule opts in with `direct:`/`group_direct:`, while a
+    **static** watcher names the room outright as `@someone` — the `@` convention both
+    platforms implement (`rocketchat/rest.py`, `mattermost/rest.py`, where it resolves
+    to a direct channel). Rules have no runtime effect until the watcher manager lands,
+    so counting only rules would have left this condition guarding the one form that
+    cannot yet happen while missing the one that can.
+
+    Takes the two lists rather than a `GatewayConfig` because this module is in
+    `gateway.core`, which the config layer imports and must not import back.
+    """
+    owners = {
+        rule.connector
+        for rule in watcher_rules
+        if rule.rooms.direct or rule.rooms.group_direct
+    }
+    owners |= {w.connector for w in watchers if is_direct_room_name(w.room)}
+    return owners
 
 
 def find_identity_conflicts(entries: list[ConnectorIdentity]) -> list[str]:
@@ -108,11 +165,12 @@ def find_identity_conflicts(entries: list[ConnectorIdentity]) -> list[str]:
       account has open.
     """
     conflicts: list[str] = []
-    groups: dict[tuple[str, str], list[ConnectorIdentity]] = {}
+    groups: dict[tuple[str, str, str], list[ConnectorIdentity]] = {}
     for e in entries:
-        groups.setdefault((e.identity.origin, e.identity.user_id), []).append(e)
+        key = (e.identity.platform, e.identity.origin, e.identity.user_id)
+        groups.setdefault(key, []).append(e)
 
-    for (origin, user_id), group in sorted(groups.items()):
+    for (_platform, origin, user_id), group in sorted(groups.items()):
         if len(group) < 2:
             continue
         names = ", ".join(sorted(f"'{e.connector_name}'" for e in group))

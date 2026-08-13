@@ -438,3 +438,18 @@ def union_subsumes(
                 seen.add(nxt)
                 queue.append(nxt)
     return True
+
+
+def is_direct_room_name(room: str) -> bool:
+    """Whether a statically configured room name addresses a direct message.
+
+    `@someone` is the convention both connectors implement — Rocket.Chat's and
+    Mattermost's `resolve_room()` each branch on the `@` prefix and open a direct
+    channel — and `gateway/config.py` already relies on it when deriving a watcher name.
+    Stated here so a caller that needs to *reason* about DMs (who owns an account's DM
+    stream, §4.5) does not have to restate a convention it cannot see.
+
+    Not a pattern-language concern, but this module is where room-name meaning lives,
+    and the alternative was a fourth copy of `startswith("@")`.
+    """
+    return room.startswith("@")

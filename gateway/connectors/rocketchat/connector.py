@@ -526,7 +526,11 @@ class RocketChatConnector(Connector):
                 f"for a shared bot account, and starting it unchecked is what that "
                 f"check exists to prevent."
             )
-        return BotIdentity(canonical_origin(self._config.server_url), user_id)
+        return BotIdentity(
+            platform="rocketchat",
+            origin=canonical_origin(self._config.server_url),
+            user_id=user_id,
+        )
 
     @property
     def agent_username(self) -> str:

@@ -124,8 +124,17 @@ class SessionManager:
         await self._connector.connect()
 
     async def sync_only(self, unavailable_agents: set[str] | None = None) -> list[str]:
-        """Phase two: restore watchers and subscribe. Requires `connect_only()` first."""
-        return await self._lifecycle.sync_watchers(unavailable_agents=unavailable_agents)
+        """Phase two: restore watchers, subscribe, then open the inbound stream.
+
+        `start_inbound()` is last on purpose. A connector that delivers everything its
+        account can see discards events for rooms it has no state for, so reading before
+        the restore turns "not subscribed yet" into "lost" — and the errors returned
+        here are per-watcher failures, not a reason to leave the connector deaf, so the
+        stream starts regardless of them.
+        """
+        errors = await self._lifecycle.sync_watchers(unavailable_agents=unavailable_agents)
+        await self._connector.start_inbound()
+        return errors
 
     async def shutdown(self) -> None:
         """Stop all processors, save state, disconnect connector.

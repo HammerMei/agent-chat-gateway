@@ -16,6 +16,7 @@ from gateway.core.bot_identity import (
     ConnectorIdentity,
     ConnectorIdentityError,
     canonical_origin,
+    dm_owner_connectors,
     find_identity_conflicts,
 )
 from gateway.core.connector import Connector
@@ -30,7 +31,6 @@ class TestCanonicalOrigin(unittest.TestCase):
             "https://mm.example.com/",
             "https://mm.example.com:443",
             "https://MM.Example.COM",
-            "https://mm.example.com/api/v4",
         ]
         self.assertEqual(
             len({canonical_origin(f) for f in forms}),
@@ -51,14 +51,40 @@ class TestCanonicalOrigin(unittest.TestCase):
             canonical_origin("https://rc.example.com"),
         )
 
+    def test_a_deployment_path_is_kept(self):
+        """The opposite failure direction, and the worse one: two deployments under one
+        host are two servers (both clients build their URLs on the prefix), and
+        collapsing them would refuse a valid pair rather than miss an invalid one."""
+        self.assertNotEqual(
+            canonical_origin("https://host.example/rc-one"),
+            canonical_origin("https://host.example/rc-two"),
+        )
+
+    def test_an_ipv6_host_keeps_its_brackets(self):
+        """Without them, an address-with-port and a longer address render identically."""
+        self.assertNotEqual(
+            canonical_origin("https://[::1]:8443"),
+            canonical_origin("https://[::1:8443]"),
+        )
+
+    def test_an_unparseable_port_does_not_raise(self):
+        """Reached from `acg config validate`, where a traceback replaces the attributed
+        bad-URL finding the operator actually needs."""
+        self.assertEqual(
+            canonical_origin("https://chat.example.com:notaport"),
+            canonical_origin("https://chat.example.com:notaport"),
+        )
+
     def test_a_bare_host_is_accepted(self):
         """`urlsplit` reads a schemeless string as a path, which would make every bare
         host normalise to the same empty origin — every such connector a duplicate."""
         self.assertEqual(canonical_origin("rc.example.com"), "https://rc.example.com")
 
 
-def _entry(name, user_id="u1", origin="https://s", scope="", owns_dms=False):
-    return ConnectorIdentity(name, BotIdentity(origin, user_id, scope), owns_dms)
+def _entry(name, user_id="u1", origin="https://s", scope="", owns_dms=False,
+           platform="rocketchat"):
+    return ConnectorIdentity(
+        name, BotIdentity(platform, origin, user_id, scope), owns_dms)
 
 
 class TestIdentityConflicts(unittest.TestCase):
@@ -119,6 +145,20 @@ class TestIdentityConflicts(unittest.TestCase):
             find_identity_conflicts([
                 _entry("a", scope="team1", owns_dms=True),
                 _entry("b", scope="team2", owns_dms=False),
+            ]),
+            [],
+        )
+
+    def test_two_platforms_at_one_origin_are_not_one_account(self):
+        """User ids live in per-platform id spaces. A Rocket.Chat and a Mattermost
+        deployment reachable at one origin are separate authentication realms, and an id
+        — or a conventional username like `bot` at validation time — colliding across
+        them is a coincidence. Two connectors of different types can never be one
+        account, so this must not refuse them."""
+        self.assertEqual(
+            find_identity_conflicts([
+                _entry("rc", platform="rocketchat"),
+                _entry("mm", platform="mattermost", scope="team1"),
             ]),
             [],
         )
@@ -327,6 +367,7 @@ class TestTheRealConnectorsReportTheirIdentity(unittest.TestCase):
 
     def test_rocketchat_reports_the_login_id_under_a_canonical_origin(self):
         identity = self._rc("rc-user-1").bot_identity()
+        self.assertEqual(identity.platform, "rocketchat")
         self.assertEqual(identity.user_id, "rc-user-1")
         self.assertEqual(identity.origin, "https://chat.example.com")
         self.assertEqual(identity.scope, "", "Rocket.Chat has no team to scope by")
@@ -340,6 +381,7 @@ class TestTheRealConnectorsReportTheirIdentity(unittest.TestCase):
         two connectors on one team can spell it two ways and compare as different,
         breaking the one case the exception is meant to make safe."""
         identity = self._mm("mm-user-1", "team-id-abc").bot_identity()
+        self.assertEqual(identity.platform, "mattermost")
         self.assertEqual(identity.user_id, "mm-user-1")
         self.assertEqual(identity.scope, "team-id-abc")
         self.assertNotEqual(identity.scope, "eng", "must not be the configured name")
@@ -353,3 +395,185 @@ class TestTheRealConnectorsReportTheirIdentity(unittest.TestCase):
         this account", which is not an answer Mattermost is allowed to give."""
         with self.assertRaises(ConnectorIdentityError):
             self._mm("mm-user-1", "").bot_identity()
+
+
+class TestWhoOwnsTheDmStream(unittest.TestCase):
+    """Both watcher shapes reach a DM, and only one of them runs today.
+
+    `direct:`/`group_direct:` are rule fields, and rules have no runtime effect until
+    the watcher manager lands. A **static** watcher naming `@someone` is the form that
+    actually works now — so counting only rules guarded the case that cannot yet happen
+    and missed the one that can.
+    """
+
+    def _rule(self, connector, direct=False, group_direct=False):
+        from unittest.mock import MagicMock as M
+
+        return M(connector=connector, rooms=M(direct=direct, group_direct=group_direct))
+
+    def _watcher(self, connector, room):
+        from unittest.mock import MagicMock as M
+
+        return M(connector=connector, room=room)
+
+    def test_a_static_at_room_makes_its_connector_a_dm_owner(self):
+        self.assertEqual(
+            dm_owner_connectors([self._watcher("mm-eng", "@alice")], []), {"mm-eng"})
+
+    def test_a_static_channel_does_not(self):
+        self.assertEqual(
+            dm_owner_connectors([self._watcher("mm-eng", "incidents")], []), set())
+
+    def test_a_rule_opting_in_counts(self):
+        self.assertEqual(
+            dm_owner_connectors([], [self._rule("mm-eng", direct=True)]), {"mm-eng"})
+        self.assertEqual(
+            dm_owner_connectors([], [self._rule("mm-eng", group_direct=True)]),
+            {"mm-eng"},
+        )
+
+    def test_both_shapes_are_unioned(self):
+        owners = dm_owner_connectors(
+            [self._watcher("mm-sales", "@bob"), self._watcher("mm-eng", "general")],
+            [self._rule("mm-eng", direct=True)],
+        )
+        self.assertEqual(owners, {"mm-sales", "mm-eng"})
+
+
+class TestStaticDmWatchersReachTheCheck(unittest.TestCase):
+    """The wiring, not the helper: `GatewayService` must derive its DM owners this way.
+
+    Two Mattermost connectors on one account and different teams are allowed — except
+    when both handle DMs, because a DM channel is account-level and both would answer.
+    With static watchers being the only form that runs, this is the path that matters.
+    """
+
+    def _config(self, root, second_room):
+        import textwrap
+
+        path = root / "config.yaml"
+        path.write_text(textwrap.dedent(f"""
+            connectors:
+              - name: mm-eng
+                type: mattermost
+                server:
+                  url: https://mm.example.com
+                  team: eng
+                  username: acg-bot
+                  password: secret
+              - name: mm-sales
+                type: mattermost
+                server:
+                  url: https://mm.example.com
+                  team: sales
+                  username: acg-bot
+                  password: secret
+            agents:
+              default:
+                type: claude
+                working_directory: {root}
+            watchers:
+              - name: w1
+                connector: mm-eng
+                room: "@alice"
+              - name: w2
+                connector: mm-sales
+                room: "{second_room}"
+        """))
+        return path
+
+    def _service_dm_owners(self, second_room):
+        import tempfile
+        from pathlib import Path as P
+        from unittest.mock import patch
+
+        from gateway.config import GatewayConfig
+        from gateway.core import state as state_mod
+        from gateway.service import GatewayService
+
+        with tempfile.TemporaryDirectory() as d:
+            root = P(d)
+            cfg = GatewayConfig.from_file(str(self._config(root, second_room)))
+            with patch.object(state_mod, "RUNTIME_DIR", root / "runtime"):
+                service = GatewayService(cfg)
+            return service._dm_owner_connectors
+
+    def test_two_static_dm_watchers_make_both_connectors_owners(self):
+        self.assertEqual(self._service_dm_owners("@bob"), {"mm-eng", "mm-sales"})
+
+    def test_a_channel_watcher_leaves_its_connector_out(self):
+        """Otherwise the test above would pass against a set that always holds both."""
+        self.assertEqual(self._service_dm_owners("incidents"), {"mm-eng"})
+
+
+class TestInboundStartsAfterWatchersExist(unittest.IsolatedAsyncioTestCase):
+    """A connector that reads before its rooms are known loses those messages.
+
+    Mattermost's socket delivers every channel the account can see, and the handler
+    returns early for a channel with no state. Nothing replays them: the watermark
+    restore only covers channels that already exist. So "not subscribed yet" becomes
+    "permanently lost" — a window that already spanned each connector's own watcher
+    restore, and that the identity barrier widens by every other connector's login.
+    """
+
+    async def test_sync_only_starts_the_stream_after_restoring_watchers(self):
+        from unittest.mock import AsyncMock, MagicMock, call
+
+        from gateway.core.session_manager import SessionManager
+
+        sm = SessionManager.__new__(SessionManager)
+        order = MagicMock()
+        sm._connector = MagicMock()
+        sm._connector.start_inbound = AsyncMock(side_effect=lambda: order("inbound"))
+        sm._lifecycle = MagicMock()
+        sm._lifecycle.sync_watchers = AsyncMock(side_effect=lambda **kw: order("sync") or [])
+
+        await sm.sync_only()
+
+        self.assertEqual(order.call_args_list, [call("sync"), call("inbound")])
+
+    async def test_the_stream_starts_even_when_a_watcher_failed(self):
+        """Per-watcher failures are reported, not a reason to leave the connector deaf
+        for the rooms that did start."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from gateway.core.session_manager import SessionManager
+
+        sm = SessionManager.__new__(SessionManager)
+        sm._connector = MagicMock()
+        sm._connector.start_inbound = AsyncMock()
+        sm._lifecycle = MagicMock()
+        sm._lifecycle.sync_watchers = AsyncMock(return_value=["w1 failed"])
+
+        errors = await sm.sync_only()
+
+        self.assertEqual(errors, ["w1 failed"])
+        sm._connector.start_inbound.assert_awaited_once()
+
+    async def test_mattermost_connect_opens_the_socket_without_reading_it(self):
+        """Splitting at the listen loop, not at the socket: the socket being open is
+        what lets the client buffer arrivals during the wait instead of missing them."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from gateway.connectors.mattermost.connector import MattermostConnector
+
+        c = MattermostConnector.__new__(MattermostConnector)
+        c._rest = MagicMock(
+            authenticate=AsyncMock(), get_me=AsyncMock(), resolve_team=AsyncMock(),
+            bot_username="bot")
+        c._config = MagicMock(server_url="https://mm.example.com", team="eng")
+        c._ws = MagicMock(connect=AsyncMock(), start=AsyncMock())
+
+        await c.connect()
+        c._ws.connect.assert_awaited_once()
+        c._ws.start.assert_not_awaited()
+
+        await c.start_inbound()
+        c._ws.start.assert_awaited_once()
+
+    async def test_the_base_connector_has_nothing_to_defer(self):
+        """Rocket.Chat gates delivery per room, so it needs no carve-out — the default
+        must be a no-op rather than an abstract method every connector has to answer."""
+        from gateway.connectors.script.connector import ScriptConnector
+
+        await ScriptConnector().start_inbound()

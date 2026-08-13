@@ -536,6 +536,26 @@ class Connector(ABC):
         """
         return "direct"
 
+    async def start_inbound(self) -> None:
+        """Begin consuming inbound events. Called after watchers are restored.
+
+        Separate from `connect()` because authenticating and *receiving* are different
+        moments, and a connector that starts both at once drops everything arriving
+        before its rooms are known. Mattermost's socket delivers every channel the
+        account can see and its handler discards events for channels with no state yet,
+        so each such message is lost with no watermark to recover it from.
+
+        The gap is not new — it already spanned each connector's own watcher restore,
+        which creates sessions and fetches history — but the identity barrier widens it
+        by every other connector's login, and this closes both: the socket is open
+        during the wait, so the client library buffers what arrives, and the listen loop
+        starts once the channels those events belong to exist.
+
+        A no-op by default. A connector whose delivery is gated per room (Rocket.Chat
+        subscribes room by room) has nothing to defer.
+        """
+        return None
+
     def bot_identity(self) -> "BotIdentity | None":
         """Who this connector is authenticated as, or ``None`` if it has no account.
 
