@@ -127,6 +127,27 @@ MessageHandler = Callable[[IncomingMessage], Awaitable[bool]]
 CapacityCheck = Callable[[str], bool]  # (room_id: str) -> bool
 
 
+# Connector *types* whose transport delivers unsolicited inbound — the load-time
+# twin of `Connector.supports_unsolicited_inbound()` below, which is the
+# declaration; this is what the config loader can actually read.
+#
+# It has to be a set of type strings rather than a lookup through the connector
+# classes: enforcement happens in `gateway/config.py`, which only ever sees a
+# `ConnectorConfig` (a type string, no instance), and `gateway/connectors/` imports
+# `gateway.config`, so reading the classes from there would invert the dependency
+# and pull the whole websocket stack into `acg config validate`.
+#
+# Two declarations of one fact is the shape that has bitten this loader repeatedly,
+# so they are bound by a test that walks every type the connector factory knows and
+# asserts the set agrees with the class — rather than a comment asking the next
+# person to remember. Membership (not absence) is the test, so an unrecognised type
+# is restricted, matching the method's fail-closed default.
+TYPES_WITH_UNSOLICITED_INBOUND: frozenset[str] = frozenset({
+    "rocketchat",
+    "mattermost",
+})
+
+
 # ---------------------------------------------------------------------------
 # Connector ABC
 # ---------------------------------------------------------------------------
@@ -354,6 +375,29 @@ class Connector(ABC):
         Default: no-op.
         """
         pass
+
+    # ── Transport capability ──────────────────────────────────────────────────
+
+    def supports_unsolicited_inbound(self) -> bool:
+        """Return True if this transport delivers messages for rooms not asked for.
+
+        The single property design §2.6 derives idle eligibility, eager-versus-lazy
+        watcher creation and black-hole behaviour from, instead of branching per
+        connector. Mattermost receives every channel the bot belongs to on one
+        socket; Rocket.Chat can subscribe-all via ``__my_messages__``. Script's
+        messages arrive by direct injection that bypasses the connector, and Voice's
+        rooms arrive as HTTP path segments — neither has a stream to discover rooms
+        from.
+
+        Default: False. A connector that cannot discover rooms may only be given
+        rules naming **literal** rooms, enforced at config load (see
+        ``TYPES_WITH_UNSOLICITED_INBOUND``), so defaulting to False means a new
+        connector type is restricted until it declares otherwise. That direction is
+        deliberate: a pattern rule on a connector that cannot discover rooms fails
+        *silently* — the rule simply never materializes — while the restriction
+        applied wrongly fails *loudly*, at load, naming the field.
+        """
+        return False
 
     # ── Attachment support ────────────────────────────────────────────────────
 

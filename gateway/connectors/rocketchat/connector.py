@@ -554,6 +554,12 @@ class RocketChatConnector(Connector):
         parts.extend(f"@{u}" for u in other_agents)
         return "to: " + "+".join(parts)
 
+    def supports_unsolicited_inbound(self) -> bool:
+        """Yes — `stream-room-messages` with the reserved id `__my_messages__`
+        delivers messages for rooms this connector never per-room-subscribed to
+        (design §2.6, verified in §6.1)."""
+        return True
+
     def supports_history(self) -> bool:
         return True
 
