@@ -285,9 +285,11 @@ watchers:
   # name (optional):
   #   Only allowed when the entry has exactly one room. If omitted, the watcher name is
   #   auto-derived as "<connector>-<room>" (DM rooms like "@alice" become "<connector>-dm-alice").
-  #   Watcher names are persistent identifiers (state.json sessions, CLI pause/resume/reset,
-  #   attachment/system-prompt file paths) — set an explicit name on any watcher whose session
-  #   you want to survive editing the room list. See docs/migration-0.2.md.
+  #   Watcher names are persistent identifiers (state.json sessions, CLI pause/resume/reset)
+  #   — set an explicit name on any watcher whose session you want to survive editing the
+  #   room list. See docs/migration-0.2.md.
+  #   They are NO LONGER file paths: the system-prompt file and attachment workspace key on
+  #   a digest of (connector, room id), so renaming a watcher no longer orphans them.
   #
   # session_id: REMOVED — setting it is a config error.
   #   A watcher's session is created on first start and its ID persisted automatically;

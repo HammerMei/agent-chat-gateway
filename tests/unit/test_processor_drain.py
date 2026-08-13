@@ -388,7 +388,7 @@ class TestEnsureContextInjectedRetryOnMessage(unittest.IsolatedAsyncioTestCase):
 
             async def ensure_durable_instructions(
                 self, session_id, working_directory, timeout, content,
-                *, watcher_name, already_delivered,
+                *, path_key, already_delivered,
             ):
                 return await self._send_once_as_durable_fallback(
                     session_id, working_directory, timeout, content, already_delivered,
@@ -400,7 +400,7 @@ class TestEnsureContextInjectedRetryOnMessage(unittest.IsolatedAsyncioTestCase):
         # Simulate the failed startup attempt directly via ensure(), exactly
         # as WatcherLifecycle._start_watcher() would have on gateway boot.
         await injector.ensure(
-            ws, ws.session_id, agent, "/tmp", 10, watcher_name="w1", content="ctx",
+            ws, ws.session_id, agent, "/tmp", 10, watcher_name="w1", path_key='pk-test', content="ctx",
         )
         self.assertEqual(injector.status_for(ws.session_id).state, "failed_retryable")
         self.assertFalse(ws.context_injected)
@@ -445,7 +445,7 @@ class TestEnsureContextInjectedRetryOnMessage(unittest.IsolatedAsyncioTestCase):
 
             async def ensure_durable_instructions(
                 self, session_id, working_directory, timeout, content,
-                *, watcher_name, already_delivered,
+                *, path_key, already_delivered,
             ):
                 return await self._send_once_as_durable_fallback(
                     session_id, working_directory, timeout, content, already_delivered,
@@ -456,7 +456,7 @@ class TestEnsureContextInjectedRetryOnMessage(unittest.IsolatedAsyncioTestCase):
 
         for _ in range(_MAX_INJECT_ATTEMPTS):
             await injector.ensure(
-                ws, ws.session_id, agent, "/tmp", 10, watcher_name="w1", content="ctx",
+                ws, ws.session_id, agent, "/tmp", 10, watcher_name="w1", path_key='pk-test', content="ctx",
             )
         self.assertEqual(injector.status_for(ws.session_id).state, "failed_degraded")
         self.assertTrue(ws.context_injected)

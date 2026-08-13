@@ -1374,10 +1374,11 @@ def _parse_one_watcher_entry(
         if "/" in watcher_name:
             raise ValueError(
                 f"Watcher name '{watcher_name}' must not contain '/' — "
-                "watcher names are used as filesystem path components "
-                "(e.g. <working_directory>/.acg-attachments/<name>, "
-                "<RUNTIME_DIR>/system-prompts/<name>.md) "
-                "and a '/' could escape the intended directory."
+                "watcher names are identifiers, not paths: they key state.json "
+                "records and are the handle for 'pause'/'resume'/'reset'. "
+                "(They are no longer path components — those key on a digest of "
+                "the connector and room id instead, see gateway/core/paths.py — "
+                "but a '/' in an identifier is still a mistake worth refusing.)"
             )
         if watcher_name in seen_watcher_names or watcher_name in staged_names:
             origin = (

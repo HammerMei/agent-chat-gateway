@@ -29,6 +29,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     rejected at config-load time with a clear "not implemented yet" error —
     the rule-matching engine that would give it meaning hasn't landed yet.
 
+### Changed
+- **Per-room files no longer key on the watcher name.** The system-prompt file
+  (`<RUNTIME_DIR>/system-prompts/…`) and the attachment workspace
+  (`<working_directory>/.acg-attachments/…`) are now named by a digest of
+  `(connector, room id)` instead of the watcher's display name
+  (`docs/design/dynamic-watcher-design.md` §2.3). v0.5.1 documented watcher names as
+  "persistent identifiers (state.json sessions, CLI pause/resume/reset, attachment/
+  system-prompt file paths)"; the last of those is no longer true, and that is the point
+  — a rename used to orphan both artifacts, and a name collision could point one room's
+  attachment path at another room's files.
+
+  *On upgrade:* one prompt file and one symlink per existing room are orphaned once.
+  They are internal artifacts and harmless to delete; automatic reclamation belongs to
+  the watcher-expiry work. Watcher names remain persistent identifiers for state records
+  and for `pause`/`resume`/`reset`.
+
 ### Removed
 - **BREAKING: `watchers[].session_id` (sticky sessions).** Setting it is now a
   config error naming the replacement, rather than being silently ignored — every

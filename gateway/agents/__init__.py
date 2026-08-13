@@ -134,7 +134,7 @@ class AgentBackend(ABC):
         timeout: int,
         content: str,
         *,
-        watcher_name: str,
+        path_key: str,
         already_delivered: bool,
     ) -> str | None:
         """Make `content` durably visible to the model, by whatever mechanism this
@@ -155,6 +155,13 @@ class AgentBackend(ABC):
         avoid duplicating content into conversation history. Backends with no
         such side effect (returning a value for the caller to re-supply)
         should ignore it and always return fresh content.
+
+        `path_key`: the filesystem key for this room, from
+        `gateway.core.paths.room_path_key(connector, room_id)`. It replaced a
+        `watcher_name` parameter, and the rename is the point: a display name is free to
+        change (a channel rename, a group DM's membership changing, a better sanitizer),
+        and using it as a path component made every such change orphan a file. Backends
+        must not derive anything human-facing from it — it is opaque by design (§2.3).
 
         There is deliberately NO usable default here — every backend must
         make an explicit choice, visible in its own source, about how it

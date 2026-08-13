@@ -50,7 +50,7 @@ class TestEnsureDurableInstructionsHasNoDefault(unittest.IsolatedAsyncioTestCase
         with self.assertRaises(NotImplementedError):
             await backend.ensure_durable_instructions(
                 "ses_001", "/tmp", 10, "some content",
-                watcher_name="w1", already_delivered=False,
+                path_key="w1", already_delivered=False,
             )
 
     async def test_not_implemented_message_names_the_backend_class(self):
@@ -59,7 +59,7 @@ class TestEnsureDurableInstructionsHasNoDefault(unittest.IsolatedAsyncioTestCase
         with self.assertRaises(NotImplementedError) as ctx:
             await backend.ensure_durable_instructions(
                 "ses_001", "/tmp", 10, "some content",
-                watcher_name="w1", already_delivered=False,
+                path_key="w1", already_delivered=False,
             )
 
         self.assertIn("_RecordingBackend", str(ctx.exception))
@@ -72,7 +72,7 @@ class TestEnsureDurableInstructionsHasNoDefault(unittest.IsolatedAsyncioTestCase
         with self.assertRaises(NotImplementedError):
             await backend.ensure_durable_instructions(
                 "ses_001", "/tmp", 10, "some content",
-                watcher_name="w1", already_delivered=False,
+                path_key="w1", already_delivered=False,
             )
 
         self.assertEqual(len(backend.send_calls), 0)

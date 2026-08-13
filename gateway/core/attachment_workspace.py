@@ -8,8 +8,11 @@ permission prompts from Claude Code).
 
 Layout::
 
-    {working_directory}/.acg-attachments/{watcher_name}
+    {working_directory}/.acg-attachments/{path_key}
         → {global_cache}/{connector_name}/{room_id}/
+
+where path_key is a digest of (connector, room_id) — see gateway/core/paths.py for
+why the display name is not used here.
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ import logging
 from pathlib import Path
 
 from .connector import Attachment, Connector
+from .paths import resolve_under
 
 logger = logging.getLogger("agent-chat-gateway.core.attachment_workspace")
 
@@ -28,7 +32,7 @@ def localize_attachment_paths(
 ) -> list[str]:
     """Remap attachment paths through a per-watcher symlink directory.
 
-    If ``local_base`` is set (e.g. ``{cwd}/.acg-attachments/{watcher_name}``
+    If ``local_base`` is set (e.g. ``{cwd}/.acg-attachments/{path_key}``
     → global cache dir), each attachment's filename is resolved under the
     symlink so the agent sees a cwd-local path.  This avoids out-of-project
     permission prompts from Claude Code.
@@ -65,11 +69,18 @@ class AttachmentWorkspace:
 
     def setup(
         self,
-        watcher_name: str,
+        path_key: str,
         room_id: str,
         working_directory: str,
     ) -> str | None:
-        """Create or update a per-watcher symlink for cached attachments.
+        """Create or update a per-room symlink for cached attachments.
+
+        ``path_key`` is a digest of (connector, room_id) rather than the watcher's
+        display name. The name used to be this path component, which made it
+        load-bearing: renaming a room orphaned the old link, and a collision pointed one
+        room's attachment path at another room's files (§2.3). The cost is that a
+        directory listing no longer reads as room names, which `list` offsets by showing
+        both.
 
         Returns:
             Absolute path to the symlink directory (str) if the connector
@@ -82,7 +93,10 @@ class AttachmentWorkspace:
         acg_dir = Path(working_directory) / ".acg-attachments"
         acg_dir.mkdir(parents=True, exist_ok=True)
 
-        link = acg_dir / watcher_name
+        # Containment is checked on the link's *location*, never by resolving through
+        # it: this link points outside working_directory on purpose, at the global
+        # cache, so demanding that its target stay inside would always fail (§2.3).
+        link = resolve_under(acg_dir, path_key)
         cache_path = Path(cache_dir)
         cache_path.mkdir(parents=True, exist_ok=True)
 

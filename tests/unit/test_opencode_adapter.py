@@ -253,7 +253,7 @@ class TestEnsureDurableInstructions(unittest.IsolatedAsyncioTestCase):
             with patch("gateway.agents.opencode.adapter.RUNTIME_DIR", Path(tmp)):
                 path = await backend.ensure_durable_instructions(
                     "ses_001", "/unused", 10, "identity header content",
-                    watcher_name="w1", already_delivered=False,
+                    path_key="w1", already_delivered=False,
                 )
             self.assertEqual(path, str(Path(tmp) / "system-prompts" / "w1.md"))
 
@@ -267,7 +267,7 @@ class TestEnsureDurableInstructions(unittest.IsolatedAsyncioTestCase):
                 content = "## ACG Session Identity\nhello world"
                 path = await backend.ensure_durable_instructions(
                     "ses_001", "/unused", 10, content,
-                    watcher_name="w1", already_delivered=False,
+                    path_key="w1", already_delivered=False,
                 )
                 self.assertEqual(Path(path).read_text(), content)
 
@@ -282,7 +282,7 @@ class TestEnsureDurableInstructions(unittest.IsolatedAsyncioTestCase):
             with patch("gateway.agents.opencode.adapter.RUNTIME_DIR", Path(tmp)):
                 path = await backend.ensure_durable_instructions(
                     "ses_001", "/unused", 10, "content",
-                    watcher_name="w1", already_delivered=True,
+                    path_key="w1", already_delivered=True,
                 )
             self.assertIsNotNone(path)
 
@@ -296,11 +296,11 @@ class TestEnsureDurableInstructions(unittest.IsolatedAsyncioTestCase):
             with patch("gateway.agents.opencode.adapter.RUNTIME_DIR", Path(tmp)):
                 await backend.ensure_durable_instructions(
                     "ses_001", "/unused", 10, "old content",
-                    watcher_name="w1", already_delivered=False,
+                    path_key="w1", already_delivered=False,
                 )
                 path = await backend.ensure_durable_instructions(
                     "ses_001", "/unused", 10, "new content",
-                    watcher_name="w1", already_delivered=False,
+                    path_key="w1", already_delivered=False,
                 )
                 self.assertEqual(Path(path).read_text(), "new content")
 
@@ -313,11 +313,11 @@ class TestEnsureDurableInstructions(unittest.IsolatedAsyncioTestCase):
             with patch("gateway.agents.opencode.adapter.RUNTIME_DIR", Path(tmp)):
                 path_a = await backend.ensure_durable_instructions(
                     "ses_a", "/unused", 10, "content A",
-                    watcher_name="watcher-a", already_delivered=False,
+                    path_key="watcher-a", already_delivered=False,
                 )
                 path_b = await backend.ensure_durable_instructions(
                     "ses_b", "/unused", 10, "content B",
-                    watcher_name="watcher-b", already_delivered=False,
+                    path_key="watcher-b", already_delivered=False,
                 )
             self.assertNotEqual(path_a, path_b)
             self.assertEqual(Path(path_a).read_text(), "content A")

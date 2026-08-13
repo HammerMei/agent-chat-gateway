@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from gateway.core.paths import room_path_key
 from tests.helpers import IsolatedTestCase
 
 # ── Tests: path traversal check ──────────────────────────────────────────────
@@ -391,7 +392,7 @@ class TestAttachmentWarningPromptInjection(IsolatedTestCase):
                 return AgentResponse(text="mock reply")
 
             async def ensure_durable_instructions(self, session_id, working_directory,
-                                                    timeout, content, *, watcher_name,
+                                                    timeout, content, *, path_key,
                                                     already_delivered):
                 return await self._send_once_as_durable_fallback(
                     session_id, working_directory, timeout, content, already_delivered,
@@ -453,7 +454,7 @@ class TestAttachmentWarningPromptInjection(IsolatedTestCase):
                 return AgentResponse(text="mock reply")
 
             async def ensure_durable_instructions(self, session_id, working_directory,
-                                                    timeout, content, *, watcher_name,
+                                                    timeout, content, *, path_key,
                                                     already_delivered):
                 return await self._send_once_as_durable_fallback(
                     session_id, working_directory, timeout, content, already_delivered,
@@ -484,7 +485,13 @@ class TestAttachmentSymlink(IsolatedTestCase):
     """Issue #17: per-watcher symlinks for attachment paths inside agent cwd."""
 
     async def test_symlink_created_on_watcher_start(self):
-        """_start_watcher should create .acg-attachments/{watcher_name} symlink."""
+        """_start_watcher creates .acg-attachments/{path_key} — keyed on the room.
+
+        The component used to be the watcher's display name, which made that name
+        load-bearing: renaming a room orphaned the link, and a collision pointed one
+        room's attachment path at another's files (§2.3). Asserting the derived key is
+        what pins the new contract; asserting the name would pin the bug.
+        """
         from gateway.agents import AgentBackend
         from gateway.agents.response import AgentResponse
         from gateway.config import AgentConfig, WatcherConfig
@@ -505,7 +512,7 @@ class TestAttachmentSymlink(IsolatedTestCase):
                 return AgentResponse(text="ok")
 
             async def ensure_durable_instructions(self, session_id, working_directory,
-                                                    timeout, content, *, watcher_name,
+                                                    timeout, content, *, path_key,
                                                     already_delivered):
                 return await self._send_once_as_durable_fallback(
                     session_id, working_directory, timeout, content, already_delivered,
@@ -527,8 +534,14 @@ class TestAttachmentSymlink(IsolatedTestCase):
                                      watcher_configs=[wc])
             await manager.run_once()
 
-            link = Path(tmpdir) / ".acg-attachments" / "script"
+            link = (
+                Path(tmpdir) / ".acg-attachments" / room_path_key("script", "script")
+            )
             self.assertTrue(link.is_symlink(), f"Expected symlink at {link}")
+            self.assertFalse(
+                (Path(tmpdir) / ".acg-attachments" / "script").exists(),
+                "the display name must no longer be a path component",
+            )
             self.assertEqual(link.resolve(), cache_dir.resolve())
 
             await manager.shutdown()
@@ -555,7 +568,7 @@ class TestAttachmentSymlink(IsolatedTestCase):
                 return AgentResponse(text="ok")
 
             async def ensure_durable_instructions(self, session_id, working_directory,
-                                                    timeout, content, *, watcher_name,
+                                                    timeout, content, *, path_key,
                                                     already_delivered):
                 return await self._send_once_as_durable_fallback(
                     session_id, working_directory, timeout, content, already_delivered,
@@ -591,8 +604,15 @@ class TestAttachmentSymlink(IsolatedTestCase):
                                      watcher_configs=[wc1, wc2])
             await manager.run_once()
 
-            link_a = Path(tmpdir) / ".acg-attachments" / "watcher-a"
-            link_b = Path(tmpdir) / ".acg-attachments" / "watcher-b"
+            # Keyed per ROOM, not per watcher name — which is the distinction the
+            # re-key introduces: two watchers on one room would share a link, and the
+            # same watcher renamed keeps its own.
+            link_a = (
+                Path(tmpdir) / ".acg-attachments" / room_path_key("script", "room-a")
+            )
+            link_b = (
+                Path(tmpdir) / ".acg-attachments" / room_path_key("script", "room-b")
+            )
 
             self.assertTrue(link_a.is_symlink())
             self.assertTrue(link_b.is_symlink())
@@ -626,7 +646,7 @@ class TestAttachmentSymlink(IsolatedTestCase):
                 return AgentResponse(text="ok")
 
             async def ensure_durable_instructions(self, session_id, working_directory,
-                                                    timeout, content, *, watcher_name,
+                                                    timeout, content, *, path_key,
                                                     already_delivered):
                 return await self._send_once_as_durable_fallback(
                     session_id, working_directory, timeout, content, already_delivered,
@@ -673,7 +693,8 @@ class TestAttachmentSymlink(IsolatedTestCase):
 
             last_send = agent.sent_messages[-1]
             expected_local = str(
-                Path(tmpdir) / ".acg-attachments" / "script" / "fileXYZ_doc.pdf"
+                Path(tmpdir) / ".acg-attachments" / room_path_key("script", "script")
+                / "fileXYZ_doc.pdf"
             )
             self.assertIsNotNone(last_send["attachments"])
             self.assertIn(
@@ -718,7 +739,7 @@ class TestAttachmentSymlink(IsolatedTestCase):
                 return AgentResponse(text="ok")
 
             async def ensure_durable_instructions(self, session_id, working_directory,
-                                                    timeout, content, *, watcher_name,
+                                                    timeout, content, *, path_key,
                                                     already_delivered):
                 return await self._send_once_as_durable_fallback(
                     session_id, working_directory, timeout, content, already_delivered,
