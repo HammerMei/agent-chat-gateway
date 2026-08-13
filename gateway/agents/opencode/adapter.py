@@ -842,9 +842,12 @@ class OpenCodeBackend(AgentBackend):
         """
         acg_dir = RUNTIME_DIR / "system-prompts"
         await asyncio.to_thread(acg_dir.mkdir, parents=True, exist_ok=True)
-        # Named by the (connector, room_id) digest, not the display name — see the
-        # Claude adapter's implementation for why, and resolve_under for the
-        # containment check that comes with treating the key as external data (§2.3).
+        # Named by the caller-supplied ``path_key``, which is opaque here: it is scoped
+        # to the watcher in a room (watcher_prompt_key), NOT to the room alone, because
+        # two watchers may bind different agents to one room and a room-only key would
+        # make the second overwrite the first. Do not substitute room_path_key — that one
+        # is for the attachment workspace. resolve_under supplies the containment check
+        # that comes with treating the key as external data (§2.3).
         path = resolve_under(acg_dir, f"{path_key}.md")
         await asyncio.to_thread(_atomic_write_text, path, content)
         return str(path)
