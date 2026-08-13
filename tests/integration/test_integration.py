@@ -250,8 +250,14 @@ class TestBasicEcho(IsolatedTestCase):
         and still worth pinning: reuse must not call `create_session`, or a restart
         would silently start a fresh conversation.
         """
-        from gateway.core.state import WatcherState
+        from gateway.config import AgentConfig
+        from gateway.core.state import WatcherState, backend_identity
 
+        # The identity is part of what makes the id reusable (§2.4), so it is derived
+        # from the same AgentConfig `make_manager` builds rather than written as a
+        # literal — a literal would keep passing while silently describing a session
+        # that no longer resumes.
+        cfg = AgentConfig()
         persisted = [
             WatcherState(
                 watcher_name="script",
@@ -259,6 +265,7 @@ class TestBasicEcho(IsolatedTestCase):
                 room_id="script",
                 room_type="script",
                 context_injected=True,
+                backend_identity=backend_identity(cfg.type, cfg.working_directory),
             )
         ]
         connector = ScriptConnector()
@@ -1077,9 +1084,12 @@ class TestWatermarkPersistence(IsolatedTestCase):
         """On startup, last_processed_ts from persisted state is pushed into the connector."""
         from unittest.mock import patch
 
+        from gateway.config import AgentConfig
+        from gateway.core.state import backend_identity
         from gateway.state import WatcherState
 
         persisted_ts = "1234567890.000001"
+        cfg = AgentConfig()
         persisted = [
             WatcherState(
                 watcher_name="script",
@@ -1089,6 +1099,10 @@ class TestWatermarkPersistence(IsolatedTestCase):
                 context_injected=True,
                 paused=False,
                 last_processed_ts=persisted_ts,
+                # The watermark is restored either way, so this test passed while
+                # quietly exercising a *fresh* session — the one thing its scenario
+                # ("restart with persisted state") does not describe.
+                backend_identity=backend_identity(cfg.type, cfg.working_directory),
             )
         ]
 
