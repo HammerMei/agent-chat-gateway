@@ -282,9 +282,15 @@ class TestBackendSignaturePreflight(unittest.TestCase):
         with self.assertRaises(TypeError) as cm:
             check_backend_signatures({"posonly": _PositionalOnly()})
         msg = str(cm.exception)
-        self.assertIn("positional-only", msg)
+        self.assertIn("posonly", msg, "must name the offending backend")
+        self.assertIn("path_key", msg, "must name the offending parameter")
         self.assertIn("*, path_key, already_delivered", msg,
                       "must say what to change it to")
+        # Deliberately not asserting the interpreter's phrasing. The first version of
+        # this test looked for "positional-only" and CI failed on one runner alone:
+        # that CPython writes "positional only" without the hyphen. `bind`'s diagnosis
+        # is quoted into the message but its wording is not ours to depend on — assert
+        # the parameter name (stable) and the remedy (ours).
 
     def test_a_positional_or_keyword_path_key_is_accepted(self):
         """The permissive-but-callable case: not keyword-only, but the keyword call
