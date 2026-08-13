@@ -954,9 +954,6 @@ def _key_list(keys) -> str:
     return ", ".join(sorted(repr(str(k)) for k in keys))
 
 
-_MISSING = object()
-
-
 def _validated_optional_name(raw: object, where: str, field_name: str) -> str | None:
     """Check a `str | None` field whose value is an identity, not a message.
 
@@ -972,7 +969,7 @@ def _validated_optional_name(raw: object, where: str, field_name: str) -> str | 
     both mean the default. An empty string is not one of them: it cannot serve as an
     identity, and silently auto-naming is the failure this check exists to remove.
     """
-    if raw is _MISSING or raw is None:
+    if raw is _MISSING_FIELD or raw is None:
         return None
     if not isinstance(raw, str):
         raise ValueError(
@@ -1069,6 +1066,84 @@ def _parse_history_handoff(raw: object, where: str) -> HistoryHandoffConfig:
         fetch_count=values.get("fetch_count", _HH_DEFAULTS.fetch_count),
         verbatim_tail=values.get("verbatim_tail", _HH_DEFAULTS.verbatim_tail),
     )
+
+
+def _resolve_watcher_connector(
+    wc: Mapping,
+    where: str,
+    connectors: list[ConnectorConfig],
+    connector_names: set[str],
+) -> str:
+    """Resolve a watcher entry's or rule's `connector:` to a concrete name.
+
+    The type check must come BEFORE any truthiness test. An earlier review fixed
+    only the truthy half — a YAML list reaching a set-membership test and crashing
+    — and the `and` it used left the falsy half open: `connector: false`, `0`, or
+    `[]` skipped the check, then read as falsy and fell through to `connectors[0]`.
+    That is worse than the crash it was guarding, because it binds the watcher to
+    the wrong account *silently*, and the canonical multi-agent setup gives every
+    agent its own account.
+
+    `null` and an absent key are the two spellings of "no value here", and both
+    legitimately mean "use the default": `connector:` is permitted in a
+    `watcher_templates:` entry, so an explicit null is how an entry declines an
+    inherited one. Every other non-string is a mistake.
+
+    Shared by the static and rule parsers, which had byte-identical copies of this
+    differing only in the message prefix — the de-duplication the rule copy's
+    comment deferred until the static fix reached this branch.
+    """
+    raw_connector = wc.get("connector", _MISSING_FIELD)
+    if raw_connector is _MISSING_FIELD or raw_connector is None:
+        watcher_connector = ""
+    elif not isinstance(raw_connector, str):
+        raise ValueError(
+            f"{where}: 'connector' must be a string "
+            f"(got {type(raw_connector).__name__})."
+        )
+    else:
+        watcher_connector = raw_connector
+    if watcher_connector and watcher_connector not in connector_names:
+        raise ValueError(
+            f"{where} references unknown connector '{watcher_connector}'"
+        )
+    if not watcher_connector and not connectors:
+        # from_file() can never reach either parser with an empty `connectors`
+        # list (an earlier structural check already raised), and collect_config()
+        # guards against it too (its own "no connectors parsed successfully"
+        # branch returns before ever reaching the watcher loop) — but
+        # EditableConfig.expanded_watchers() calls the static parser directly, per
+        # raw watcher entry, against whatever partial `connectors`
+        # collect_config() returned, so an all-connectors-failed config CAN
+        # legitimately land here. Without this guard, `connectors[0].name` below
+        # raises an uncaught IndexError instead of the ValueError every caller's
+        # `except ValueError` expects.
+        raise ValueError(
+            f"{where} has no explicit 'connector' set and no connectors are "
+            "configured to default to."
+        )
+    return watcher_connector or connectors[0].name
+
+
+def _validated_watcher_agent(
+    wc: Mapping, where: str, agents: dict, default_agent: str
+) -> str:
+    """Resolve a watcher entry's or rule's `agent:`, defaulting to `default_agent`.
+
+    Same shape as the connector check above and shared for the same reason: a
+    truthy-but-non-string `agent` (e.g. a YAML list) reached `watcher_agent not in
+    agents` — a dict — unchecked, crashing with an uncaught TypeError instead of
+    the clean ValueError every caller expects.
+    """
+    watcher_agent = wc.get("agent", default_agent)
+    if not isinstance(watcher_agent, str):
+        raise ValueError(
+            f"{where}: 'agent' must be a string "
+            f"(got {type(watcher_agent).__name__})."
+        )
+    if watcher_agent not in agents:
+        raise ValueError(f"{where} references unknown agent '{watcher_agent}'")
+    return watcher_agent
 
 
 def _parse_one_watcher_entry(
@@ -1190,9 +1265,9 @@ def _parse_one_watcher_entry(
     # only the truthy half; see _validated_optional_name() for why the falsy
     # half was the worse of the two.
     where = f"Watcher entry at index {index}"
-    explicit_name = _validated_optional_name(wc.get("name", _MISSING), where, "name")
+    explicit_name = _validated_optional_name(wc.get("name", _MISSING_FIELD), where, "name")
     explicit_session_id = _validated_optional_name(
-        wc.get("session_id", _MISSING), where, "session_id"
+        wc.get("session_id", _MISSING_FIELD), where, "session_id"
     )
     if len(rooms_list) > 1:
         if explicit_name:
@@ -1209,65 +1284,10 @@ def _parse_one_watcher_entry(
                 "entries."
             )
 
-    # The type check must come BEFORE any truthiness test. An earlier review
-    # fixed only the truthy half of this — a YAML list reaching a set-membership
-    # test and crashing — and the `and` it used left the falsy half open:
-    # `connector: false`, `0`, or `[]` skipped the check, then read as falsy and
-    # fell through to `connectors[0]`. That is worse than the crash it was
-    # guarding, because it binds the watcher to the wrong account *silently*, and
-    # the canonical multi-agent setup gives every agent its own account.
-    #
-    # `null` and an absent key are the two spellings of "no value here", and both
-    # legitimately mean "use the default": `connector:` is permitted in a
-    # `watcher_templates:` entry, so an explicit null is how an entry declines an
-    # inherited one. Every other non-string is a mistake.
-    raw_connector = wc.get("connector", _MISSING)
-    if raw_connector is _MISSING or raw_connector is None:
-        watcher_connector = ""
-    elif not isinstance(raw_connector, str):
-        raise ValueError(
-            f"Watcher entry at index {index}: 'connector' must be a string "
-            f"(got {type(raw_connector).__name__})."
-        )
-    else:
-        watcher_connector = raw_connector
-    if watcher_connector and watcher_connector not in connector_names:
-        raise ValueError(
-            f"Watcher entry at index {index} references unknown connector "
-            f"'{watcher_connector}'"
-        )
-    if not watcher_connector and not connectors:
-        # from_file() can never reach this function with an empty
-        # `connectors` list (an earlier structural check already raised),
-        # and collect_config() guards against it too (its own "no connectors
-        # parsed successfully" branch returns before ever reaching the
-        # watcher loop) — but EditableConfig.expanded_watchers() calls this
-        # function directly, per raw watcher entry, against whatever partial
-        # `connectors` collect_config() returned, so an all-connectors-failed
-        # config CAN legitimately land here. Without this guard,
-        # `connectors[0].name` below raises an uncaught IndexError instead
-        # of the ValueError every caller's `except ValueError` expects.
-        raise ValueError(
-            f"Watcher entry at index {index} has no explicit 'connector' set "
-            "and no connectors are configured to default to."
-        )
-    resolved_connector = watcher_connector or connectors[0].name
-
-    watcher_agent = wc.get("agent", default_agent)
-    if not isinstance(watcher_agent, str):
-        # PR review finding: same class of bug as 'connector' above — a
-        # truthy-but-non-string 'agent' (e.g. a YAML list) reached
-        # `watcher_agent not in agents` (a dict) unchecked, crashing with
-        # an uncaught TypeError instead of a clean ValueError.
-        raise ValueError(
-            f"Watcher entry at index {index}: 'agent' must be a string "
-            f"(got {type(watcher_agent).__name__})."
-        )
-    if watcher_agent not in agents:
-        raise ValueError(
-            f"Watcher entry at index {index} references unknown agent "
-            f"'{watcher_agent}'"
-        )
+    resolved_connector = _resolve_watcher_connector(
+        wc, where, connectors, connector_names
+    )
+    watcher_agent = _validated_watcher_agent(wc, where, agents, default_agent)
 
     # Resolve watcher-level context_inject_files (shared across expanded rooms)
     raw_ctx = wc.get("context_inject_files", [])
@@ -1465,100 +1485,6 @@ WATCHER_RULE_KEYS: frozenset[str] = frozenset({
 })
 
 
-def _key_list(keys) -> str:
-    """Format a key set for an error message.
-
-    Stringifies before sorting because YAML keys need not be strings: `1: value`
-    on a rule would otherwise make `sorted()` compare int with str, or
-    `", ".join()` receive an int — raising TypeError out of the *error path* and
-    escaping collect_config()'s `except ValueError`, so a malformed entry would
-    abort the whole validation pass instead of being reported.
-    """
-    return ", ".join(sorted(str(k) for k in keys))
-
-
-def _validated_notification(raw: object, index: int, field_name: str) -> str | None:
-    """Check a notification field against its declared `str | None` contract.
-
-    Copied unchecked, a YAML boolean or number reaches the platform REST client's
-    message field much later, where the send fails and is only logged as a
-    warning — so the operator's status message silently never appears. An
-    actionable load error is the whole point of checking it here.
-    """
-    if raw is None:
-        return None
-    if not isinstance(raw, str):
-        raise ValueError(
-            f"Watcher rule at index {index}: '{field_name}' must be a string or "
-            f"null (got {type(raw).__name__})."
-        )
-    return raw
-
-
-_HH_FIELD_TYPES: dict[str, type] = {
-    "enabled": bool,
-    "fetch_count": int,
-    "verbatim_tail": int,
-}
-
-
-def _parse_history_handoff(raw: object, index: int) -> HistoryHandoffConfig:
-    """Validate a `history_handoff:` block, keys and values.
-
-    Validating only the outer mapping was not enough, and the gap had the same
-    shape as the bug it replaced: `history_handoff: {enable: false}` -- one letter
-    short -- was silently ignored, leaving handoff **enabled**, which is the exact
-    inversion that `history_handoff: false` used to produce. Since `enabled`
-    defaults to True, every typo in this block fails in the direction the operator
-    did not want.
-
-    Types are enforced too: `enabled: "false"` is a truthy string, and a negative
-    or non-integer count would reach lifecycle code unchallenged.
-    """
-    if raw is None:
-        raw = {}
-    if not isinstance(raw, Mapping):
-        raise ValueError(
-            f"Watcher rule at index {index}: 'history_handoff' must be a mapping "
-            f"(got {type(raw).__name__}). To turn it off, set "
-            "'history_handoff: {enabled: false}'."
-        )
-    unknown = set(raw) - set(_HH_FIELD_TYPES)
-    if unknown:
-        raise ValueError(
-            f"Watcher rule at index {index}: unknown key(s) in 'history_handoff': "
-            f"{_key_list(unknown)}. Valid keys are {_key_list(_HH_FIELD_TYPES)}."
-        )
-    values: dict[str, object] = {}
-    for key, want in _HH_FIELD_TYPES.items():
-        if key not in raw:
-            continue
-        value = raw[key]
-        # bool is a subclass of int, so an int field must reject it explicitly and
-        # a bool field must not accept 0/1.
-        if want is bool and not isinstance(value, bool):
-            raise ValueError(
-                f"Watcher rule at index {index}: 'history_handoff.{key}' must be "
-                f"true or false (got {type(value).__name__})."
-            )
-        if want is int and (isinstance(value, bool) or not isinstance(value, int)):
-            raise ValueError(
-                f"Watcher rule at index {index}: 'history_handoff.{key}' must be "
-                f"an integer (got {type(value).__name__})."
-            )
-        if want is int and value < 0:
-            raise ValueError(
-                f"Watcher rule at index {index}: 'history_handoff.{key}' must not "
-                f"be negative (got {value})."
-            )
-        values[key] = value
-    return HistoryHandoffConfig(
-        enabled=values.get("enabled", _HH_DEFAULTS.enabled),
-        fetch_count=values.get("fetch_count", _HH_DEFAULTS.fetch_count),
-        verbatim_tail=values.get("verbatim_tail", _HH_DEFAULTS.verbatim_tail),
-    )
-
-
 def _parse_one_watcher_rule(
     entry: object,
     index: int,
@@ -1590,6 +1516,10 @@ def _parse_one_watcher_rule(
         entry, templates, "watcher_templates", f"Watcher rule at index {index}",
         "watcher",
     )
+    # Passed to the helpers this parser shares with the static one, which take the
+    # message prefix rather than an index so there is one implementation of each
+    # check instead of a rule-shaped copy beside a static-shaped one.
+    where = f"Watcher rule at index {index}"
 
     # ── name: the RULE's identity, required and unique ──────────────────────
     # Required, unlike the static shape where it could be derived from the room.
@@ -1692,50 +1622,10 @@ def _parse_one_watcher_rule(
                 "later rule sees it."
             )
 
-    # Type-check before any truthiness test, or falsy non-strings
-    # (`connector: false`, `0`, `[]`) skip the check, read as falsy, and fall
-    # through to connectors[0] — silently binding the rule to the wrong account.
-    # `null` and an absent key both legitimately mean "use the default", since
-    # `connector:` is permitted in a `watcher_templates:` entry and an explicit
-    # null is how an entry declines an inherited one.
-    #
-    # The static parser has the same two value checks; they are fixed separately
-    # there (that copy is reachable in a released version, this one is not yet).
-    # De-duplicating them is deliberately left until that fix reaches this branch,
-    # rather than entangling the two changes.
-    raw_connector = wc.get("connector", _MISSING_FIELD)
-    if raw_connector is _MISSING_FIELD or raw_connector is None:
-        watcher_connector = ""
-    elif not isinstance(raw_connector, str):
-        raise ValueError(
-            f"Watcher rule at index {index}: 'connector' must be a string "
-            f"(got {type(raw_connector).__name__})."
-        )
-    else:
-        watcher_connector = raw_connector
-    if watcher_connector and watcher_connector not in connector_names:
-        raise ValueError(
-            f"Watcher rule at index {index} references unknown connector "
-            f"'{watcher_connector}'"
-        )
-    if not watcher_connector and not connectors:
-        raise ValueError(
-            f"Watcher rule at index {index} has no explicit 'connector' set "
-            "and no connectors are configured to default to."
-        )
-    resolved_connector = watcher_connector or connectors[0].name
-
-    watcher_agent = wc.get("agent", default_agent)
-    if not isinstance(watcher_agent, str):
-        raise ValueError(
-            f"Watcher rule at index {index}: 'agent' must be a string "
-            f"(got {type(watcher_agent).__name__})."
-        )
-    if watcher_agent not in agents:
-        raise ValueError(
-            f"Watcher rule at index {index} references unknown agent "
-            f"'{watcher_agent}'"
-        )
+    resolved_connector = _resolve_watcher_connector(
+        wc, where, connectors, connector_names
+    )
+    watcher_agent = _validated_watcher_agent(wc, where, agents, default_agent)
 
     idle_days = _parse_rule_ttl(wc, index, "session_idle_days")
     expire_days = _parse_rule_ttl(wc, index, "session_expire_days")
@@ -1746,7 +1636,7 @@ def _parse_one_watcher_rule(
             f"'session_expire_days' ({expire_days})."
         )
 
-    history_handoff = _parse_history_handoff(wc.get("history_handoff"), index)
+    history_handoff = _parse_history_handoff(wc.get("history_handoff"), where)
 
     # Construct fully BEFORE registering the name. The static parser stages names
     # for exactly this reason, with a comment explaining it, and that lesson was
@@ -1771,10 +1661,10 @@ def _parse_one_watcher_rule(
             f"Watcher rule at index {index}: 'context_inject_files'",
         ),
         online_notification=_validated_notification(
-            wc.get("online_notification"), index, "online_notification"
+            wc.get("online_notification"), where, "online_notification"
         ),
         offline_notification=_validated_notification(
-            wc.get("offline_notification"), index, "offline_notification"
+            wc.get("offline_notification"), where, "offline_notification"
         ),
         history_handoff=history_handoff,
     )
