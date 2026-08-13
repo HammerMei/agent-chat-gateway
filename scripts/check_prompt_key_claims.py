@@ -22,6 +22,13 @@ by hand after touching either key.
     uv run python scripts/check_prompt_key_claims.py
 
 Exits non-zero if anything is suspect, so it can be dropped into a pre-push hook.
+
+**It is a helper, not a proof.** A heuristic over prose is either leaky or noisy: the
+first version required "prompt" or "durable" in the window and missed a five-line error
+message; widening it then flagged eight passages of which five were correct uses of
+`room_path_key`. The durable fix is not a better detector — it is stating the rule **once**
+in `gateway/core/paths.py` and having code comments point there instead of restating it.
+This script covers only the user-facing texts that must carry the rule themselves.
 """
 
 from __future__ import annotations
@@ -40,26 +47,86 @@ MENTIONS = ("path_key", "system-prompt", "acg-attachments", "room_path_key",
 HISTORICAL = ("docs/migration-0.2.md", "docs/migration-0.3.md",
               "docs/design/dynamic-watcher-design.md")
 
-WINDOW = 3  # lines either side — a claim and its subject are rarely further apart
+# Lines either side. Was 3, which was too narrow for a multi-line error message: the
+# claim in config.py's watcher-name error spans five lines, so its subject and its
+# assertion never landed in one window. A window is a guess about how far apart the two
+# halves of a claim sit, and guessing small is how a detector reports clean.
+WINDOW = 6
 
 
-def is_suspect(window: str) -> bool:
-    """True if this passage says the prompt file keys on the room alone."""
-    about_prompt = "system-prompt" in window or "durable" in window
-    room_only = bool(re.search(r"connector,?\s*room[ _]id", window, re.I)) or \
+# Three claims that are false after `impl/path-rekey`, each phrased many ways. The
+# detector looks for what a passage *asserts*, not for wording — but "what it asserts"
+# still has to be described, and the first version described only one of the three:
+# it required the window to mention "prompt" or "durable", so a passage saying
+# "those key on a digest of the connector and room id" (in config.py's name error) went
+# unseen. Claiming phrasing-independence while depending on two nouns is the same mistake
+# one level up, so the claims are enumerated here instead.
+
+
+def _room_only_key(window: str) -> bool:
+    """Says the key is (connector, room_id), with no mention of watcher scope."""
+    room_only = bool(re.search(r"connector,?\s*(and\s+)?room[ _]id", window, re.I)) or \
         "room_path_key" in window
     watcher_aware = any(
         marker in window
-        for marker in ("watcher_prompt_key", "watcher name", "watcher in a room",
-                       "watcher-in-a-room", "watcher-scoped")
+        for marker in ("watcher_prompt_key", "watcher name", "watcher names",
+                       "watcher in a room", "watcher-in-a-room", "watcher-scoped")
     )
-    return about_prompt and room_only and not watcher_aware
+    return room_only and not watcher_aware
+
+
+def _about_prompt(window: str) -> bool:
+    return "system-prompt" in window or "durable" in window or "prompt file" in window
+
+
+def _about_either_path(window: str) -> bool:
+    return _about_prompt(window) or "acg-attachments" in window or \
+        "attachment cache" in window or "path component" in window
+
+
+def _claims_name_keys_paths(window: str) -> bool:
+    """Says a watcher name keys these paths, without saying that it no longer does."""
+    asserts_name = bool(re.search(
+        r"watcher name[s]?\b[^.]{0,120}?(key|path component|file path|orphan)",
+        window, re.I,
+    ))
+    disclaims = bool(re.search(r"no longer|not\s+path|never the display name|used to",
+                               window, re.I))
+    return asserts_name and not disclaims
+
+
+def is_suspect(window: str) -> bool:
+    """True if this passage asserts something the re-key made false.
+
+    Either of two claims:
+
+    * the **prompt file** keys on the room alone — it keys on
+      `watcher_prompt_key(connector, room_id, watcher_name)`;
+    * a **watcher name** keys either path — neither is named after it any more, though
+      the name is still one input to the prompt digest.
+
+    A passage that mentions the room-only key while talking about *either* artifact is
+    suspect too, because the attachment workspace is the only one that is room-scoped and
+    a passage covering both cannot be right with one key.
+    """
+    if _claims_name_keys_paths(window) and _about_either_path(window):
+        return True
+    if _about_prompt(window) and _room_only_key(window):
+        return True
+    # "those paths key on (connector, room id)" while discussing path components at all:
+    # true of the attachment link, false of the prompt file, so a passage that does not
+    # distinguish them is wrong about one of the two.
+    return "path component" in window and _room_only_key(window)
 
 
 def main() -> int:
+    # User-facing surfaces only. Code comments are kept correct by a different means —
+    # they point at gateway/core/paths.py instead of restating which key belongs where —
+    # because a heuristic over prose cannot be both quiet and complete, and tuning it was
+    # oscillating between missing real claims and flagging correct uses of
+    # `room_path_key`. Removing the restatements is the actual fix; this only guards the
+    # texts that must state the rule because their readers will not open the source.
     files = [
-        *REPO.joinpath("gateway").rglob("*.py"),
-        *REPO.joinpath("tests").rglob("*.py"),
         *REPO.joinpath("docs").rglob("*.md"),
         REPO / "CHANGELOG.md",
         REPO / "config.example.yaml",

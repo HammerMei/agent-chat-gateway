@@ -18,6 +18,7 @@ why the display name is not used here.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 from .connector import Attachment, Connector
@@ -55,13 +56,21 @@ def localize_attachment_paths(
 
 
 class AttachmentWorkspace:
-    """Manages per-watcher attachment symlinks inside agent working directories.
+    """Manages per-room attachment symlinks inside agent working directories.
 
     Usage::
 
+        from gateway.core.paths import room_path_key
+
         workspace = AttachmentWorkspace(connector)
-        local_base = workspace.setup(watcher_name, room_id, working_directory)
+        local_base = workspace.setup(
+            room_path_key(connector_name, room_id), room_id, working_directory
+        )
         # local_base is either a str path or None if attachments are unsupported
+
+    The example passes the key explicitly because passing a watcher name instead would
+    *work* — it satisfies `resolve_under` — and silently restore per-watcher links, so the
+    misuse produces no error. See gateway/core/paths.py for which key belongs where.
     """
 
     def __init__(self, connector: Connector) -> None:
@@ -75,12 +84,13 @@ class AttachmentWorkspace:
     ) -> str | None:
         """Create or update a per-room symlink for cached attachments.
 
-        ``path_key`` is a digest of (connector, room_id) rather than the watcher's
-        display name. The name used to be this path component, which made it
-        load-bearing: renaming a room orphaned the old link, and a collision pointed one
-        room's attachment path at another room's files (§2.3). The cost is that a
-        directory listing no longer reads as room names, which `list` offsets by showing
-        both.
+        ``path_key`` identifies the ROOM — pass `room_path_key(...)`. The watcher's
+        display name used to be this path component, which made it load-bearing: renaming
+        a room orphaned the old link, and a collision pointed one room's attachment path
+        at another room's files (§2.3). Which key belongs to which artifact is documented
+        once, in gateway/core/paths.py; this docstring deliberately does not restate it.
+        The cost is that a directory listing no longer reads as room names, which `list`
+        offsets by showing both.
 
         Returns:
             Absolute path to the symlink directory (str) if the connector
@@ -107,57 +117,63 @@ class AttachmentWorkspace:
 
     @staticmethod
     def _ensure_link(link: Path, cache_path: Path) -> bool:
-        """Make `link` a symlink to `cache_path`, tolerating a concurrent writer.
+        """Point `link` at `cache_path`, atomically, tolerating a concurrent writer.
 
-        One operation rather than three independent branches, because the room-keyed link
-        is *shared* by a room's watchers and the lifecycle locks are per watcher. Every
-        step here is a check followed by an act, and another thread can intervene between
-        them:
+        The room-keyed link is *shared* by a room's watchers while the lifecycle locks are
+        per watcher, so another thread can act between any check and the act that follows
+        it. Three ways that bites, and the third is why this uses a rename:
 
         * both observe it absent, and one `symlink_to` loses;
-        * both observe a stale target, and one `unlink` loses (`FileNotFoundError`) or one
-          `symlink_to` loses (`FileExistsError`).
+        * both observe a stale target, and one `unlink` loses;
+        * one observes a stale target, **pauses**, the other replaces the link and starts
+          its watcher — and the paused thread then unlinks a link that is now correct.
+          The second watcher can localize an attachment during that gap and fall back to
+          the out-of-project cache path, which is what triggers the permission prompts
+          this symlink exists to avoid.
 
-        The first version of this fix handled only the absent case — patching the branch
-        that was reported and leaving its twin, which is the mistake this file is now
-        arranged to prevent. So the whole sequence retries once and then judges by the
-        end state: what matters is that the link points at `cache_path` when this returns,
-        not which thread put it there.
-
-        Returns False (without raising) only for the one case that is not a race: a real
-        file or directory occupying the path, which is an operator problem rather than a
-        concurrent writer.
+        No amount of exception handling fixes the third: nothing raises. The window is
+        what has to go, so the replacement is a `symlink` to a temporary name followed by
+        `os.replace`, which swaps it in atomically — there is never a moment with no link.
+        An earlier version of this method unlinked and re-created, which is exactly that
+        window.
         """
+        target = str(cache_path)
         for _ in range(2):
             if link.is_symlink():
-                if link.resolve() == cache_path.resolve():
+                if os.readlink(link) == target or link.resolve() == cache_path.resolve():
                     return True
-                try:
-                    link.unlink()
-                except FileNotFoundError:
-                    # Another thread removed it first; re-evaluate rather than assume.
-                    continue
-                logger.info("Repointing attachment symlink: %s → %s", link, cache_path)
             elif link.exists():
                 logger.warning(
                     "Attachment path %s exists but is not a symlink — skipping", link
                 )
                 return False
-            try:
-                link.symlink_to(cache_path)
-                logger.info("Created attachment symlink: %s → %s", link, cache_path)
-                return True
-            except FileExistsError:
-                # Someone created it between the check and here. If it is already what
-                # this call wanted, that is success; otherwise loop to re-evaluate.
-                if link.is_symlink() and link.resolve() == cache_path.resolve():
-                    logger.debug(
-                        "Attachment symlink %s created concurrently — reusing it", link
-                    )
-                    return True
 
-        # Judged by the end state after the bounded retry: a third writer would have to
-        # be actively fighting for this path, and reporting the truth beats looping.
+            # Unique per attempt and per process so two writers never collide on the
+            # temporary name itself.
+            tmp = link.with_name(f".{link.name}.{os.getpid()}.{id(link):x}.tmp")
+            try:
+                tmp.symlink_to(cache_path)
+            except FileExistsError:
+                tmp.unlink(missing_ok=True)
+                tmp.symlink_to(cache_path)
+            try:
+                # Atomic on POSIX when both paths are in one directory: the link either
+                # points at the old target or the new one, never at nothing.
+                os.replace(tmp, link)
+            except OSError as e:
+                tmp.unlink(missing_ok=True)
+                # A directory in the way is the one non-race case; report it as such
+                # rather than retrying.
+                if link.exists() and not link.is_symlink():
+                    logger.warning(
+                        "Attachment path %s exists but is not a symlink — skipping", link
+                    )
+                    return False
+                logger.debug("Attachment symlink swap for %s failed (%s) — retrying", link, e)
+                continue
+            logger.info("Attachment symlink ready: %s → %s", link, cache_path)
+            return True
+
         ok = link.is_symlink() and link.resolve() == cache_path.resolve()
         if not ok:
             logger.warning(
@@ -165,4 +181,3 @@ class AttachmentWorkspace:
                 link, cache_path,
             )
         return ok
-

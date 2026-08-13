@@ -201,6 +201,51 @@ class TestAttachmentWorkspaceSetup(unittest.TestCase):
         self.assertIsNone(workspace.setup("ROOMKEY", "room1", str(self.work)))
         self.assertFalse((self.work / ".acg-attachments").exists())
 
+    def test_the_link_is_never_absent_while_being_repointed(self):
+        """The window, not the exception.
+
+        A thread that observed a stale target, paused, and resumed after another thread
+        had already repointed the link would `unlink` a *correct* link and re-create it.
+        Nothing raises; there is simply a moment with no link, and the other watcher can
+        localize an attachment in it — falling back to the out-of-project cache path,
+        which is what triggers the permission prompts this symlink exists to avoid.
+
+        Asserted as a property rather than by timing: `unlink` must not be reached on this
+        path at all. `os.replace` swaps the link atomically instead, so the window cannot
+        exist regardless of interleaving.
+        """
+        acg = self.work / ".acg-attachments"
+        acg.mkdir()
+        stale = self.tmp / "old-cache"
+        stale.mkdir()
+        (acg / "ROOMKEY").symlink_to(stale)
+
+        real_unlink = Path.unlink
+        unlinked: list[str] = []
+
+        def recording_unlink(self, *a, **kw):  # noqa: ANN001 - patched method
+            unlinked.append(self.name)
+            return real_unlink(self, *a, **kw)
+
+        with patch.object(Path, "unlink", recording_unlink):
+            got = self.workspace.setup("ROOMKEY", "room1", str(self.work))
+
+        self.assertEqual(got, str(acg / "ROOMKEY"))
+        self.assertEqual((acg / "ROOMKEY").resolve(), self.cache.resolve())
+        self.assertNotIn(
+            "ROOMKEY", unlinked,
+            "the live link was unlinked before being re-created, which leaves a window "
+            f"where it does not exist (unlinked: {unlinked})",
+        )
+
+    def test_the_swap_leaves_no_temporary_behind(self):
+        """A rename-based swap that failed to clean up would litter the user's project
+        directory, which is what `.acg-attachments` lives in."""
+        self.workspace.setup("ROOMKEY", "room1", str(self.work))
+        acg = self.work / ".acg-attachments"
+        leftovers = [p.name for p in acg.iterdir() if p.name != "ROOMKEY"]
+        self.assertEqual(leftovers, [], f"temporary files left behind: {leftovers}")
+
     def test_a_hostile_key_cannot_escape_the_workspace(self):
         """`resolve_under` is what stands between an unexpected key and the filesystem."""
         for key in ("../escape", "/abs", "..", "a/b"):

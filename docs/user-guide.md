@@ -497,14 +497,17 @@ watchers:
 single-item `rooms:`) — it pins a specific watcher's identity, which is ambiguous
 across an expanded multi-room entry.
 
-> ⚠️ **Watcher names are persistent identifiers** — they key session state
-> in `state.<connector>.json`, attachment cache directories, and injected
-> system-prompt files, and they're what you type into
-> `agent-chat-gateway pause|resume|reset`. Renaming a watcher (including by
-> switching it from an explicit `name:` to auto-generated `rooms:`) starts a
-> fresh session under the new name and orphans the old one. See
-> `docs/migration-0.2.md` for the safe way to rename a watcher that already
-> has state you care about.
+> ⚠️ **Watcher names are persistent identifiers** — they key session state in
+> `state.<connector>.json` and they're what you type into
+> `agent-chat-gateway pause|resume|reset`. Renaming a watcher (including by switching it
+> from an explicit `name:` to auto-generated `rooms:`) starts a fresh session under the
+> new name and orphans the old one. See `docs/migration-0.2.md` for the safe way to
+> rename a watcher that already has state you care about.
+>
+> Names no longer name the per-room files directly. The attachment cache directory is
+> keyed on the room, so renaming a watcher does not disturb it; the injected
+> system-prompt file is keyed on the watcher *within* its room, so a rename leaves the
+> old file behind — internal, and safe to delete.
 
 **Watcher Fields:**
 

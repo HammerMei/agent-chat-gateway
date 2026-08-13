@@ -1376,9 +1376,9 @@ def _parse_one_watcher_entry(
                 f"Watcher name '{watcher_name}' must not contain '/' — "
                 "watcher names are identifiers, not paths: they key state.json "
                 "records and are the handle for 'pause'/'resume'/'reset'. "
-                "(They are no longer path components — those key on a digest of "
-                "the connector and room id instead, see gateway/core/paths.py — "
-                "but a '/' in an identifier is still a mistake worth refusing.)"
+                "(They are no longer used as path components directly; how per-room "
+                "files are named is documented in gateway/core/paths.py. A '/' in an "
+                "identifier is still a mistake worth refusing.)"
             )
         if watcher_name in seen_watcher_names or watcher_name in staged_names:
             origin = (
