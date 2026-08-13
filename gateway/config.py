@@ -25,7 +25,7 @@ happens to resemble a placeholder is never silently misinterpreted.
 import logging
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -41,6 +41,8 @@ from .core.config import (  # noqa: F401 — re-exports
     ToolRule,
     WatcherConfig,
 )
+from .core.room_pattern import InvalidRoomPattern, RoomPattern, union_subsumes
+from .core.watcher_rule import RoomMatcher, WatcherRule
 
 # v0.2's global `*_defaults:` blocks (removed in v0.3 — see docs/migration-0.3.md) merged
 # flatly and unconditionally into EVERY entry of a kind, regardless of type: setting
@@ -1177,6 +1179,315 @@ def _parse_one_watcher_entry(
         )
     seen_watcher_names.update(staged_names)
     return result
+
+
+def entry_is_watcher_rule(entry: object) -> bool:
+    """Whether a raw `watchers:` entry uses the rule shape rather than the
+    static one.
+
+    The discriminator is the *type* of `rooms:`, which makes the two shapes
+    unambiguous rather than merely different: a mapping is a rule
+    (`rooms: {include: [...]}`), a list is the old multi-room shorthand
+    (`rooms: [a, b]`). `room:` is static-only. Neither shape can be mistaken for
+    the other, so no heuristics and no config flag are needed to decide which
+    parser an entry belongs to.
+    """
+    return isinstance(entry, Mapping) and isinstance(entry.get("rooms"), Mapping)
+
+
+def _parse_pattern_list(
+    raw: object, index: int, field_name: str
+) -> tuple[RoomPattern, ...]:
+    """Validate and compile one glob list from a rule's `rooms:` block.
+
+    Patterns are compiled here, at load, so an invalid pattern can never surface
+    on the message-delivery path where no operator is present to fix it (§2.1).
+    """
+    if raw is None:
+        return ()
+    if isinstance(raw, str) or not isinstance(raw, Sequence):
+        raise ValueError(
+            f"Watcher rule at index {index}: 'rooms.{field_name}' must be a list "
+            f"of patterns (got {type(raw).__name__})."
+        )
+    out: list[RoomPattern] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, str) or not item:
+            raise ValueError(
+                f"Watcher rule at index {index}: 'rooms.{field_name}' entries "
+                "must be non-empty strings."
+            )
+        if item in seen:
+            raise ValueError(
+                f"Watcher rule at index {index}: 'rooms.{field_name}' contains "
+                f"duplicate pattern '{item}'."
+            )
+        seen.add(item)
+        try:
+            out.append(RoomPattern(item))
+        except InvalidRoomPattern as e:
+            raise ValueError(
+                f"Watcher rule at index {index}: 'rooms.{field_name}' pattern "
+                f"'{item}' is not valid: {e}"
+            ) from e
+    return tuple(out)
+
+
+def _parse_dm_flag(rooms_raw: Mapping, index: int, field_name: str) -> bool:
+    """Read `rooms.direct` / `rooms.group_direct`.
+
+    Only the boolean form is accepted. §2.7 reserves the object form
+    (`direct: {include: [...], exclude: [...]}`) for when per-DM control is
+    genuinely needed, and the JSON schema leaves room for it so that adding it
+    later is additive. Until then a mapping here is rejected explicitly rather
+    than being silently truthy — which is exactly how `direct: {}` would
+    otherwise read as "DMs enabled".
+    """
+    value = rooms_raw.get(field_name, False)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, Mapping):
+        raise ValueError(
+            f"Watcher rule at index {index}: 'rooms.{field_name}' does not yet "
+            "accept the object form; use true or false. Per-DM include/exclude "
+            "is a planned extension."
+        )
+    raise ValueError(
+        f"Watcher rule at index {index}: 'rooms.{field_name}' must be true or "
+        f"false (got {type(value).__name__})."
+    )
+
+
+def _parse_rule_ttl(wc: Mapping, index: int, field_name: str) -> int | None:
+    """Read a per-rule session TTL.
+
+    These live on the rule rather than the agent so two rules sharing one agent
+    can differ (§5.4).
+    """
+    value = wc.get(field_name)
+    if value is None:
+        return None
+    # bool is an int subclass; `session_idle_days: true` is a mistake, not a 1.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(
+            f"Watcher rule at index {index}: '{field_name}' must be a positive "
+            f"integer (got {type(value).__name__})."
+        )
+    if value <= 0:
+        raise ValueError(
+            f"Watcher rule at index {index}: '{field_name}' must be a positive "
+            f"integer (got {value})."
+        )
+    return value
+
+
+def _parse_one_watcher_rule(
+    entry: object,
+    index: int,
+    *,
+    connectors: list[ConnectorConfig],
+    connector_names: set[str],
+    agents: dict,
+    default_agent: str,
+    config_dir: Path,
+    templates: dict,
+    seen_rule_names: set[str],
+) -> WatcherRule:
+    """Parse one rule-shaped `watchers:` entry into a `WatcherRule`.
+
+    Runs alongside `_parse_one_watcher_entry` rather than replacing it: until the
+    watcher manager lands, an old-shape config must keep loading and running
+    byte-identically, so neither parser may assume the other is gone.
+
+    Unlike the static parser this returns exactly one object, because a rule is
+    one thing — the expansion that used to turn `rooms: [a, b]` into several
+    watchers now happens at runtime, per discovered room.
+    """
+    if not isinstance(entry, Mapping):
+        raise ValueError(
+            f"Watcher rule at index {index} must be a mapping "
+            f"(got {type(entry).__name__})."
+        )
+    wc = _resolve_inherits(
+        entry, templates, "watcher_templates", f"Watcher rule at index {index}",
+        "watcher",
+    )
+
+    # ── name: the RULE's identity, required and unique ──────────────────────
+    # Required, unlike the static shape where it could be derived from the room.
+    # A rule has no room to derive from, and the name is what shadowing warnings
+    # and `rule_name` in persisted state refer to (§5.3).
+    raw_name = wc.get("name")
+    if not isinstance(raw_name, str) or not raw_name.strip():
+        raise ValueError(
+            f"Watcher rule at index {index}: 'name' is required and must be a "
+            "non-empty string. Rules are not auto-named: there is no single room "
+            "to derive a name from."
+        )
+    rule_name = raw_name.strip()
+    if rule_name in seen_rule_names:
+        raise ValueError(f"Duplicate watcher rule name '{rule_name}'")
+
+    if "room" in wc:
+        raise ValueError(
+            f"Watcher rule at index {index}: 'room' cannot be combined with a "
+            "'rooms:' block. Move the room into 'rooms.include'."
+        )
+    if "session_id" in wc:
+        raise ValueError(
+            f"Watcher rule at index {index}: 'session_id' is no longer "
+            "supported. To carry context into a new session, have the agent "
+            "summarise the session to a file and read it back — a handoff "
+            "survives the backend expiring a session, which pinning never did."
+        )
+
+    # entry_is_watcher_rule() guarantees this for entries routed here by the
+    # loader, but this function is also callable directly (the config tool calls
+    # the static parser that way), so it is checked rather than asserted — an
+    # assert would vanish under -O and leave a TypeError instead.
+    rooms_raw = wc.get("rooms")
+    if not isinstance(rooms_raw, Mapping):
+        raise ValueError(
+            f"Watcher rule at index {index}: 'rooms' must be a mapping with "
+            f"include/exclude/direct/group_direct (got "
+            f"{type(rooms_raw).__name__})."
+        )
+    unknown = set(rooms_raw) - {"include", "exclude", "direct", "group_direct"}
+    if unknown:
+        raise ValueError(
+            f"Watcher rule at index {index}: unknown key(s) in 'rooms': "
+            f"{', '.join(sorted(unknown))}. "
+            "Valid keys are include, exclude, direct, group_direct."
+        )
+
+    matcher = RoomMatcher(
+        include=_parse_pattern_list(rooms_raw.get("include"), index, "include"),
+        exclude=_parse_pattern_list(rooms_raw.get("exclude"), index, "exclude"),
+        direct=_parse_dm_flag(rooms_raw, index, "direct"),
+        group_direct=_parse_dm_flag(rooms_raw, index, "group_direct"),
+    )
+    # An empty include is a hard error unless the rule is DM-only: with no
+    # patterns and no DM opt-in the rule can never match anything, which is a
+    # typo rather than an intention (§2.1).
+    if not matcher.include and not matcher.claims_only_direct:
+        raise ValueError(
+            f"Watcher rule at index {index} ('{rule_name}') can never match any "
+            "room: 'rooms.include' is empty and neither 'rooms.direct' nor "
+            "'rooms.group_direct' is set."
+        )
+    if matcher.exclude and not matcher.include:
+        raise ValueError(
+            f"Watcher rule at index {index} ('{rule_name}'): 'rooms.exclude' has "
+            "no effect without 'rooms.include' — exclude filters named rooms, "
+            "and DM opt-ins are not name-matched."
+        )
+
+    watcher_connector = wc.get("connector", "")
+    if watcher_connector and not isinstance(watcher_connector, str):
+        raise ValueError(
+            f"Watcher rule at index {index}: 'connector' must be a string "
+            f"(got {type(watcher_connector).__name__})."
+        )
+    if watcher_connector and watcher_connector not in connector_names:
+        raise ValueError(
+            f"Watcher rule at index {index} references unknown connector "
+            f"'{watcher_connector}'"
+        )
+    if not watcher_connector and not connectors:
+        raise ValueError(
+            f"Watcher rule at index {index} has no explicit 'connector' set "
+            "and no connectors are configured to default to."
+        )
+    resolved_connector = watcher_connector or connectors[0].name
+
+    watcher_agent = wc.get("agent", default_agent)
+    if not isinstance(watcher_agent, str):
+        raise ValueError(
+            f"Watcher rule at index {index}: 'agent' must be a string "
+            f"(got {type(watcher_agent).__name__})."
+        )
+    if watcher_agent not in agents:
+        raise ValueError(
+            f"Watcher rule at index {index} references unknown agent "
+            f"'{watcher_agent}'"
+        )
+
+    idle_days = _parse_rule_ttl(wc, index, "session_idle_days")
+    expire_days = _parse_rule_ttl(wc, index, "session_expire_days")
+    if idle_days is not None and expire_days is not None and idle_days >= expire_days:
+        raise ValueError(
+            f"Watcher rule at index {index} ('{rule_name}'): "
+            f"'session_idle_days' ({idle_days}) must be strictly less than "
+            f"'session_expire_days' ({expire_days})."
+        )
+
+    hh_raw = wc.get("history_handoff", {}) or {}
+    history_handoff = HistoryHandoffConfig(
+        enabled=hh_raw.get("enabled", _HH_DEFAULTS.enabled),
+        fetch_count=hh_raw.get("fetch_count", _HH_DEFAULTS.fetch_count),
+        verbatim_tail=hh_raw.get("verbatim_tail", _HH_DEFAULTS.verbatim_tail),
+    )
+
+    seen_rule_names.add(rule_name)
+    return WatcherRule(
+        name=rule_name,
+        connector=resolved_connector,
+        agent=watcher_agent,
+        rooms=matcher,
+        session_idle_days=idle_days,
+        session_expire_days=expire_days,
+        context_inject_files=_resolve_paths(wc.get("context_inject_files", []), config_dir),
+        online_notification=wc.get("online_notification"),
+        offline_notification=wc.get("offline_notification"),
+        history_handoff=history_handoff,
+    )
+
+
+def find_shadowed_rules(rules: list[WatcherRule]) -> list[tuple[WatcherRule, WatcherRule]]:
+    """Find rules that can never fire because earlier rules already claim them.
+
+    Returns `(shadowed, shadowed_by)` pairs. Under first-match precedence a rule
+    whose whole language is already claimed by earlier rules on the same
+    connector is dead config — almost always a mistake in ordering.
+
+    Reported as a warning, never an error, and deliberately under-reported. Two
+    cases are passed over rather than guessed at:
+
+    * A rule carrying `exclude` patterns cannot *shadow* a later one, because the
+      excluded slice is precisely what it does not claim. Computing the
+      difference of two glob unions is where exactness would start costing more
+      than the warning is worth.
+    * A shadow formed only by **several** earlier rules together — `a*` plus
+      `b*` covering `[ab]*` — is not reported, even though `union_subsumes` could
+      prove it. Comparing one earlier rule at a time matches §2.1's wording
+      ("fully shadowed by an earlier one") and keeps the warning pointed at a
+      single rule the operator can go and read. A vaguer "these four rules
+      collectively cover this one" is worth less than silence.
+
+    Under-reporting is the right direction here: a missed warning costs nothing,
+    while a false one sends someone hunting a rule that works.
+    """
+    out: list[tuple[WatcherRule, WatcherRule]] = []
+    for i, rule in enumerate(rules):
+        for earlier in rules[:i]:
+            if earlier.connector != rule.connector:
+                continue
+            if earlier.rooms.exclude:
+                continue
+            # DM classes are claimed by flag, so an earlier rule shadows this
+            # one's DM reach only by opting into the same class.
+            if rule.rooms.direct and not earlier.rooms.direct:
+                continue
+            if rule.rooms.group_direct and not earlier.rooms.group_direct:
+                continue
+            if rule.rooms.include and not union_subsumes(
+                earlier.rooms.include, rule.rooms.include
+            ):
+                continue
+            out.append((rule, earlier))
+            break
+    return out
 
 
 def _parse_max_queue_depth(raw: dict) -> int:
