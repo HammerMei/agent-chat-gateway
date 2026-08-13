@@ -1343,6 +1343,100 @@ WATCHER_RULE_KEYS: frozenset[str] = frozenset({
 })
 
 
+def _key_list(keys) -> str:
+    """Format a key set for an error message.
+
+    Stringifies before sorting because YAML keys need not be strings: `1: value`
+    on a rule would otherwise make `sorted()` compare int with str, or
+    `", ".join()` receive an int — raising TypeError out of the *error path* and
+    escaping collect_config()'s `except ValueError`, so a malformed entry would
+    abort the whole validation pass instead of being reported.
+    """
+    return ", ".join(sorted(str(k) for k in keys))
+
+
+def _validated_notification(raw: object, index: int, field_name: str) -> str | None:
+    """Check a notification field against its declared `str | None` contract.
+
+    Copied unchecked, a YAML boolean or number reaches the platform REST client's
+    message field much later, where the send fails and is only logged as a
+    warning — so the operator's status message silently never appears. An
+    actionable load error is the whole point of checking it here.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ValueError(
+            f"Watcher rule at index {index}: '{field_name}' must be a string or "
+            f"null (got {type(raw).__name__})."
+        )
+    return raw
+
+
+_HH_FIELD_TYPES: dict[str, type] = {
+    "enabled": bool,
+    "fetch_count": int,
+    "verbatim_tail": int,
+}
+
+
+def _parse_history_handoff(raw: object, index: int) -> HistoryHandoffConfig:
+    """Validate a `history_handoff:` block, keys and values.
+
+    Validating only the outer mapping was not enough, and the gap had the same
+    shape as the bug it replaced: `history_handoff: {enable: false}` -- one letter
+    short -- was silently ignored, leaving handoff **enabled**, which is the exact
+    inversion that `history_handoff: false` used to produce. Since `enabled`
+    defaults to True, every typo in this block fails in the direction the operator
+    did not want.
+
+    Types are enforced too: `enabled: "false"` is a truthy string, and a negative
+    or non-integer count would reach lifecycle code unchallenged.
+    """
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, Mapping):
+        raise ValueError(
+            f"Watcher rule at index {index}: 'history_handoff' must be a mapping "
+            f"(got {type(raw).__name__}). To turn it off, set "
+            "'history_handoff: {enabled: false}'."
+        )
+    unknown = set(raw) - set(_HH_FIELD_TYPES)
+    if unknown:
+        raise ValueError(
+            f"Watcher rule at index {index}: unknown key(s) in 'history_handoff': "
+            f"{_key_list(unknown)}. Valid keys are {_key_list(_HH_FIELD_TYPES)}."
+        )
+    values: dict[str, object] = {}
+    for key, want in _HH_FIELD_TYPES.items():
+        if key not in raw:
+            continue
+        value = raw[key]
+        # bool is a subclass of int, so an int field must reject it explicitly and
+        # a bool field must not accept 0/1.
+        if want is bool and not isinstance(value, bool):
+            raise ValueError(
+                f"Watcher rule at index {index}: 'history_handoff.{key}' must be "
+                f"true or false (got {type(value).__name__})."
+            )
+        if want is int and (isinstance(value, bool) or not isinstance(value, int)):
+            raise ValueError(
+                f"Watcher rule at index {index}: 'history_handoff.{key}' must be "
+                f"an integer (got {type(value).__name__})."
+            )
+        if want is int and value < 0:
+            raise ValueError(
+                f"Watcher rule at index {index}: 'history_handoff.{key}' must not "
+                f"be negative (got {value})."
+            )
+        values[key] = value
+    return HistoryHandoffConfig(
+        enabled=values.get("enabled", _HH_DEFAULTS.enabled),
+        fetch_count=values.get("fetch_count", _HH_DEFAULTS.fetch_count),
+        verbatim_tail=values.get("verbatim_tail", _HH_DEFAULTS.verbatim_tail),
+    )
+
+
 def _validated_path_list(raw: object, index: int) -> list[str]:
     """Check a path list before `_resolve_paths` iterates it.
 
@@ -1439,8 +1533,8 @@ def _parse_one_watcher_rule(
     if unknown_top:
         raise ValueError(
             f"Watcher rule at index {index} ('{rule_name}'): unknown key(s) "
-            f"{', '.join(sorted(unknown_top))}. Valid keys are "
-            f"{', '.join(sorted(WATCHER_RULE_KEYS))}."
+            f"{_key_list(unknown_top)}. Valid keys are "
+            f"{_key_list(WATCHER_RULE_KEYS)}."
         )
 
     rooms_raw = wc.get("rooms")
@@ -1454,7 +1548,7 @@ def _parse_one_watcher_rule(
     if unknown:
         raise ValueError(
             f"Watcher rule at index {index}: unknown key(s) in 'rooms': "
-            f"{', '.join(sorted(unknown))}. "
+            f"{_key_list(unknown)}. "
             "Valid keys are include, except_for, direct, group_direct."
         )
 
@@ -1553,27 +1647,16 @@ def _parse_one_watcher_rule(
             f"'session_expire_days' ({expire_days})."
         )
 
-    # `or {}` hid two mistakes: a truthy non-mapping raised AttributeError on
-    # `.get` below (and collect_config only catches ValueError, so one bad rule
-    # would abort the whole validation pass), while `history_handoff: false` was
-    # replaced by `{}` — the defaults — so writing false to disable it enabled it.
-    hh_raw = wc.get("history_handoff")
-    if hh_raw is None:
-        hh_raw = {}
-    elif not isinstance(hh_raw, Mapping):
-        raise ValueError(
-            f"Watcher rule at index {index}: 'history_handoff' must be a mapping "
-            f"(got {type(hh_raw).__name__}). To turn it off, set "
-            "'history_handoff: {enabled: false}'."
-        )
-    history_handoff = HistoryHandoffConfig(
-        enabled=hh_raw.get("enabled", _HH_DEFAULTS.enabled),
-        fetch_count=hh_raw.get("fetch_count", _HH_DEFAULTS.fetch_count),
-        verbatim_tail=hh_raw.get("verbatim_tail", _HH_DEFAULTS.verbatim_tail),
-    )
+    history_handoff = _parse_history_handoff(wc.get("history_handoff"), index)
 
-    seen_rule_names.add(rule_name)
-    return WatcherRule(
+    # Construct fully BEFORE registering the name. The static parser stages names
+    # for exactly this reason, with a comment explaining it, and that lesson was
+    # not carried over here: with the name added first, a rule that then failed
+    # validation left its name registered even though no rule was returned, so a
+    # later valid rule with the same name was rejected as a duplicate of something
+    # that does not exist. Harmless under from_file()'s fail-fast loading, wrong
+    # under collect_config(), which keeps going after a failed entry.
+    rule = WatcherRule(
         name=rule_name,
         connector=resolved_connector,
         agent=watcher_agent,
@@ -1581,12 +1664,20 @@ def _parse_one_watcher_rule(
         session_idle_days=idle_days,
         session_expire_days=expire_days,
         context_inject_files=_resolve_paths(
-            _validated_path_list(wc.get("context_inject_files", []), index), config_dir
+            _validated_path_list(wc.get("context_inject_files", []), index),
+            config_dir,
+            f"Watcher rule at index {index}: 'context_inject_files'",
         ),
-        online_notification=wc.get("online_notification"),
-        offline_notification=wc.get("offline_notification"),
+        online_notification=_validated_notification(
+            wc.get("online_notification"), index, "online_notification"
+        ),
+        offline_notification=_validated_notification(
+            wc.get("offline_notification"), index, "offline_notification"
+        ),
         history_handoff=history_handoff,
     )
+    seen_rule_names.add(rule_name)
+    return rule
 
 
 @dataclass(frozen=True)
