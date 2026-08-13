@@ -283,7 +283,8 @@ class TestBackendSignaturePreflight(unittest.TestCase):
             check_backend_signatures({"posonly": _PositionalOnly()})
         msg = str(cm.exception)
         self.assertIn("positional-only", msg)
-        self.assertIn("keyword-only", msg, "must say what to change it to")
+        self.assertIn("*, path_key, already_delivered", msg,
+                      "must say what to change it to")
 
     def test_a_positional_or_keyword_path_key_is_accepted(self):
         """The permissive-but-callable case: not keyword-only, but the keyword call
@@ -306,8 +307,8 @@ class TestBackendSignaturePreflight(unittest.TestCase):
         check_backend_signatures({"poskw": _PositionalOrKeyword()})
 
     def test_a_backend_taking_kwargs_is_accepted(self):
-        """A `**kwargs` override cannot be judged by parameter name and is not the defect
-        this looks for; forcing it to fail would refuse a working implementation."""
+        """A `**kwargs` override absorbs every argument the caller passes, so the call
+        succeeds; refusing it would reject a working implementation."""
         from gateway.agents import AgentBackend, check_backend_signatures
 
         class _Kwargs(AgentBackend):
@@ -321,6 +322,90 @@ class TestBackendSignaturePreflight(unittest.TestCase):
                 return None
 
         check_backend_signatures({"flexible": _Kwargs()})
+
+    def test_a_legacy_parameter_hidden_behind_kwargs_is_refused(self):
+        """`**kwargs` makes the call *look* satisfiable without making it satisfiable.
+
+        `(..., *, watcher_name, already_delivered, **kwargs)` swallows the caller's
+        `path_key=` — but `watcher_name` is still required and the caller never passes it,
+        so the first watcher start raises `TypeError: missing 1 required keyword-only
+        argument`. Three versions of this check each answered a piece of the question
+        (is the name present; is its kind keyword-callable; is there a `**kwargs`) and each
+        piece let a different signature through. Binding the real call asks it once.
+        """
+        from gateway.agents import AgentBackend, check_backend_signatures
+
+        class _LegacyPlusKwargs(AgentBackend):
+            async def create_session(self, *a, **kw):
+                return "s"
+
+            async def send(self, *a, **kw):
+                raise NotImplementedError
+
+            async def ensure_durable_instructions(
+                self, session_id, working_directory, timeout, content, *,
+                watcher_name, already_delivered, **kwargs,
+            ):
+                return None
+
+        with self.assertRaises(TypeError) as cm:
+            check_backend_signatures({"legacykw": _LegacyPlusKwargs()})
+        msg = str(cm.exception)
+        self.assertIn("watcher_name", msg)
+        self.assertIn("path_key", msg)
+
+    def test_a_required_parameter_the_caller_never_passes_is_refused(self):
+        """Not a case anyone reported — it falls out of asking the question properly.
+
+        A backend adding its own required argument (a tenant, a client handle) fails the
+        same way and for the same reason: the gateway's call cannot supply it. Nothing in
+        the check knows this parameter exists, which is the point of binding rather than
+        enumerating spellings.
+        """
+        from gateway.agents import AgentBackend, check_backend_signatures
+
+        class _ExtraRequired(AgentBackend):
+            async def create_session(self, *a, **kw):
+                return "s"
+
+            async def send(self, *a, **kw):
+                raise NotImplementedError
+
+            async def ensure_durable_instructions(
+                self, session_id, working_directory, timeout, content, *,
+                path_key, already_delivered, tenant,
+            ):
+                return None
+
+        with self.assertRaises(TypeError) as cm:
+            check_backend_signatures({"extra": _ExtraRequired()})
+        self.assertIn("tenant", str(cm.exception))
+
+    def test_the_probe_matches_the_call_the_gateway_actually_makes(self):
+        """The check is only worth its refusals if the call it binds is the real one.
+
+        A drifting probe would refuse working backends or accept broken ones while every
+        test above still passed, because they all bind the same wrong shape. This reads
+        the real call site's keywords out of the source instead of restating them.
+        """
+        import ast
+        import inspect
+        from pathlib import Path
+
+        from gateway.core import injected_context_builder
+
+        src = Path(inspect.getfile(injected_context_builder)).read_text()
+        calls = [
+            node for node in ast.walk(ast.parse(src))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "ensure_durable_instructions"
+        ]
+        self.assertEqual(len(calls), 1, "expected exactly one call site to compare against")
+        call = calls[0]
+        self.assertEqual(
+            sorted(kw.arg for kw in call.keywords), ["already_delivered", "path_key"])
+        self.assertEqual(len(call.args), 4, "positional count must match the probe")
 
 
 if __name__ == "__main__":

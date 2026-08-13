@@ -42,71 +42,69 @@ class GatewayBrokerConfig:
 
 
 def check_backend_signatures(backends) -> None:
-    """Refuse to start if a backend still implements the pre-rename signature.
+    """Refuse to start if a backend cannot be called the way the gateway calls it.
 
     `ensure_durable_instructions`'s `watcher_name` parameter became `path_key`, and the
     two are not interchangeable: the value is now scoped to the watcher in a room, so a
     backend keying a file on it as if it were a display name reintroduces the overwrite
     between same-room watchers (see gateway/core/paths.py).
 
+    **Asked as one question — "would the real call succeed?" — via `Signature.bind`.**
+    Three earlier versions asked it in pieces and each was reported as incomplete: is
+    `path_key` present (a positional-only declaration passes, then fails on a keyword
+    call); is its `kind` callable by keyword (a `**kwargs` signature passes even while a
+    required legacy `watcher_name` remains unfilled). Every one of those was a hand-rolled
+    approximation of what `bind` answers exactly, so the approximations are gone. The
+    probe arguments below mirror the caller, which is what makes the answer meaningful.
+
     Deliberately a preflight rather than a compatibility shim. `AgentBackend` is a
-    documented extension point, but registering one requires editing
-    `service.py`'s `_build_agent_backend`, so a custom backend is a fork rather than a
-    plugin — and a fork rebasing onto this branch already meets a removed config field and
-    a refused state format. Accepting both spellings would keep two names for one
-    parameter alive in a contract, which is the ambiguity this rename removed.
+    documented extension point, but registering one requires editing `service.py`'s
+    `_build_agent_backend`, so a custom backend is a fork rather than a plugin — and a fork
+    rebasing onto this branch already meets a removed config field and a refused state
+    format. Accepting both spellings would keep two names for one parameter alive in a
+    contract, which is the ambiguity this rename removed.
 
-    What the shim would genuinely have bought is a better failure than
-    `TypeError: unexpected keyword argument 'path_key'` at the first watcher start. This
-    buys that directly, and earlier: the base method's own `NotImplementedError` shows the
-    established standard here is a call-time failure carrying an actionable message, so the
-    defect in the raw TypeError was the message, not the timing.
+    What a shim would genuinely have bought is a better failure than a raw `TypeError` at
+    the first watcher start. This buys that directly, and earlier: the base method's own
+    `NotImplementedError` shows the standard here is a call-time failure carrying an
+    actionable message, so the defect in the raw TypeError was the message, not the timing.
 
-    Checked by signature rather than by calling anything, so a backend that never
-    exercises this path is unaffected.
+    Nothing is called — `bind` only matches arguments against the signature — so a backend
+    that never exercises this path is unaffected.
     """
     import inspect
+
+    # The call `InjectedContextBuilder.ensure()` actually makes. Kept beside the check
+    # rather than described, because the check is only meaningful if it matches reality.
+    probe_args = ("session-id", "/working/dir", 1, "content")
+    probe_kwargs = {"path_key": "key", "already_delivered": False}
 
     for name, backend in sorted(getattr(backends, "items", lambda: [])()):
         impl = type(backend).ensure_durable_instructions
         if impl is AgentBackend.ensure_durable_instructions:
             continue  # not overridden; the base raises with its own message
-        params = inspect.signature(impl).parameters
-        # Presence is not enough: the caller passes `path_key=...`, so a parameter
-        # declared positional-only would satisfy a membership test and then still raise
-        # the very TypeError this check exists to replace ("got some positional-only
-        # arguments passed as keyword"). A check that lets its own failure mode through in
-        # a describable case is not doing its one job.
-        keyword_callable = (
-            any(q.kind is inspect.Parameter.VAR_KEYWORD for q in params.values())
-            or (
-                "path_key" in params
-                and params["path_key"].kind in (
-                    inspect.Parameter.KEYWORD_ONLY,
-                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                )
-            )
-        )
-        if keyword_callable:
-            continue
-        if "path_key" in params:
-            raise TypeError(
-                f"Agent backend '{name}' ({type(backend).__name__}) declares "
-                "ensure_durable_instructions()'s 'path_key' as positional-only. The "
-                "caller passes it by keyword, so this would fail at the first watcher "
-                "start. Declare it keyword-only (after '*'), as the base class does."
-            )
-        if "watcher_name" in params:
-            raise TypeError(
-                f"Agent backend '{name}' ({type(backend).__name__}) implements "
-                "ensure_durable_instructions() with the old 'watcher_name' parameter. "
+
+        try:
+            inspect.signature(impl).bind(backend, *probe_args, **probe_kwargs)
+        except TypeError as exc:
+            params = inspect.signature(impl).parameters
+            hint = (
                 "It was renamed to 'path_key' and the meaning changed: the value is an "
                 "opaque key scoped to the watcher in a room, not a display name. Rename "
                 "the parameter and use it verbatim as the file name — do not derive "
                 "anything from it, and do not substitute room_path_key, which belongs to "
-                "the attachment workspace. See gateway/core/paths.py and "
-                "docs/architecture.md's 'Adding a New Agent Backend'."
+                "the attachment workspace."
+                if "watcher_name" in params
+                else "The gateway passes path_key= and already_delivered= by keyword and "
+                "passes nothing else, so match the base class signature: (session_id, "
+                "working_directory, timeout, content, *, path_key, already_delivered)."
             )
+            raise TypeError(
+                f"Agent backend '{name}' ({type(backend).__name__}) cannot be called the "
+                f"way the gateway calls ensure_durable_instructions(): {exc}. {hint} "
+                "See gateway/core/paths.py and docs/architecture.md's 'Adding a New Agent "
+                "Backend'."
+            ) from exc
 
 
 class AgentBackend(ABC):
