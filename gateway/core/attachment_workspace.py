@@ -8,8 +8,11 @@ permission prompts from Claude Code).
 
 Layout::
 
-    {working_directory}/.acg-attachments/{watcher_name}
+    {working_directory}/.acg-attachments/{path_key}
         → {global_cache}/{connector_name}/{room_id}/
+
+where path_key is a digest of (connector, room_id) — see gateway/core/paths.py for
+why the display name is not used here.
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ import logging
 from pathlib import Path
 
 from .connector import Attachment, Connector
+from .paths import resolve_under
 
 logger = logging.getLogger("agent-chat-gateway.core.attachment_workspace")
 
@@ -28,7 +32,7 @@ def localize_attachment_paths(
 ) -> list[str]:
     """Remap attachment paths through a per-watcher symlink directory.
 
-    If ``local_base`` is set (e.g. ``{cwd}/.acg-attachments/{watcher_name}``
+    If ``local_base`` is set (e.g. ``{cwd}/.acg-attachments/{path_key}``
     → global cache dir), each attachment's filename is resolved under the
     symlink so the agent sees a cwd-local path.  This avoids out-of-project
     permission prompts from Claude Code.
@@ -51,13 +55,21 @@ def localize_attachment_paths(
 
 
 class AttachmentWorkspace:
-    """Manages per-watcher attachment symlinks inside agent working directories.
+    """Manages per-room attachment symlinks inside agent working directories.
 
     Usage::
 
+        from gateway.core.paths import room_path_key
+
         workspace = AttachmentWorkspace(connector)
-        local_base = workspace.setup(watcher_name, room_id, working_directory)
+        local_base = workspace.setup(
+            room_path_key(connector_name, room_id), room_id, working_directory
+        )
         # local_base is either a str path or None if attachments are unsupported
+
+    The example passes the key explicitly because passing a watcher name instead would
+    *work* — it satisfies `resolve_under` — and silently restore per-watcher links, so the
+    misuse produces no error. See gateway/core/paths.py for which key belongs where.
     """
 
     def __init__(self, connector: Connector) -> None:
@@ -65,11 +77,19 @@ class AttachmentWorkspace:
 
     def setup(
         self,
-        watcher_name: str,
+        path_key: str,
         room_id: str,
         working_directory: str,
     ) -> str | None:
-        """Create or update a per-watcher symlink for cached attachments.
+        """Create or update a per-room symlink for cached attachments.
+
+        ``path_key`` identifies the ROOM — pass `room_path_key(...)`. The watcher's
+        display name used to be this path component, which made it load-bearing: renaming
+        a room orphaned the old link, and a collision pointed one room's attachment path
+        at another room's files (§2.3). Which key belongs to which artifact is documented
+        once, in gateway/core/paths.py; this docstring deliberately does not restate it.
+        The cost is that a directory listing no longer reads as room names, which `list`
+        offsets by showing both.
 
         Returns:
             Absolute path to the symlink directory (str) if the connector
@@ -82,10 +102,27 @@ class AttachmentWorkspace:
         acg_dir = Path(working_directory) / ".acg-attachments"
         acg_dir.mkdir(parents=True, exist_ok=True)
 
-        link = acg_dir / watcher_name
+        # Containment is checked on the link's *location*, never by resolving through
+        # it: this link points outside working_directory on purpose, at the global
+        # cache, so demanding that its target stay inside would always fail (§2.3).
+        link = resolve_under(acg_dir, path_key)
         cache_path = Path(cache_dir)
         cache_path.mkdir(parents=True, exist_ok=True)
 
+        # Deliberately a plain check-then-act, with no synchronisation.
+        #
+        # Two watchers share this link only when they share a connector AND a room — the
+        # same bot account in the same room, which CLAUDE.md records as a degenerate case
+        # with no practical use beyond framework-level testing. In that configuration two
+        # concurrent starts can race here and one raises, failing that watcher's startup
+        # loudly.
+        #
+        # That is accepted rather than fixed. `impl/uniqueness` (design §4.1) makes one
+        # watcher per room the rule, and `impl/manager` moves the lifecycle lock to
+        # `(connector, room_id)` — the same granularity as this link — so the race
+        # disappears with its precondition rather than needing a guard. Tolerating the
+        # collision now would mean code whose only job is to survive a state that is about
+        # to become impossible, and which someone would then have to remember to remove.
         if link.is_symlink():
             if link.resolve() != cache_path.resolve():
                 link.unlink()

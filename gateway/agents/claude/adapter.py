@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ...core.adapter_utils import build_attachment_prompt
+from ...core.paths import resolve_under
 from .. import AgentBackend, GatewayBrokerConfig
 from ..errors import (
     AgentExecutionError,
@@ -429,7 +430,7 @@ class ClaudeBackend(AgentBackend):
         timeout: int,
         content: str,
         *,
-        watcher_name: str,
+        path_key: str,
         already_delivered: bool,
     ) -> str | None:
         """Write `content` to a stable per-watcher file for --append-system-prompt-file.
@@ -452,13 +453,18 @@ class ClaudeBackend(AgentBackend):
         accidental `git add` if that directory is a real user project under
         version control (a documented, real configuration — see
         docs/user-guide.md's ``working_directory: ~/my-project`` examples).
-        ``watcher_name`` is globally unique (enforced at config-load time) and
-        forbidden from containing ``/`` (see gateway/config.py), so this path
-        cannot collide with another watcher's file or escape RUNTIME_DIR.
+        The file is named by ``path_key``, which the caller derives — treat it as opaque.
+        It is scoped to the *watcher in a room*, not to the room alone: two watchers may
+        bind different agents to one connector+room, and a room-only key would make the
+        second overwrite the first one's instructions. The display name used to be the
+        path component outright, which made it load-bearing — a rename orphaned the file
+        and two rooms could collide (§2.3). ``resolve_under`` re-checks containment,
+        because the key is built from external connector data and a path from such data
+        is validated rather than trusted.
         """
         acg_dir = RUNTIME_DIR / "system-prompts"
         await asyncio.to_thread(acg_dir.mkdir, parents=True, exist_ok=True)
-        path = acg_dir / f"{watcher_name}.md"
+        path = resolve_under(acg_dir, f"{path_key}.md")
         await asyncio.to_thread(_atomic_write_text, path, content)
         return str(path)
 

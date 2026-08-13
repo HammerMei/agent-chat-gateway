@@ -47,6 +47,7 @@ from typing import TYPE_CHECKING
 import httpx
 
 from ...core.adapter_utils import build_attachment_prompt
+from ...core.paths import resolve_under
 from .. import AgentBackend, GatewayBrokerConfig
 from ..errors import (
     AgentExecutionError,
@@ -67,7 +68,9 @@ logger = logging.getLogger("agent-chat-gateway.agents.opencode")
 
 # ACG's own runtime state directory — same convention as
 # gateway/agents/claude/adapter.py's RUNTIME_DIR. Durable per-watcher
-# instructions files live under RUNTIME_DIR/system-prompts/<watcher_name>.md
+# instructions files live under RUNTIME_DIR/system-prompts/<path_key>.md, where
+# path_key is opaque to this adapter — the caller derives it per watcher-in-a-room
+# (gateway/core/paths.py's watcher_prompt_key), never from the display name (§2.3)
 # for both backends; watcher names are globally unique and forbidden from
 # containing "/" (see gateway/config.py), so paths never collide, and each
 # watcher only ever uses one backend type, so there's no cross-backend clash
@@ -799,13 +802,13 @@ class OpenCodeBackend(AgentBackend):
         timeout: int,
         content: str,
         *,
-        watcher_name: str,
+        path_key: str,
         already_delivered: bool,
     ) -> str | None:
         """Write ``content`` to a stable per-watcher file for per-request resupply.
 
         Mirrors ``ClaudeBackend.ensure_durable_instructions()``'s contract
-        exactly: writes durable content to ``RUNTIME_DIR/system-prompts/<watcher_name>.md``
+        exactly: writes durable content to ``RUNTIME_DIR/system-prompts/<path_key>.md``
         and returns that path as ``to_repeat``. ``message_processor.py`` already
         resupplies whatever this returns via ``append_system_prompt_file`` on
         every subsequent ``send()``/``stream()`` call for this watcher — see
@@ -839,7 +842,13 @@ class OpenCodeBackend(AgentBackend):
         """
         acg_dir = RUNTIME_DIR / "system-prompts"
         await asyncio.to_thread(acg_dir.mkdir, parents=True, exist_ok=True)
-        path = acg_dir / f"{watcher_name}.md"
+        # Named by the caller-supplied ``path_key``, which is opaque here: it is scoped
+        # to the watcher in a room (watcher_prompt_key), NOT to the room alone, because
+        # two watchers may bind different agents to one room and a room-only key would
+        # make the second overwrite the first. Do not substitute room_path_key — that one
+        # is for the attachment workspace. resolve_under supplies the containment check
+        # that comes with treating the key as external data (§2.3).
+        path = resolve_under(acg_dir, f"{path_key}.md")
         await asyncio.to_thread(_atomic_write_text, path, content)
         return str(path)
 

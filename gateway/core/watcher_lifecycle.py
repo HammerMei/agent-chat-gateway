@@ -20,6 +20,7 @@ from .dispatch import MessageDispatcher
 from .history_context import format_history_context
 from .injected_context_builder import InjectedContextBuilder
 from .message_processor import MessageProcessor
+from .paths import room_path_key, watcher_prompt_key
 from .permission import PermissionRegistry
 from .session_maps import SessionMaps
 from .state import WatcherState
@@ -450,7 +451,12 @@ class WatcherLifecycle:
             )
             to_repeat = await self._injector.ensure(
                 ws, session_id, agent, agent_cfg.working_directory, agent_cfg.timeout,
-                watcher_name=wc.name, content=built_content,
+                watcher_name=wc.name,
+                # The prompt file is per WATCHER, not per room: two watchers may bind
+                # different agents to one room, and their durable instructions differ.
+                # See watcher_prompt_key for why this is not room_path_key.
+                path_key=watcher_prompt_key(wc.connector, room.id, wc.name),
+                content=built_content,
             )
         except Exception:
             self._states.pop(wc.name, None)
@@ -469,7 +475,7 @@ class WatcherLifecycle:
         try:
             attachment_local_base = await asyncio.to_thread(
                 self._attachment_workspace.setup,
-                wc.name,
+                room_path_key(wc.connector, room.id),
                 room.id,
                 agent_cfg.working_directory,
             )

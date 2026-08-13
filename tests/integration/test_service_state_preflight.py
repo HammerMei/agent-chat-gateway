@@ -131,5 +131,288 @@ class TestServiceStatePreflight(unittest.TestCase):
             factory.assert_not_called()
 
 
+class TestBackendSignaturePreflight(unittest.TestCase):
+    """A backend left on the pre-rename signature must fail with an actionable message.
+
+    `ensure_durable_instructions`'s `watcher_name` parameter became `path_key`, and the two
+    are not interchangeable — the value is now scoped to the watcher in a room. A custom
+    backend still on the old spelling would raise `TypeError: unexpected keyword argument
+    'path_key'` at the first watcher start, deep inside the lifecycle, which rolls the
+    startup back and says nothing about what to change.
+
+    A compatibility shim was declined rather than overlooked: registering a backend
+    requires editing `service.py`, so a custom one is a fork rather than a plugin, and a
+    fork rebasing onto this branch already meets a removed config field and a refused state
+    format. Accepting both spellings would keep two names for one parameter alive in a
+    contract the rename exists to disambiguate. What the shim would really have bought is
+    the better message — which this provides, and earlier.
+    """
+
+    def test_the_old_signature_is_refused_by_name(self):
+        from gateway.agents import AgentBackend, check_backend_signatures
+
+        class _Legacy(AgentBackend):
+            async def create_session(self, *a, **kw):
+                return "s"
+
+            async def send(self, *a, **kw):
+                raise NotImplementedError
+
+            async def ensure_durable_instructions(
+                self, session_id, working_directory, timeout, content, *,
+                watcher_name, already_delivered,
+            ):
+                return None
+
+        with self.assertRaises(TypeError) as cm:
+            check_backend_signatures({"legacy": _Legacy()})
+        msg = str(cm.exception)
+        self.assertIn("legacy", msg)
+        self.assertIn("watcher_name", msg)
+        self.assertIn("path_key", msg)
+        self.assertIn("room_path_key", msg, "must warn against the wrong substitution")
+
+    def test_the_current_signature_passes(self):
+        from gateway.agents import AgentBackend, check_backend_signatures
+
+        class _Current(AgentBackend):
+            async def create_session(self, *a, **kw):
+                return "s"
+
+            async def send(self, *a, **kw):
+                raise NotImplementedError
+
+            async def ensure_durable_instructions(
+                self, session_id, working_directory, timeout, content, *,
+                path_key, already_delivered,
+            ):
+                return None
+
+        check_backend_signatures({"ok": _Current()})
+
+    def test_a_backend_that_does_not_override_it_is_left_alone(self):
+        """Not overriding is legitimate — the base raises with its own message, and many
+        test backends never exercise this path. The preflight must not force them to
+        implement it just to start."""
+        from gateway.agents import AgentBackend, check_backend_signatures
+
+        class _NoOverride(AgentBackend):
+            async def create_session(self, *a, **kw):
+                return "s"
+
+            async def send(self, *a, **kw):
+                raise NotImplementedError
+
+        check_backend_signatures({"bare": _NoOverride()})
+
+    def test_the_service_actually_runs_the_preflight(self):
+        """The wiring, not the function.
+
+        Every test above calls `check_backend_signatures` directly, so removing the call
+        from `GatewayService.__init__` failed none of them — the same gap as asserting two
+        keys differ while a call site uses the wrong one. This constructs the service with
+        a legacy backend and requires the refusal.
+        """
+        from gateway.agents import AgentBackend
+
+        class _Legacy(AgentBackend):
+            async def create_session(self, *a, **kw):
+                return "s"
+
+            async def send(self, *a, **kw):
+                raise NotImplementedError
+
+            async def ensure_durable_instructions(
+                self, session_id, working_directory, timeout, content, *,
+                watcher_name, already_delivered,
+            ):
+                return None
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        runtime = root / "runtime"
+        runtime.mkdir()
+        path = root / "config.yaml"
+        path.write_text(textwrap.dedent(f"""\
+            connectors:
+              - name: script
+                type: script
+            agents:
+              default:
+                type: claude
+                working_directory: {root}
+            watchers:
+              - name: w1
+                connector: script
+                room: script
+        """))
+
+        with patch.object(state_mod, "RUNTIME_DIR", runtime), \
+             patch("gateway.service._build_agent_backend", return_value=_Legacy()):
+            cfg = GatewayConfig.from_file(str(path))
+            with self.assertRaises(TypeError) as cm:
+                GatewayService(cfg)
+        self.assertIn("watcher_name", str(cm.exception))
+
+    def test_a_positional_only_path_key_is_refused(self):
+        """Presence is not enough — the parameter has to be callable by keyword.
+
+        The caller passes `path_key=...`, so a positional-only declaration satisfies a
+        membership test and then raises "got some positional-only arguments passed as
+        keyword arguments" at the first watcher start: exactly the raw TypeError this
+        preflight exists to replace. A check that lets its own failure mode through in a
+        describable case is not doing its one job.
+        """
+        from gateway.agents import AgentBackend, check_backend_signatures
+
+        class _PositionalOnly(AgentBackend):
+            async def create_session(self, *a, **kw):
+                return "s"
+
+            async def send(self, *a, **kw):
+                raise NotImplementedError
+
+            async def ensure_durable_instructions(
+                self, session_id, working_directory, timeout, content, path_key, /, *,
+                already_delivered,
+            ):
+                return None
+
+        with self.assertRaises(TypeError) as cm:
+            check_backend_signatures({"posonly": _PositionalOnly()})
+        msg = str(cm.exception)
+        self.assertIn("posonly", msg, "must name the offending backend")
+        self.assertIn("path_key", msg, "must name the offending parameter")
+        self.assertIn("*, path_key, already_delivered", msg,
+                      "must say what to change it to")
+        # Deliberately not asserting the interpreter's phrasing. The first version of
+        # this test looked for "positional-only" and CI failed on one runner alone:
+        # that CPython writes "positional only" without the hyphen. `bind`'s diagnosis
+        # is quoted into the message but its wording is not ours to depend on — assert
+        # the parameter name (stable) and the remedy (ours).
+
+    def test_a_positional_or_keyword_path_key_is_accepted(self):
+        """The permissive-but-callable case: not keyword-only, but the keyword call
+        works, so refusing it would reject a working backend."""
+        from gateway.agents import AgentBackend, check_backend_signatures
+
+        class _PositionalOrKeyword(AgentBackend):
+            async def create_session(self, *a, **kw):
+                return "s"
+
+            async def send(self, *a, **kw):
+                raise NotImplementedError
+
+            async def ensure_durable_instructions(
+                self, session_id, working_directory, timeout, content, path_key,
+                already_delivered=False,
+            ):
+                return None
+
+        check_backend_signatures({"poskw": _PositionalOrKeyword()})
+
+    def test_a_backend_taking_kwargs_is_accepted(self):
+        """A `**kwargs` override absorbs every argument the caller passes, so the call
+        succeeds; refusing it would reject a working implementation."""
+        from gateway.agents import AgentBackend, check_backend_signatures
+
+        class _Kwargs(AgentBackend):
+            async def create_session(self, *a, **kw):
+                return "s"
+
+            async def send(self, *a, **kw):
+                raise NotImplementedError
+
+            async def ensure_durable_instructions(self, *a, **kw):
+                return None
+
+        check_backend_signatures({"flexible": _Kwargs()})
+
+    def test_a_legacy_parameter_hidden_behind_kwargs_is_refused(self):
+        """`**kwargs` makes the call *look* satisfiable without making it satisfiable.
+
+        `(..., *, watcher_name, already_delivered, **kwargs)` swallows the caller's
+        `path_key=` — but `watcher_name` is still required and the caller never passes it,
+        so the first watcher start raises `TypeError: missing 1 required keyword-only
+        argument`. Three versions of this check each answered a piece of the question
+        (is the name present; is its kind keyword-callable; is there a `**kwargs`) and each
+        piece let a different signature through. Binding the real call asks it once.
+        """
+        from gateway.agents import AgentBackend, check_backend_signatures
+
+        class _LegacyPlusKwargs(AgentBackend):
+            async def create_session(self, *a, **kw):
+                return "s"
+
+            async def send(self, *a, **kw):
+                raise NotImplementedError
+
+            async def ensure_durable_instructions(
+                self, session_id, working_directory, timeout, content, *,
+                watcher_name, already_delivered, **kwargs,
+            ):
+                return None
+
+        with self.assertRaises(TypeError) as cm:
+            check_backend_signatures({"legacykw": _LegacyPlusKwargs()})
+        msg = str(cm.exception)
+        self.assertIn("watcher_name", msg)
+        self.assertIn("path_key", msg)
+
+    def test_a_required_parameter_the_caller_never_passes_is_refused(self):
+        """Not a case anyone reported — it falls out of asking the question properly.
+
+        A backend adding its own required argument (a tenant, a client handle) fails the
+        same way and for the same reason: the gateway's call cannot supply it. Nothing in
+        the check knows this parameter exists, which is the point of binding rather than
+        enumerating spellings.
+        """
+        from gateway.agents import AgentBackend, check_backend_signatures
+
+        class _ExtraRequired(AgentBackend):
+            async def create_session(self, *a, **kw):
+                return "s"
+
+            async def send(self, *a, **kw):
+                raise NotImplementedError
+
+            async def ensure_durable_instructions(
+                self, session_id, working_directory, timeout, content, *,
+                path_key, already_delivered, tenant,
+            ):
+                return None
+
+        with self.assertRaises(TypeError) as cm:
+            check_backend_signatures({"extra": _ExtraRequired()})
+        self.assertIn("tenant", str(cm.exception))
+
+    def test_the_probe_matches_the_call_the_gateway_actually_makes(self):
+        """The check is only worth its refusals if the call it binds is the real one.
+
+        A drifting probe would refuse working backends or accept broken ones while every
+        test above still passed, because they all bind the same wrong shape. This reads
+        the real call site's keywords out of the source instead of restating them.
+        """
+        import ast
+        import inspect
+        from pathlib import Path
+
+        from gateway.core import injected_context_builder
+
+        src = Path(inspect.getfile(injected_context_builder)).read_text()
+        calls = [
+            node for node in ast.walk(ast.parse(src))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "ensure_durable_instructions"
+        ]
+        self.assertEqual(len(calls), 1, "expected exactly one call site to compare against")
+        call = calls[0]
+        self.assertEqual(
+            sorted(kw.arg for kw in call.keywords), ["already_delivered", "path_key"])
+        self.assertEqual(len(call.args), 4, "positional count must match the probe")
+
+
 if __name__ == "__main__":
     unittest.main()

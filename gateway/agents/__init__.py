@@ -41,6 +41,72 @@ class GatewayBrokerConfig:
     skip_owner_approval: bool = False  # when True, bypass owner approval for all tool calls
 
 
+def check_backend_signatures(backends) -> None:
+    """Refuse to start if a backend cannot be called the way the gateway calls it.
+
+    `ensure_durable_instructions`'s `watcher_name` parameter became `path_key`, and the
+    two are not interchangeable: the value is now scoped to the watcher in a room, so a
+    backend keying a file on it as if it were a display name reintroduces the overwrite
+    between same-room watchers (see gateway/core/paths.py).
+
+    **Asked as one question — "would the real call succeed?" — via `Signature.bind`.**
+    Three earlier versions asked it in pieces and each was reported as incomplete: is
+    `path_key` present (a positional-only declaration passes, then fails on a keyword
+    call); is its `kind` callable by keyword (a `**kwargs` signature passes even while a
+    required legacy `watcher_name` remains unfilled). Every one of those was a hand-rolled
+    approximation of what `bind` answers exactly, so the approximations are gone. The
+    probe arguments below mirror the caller, which is what makes the answer meaningful.
+
+    Deliberately a preflight rather than a compatibility shim. `AgentBackend` is a
+    documented extension point, but registering one requires editing `service.py`'s
+    `_build_agent_backend`, so a custom backend is a fork rather than a plugin — and a fork
+    rebasing onto this branch already meets a removed config field and a refused state
+    format. Accepting both spellings would keep two names for one parameter alive in a
+    contract, which is the ambiguity this rename removed.
+
+    What a shim would genuinely have bought is a better failure than a raw `TypeError` at
+    the first watcher start. This buys that directly, and earlier: the base method's own
+    `NotImplementedError` shows the standard here is a call-time failure carrying an
+    actionable message, so the defect in the raw TypeError was the message, not the timing.
+
+    Nothing is called — `bind` only matches arguments against the signature — so a backend
+    that never exercises this path is unaffected.
+    """
+    import inspect
+
+    # The call `InjectedContextBuilder.ensure()` actually makes. Kept beside the check
+    # rather than described, because the check is only meaningful if it matches reality.
+    probe_args = ("session-id", "/working/dir", 1, "content")
+    probe_kwargs = {"path_key": "key", "already_delivered": False}
+
+    for name, backend in sorted(getattr(backends, "items", lambda: [])()):
+        impl = type(backend).ensure_durable_instructions
+        if impl is AgentBackend.ensure_durable_instructions:
+            continue  # not overridden; the base raises with its own message
+
+        try:
+            inspect.signature(impl).bind(backend, *probe_args, **probe_kwargs)
+        except TypeError as exc:
+            params = inspect.signature(impl).parameters
+            hint = (
+                "It was renamed to 'path_key' and the meaning changed: the value is an "
+                "opaque key scoped to the watcher in a room, not a display name. Rename "
+                "the parameter and use it verbatim as the file name — do not derive "
+                "anything from it, and do not substitute room_path_key, which belongs to "
+                "the attachment workspace."
+                if "watcher_name" in params
+                else "The gateway passes path_key= and already_delivered= by keyword and "
+                "passes nothing else, so match the base class signature: (session_id, "
+                "working_directory, timeout, content, *, path_key, already_delivered)."
+            )
+            raise TypeError(
+                f"Agent backend '{name}' ({type(backend).__name__}) cannot be called the "
+                f"way the gateway calls ensure_durable_instructions(): {exc}. {hint} "
+                "See gateway/core/paths.py and docs/architecture.md's 'Adding a New Agent "
+                "Backend'."
+            ) from exc
+
+
 class AgentBackend(ABC):
     """Abstract backend that creates sessions and sends messages to an agent."""
 
@@ -134,7 +200,7 @@ class AgentBackend(ABC):
         timeout: int,
         content: str,
         *,
-        watcher_name: str,
+        path_key: str,
         already_delivered: bool,
     ) -> str | None:
         """Make `content` durably visible to the model, by whatever mechanism this
@@ -155,6 +221,23 @@ class AgentBackend(ABC):
         avoid duplicating content into conversation history. Backends with no
         such side effect (returning a value for the caller to re-supply)
         should ignore it and always return fresh content.
+
+        `path_key`: an **opaque** filesystem key for this file. Backends must treat it as
+        a name and derive nothing from it — not the room, not the watcher, nothing
+        human-facing.
+
+        Callers pass `gateway.core.paths.watcher_prompt_key(connector, room_id,
+        watcher_name)`, which is scoped to the *watcher in a room* rather than to the room
+        alone. That matters for anyone implementing this method: two watchers may bind
+        different agents to one connector+room, and a room-only key makes the second
+        overwrite the first one's instructions silently. The room-scoped
+        `room_path_key` exists for the attachment workspace, whose cache genuinely is per
+        room — do not reach for it here.
+
+        It replaced a `watcher_name` parameter, and the rename is the point: a display
+        name is free to change (a channel rename, a group DM's membership changing, a
+        better sanitizer), and using it directly as a path component made every such
+        change orphan a file and let two rooms collide (§2.3).
 
         There is deliberately NO usable default here — every backend must
         make an explicit choice, visible in its own source, about how it
