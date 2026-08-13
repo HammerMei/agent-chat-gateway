@@ -2551,3 +2551,72 @@ class TestWatcherEntryScalarValidation(unittest.TestCase):
     def test_enabled_false_is_the_supported_way_to_disable(self):
         w = self._load_one("- {room: general, history_handoff: {enabled: false}}")
         self.assertFalse(w.history_handoff.enabled)
+
+
+class TestContextInjectFileListValidation(unittest.TestCase):
+    """A bare string where a list belongs must be an error, not eight paths.
+
+    `_resolve_paths` iterates what it is given, so `context_inject_files: notes.md`
+    silently became one path per character — a config that loads clean and injects
+    nothing. All three context layers shared the defect, so the check lives in
+    `_resolve_paths` rather than at each call site.
+    """
+
+    BASE = """\
+        connectors:
+          - name: rc
+            type: rocketchat
+            server: {{url: http://localhost:3000, username: bot, password: pw}}
+        {conn}
+        agents:
+          default:
+            type: claude
+            working_directory: /tmp
+        {agent}
+        watchers:
+          - room: general
+        {watcher}
+        """
+
+    def _write(self, *, conn="", agent="", watcher="") -> str:
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(textwrap.dedent(self.BASE).format(conn=conn, agent=agent, watcher=watcher))
+            return f.name
+
+    def _rejects(self, needle: str, **kw) -> str:
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(self._write(**kw))
+        self.assertIn(needle, str(ctx.exception))
+        return str(ctx.exception)
+
+    def test_a_bare_string_is_rejected_on_a_connector(self):
+        msg = self._rejects("Connector 'rc': 'context_inject_files'",
+                            conn="    context_inject_files: c.md")
+        self.assertIn("one character at a time", msg)
+
+    def test_a_bare_string_is_rejected_on_an_agent(self):
+        self._rejects("Agent 'default': 'context_inject_files'",
+                      agent="    context_inject_files: a.md")
+
+    def test_a_bare_string_is_rejected_on_a_watcher(self):
+        self._rejects("Watcher entry at index 0: 'context_inject_files'",
+                      watcher="    context_inject_files: w.md")
+
+    def test_a_non_string_element_is_a_value_error_not_a_type_error(self):
+        """TypeError would escape collect_config()'s `except ValueError` and abort
+        the whole validation pass rather than reporting one entry."""
+        self._rejects("entries must be strings", watcher="    context_inject_files: [ok.md, 3]")
+
+    def test_valid_lists_still_load_on_all_three_layers(self):
+        cfg = GatewayConfig.from_file(self._write(
+            conn="    context_inject_files: [c.md]",
+            agent="    context_inject_files: [a.md]",
+            watcher="    context_inject_files: [w.md]",
+        ))
+        self.assertEqual(len(cfg.connectors[0].context_inject_files), 1)
+        self.assertEqual(len(cfg.agents["default"].context_inject_files), 1)
+        self.assertEqual(len(cfg.watchers[0].context_inject_files), 1)
+
+    def test_omitting_them_entirely_still_loads(self):
+        cfg = GatewayConfig.from_file(self._write())
+        self.assertEqual(cfg.watchers[0].context_inject_files, [])

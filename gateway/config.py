@@ -25,7 +25,7 @@ happens to resemble a placeholder is never silently misinterpreted.
 import logging
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -546,10 +546,33 @@ def _auto_watcher_name(connector: str, room: str) -> str:
     return f"{connector}-{_sanitize_room_for_name(room)}"
 
 
-def _resolve_paths(paths: list, base_dir: Path) -> list[str]:
-    """Resolve a list of path strings relative to base_dir."""
+def _resolve_paths(paths: object, base_dir: Path, label: str = "context_inject_files") -> list[str]:
+    """Resolve a list of path strings relative to base_dir.
+
+    Validates the container before iterating it, because iterating the wrong type
+    fails in two quiet ways. A bare string is iterated **per character**, so
+    `context_inject_files: notes.md` becomes eight paths ending `/n`, `/o`, `/t`
+    … rather than one error — a config that looks accepted and injects nothing.
+    A non-string element reaches `Path()` and raises `TypeError`, which
+    `collect_config()` does not catch (it catches `ValueError`), so a single bad
+    entry aborts the whole validation pass instead of being reported as one issue
+    with the other entries still checked.
+
+    The check lives here rather than at each call site because this is the
+    function that iterates, and all three context layers -- connector, agent and
+    watcher -- were affected identically.
+    """
+    if isinstance(paths, str) or not isinstance(paths, Sequence):
+        raise ValueError(
+            f"{label} must be a list of paths (got {type(paths).__name__}); "
+            "a bare string would be read one character at a time."
+        )
     resolved = []
     for p in paths:
+        if not isinstance(p, str):
+            raise ValueError(
+                f"{label} entries must be strings (got {type(p).__name__})."
+            )
         if p and not Path(p).is_absolute():
             resolved.append(str((base_dir / p).resolve()))
         elif p:
@@ -681,7 +704,7 @@ def _parse_one_connector(
 
     # Resolve connector-level context_inject_files
     raw_ctx = cc.get("context_inject_files", [])
-    ctx_files = _resolve_paths(raw_ctx, config_dir)
+    ctx_files = _resolve_paths(raw_ctx, config_dir, f"Connector '{name}': 'context_inject_files'")
 
     # Resolve attachments.cache_dir_global relative to config dir
     # (consistent with working_directory resolution below)
@@ -741,7 +764,7 @@ def _parse_one_agent(
 
     # Resolve context_inject_files (list) relative to the config file's directory
     raw_ctx = agent_raw.get("context_inject_files", [])
-    ctx_files = _resolve_paths(raw_ctx, config_dir)
+    ctx_files = _resolve_paths(raw_ctx, config_dir, f"Agent '{agent_name}': 'context_inject_files'")
 
     # Resolve working_directory: expand a leading ~ first (matching
     # the cache_dir_global handling above), then resolve relative to
@@ -1124,7 +1147,9 @@ def _parse_one_watcher_entry(
 
     # Resolve watcher-level context_inject_files (shared across expanded rooms)
     raw_ctx = wc.get("context_inject_files", [])
-    ctx_files = _resolve_paths(raw_ctx, config_dir)
+    ctx_files = _resolve_paths(
+        raw_ctx, config_dir, f"Watcher entry at index {index}: 'context_inject_files'"
+    )
 
     # Defaults sourced from module-level _HH_DEFAULTS — see its docstring above.
     #
