@@ -1243,7 +1243,7 @@ def _parse_dm_flag(rooms_raw: Mapping, index: int, field_name: str) -> bool:
     """Read `rooms.direct` / `rooms.group_direct`.
 
     Only the boolean form is accepted. §2.7 reserves the object form
-    (`direct: {include: [...], exclude: [...]}`) for when per-DM control is
+    (`direct: {include: [...], except_for: [...]}`) for when per-DM control is
     genuinely needed, and the JSON schema leaves room for it so that adding it
     later is additive. Until then a mapping here is rejected explicitly rather
     than being silently truthy — which is exactly how `direct: {}` would
@@ -1255,7 +1255,7 @@ def _parse_dm_flag(rooms_raw: Mapping, index: int, field_name: str) -> bool:
     if isinstance(value, Mapping):
         raise ValueError(
             f"Watcher rule at index {index}: 'rooms.{field_name}' does not yet "
-            "accept the object form; use true or false. Per-DM include/exclude "
+            "accept the object form; use true or false. Per-DM include/except_for "
             "is a planned extension."
         )
     raise ValueError(
@@ -1355,20 +1355,20 @@ def _parse_one_watcher_rule(
     if not isinstance(rooms_raw, Mapping):
         raise ValueError(
             f"Watcher rule at index {index}: 'rooms' must be a mapping with "
-            f"include/exclude/direct/group_direct (got "
+            f"include/except_for/direct/group_direct (got "
             f"{type(rooms_raw).__name__})."
         )
-    unknown = set(rooms_raw) - {"include", "exclude", "direct", "group_direct"}
+    unknown = set(rooms_raw) - {"include", "except_for", "direct", "group_direct"}
     if unknown:
         raise ValueError(
             f"Watcher rule at index {index}: unknown key(s) in 'rooms': "
             f"{', '.join(sorted(unknown))}. "
-            "Valid keys are include, exclude, direct, group_direct."
+            "Valid keys are include, except_for, direct, group_direct."
         )
 
     matcher = RoomMatcher(
         include=_parse_pattern_list(rooms_raw.get("include"), index, "include"),
-        exclude=_parse_pattern_list(rooms_raw.get("exclude"), index, "exclude"),
+        except_for=_parse_pattern_list(rooms_raw.get("except_for"), index, "except_for"),
         direct=_parse_dm_flag(rooms_raw, index, "direct"),
         group_direct=_parse_dm_flag(rooms_raw, index, "group_direct"),
     )
@@ -1381,28 +1381,29 @@ def _parse_one_watcher_rule(
             "room: 'rooms.include' is empty and neither 'rooms.direct' nor "
             "'rooms.group_direct' is set."
         )
-    if matcher.exclude and not matcher.include:
+    if matcher.except_for and not matcher.include:
         raise ValueError(
-            f"Watcher rule at index {index} ('{rule_name}'): 'rooms.exclude' has "
-            "no effect without 'rooms.include' — exclude filters named rooms, "
+            f"Watcher rule at index {index} ('{rule_name}'): 'rooms.except_for' has "
+            "no effect without 'rooms.include' — it filters named rooms, "
             "and DM opt-ins are not name-matched."
         )
-    # An exclude that cannot overlap the include union is dead config which
+    # An except_for pattern that cannot overlap the include union is dead config
     # *reads* like protection. Excluding a room this rule never claimed does not
     # keep a later rule from claiming it, because a name the include misses is
     # NO_MATCH and falls through — so the operator who wrote it to block a room
     # got the opposite of what they intended, silently. Same typo class as the
     # empty-include error above, so it is refused the same way.
-    for pattern in matcher.exclude:
+    for pattern in matcher.except_for:
         if not union_intersects([pattern], matcher.include):
             raise ValueError(
                 f"Watcher rule at index {index} ('{rule_name}'): "
-                f"'rooms.exclude' pattern '{pattern.raw}' can never match any "
-                "room this rule includes, so it does nothing. Note that "
-                "excluding a room does not stop a *later* rule from claiming "
-                "it — a room this rule does not include simply falls through. "
-                "To keep a room away from every rule, include it here and "
-                "exclude it: the rule then claims it and declines it, and no "
+                f"'rooms.except_for' pattern '{pattern.raw}' can never match any "
+                "room this rule includes, so it does nothing. 'except_for' "
+                "subtracts from this rule's own 'include' — it does not stop a "
+                "*later* rule from claiming a room, because a room this rule "
+                "does not include simply falls through to the next one. To keep "
+                "a room away from every rule, name it in 'include' and in "
+                "'except_for': this rule then claims it and declines it, and no "
                 "later rule sees it."
             )
 
@@ -1477,7 +1478,7 @@ def find_shadowed_rules(rules: list[WatcherRule]) -> list[tuple[WatcherRule, Wat
     Reported as a warning, never an error, and deliberately under-reported. Two
     cases are passed over rather than guessed at:
 
-    * A rule carrying `exclude` patterns cannot *shadow* a later one, because the
+    * A rule carrying `except_for` patterns cannot *shadow* a later one, because the
       excluded slice is precisely what it does not claim. Computing the
       difference of two glob unions is where exactness would start costing more
       than the warning is worth.
@@ -1496,7 +1497,7 @@ def find_shadowed_rules(rules: list[WatcherRule]) -> list[tuple[WatcherRule, Wat
         for earlier in rules[:i]:
             if earlier.connector != rule.connector:
                 continue
-            if earlier.rooms.exclude:
+            if earlier.rooms.except_for:
                 continue
             # DM classes are claimed by flag, so an earlier rule shadows this
             # one's DM reach only by opting into the same class.

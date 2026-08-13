@@ -52,7 +52,7 @@ def rule(name="r", connector="mm-home", **rooms) -> WatcherRule:
         agent="claude-eng",
         rooms=RoomMatcher(
             include=tuple(RoomPattern(p) for p in rooms.get("include", ())),
-            exclude=tuple(RoomPattern(p) for p in rooms.get("exclude", ())),
+            except_for=tuple(RoomPattern(p) for p in rooms.get("except_for", ())),
             direct=rooms.get("direct", False),
             group_direct=rooms.get("group_direct", False),
         ),
@@ -93,12 +93,12 @@ class TestMatcherSemantics(unittest.TestCase):
         m = RoomMatcher(include=(RoomPattern("eng-*"),))
         self.assertIs(m.match("ops-x", RoomKind.CHANNEL), RuleMatch.NO_MATCH)
 
-    def test_exclude_declines_rather_than_falling_through(self):
+    def test_except_for_declines_rather_than_falling_through(self):
         """§2.1's real decision: an excluded room does NOT reach a later rule.
-        Fall-through would make exclude a routing operator and let two rules
+        Fall-through would make except_for a routing operator and let two rules
         contend for the same room."""
         m = RoomMatcher(
-            include=(RoomPattern("eng-*"),), exclude=(RoomPattern("eng-archive"),)
+            include=(RoomPattern("eng-*"),), except_for=(RoomPattern("eng-archive"),)
         )
         self.assertIs(m.match("eng-archive", RoomKind.CHANNEL), RuleMatch.DECLINED)
         self.assertIsNot(m.match("eng-archive", RoomKind.CHANNEL), RuleMatch.NO_MATCH)
@@ -126,9 +126,9 @@ class TestMatcherSemantics(unittest.TestCase):
             RoomMatcher(group_direct=True).match("", RoomKind.DM), RuleMatch.NO_MATCH
         )
 
-    def test_exclude_is_not_consulted_for_dms(self):
+    def test_except_for_is_not_consulted_for_dms(self):
         m = RoomMatcher(
-            include=(RoomPattern("eng-*"),), exclude=(RoomPattern("*"),), direct=True
+            include=(RoomPattern("eng-*"),), except_for=(RoomPattern("*"),), direct=True
         )
         self.assertIs(m.match("", RoomKind.DM), RuleMatch.CLAIMED)
 
@@ -252,27 +252,30 @@ class TestParserHardErrors(unittest.TestCase):
         msg = self._err({**MINIMAL, "rooms": {"include": ["eng-[a"]}}, "is not valid")
         self.assertIn("eng-[a", msg)
 
-    def test_exclude_without_include_is_a_no_op_and_refused(self):
+    def test_except_for_without_include_is_a_no_op_and_refused(self):
         self._err(
-            {"name": "x", "rooms": {"exclude": ["a"], "direct": True}},
+            {"name": "x", "rooms": {"except_for": ["a"], "direct": True}},
             "no effect without",
         )
 
-    def test_an_exclude_that_cannot_overlap_the_include_is_refused(self):
-        """The footgun: `exclude: [ops-secret]` next to `include: [eng-*]` reads
+    def test_an_except_for_that_cannot_overlap_the_include_is_refused(self):
+        """The footgun: `except_for: [ops-secret]` next to `include: [eng-*]` reads
         like protection and does nothing at all, because a name the include
         misses is NO_MATCH and falls through to the next rule."""
         msg = self._err(
-            {**MINIMAL, "rooms": {"include": ["eng-*"], "exclude": ["ops-secret"]}},
+            {**MINIMAL, "rooms": {"include": ["eng-*"], "except_for": ["ops-secret"]}},
             "can never match any room this rule includes",
         )
-        # The message has to teach the fall-through fact, or the operator fixes
-        # the pattern and still does not get what they wanted.
+        # The message has to teach three things, or the operator fixes the
+        # pattern and still does not get what they wanted: that except_for is
+        # relative to this rule's include, that it does not protect a room from
+        # later rules, and what does.
+        self.assertIn("subtracts from this rule's own 'include'", msg)
         self.assertIn("does not stop a *later* rule", msg)
-        self.assertIn("include it here and exclude it", msg)
+        self.assertIn("name it in 'include' and in 'except_for'", msg)
 
-    def test_a_partially_overlapping_exclude_is_fine(self):
-        r = parse({**MINIMAL, "rooms": {"include": ["eng-*"], "exclude": ["eng-archive"]}})
+    def test_a_partially_overlapping_except_for_is_fine(self):
+        r = parse({**MINIMAL, "rooms": {"include": ["eng-*"], "except_for": ["eng-archive"]}})
         self.assertIs(r.match("eng-backend", RoomKind.CHANNEL), RuleMatch.CLAIMED)
         self.assertIs(r.match("eng-archive", RoomKind.CHANNEL), RuleMatch.DECLINED)
 
@@ -280,7 +283,7 @@ class TestParserHardErrors(unittest.TestCase):
         msg = self._err(
             {
                 **MINIMAL,
-                "rooms": {"include": ["eng-*"], "exclude": ["eng-old", "ops-x"]},
+                "rooms": {"include": ["eng-*"], "except_for": ["eng-old", "ops-x"]},
             },
             "'ops-x'",
         )
@@ -333,12 +336,12 @@ class TestTheDenyIdiom(unittest.TestCase):
     contradiction someone should "fix"."""
 
     def test_the_same_pattern_in_both_lists_is_accepted(self):
-        r = parse({"name": "block", "rooms": {"include": ["eng-old"], "exclude": ["eng-old"]}})
+        r = parse({"name": "block", "rooms": {"include": ["eng-old"], "except_for": ["eng-old"]}})
         self.assertIs(r.match("eng-old", RoomKind.CHANNEL), RuleMatch.DECLINED)
 
     def test_it_blocks_later_rules_which_a_plain_omission_would_not(self):
         blocker = parse(
-            {"name": "block", "rooms": {"include": ["eng-old"], "exclude": ["eng-old"]}},
+            {"name": "block", "rooms": {"include": ["eng-old"], "except_for": ["eng-old"]}},
             seen=set(),
         )
         catchall = parse({"name": "all", "rooms": {"include": ["eng-*"]}}, seen=set())
@@ -354,7 +357,7 @@ class TestTheDenyIdiom(unittest.TestCase):
         self.assertEqual(route("eng-new"), "all:CLAIMED")
 
     def test_a_broader_deny_pattern_works_the_same_way(self):
-        r = parse({"name": "block", "rooms": {"include": ["tmp-*"], "exclude": ["tmp-*"]}})
+        r = parse({"name": "block", "rooms": {"include": ["tmp-*"], "except_for": ["tmp-*"]}})
         self.assertIs(r.match("tmp-anything", RoomKind.CHANNEL), RuleMatch.DECLINED)
 
 
@@ -400,9 +403,9 @@ class TestShadowDetection(unittest.TestCase):
         b = rule("b", connector="rc-home", include=["eng-*"])
         self.assertEqual(find_shadowed_rules([a, b]), [])
 
-    def test_a_rule_with_excludes_does_not_shadow(self):
+    def test_a_rule_with_an_except_for_does_not_shadow(self):
         """The excluded slice is precisely what it does not claim."""
-        a = rule("a", include=["eng-*"], exclude=["eng-archive"])
+        a = rule("a", include=["eng-*"], except_for=["eng-archive"])
         b = rule("b", include=["eng-archive"])
         self.assertEqual(find_shadowed_rules([a, b]), [])
 
@@ -419,10 +422,10 @@ class TestShadowDetection(unittest.TestCase):
         b = rule("b", direct=True, group_direct=True)
         self.assertEqual(find_shadowed_rules([a, b]), [])
 
-    def test_a_rule_shadowed_despite_its_own_excludes(self):
+    def test_a_rule_shadowed_despite_its_own_except_for(self):
         """Excludes only shrink the later rule, so it is still unreachable."""
         a = rule("a", include=["eng-*"])
-        b = rule("b", include=["eng-*"], exclude=["eng-archive"])
+        b = rule("b", include=["eng-*"], except_for=["eng-archive"])
         self.assertEqual(find_shadowed_rules([a, b]), [(b, a)])
 
     def test_star_shadows_everything_after_it(self):

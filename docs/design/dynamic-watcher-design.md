@@ -69,7 +69,7 @@ watchers:
     agent: claude-eng
     rooms:
       include: ["eng-*", "incident-*"]
-      exclude: ["eng-archive"]
+      except_for: ["eng-archive"]
     session_idle_days: 7
     session_expire_days: 30
     # plus every existing watcher parameter: context_inject_files,
@@ -96,19 +96,26 @@ static checks below are decidable:
 | matched against | the room's **full** platform name, implicitly anchored at both ends |
 | case | sensitive; both platforms' slugs are lowercase by construction |
 | unicode | compared NFC-normalised, so a decomposed pattern matches a composed name |
-| exclude | evaluated after include, within the same rule; an excluded room does **not** fall through to a later rule — the rule claimed it and then declined it |
+| `except_for` | subtracts from **this rule's own `include`**, evaluated after it. A room it removes does **not** fall through to a later rule — the rule claimed it and then declined it |
 
 That last row is a real decision rather than an implementation detail: fall-
-through would make `exclude` a routing operator, and two rules could then
+through would make `except_for` a routing operator, and two rules could then
 silently contend for the same room. Two consequences follow from it that are
 easy to get backwards, so both are stated outright.
 
-**Excluding a room only affects rooms the rule already includes.** A name no
-`include` pattern matches is `NO_MATCH`, which falls through — so listing a room
-in `exclude` without including it does **not** keep a later rule from claiming
-it. It looks like protection and is a no-op. Because that reads as the opposite
-of what it does, an `exclude` pattern that cannot overlap the rule's `include`
-union is a hard error rather than a warning (below).
+**The key is named `except_for`, not `exclude`, and the name is doing work.**
+"Exclude" reads as absolute — *exclude this room from the bot* — whereas the
+behaviour is relative: *of the rooms I include, not these*. English does not let
+"except for" stand alone, so the word itself makes a reader look for the
+`include` it subtracts from, which is exactly the relationship that has to be
+understood to use it correctly.
+
+**It only affects rooms the rule already includes.** A name no `include` pattern
+matches is `NO_MATCH`, which falls through — so listing a room under `except_for`
+without including it does **not** keep a later rule from claiming it. It looks
+like protection and is a no-op. Because that reads as the opposite of what it
+does, an `except_for` pattern that cannot overlap the rule's `include` union is a
+hard error rather than a warning (below).
 
 **Including a room and excluding it is how you block it entirely.** The rule
 claims the room, declines it, and `DECLINED` does not fall through, so no later
@@ -120,7 +127,7 @@ watchers:
     connector: mm-home
     rooms:
       include: ["tmp-*"]
-      exclude: ["tmp-*"]
+      except_for: ["tmp-*"]
   - name: everything-else
     connector: mm-home
     rooms:
@@ -136,7 +143,7 @@ Given globs, the load-time checks split into three tiers by what is actually
 decidable, rather than one promise that cannot be kept:
 
 - **Hard errors**: a syntactically invalid pattern; an empty include list on a
-  rule that is not DM-only; a duplicate rule name; an `exclude` pattern that
+  rule that is not DM-only; a duplicate rule name; an `except_for` pattern that
   cannot overlap the rule's own `include` union. That last one is an error rather
   than a warning because the config it describes is not merely useless — it reads
   as protecting a room while leaving it free for any later rule to claim, so
@@ -636,7 +643,7 @@ inference from inactivity (§2.7, §4.4).
 
 **A room the gateway has never seen cannot be paused.** Pause acts on a
 record, and an unobserved room has none — no id, no kind, nothing to key on.
-The request is rejected with a message pointing at the rule's `exclude:` list,
+The request is rejected with a message pointing at the rule's `except_for:` list,
 which is where "never engage with this room" belongs: declarative, effective
 before the first message rather than after it, and not dependent on the room
 having been observed. (Today's behaviour is to fabricate an empty record for
@@ -861,7 +868,7 @@ watchers:
     agent: claude-eng
     rooms:
       include: ["eng-*", "incident-*"]
-      exclude: ["eng-archive"]
+      except_for: ["eng-archive"]
 
   - name: direct-messages            # exactly one rule per bot account
     connector: mm-eng                # may opt into DMs
@@ -890,7 +897,7 @@ inbound message
 └─ team channel?
      └─ event's team == this connector's team?
           no  → drop
-          yes → first rule whose include/exclude matches the channel name
+          yes → first rule whose include/except_for matches the channel name
 ```
 
 Classifying before gating avoids a "an empty team id means pass" special
@@ -972,7 +979,7 @@ rooms:
   rooms: {direct: {include: ["@alice", "@bob"]}}
   agent: claude-support
 - name: dm-everyone-else
-  rooms: {direct: {include: ["*"], exclude: ["@alice", "@bob"]}}
+  rooms: {direct: {include: ["*"], except_for: ["@alice", "@bob"]}}
   agent: claude-general
 ```
 
@@ -1267,7 +1274,7 @@ on-disk records persist, and boot then eagerly starts every room ever seen.
   legacy state files cause a refusal to start; jobs are re-created. The
   release ships one guide covering the procedure and stating the losses —
   chiefly that every room starts a fresh agent session, and that a paused
-  room must be re-expressed as an `exclude:` entry or it becomes active
+  room must be re-expressed as an `except_for:` entry or it becomes active
   (§5.3).
 
   Every alternative was considered and rejected for the same reason: each
@@ -1618,7 +1625,7 @@ one upgrade.
 2. acg schedule list             # record scheduled jobs
 3. stop the gateway
 4. rewrite config.yaml: concrete watchers → rules (§5.4)
-      – a paused watcher becomes an `exclude:` entry, not a rule
+      – a paused watcher becomes an `except_for:` entry, not a rule
       – drop any `session_id:`; it no longer exists (§2.4)
 5. remove the old state files:  ~/.agent-chat-gateway/state.*.json
 6. start, then re-create the scheduled jobs from step 2
@@ -1630,7 +1637,7 @@ one upgrade.
 |---|---|
 | Agent sessions | Every room starts a fresh session. Conversational memory inside the agent is gone; history handoff refetches recent room messages, so there is partial continuity from the room's own transcript |
 | `last_processed_ts` watermarks | A one-off boundary effect per room: a message either side of the cut may be reprocessed or skipped once |
-| Paused state | **The dangerous one.** A paused room becomes active unless its pause is re-expressed. Step 4 turns it into `exclude:`, which is the better home anyway (§2.5) — declarative, and effective before the first message rather than after |
+| Paused state | **The dangerous one.** A paused room becomes active unless its pause is re-expressed. Step 4 turns it into `except_for:`, which is the better home anyway (§2.5) — declarative, and effective before the first message rather than after |
 | Scheduled jobs | Jobs key on a watcher name that no longer exists; they are re-created in step 6 |
 | Pinned `session_id` | The field is gone (§2.4). A config that sets it fails to load, naming the replacement: have the agent summarise its session to a file and read that back in the new one — which also survives the backend expiring a session, as pinning never did |
 
@@ -1650,11 +1657,11 @@ expressible in the new model (§2.5).
 ### 5.4 Config schema
 
 - `watchers[].room` / `.rooms` → `watchers[].rooms.include` /
-  `.rooms.exclude`, patterns, order-significant.
+  `.rooms.except_for`, patterns, order-significant.
 - New `watchers[].rooms.direct` and `.group_direct` booleans, both defaulting
   to false — DMs cannot be matched by name pattern on either platform (§2.7).
   Accept only the boolean form for now; the JSON schema should leave room for
-  the object form (`direct: {include: [...], exclude: [...]}`) so the later
+  the object form (`direct: {include: [...], except_for: [...]}`) so the later
   extension in §2.7 is additive rather than a breaking schema change.
 - `session_idle_days` / `session_expire_days` move from the agent to the
   rule, so two rules sharing an agent can differ.
@@ -1710,7 +1717,7 @@ what makes §5.1's corruption reachable.
 ### 5.6 Order
 
 1. §5.1 prerequisites.
-2. Rule parsing: patterns, include/exclude, order preservation,
+2. Rule parsing: patterns, include/except_for, order preservation,
    literal-only enforcement, shadowing detection.
 3. State schema and its serialization tests, plus the legacy-state **refusal**
    (§5.3) — a version check with a message, not a converter. Test that a

@@ -53,7 +53,7 @@ class RoomKind(Enum):
 class RuleMatch(Enum):
     """The outcome of testing one rule against one room.
 
-    Three outcomes rather than a boolean, because §2.1 makes `exclude` a
+    Three outcomes rather than a boolean, because §2.1 makes `except_for` a
     within-rule veto rather than a routing operator: "an excluded room does
     **not** fall through to a later rule — the rule claimed it and then declined
     it". Collapsing `DECLINED` into `NO_MATCH` would let a later rule pick up a
@@ -68,7 +68,7 @@ class RuleMatch(Enum):
     """This rule owns the room; build a watcher from it."""
 
     DECLINED = "declined"
-    """An include matched and an exclude vetoed. Stop — do not try later rules,
+    """An include matched and an `except_for` pattern vetoed. Stop — do not try later rules,
     and do not build a watcher."""
 
 
@@ -76,25 +76,25 @@ class RuleMatch(Enum):
 class RoomMatcher:
     """Which rooms a rule claims.
 
-    `include`/`exclude` are compiled globs over room names; `direct` and
+    `include`/`except_for` are compiled globs over room names; `direct` and
     `group_direct` are opt-ins for the two DM kinds, which have no name to match
     against on either platform (§2.7). All four can appear on one rule: the
     patterns govern named rooms and the flags govern DMs, independently.
     """
 
     include: tuple[RoomPattern, ...] = ()
-    exclude: tuple[RoomPattern, ...] = ()
+    except_for: tuple[RoomPattern, ...] = ()
     direct: bool = False
     group_direct: bool = False
 
     def match(self, name: str, kind: RoomKind) -> RuleMatch:
         """Test one room against this rule.
 
-        `exclude` is deliberately **not** consulted for DMs. In the boolean form
+        `except_for` is deliberately **not** consulted for DMs. In the boolean form
         there is nothing for a name pattern to match — a 1:1 DM has no room name
-        on Rocket.Chat at all — so an exclude list could only ever be a no-op
+        on Rocket.Chat at all — so an `except_for` list could only ever be a no-op
         there. §2.7 records the object form (`direct: {include: [...],
-        exclude: [...]}`) as the additive extension for when per-DM control is
+        except_for: [...]}`) as the additive extension for when per-DM control is
         genuinely needed.
         """
         if kind is RoomKind.DM:
@@ -104,7 +104,7 @@ class RoomMatcher:
 
         if not any(p.matches(name) for p in self.include):
             return RuleMatch.NO_MATCH
-        if any(p.matches(name) for p in self.exclude):
+        if any(p.matches(name) for p in self.except_for):
             return RuleMatch.DECLINED
         return RuleMatch.CLAIMED
 

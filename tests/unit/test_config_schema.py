@@ -105,7 +105,7 @@ class TestRuleShapedWatchersValidate:
     def test_a_rule_with_include_patterns(self, validator, base_doc):
         self._ok(validator, base_doc, {
             "name": "eng", "connector": "rc-main", "agent": "my-agent",
-            "rooms": {"include": ["eng-*", "incident-*"], "exclude": ["eng-archive"]},
+            "rooms": {"include": ["eng-*", "incident-*"], "except_for": ["eng-archive"]},
         })
 
     def test_a_dm_only_rule_needs_no_include(self, validator, base_doc):
@@ -126,7 +126,7 @@ class TestRuleShapedWatchersValidate:
         though the loader rejects it today, so a config written against a later
         loader still validates here rather than needing a schema change."""
         self._ok(validator, base_doc, {
-            "name": "dms", "rooms": {"direct": {"include": ["alice"], "exclude": ["bob"]}},
+            "name": "dms", "rooms": {"direct": {"include": ["alice"], "except_for": ["bob"]}},
         })
 
     def test_the_static_shape_still_validates(self, validator, base_doc):

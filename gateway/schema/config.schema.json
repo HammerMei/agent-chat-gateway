@@ -235,7 +235,7 @@
       ]
     },
     "dmOptIn": {
-      "description": "Opt in to a DM class. Only true/false is accepted by the loader today. The object form is reserved for per-DM include/exclude (§2.7) and is accepted here so that adding it later extends this union instead of changing the schema's shape — a config written against the newer loader still validates against this schema.",
+      "description": "Opt in to a DM class. Only true/false is accepted by the loader today. The object form is reserved for per-DM include/except_for (§2.7) and is accepted here so that adding it later extends this union instead of changing the schema's shape — a config written against the newer loader still validates against this schema.",
       "anyOf": [
         { "type": "boolean" },
         {
@@ -243,7 +243,7 @@
           "additionalProperties": false,
           "properties": {
             "include": { "type": "array", "items": { "type": "string" } },
-            "exclude": { "type": "array", "items": { "type": "string" } }
+            "except_for": { "type": "array", "items": { "type": "string" } }
           }
         }
       ]
@@ -278,7 +278,7 @@
               "items": { "type": "string" },
               "description": "Globs ('*', '?', '[...]') matched against the room's full name, anchored at both ends, case-sensitively. Required unless the rule opts into DMs only."
             },
-            "exclude": {
+            "except_for": {
               "type": "array",
               "items": { "type": "string" },
               "description": "Evaluated after include, within this rule. An excluded room does NOT fall through to a later rule — this rule claimed it and then declined it."
