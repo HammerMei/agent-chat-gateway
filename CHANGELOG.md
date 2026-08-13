@@ -29,6 +29,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     rejected at config-load time with a clear "not implemented yet" error —
     the rule-matching engine that would give it meaning hasn't landed yet.
 
+### Removed
+- **BREAKING: `watchers[].session_id` (sticky sessions).** Setting it is now a
+  config error naming the replacement, rather than being silently ignored — every
+  field on a watcher entry is read with `.get()`, so a quiet removal would have
+  left the config loading, the session no longer pinned, and nothing said about it.
+  This was documented in `v0.5.1`, so **a config carrying it fails at startup after
+  upgrading.**
+
+  *Why it is gone rather than moved:* a pinned id names a session the backend is
+  free to expire (Claude Code's default `cleanupPeriodDays` is 30), after which the
+  watcher silently starts empty; and with a watcher created per discovered room,
+  one id in config cannot say which room it belongs to.
+
+  *Migration:* delete the field. To carry context into a session, have the agent
+  summarise its session to a file and list that file in `context_inject_files` —
+  see `docs/user-guide.md`'s Use Case 3. Session *continuity* across daemon
+  restarts needs no configuration and is unaffected: the runtime-assigned session
+  id is persisted in the state file and resumed. The two cross-watcher
+  duplicate-`session_id` load errors are gone with the field.
+
 ### Fixed
 - **File attachment uploads restored on Rocket.Chat 8.0+.** RC 8.0 removed
   the one-step `rooms.upload/{rid}` endpoint that `RocketChatREST.upload_file()`

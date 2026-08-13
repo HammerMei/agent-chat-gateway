@@ -261,15 +261,23 @@ That field has been removed, and setting it is now a config error. Two reasons:
   discovered, so a single id in config cannot say which room it belongs to.
 
 A handoff has neither problem: it is a file, so it outlives any session, and each
-watcher reads it on its own first turn.
+watcher reads it on its own session start.
 
 **Example: hand off a local session's context**
 
 ```bash
-# 1. In your existing local session, ask the agent to summarise itself to a file.
-claude -p "Summarise everything we have established in this session — decisions,
-constraints, open questions, and where we left off — into ./HANDOFF.md. Write it
-for another instance of yourself with no memory of this conversation."
+# 1. Resume the existing session and ask it to summarise itself to a file.
+#    `--resume <id>` (or `-c` for the most recent session) is required: a bare
+#    `claude -p` starts a NEW session, which has none of the context you want.
+#    Write to an ABSOLUTE path — step 2 resolves the same path relative to
+#    config.yaml, which is usually a different directory.
+claude --resume ses_abc123def456 -p "Summarise everything we have established in
+this session — decisions, constraints, open questions, and where we left off —
+into /Users/me/project/HANDOFF.md. Write it for another instance of yourself with
+no memory of this conversation."
+
+# Session ids are printed by `claude -p --output-format json`, and `claude -c -p`
+# resumes the most recent session without needing one.
 ```
 
 ```yaml
@@ -281,7 +289,7 @@ watchers:
     room: "@alice"
     agent: claude
     context_inject_files:
-      - ./HANDOFF.md
+      - /Users/me/project/HANDOFF.md
 ```
 
 ```bash
@@ -291,7 +299,9 @@ agent-chat-gateway start
 
 **Notes:**
 
-- `context_inject_files` paths are resolved relative to `config.yaml`'s directory.
+- `context_inject_files` paths are resolved relative to `config.yaml`'s directory, so
+  a relative path written from a project shell will not resolve — use an absolute
+  path, or write the handoff next to `config.yaml`.
 - Context files are re-read on every watcher start, so rewriting `HANDOFF.md` takes
   effect the next time the watcher starts. Run `agent-chat-gateway reset <watcher>`
   as well if you want the updated context to open a *fresh* conversation instead of
