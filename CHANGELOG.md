@@ -13,11 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Config schema groundwork for on-the-fly watchers** (see
   `docs/design/dynamic-watcher-design.md`) — purely additive, no runtime
   behavior change yet:
-  - `AgentConfig.session_idle_days` / `session_expire_days` — optional TTL
-    settings for the upcoming idle/expire watcher lifecycle, inheritable via
-    `agent_templates:`. Both default to `None` (feature off). Validated at
-    load time: positive integers, and `session_idle_days` must be strictly
-    less than `session_expire_days` when both are set.
+  - `session_idle_days` / `session_expire_days` — optional TTL settings for the
+    upcoming idle/expire watcher lifecycle, on a **watcher rule**, so two rules
+    sharing one agent can differ. Both default to `None` (feature off).
+    Validated at load time: positive integers, and `session_idle_days` must be
+    strictly less than `session_expire_days` when both are set. They briefly
+    lived on `AgentConfig` earlier in this same unreleased cycle; setting either
+    on an agent is now a load error naming the new home.
   - `AgentBackend.typical_session_retention_days() -> int | None` — lets a
     backend declare its own session-retention limit. `ClaudeBackend` returns
     `30` (Claude Code's default `cleanupPeriodDays`); `OpenCodeBackend`

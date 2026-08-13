@@ -103,6 +103,13 @@ _MISSING_FIELD = object()
 # same as `working_directory` — so this map only ever needs to cover known
 # types; an unrecognized `type` value surfaces at runtime instead
 # (gateway/service.py's "Unknown agent type" check), unchanged from before.
+# Keys that used to live on an agent and now live on a watcher rule. Reported as a
+# hard error naming the new home — see the check in _parse_one_agent().
+_MOVED_TO_RULE_KEYS: frozenset[str] = frozenset({
+    "session_idle_days",
+    "session_expire_days",
+})
+
 _AGENT_TYPE_DEFAULT_COMMAND: dict[str, str] = {
     "claude": "claude",
     "opencode": "opencode",
@@ -855,52 +862,22 @@ def _parse_one_agent(
         agent_type, ""
     )
 
-    # session_idle_days / session_expire_days: on-the-fly watcher lifecycle
-    # (docs/design/dynamic-watcher-design.md). Both optional; None means the
-    # idle/expire lifecycle is off. When both are set, idle must be strictly
-    # less than expire — otherwise a watcher jumps straight from active to
-    # gone, skipping the back-burner state entirely. This only covers the
-    # config-level half of that invariant: the effective expiry is actually
-    # min(session_expire_days, the agent backend's own
-    # typical_session_retention_days()), and that half can't be checked here
-    # since this loader only ever sees AgentConfig, never a live AgentBackend
-    # instance — the runtime code that consumes these values (not yet built)
-    # must re-check against the effective value.
-    session_idle_days = agent_raw.get("session_idle_days")
-    if session_idle_days is not None:
-        if isinstance(session_idle_days, bool) or not isinstance(session_idle_days, int):
+    # session_idle_days / session_expire_days moved from the agent to the watcher
+    # rule (design §5.4). A leftover key here is a hard, actionable error rather
+    # than a silent behaviour change — the same treatment `_REMOVED_DEFAULTS_KEYS`
+    # gives a retired top-level block, and for the same reason: the value would
+    # otherwise be read, ignored, and the lifecycle the operator asked for would
+    # never happen. Checked here rather than at the top level so collect_config()
+    # attributes it to the agent that carries it; an inherited value from an
+    # `agent_templates:` entry is caught too, since `agent_raw` is already merged.
+    for moved_key in _MOVED_TO_RULE_KEYS:
+        if moved_key in agent_raw:
             raise ValueError(
-                f"Agent '{agent_name}': session_idle_days must be an integer "
-                f"(got {type(session_idle_days).__name__})."
+                f"Agent '{agent_name}': '{moved_key}' is no longer set on an agent — "
+                f"it moved to the watcher rule that uses the agent, so two rules "
+                f"sharing one agent can have different lifecycles. Move it into the "
+                f"'watchers:' entry. See docs/design/dynamic-watcher-design.md."
             )
-        if session_idle_days <= 0:
-            raise ValueError(
-                f"Agent '{agent_name}': session_idle_days must be a positive "
-                f"integer (got {session_idle_days})."
-            )
-    session_expire_days = agent_raw.get("session_expire_days")
-    if session_expire_days is not None:
-        if isinstance(session_expire_days, bool) or not isinstance(session_expire_days, int):
-            raise ValueError(
-                f"Agent '{agent_name}': session_expire_days must be an integer "
-                f"(got {type(session_expire_days).__name__})."
-            )
-        if session_expire_days <= 0:
-            raise ValueError(
-                f"Agent '{agent_name}': session_expire_days must be a positive "
-                f"integer (got {session_expire_days})."
-            )
-    if (
-        session_idle_days is not None
-        and session_expire_days is not None
-        and session_idle_days >= session_expire_days
-    ):
-        raise ValueError(
-            f"Agent '{agent_name}': session_idle_days ({session_idle_days}) must "
-            f"be strictly less than session_expire_days ({session_expire_days}) — "
-            "otherwise a watcher would jump straight from active to expired, "
-            "skipping the idle back-burner state entirely."
-        )
 
     agent_cfg = AgentConfig(
         name=agent_name,
@@ -929,8 +906,6 @@ def _parse_one_agent(
             timeout=perm_raw.get("timeout", 300),
             skip_owner_approval=perm_raw.get("skip_owner_approval", False),
         ),
-        session_idle_days=session_idle_days,
-        session_expire_days=session_expire_days,
     )
 
     # Validate that agent.timeout > permissions.timeout when permissions are

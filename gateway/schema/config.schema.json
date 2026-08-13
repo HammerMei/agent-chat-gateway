@@ -214,17 +214,7 @@
           "minimum": 1,
           "description": "Must be greater than permissions.timeout."
         },
-        "permissions": { "$ref": "#/$defs/permissions" },
-        "session_idle_days": {
-          "type": ["integer", "null"],
-          "minimum": 1,
-          "description": "Days with no message before a watcher's runtime object is dropped (session kept). Omit, or set explicitly to null to suppress an inherited value, for no idle lifecycle. Must be strictly less than session_expire_days when both are set. See docs/design/dynamic-watcher-design.md."
-        },
-        "session_expire_days": {
-          "type": ["integer", "null"],
-          "minimum": 1,
-          "description": "Days with no message before the session itself is dropped too. Omit, or set explicitly to null to suppress an inherited value, for no expiry. See docs/design/dynamic-watcher-design.md."
-        }
+        "permissions": { "$ref": "#/$defs/permissions" }
       }
     },
     "watcher": {
