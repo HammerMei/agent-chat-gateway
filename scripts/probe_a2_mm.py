@@ -8,12 +8,26 @@ proves it, and the distinction that matters for routing is membership vs
 readability — if delivery follows readability, a membership gate is needed and
 Mattermost has no per-message signal for it.
 
+Case 2 is preceded by a PREFLIGHT using the probe's own credentials, because
+without it "no event arrived" is ambiguous — a channel the probe cannot read
+looks exactly like one whose delivery is membership-gated. The preflight asserts
+the probe really can read the channel (channel GET, public listing, posts) and
+really is not a member (absent from its joined list, plus an admin-token
+membership lookup returning 404; the probe's own lookup returns 403, since a
+non-member cannot query even its own row).
+
 Cases:
   1. post in a channel the probe user IS a member of  -> expect delivered
   2. post in a PUBLIC channel the probe user is NOT in -> the question
   3. post BY the probe user itself                     -> own-message echo
   4. add a user to a channel                           -> system message
   5. DM to the probe user                              -> DM delivery
+  6. join the probe to the case-2 channel, post again -> isolates the variable
+
+Case 6 exists because cases 1 and 2 differ in two ways at once (different
+channel AND different membership), so alone they cannot rule out a
+channel-specific quirk. Case 6 changes only the membership row, then removes
+the probe again so the script stays re-runnable.
 
 Also records, per event, whether `data.channel_name`, `data.channel_type` and
 `broadcast.team_id` are populated — if they are, routing can skip a REST
@@ -88,6 +102,28 @@ class MM:
         r.raise_for_status()
         return r.json()["id"]
 
+    async def channel_type(self, channel_id: str) -> tuple[int, str]:
+        r = await self.c.get(f"channels/{channel_id}", headers=self.h)
+        return r.status_code, r.json().get("type", "") if r.status_code == 200 else ""
+
+    async def membership_status(self, channel_id: str, user_id: str) -> int:
+        r = await self.c.get(f"channels/{channel_id}/members/{user_id}", headers=self.h)
+        return r.status_code
+
+    async def posts_status(self, channel_id: str) -> int:
+        r = await self.c.get(f"channels/{channel_id}/posts", headers=self.h)
+        return r.status_code
+
+    async def public_channel_names(self, team_id: str) -> set[str]:
+        r = await self.c.get(f"teams/{team_id}/channels", headers=self.h)
+        r.raise_for_status()
+        return {c["name"] for c in r.json()}
+
+    async def joined_channel_names(self, team_id: str) -> set[str]:
+        r = await self.c.get(f"users/{self.uid}/teams/{team_id}/channels", headers=self.h)
+        r.raise_for_status()
+        return {c["name"] for c in r.json()}
+
     async def close(self) -> None:
         await self.c.aclose()
 
@@ -111,6 +147,41 @@ async def driver(a, ready: asyncio.Event) -> None:
     log(f"  -> {await admin.post(member_ch, 'A2 case1 member-channel')}")
     await asyncio.sleep(3)
 
+    # Preflight for CASE 2, using the PROBE's own credentials. Without it, "no
+    # event arrived" is ambiguous: a channel the probe cannot read and one whose
+    # delivery is membership-gated look identical from the listener's side. The
+    # conclusion in the design doc's §6.2 rests on this distinction, so the
+    # fixture is asserted rather than assumed.
+    log(f"PREFLIGHT for CASE 2 on '{a.outside_channel}':")
+    ch_st, ch_type = await probe.channel_type(outside_ch)
+    log(f"  probe GET channel        -> {ch_st} type={ch_type!r}   (want 200 / 'O')")
+    posts_st = await probe.posts_status(outside_ch)
+    log(f"  probe GET channel posts  -> {posts_st}            (want 200: content really is readable)")
+    try:
+        in_public = a.outside_channel in await probe.public_channel_names(tid)
+        in_joined = a.outside_channel in await probe.joined_channel_names(tid)
+        listed = True
+    except httpx.HTTPStatusError as e:
+        # A public channel is only readable to team members; if the probe is not
+        # on the team, that is the fixture being wrong, not a finding.
+        log(f"  channel listing failed  -> {e.response.status_code} — is the probe a member of team '{a.team}'?")
+        in_public = in_joined = False
+        listed = False
+    if listed:
+        log(f"  in team's public list    -> {in_public}         (want True)")
+        log(f"  in probe's joined list   -> {in_joined}        (want False)")
+    own_ms = await probe.membership_status(outside_ch, probe.uid)
+    admin_ms = await admin.membership_status(outside_ch, probe.uid)
+    log(f"  probe's own membership   -> {own_ms}            (403 expected: a non-member cannot query even its own row)")
+    log(f"  admin-token membership   -> {admin_ms}            (want 404 — this is the load-bearing non-membership proof)")
+
+    if (ch_st == 200 and ch_type == "O" and posts_st == 200
+            and listed and in_public and not in_joined and admin_ms == 404):
+        log("  preflight OK: readable, and genuinely not a member")
+    else:
+        log("  *** PREFLIGHT FAILED — CASE 2 cannot distinguish membership gating "
+            "from plain inaccessibility. Fix the fixture before trusting it. ***")
+
     log(f"CASE 2: admin posts in PUBLIC '{a.outside_channel}' (probe NOT member) ch={outside_ch}")
     log(f"  -> {await admin.post(outside_ch, 'A2 case2 outside-channel')}")
     await asyncio.sleep(3)
@@ -129,6 +200,19 @@ async def driver(a, ready: asyncio.Event) -> None:
     dm = await admin.dm_channel(admin.uid, probe_uid)
     log(f"  -> dm ch={dm} post: {await admin.post(dm, 'A2 case5 direct-message')}")
     await asyncio.sleep(3)
+
+    # CASE 6 isolates the variable. Cases 1 and 2 differ in two ways at once —
+    # different channels AND different membership — so on their own they cannot
+    # rule out a channel-specific quirk. Joining the *same* channel that was
+    # silent in case 2 and posting again changes only the membership row.
+    log(f"CASE 6: join probe to the case-2 channel, then post there again ch={outside_ch}")
+    log(f"  -> add probe: {await admin.add_member(outside_ch, probe_uid)}")
+    await asyncio.sleep(2)
+    log(f"  -> post: {await admin.post(outside_ch, 'A2 case6 same-channel-after-join')}")
+    await asyncio.sleep(3)
+    # Restore the fixture so the script is re-runnable: case 2 requires the probe
+    # to be a non-member again.
+    log(f"  -> cleanup, remove probe: {await admin.remove_member(outside_ch, probe_uid)}")
 
     await admin.close()
     await probe.close()

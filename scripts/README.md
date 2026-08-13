@@ -22,6 +22,7 @@ posting.
 | `probe_a1_rc_followup.py` | Are system messages and DMs delivered over that subscription, and does the second `sub` parameter change anything? |
 | `probe_a2_mm.py` | Does Mattermost's websocket deliver posts for channels the account can merely *read*, or only ones it belongs to? Are channel name/type/team id present on the event? |
 | `probe_group_dm_and_teams.py` | How does each platform represent a **group** DM, and does a Mattermost socket carry channels from a *second* team the account belongs to? Takes `mm` or `rc` as its first argument. |
+| `probe_rc_dm_immutability.py` | Can a Rocket.Chat 1:1 DM gain a member *in place*, keeping its room id? Decides whether the room-kind cache needs an invalidation path. Needs no websocket, and runs as the admin account on purpose — a route refused to admin on room-type grounds is refused to everyone. |
 
 They deliberately do **not** reuse the connectors in `gateway/connectors/`:
 the point is to observe the wire frame before any of our own parsing can

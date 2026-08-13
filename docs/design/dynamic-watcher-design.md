@@ -155,9 +155,20 @@ therefore:
    message buffered, and classify there.
 3. Match rules against the now-known kind, then create or drop.
 
-**Cache the kind per room id.** A room's kind does not change, with one
-exception: a 1:1 DM that gains members becomes a group DM, which must
-invalidate rather than be served stale (§6.4).
+**Cache the kind per room id, and it needs no invalidation.** A room's kind does
+not change, and the obvious exception — a 1:1 DM that gains a member and becomes
+a group DM — is not reachable on Rocket.Chat: the server refuses to add a
+participant to a type-`d` room at all, and a DM with a different member set is a
+*different room with its own id* (§6.4). The cache therefore cannot go stale, in
+either direction.
+
+This is worth stating explicitly because the alternative would have been
+awkward: ordinary frames for a DM carry only type `d`, so nothing in the message
+stream would signal that a cached kind had become wrong, and the one event that
+would — a participant change — arrives as a system message, which step 1 above
+rejects before classification ever runs. If a future server version does allow
+in-place growth, that reject is the point an invalidation would have to hook
+ahead of.
 
 #### One dedup transaction, for every outcome
 
@@ -1714,7 +1725,12 @@ what makes §5.1's corruption reachable.
 
 Both connector assumptions were resolved against a live Rocket.Chat and
 Mattermost instance. Reproducible with `scripts/probe_a1_rc.py`,
-`scripts/probe_a1_rc_followup.py` and `scripts/probe_a2_mm.py`.
+`scripts/probe_a1_rc_followup.py`, `scripts/probe_a2_mm.py`,
+`scripts/probe_group_dm_and_teams.py` and
+`scripts/probe_rc_dm_immutability.py` — kept so each finding can be re-checked
+against a different server version rather than trusted indefinitely.
+
+Versions tested: **Rocket.Chat 8.5.1** and **Mattermost 11.7.0**.
 
 ### 6.1 Rocket.Chat: `__my_messages__` works, and carries what routing needs
 
@@ -1742,11 +1758,24 @@ for rooms the account never per-room-subscribed to. Frame shape:
 
 ### 6.2 Mattermost: delivery tracks membership, not readability
 
-The docstring claim holds. With the probe account a **non-member** of a public
-channel it could nonetheless read — membership lookup returning 404 while the
-channel appeared in its own visible channel list — a post in that channel
-produced **no `posted` event at all**, while posts in a channel it belonged to
-arrived normally.
+The docstring claim holds, verified with an explicit preflight so that "no event"
+cannot be confused with "no access".
+
+Readability was established three ways with the probe's **own** token: `GET` on
+the channel returned 200 with `type: "O"`, the channel appeared in the team's
+public channel list, and the channel's posts were readable. Non-membership was
+established by the channel being absent from the probe's own joined-channel list
+and by an **admin-token** membership lookup returning 404 — note that the
+probe's own membership lookup returns **403**, since a non-member cannot query
+even its own membership row, which is why the admin-token check is the
+load-bearing one.
+
+Against that setup, a post in the readable-but-not-joined channel produced **no
+`posted` event at all** for 12s, a post to a channel the probe belonged to
+arrived in ~10ms as a positive control, and — the control that isolates the
+variable — adding the probe to that *same* channel and posting again delivered
+in ~10ms. Only the membership row changed between silence and delivery, which
+rules out a channel-specific quirk.
 
 | Observed | Design consequence |
 |---|---|
@@ -1802,6 +1831,24 @@ indistinguishable from a 1:1 **from the frame alone**: the participant list
 exists only over REST, so classifying the two requires a lookup per DM room
 (cacheable, but a lookup).
 
+**A Rocket.Chat DM's member set is immutable, which is what makes that cache
+safe.** On 8.5.1, every route for adding a participant to an existing type-`d`
+room is refused on the grounds of the room *type* rather than permissions —
+`addUsersToRoom`, the route the web UI itself uses, returns
+`error-cant-invite-for-direct-room`; `channels.invite` and `groups.invite` return
+`error-room-not-found` because a DM is neither; `im.invite` does not exist.
+Removal is refused the same way, so the set cannot shrink either. Instead,
+`im.create` is idempotent *per member set*: asking for a different set returns a
+**different room id**, and the original 1:1 keeps its own id with two members.
+A group DM is therefore a separate room, never a mutated 1:1 — which is why the
+kind cache in §2.2 needs no invalidation path.
+
+Two incidental facts, both of which would be easy to assume wrongly: DM room ids
+on 8.5.1 are ordinary 24-character ObjectIds, **not** the concatenated-sorted-user-id
+form some older material describes, so participants cannot be recovered from the
+id; and the member cap is a server setting (`DirectMesssage_maxUsers`, 8 on the
+lab).
+
 **Why the distinction has to be kept anyway.** It is not about display names.
 `require_mention` is skipped entirely when a room's type is `dm` — on both
 platforms — so a group DM classified as a plain DM makes the agent answer
@@ -1838,5 +1885,13 @@ None of these gate the design.
   membership changes.** It is stable across the observed session, and its
   construction suggests it is derived from the member set — which would mean
   adding a member yields a *different* channel entirely rather than mutating
-  this one. Worth confirming before relying on it as a durable key, though
-  `room_id` is the actual key regardless (§2.3).
+  this one. That is exactly how Rocket.Chat behaves (§6.4), which makes it the
+  likely answer here too, but it is inference rather than observation. Worth
+  confirming before relying on it as a durable key, though `room_id` is the
+  actual key regardless (§2.3).
+- **Whether Rocket.Chat's refusal to mutate a DM's member set holds on other
+  versions.** Established on 8.5.1, at the API level, and the refusals are on
+  room type rather than on permissions — so they apply to any caller, including
+  an administrator. The kind cache in §2.2 depends on this. If a later version
+  permits in-place growth, the cache needs the invalidation hook that section
+  identifies; nothing else in the design changes.
