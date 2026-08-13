@@ -152,7 +152,20 @@ decidable, rather than one promise that cannot be kept:
   exact.
 - **Exact warnings**, decidable for globs: one rule fully shadowed by an
   earlier one (glob subsumption is decidable for this syntax), and a DM opt-in
-  shadowed by an earlier rule that already claimed that class (§2.7).
+  shadowed by an earlier rule that already claimed that class (§2.7). A rule can
+  reach rooms in three independent ways — by name, and by each DM class — so a
+  hybrid rule can lose one reach and stay live for the others; each dead reach is
+  its own warning, since a rule whose DM opt-in is dead looks perfectly healthy
+  from its patterns alone.
+
+  **An earlier rule's blocking language is its `include`, not its `include`
+  minus its `except_for`** — the one part of this that is easy to get backwards.
+  Because `except_for` produces a decline that halts routing rather than falling
+  through, a room the earlier rule *declines* never reaches a later rule either.
+  An earlier rule therefore shadows everything its `include` matches, whether it
+  goes on to claim or decline it, and its own `except_for` has no bearing on what
+  it shadows. A deny rule shadows later rules for its rooms completely, which is
+  exactly what it is for.
 - **Observational only**: a rule that has matched zero rooms. This is *not*
   reported as a dead rule, because it is indistinguishable from a correct rule
   whose rooms have simply been quiet — `list` shows the count and lets the

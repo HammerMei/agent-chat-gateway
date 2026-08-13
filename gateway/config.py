@@ -89,6 +89,11 @@ TEMPLATE_FORBIDDEN_KEYS: dict[str, frozenset[str]] = {
 # not opt-in — and missed this loader, which stayed hardcoded at enabled=False).
 _HH_DEFAULTS = HistoryHandoffConfig()
 
+# Distinguishes "key absent" from "key present with a falsy value". Needed
+# wherever an explicit `null` means something different from omission, and
+# wherever a falsy non-string must be rejected rather than read as "not set".
+_MISSING_FIELD = object()
+
 # Per-type fallback for `command` when an agent (or its template) sets `type`
 # but not `command`. Deliberately NOT a single hardcoded string (e.g. always
 # "claude") — that was the other half of the bug _REMOVED_DEFAULTS_KEYS above
@@ -1407,12 +1412,27 @@ def _parse_one_watcher_rule(
                 "later rule sees it."
             )
 
-    watcher_connector = wc.get("connector", "")
-    if watcher_connector and not isinstance(watcher_connector, str):
+    # Type-check before any truthiness test, or falsy non-strings
+    # (`connector: false`, `0`, `[]`) skip the check, read as falsy, and fall
+    # through to connectors[0] — silently binding the rule to the wrong account.
+    # `null` and an absent key both legitimately mean "use the default", since
+    # `connector:` is permitted in a `watcher_templates:` entry and an explicit
+    # null is how an entry declines an inherited one.
+    #
+    # The static parser has the same two value checks; they are fixed separately
+    # there (that copy is reachable in a released version, this one is not yet).
+    # De-duplicating them is deliberately left until that fix reaches this branch,
+    # rather than entangling the two changes.
+    raw_connector = wc.get("connector", _MISSING_FIELD)
+    if raw_connector is _MISSING_FIELD or raw_connector is None:
+        watcher_connector = ""
+    elif not isinstance(raw_connector, str):
         raise ValueError(
             f"Watcher rule at index {index}: 'connector' must be a string "
-            f"(got {type(watcher_connector).__name__})."
+            f"(got {type(raw_connector).__name__})."
         )
+    else:
+        watcher_connector = raw_connector
     if watcher_connector and watcher_connector not in connector_names:
         raise ValueError(
             f"Watcher rule at index {index} references unknown connector "
@@ -1446,7 +1466,19 @@ def _parse_one_watcher_rule(
             f"'session_expire_days' ({expire_days})."
         )
 
-    hh_raw = wc.get("history_handoff", {}) or {}
+    # `or {}` hid two mistakes: a truthy non-mapping raised AttributeError on
+    # `.get` below (and collect_config only catches ValueError, so one bad rule
+    # would abort the whole validation pass), while `history_handoff: false` was
+    # replaced by `{}` — the defaults — so writing false to disable it enabled it.
+    hh_raw = wc.get("history_handoff")
+    if hh_raw is None:
+        hh_raw = {}
+    elif not isinstance(hh_raw, Mapping):
+        raise ValueError(
+            f"Watcher rule at index {index}: 'history_handoff' must be a mapping "
+            f"(got {type(hh_raw).__name__}). To turn it off, set "
+            "'history_handoff: {enabled: false}'."
+        )
     history_handoff = HistoryHandoffConfig(
         enabled=hh_raw.get("enabled", _HH_DEFAULTS.enabled),
         fetch_count=hh_raw.get("fetch_count", _HH_DEFAULTS.fetch_count),
@@ -1468,49 +1500,91 @@ def _parse_one_watcher_rule(
     )
 
 
-def find_shadowed_rules(rules: list[WatcherRule]) -> list[tuple[WatcherRule, WatcherRule]]:
-    """Find rules that can never fire because earlier rules already claim them.
+@dataclass(frozen=True)
+class ShadowFinding:
+    """One reach of one rule that an earlier rule has already taken.
 
-    Returns `(shadowed, shadowed_by)` pairs. Under first-match precedence a rule
-    whose whole language is already claimed by earlier rules on the same
-    connector is dead config — almost always a mistake in ordering.
+    `scope` says how much of the rule is dead, because a rule can reach rooms in
+    up to three independent ways and lose only some of them:
 
-    Reported as a warning, never an error, and deliberately under-reported. Two
-    cases are passed over rather than guessed at:
-
-    * A rule carrying `except_for` patterns cannot *shadow* a later one, because the
-      excluded slice is precisely what it does not claim. Computing the
-      difference of two glob unions is where exactness would start costing more
-      than the warning is worth.
-    * A shadow formed only by **several** earlier rules together — `a*` plus
-      `b*` covering `[ab]*` — is not reported, even though `union_subsumes` could
-      prove it. Comparing one earlier rule at a time matches §2.1's wording
-      ("fully shadowed by an earlier one") and keeps the warning pointed at a
-      single rule the operator can go and read. A vaguer "these four rules
-      collectively cover this one" is worth less than silence.
-
-    Under-reporting is the right direction here: a missed warning costs nothing,
-    while a false one sends someone hunting a rule that works.
+    * `"rule"` — every reach it has is already claimed; the rule can never fire.
+    * `"named"` / `"direct"` / `"group_direct"` — that one reach is dead while the
+      rule remains live for the others. Reported separately because a hybrid rule
+      whose DM opt-in is dead looks perfectly healthy otherwise, and §2.1 asks for
+      a warning when an earlier rule already claimed a DM class.
     """
-    out: list[tuple[WatcherRule, WatcherRule]] = []
+
+    rule: WatcherRule
+    shadowed_by: WatcherRule
+    scope: str
+
+
+def find_shadowed_rules(rules: list[WatcherRule]) -> list[ShadowFinding]:
+    """Find reaches that can never fire because an earlier rule already takes them.
+
+    Under first-match precedence a rule only ever sees rooms no earlier rule
+    stopped, so anything already taken upstream is dead config — nearly always a
+    mistake in ordering.
+
+    **An earlier rule's blocking language is its `include`, not its
+    `include` minus its `except_for`.** This is the part that is easy to get
+    backwards. `except_for` produces `DECLINED`, which halts routing rather than
+    falling through (§2.1) — so a room the earlier rule declines never reaches a
+    later rule either. An earlier rule therefore blocks everything its `include`
+    matches, whether it goes on to claim or decline it, and its own `except_for`
+    is irrelevant to what it shadows. A deny rule (`include: [X]`,
+    `except_for: [X]`) shadows later rules for `X` completely, which is precisely
+    its purpose.
+
+    DM classes are claimed by flag rather than by pattern, so an earlier rule
+    takes this one's DM reach only by opting into the same class.
+
+    Reported as warnings, never errors, and still deliberately under-reported in
+    one case: a shadow formed only by **several** earlier rules together — `a*`
+    plus `b*` covering `[ab]*` — is not reported, even though `union_subsumes`
+    could prove it, because comparing one earlier rule at a time keeps each
+    warning pointed at a single rule someone can go and read. A vaguer "these four
+    rules collectively cover this one" is worth less than silence. Under-reporting
+    is the right direction: a missed warning costs nothing, a false one sends
+    someone hunting a rule that works.
+    """
+    out: list[ShadowFinding] = []
     for i, rule in enumerate(rules):
-        for earlier in rules[:i]:
-            if earlier.connector != rule.connector:
-                continue
-            if earlier.rooms.except_for:
-                continue
-            # DM classes are claimed by flag, so an earlier rule shadows this
-            # one's DM reach only by opting into the same class.
-            if rule.rooms.direct and not earlier.rooms.direct:
-                continue
-            if rule.rooms.group_direct and not earlier.rooms.group_direct:
-                continue
-            if rule.rooms.include and not union_subsumes(
-                earlier.rooms.include, rule.rooms.include
-            ):
-                continue
-            out.append((rule, earlier))
-            break
+        earlier_rules = [e for e in rules[:i] if e.connector == rule.connector]
+
+        # Which reaches this rule has, and the first earlier rule taking each.
+        blockers: dict[str, WatcherRule] = {}
+        if rule.rooms.include:
+            blockers["named"] = next(
+                (
+                    e
+                    for e in earlier_rules
+                    if e.rooms.include
+                    and union_subsumes(e.rooms.include, rule.rooms.include)
+                ),
+                None,
+            )
+        if rule.rooms.direct:
+            blockers["direct"] = next(
+                (e for e in earlier_rules if e.rooms.direct), None
+            )
+        if rule.rooms.group_direct:
+            blockers["group_direct"] = next(
+                (e for e in earlier_rules if e.rooms.group_direct), None
+            )
+
+        if not blockers:  # unreachable post-validation, but do not crash on it
+            continue
+        if all(b is not None for b in blockers.values()):
+            # Every reach is taken, so the rule as a whole is dead. Attribute it
+            # to the named blocker when there is one, since that is the reach an
+            # operator is most likely scanning for.
+            by = blockers.get("named") or next(iter(blockers.values()))
+            out.append(ShadowFinding(rule=rule, shadowed_by=by, scope="rule"))
+        else:
+            for scope, by in blockers.items():
+                if by is not None:
+                    out.append(ShadowFinding(rule=rule, shadowed_by=by, scope=scope))
     return out
 
 

@@ -279,14 +279,30 @@ def _sentinel(used: set[str]) -> str:
 def _shared_alphabet(patterns: Iterable[RoomPattern]) -> list[str] | None:
     """The finite alphabet a product search over these patterns can use.
 
-    Returns `None` when it would be too large to be worth building. Every
-    character no pattern mentions behaves identically — it can only be consumed
-    by `?`, `*` or a negated class — so one sentinel stands for all of them.
+    Returns `None` when no trustworthy alphabet exists, which both callers treat
+    as "cannot decide, report nothing". Every character no pattern mentions
+    behaves identically — it can only be consumed by `?`, `*` or a negated class —
+    so one sentinel stands for all of them.
+
+    Two refusals:
+
+    * The set is too large to be worth expanding.
+    * Some character is a **combining mark**. The product search concatenates
+      alphabet characters into candidate witnesses, but `matches()` compares
+      NFC-normalised names, so a witness ending in a combining mark is not the
+      string the runtime would ever see: `"e" + U+0301` folds to `é`, one
+      character rather than two. Searching that space produces answers about
+      strings that cannot exist as room names, so no answer is given instead.
+      This costs nothing in practice — both platforms build room names as slugs,
+      and a pattern only reaches here with a standalone combining mark if one was
+      written without a base character to attach to.
     """
     used: set[str] = set()
     for p in patterns:
         used |= p._alphabet_members()
     if len(used) > _MAX_CLASS_MEMBERS:
+        return None
+    if any(unicodedata.combining(ch) for ch in used):
         return None
     return sorted(used) + [_sentinel(used)]
 
@@ -305,6 +321,14 @@ def union_intersects(
     accepts. On hitting the bound this returns `True`, the opposite direction to
     `union_subsumes`, because both defaults mean "do not report anything": here a
     claimed intersection is the non-finding.
+
+    The automaton walks raw code points while `matches()` compares NFC-normalised
+    names, so the two disagree when a metacharacter can straddle a base character
+    and a combining mark — the search would offer `"e" + U+0301` as a shared
+    witness of `e?` and `?́`, while matching folds that to the single character
+    `é`, which neither pattern accepts. `_shared_alphabet` refuses to build an
+    alphabet in that case, so the answer here becomes the conservative one rather
+    than a wrong one.
     """
     left = list(left)
     right = list(right)

@@ -226,6 +226,34 @@ class TestMatchingAgainstAnIndependentOracle(unittest.TestCase):
         self.assertEqual(checked, expected_patterns * expected_subjects)
 
 
+class TestCombiningMarksAreRefusedRatherThanMisanswered(unittest.TestCase):
+    """The automaton walks raw code points; `matches()` compares NFC-normalised
+    names. They disagree when a metacharacter straddles a base character and a
+    combining mark, so no alphabet is built and both functions fall back to their
+    "report nothing" answer instead of a wrong one."""
+
+    ACUTE = "\u0301"
+
+    def test_intersection_declines_to_answer(self):
+        # "e" + combining acute would be a shared witness on raw code points, but
+        # NFC folds it to a single character that neither pattern accepts.
+        got = union_intersects([RoomPattern("e?")], [RoomPattern("?" + self.ACUTE)])
+        self.assertTrue(got, "must return the do-not-report value, not a wrong False")
+
+    def test_subsumption_declines_to_answer(self):
+        got = union_subsumes([RoomPattern("e?")], [RoomPattern("?" + self.ACUTE)])
+        self.assertFalse(got, "must return the do-not-report value")
+
+    def test_patterns_without_combining_marks_are_still_decided_exactly(self):
+        self.assertFalse(union_intersects([RoomPattern("eng-*")], [RoomPattern("ops-*")]))
+        self.assertTrue(union_intersects([RoomPattern("eng-*")], [RoomPattern("*-backend")]))
+
+    def test_a_composed_accent_is_fine_because_it_is_one_character(self):
+        """Only a *standalone* combining mark trips the guard — a normal accented
+        name composes to a single character at compile time."""
+        self.assertTrue(union_intersects([RoomPattern("caf\u00e9")], [RoomPattern("caf?")]))
+
+
 class TestSubsumptionKnownCases(unittest.TestCase):
     def _subsumes(self, outer: list[str], inner: list[str]) -> bool:
         return union_subsumes(

@@ -327,6 +327,47 @@ class TestParserHardErrors(unittest.TestCase):
         self._err(["not", "a", "mapping"], "must be a mapping")
 
 
+class TestParserScalarValidation(unittest.TestCase):
+    """Malformed scalars must be load errors, not silent defaults.
+
+    Both of these are copies of checks in the static parser, fixed separately
+    there because that copy is reachable in a released version and this one is
+    not yet."""
+
+    def _err(self, entry, needle):
+        with self.assertRaises(ValueError) as cm:
+            parse(entry)
+        self.assertIn(needle, str(cm.exception))
+        return str(cm.exception)
+
+    def test_a_falsy_non_string_connector_is_rejected_not_defaulted(self):
+        """These skipped a truthiness-guarded type check and then bound the rule
+        to connectors[0] — silently, to the wrong account."""
+        for bad in (False, 0, [], {}):
+            with self.subTest(bad=bad):
+                self._err({**MINIMAL, "connector": bad}, "'connector' must be a string")
+
+    def test_null_connector_defaults_like_an_absent_one(self):
+        """`connector:` is legal in a watcher_templates entry, so explicit null is
+        how a rule declines an inherited one."""
+        self.assertEqual(parse({**MINIMAL, "connector": None}).connector, "mm-home")
+
+    def test_a_non_mapping_history_handoff_is_rejected(self):
+        for bad in (True, [1], "yes"):
+            with self.subTest(bad=bad):
+                msg = self._err({**MINIMAL, "history_handoff": bad},
+                                "'history_handoff' must be a mapping")
+                self.assertIn("enabled: false", msg)
+
+    def test_history_handoff_false_does_not_silently_enable_it(self):
+        """`false` used to be replaced by {}, which means the defaults — and
+        enabled defaults to True, so it turned the feature on."""
+        self._err({**MINIMAL, "history_handoff": False}, "must be a mapping")
+
+    def test_null_history_handoff_uses_defaults(self):
+        self.assertTrue(parse({**MINIMAL, "history_handoff": None}).history_handoff.enabled)
+
+
 class TestTheDenyIdiom(unittest.TestCase):
     """Including a room and excluding it is how you blackhole it.
 
@@ -362,88 +403,127 @@ class TestTheDenyIdiom(unittest.TestCase):
 
 
 class TestShadowDetection(unittest.TestCase):
+    def _found(self, rules):
+        return [(f.rule.name, f.shadowed_by.name, f.scope) for f in find_shadowed_rules(rules)]
+
     def test_a_later_narrower_rule_is_shadowed(self):
-        a = rule("broad", include=["eng-*"])
-        b = rule("narrow", include=["eng-backend"])
-        self.assertEqual(find_shadowed_rules([a, b]), [(b, a)])
+        a, b = rule("broad", include=["eng-*"]), rule("narrow", include=["eng-backend"])
+        self.assertEqual(self._found([a, b]), [("narrow", "broad", "rule")])
 
     def test_order_matters(self):
-        a = rule("broad", include=["eng-*"])
-        b = rule("narrow", include=["eng-backend"])
-        self.assertEqual(find_shadowed_rules([b, a]), [])
+        a, b = rule("broad", include=["eng-*"]), rule("narrow", include=["eng-backend"])
+        self.assertEqual(self._found([b, a]), [])
 
     def test_disjoint_rules_are_fine(self):
         self.assertEqual(
-            find_shadowed_rules([rule("a", include=["eng-*"]), rule("b", include=["ops-*"])]),
-            [],
+            self._found([rule("a", include=["eng-*"]), rule("b", include=["ops-*"])]), []
         )
-
-    def test_a_shadow_formed_only_by_a_union_is_not_reported(self):
-        """A documented, deliberate gap rather than an oversight.
-
-        `[ab]*` really is covered by `a*` together with `b*`, and the engine can
-        prove it — `union_subsumes` takes a union on the outer side precisely so
-        that it can. The check here compares against one earlier rule at a time
-        anyway, matching §2.1's wording ("fully shadowed by an earlier one") and
-        keeping the warning's attribution to a single named rule an operator can
-        go and look at. Under-reporting is the chosen posture for this check, so
-        the union case is silence rather than a vaguer message."""
-        a = rule("a", include=["a*"])
-        b = rule("b", include=["b*"])
-        c = rule("c", include=["[ab]*"])
-        self.assertEqual(find_shadowed_rules([a, b, c]), [])
-
-    def test_but_a_single_earlier_rule_that_covers_it_is_reported(self):
-        a = rule("a", include=["[ab]*"])
-        c = rule("c", include=["a*"])
-        self.assertEqual(find_shadowed_rules([a, c]), [(c, a)])
 
     def test_different_connectors_never_shadow(self):
         a = rule("a", connector="mm-home", include=["*"])
         b = rule("b", connector="rc-home", include=["eng-*"])
-        self.assertEqual(find_shadowed_rules([a, b]), [])
-
-    def test_a_rule_with_an_except_for_does_not_shadow(self):
-        """The excluded slice is precisely what it does not claim."""
-        a = rule("a", include=["eng-*"], except_for=["eng-archive"])
-        b = rule("b", include=["eng-archive"])
-        self.assertEqual(find_shadowed_rules([a, b]), [])
-
-    def test_dm_opt_in_is_shadowed_only_by_an_earlier_dm_opt_in(self):
-        broad = rule("broad", include=["*"])
-        dms = rule("dms", direct=True)
-        self.assertEqual(find_shadowed_rules([broad, dms]), [])
-
-        earlier_dms = rule("earlier", direct=True)
-        self.assertEqual(find_shadowed_rules([earlier_dms, dms]), [(dms, earlier_dms)])
-
-    def test_group_dm_opt_in_is_tracked_separately(self):
-        a = rule("a", direct=True)
-        b = rule("b", direct=True, group_direct=True)
-        self.assertEqual(find_shadowed_rules([a, b]), [])
-
-    def test_a_rule_shadowed_despite_its_own_except_for(self):
-        """Excludes only shrink the later rule, so it is still unreachable."""
-        a = rule("a", include=["eng-*"])
-        b = rule("b", include=["eng-*"], except_for=["eng-archive"])
-        self.assertEqual(find_shadowed_rules([a, b]), [(b, a)])
+        self.assertEqual(self._found([a, b]), [])
 
     def test_star_shadows_everything_after_it(self):
-        a = rule("a", include=["*"])
-        b = rule("b", include=["eng-*"])
-        c = rule("c", include=["ops-?"])
-        found = find_shadowed_rules([a, b, c])
-        self.assertEqual(found, [(b, a), (c, a)])
-
-    def test_only_the_first_shadowing_rule_is_reported(self):
-        a = rule("a", include=["*"])
-        b = rule("b", include=["eng-*"])
-        c = rule("c", include=["eng-backend"])
-        found = find_shadowed_rules([a, b, c])
-        self.assertEqual([(s.name, by.name) for s, by in found], [("b", "a"), ("c", "a")])
+        rules = [rule("a", include=["*"]), rule("b", include=["eng-*"]), rule("c", include=["ops-?"])]
+        self.assertEqual(self._found(rules), [("b", "a", "rule"), ("c", "a", "rule")])
 
     def test_no_rules_no_findings(self):
         self.assertEqual(find_shadowed_rules([]), [])
+
+    def test_a_shadow_formed_only_by_a_union_is_not_reported(self):
+        """A documented, deliberate gap. `[ab]*` really is covered by `a*` with
+        `b*`, and `union_subsumes` can prove it, but comparing one earlier rule at
+        a time keeps each warning pointed at a single rule someone can go and
+        read."""
+        rules = [rule("a", include=["a*"]), rule("b", include=["b*"]), rule("c", include=["[ab]*"])]
+        self.assertEqual(self._found(rules), [])
+
+    def test_but_a_single_earlier_rule_that_covers_it_is_reported(self):
+        a, c = rule("a", include=["[ab]*"]), rule("c", include=["a*"])
+        self.assertEqual(self._found([a, c]), [("c", "a", "rule")])
+
+
+class TestAnEarlierRulesBlockingLanguageIsItsInclude(unittest.TestCase):
+    """The subtle one, and the earlier implementation had it backwards.
+
+    `except_for` yields DECLINED, which halts routing rather than falling through
+    — so a room an earlier rule declines never reaches a later rule either. An
+    earlier rule therefore blocks everything its `include` matches, whether it
+    goes on to claim or decline it, and its own `except_for` has no bearing on
+    what it shadows."""
+
+    def _found(self, rules):
+        return [(f.rule.name, f.shadowed_by.name, f.scope) for f in find_shadowed_rules(rules)]
+
+    def test_a_declined_room_still_shadows_a_later_rule_for_it(self):
+        deny = rule("deny", include=["eng-*"], except_for=["eng-archive"])
+        later = rule("later", include=["eng-archive"])
+        self.assertEqual(self._found([deny, later]), [("later", "deny", "rule")])
+
+    def test_the_deny_idiom_shadows_completely(self):
+        """Its whole purpose is to stop later rules, so saying so is correct."""
+        blocker = rule("block", include=["tmp-*"], except_for=["tmp-*"])
+        catchall = rule("all", include=["tmp-x"])
+        self.assertEqual(self._found([blocker, catchall]), [("all", "block", "rule")])
+
+    def test_an_except_for_on_the_earlier_rule_does_not_narrow_what_it_shadows(self):
+        """Same blocker name both times, so the only difference under test is
+        whether the earlier rule carries an except_for."""
+        later = rule("b", include=["eng-backend"])
+        with_exc = self._found(
+            [rule("a", include=["eng-*"], except_for=["eng-archive"]), later]
+        )
+        without_exc = self._found([rule("a", include=["eng-*"]), later])
+        self.assertEqual(with_exc, without_exc)
+        self.assertEqual(with_exc, [("b", "a", "rule")])
+
+    def test_a_rule_shadowed_despite_its_own_except_for(self):
+        a = rule("a", include=["eng-*"])
+        b = rule("b", include=["eng-*"], except_for=["eng-archive"])
+        self.assertEqual(self._found([a, b]), [("b", "a", "rule")])
+
+
+class TestDmReachIsReportedIndependently(unittest.TestCase):
+    """§2.1 asks for a warning when an earlier rule already claimed a DM class.
+
+    A hybrid rule can lose its DM reach while staying perfectly alive for named
+    rooms, so whole-rule shadowing alone would miss it — the rule looks healthy."""
+
+    def _found(self, rules):
+        return [(f.rule.name, f.shadowed_by.name, f.scope) for f in find_shadowed_rules(rules)]
+
+    def test_a_dead_dm_opt_in_on_an_otherwise_live_rule(self):
+        a = rule("a", include=["eng-*"], direct=True)
+        b = rule("b", include=["ops-*"], direct=True)  # named reach is disjoint
+        self.assertEqual(self._found([a, b]), [("b", "a", "direct")])
+
+    def test_group_direct_is_tracked_separately_from_direct(self):
+        a = rule("a", direct=True)
+        b = rule("b", direct=True, group_direct=True)
+        self.assertEqual(self._found([a, b]), [("b", "a", "direct")])
+
+    def test_a_named_reach_can_die_while_dms_stay_live(self):
+        a = rule("a", include=["eng-*"])
+        b = rule("b", include=["eng-backend"], direct=True)
+        self.assertEqual(self._found([a, b]), [("b", "a", "named")])
+
+    def test_all_reaches_dead_collapses_into_one_rule_finding(self):
+        a = rule("a", include=["*"], direct=True, group_direct=True)
+        b = rule("b", include=["eng-*"], direct=True, group_direct=True)
+        self.assertEqual(self._found([a, b]), [("b", "a", "rule")])
+
+    def test_a_dm_only_rule_is_not_shadowed_by_a_named_only_rule(self):
+        broad = rule("broad", include=["*"])
+        dms = rule("dms", direct=True)
+        self.assertEqual(self._found([broad, dms]), [])
+
+    def test_a_dm_only_rule_shadowed_by_an_earlier_dm_opt_in(self):
+        self.assertEqual(
+            self._found([rule("earlier", direct=True), rule("dms", direct=True)]),
+            [("dms", "earlier", "rule")],
+        )
+
 
 
 if __name__ == "__main__":
