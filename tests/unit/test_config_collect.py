@@ -466,13 +466,16 @@ class TestCollectConfigQueueSchedulerSessionId(_CollectConfigTestBase):
 
 
 class TestCollectConfigOnTheFlyWatcherFields(_CollectConfigTestBase):
-    """session_idle_days/session_expire_days (AgentConfig) and exclude_room/
-    room: "*" (WatcherConfig) — docs/design/dynamic-watcher-design.md. Same
-    class of requirement as the fields above: a bad value must surface as a
-    collected, per-entity ConfigIssue through collect_config(), never an
-    uncaught exception that aborts the whole file."""
+    """exclude_room / room: "*" (WatcherConfig), and the TTL keys that moved off the
+    agent — docs/design/dynamic-watcher-design.md. Same class of requirement as the
+    fields above: a bad value must surface as a collected, per-entity ConfigIssue
+    through collect_config(), never an uncaught exception that aborts the whole
+    file."""
 
-    def test_invalid_session_idle_expire_ordering_is_a_collected_agent_issue(self):
+    def test_a_ttl_key_left_on_an_agent_is_a_collected_agent_issue(self):
+        """These moved to the watcher rule (design §5.4), and a leftover key is a
+        hard error rather than a silently ignored one — so it must arrive here as an
+        attributed issue, not as an exception that stops the pass."""
         config_path = self._write(f"""\
             connectors:
               - name: rc
@@ -483,16 +486,15 @@ class TestCollectConfigOnTheFlyWatcherFields(_CollectConfigTestBase):
                 type: claude
                 working_directory: {self.agent_dir}
                 session_idle_days: 30
-                session_expire_days: 10
             watchers:
               - room: general
         """)
         config, issues = collect_config(config_path)
         self.assertIsNotNone(config)
         self.assertEqual(config.agents, {})
-        self.assertTrue(
-            any("must be strictly less than" in i.message for i in issues)
-        )
+        agent_issues = [i for i in issues if i.entity_kind == "agent"]
+        self.assertEqual(len(agent_issues), 1, [i.message for i in issues])
+        self.assertIn("moved to the watcher rule", agent_issues[0].message)
 
     def test_wildcard_room_is_a_collected_watcher_issue(self):
         config_path = self._write(f"""\

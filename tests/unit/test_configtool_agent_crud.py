@@ -380,27 +380,24 @@ class TestEditAgent:
             entry = app.editable_config.agents_raw["existing-agent"]
             assert "lazy_instruction_loading" not in entry
 
-    async def test_session_idle_and_expire_days_fields_are_editable_and_save(
+    async def test_the_session_ttl_fields_are_not_offered_on_an_agent(
         self, tmp_path, work_dir
     ):
-        """docs/design/dynamic-watcher-design.md: AgentConfig.session_idle_days/
-        session_expire_days must be reachable through the TUI form, not just
-        by hand-editing config.yaml — same as every other AgentConfig field."""
+        """The TTLs moved to the watcher rule (design §5.4), so the agent form must
+        not offer them: writing either through this form would produce a config the
+        loader now rejects outright. Asserted as an absence rather than deleted with
+        the fields, so re-adding them to the form without loader support fails here.
+        """
         config_path = _write_config(tmp_path, _config_with_one_agent(work_dir))
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
             await _open_agent_in_edit_mode(pilot, app)
 
-            app.screen.query_one("#field-session_idle_days", Input).value = "7"
-            app.screen.query_one("#field-session_expire_days", Input).value = "30"
-            await pilot.pause()
-            await pilot.press("ctrl+s")
-            await pilot.pause()
-
-            entry = app.editable_config.agents_raw["existing-agent"]
-            assert entry["session_idle_days"] == 7
-            assert entry["session_expire_days"] == 30
+            for field in ("session_idle_days", "session_expire_days"):
+                assert not app.screen.query(f"#field-{field}"), (
+                    f"the agent form still offers {field}, which the loader rejects"
+                )
 
     async def test_permissions_checkbox_subfield_write(self, tmp_path, work_dir):
         config_path = _write_config(tmp_path, _config_with_one_agent(work_dir))

@@ -131,11 +131,11 @@ class AgentConfig:
     guest_allowed_tools: list[ToolRule] = field(default_factory=list)  # auto-approved for guests
     timeout: int = 360           # seconds to wait for the agent to respond; must be > permissions.timeout
     permissions: PermissionConfig = field(default_factory=PermissionConfig)
-    # On-the-fly watcher lifecycle (docs/design/dynamic-watcher-design.md).
-    # Both None = the idle/expire lifecycle is off for this agent's watchers;
-    # runtime consumers must treat None as "never idle"/"never expire", not 0.
-    session_idle_days: int | None = None    # days with no message before a watcher's runtime object is dropped (session kept)
-    session_expire_days: int | None = None  # days with no message before the session itself is dropped too
+    # No session_idle_days / session_expire_days here: the on-the-fly watcher
+    # lifecycle TTLs live on the WatcherRule instead (design §5.4), so two rules
+    # sharing one agent can have different lifecycles. Setting either on an agent
+    # is a load error naming the new home — see `_MOVED_TO_RULE_KEYS` in
+    # gateway/config.py.
 
     def effective_owner_allowed_tools(self) -> "list[ToolRule]":
         """Return owner_allowed_tools with built-in gateway rules prepended.

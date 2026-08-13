@@ -22,7 +22,7 @@ from unittest.mock import patch
 
 import yaml
 
-from gateway.config import GatewayConfig
+from gateway.config import GatewayConfig, collect_config
 
 # ── Tests: working_directory validation ──────────────────────────────────────
 
@@ -1623,8 +1623,18 @@ class TestAgentTemplates(unittest.TestCase):
         self.assertIn("must not set 'inherits'", msg)
 
 
-class TestAgentSessionLifecycleConfig(unittest.TestCase):
-    """session_idle_days / session_expire_days (docs/design/dynamic-watcher-design.md)."""
+class TestAgentSessionLifecycleKeysAreRejected(unittest.TestCase):
+    """The TTLs moved from the agent to the watcher rule (design §5.4).
+
+    Removing them silently was the wrong option: the value would be read, ignored,
+    and the lifecycle the operator asked for would simply never happen — the exact
+    shape of failure this loader has produced repeatedly. So a leftover key is a
+    hard error naming the new home, the same treatment `_REMOVED_DEFAULTS_KEYS`
+    gives a retired top-level block.
+
+    Both keys were added after v0.5.1 and never released, so this breaks no deployed
+    config; it only catches someone following the pre-release design doc.
+    """
 
     def _write_config(self, agent_block: str) -> str:
         cfg = textwrap.dedent(f"""\
@@ -1645,77 +1655,33 @@ class TestAgentSessionLifecycleConfig(unittest.TestCase):
             f.write(cfg)
             return f.name
 
-    def test_defaults_are_none(self):
-        path = self._write_config("")
-        config = GatewayConfig.from_file(path)
-        self.assertIsNone(config.agents["default"].session_idle_days)
-        self.assertIsNone(config.agents["default"].session_expire_days)
+    def test_an_agent_no_longer_carries_the_fields_at_all(self):
+        config = GatewayConfig.from_file(self._write_config(""))
+        agent = config.agents["default"]
+        self.assertFalse(hasattr(agent, "session_idle_days"))
+        self.assertFalse(hasattr(agent, "session_expire_days"))
 
-    def test_both_set_and_valid(self):
-        path = self._write_config("""\
-            session_idle_days: 7
-            session_expire_days: 30
-        """)
-        config = GatewayConfig.from_file(path)
-        self.assertEqual(config.agents["default"].session_idle_days, 7)
-        self.assertEqual(config.agents["default"].session_expire_days, 30)
+    def test_either_key_on_an_agent_is_a_load_error_naming_the_rule(self):
+        for key in ("session_idle_days", "session_expire_days"):
+            with self.subTest(key=key):
+                path = self._write_config(f"{key}: 7\n")
+                with self.assertRaises(ValueError) as ctx:
+                    GatewayConfig.from_file(path)
+                msg = str(ctx.exception)
+                self.assertIn(key, msg)
+                self.assertIn("moved to the watcher rule", msg)
 
-    def test_only_idle_set_is_valid(self):
-        path = self._write_config("session_idle_days: 7\n")
-        config = GatewayConfig.from_file(path)
-        self.assertEqual(config.agents["default"].session_idle_days, 7)
-        self.assertIsNone(config.agents["default"].session_expire_days)
-
-    def test_idle_must_be_strictly_less_than_expire(self):
-        path = self._write_config("""\
-            session_idle_days: 30
-            session_expire_days: 30
-        """)
+    def test_an_explicit_null_is_rejected_too(self):
+        """`null` is not a way to keep the key: the field is gone, so writing it at
+        all means the operator believes an agent-level lifecycle exists."""
+        path = self._write_config("session_idle_days: null\n")
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(path)
-        msg = str(ctx.exception)
-        self.assertIn("session_idle_days (30) must be strictly less than session_expire_days (30)", msg)
+        self.assertIn("moved to the watcher rule", str(ctx.exception))
 
-    def test_idle_greater_than_expire_raises(self):
-        path = self._write_config("""\
-            session_idle_days: 45
-            session_expire_days: 30
-        """)
-        with self.assertRaises(ValueError) as ctx:
-            GatewayConfig.from_file(path)
-        self.assertIn("must be strictly less than", str(ctx.exception))
-
-    def test_non_integer_idle_days_raises(self):
-        path = self._write_config("session_idle_days: 'soon'\n")
-        with self.assertRaises(ValueError) as ctx:
-            GatewayConfig.from_file(path)
-        self.assertIn("session_idle_days must be an integer", str(ctx.exception))
-
-    def test_non_integer_expire_days_raises(self):
-        path = self._write_config("session_expire_days: 3.5\n")
-        with self.assertRaises(ValueError) as ctx:
-            GatewayConfig.from_file(path)
-        self.assertIn("session_expire_days must be an integer", str(ctx.exception))
-
-    def test_boolean_is_rejected_even_though_bool_is_an_int_subclass(self):
-        path = self._write_config("session_idle_days: true\n")
-        with self.assertRaises(ValueError) as ctx:
-            GatewayConfig.from_file(path)
-        self.assertIn("session_idle_days must be an integer", str(ctx.exception))
-
-    def test_zero_idle_days_raises(self):
-        path = self._write_config("session_idle_days: 0\n")
-        with self.assertRaises(ValueError) as ctx:
-            GatewayConfig.from_file(path)
-        self.assertIn("must be a positive integer", str(ctx.exception))
-
-    def test_negative_expire_days_raises(self):
-        path = self._write_config("session_expire_days: -1\n")
-        with self.assertRaises(ValueError) as ctx:
-            GatewayConfig.from_file(path)
-        self.assertIn("must be a positive integer", str(ctx.exception))
-
-    def test_inherited_via_agent_templates(self):
+    def test_a_value_inherited_from_an_agent_template_is_rejected(self):
+        """The check reads the already-merged entry, so a template cannot smuggle
+        one in — the case a key-presence check on the raw entry would have missed."""
         cfg = textwrap.dedent("""\
             connectors:
               - name: rc
@@ -1726,12 +1692,8 @@ class TestAgentSessionLifecycleConfig(unittest.TestCase):
                 type: claude
                 working_directory: /tmp
                 session_idle_days: 7
-                session_expire_days: 30
             agents:
               default: {inherits: standard}
-              custom:
-                inherits: standard
-                session_expire_days: 14
             watchers:
               - name: w1
                 room: general
@@ -1739,12 +1701,49 @@ class TestAgentSessionLifecycleConfig(unittest.TestCase):
         with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
             f.write(cfg)
             path = f.name
-        config = GatewayConfig.from_file(path)
-        self.assertEqual(config.agents["default"].session_idle_days, 7)
-        self.assertEqual(config.agents["default"].session_expire_days, 30)
-        # 'custom' overrides just session_expire_days, keeps inherited idle_days.
-        self.assertEqual(config.agents["custom"].session_idle_days, 7)
-        self.assertEqual(config.agents["custom"].session_expire_days, 14)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        self.assertIn("moved to the watcher rule", str(ctx.exception))
+
+    def test_collect_config_attributes_it_to_the_agent_and_keeps_going(self):
+        """A second, healthy agent isolates the attribution from the pre-existing
+        cascade: when the *only* agent fails, zero agents parse and
+        collect_config() adds its own "must define at least one agent" global issue
+        on top. That cascade is existing behaviour, asserted separately below."""
+        cfg = textwrap.dedent("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+              legacy:
+                type: claude
+                working_directory: /tmp
+                session_expire_days: 30
+            watchers:
+              - name: w1
+                room: general
+        """)
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(cfg)
+            path = f.name
+        config, issues = collect_config(path)
+        self.assertEqual(len(issues), 1, [i.message for i in issues])
+        self.assertEqual(issues[0].entity_kind, "agent")
+        self.assertEqual(issues[0].entity_name, "legacy")
+        # The healthy agent and the watcher are unaffected.
+        self.assertEqual(sorted(config.agents), ["default"])
+        self.assertEqual([w.name for w in config.watchers], ["w1"])
+
+    def test_the_only_agent_failing_still_reports_the_named_key_first(self):
+        """Pre-existing cascade, pinned so the attributed issue is not mistaken for
+        the whole story: the "at least one agent" global issue follows it."""
+        _, issues = collect_config(self._write_config("session_expire_days: 30\n"))
+        self.assertEqual([i.entity_kind for i in issues], ["agent", "global"])
+        self.assertIn("moved to the watcher rule", issues[0].message)
 
 
 class TestWatcherTemplates(unittest.TestCase):

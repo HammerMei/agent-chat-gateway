@@ -216,24 +216,45 @@ class TestSchemaCatchesKnownMistakes:
 
 
 class TestNullableTTLFields:
-    """docs/design/dynamic-watcher-design.md + PR #77 review: an explicit
-    `null` must validate even though the field is otherwise a positive
-    integer — this is the loader-supported way to suppress a non-null value
-    inherited from an agent_templates entry (_deep_merge()'s documented
-    "explicit null suppresses a base value" contract), not just "omit it"."""
+    """The TTLs live on a watcher **rule**, not an agent (design §5.4).
+
+    An explicit `null` must still validate even though the field is otherwise a
+    positive integer — that is the loader-supported way to suppress a non-null value
+    inherited from a `watcher_templates:` entry (`_deep_merge()`'s documented
+    "explicit null suppresses a base value" contract), not just "omit it".
+
+    The agent side asserts the opposite: `$defs/agent` sets
+    `additionalProperties: false`, so a leftover TTL key there is a *schema* error as
+    well as a loader error. Both halves are checked, because the schema is not
+    enforced at load and the loader does not read the schema — neither one covers
+    the other.
+    """
 
     @pytest.fixture
     def base_doc(self) -> dict:
         return _load_yaml(REPO_ROOT / "config.example.yaml")
 
-    def test_explicit_null_session_idle_days_is_schema_valid(self, validator, base_doc):
+    @pytest.mark.parametrize("field", ["session_idle_days", "session_expire_days"])
+    def test_explicit_null_on_a_rule_is_schema_valid(self, validator, base_doc, field):
         doc = copy.deepcopy(base_doc)
-        doc["agents"]["my-agent"]["session_idle_days"] = None
+        doc["watchers"] = [
+            {"name": "eng", "rooms": {"include": ["eng-*"]}, field: None}
+        ]
         errors = list(validator.iter_errors(doc))
         assert not errors, "\n".join(str(e) for e in errors)
 
-    def test_explicit_null_session_expire_days_is_schema_valid(self, validator, base_doc):
+    @pytest.mark.parametrize("field", ["session_idle_days", "session_expire_days"])
+    def test_a_positive_integer_on_a_rule_is_schema_valid(self, validator, base_doc, field):
         doc = copy.deepcopy(base_doc)
-        doc["agents"]["my-agent"]["session_expire_days"] = None
+        doc["watchers"] = [
+            {"name": "eng", "rooms": {"include": ["eng-*"]}, field: 7}
+        ]
         errors = list(validator.iter_errors(doc))
         assert not errors, "\n".join(str(e) for e in errors)
+
+    @pytest.mark.parametrize("field", ["session_idle_days", "session_expire_days"])
+    def test_the_key_is_no_longer_accepted_on_an_agent(self, validator, base_doc, field):
+        doc = copy.deepcopy(base_doc)
+        doc["agents"]["my-agent"][field] = 7
+        errors = list(validator.iter_errors(doc))
+        assert errors, f"$defs/agent still accepts {field}"
