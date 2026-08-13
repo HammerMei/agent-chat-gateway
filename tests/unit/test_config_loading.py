@@ -349,23 +349,28 @@ class TestConfigValidationHardening(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "'room' must be a string"):
             GatewayConfig.from_file(path)
 
-    def test_non_string_watcher_session_id_raises_value_error_not_type_error(self):
-        path = self._write_config("""\
-            connectors:
-              - name: rc
-                type: rocketchat
-                server: {url: http://localhost:3000, username: bot, password: pw}
-            agents:
-              default:
-                type: claude
-                working_directory: /tmp
-            watchers:
-              - room: general
-                connector: rc
-                session_id: [abc]
-        """)
-        with self.assertRaisesRegex(ValueError, "'session_id' must be a string"):
-            GatewayConfig.from_file(path)
+    def test_any_watcher_session_id_is_refused_since_the_field_is_removed(self):
+        """It used to be type-checked; now the key itself is refused, whatever its
+        value. Inverted rather than deleted: a plain deletion would have made a
+        released, load-bearing key silently ignored, which is why the check exists."""
+        for value in ("[abc]", "'ses_abc123'", "null", "false", "0"):
+            with self.subTest(value=value):
+                path = self._write_config(f"""\
+                    connectors:
+                      - name: rc
+                        type: rocketchat
+                        server: {{url: http://localhost:3000, username: bot, password: pw}}
+                    agents:
+                      default:
+                        type: claude
+                        working_directory: /tmp
+                    watchers:
+                      - room: general
+                        connector: rc
+                        session_id: {value}
+                """)
+                with self.assertRaisesRegex(ValueError, "'session_id' is no longer supported"):
+                    GatewayConfig.from_file(path)
 
     def test_non_string_default_agent_raises_value_error_not_type_error(self):
         path = self._write_config("""\
@@ -2181,18 +2186,19 @@ class TestWatcherRoomsExpansion(unittest.TestCase):
             GatewayConfig.from_file(path)
         self.assertIn("'name' can only be set when there is exactly one room", str(ctx.exception))
 
-    def test_explicit_session_id_with_multiple_rooms_raises(self):
-        path = self._write_config("""\
-            - connector: rc-home
-              session_id: sticky-1
-              rooms: [general, dev]
-        """)
-        with self.assertRaises(ValueError) as ctx:
-            GatewayConfig.from_file(path)
-        self.assertIn(
-            "'session_id' can only be set when there is exactly one room",
-            str(ctx.exception),
-        )
+    def test_session_id_is_refused_regardless_of_room_count(self):
+        """The old error was "only with exactly one room"; the field is removed, so the
+        room count no longer enters into it. Both shapes must say so."""
+        for rooms in ("rooms: [general, dev]", "room: general"):
+            with self.subTest(rooms=rooms):
+                path = self._write_config(f"""\
+                    - connector: rc-home
+                      session_id: sticky-1
+                      {rooms}
+                """)
+                with self.assertRaises(ValueError) as ctx:
+                    GatewayConfig.from_file(path)
+                self.assertIn("'session_id' is no longer supported", str(ctx.exception))
 
     def test_explicit_name_preserved_on_single_room_entry(self):
         path = self._write_config("""\
@@ -2705,7 +2711,6 @@ class TestEveryStaticWatcherFieldIsTypeChecked(unittest.TestCase):
         "room": 7,
         "rooms": "general",
         "exclude_room": "general",
-        "session_id": [],
         "context_inject_files": "notes.md",
         "online_notification": True,
         "offline_notification": 3,

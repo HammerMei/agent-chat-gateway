@@ -23,7 +23,7 @@ Inspired by [OpenClaw](https://github.com/openclaw/openclaw)'s vision of making 
 - 👥 **[User-aware in chat](docs/user-guide.md#user-aware-responses)** — the agent knows who sent each message and can personalize tone, language, and style per person using room profiles
 - 🔒 **[Owner & Guest roles](docs/permission-reference.md#roles)** — control who can do what, with different permissions per role
 - 🛡️ **[Human oversight for sensitive actions](docs/permission-reference.md#approval-workflow)** — the agent pauses and asks for your approval before executing risky operations like file writes or shell commands
-- 🔗 **[Continue your session remotely](docs/user-guide.md#use-case-3--continue-an-existing-agent-session-remotely)** — pin a chat room to an existing agent session and pick up right where you left off, from anywhere
+- 🔗 **[Continue your session remotely](docs/user-guide.md#use-case-3--carry-an-existing-agent-sessions-context-into-chat)** — hand a local agent session's context to a chat room and pick up right where you left off, from anywhere
 - 📎 **[File attachments](docs/user-guide.md#attachment-handling)** — send files in chat and the agent can read and work with them
 - 🧠 **[Context injection](docs/user-guide.md#context-files)** — pre-load domain knowledge, system prompts, or project context into the agent at startup
 - ⚡ **[Multiple chat systems at once](docs/user-guide.md#multi-connector-setup)** — connect to several chat platforms simultaneously

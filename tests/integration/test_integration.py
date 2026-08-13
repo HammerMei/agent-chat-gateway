@@ -1320,10 +1320,18 @@ class TestStartupRaceRollback(IsolatedTestCase):
 
 
 class TestDuplicateSessionIdValidation(unittest.TestCase):
-    """Fix 2A: config.yaml with duplicate sticky session_ids must fail at load time."""
+    """Fix 2A, superseded: the duplicate-sticky-session_id check is gone with the field.
+
+    `watchers[].session_id` is removed, so two watchers cannot share one and the
+    cross-watcher pass has nothing to compare. The hazard it guarded — two watchers
+    on one id silently overwriting the session→room / session→connector routing maps,
+    so permission notifications land in the wrong room — now cannot arise from config
+    at all. These cases are kept, inverted, because the property that matters is
+    unchanged: such a config must be refused at load rather than accepted.
+    """
 
     def test_duplicate_sticky_session_id_raises_at_config_load(self):
-        """Two watchers sharing the same sticky session_id → ValueError on from_file()."""
+        """Still a load error — now because the field itself is refused, per entry."""
         import tempfile
         import textwrap
 
@@ -1357,10 +1365,11 @@ class TestDuplicateSessionIdValidation(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(tmp_path)
 
-        self.assertIn("shared-session-id", str(ctx.exception))
+        self.assertIn("'session_id' is no longer supported", str(ctx.exception))
 
-    def test_unique_sticky_session_ids_do_not_raise(self):
-        """Two watchers with different sticky session_ids → no error."""
+    def test_unique_sticky_session_ids_are_now_refused_too(self):
+        """Inverted: uniqueness used to make them legal. The field is gone, so being
+        distinct no longer helps — each entry is refused on its own."""
         import tempfile
         import textwrap
 
@@ -1391,9 +1400,9 @@ class TestDuplicateSessionIdValidation(unittest.TestCase):
             f.write(cfg)
             tmp_path = f.name
 
-        # Must not raise
-        config = GatewayConfig.from_file(tmp_path)
-        self.assertEqual(len(config.watchers), 2)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(tmp_path)
+        self.assertIn("'session_id' is no longer supported", str(ctx.exception))
 
     def test_no_session_id_watchers_do_not_raise(self):
         """Watchers without sticky session_ids (auto-create) must never trigger the check."""

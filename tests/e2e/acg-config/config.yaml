@@ -89,8 +89,9 @@ agents:
     session_prefix: e2e-oc-perm
 
 # All watchers share the same connector and an empty context_inject_files list.
-# session_id and online/offline_notification are omitted entirely — they now
-# default to null (auto-create session / quiet) so there's nothing to state.
+# online/offline_notification are omitted entirely — they default to null (quiet),
+# so there is nothing to state. session_id no longer exists at all: sessions are
+# auto-created and persisted, never pinned from config.
 # Explicit 'name:' is kept on every entry (rather than relying on rooms:
 # auto-naming) because tests/e2e/test_schedule_e2e.py references watcher names
 # 'e2e-dm' and 'e2e-claude-channel' literally.

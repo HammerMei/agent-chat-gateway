@@ -50,7 +50,7 @@
     },
     "watcher_templates": {
       "type": "object",
-      "description": "Named, reusable field blocks for watchers. Reference one by name via a watcher's 'inherits:' field. Must not set 'name', 'room', 'rooms', or 'session_id' — those identify a specific watcher. No nested templates.",
+      "description": "Named, reusable field blocks for watchers. Reference one by name via a watcher's 'inherits:' field. Must not set 'name', 'room', or 'rooms' — those identify a specific watcher — nor 'session_id', which is removed entirely (sessions are no longer pinned from config; use a handoff file via context_inject_files). No nested templates.",
       "additionalProperties": {
         "type": "object",
         "properties": {
@@ -341,10 +341,6 @@
           "description": "Only meaningful once room: \"*\" (rule-based room matching) is implemented; the loader currently rejects room: \"*\" outright with a 'not implemented yet' error regardless of this field. See docs/design/dynamic-watcher-design.md."
         },
         "agent": { "type": "string" },
-        "session_id": {
-          "type": ["string", "null"],
-          "description": "Only allowed when the entry has exactly one room."
-        },
         "context_inject_files": {
           "type": "array",
           "items": { "type": "string" }

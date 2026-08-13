@@ -180,7 +180,6 @@ config = {
         "connector":          "rocketchat",
         "room":               watcher_room,
         "agent":              "default-agent",
-        "session_id":         None,
         "context_inject_files": [],
         "online_notification":  "✅ _Agent online_",
         "offline_notification": "❌ _Agent offline_",

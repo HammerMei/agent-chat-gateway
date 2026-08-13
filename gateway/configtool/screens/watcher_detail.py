@@ -19,7 +19,7 @@ docs/design/config-tool.md's Phase 3 "two-tier rule" (decision 3):
   - Editing a GROUP-SHARED field (`description` — a free-text annotation
     with no bearing on which connector/agent/room is actually watched)
     edits the shared raw entry in place — the whole group moves together.
-  - Editing a PER-ROOM field (`room` itself, `name` — see below, `session_id`,
+  - Editing a PER-ROOM field (`room` itself, `name` — see below,
     `connector`, `agent`, `inherits`, `online_notification`,
     `offline_notification`, `context_inject_files`, `history_handoff.*`)
     auto-splits this one room out of its group into its own entry
@@ -89,13 +89,13 @@ if TYPE_CHECKING:
     from ..app import ConfigToolApp
 
 _KNOWN_FIELDS = [
-    "session_id", "online_notification", "offline_notification",
+    "online_notification", "offline_notification",
     "context_inject_files", "history_handoff",
 ]
 
 # A watcher template's own field list — relocated here from the deleted
 # defaults.py (was WATCHER_DEFAULTS_FIELDS), reused by TemplateDetailScreen.
-# gateway/config.py forbids {name, room, rooms, session_id} on a watcher
+# gateway/config.py forbids {name, room, rooms} on a watcher
 # template, since each of those pins one SPECIFIC watcher's identity and has
 # no business in a block every watcher merges against. Also reused, VERBATIM,
 # by WatcherDetailScreen below for the identical reason: these are exactly
@@ -152,7 +152,7 @@ WATCHER_TEMPLATE_DATACLASS_DEFAULTS: dict[str, object] = {
 # instead, which (a) needlessly triggered a group split for an edit that
 # never needed one, and (b) silently LOST the edit entirely, since
 # split_entry's own field loop never copies "description" (it's not one of
-# name/session_id/WATCHER_TEMPLATE_FIELDS).
+# name/WATCHER_TEMPLATE_FIELDS).
 #
 # User-reported bug, fixed: 'connector'/'agent' used to ALSO be in this set
 # ("group-shared, move the whole group in place") — that's wrong for the
@@ -341,7 +341,6 @@ class WatcherDetailScreen(FormScreen):
                 FieldSpec("connector", "enum", "Connector", options=connector_names),
                 FieldSpec("agent", "enum", "Agent", options=agent_names),
                 room_spec,
-                FieldSpec("session_id", "str", "Session ID"),
                 *WATCHER_TEMPLATE_FIELDS,
             ),
             _WATCHER_REQUIRED_FIELD_KEYS,
@@ -358,7 +357,7 @@ class WatcherDetailScreen(FormScreen):
         # matters for the rare existing entry that never set its own
         # connector:/agent: explicitly; save()'s own validate_config() call
         # remains the real backstop for whatever this approximation gets
-        # wrong. name/session_id/room have no meaningful default at all —
+        # wrong. name/room have no meaningful default at all —
         # None (blank) is the honest answer for an identity field nothing
         # implies a value for.
         defaults = dict(WATCHER_TEMPLATE_DATACLASS_DEFAULTS)
@@ -366,7 +365,6 @@ class WatcherDetailScreen(FormScreen):
             self.cfg.connectors_raw[0].get("name", "") if self.cfg.connectors_raw else ""
         )
         defaults["agent"] = next(iter(self.cfg.agents_raw), "")
-        defaults["session_id"] = None
         defaults["room"] = None
         return defaults
 
@@ -680,7 +678,7 @@ class WatcherDetailScreen(FormScreen):
             apply_update(self.raw_entry, key, value)
 
         if per_room_updates or inherits_changed:
-            # A per-room field changed (room/name/session_id/connector/agent/
+            # A per-room field changed (room/name/connector/agent/
             # online_notification/offline_notification/context_inject_files/
             # history_handoff.*) OR inherits changed — every one of these
             # identifies or configures the room being watched, so there's no
@@ -711,7 +709,7 @@ class WatcherDetailScreen(FormScreen):
             )
 
             split_entry: dict = {}
-            for key in ("name", "session_id", *(f.key for f in WATCHER_TEMPLATE_FIELDS)):
+            for key in ("name", *(f.key for f in WATCHER_TEMPLATE_FIELDS)):
                 value = per_room_updates.get(key, get_nested(self._current_entry(), key))
                 apply_update(split_entry, key, value)
             if self._inherits_current is not None:

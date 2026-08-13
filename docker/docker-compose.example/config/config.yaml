@@ -101,7 +101,6 @@ watchers:
     connector: rocketchat
     room: "@your-username"     # DM with owner, e.g. "@alice"
     agent: opencode_agent
-    session_id: ~
     context_inject_files: []
     online_notification: "✅ _Agent online_"
     offline_notification: "❌ _Agent offline_"
@@ -111,7 +110,6 @@ watchers:
     connector: rocketchat
     room: "general"            # channel name (no @)
     agent: claude_agent
-    session_id: ~
     context_inject_files: []
     online_notification: "✅ _Agent online_"
     offline_notification: "❌ _Agent offline_"
