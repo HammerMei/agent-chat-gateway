@@ -204,18 +204,17 @@ class WatcherConfig:
     Defined in config.yaml under 'watchers:'. The gateway starts all configured
     watchers on startup — no runtime add-watcher commands are needed.
 
-    session_id:
-      - Set to a session ID string to pin this watcher to an existing session (sticky).
-        The session ID is never cleared, even by 'reset'.
-      - Set to None (or omit) to let the gateway auto-create a session on first start.
-        The generated session ID is stored in state.json and cleared by 'reset'.
+    There is no `session_id` here: sessions are not pinned from config. The gateway
+    creates one on first start, persists the id it was given in state.json, reuses it
+    across restarts, and clears it on 'reset'. `watchers[].session_id` is refused at
+    load, naming the handoff replacement — see gateway/config.py. The runtime-assigned
+    `WatcherState.session_id` is a different thing and is unaffected.
     """
 
     name: str                                        # unique watcher name (used in CLI commands)
     connector: str                                   # must match a ConnectorConfig.name
     room: str                                        # room name or @username for DM
     agent: str                                       # must match an AgentConfig.name
-    session_id: str | None = None                    # sticky session ID; None = auto-create
     exclude_rooms: list[str] = field(default_factory=list)  # only meaningful once room == "*" is
     # supported (docs/design/dynamic-watcher-design.md) — the config loader currently rejects
     # room == "*" with a clear "not implemented yet" error, so this is always empty today.

@@ -241,25 +241,39 @@ class TestBasicEcho(IsolatedTestCase):
 
         await manager.shutdown()
 
-    async def test_sticky_session_id_skips_create_session(self):
-        """Providing a session_id in WatcherConfig skips create_session."""
+    async def test_a_persisted_session_id_skips_create_session(self):
+        """An existing session is reused rather than recreated.
+
+        This previously staged the same property with a config-pinned
+        `WatcherConfig.session_id`. That field is removed, so the only remaining source
+        of a pre-existing id is persisted state — and the property itself is unchanged
+        and still worth pinning: reuse must not call `create_session`, or a restart
+        would silently start a fresh conversation.
+        """
+        from gateway.core.state import WatcherState
+
+        persisted = [
+            WatcherState(
+                watcher_name="script",
+                session_id="my-existing-session-abc123",
+                room_id="script",
+                room_type="script",
+                context_injected=True,
+            )
+        ]
         connector = ScriptConnector()
         agent = MockAgentBackend()
-        wc = WatcherConfig(
-            name="script",
-            connector="script",
-            room="script",
-            agent="default",
-            session_id="my-existing-session-abc123",
-        )
-        manager = make_manager(connector, agent, watcher_configs=[wc])
 
-        await manager.run_once()
+        with patch("gateway.core.state_store.load_state", return_value=persisted):
+            manager = make_manager(
+                connector, agent, watcher_configs=[make_watcher(name="script")]
+            )
+            await manager.run_once()
 
         await connector.inject("hi")
         await connector.receive_reply(timeout=5.0)
 
-        # create_session should NOT have been called — session ID came from config
+        # create_session must NOT have been called — the id came from state.
         self.assertEqual(agent.created_sessions, [])
         self.assertEqual(
             agent.sent_messages[-1]["session_id"], "my-existing-session-abc123"
@@ -501,28 +515,36 @@ class TestWatcherLifecycle(IsolatedTestCase):
 
         await manager.shutdown()
 
-    async def test_reset_sticky_session_keeps_same_id(self):
-        """Reset does NOT clear a sticky session_id from config."""
+    async def test_reset_has_no_sticky_exemption_any_more(self):
+        """Inverted: reset now clears every watcher's session, with no exception.
+
+        This asserted the one behaviour that genuinely changed with the removal of
+        `watchers[].session_id` — a pinned watcher used to keep its session across
+        `reset`. No config can express that any more (the loader refuses the key), so
+        the exemption is unreachable rather than merely unused, and the honest test is
+        that reset is now unconditional.
+
+        Kept as a test rather than deleted, because "reset clears the session" is
+        exactly the invariant the removed branch used to break.
+        """
         connector = ScriptConnector()
         agent = MockAgentBackend()
-        wc = WatcherConfig(
-            name="script",
-            connector="script",
-            room="script",
-            agent="default",
-            session_id="sticky-session-123",
+        manager = make_manager(
+            connector, agent, watcher_configs=[make_watcher(name="script")]
         )
-        manager = make_manager(connector, agent, watcher_configs=[wc])
 
         await manager.run_once()
-        self.assertEqual(agent.created_sessions, [])  # sticky: no create_session call
+        self.assertEqual(len(agent.created_sessions), 1)
+        first = agent.created_sessions[0]["session_id"]
 
         await manager.reset_watcher("script")
-        self.assertEqual(agent.created_sessions, [])  # still no new session after reset
+        self.assertEqual(len(agent.created_sessions), 2, "reset did not create a session")
+        second = agent.created_sessions[1]["session_id"]
+        self.assertNotEqual(first, second)
 
         await connector.inject("hi")
         await connector.receive_reply(timeout=5.0)
-        self.assertEqual(agent.sent_messages[-1]["session_id"], "sticky-session-123")
+        self.assertEqual(agent.sent_messages[-1]["session_id"], second)
 
         await manager.shutdown()
 
@@ -1088,12 +1110,13 @@ class TestWatermarkPersistence(IsolatedTestCase):
                 connector,
                 agent,
                 watcher_configs=[
+                    # The session id comes from the persisted WatcherState above;
+                    # it was never the config's to supply.
                     WatcherConfig(
                         name="script",
                         connector="script",
                         room="script",
                         agent="default",
-                        session_id="existing-session",
                     )
                 ],
             )
