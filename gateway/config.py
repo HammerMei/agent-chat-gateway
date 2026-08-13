@@ -998,8 +998,10 @@ def _validated_optional_name(raw: object, where: str, field_name: str) -> str | 
     and was then read as "not set". That is reachable and silent — pyyaml resolves
     `name: no` to the boolean False, so an operator naming a watcher `no` (or
     writing `0`, `[]`) silently gets an auto-generated name instead of an error.
-    The name is the watcher's persistent identity: its state.json session, its
-    `pause`/`resume`/`reset` handle, and its system-prompt and attachment paths.
+    The name is the watcher's persistent identity: its state.json session and its
+    `pause`/`resume`/`reset` handle. It is no longer a path component — how the
+    per-room files are named is documented in gateway/core/paths.py, which is the one
+    place that states it.
 
     An absent key and an explicit null are the two spellings of "no value here" and
     both mean the default. An empty string is not one of them: it cannot serve as an
