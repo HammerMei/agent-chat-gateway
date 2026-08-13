@@ -7,7 +7,9 @@ conversation silently or lands on an unrelated session that happens to carry the
 id. These tests cover the comparison, not the field.
 """
 
+import sys
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from gateway.core.state import WatcherState, backend_identity
@@ -31,6 +33,55 @@ class TestBackendIdentityValue(unittest.TestCase):
         next boot. `tests/unit/test_state_schema.py` already persists `claude:/srv/work`.
         """
         self.assertEqual(backend_identity("claude", "/srv/work"), "claude:/srv/work")
+
+
+class TestTheIdentityFollowsTheRealDirectory(unittest.TestCase):
+    """A configured path and the directory a process actually runs in can differ."""
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name).resolve()
+        (self.root / "v1").mkdir()
+        (self.root / "v2").mkdir()
+        self.link = self.root / "current"
+        self.link.symlink_to(self.root / "v1")
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_retargeting_a_symlink_changes_the_identity(self):
+        """The case an uncanonicalized identity cannot see.
+
+        `/srv/current -> /srv/v1` repointed to `/srv/v2` leaves config.yaml byte-identical
+        while the backend's session store moves, because a child process launched with
+        `cwd=<symlink>` reports the physical path. Comparing the configured string would
+        call that a match and replay the old id into the new store.
+        """
+        before = backend_identity("claude", str(self.link))
+        self.link.unlink()
+        self.link.symlink_to(self.root / "v2")
+        after = backend_identity("claude", str(self.link))
+
+        self.assertNotEqual(before, after)
+        self.assertIn("v1", before)
+        self.assertIn("v2", after)
+
+    def test_the_child_process_really_does_see_the_physical_path(self):
+        """Pins the premise the test above rests on, rather than assuming POSIX.
+
+        If `getcwd()` ever reported the symlink instead, canonicalizing would be the bug
+        and this test says so at the point the assumption is made.
+        """
+        import subprocess
+        out = subprocess.run(
+            [sys.executable, "-c", "import os; print(os.getcwd())"],
+            cwd=str(self.link), capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        self.assertEqual(Path(out).resolve(), (self.root / "v1").resolve())
+
+    def test_an_empty_working_directory_is_not_resolved_to_the_process_cwd(self):
+        """Config load requires the field, so empty only reaches here from tests —
+        and resolving it would make an identity depend on where pytest was run."""
+        self.assertEqual(backend_identity("claude", ""), "claude:")
 
 
 class TestSessionReuseRequiresMatchingIdentity(unittest.IsolatedAsyncioTestCase):
@@ -191,6 +242,64 @@ class TestSessionReuseRequiresMatchingIdentity(unittest.IsolatedAsyncioTestCase)
         self.assertTrue(
             any(old_id in line for line in logs.output),
             f"the full session id must appear in the warning; got {logs.output}")
+
+    async def test_a_replacement_session_starts_with_context_undelivered(self):
+        """The flag describes a *session*, and the replacement has received nothing.
+
+        Both shipped backends ignore `already_delivered`, so this changes no behaviour
+        today — it keeps the record true, and keeps the invariant `reset_watcher` already
+        maintains (clearing a session id clears this flag) from having an exception that
+        depends on which code path replaced the session.
+        """
+        lifecycle, _, _, wc = self._make_lifecycle(working_directory="/srv/moved")
+        state = self._stored("old-session-id", backend_identity("claude", "/srv/work"))
+        state.context_injected = True
+
+        await self._start(lifecycle, wc, state)
+
+        # `ensure()` sets the flag back to True on success, so asserting the flag after
+        # startup would pass either way. The observable that matters is what the backend
+        # was *told*: `already_delivered` is the value the contract lets it skip on.
+        kwargs = lifecycle._agents["claude"].ensure_durable_instructions.call_args.kwargs
+        self.assertFalse(
+            kwargs["already_delivered"],
+            "a replacement session must not be told its context was already delivered")
+
+    async def test_a_reused_session_is_told_its_context_was_delivered(self):
+        """The other half, so the assertion above pins a distinction rather than a
+        constant: a genuinely resumed session keeps its history."""
+        lifecycle, _, _, wc = self._make_lifecycle()
+        state = self._stored("old-session-id", backend_identity("claude", "/srv/work"))
+        state.context_injected = True
+
+        await self._start(lifecycle, wc, state)
+
+        kwargs = lifecycle._agents["claude"].ensure_durable_instructions.call_args.kwargs
+        self.assertTrue(kwargs["already_delivered"])
+
+    async def test_the_abandoned_session_takes_its_retry_bookkeeping_with_it(self):
+        """Found by checking `reset_watcher`, not reported: it pairs "clear the session"
+        with `injector.reset_session()`, and an identity mismatch replaces a session
+        without passing through it. Left alone, a watcher that had reached
+        failed_degraded would carry that verdict into a session never injected at all."""
+        lifecycle, _, _, wc = self._make_lifecycle(working_directory="/srv/moved")
+        state = self._stored("old-session-id", backend_identity("claude", "/srv/work"))
+        lifecycle._injector.reset_session = MagicMock()
+
+        await self._start(lifecycle, wc, state)
+
+        lifecycle._injector.reset_session.assert_called_once_with("old-session-id")
+
+    async def test_a_reused_session_keeps_its_bookkeeping(self):
+        """The other half: reuse must not reset anything, or every restart would clear
+        the retry counter it exists to accumulate."""
+        lifecycle, _, _, wc = self._make_lifecycle()
+        state = self._stored("old-session-id", backend_identity("claude", "/srv/work"))
+        lifecycle._injector.reset_session = MagicMock()
+
+        await self._start(lifecycle, wc, state)
+
+        lifecycle._injector.reset_session.assert_not_called()
 
     async def test_what_is_stored_is_what_the_next_run_compares(self):
         """The round trip, which asserting a literal string would not catch.

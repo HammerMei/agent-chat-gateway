@@ -378,6 +378,13 @@ class WatcherLifecycle:
         session_id, created_new_session = await self._provision_session(
             wc, state, agent, agent_cfg, identity
         )
+        if created_new_session and state and state.session_id:
+            # The record survived but its session did not, so the bookkeeping keyed to
+            # the old id has to go with it — the same pairing `reset_watcher` makes when
+            # it clears a session id. Without this the retry counter for the abandoned
+            # session outlives it, and a watcher that had reached failed_degraded would
+            # carry that verdict into a session which has never been injected at all.
+            self._injector.reset_session(state.session_id)
 
         # 3. Build state and register maps
         ws = WatcherState(
@@ -385,7 +392,16 @@ class WatcherLifecycle:
             session_id=session_id,
             room_id=room.id,
             room_type=room.type,
-            context_injected=state.context_injected if state else False,
+            # False whenever the session is new, not merely when the record is:
+            # the flag describes what a *session* has received, and a replacement
+            # session has received nothing. `reset_watcher` already pairs "clear the
+            # session id" with "clear this flag"; an identity mismatch replaces the
+            # session without going through that path, so it has to pair them too.
+            context_injected=(
+                state.context_injected
+                if state and not created_new_session
+                else False
+            ),
             paused=False,
             last_processed_ts=state.last_processed_ts if state else "",
             backend_identity=identity,

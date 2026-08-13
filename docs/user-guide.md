@@ -1036,7 +1036,14 @@ Files are cached globally in the `cache_dir` and symlinked into each watcher's w
 
 By default, each watcher creates its own persistent session with the agent backend. The session ID is stored in `~/.agent-chat-gateway/state.<connector>.json` and reused across daemon restarts.
 
-The session is reused only while the agent still resolves to the same **backend type and working directory** — the pair that scopes where the backend keeps its sessions. Change either one and the watcher starts a fresh session and logs why, rather than replaying an id into a store that never issued it, where it would find nothing or, worse, an unrelated session with the same id. The earlier conversation is not deleted; it stays in the backend it was created against. The gateway will not re-attach it, though — the state record now holds the new session, so changing the setting back starts a third session rather than returning to the first. Recovering that conversation means resuming it with the backend's own tooling (for Claude Code, `claude --resume <id>` from the original working directory), using the id from the log line that reported the change.
+The session is reused only while the agent still resolves to the same **backend type and physical working directory** — the pair that scopes where the backend keeps its sessions. Change either one and the watcher starts a fresh session and logs why, rather than replaying an id into a store that never issued it, where it would find nothing or, worse, an unrelated session with the same id. The earlier conversation is not deleted; it stays in the backend it was created against. The gateway will not re-attach it, though — the state record now holds the new session, so changing the setting back starts a third session rather than returning to the first. Recovering that conversation means resuming it with the backend's own tooling (for Claude Code, `claude --resume <id>` from the original working directory), using the id from the log line that reported the change.
+
+> ⚠️ **If `working_directory` points through a symlink** — a `current -> release-N`
+> deploy link, say — repointing that link swaps the session too, even though
+> `config.yaml` did not change. This is not incidental: a process launched there
+> reports the physical path, so the backend genuinely keeps its sessions per target
+> directory. Point `working_directory` at a stable path if you want conversations to
+> survive a deploy.
 
 No configuration is involved: a watcher's session id is assigned by the backend and
 persisted by the gateway, never written by hand.

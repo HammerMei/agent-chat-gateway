@@ -216,6 +216,20 @@ def backend_identity(agent_type: str, working_directory: str) -> str:
     store: replaying it either loses continuity silently or matches an unrelated session
     that happens to carry the same id.
 
+    The directory is **canonicalized**, and that is the whole point rather than tidiness:
+    the config loader resolves relative paths but leaves an absolute one as written, and
+    a backend subprocess launched with `cwd=/srv/current` reports the *physical* path
+    from `getcwd()` (verified: retargeting the symlink changes what the child sees, and
+    Claude Code's session store lives under a slugified physical path). So a deploy
+    symlink repointed between restarts changes the store while leaving the configured
+    string identical — the exact replay this comparison exists to catch, invisible to an
+    uncanonicalized identity.
+
+    An empty `working_directory` stays empty rather than resolving to the process cwd:
+    config load requires the field and requires it to exist, so empty reaches here only
+    from tests constructing `AgentConfig()` directly, and resolving it would make their
+    identity depend on where pytest was invoked.
+
     `type:working_directory`, and the separator is load-bearing rather than cosmetic —
     the value is compared against records already on disk, so changing the spelling
     invalidates every stored identity and silently restarts every session. Takes the two
@@ -227,7 +241,8 @@ def backend_identity(agent_type: str, working_directory: str) -> str:
     nothing. It is not a filesystem key — those are in `gateway/core/paths.py` and are
     digests for the opposite reason.
     """
-    return f"{agent_type}:{working_directory}"
+    resolved = str(Path(working_directory).resolve()) if working_directory else ""
+    return f"{agent_type}:{resolved}"
 
 
 def state_files() -> list[Path]:
