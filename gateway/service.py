@@ -29,8 +29,9 @@ from .connectors import connector_factory
 from .control import ControlServer
 from .core.bot_identity import (
     ConnectorIdentity,
+    DmClaim,
     DuplicateBotIdentityError,
-    dm_owner_connectors,
+    dm_claims,
     find_identity_conflicts,
 )
 from .core.config import CoreConfig
@@ -290,13 +291,13 @@ class GatewayService:
 
         self._runtime_manager = AgentRuntimeManager(agents)
 
-        # Connectors that claim their account's direct-message stream — from rules that
-        # opt in AND from static watchers naming an `@someone` room, since both reach a
-        # DM and only the static form has runtime effect today. Read once here rather
-        # than holding the whole config: the identity barrier needs only this, and
-        # config is immutable after load. A DM has no team, so it is the one thing the
-        # Mattermost different-teams exception cannot keep apart (§4.5).
-        self._dm_owner_connectors: set[str] = dm_owner_connectors(
+        # What each connector claims of its account's direct messages — a rule opting
+        # in takes the whole stream, a static `@someone` watcher takes one channel.
+        # Read once here rather than holding the whole config: the identity barrier
+        # needs only this, and config is immutable after load. A DM has no team, so it
+        # is the one thing the Mattermost different-teams exception cannot keep apart
+        # (§4.5).
+        self._dm_claims: dict[str, DmClaim] = dm_claims(
             config.watchers, config.watcher_rules
         )
         self._entries: list[ConnectorEntry] = []
@@ -399,7 +400,7 @@ class GatewayService:
                 ConnectorIdentity(
                     connector_name=e.name,
                     identity=identity,
-                    owns_dms=e.name in self._dm_owner_connectors,
+                    dms=self._dm_claims.get(e.name, DmClaim()),
                 )
             )
         conflicts = find_identity_conflicts(identities)

@@ -17,8 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   means both receive the identical message stream, so every room matching rules on both
   gets two agents answering it, which the per-connector watcher key cannot detect.
   Two exceptions, per design §4.5: Mattermost connectors scoped to **different teams**
-  may share an account, and at most **one** of them may enable direct messages (a DM has
-  no team, so it reaches every connection the account has open).
+  may share an account, and no two of them may claim **overlapping** direct messages (a
+  DM has no team, so it reaches every connection the account has open). A rule opting in
+  with `direct:`/`group_direct:` claims every DM; a static `@someone` watcher claims just
+  that conversation, so two connectors on `@alice` and `@bob` are a working setup.
   A connector that cannot establish its own identity stops startup rather than starting
   unchecked. Mattermost now opens its socket while connecting but starts reading it
   only after watchers are restored, so messages arriving during startup are buffered

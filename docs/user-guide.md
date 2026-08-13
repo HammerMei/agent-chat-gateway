@@ -359,8 +359,10 @@ are both fully supported today; a daemon can run one, the other, or both at once
 >
 > **Mattermost is the one exception**: two connectors on one account are allowed when
 > each is scoped to a **different team**, since each ignores the other team's channels.
-> Even then, only one of them may enable direct messages — a DM belongs to no team, so
-> the server delivers it to every connection the account has open.
+> Even then their direct messages must not overlap — a DM belongs to no team, so the
+> server delivers it to every connection the account has open. Watching `@alice` on one
+> and `@bob` on the other is fine; the same person on both is not, and a rule with
+> `direct:` takes *every* DM, which overlaps with any of them.
 
 ```yaml
 connectors:

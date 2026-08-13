@@ -46,8 +46,9 @@ from .connectors.voice.config import VoiceConfig
 from .core.bot_identity import (
     BotIdentity,
     ConnectorIdentity,
+    DmClaim,
     canonical_origin,
-    dm_owner_connectors,
+    dm_claims,
     find_identity_conflicts,
 )
 from .core.state import StateFormatError, load_state, state_files
@@ -237,7 +238,7 @@ def _check_declared_bot_accounts(config: GatewayConfig, result: ValidationResult
     are missed duplicates that the runtime check still catches — never a rejection of a
     configuration that would have worked.
     """
-    dm_owners = dm_owner_connectors(config.watchers, config.watcher_rules)
+    claims = dm_claims(config.watchers, config.watcher_rules)
     declared: list[ConnectorIdentity] = []
     for connector in config.connectors:
         validator = _CONNECTOR_VALIDATORS.get(connector.type)
@@ -260,7 +261,7 @@ def _check_declared_bot_accounts(config: GatewayConfig, result: ValidationResult
                     user_id=username,
                     scope=getattr(cfg, "team", ""),
                 ),
-                owns_dms=connector.name in dm_owners,
+                dms=claims.get(connector.name, DmClaim()),
             )
         )
 

@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from gateway.core.bot_identity import (
     BotIdentity,
     ConnectorIdentityError,
+    DmClaim,
     DuplicateBotIdentityError,
     canonical_origin,
 )
@@ -172,7 +173,7 @@ class TestIdentityBarrier(unittest.IsolatedAsyncioTestCase):
     two phases, because a SessionManager owns one connector and can never see the pair.
     """
 
-    def _service_with(self, *identities, dm_owners=frozenset()):
+    def _service_with(self, *identities, dms=None):
         service = _make_service()
         service._runtime_manager.start_all = AsyncMock(return_value=[])
         service._runtime_manager.has_active_brokers = False
@@ -180,7 +181,7 @@ class TestIdentityBarrier(unittest.IsolatedAsyncioTestCase):
         service._runtime_manager.stop_all = AsyncMock()
         service._control.start = AsyncMock()
         service._control.stop = AsyncMock()
-        service._dm_owner_connectors = set(dm_owners)
+        service._dm_claims = dict(dms or {})
 
         entries = []
         for i, identity in enumerate(identities):
@@ -241,13 +242,13 @@ class TestIdentityBarrier(unittest.IsolatedAsyncioTestCase):
 
         service._entries[0].session_manager.sync_only.assert_not_awaited()
 
-    async def test_two_dm_owners_across_teams_are_refused(self):
-        """The exception's condition, wired: the connector names come from the service's
-        own DM-owner set, which is derived from the rules at construction."""
+    async def test_two_overlapping_dm_claims_across_teams_are_refused(self):
+        """The exception's condition, wired: the claims come from the service's own map,
+        derived from both watcher shapes at construction."""
         service = self._service_with(
             BotIdentity("mattermost", "https://mm.example.com", "user-abc", scope="team-1"),
             BotIdentity("mattermost", "https://mm.example.com", "user-abc", scope="team-2"),
-            dm_owners={"c0", "c1"},
+            dms={"c0": DmClaim(whole_stream=True), "c1": DmClaim(whole_stream=True)},
         )
 
         with self.assertRaises(DuplicateBotIdentityError) as cm:
@@ -258,7 +259,7 @@ class TestIdentityBarrier(unittest.IsolatedAsyncioTestCase):
         service = self._service_with(
             BotIdentity("mattermost", "https://mm.example.com", "user-abc", scope="team-1"),
             BotIdentity("mattermost", "https://mm.example.com", "user-abc", scope="team-2"),
-            dm_owners={"c0"},
+            dms={"c0": DmClaim(whole_stream=True)},
         )
         service._control.start = AsyncMock(side_effect=RuntimeError("stop here"))
 

@@ -62,6 +62,9 @@ def canonical_origin(url: str) -> str:
     * **An IPv6 host keeps its brackets.** Without them `https://[::1]:8443` and
       `https://[::1:8443]` both render as `https://::1:8443`, one address-and-port and
       one address, indistinguishable.
+    * **A terminal DNS root dot is dropped.** `chat.example.com.` and `chat.example.com`
+      resolve to one server, so keeping the dot would split one account into two keys —
+      a missed duplicate, which here means two agents in the same room.
     * **An unparseable port is left alone rather than normalised.** `urlsplit().port`
       raises on a non-numeric or out-of-range port, and this function is reached from
       `acg config validate`, where a traceback replaces the attributed bad-URL finding
@@ -73,7 +76,7 @@ def canonical_origin(url: str) -> str:
     """
     parsed = urlsplit(url if "//" in url else f"//{url}", scheme="https")
     scheme = (parsed.scheme or "https").lower()
-    host = (parsed.hostname or "").lower()
+    host = (parsed.hostname or "").lower().rstrip(".")  # a terminal DNS root dot
     if ":" in host:  # IPv6 literal — brackets are what make host and port separable
         host = f"[{host}]"
     try:
@@ -118,35 +121,70 @@ class BotIdentity:
 
 
 @dataclass(frozen=True)
+class DmClaim:
+    """How much of an account's direct-message traffic one connector answers.
+
+    A boolean was wrong, and wrong in the expensive direction. A rule opting in with
+    `direct:`/`group_direct:` claims the whole class — every DM the account receives.
+    A **static** watcher claims exactly one resolved channel: `subscribe_room()`
+    registers that channel and `_on_posted_event()` ignores every other, so two
+    connectors watching `@alice` and `@bob` cannot both answer one message. Treating
+    both shapes as "owns DMs" refused a configuration that works.
+    """
+
+    whole_stream: bool = False
+    rooms: frozenset[str] = frozenset()
+
+    def overlaps(self, other: "DmClaim") -> bool:
+        """Whether both connectors could answer the same direct message."""
+        if not (self.whole_stream or self.rooms):
+            return False
+        if not (other.whole_stream or other.rooms):
+            return False
+        if self.whole_stream or other.whole_stream:
+            return True  # one of them takes every DM, including the other's
+        return bool(self.rooms & other.rooms)
+
+
+@dataclass(frozen=True)
 class ConnectorIdentity:
-    """One connector's answer, plus whether it claims the account's DM stream."""
+    """One connector's answer, plus what it claims of the account's DM traffic."""
 
     connector_name: str
     identity: BotIdentity
-    owns_dms: bool = False
+    dms: DmClaim = DmClaim()
 
 
-def dm_owner_connectors(watchers, watcher_rules) -> set[str]:
-    """Which connectors claim their account's direct-message stream.
+def dm_claims(watchers, watcher_rules) -> dict[str, DmClaim]:
+    """What each connector claims of its account's direct messages.
 
-    Takes both watcher shapes because both can reach a DM, and only one of them can
-    reach anything at all today: a rule opts in with `direct:`/`group_direct:`, while a
-    **static** watcher names the room outright as `@someone` — the `@` convention both
-    platforms implement (`rocketchat/rest.py`, `mattermost/rest.py`, where it resolves
-    to a direct channel). Rules have no runtime effect until the watcher manager lands,
-    so counting only rules would have left this condition guarding the one form that
-    cannot yet happen while missing the one that can.
+    Both watcher shapes reach a DM, and they claim different amounts — see `DmClaim`.
+    Only one of the two shapes runs today: rules have no runtime effect until the
+    watcher manager lands, while a static `@someone` watcher works now, so a check
+    reading only rules guards the form that cannot yet happen.
+
+    Room names are compared casefolded. Two spellings of one username are one channel,
+    and here a missed match is the costly direction — it lets two connectors answer the
+    same DM — whereas over-matching only refuses a pair that was already suspicious.
 
     Takes the two lists rather than a `GatewayConfig` because this module is in
     `gateway.core`, which the config layer imports and must not import back.
     """
-    owners = {
+    whole: set[str] = {
         rule.connector
         for rule in watcher_rules
         if rule.rooms.direct or rule.rooms.group_direct
     }
-    owners |= {w.connector for w in watchers if is_direct_room_name(w.room)}
-    return owners
+    rooms: dict[str, set[str]] = {}
+    for w in watchers:
+        if is_direct_room_name(w.room):
+            rooms.setdefault(w.connector, set()).add(w.room.casefold())
+
+    return {
+        name: DmClaim(
+            whole_stream=name in whole, rooms=frozenset(rooms.get(name, ())))
+        for name in whole | rooms.keys()
+    }
 
 
 def find_identity_conflicts(entries: list[ConnectorIdentity]) -> list[str]:
@@ -160,9 +198,11 @@ def find_identity_conflicts(entries: list[ConnectorIdentity]) -> list[str]:
     * a group of one is always fine;
     * a group of more than one is a conflict **unless** every member has a distinct,
       non-empty `scope` — the Mattermost different-teams exception;
-    * an excepted group may still contain **at most one** DM owner. A DM has no team, so
-      the team gate cannot separate it and the platform delivers it to every socket the
-      account has open.
+    * within an excepted group, no two connectors may claim **overlapping** direct
+      messages. A DM has no team, so the team gate cannot separate it and the platform
+      delivers it to every socket the account has open — but a static watcher claims one
+      channel rather than the stream, so two connectors on `@alice` and `@bob` are fine
+      and only an actual overlap is a conflict.
     """
     conflicts: list[str] = []
     groups: dict[tuple[str, str, str], list[ConnectorIdentity]] = {}
@@ -184,14 +224,23 @@ def find_identity_conflicts(entries: list[ConnectorIdentity]) -> list[str]:
                 f"— on Mattermost only — scope them to different teams."
             )
             continue
-        owners = sorted(e.connector_name for e in group if e.owns_dms)
-        if len(owners) > 1:
-            listed = ", ".join(f"'{n}'" for n in owners)
-            conflicts.append(
-                f"Connectors {listed} share the bot account {user_id} on {origin} and "
-                f"each enable direct messages. Different teams keep their channels "
-                f"apart, but a DM has no team and is delivered to every connection the "
-                f"account has open, so both would answer the same DM. Enable direct "
-                f"messages on exactly one of them."
-            )
+        for i, a in enumerate(group):
+            for b in group[i + 1:]:
+                if not a.dms.overlaps(b.dms):
+                    continue
+                pair = ", ".join(
+                    sorted(f"'{e.connector_name}'" for e in (a, b)))
+                shared = sorted(a.dms.rooms & b.dms.rooms)
+                detail = (
+                    f"both watch {', '.join(shared)}"
+                    if shared
+                    else "one of them takes every direct message the account receives"
+                )
+                conflicts.append(
+                    f"Connectors {pair} share the bot account {user_id} on {origin} and "
+                    f"their direct-message coverage overlaps — {detail}. Different teams "
+                    f"keep their channels apart, but a DM has no team and reaches every "
+                    f"connection the account has open, so both would answer it. Leave "
+                    f"the overlapping direct messages to one of them."
+                )
     return conflicts

@@ -15,8 +15,9 @@ from gateway.core.bot_identity import (
     BotIdentity,
     ConnectorIdentity,
     ConnectorIdentityError,
+    DmClaim,
     canonical_origin,
-    dm_owner_connectors,
+    dm_claims,
     find_identity_conflicts,
 )
 from gateway.core.connector import Connector
@@ -51,6 +52,15 @@ class TestCanonicalOrigin(unittest.TestCase):
             canonical_origin("https://rc.example.com"),
         )
 
+    def test_a_terminal_dns_root_dot_is_dropped(self):
+        """`chat.example.com.` and `chat.example.com` resolve to one server, so keeping
+        the dot splits one account into two keys — a *missed* duplicate, which here means
+        two agents answering in the same room."""
+        self.assertEqual(
+            canonical_origin("http://chat.example.com."),
+            canonical_origin("http://chat.example.com"),
+        )
+
     def test_a_deployment_path_is_kept(self):
         """The opposite failure direction, and the worse one: two deployments under one
         host are two servers (both clients build their URLs on the prefix), and
@@ -81,10 +91,10 @@ class TestCanonicalOrigin(unittest.TestCase):
         self.assertEqual(canonical_origin("rc.example.com"), "https://rc.example.com")
 
 
-def _entry(name, user_id="u1", origin="https://s", scope="", owns_dms=False,
+def _entry(name, user_id="u1", origin="https://s", scope="", dms=None,
            platform="rocketchat"):
     return ConnectorIdentity(
-        name, BotIdentity(platform, origin, user_id, scope), owns_dms)
+        name, BotIdentity(platform, origin, user_id, scope), dms or DmClaim())
 
 
 class TestIdentityConflicts(unittest.TestCase):
@@ -130,12 +140,12 @@ class TestIdentityConflicts(unittest.TestCase):
         self.assertEqual(
             len(find_identity_conflicts([_entry("a", scope="team1"), _entry("b")])), 1)
 
-    def test_two_dm_owners_on_one_account_are_rejected_even_across_teams(self):
+    def test_two_whole_stream_claims_on_one_account_are_rejected_across_teams(self):
         """The condition on the exception. A DM has no team, so the team gate cannot
         separate it and the platform delivers it to every open connection."""
         conflicts = find_identity_conflicts([
-            _entry("a", scope="team1", owns_dms=True),
-            _entry("b", scope="team2", owns_dms=True),
+            _entry("a", scope="team1", dms=DmClaim(whole_stream=True)),
+            _entry("b", scope="team2", dms=DmClaim(whole_stream=True)),
         ])
         self.assertEqual(len(conflicts), 1)
         self.assertIn("direct message", conflicts[0].lower())
@@ -143,10 +153,43 @@ class TestIdentityConflicts(unittest.TestCase):
     def test_one_dm_owner_across_teams_is_allowed(self):
         self.assertEqual(
             find_identity_conflicts([
-                _entry("a", scope="team1", owns_dms=True),
-                _entry("b", scope="team2", owns_dms=False),
+                _entry("a", scope="team1", dms=DmClaim(whole_stream=True)),
+                _entry("b", scope="team2"),
             ]),
             [],
+        )
+
+    def test_disjoint_static_dms_across_teams_are_allowed(self):
+        """A static watcher claims one resolved channel, not the stream: `subscribe_room`
+        registers that channel and the handler ignores every other, so these two cannot
+        both answer one message. Rejecting them refuses a configuration that works —
+        the expensive direction for a check whose answer is "do not start"."""
+        self.assertEqual(
+            find_identity_conflicts([
+                _entry("a", scope="team1", dms=DmClaim(rooms=frozenset({"@alice"}))),
+                _entry("b", scope="team2", dms=DmClaim(rooms=frozenset({"@bob"}))),
+            ]),
+            [],
+        )
+
+    def test_the_same_static_dm_on_both_is_rejected(self):
+        conflicts = find_identity_conflicts([
+            _entry("a", scope="team1", dms=DmClaim(rooms=frozenset({"@alice"}))),
+            _entry("b", scope="team2", dms=DmClaim(rooms=frozenset({"@alice", "@bob"}))),
+        ])
+        self.assertEqual(len(conflicts), 1)
+        self.assertIn("@alice", conflicts[0])
+        self.assertNotIn("@bob", conflicts[0], "only the overlap is the problem")
+
+    def test_a_whole_stream_claim_swallows_another_connector_static_dm(self):
+        """`direct: true` takes every DM the account receives, including the one a
+        static watcher on the other connector is waiting for."""
+        self.assertEqual(
+            len(find_identity_conflicts([
+                _entry("a", scope="team1", dms=DmClaim(whole_stream=True)),
+                _entry("b", scope="team2", dms=DmClaim(rooms=frozenset({"@alice"}))),
+            ])),
+            1,
         )
 
     def test_two_platforms_at_one_origin_are_not_one_account(self):
@@ -416,28 +459,37 @@ class TestWhoOwnsTheDmStream(unittest.TestCase):
 
         return M(connector=connector, room=room)
 
-    def test_a_static_at_room_makes_its_connector_a_dm_owner(self):
-        self.assertEqual(
-            dm_owner_connectors([self._watcher("mm-eng", "@alice")], []), {"mm-eng"})
+    def test_a_static_at_room_claims_that_room_only(self):
+        claims = dm_claims([self._watcher("mm-eng", "@alice")], [])
+        self.assertEqual(claims["mm-eng"], DmClaim(rooms=frozenset({"@alice"})))
+        self.assertFalse(claims["mm-eng"].whole_stream)
 
-    def test_a_static_channel_does_not(self):
-        self.assertEqual(
-            dm_owner_connectors([self._watcher("mm-eng", "incidents")], []), set())
+    def test_a_static_channel_claims_nothing(self):
+        self.assertEqual(dm_claims([self._watcher("mm-eng", "incidents")], []), {})
 
-    def test_a_rule_opting_in_counts(self):
-        self.assertEqual(
-            dm_owner_connectors([], [self._rule("mm-eng", direct=True)]), {"mm-eng"})
-        self.assertEqual(
-            dm_owner_connectors([], [self._rule("mm-eng", group_direct=True)]),
-            {"mm-eng"},
-        )
+    def test_a_rule_opting_in_claims_the_whole_stream(self):
+        for kwargs in ({"direct": True}, {"group_direct": True}):
+            with self.subTest(**kwargs):
+                claims = dm_claims([], [self._rule("mm-eng", **kwargs)])
+                self.assertTrue(claims["mm-eng"].whole_stream)
 
-    def test_both_shapes_are_unioned(self):
-        owners = dm_owner_connectors(
+    def test_room_names_are_compared_casefolded(self):
+        """One username spelled two ways is one channel, and a missed match here is the
+        costly direction: it lets two connectors answer the same DM."""
+        claims = dm_claims(
+            [self._watcher("a", "@Alice"), self._watcher("b", "@alice")], [])
+        self.assertTrue(claims["a"].overlaps(claims["b"]))
+
+    def test_both_shapes_combine_on_one_connector(self):
+        claims = dm_claims(
             [self._watcher("mm-sales", "@bob"), self._watcher("mm-eng", "general")],
             [self._rule("mm-eng", direct=True)],
         )
-        self.assertEqual(owners, {"mm-sales", "mm-eng"})
+        self.assertTrue(claims["mm-eng"].whole_stream)
+        self.assertEqual(claims["mm-sales"].rooms, frozenset({"@bob"}))
+
+    def test_a_connector_claiming_nothing_never_overlaps(self):
+        self.assertFalse(DmClaim().overlaps(DmClaim(whole_stream=True)))
 
 
 class TestStaticDmWatchersReachTheCheck(unittest.TestCase):
@@ -496,14 +548,20 @@ class TestStaticDmWatchersReachTheCheck(unittest.TestCase):
             cfg = GatewayConfig.from_file(str(self._config(root, second_room)))
             with patch.object(state_mod, "RUNTIME_DIR", root / "runtime"):
                 service = GatewayService(cfg)
-            return service._dm_owner_connectors
+            return service._dm_claims
 
-    def test_two_static_dm_watchers_make_both_connectors_owners(self):
-        self.assertEqual(self._service_dm_owners("@bob"), {"mm-eng", "mm-sales"})
+    def test_static_dm_watchers_become_per_room_claims(self):
+        claims = self._service_dm_owners("@bob")
+        self.assertEqual(claims["mm-eng"].rooms, frozenset({"@alice"}))
+        self.assertEqual(claims["mm-sales"].rooms, frozenset({"@bob"}))
+        self.assertFalse(
+            claims["mm-eng"].overlaps(claims["mm-sales"]),
+            "disjoint DMs on two connectors are a working configuration",
+        )
 
-    def test_a_channel_watcher_leaves_its_connector_out(self):
-        """Otherwise the test above would pass against a set that always holds both."""
-        self.assertEqual(self._service_dm_owners("incidents"), {"mm-eng"})
+    def test_a_channel_watcher_claims_nothing(self):
+        """Otherwise the test above would pass against a map that always holds both."""
+        self.assertNotIn("mm-sales", self._service_dm_owners("incidents"))
 
 
 class TestInboundStartsAfterWatchersExist(unittest.IsolatedAsyncioTestCase):
