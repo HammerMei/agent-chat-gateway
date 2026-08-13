@@ -49,6 +49,7 @@ from ..config import (
     _parse_templates_block,
     _resolve_inherits,
     collect_config,
+    entry_is_watcher_rule,
 )
 from ..config_validate import Finding, ValidationResult, validate_config
 
@@ -499,6 +500,16 @@ class EditableConfig:
         seen_watcher_names: set[str] = set()
         result: list[ExpandedWatcher] = []
         for entry in mem_watchers_raw:
+            # A rule-shaped entry is not an expanded watcher and never becomes one
+            # here — it names no room, and which rooms it will claim is only known at
+            # runtime. It is skipped KNOWINGLY rather than left to the `except
+            # ValueError` below: a rule is valid config, so nothing reports an issue
+            # for it, and relying on the parser to reject it would make that
+            # `continue`'s "its own Finding explains why" a lie — a legal entry with
+            # no row and no explanation anywhere. Rules get their own display in the
+            # config tool's Rules tab (design §5.5).
+            if entry_is_watcher_rule(entry):
+                continue
             try:
                 expanded = _parse_one_watcher_entry(
                     entry, 0, watcher_templates, connector_names, config.connectors,

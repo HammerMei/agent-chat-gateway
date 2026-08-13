@@ -38,6 +38,7 @@ from .config import (
     GatewayConfig,
     _parse_templates_block,
     collect_config,
+    find_shadowed_rules,
 )
 from .connectors.mattermost.config import MattermostConfig
 from .connectors.rocketchat.config import RocketChatConfig
@@ -164,10 +165,51 @@ def validate_config(config_path: str, lint: bool = False) -> ValidationResult:
 
     _check_connectors(config, result)
     _check_state_orphans(config, result)
+    _check_shadowed_rules(config, result)
     if lint:
         _lint_config(raw, result)
 
     return result
+
+
+_SHADOW_SCOPE_WORDING = {
+    "rule": "can never fire: every way it reaches a room",
+    "named": "will never match a named room: that pattern set",
+    "direct": "will never see a 1:1 DM: that reach",
+    "group_direct": "will never see a group DM: that reach",
+}
+
+
+def _check_shadowed_rules(config: GatewayConfig, result: ValidationResult) -> None:
+    """Warn about rule reaches an earlier rule already claims.
+
+    Warnings, not errors: under first-match precedence a shadowed rule is dead
+    config — nearly always a mistake in ordering — but the config is coherent and
+    the daemon starts fine, so refusing to load would be wrong.
+
+    This lives here rather than in the loader for two reasons. `from_file()` is
+    fail-fast and has no warning channel at all, and `collect_config()`'s
+    `ConfigIssue` is documented as "a from_file()-would-have-raised problem" and is
+    converted to severity="error" unconditionally above — riding it would report
+    dead-but-legal config as a load failure. `validate_config()` already emits
+    warnings, and is what both `acg config validate` and the config TUI's banner
+    read.
+
+    Nothing warns at daemon startup, because until the watcher manager lands
+    nothing consumes rules, so there is no behaviour for a shadowed rule to affect.
+    """
+    for finding in find_shadowed_rules(config.watcher_rules):
+        detail = _SHADOW_SCOPE_WORDING.get(finding.scope, f"reach '{finding.scope}'")
+        msg = (
+            f"Watcher rule '{finding.rule.name}' {detail} is already claimed by "
+            f"the earlier rule '{finding.shadowed_by.name}'. Under first-match "
+            "precedence a rule only sees rooms no earlier rule stopped — reorder "
+            "them, or narrow the earlier rule."
+        )
+        result.warnings.append(msg)
+        result.findings.append(
+            Finding("warning", "watcher", finding.rule.name, "rooms", msg)
+        )
 
 
 def _looks_like_url(value: str) -> bool:
