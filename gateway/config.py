@@ -1462,29 +1462,6 @@ def _parse_history_handoff(raw: object, index: int) -> HistoryHandoffConfig:
     )
 
 
-def _validated_path_list(raw: object, index: int) -> list[str]:
-    """Check a path list before `_resolve_paths` iterates it.
-
-    Unvalidated, a bare string is iterated *per character*: `context_inject_files:
-    foo` becomes three paths ending `/f`, `/o`, `/o` rather than one error. And a
-    non-string element raises TypeError out of `Path()`, which collect_config()
-    does not catch, so one bad rule aborts the whole validation pass.
-    """
-    if isinstance(raw, str) or not isinstance(raw, Sequence):
-        raise ValueError(
-            f"Watcher rule at index {index}: 'context_inject_files' must be a "
-            f"list of paths (got {type(raw).__name__}); a bare string would be "
-            "read one character at a time."
-        )
-    for item in raw:
-        if not isinstance(item, str) or not item:
-            raise ValueError(
-                f"Watcher rule at index {index}: 'context_inject_files' entries "
-                "must be non-empty strings."
-            )
-    return list(raw)
-
-
 def _parse_one_watcher_rule(
     entry: object,
     index: int,
@@ -1688,8 +1665,11 @@ def _parse_one_watcher_rule(
         rooms=matcher,
         session_idle_days=idle_days,
         session_expire_days=expire_days,
+        # _resolve_paths validates the container and every element itself, so
+        # there is one implementation of this check rather than a rule-shaped copy
+        # beside a static-shaped one.
         context_inject_files=_resolve_paths(
-            _validated_path_list(wc.get("context_inject_files", []), index),
+            wc.get("context_inject_files", []),
             config_dir,
             f"Watcher rule at index {index}: 'context_inject_files'",
         ),

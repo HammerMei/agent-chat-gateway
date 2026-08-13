@@ -422,13 +422,100 @@ class TestContextInjectFilesValidation(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse({**MINIMAL, "context_inject_files": ["ok", 3]})
 
-    def test_an_empty_element_is_rejected(self):
-        with self.assertRaises(ValueError):
-            parse({**MINIMAL, "context_inject_files": [""]})
+    def test_an_empty_element_is_skipped_not_rejected(self):
+        """Documents the shared implementation's behaviour rather than the stricter
+        one this test originally asserted.
+
+        `_resolve_paths` skips empty entries, which is how the static path has
+        always behaved and is therefore released behaviour. Tightening it to an
+        error would change that path too, so it belongs in its own change rather
+        than riding along here — noted because an empty entry is most likely a
+        typo, and silently dropping it is the same quiet family as the bugs this
+        branch has been fixing."""
+        r = parse({**MINIMAL, "context_inject_files": ["", "a.md"]})
+        self.assertEqual(len(r.context_inject_files), 1)
 
     def test_a_proper_list_is_resolved(self):
         r = parse({**MINIMAL, "context_inject_files": ["a.md"]})
         self.assertTrue(r.context_inject_files[0].endswith("a.md"))
+
+
+class TestEveryRuleFieldIsTypeChecked(unittest.TestCase):
+    """The systematic guard, added because the review kept finding fields one at a
+    time.
+
+    Four separate rounds each found another field the parser read and copied
+    without checking its type -- connector, history_handoff, context_inject_files,
+    then the notifications. Fixing them individually left no reason to believe the
+    next one was covered. This enumerates every key in WATCHER_RULE_KEYS and
+    requires each to reject a value of the wrong type, so a field added later
+    without validation fails here rather than in a fifth review round."""
+
+    # A wrong-typed value per field, and the fields where any type is acceptable.
+    WRONG_VALUE = {
+        "name": [],
+        "connector": False,
+        "agent": 3,
+        "rooms": ["eng-*"],
+        "session_idle_days": "seven",
+        "session_expire_days": [30],
+        "context_inject_files": "notes.md",
+        "online_notification": True,
+        "offline_notification": 3,
+        "history_handoff": True,
+    }
+    # `description` is annotation only and never read; `inherits` is resolved
+    # before this parser sees the entry, and has its own tests.
+    NOT_READ_HERE = {"description", "inherits"}
+
+    def test_the_table_covers_every_declared_key(self):
+        from gateway.config import WATCHER_RULE_KEYS
+
+        self.assertEqual(
+            set(self.WRONG_VALUE) | self.NOT_READ_HERE,
+            set(WATCHER_RULE_KEYS),
+            "a rule field was added without a wrong-type case here",
+        )
+
+    def test_each_field_rejects_a_wrong_type(self):
+        for field, bad in self.WRONG_VALUE.items():
+            with self.subTest(field=field):
+                with self.assertRaises(ValueError, msg=f"{field} accepted {bad!r}"):
+                    parse({**MINIMAL, field: bad})
+
+    def test_history_handoff_inner_fields_are_checked_too(self):
+        """The outer mapping being valid is not enough: `enable: false` -- one
+        letter short -- was silently ignored, leaving handoff ENABLED, which is the
+        same inversion `history_handoff: false` used to produce."""
+        for bad in ({"enable": False}, {"enabled": "false"}, {"fetch_count": -1},
+                    {"fetch_count": True}, {"verbatim_tail": "10"}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    parse({**MINIMAL, "history_handoff": bad})
+
+    def test_valid_history_handoff_still_works(self):
+        r = parse({**MINIMAL, "history_handoff": {"enabled": False, "fetch_count": 5}})
+        self.assertFalse(r.history_handoff.enabled)
+        self.assertEqual(r.history_handoff.fetch_count, 5)
+
+    def test_a_non_string_yaml_key_does_not_crash_the_error_path(self):
+        """`1: value` made the unknown-key formatter raise TypeError out of the
+        error path, escaping collect_config()'s `except ValueError`."""
+        with self.assertRaises(ValueError):
+            parse({**MINIMAL, 1: "value"})
+        with self.assertRaises(ValueError):
+            parse({**MINIMAL, "rooms": {"include": ["a"], 2: "x"}})
+
+    def test_a_failed_rule_does_not_reserve_its_name(self):
+        """The static parser stages names for exactly this reason. With the name
+        registered first, a rule that then failed left it taken, and a later valid
+        rule was rejected as a duplicate of something that was never returned."""
+        seen: set[str] = set()
+        with self.assertRaises(ValueError):
+            parse({**MINIMAL, "context_inject_files": "oops"}, seen=seen)
+        self.assertEqual(seen, set(), "the failed rule's name was left registered")
+        # The same name must still be usable afterwards.
+        self.assertEqual(parse(MINIMAL, seen=seen).name, "eng")
 
 
 class TestTheDenyIdiom(unittest.TestCase):
