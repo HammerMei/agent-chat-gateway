@@ -72,8 +72,30 @@ def check_backend_signatures(backends) -> None:
         if impl is AgentBackend.ensure_durable_instructions:
             continue  # not overridden; the base raises with its own message
         params = inspect.signature(impl).parameters
-        if "path_key" in params:
+        # Presence is not enough: the caller passes `path_key=...`, so a parameter
+        # declared positional-only would satisfy a membership test and then still raise
+        # the very TypeError this check exists to replace ("got some positional-only
+        # arguments passed as keyword"). A check that lets its own failure mode through in
+        # a describable case is not doing its one job.
+        keyword_callable = (
+            any(q.kind is inspect.Parameter.VAR_KEYWORD for q in params.values())
+            or (
+                "path_key" in params
+                and params["path_key"].kind in (
+                    inspect.Parameter.KEYWORD_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                )
+            )
+        )
+        if keyword_callable:
             continue
+        if "path_key" in params:
+            raise TypeError(
+                f"Agent backend '{name}' ({type(backend).__name__}) declares "
+                "ensure_durable_instructions()'s 'path_key' as positional-only. The "
+                "caller passes it by keyword, so this would fail at the first watcher "
+                "start. Declare it keyword-only (after '*'), as the base class does."
+            )
         if "watcher_name" in params:
             raise TypeError(
                 f"Agent backend '{name}' ({type(backend).__name__}) implements "

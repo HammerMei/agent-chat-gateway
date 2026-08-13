@@ -255,6 +255,56 @@ class TestBackendSignaturePreflight(unittest.TestCase):
                 GatewayService(cfg)
         self.assertIn("watcher_name", str(cm.exception))
 
+    def test_a_positional_only_path_key_is_refused(self):
+        """Presence is not enough — the parameter has to be callable by keyword.
+
+        The caller passes `path_key=...`, so a positional-only declaration satisfies a
+        membership test and then raises "got some positional-only arguments passed as
+        keyword arguments" at the first watcher start: exactly the raw TypeError this
+        preflight exists to replace. A check that lets its own failure mode through in a
+        describable case is not doing its one job.
+        """
+        from gateway.agents import AgentBackend, check_backend_signatures
+
+        class _PositionalOnly(AgentBackend):
+            async def create_session(self, *a, **kw):
+                return "s"
+
+            async def send(self, *a, **kw):
+                raise NotImplementedError
+
+            async def ensure_durable_instructions(
+                self, session_id, working_directory, timeout, content, path_key, /, *,
+                already_delivered,
+            ):
+                return None
+
+        with self.assertRaises(TypeError) as cm:
+            check_backend_signatures({"posonly": _PositionalOnly()})
+        msg = str(cm.exception)
+        self.assertIn("positional-only", msg)
+        self.assertIn("keyword-only", msg, "must say what to change it to")
+
+    def test_a_positional_or_keyword_path_key_is_accepted(self):
+        """The permissive-but-callable case: not keyword-only, but the keyword call
+        works, so refusing it would reject a working backend."""
+        from gateway.agents import AgentBackend, check_backend_signatures
+
+        class _PositionalOrKeyword(AgentBackend):
+            async def create_session(self, *a, **kw):
+                return "s"
+
+            async def send(self, *a, **kw):
+                raise NotImplementedError
+
+            async def ensure_durable_instructions(
+                self, session_id, working_directory, timeout, content, path_key,
+                already_delivered=False,
+            ):
+                return None
+
+        check_backend_signatures({"poskw": _PositionalOrKeyword()})
+
     def test_a_backend_taking_kwargs_is_accepted(self):
         """A `**kwargs` override cannot be judged by parameter name and is not the defect
         this looks for; forcing it to fail would refuse a working implementation."""
