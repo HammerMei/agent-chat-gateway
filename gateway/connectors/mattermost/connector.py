@@ -30,6 +30,11 @@ from pathlib import Path
 
 from ...agents.response import AgentEvent, AgentResponse
 from ...core.adapter_utils import ts_ms_to_iso_local, weekday_abbrev
+from ...core.bot_identity import (
+    BotIdentity,
+    ConnectorIdentityError,
+    canonical_origin,
+)
 from ...core.connector import (
     Connector,
     IncomingMessage,
@@ -396,6 +401,39 @@ class MattermostConnector(Connector):
     # containing these characters could inject fake delimiter fields into the
     # trusted header and bypass RBAC enforcement in CLAUDE.md.
     _PREFIX_UNSAFE_RE = re.compile(r"[\|\[\]\r\n]")
+
+    def bot_identity(self) -> BotIdentity:
+        """Account id from `users/me`, scoped by the **resolved** team id.
+
+        Both halves are server-resolved for the same reason: token-only auth leaves
+        `username` empty, and `team:` accepts either a team name or a team id, so two
+        connectors on one team can spell it two ways. Comparing what the operator wrote
+        would call them different and let the duplicate through — the one case this
+        exception is supposed to be safe for is exactly the case it would break.
+
+        A missing team is fatal rather than an empty scope: an empty scope means "no
+        sub-scope keeps me apart from another connector on this account", which for
+        Mattermost would silently convert a supported two-team setup into a rejected
+        one — or, worse, admit a connector whose team gate cannot work.
+        """
+        user_id = self._rest.bot_user_id
+        team_id = self._rest.team_id
+        if not user_id:
+            raise ConnectorIdentityError(
+                f"Mattermost connector for {self._config.server_url} cannot report its "
+                f"own user id — `users/me` returned none, so this connector is not "
+                f"authenticated and cannot be checked against the others for a shared "
+                f"bot account."
+            )
+        if not team_id:
+            raise ConnectorIdentityError(
+                f"Mattermost connector for {self._config.server_url} has no resolved "
+                f"team id for team '{self._config.team}'. Two connectors may share one "
+                f"bot account only when each is scoped to a different team, and that "
+                f"cannot be established here."
+            )
+        return BotIdentity(
+            canonical_origin(self._config.server_url), user_id, scope=team_id)
 
     @property
     def agent_username(self) -> str:

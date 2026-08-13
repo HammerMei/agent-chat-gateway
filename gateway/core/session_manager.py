@@ -103,12 +103,29 @@ class SessionManager:
         Returns:
             List of human-readable error strings for any watchers that failed.
         """
+        await self.connect_only()
+        errors = await self.sync_only(unavailable_agents=unavailable_agents)
+        logger.info("SessionManager ready (run_once)")
+        return errors
+
+    async def connect_only(self) -> None:
+        """Phase one: authenticate. No subscription, no watcher, no room.
+
+        Split from `sync_only` so an orchestrator holding several connectors can put a
+        barrier between the phases — two connectors on one bot account have to be
+        refused *before* either subscribes, and each SessionManager owns exactly one
+        connector, so nothing at this layer can see the collision (§4.5).
+
+        A single-connector caller has no such barrier to run and should keep using
+        `run_once()`.
+        """
         self._connector.register_handler(self._dispatcher.dispatch)
         self._connector.register_capacity_check(self._dispatcher.has_capacity)
         await self._connector.connect()
-        errors = await self._lifecycle.sync_watchers(unavailable_agents=unavailable_agents)
-        logger.info("SessionManager ready (run_once)")
-        return errors
+
+    async def sync_only(self, unavailable_agents: set[str] | None = None) -> list[str]:
+        """Phase two: restore watchers and subscribe. Requires `connect_only()` first."""
+        return await self._lifecycle.sync_watchers(unavailable_agents=unavailable_agents)
 
     async def shutdown(self) -> None:
         """Stop all processors, save state, disconnect connector.

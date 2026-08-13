@@ -27,6 +27,11 @@ from .agents.opencode import OpenCodeBackend
 from .config import AgentConfig, GatewayConfig
 from .connectors import connector_factory
 from .control import ControlServer
+from .core.bot_identity import (
+    ConnectorIdentity,
+    DuplicateBotIdentityError,
+    find_identity_conflicts,
+)
 from .core.config import CoreConfig
 from .core.connector import Connector
 from .core.expiry_task import run_expiry_task
@@ -284,6 +289,15 @@ class GatewayService:
 
         self._runtime_manager = AgentRuntimeManager(agents)
 
+        # Connectors whose rules opt into direct messages (§2.7). Read once here
+        # rather than holding the whole config: the identity barrier needs only this,
+        # and config is immutable after load. A DM has no team, so it is the one thing
+        # the Mattermost different-teams exception cannot keep apart (§4.5).
+        self._dm_owner_connectors: set[str] = {
+            rule.connector
+            for rule in config.watcher_rules
+            if rule.rooms.direct or rule.rooms.group_direct
+        }
         self._entries: list[ConnectorEntry] = []
         for cc in config.connectors:
             connector = connector_factory(cc)
@@ -318,6 +332,78 @@ class GatewayService:
             self._entries,
             job_store=self._job_store,
         )
+
+    async def _settle(
+        self,
+        coros: list,
+        *,
+        phase: str,
+        startup_errors: list[str],
+    ) -> None:
+        """Await every coroutine, then raise the first failure — never before.
+
+        `return_exceptions=True` is required, and the reason is a race this code was
+        bitten by: without it the FIRST failure (a bad URL failing DNS almost instantly)
+        propagates immediately WITHOUT cancelling the still-in-flight calls for the
+        other connectors (a real login plus handshake is much slower). Those keep
+        running as orphaned tasks, while the caller's `except Exception` routes into
+        `shutdown()` -> `session_manager.shutdown()` -> `save_state()` for EVERY entry —
+        including one whose startup had not finished populating its watcher states,
+        overwriting that connector's state file with a partial dict and wiping real
+        session ids for a connector that was never part of the failure.
+
+        Awaiting every result before deciding closes that race. Extracted because
+        startup now settles twice, and two copies of this reasoning would be one edit
+        away from one of them losing it.
+        """
+        results = await asyncio.gather(*coros, return_exceptions=True)
+        first_exception: BaseException | None = None
+        for entry, result in zip(self._entries, results, strict=True):
+            if isinstance(result, BaseException):
+                logger.error(
+                    "SessionManager for connector '%s' failed to %s during startup: %s",
+                    entry.name,
+                    phase,
+                    result,
+                )
+                startup_errors.append(
+                    f"Connector '{entry.name}' failed to {phase}: {result}"
+                )
+                if first_exception is None:
+                    first_exception = result
+            elif isinstance(result, list):
+                startup_errors.extend(result)
+        if first_exception is not None:
+            raise first_exception
+
+    def _check_bot_identities(self) -> None:
+        """Refuse to go further if two connectors are one bot account (§4.5).
+
+        Runs between authentication and subscription: earlier there is no identity to
+        read, later the damage is already possible. A connector that cannot answer
+        raises `ConnectorIdentityError` out of here, which is the fail-closed half.
+
+        Rejects the whole startup rather than disabling the offending connector: which
+        one is "offending" depends only on config order, and this project's other
+        preflights (`check_state_formats`, `check_backend_signatures`) refuse loudly
+        rather than degrade quietly — a daemon that silently drops a connector looks
+        healthy while half its rooms go unanswered.
+        """
+        identities: list[ConnectorIdentity] = []
+        for e in self._entries:
+            identity = e.connector.bot_identity()
+            if identity is None:
+                continue  # declares no shared account to collide over
+            identities.append(
+                ConnectorIdentity(
+                    connector_name=e.name,
+                    identity=identity,
+                    owns_dms=e.name in self._dm_owner_connectors,
+                )
+            )
+        conflicts = find_identity_conflicts(identities)
+        if conflicts:
+            raise DuplicateBotIdentityError("\n".join(conflicts))
 
     async def run(self, startup_fd: int = -1) -> None:
         """Connect all connectors, start unified control socket, block until cancelled.
@@ -372,32 +458,29 @@ class GatewayService:
             # before deciding what to do next closes that race: by the time
             # any exception is re-raised, no run_once() call is still
             # in-flight, so shutdown() can no longer race one.
-            sm_results = await asyncio.gather(
-                *[
-                    e.session_manager.run_once(
+            #
+            # The two phases are separated by an identity barrier rather than merged:
+            # two connectors on one bot account must be refused before EITHER
+            # subscribes (§4.5), and a SessionManager owns exactly one connector, so
+            # only this loop can see the collision. Fanning `run_once()` out would let
+            # connector A finish subscribing while B was still logging in, and the
+            # check would then run after the duplicate had started answering.
+            await self._settle(
+                [e.session_manager.connect_only() for e in self._entries],
+                phase="connect",
+                startup_errors=startup_errors,
+            )
+            self._check_bot_identities()
+            await self._settle(
+                [
+                    e.session_manager.sync_only(
                         unavailable_agents=self._runtime_manager.unavailable_agents,
                     )
                     for e in self._entries
                 ],
-                return_exceptions=True,
+                phase="start",
+                startup_errors=startup_errors,
             )
-            first_exception: BaseException | None = None
-            for entry, result in zip(self._entries, sm_results, strict=True):
-                if isinstance(result, BaseException):
-                    logger.error(
-                        "SessionManager for connector '%s' failed during startup: %s",
-                        entry.name,
-                        result,
-                    )
-                    startup_errors.append(
-                        f"Connector '{entry.name}' failed to start: {result}"
-                    )
-                    if first_exception is None:
-                        first_exception = result
-                else:
-                    startup_errors.extend(result)
-            if first_exception is not None:
-                raise first_exception
 
             # Load persisted jobs and start the job scheduler AFTER connectors are
             # connected and watchers are up.  Starting it before run_once() would

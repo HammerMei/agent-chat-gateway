@@ -10,6 +10,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Two connectors may no longer run as one bot account.** Each connector reports the
+  identity its platform assigned it — Rocket.Chat's login user id, Mattermost's
+  `users/me` id plus resolved team id — and startup refuses before any connector
+  subscribes if two of them are the same account on the same server. Sharing an account
+  means both receive the identical message stream, so every room matching rules on both
+  gets two agents answering it, which the per-connector watcher key cannot detect.
+  Two exceptions, per design §4.5: Mattermost connectors scoped to **different teams**
+  may share an account, and at most **one** of them may enable direct messages (a DM has
+  no team, so it reaches every connection the account has open).
+  A connector that cannot establish its own identity stops startup rather than starting
+  unchecked. `acg config validate` reports the case config can see — two connectors
+  naming one server and one username — without needing a restart.
 - **A persisted session is only resumed against the backend that issued it.**
   Watcher state records the resolved `backend_identity` (agent backend type plus
   the **canonicalized** working directory — a deploy symlink repointed to a new

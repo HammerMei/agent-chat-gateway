@@ -22,6 +22,7 @@ from enum import Enum
 from typing import Any, Awaitable, Callable, Literal
 
 from ..agents.response import AgentEvent, AgentResponse
+from .bot_identity import BotIdentity  # noqa: F401 — used in an annotation
 
 # ---------------------------------------------------------------------------
 # Roles
@@ -534,6 +535,27 @@ class Connector(ABC):
         Used by SessionManager to select timeout and retry strategies.
         """
         return "direct"
+
+    def bot_identity(self) -> "BotIdentity | None":
+        """Who this connector is authenticated as, or ``None`` if it has no account.
+
+        Called once after ``connect()`` and before any subscription, so that two
+        connectors on one bot account are refused before either can start answering
+        (§4.5). Override in every connector that authenticates as an account on a
+        server other connectors could also reach.
+
+        ``None`` is a claim, not a default to fall through: it says this connector has
+        no shared account to collide over — a local stdin/stdout or script connector.
+        `tests/unit/test_bot_identity_coverage.py` enumerates the connectors in this
+        package and fails when a new one neither overrides this nor is listed there, so
+        a platform connector cannot inherit the accountless answer by omission.
+
+        Raise `ConnectorIdentityError` when the connector *does* have an account but
+        cannot establish it — a whoami that failed, an id the login response omitted.
+        Fail-closed: an unanswerable identity cannot be compared, and starting anyway is
+        the situation this check exists to prevent.
+        """
+        return None
 
     @property
     def agent_username(self) -> str:

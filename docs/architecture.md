@@ -586,17 +586,29 @@ GatewayService.run()
 ├─ AgentRuntimeManager.start_all()
 │  ├─ Start agent backends (subprocesses, etc.)
 │  └─ Start permission brokers (HTTP servers, SSE listeners)
-├─ run_once()
-│  ├─ Connector.connect() [DDP WebSocket, etc.]
-│  └─ SessionManager.run_once() [resume persisted watchers]
+├─ SessionManager.connect_only()  [every connector, concurrently]
+│  └─ Connector.connect() [login, DDP WebSocket, etc.]
+├─ identity barrier — Connector.bot_identity() for all, duplicates refused
+├─ SessionManager.sync_only()     [every connector, concurrently]
+│  └─ resume persisted watchers, resolve rooms, subscribe
 └─ ControlServer.run() [accept CLI commands]
 ```
 
 **Startup ordering rationale:**
 1. Backends first — need to be running before messages arrive
 2. Permission brokers second — only if backend succeeded
-3. Session managers third — can now safely dispatch messages to agents
-4. Control socket last — ready to accept CLI commands
+3. Connectors authenticate third — no subscription yet, so nothing is delivered
+4. **Identity barrier fourth** — two connectors logged in as one bot account receive
+   the identical stream, so every shared room would get two agents answering. Only this
+   loop sees all connectors at once (a SessionManager owns exactly one), and it has to
+   run before *any* of them subscribes: a check that fires after one has started is
+   checking something that is already happening. A connector that cannot report its own
+   identity stops startup rather than starting unchecked (design §4.5)
+5. Watchers restore and subscribe fifth — can now safely dispatch messages to agents
+6. Control socket last — ready to accept CLI commands
+
+`SessionManager.run_once()` still runs both phases back to back, for a standalone
+single-connector embedding where there is no second connector to collide with.
 
 ### Shutdown Sequence (Reverse Order)
 
