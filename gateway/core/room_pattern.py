@@ -43,6 +43,7 @@ __all__ = [
     "InvalidRoomPattern",
     "RoomPattern",
     "normalize_room_name",
+    "union_intersects",
     "union_subsumes",
 ]
 
@@ -275,6 +276,70 @@ def _sentinel(used: set[str]) -> str:
     raise InvalidRoomPattern("cannot allocate a sentinel character")  # pragma: no cover
 
 
+def _shared_alphabet(patterns: Iterable[RoomPattern]) -> list[str] | None:
+    """The finite alphabet a product search over these patterns can use.
+
+    Returns `None` when it would be too large to be worth building. Every
+    character no pattern mentions behaves identically — it can only be consumed
+    by `?`, `*` or a negated class — so one sentinel stands for all of them.
+    """
+    used: set[str] = set()
+    for p in patterns:
+        used |= p._alphabet_members()
+    if len(used) > _MAX_CLASS_MEMBERS:
+        return None
+    return sorted(used) + [_sentinel(used)]
+
+
+def union_intersects(
+    left: Iterable[RoomPattern], right: Iterable[RoomPattern]
+) -> bool:
+    """Is there any room name matched by some `left` pattern *and* some `right` one?
+
+    Used to catch an `exclude` pattern that cannot overlap the rule's `include`
+    union, which is dead config that reads like protection: excluding a room the
+    include never matched does **not** keep a later rule from claiming it.
+
+    The same product search as `union_subsumes` with the acceptance test flipped
+    — look for a string both sides accept, rather than one only the inner side
+    accepts. On hitting the bound this returns `True`, the opposite direction to
+    `union_subsumes`, because both defaults mean "do not report anything": here a
+    claimed intersection is the non-finding.
+    """
+    left = list(left)
+    right = list(right)
+    if not left or not right:
+        return False
+
+    alphabet = _shared_alphabet((*left, *right))
+    if alphabet is None:
+        return True  # cannot decide; do not report
+
+    start = (tuple(p._start() for p in left), tuple(p._start() for p in right))
+    seen = {start}
+    queue = [start]
+    while queue:
+        if len(seen) > _MAX_PRODUCT_STATES:
+            return True  # cannot decide; do not report
+        l_states, r_states = queue.pop()
+        if any(p._accepts(s) for p, s in zip(left, l_states)) and any(
+            p._accepts(s) for p, s in zip(right, r_states)
+        ):
+            return True
+        for ch in alphabet:
+            nxt = (
+                tuple(p._step(s, ch) for p, s in zip(left, l_states)),
+                tuple(p._step(s, ch) for p, s in zip(right, r_states)),
+            )
+            # Either side dying means no suffix can produce a shared witness.
+            if not any(nxt[0]) or not any(nxt[1]):
+                continue
+            if nxt not in seen:
+                seen.add(nxt)
+                queue.append(nxt)
+    return False
+
+
 def union_subsumes(
     outer: Iterable[RoomPattern], inner: Iterable[RoomPattern]
 ) -> bool:
@@ -297,12 +362,9 @@ def union_subsumes(
     if not outer:
         return False
 
-    used: set[str] = set()
-    for p in (*outer, *inner):
-        used |= p._alphabet_members()
-    if len(used) > _MAX_CLASS_MEMBERS:
-        return False
-    alphabet = sorted(used) + [_sentinel(used)]
+    alphabet = _shared_alphabet((*outer, *inner))
+    if alphabet is None:
+        return False  # cannot decide; do not report
 
     start = (
         tuple(p._start() for p in outer),

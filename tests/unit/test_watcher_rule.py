@@ -258,6 +258,34 @@ class TestParserHardErrors(unittest.TestCase):
             "no effect without",
         )
 
+    def test_an_exclude_that_cannot_overlap_the_include_is_refused(self):
+        """The footgun: `exclude: [ops-secret]` next to `include: [eng-*]` reads
+        like protection and does nothing at all, because a name the include
+        misses is NO_MATCH and falls through to the next rule."""
+        msg = self._err(
+            {**MINIMAL, "rooms": {"include": ["eng-*"], "exclude": ["ops-secret"]}},
+            "can never match any room this rule includes",
+        )
+        # The message has to teach the fall-through fact, or the operator fixes
+        # the pattern and still does not get what they wanted.
+        self.assertIn("does not stop a *later* rule", msg)
+        self.assertIn("include it here and exclude it", msg)
+
+    def test_a_partially_overlapping_exclude_is_fine(self):
+        r = parse({**MINIMAL, "rooms": {"include": ["eng-*"], "exclude": ["eng-archive"]}})
+        self.assertIs(r.match("eng-backend", RoomKind.CHANNEL), RuleMatch.CLAIMED)
+        self.assertIs(r.match("eng-archive", RoomKind.CHANNEL), RuleMatch.DECLINED)
+
+    def test_only_the_offending_pattern_is_named(self):
+        msg = self._err(
+            {
+                **MINIMAL,
+                "rooms": {"include": ["eng-*"], "exclude": ["eng-old", "ops-x"]},
+            },
+            "'ops-x'",
+        )
+        self.assertNotIn("'eng-old'", msg)
+
     def test_dm_flags_reject_the_object_form_for_now(self):
         msg = self._err({**MINIMAL, "rooms": {"direct": {"include": ["*"]}}}, "does not yet")
         self.assertIn("planned extension", msg)
@@ -294,6 +322,40 @@ class TestParserHardErrors(unittest.TestCase):
 
     def test_entry_must_be_a_mapping(self):
         self._err(["not", "a", "mapping"], "must be a mapping")
+
+
+class TestTheDenyIdiom(unittest.TestCase):
+    """Including a room and excluding it is how you blackhole it.
+
+    It is the design's only way to express "no rule may claim this room": the
+    rule claims the room, declines it, and DECLINED does not fall through. Worth
+    pinning as intended behaviour rather than leaving it to look like a
+    contradiction someone should "fix"."""
+
+    def test_the_same_pattern_in_both_lists_is_accepted(self):
+        r = parse({"name": "block", "rooms": {"include": ["eng-old"], "exclude": ["eng-old"]}})
+        self.assertIs(r.match("eng-old", RoomKind.CHANNEL), RuleMatch.DECLINED)
+
+    def test_it_blocks_later_rules_which_a_plain_omission_would_not(self):
+        blocker = parse(
+            {"name": "block", "rooms": {"include": ["eng-old"], "exclude": ["eng-old"]}},
+            seen=set(),
+        )
+        catchall = parse({"name": "all", "rooms": {"include": ["eng-*"]}}, seen=set())
+
+        def route(room: str) -> str:
+            for rule_ in (blocker, catchall):
+                outcome = rule_.match(room, RoomKind.CHANNEL)
+                if outcome is not RuleMatch.NO_MATCH:
+                    return f"{rule_.name}:{outcome.name}"
+            return "unrouted"
+
+        self.assertEqual(route("eng-old"), "block:DECLINED")
+        self.assertEqual(route("eng-new"), "all:CLAIMED")
+
+    def test_a_broader_deny_pattern_works_the_same_way(self):
+        r = parse({"name": "block", "rooms": {"include": ["tmp-*"], "exclude": ["tmp-*"]}})
+        self.assertIs(r.match("tmp-anything", RoomKind.CHANNEL), RuleMatch.DECLINED)
 
 
 class TestShadowDetection(unittest.TestCase):

@@ -41,7 +41,12 @@ from .core.config import (  # noqa: F401 — re-exports
     ToolRule,
     WatcherConfig,
 )
-from .core.room_pattern import InvalidRoomPattern, RoomPattern, union_subsumes
+from .core.room_pattern import (
+    InvalidRoomPattern,
+    RoomPattern,
+    union_intersects,
+    union_subsumes,
+)
 from .core.watcher_rule import RoomMatcher, WatcherRule
 
 # v0.2's global `*_defaults:` blocks (removed in v0.3 — see docs/migration-0.3.md) merged
@@ -1382,6 +1387,24 @@ def _parse_one_watcher_rule(
             "no effect without 'rooms.include' — exclude filters named rooms, "
             "and DM opt-ins are not name-matched."
         )
+    # An exclude that cannot overlap the include union is dead config which
+    # *reads* like protection. Excluding a room this rule never claimed does not
+    # keep a later rule from claiming it, because a name the include misses is
+    # NO_MATCH and falls through — so the operator who wrote it to block a room
+    # got the opposite of what they intended, silently. Same typo class as the
+    # empty-include error above, so it is refused the same way.
+    for pattern in matcher.exclude:
+        if not union_intersects([pattern], matcher.include):
+            raise ValueError(
+                f"Watcher rule at index {index} ('{rule_name}'): "
+                f"'rooms.exclude' pattern '{pattern.raw}' can never match any "
+                "room this rule includes, so it does nothing. Note that "
+                "excluding a room does not stop a *later* rule from claiming "
+                "it — a room this rule does not include simply falls through. "
+                "To keep a room away from every rule, include it here and "
+                "exclude it: the rule then claims it and declines it, and no "
+                "later rule sees it."
+            )
 
     watcher_connector = wc.get("connector", "")
     if watcher_connector and not isinstance(watcher_connector, str):

@@ -28,6 +28,7 @@ from gateway.core.room_pattern import (
     InvalidRoomPattern,
     RoomPattern,
     normalize_room_name,
+    union_intersects,
     union_subsumes,
 )
 
@@ -277,6 +278,86 @@ class TestSubsumptionKnownCases(unittest.TestCase):
         the empty suffix. Both directions exercised."""
         self.assertFalse(self._subsumes(["a?"], ["a*"]))
         self.assertTrue(self._subsumes(["a*"], ["a?"]))
+
+
+class TestIntersection(unittest.TestCase):
+    def _hits(self, left: list[str], right: list[str]) -> bool:
+        return union_intersects(
+            [RoomPattern(p) for p in left], [RoomPattern(p) for p in right]
+        )
+
+    def test_identical_patterns_intersect(self):
+        self.assertTrue(self._hits(["eng"], ["eng"]))
+
+    def test_disjoint_literals_do_not(self):
+        self.assertFalse(self._hits(["eng"], ["ops"]))
+
+    def test_a_star_intersects_anything(self):
+        self.assertTrue(self._hits(["*"], ["eng-backend"]))
+
+    def test_overlapping_prefixes(self):
+        self.assertTrue(self._hits(["eng-*"], ["*-backend"]))
+
+    def test_disjoint_prefixes(self):
+        self.assertFalse(self._hits(["eng-*"], ["ops-*"]))
+
+    def test_length_mismatch_makes_them_disjoint(self):
+        self.assertFalse(self._hits(["??"], ["???"]))
+
+    def test_classes(self):
+        self.assertTrue(self._hits(["v[0-9]"], ["v7"]))
+        self.assertFalse(self._hits(["v[0-8]"], ["v9"]))
+
+    def test_empty_side_never_intersects(self):
+        self.assertFalse(self._hits([], ["eng"]))
+        self.assertFalse(self._hits(["eng"], []))
+
+    def test_union_on_either_side(self):
+        self.assertTrue(self._hits(["a*", "b*"], ["b-x"]))
+        self.assertFalse(self._hits(["a*", "b*"], ["c-x"]))
+
+    def test_it_is_symmetric(self):
+        for left, right in ((["eng-*"], ["*-backend"]), (["a"], ["b"]), (["?"], ["ab"])):
+            with self.subTest(left=left, right=right):
+                self.assertEqual(self._hits(left, right), self._hits(right, left))
+
+
+class TestIntersectionAgainstBruteForce(unittest.TestCase):
+    """The one algorithmic addition gets the same treatment as the first: find
+    the shared witness the hard way and require agreement.
+
+    Both directions are asserted here, unlike subsumption. A witness found means
+    the engine must say True; and for patterns this short, no witness up to
+    length 6 means there is none, so the engine must say False."""
+
+    ALPHABET = "ab"
+    MAX_SUBJECT = 6
+
+    def test_all_pattern_pairs_up_to_length_three(self):
+        chars = "ab*?"
+        patterns = [
+            "".join(t) for n in range(1, 4) for t in itertools.product(chars, repeat=n)
+        ]
+        subjects = [
+            "".join(s)
+            for n in range(0, self.MAX_SUBJECT + 1)
+            for s in itertools.product(self.ALPHABET, repeat=n)
+        ]
+        compiled = {p: RoomPattern(p) for p in patterns}
+        pairs = 0
+        for a, b in itertools.product(patterns, repeat=2):
+            pa, pb = compiled[a], compiled[b]
+            witness = next(
+                (s for s in subjects if pa.matches(s) and pb.matches(s)), None
+            )
+            claimed = union_intersects([pa], [pb])
+            if (witness is not None) != claimed:
+                self.fail(
+                    f"left={a!r} right={b!r}: engine={claimed} but brute force "
+                    f"{'found ' + repr(witness) if witness else 'found nothing'}"
+                )
+            pairs += 1
+        self.assertEqual(pairs, len(patterns) ** 2)
 
 
 class TestSubsumptionAgainstBruteForce(unittest.TestCase):

@@ -100,13 +100,49 @@ static checks below are decidable:
 
 That last row is a real decision rather than an implementation detail: fall-
 through would make `exclude` a routing operator, and two rules could then
-silently contend for the same room.
+silently contend for the same room. Two consequences follow from it that are
+easy to get backwards, so both are stated outright.
+
+**Excluding a room only affects rooms the rule already includes.** A name no
+`include` pattern matches is `NO_MATCH`, which falls through — so listing a room
+in `exclude` without including it does **not** keep a later rule from claiming
+it. It looks like protection and is a no-op. Because that reads as the opposite
+of what it does, an `exclude` pattern that cannot overlap the rule's `include`
+union is a hard error rather than a warning (below).
+
+**Including a room and excluding it is how you block it entirely.** The rule
+claims the room, declines it, and `DECLINED` does not fall through, so no later
+rule sees it:
+
+```yaml
+watchers:
+  - name: never-here                  # a deny rule
+    connector: mm-home
+    rooms:
+      include: ["tmp-*"]
+      exclude: ["tmp-*"]
+  - name: everything-else
+    connector: mm-home
+    rooms:
+      include: ["*"]                  # never sees tmp-*
+```
+
+This is the only way the rule language expresses "no rule may claim this room",
+which is why it is documented as an idiom rather than reported as a contradiction:
+a warning here would fire on every legitimate deny rule, and nothing
+distinguishes the idiom from a copy-paste error.
 
 Given globs, the load-time checks split into three tiers by what is actually
 decidable, rather than one promise that cannot be kept:
 
 - **Hard errors**: a syntactically invalid pattern; an empty include list on a
-  rule that is not DM-only; a duplicate rule name.
+  rule that is not DM-only; a duplicate rule name; an `exclude` pattern that
+  cannot overlap the rule's own `include` union. That last one is an error rather
+  than a warning because the config it describes is not merely useless — it reads
+  as protecting a room while leaving it free for any later rule to claim, so
+  accepting it quietly is how an operator ends up believing a room is off limits
+  when it is not. Glob intersection is decidable for this syntax, so the check is
+  exact.
 - **Exact warnings**, decidable for globs: one rule fully shadowed by an
   earlier one (glob subsumption is decidable for this syntax), and a DM opt-in
   shadowed by an earlier rule that already claimed that class (§2.7).
