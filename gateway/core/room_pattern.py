@@ -101,6 +101,10 @@ _MAX_CLASS_MEMBERS = 1024
 # subsumed", never "subsumed".
 _MAX_PRODUCT_STATES = 20_000
 
+# Ceiling on the O(n^2) NFC pair check in _shared_alphabet. Above it, no alphabet
+# is built and both callers fall back to reporting nothing.
+_MAX_PAIR_CHECKS = 65_536
+
 
 def _parse_class(pattern: str, i: int) -> tuple[_Token, int]:
     """Parse a `[...]` class starting at the `[`. Returns the token and the
@@ -287,24 +291,42 @@ def _shared_alphabet(patterns: Iterable[RoomPattern]) -> list[str] | None:
     Two refusals:
 
     * The set is too large to be worth expanding.
-    * Some character is a **combining mark**. The product search concatenates
-      alphabet characters into candidate witnesses, but `matches()` compares
-      NFC-normalised names, so a witness ending in a combining mark is not the
-      string the runtime would ever see: `"e" + U+0301` folds to `é`, one
-      character rather than two. Searching that space produces answers about
-      strings that cannot exist as room names, so no answer is given instead.
-      This costs nothing in practice — both platforms build room names as slugs,
-      and a pattern only reaches here with a standalone combining mark if one was
-      written without a base character to attach to.
+    * Some ordered pair of its characters **composes under NFC**. The product
+      search concatenates alphabet characters into candidate witnesses, but
+      `matches()` compares NFC-normalised names — so a witness NFC would rewrite
+      is not a string any room name can be, and answers derived from it describe a
+      different string. `"e" + U+0301` folds to `é`, and Hangul `U+1100 + U+1161`
+      folds to `U+AC00`: two characters becoming one, where the automaton counted
+      two. Refusing the alphabet keeps the remaining searches exact instead of
+      occasionally wrong. It costs nothing in practice — both platforms build room
+      names as slugs, so a pattern only reaches here with a composable pair if one
+      was written deliberately.
     """
     used: set[str] = set()
     for p in patterns:
         used |= p._alphabet_members()
     if len(used) > _MAX_CLASS_MEMBERS:
         return None
-    if any(unicodedata.combining(ch) for ch in used):
+    # NFC composition is a property of *adjacent pairs*, not of single characters,
+    # so checking `unicodedata.combining()` per character was incomplete: Hangul
+    # Jamo U+1100 and U+1161 both report a combining class of zero yet compose to
+    # U+AC00 — one character where the automaton counted two. Canonical composition
+    # only ever joins a starter with the character following it, so an alphabet
+    # whose every ordered pair is NFC-stable cannot assemble a witness that NFC
+    # would rewrite, and the search over it is exact.
+    #
+    # This must PREVENT bogus witnesses rather than detect them afterwards.
+    # Detecting one and bailing out would be pointless: for both callers "found a
+    # witness" and "cannot decide" happen to be the same return value, so a
+    # post-hoc check could not change any answer while looking like it did.
+    ordered = sorted(used)
+    if len(ordered) * len(ordered) > _MAX_PAIR_CHECKS:
         return None
-    return sorted(used) + [_sentinel(used)]
+    for a in ordered:
+        for b in ordered:
+            if unicodedata.normalize("NFC", a + b) != a + b:
+                return None
+    return ordered + [_sentinel(used)]
 
 
 def union_intersects(

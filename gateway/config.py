@@ -1292,6 +1292,49 @@ def _parse_rule_ttl(wc: Mapping, index: int, field_name: str) -> int | None:
     return value
 
 
+# Every key a rule entry may carry. Kept in step with $defs/watcherRule in
+# gateway/schema/config.schema.json by tests/unit/test_watcher_rule.py, because
+# `acg config validate` never runs the schema and would otherwise accept typos the
+# schema rejects.
+WATCHER_RULE_KEYS: frozenset[str] = frozenset({
+    "description",
+    "inherits",
+    "name",
+    "connector",
+    "agent",
+    "rooms",
+    "session_idle_days",
+    "session_expire_days",
+    "context_inject_files",
+    "online_notification",
+    "offline_notification",
+    "history_handoff",
+})
+
+
+def _validated_path_list(raw: object, index: int) -> list[str]:
+    """Check a path list before `_resolve_paths` iterates it.
+
+    Unvalidated, a bare string is iterated *per character*: `context_inject_files:
+    foo` becomes three paths ending `/f`, `/o`, `/o` rather than one error. And a
+    non-string element raises TypeError out of `Path()`, which collect_config()
+    does not catch, so one bad rule aborts the whole validation pass.
+    """
+    if isinstance(raw, str) or not isinstance(raw, Sequence):
+        raise ValueError(
+            f"Watcher rule at index {index}: 'context_inject_files' must be a "
+            f"list of paths (got {type(raw).__name__}); a bare string would be "
+            "read one character at a time."
+        )
+    for item in raw:
+        if not isinstance(item, str) or not item:
+            raise ValueError(
+                f"Watcher rule at index {index}: 'context_inject_files' entries "
+                "must be non-empty strings."
+            )
+    return list(raw)
+
+
 def _parse_one_watcher_rule(
     entry: object,
     index: int,
@@ -1356,6 +1399,19 @@ def _parse_one_watcher_rule(
     # loader, but this function is also callable directly (the config tool calls
     # the static parser that way), so it is checked rather than asserted — an
     # assert would vanish under -O and leave a TypeError instead.
+    # The schema sets additionalProperties: false on a rule, but `acg config
+    # validate` runs collect_config() rather than the JSON Schema, so a typo like
+    # `session_expire_day: 30` would otherwise be silently ignored and the rule
+    # would quietly have no expiry. Checked here so both paths agree; a test pins
+    # this set against the schema so the two cannot drift.
+    unknown_top = set(wc) - WATCHER_RULE_KEYS
+    if unknown_top:
+        raise ValueError(
+            f"Watcher rule at index {index} ('{rule_name}'): unknown key(s) "
+            f"{', '.join(sorted(unknown_top))}. Valid keys are "
+            f"{', '.join(sorted(WATCHER_RULE_KEYS))}."
+        )
+
     rooms_raw = wc.get("rooms")
     if not isinstance(rooms_raw, Mapping):
         raise ValueError(
@@ -1493,7 +1549,9 @@ def _parse_one_watcher_rule(
         rooms=matcher,
         session_idle_days=idle_days,
         session_expire_days=expire_days,
-        context_inject_files=_resolve_paths(wc.get("context_inject_files", []), config_dir),
+        context_inject_files=_resolve_paths(
+            _validated_path_list(wc.get("context_inject_files", []), index), config_dir
+        ),
         online_notification=wc.get("online_notification"),
         offline_notification=wc.get("offline_notification"),
         history_handoff=history_handoff,
@@ -1575,13 +1633,22 @@ def find_shadowed_rules(rules: list[WatcherRule]) -> list[ShadowFinding]:
 
         if not blockers:  # unreachable post-validation, but do not crash on it
             continue
-        if all(b is not None for b in blockers.values()):
-            # Every reach is taken, so the rule as a whole is dead. Attribute it
-            # to the named blocker when there is one, since that is the reach an
-            # operator is most likely scanning for.
-            by = blockers.get("named") or next(iter(blockers.values()))
-            out.append(ShadowFinding(rule=rule, shadowed_by=by, scope="rule"))
+        all_blocked = all(b is not None for b in blockers.values())
+        one_blocker = len({id(b) for b in blockers.values()}) == 1
+        if all_blocked and one_blocker:
+            # A single earlier rule takes every reach, so "this rule is dead, see
+            # that one" is both true and actionable.
+            out.append(
+                ShadowFinding(
+                    rule=rule, shadowed_by=next(iter(blockers.values())), scope="rule"
+                )
+            )
         else:
+            # Different earlier rules take different reaches. The rule is still
+            # entirely dead when all_blocked, but collapsing would attribute it to
+            # one blocker that does not claim the other reaches — a warning whose
+            # suggested remedy would be wrong. Keep them separate so each points at
+            # the rule actually responsible.
             for scope, by in blockers.items():
                 if by is not None:
                     out.append(ShadowFinding(rule=rule, shadowed_by=by, scope=scope))

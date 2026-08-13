@@ -226,7 +226,7 @@ class TestMatchingAgainstAnIndependentOracle(unittest.TestCase):
         self.assertEqual(checked, expected_patterns * expected_subjects)
 
 
-class TestCombiningMarksAreRefusedRatherThanMisanswered(unittest.TestCase):
+class TestNfcComposablePairsAreRefusedRatherThanMisanswered(unittest.TestCase):
     """The automaton walks raw code points; `matches()` compares NFC-normalised
     names. They disagree when a metacharacter straddles a base character and a
     combining mark, so no alphabet is built and both functions fall back to their
@@ -247,6 +247,19 @@ class TestCombiningMarksAreRefusedRatherThanMisanswered(unittest.TestCase):
     def test_patterns_without_combining_marks_are_still_decided_exactly(self):
         self.assertFalse(union_intersects([RoomPattern("eng-*")], [RoomPattern("ops-*")]))
         self.assertTrue(union_intersects([RoomPattern("eng-*")], [RoomPattern("*-backend")]))
+
+    def test_hangul_jamo_are_refused_too_though_their_combining_class_is_zero(self):
+        """The first version of this guard checked unicodedata.combining() per
+        character and missed these: both report zero yet U+1100 + U+1161 compose to
+        U+AC00. Composition is a property of adjacent pairs, not of characters."""
+        import unicodedata
+        self.assertEqual(unicodedata.combining("\u1100"), 0)
+        self.assertEqual(unicodedata.combining("\u1161"), 0)
+        self.assertEqual(unicodedata.normalize("NFC", "\u1100\u1161"), "\uac00")
+        self.assertTrue(
+            union_intersects([RoomPattern("\u1100?")], [RoomPattern("?\u1161")]),
+            "must return the do-not-report value, not a wrong False",
+        )
 
     def test_a_composed_accent_is_fine_because_it_is_one_character(self):
         """Only a *standalone* combining mark trips the guard — a normal accented

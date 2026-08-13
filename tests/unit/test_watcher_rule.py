@@ -368,6 +368,69 @@ class TestParserScalarValidation(unittest.TestCase):
         self.assertTrue(parse({**MINIMAL, "history_handoff": None}).history_handoff.enabled)
 
 
+class TestUnknownRuleKeysAreRejected(unittest.TestCase):
+    """The schema sets additionalProperties: false, but `acg config validate` runs
+    collect_config() rather than the schema — so without this check a typo is
+    silently ignored and the rule quietly lacks whatever it was meant to set."""
+
+    def test_a_typo_in_a_ttl_key_is_rejected(self):
+        with self.assertRaises(ValueError) as cm:
+            parse({**MINIMAL, "session_expire_day": 30})  # missing the 's'
+        self.assertIn("session_expire_day", str(cm.exception))
+
+    def test_the_message_lists_the_valid_keys(self):
+        with self.assertRaises(ValueError) as cm:
+            parse({**MINIMAL, "bogus": 1})
+        self.assertIn("session_expire_days", str(cm.exception))
+
+    def test_every_documented_key_is_accepted(self):
+        entry = {
+            "name": "eng", "connector": "mm-home", "agent": "claude-eng",
+            "description": "x", "rooms": {"include": ["eng-*"]},
+            "session_idle_days": 7, "session_expire_days": 30,
+            "context_inject_files": [], "online_notification": "hi",
+            "offline_notification": "bye", "history_handoff": {"enabled": False},
+        }
+        self.assertEqual(parse(entry).name, "eng")
+
+    def test_the_key_set_matches_the_json_schema(self):
+        """Pins the promise made in WATCHER_RULE_KEYS' comment: the loader and the
+        schema must accept the same keys, since only one of them runs in each
+        path."""
+        import json
+
+        from gateway.config import WATCHER_RULE_KEYS
+        schema = json.loads(
+            (Path(__file__).parents[2] / "gateway/schema/config.schema.json").read_text()
+        )
+        self.assertEqual(
+            set(schema["$defs"]["watcherRule"]["properties"]), set(WATCHER_RULE_KEYS)
+        )
+
+
+class TestContextInjectFilesValidation(unittest.TestCase):
+    def test_a_bare_string_is_rejected_rather_than_split_per_character(self):
+        """Unvalidated, `context_inject_files: foo` became three paths ending /f,
+        /o, /o — because _resolve_paths iterates whatever it is given."""
+        with self.assertRaises(ValueError) as cm:
+            parse({**MINIMAL, "context_inject_files": "foo"})
+        self.assertIn("one character at a time", str(cm.exception))
+
+    def test_a_non_string_element_is_a_value_error_not_a_type_error(self):
+        """A TypeError would escape collect_config()'s except ValueError and abort
+        the whole validation pass."""
+        with self.assertRaises(ValueError):
+            parse({**MINIMAL, "context_inject_files": ["ok", 3]})
+
+    def test_an_empty_element_is_rejected(self):
+        with self.assertRaises(ValueError):
+            parse({**MINIMAL, "context_inject_files": [""]})
+
+    def test_a_proper_list_is_resolved(self):
+        r = parse({**MINIMAL, "context_inject_files": ["a.md"]})
+        self.assertTrue(r.context_inject_files[0].endswith("a.md"))
+
+
 class TestTheDenyIdiom(unittest.TestCase):
     """Including a room and excluding it is how you blackhole it.
 
@@ -482,6 +545,34 @@ class TestAnEarlierRulesBlockingLanguageIsItsInclude(unittest.TestCase):
         a = rule("a", include=["eng-*"])
         b = rule("b", include=["eng-*"], except_for=["eng-archive"])
         self.assertEqual(self._found([a, b]), [("b", "a", "rule")])
+
+
+class TestBlockerAttributionIsNotCollapsedWhenBlockersDiffer(unittest.TestCase):
+    """A whole-rule finding names one earlier rule as responsible, so it may only
+    be emitted when one earlier rule really does take every reach.
+
+    Collapsing when *different* rules block different reaches would attribute the
+    finding to a rule that does not claim the others — the warning would be true
+    but its suggested remedy wrong."""
+
+    def _found(self, rules):
+        return sorted(
+            (f.rule.name, f.shadowed_by.name, f.scope) for f in find_shadowed_rules(rules)
+        )
+
+    def test_separate_blockers_stay_separate(self):
+        named_only = rule("named", include=["eng-*"])
+        dm_only = rule("dms", direct=True)
+        hybrid = rule("hybrid", include=["eng-x"], direct=True)
+        self.assertEqual(
+            self._found([named_only, dm_only, hybrid]),
+            [("hybrid", "dms", "direct"), ("hybrid", "named", "named")],
+        )
+
+    def test_one_blocker_taking_everything_still_collapses(self):
+        both = rule("both", include=["*"], direct=True)
+        hybrid = rule("hybrid", include=["eng-x"], direct=True)
+        self.assertEqual(self._found([both, hybrid]), [("hybrid", "both", "rule")])
 
 
 class TestDmReachIsReportedIndependently(unittest.TestCase):
