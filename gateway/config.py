@@ -930,6 +930,135 @@ def _parse_one_agent(
     return agent_cfg
 
 
+def _key_list(keys) -> str:
+    """Format a key set for an error message.
+
+    Stringifies before sorting because YAML keys need not be strings: `1: value`
+    would otherwise make `sorted()` compare int with str, or `", ".join()` receive
+    an int — raising TypeError out of the *error path*, which escapes
+    collect_config()'s `except ValueError` and aborts the whole validation pass
+    instead of reporting one bad entry.
+    """
+    return ", ".join(sorted(repr(str(k)) for k in keys))
+
+
+_MISSING = object()
+
+
+def _validated_optional_name(raw: object, where: str, field_name: str) -> str | None:
+    """Check a `str | None` field whose value is an identity, not a message.
+
+    `wc.get(field) or None` had the same hole `connector:` did before it was fixed:
+    the type check sat behind a truthiness test, so a *falsy* non-string skipped it
+    and was then read as "not set". That is reachable and silent — pyyaml resolves
+    `name: no` to the boolean False, so an operator naming a watcher `no` (or
+    writing `0`, `[]`) silently gets an auto-generated name instead of an error.
+    The name is the watcher's persistent identity: its state.json session, its
+    `pause`/`resume`/`reset` handle, and its system-prompt and attachment paths.
+
+    An absent key and an explicit null are the two spellings of "no value here" and
+    both mean the default. An empty string is not one of them: it cannot serve as an
+    identity, and silently auto-naming is the failure this check exists to remove.
+    """
+    if raw is _MISSING or raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ValueError(
+            f"{where}: '{field_name}' must be a string "
+            f"(got {type(raw).__name__})."
+        )
+    if not raw:
+        raise ValueError(
+            f"{where}: '{field_name}' must not be empty — omit the key to let it "
+            "be derived."
+        )
+    return raw
+
+
+def _validated_notification(raw: object, where: str, field_name: str) -> str | None:
+    """Check a notification field against its declared `str | None` contract.
+
+    Copied through unchecked, a YAML boolean or number reaches the platform REST
+    client's message field much later, where the send fails and is only logged as a
+    warning — so the operator's status message silently never appears. An actionable
+    load error is the whole point of checking it here. Unlike a name, an empty
+    string is a legitimate "nothing to announce".
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ValueError(
+            f"{where}: '{field_name}' must be a string or null "
+            f"(got {type(raw).__name__})."
+        )
+    return raw
+
+
+_HH_FIELD_TYPES: dict[str, type] = {
+    "enabled": bool,
+    "fetch_count": int,
+    "verbatim_tail": int,
+}
+
+
+def _parse_history_handoff(raw: object, where: str) -> HistoryHandoffConfig:
+    """Validate a `history_handoff:` block — its keys as well as its values.
+
+    Validating only the outer mapping was not enough, and the gap had the same
+    shape as the bug it replaced: `history_handoff: {enable: false}` — one letter
+    short — was silently ignored, leaving handoff **enabled**, the exact inversion
+    `history_handoff: false` used to produce. Since `enabled` defaults to True,
+    every typo in this block fails in the direction the operator did not want.
+
+    Types are enforced too: `enabled: "false"` is a truthy string, and a negative
+    or non-integer count would reach the handoff fetch unchallenged.
+
+    Defaults are sourced from module-level `_HH_DEFAULTS` — see its docstring.
+    """
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, Mapping):
+        raise ValueError(
+            f"{where}: 'history_handoff' must be a mapping "
+            f"(got {type(raw).__name__}). To turn it off, set "
+            "'history_handoff: {enabled: false}'."
+        )
+    unknown = set(raw) - set(_HH_FIELD_TYPES)
+    if unknown:
+        raise ValueError(
+            f"{where}: unknown key(s) in 'history_handoff': "
+            f"{_key_list(unknown)}. Valid keys are {_key_list(_HH_FIELD_TYPES)}."
+        )
+    values: dict[str, object] = {}
+    for key, want in _HH_FIELD_TYPES.items():
+        if key not in raw:
+            continue
+        value = raw[key]
+        # bool is a subclass of int, so an int field must reject it explicitly and
+        # a bool field must not accept 0/1.
+        if want is bool and not isinstance(value, bool):
+            raise ValueError(
+                f"{where}: 'history_handoff.{key}' must be true or false "
+                f"(got {type(value).__name__})."
+            )
+        if want is int and (isinstance(value, bool) or not isinstance(value, int)):
+            raise ValueError(
+                f"{where}: 'history_handoff.{key}' must be an integer "
+                f"(got {type(value).__name__})."
+            )
+        if want is int and value < 0:
+            raise ValueError(
+                f"{where}: 'history_handoff.{key}' must not be negative "
+                f"(got {value})."
+            )
+        values[key] = value
+    return HistoryHandoffConfig(
+        enabled=values.get("enabled", _HH_DEFAULTS.enabled),
+        fetch_count=values.get("fetch_count", _HH_DEFAULTS.fetch_count),
+        verbatim_tail=values.get("verbatim_tail", _HH_DEFAULTS.verbatim_tail),
+    )
+
+
 def _parse_one_watcher_entry(
     wc_raw: object,
     index: int,
@@ -1045,30 +1174,14 @@ def _parse_one_watcher_entry(
         )
 
     # 'name' / 'session_id' pin a single sticky identity — only meaningful
-    # when the entry expands to exactly one watcher.
-    explicit_name = wc.get("name") or None
-    if explicit_name is not None and not isinstance(explicit_name, str):
-        # PR review finding: a truthy-but-non-string 'name' (e.g. a YAML
-        # list) used to reach `watcher_name in seen_watcher_names` below
-        # unchecked — an uncaught `TypeError: unhashable type` instead of a
-        # clean ValueError every caller expects. Same class of bug as
-        # _parse_one_connector()'s identical fix, and equally pre-existing
-        # in from_file() (this function is extracted verbatim from it).
-        raise ValueError(
-            f"Watcher entry at index {index}: 'name' must be a string "
-            f"(got {type(explicit_name).__name__})."
-        )
-    explicit_session_id = wc.get("session_id") or None
-    if explicit_session_id is not None and not isinstance(explicit_session_id, str):
-        # PR review finding: same class of bug as 'name' above — a
-        # truthy-but-non-string 'session_id' (e.g. a YAML list) reached
-        # `wc.session_id in seen_session_ids` (a set, in both from_file()'s
-        # and collect_config()'s post-loop duplicate check) unchecked,
-        # crashing with an uncaught TypeError.
-        raise ValueError(
-            f"Watcher entry at index {index}: 'session_id' must be a string "
-            f"(got {type(explicit_session_id).__name__})."
-        )
+    # when the entry expands to exactly one watcher. Both used to type-check
+    # only the truthy half; see _validated_optional_name() for why the falsy
+    # half was the worse of the two.
+    where = f"Watcher entry at index {index}"
+    explicit_name = _validated_optional_name(wc.get("name", _MISSING), where, "name")
+    explicit_session_id = _validated_optional_name(
+        wc.get("session_id", _MISSING), where, "session_id"
+    )
     if len(rooms_list) > 1:
         if explicit_name:
             raise ValueError(
@@ -1096,7 +1209,6 @@ def _parse_one_watcher_entry(
     # legitimately mean "use the default": `connector:` is permitted in a
     # `watcher_templates:` entry, so an explicit null is how an entry declines an
     # inherited one. Every other non-string is a mistake.
-    _MISSING = object()
     raw_connector = wc.get("connector", _MISSING)
     if raw_connector is _MISSING or raw_connector is None:
         watcher_connector = ""
@@ -1151,30 +1263,15 @@ def _parse_one_watcher_entry(
         raw_ctx, config_dir, f"Watcher entry at index {index}: 'context_inject_files'"
     )
 
-    # Defaults sourced from module-level _HH_DEFAULTS — see its docstring above.
-    #
-    # `or {}` swallowed two different mistakes. A non-mapping truthy value
-    # (`history_handoff: yes`, or a list) passed straight through and then raised
-    # AttributeError on `.get` — and collect_config() only catches ValueError, so
-    # one malformed entry aborted the whole validation pass instead of being
-    # reported as one issue with the rest still checked. A falsy non-mapping
-    # (`history_handoff: false`) was quietly replaced by `{}`, which means the
-    # *defaults* — so writing `false` to switch the feature off silently switched
-    # it on, since `enabled` defaults to True. Both are now load errors naming the
-    # field; `enabled: false` is the way to disable it.
-    hh_raw = wc.get("history_handoff")
-    if hh_raw is None:
-        hh_raw = {}
-    elif not isinstance(hh_raw, Mapping):
-        raise ValueError(
-            f"Watcher entry at index {index}: 'history_handoff' must be a mapping "
-            f"(got {type(hh_raw).__name__}). To turn it off, set "
-            "'history_handoff: {enabled: false}'."
-        )
-    history_handoff = HistoryHandoffConfig(
-        enabled=hh_raw.get("enabled", _HH_DEFAULTS.enabled),
-        fetch_count=hh_raw.get("fetch_count", _HH_DEFAULTS.fetch_count),
-        verbatim_tail=hh_raw.get("verbatim_tail", _HH_DEFAULTS.verbatim_tail),
+    # `or {}` swallowed two different mistakes, and validating only the outer
+    # mapping left a third — see _parse_history_handoff() for all three.
+    history_handoff = _parse_history_handoff(wc.get("history_handoff"), where)
+
+    online_notification = _validated_notification(
+        wc.get("online_notification"), where, "online_notification"
+    )
+    offline_notification = _validated_notification(
+        wc.get("offline_notification"), where, "offline_notification"
     )
 
     # Names are staged here, NOT written into `seen_watcher_names` directly,
@@ -1226,8 +1323,8 @@ def _parse_one_watcher_entry(
                 agent=watcher_agent,
                 session_id=explicit_session_id,
                 context_inject_files=ctx_files,
-                online_notification=wc.get("online_notification"),
-                offline_notification=wc.get("offline_notification"),
+                online_notification=online_notification,
+                offline_notification=offline_notification,
                 history_handoff=history_handoff,
             )
         )

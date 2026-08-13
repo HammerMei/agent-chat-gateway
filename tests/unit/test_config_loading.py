@@ -12,12 +12,15 @@ Run with:
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import textwrap
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+import yaml
 
 from gateway.config import GatewayConfig
 
@@ -2551,6 +2554,147 @@ class TestWatcherEntryScalarValidation(unittest.TestCase):
     def test_enabled_false_is_the_supported_way_to_disable(self):
         w = self._load_one("- {room: general, history_handoff: {enabled: false}}")
         self.assertFalse(w.history_handoff.enabled)
+
+    def test_a_misspelled_inner_key_is_rejected_rather_than_ignored(self):
+        """`enable: false` — one letter short — was accepted and ignored, leaving
+        handoff ENABLED. Since `enabled` defaults to True, every typo in this block
+        fails in the direction the operator did not want: the same inversion
+        `history_handoff: false` produced before it became an error."""
+        msg = self._rejects(
+            "- {room: general, history_handoff: {enable: false}}",
+            "unknown key(s) in 'history_handoff'",
+        )
+        self.assertIn("enable", msg)
+        self.assertIn("enabled", msg)
+
+    def test_inner_values_are_type_checked(self):
+        """`enabled: "false"` is a truthy string, and a negative or non-integer
+        count reaches the handoff fetch unchallenged. bool subclasses int, so each
+        direction needs its own check."""
+        for literal, needle in (
+            ('{enabled: "false"}', "'history_handoff.enabled' must be true or false"),
+            ("{enabled: 1}", "'history_handoff.enabled' must be true or false"),
+            ('{fetch_count: "10"}', "'history_handoff.fetch_count' must be an integer"),
+            ("{fetch_count: true}", "'history_handoff.fetch_count' must be an integer"),
+            ("{fetch_count: -1}", "'history_handoff.fetch_count' must not be negative"),
+            ("{verbatim_tail: 1.5}", "'history_handoff.verbatim_tail' must be an integer"),
+        ):
+            with self.subTest(literal=literal):
+                self._rejects(f"- {{room: general, history_handoff: {literal}}}", needle)
+
+    def test_valid_inner_values_are_honoured(self):
+        w = self._load_one(
+            "- {room: general, history_handoff: {enabled: false, fetch_count: 5, verbatim_tail: 0}}"
+        )
+        self.assertFalse(w.history_handoff.enabled)
+        self.assertEqual(w.history_handoff.fetch_count, 5)
+        self.assertEqual(w.history_handoff.verbatim_tail, 0)
+
+    def test_a_non_string_inner_key_does_not_crash_the_error_path(self):
+        """A YAML mapping key need not be a string. `1: value` made the unknown-key
+        formatter compare int with str, raising TypeError out of the *error path* —
+        which escapes collect_config()'s `except ValueError` and aborts the whole
+        validation pass instead of reporting one bad entry."""
+        self._rejects(
+            "- {room: general, history_handoff: {1: value}}",
+            "unknown key(s) in 'history_handoff'",
+        )
+
+    # ── online_notification / offline_notification ───────────────────────────
+    def test_notifications_default_to_null(self):
+        w = self._load_one("- {room: general}")
+        self.assertIsNone(w.online_notification)
+        self.assertIsNone(w.offline_notification)
+
+    def test_a_non_string_notification_is_rejected(self):
+        """Copied through unchecked, a YAML boolean or number reaches the platform
+        REST client's message field, where the send fails and is only logged as a
+        warning — so the operator's status message silently never appears."""
+        for field in ("online_notification", "offline_notification"):
+            for literal in ("true", "3", "[hi]", "{a: b}"):
+                with self.subTest(field=field, literal=literal):
+                    self._rejects(
+                        f"- {{room: general, {field}: {literal}}}",
+                        f"'{field}' must be a string or null",
+                    )
+
+    def test_a_string_or_null_notification_is_honoured(self):
+        w = self._load_one("- {room: general, online_notification: 'up', offline_notification: null}")
+        self.assertEqual(w.online_notification, "up")
+        self.assertIsNone(w.offline_notification)
+
+
+class TestEveryStaticWatcherFieldIsTypeChecked(unittest.TestCase):
+    """The systematic guard, the static twin of the rule parser's.
+
+    Five separate review rounds each found another field this loader read and used
+    without checking it was the type the reader assumed — `connector` binding to
+    connectors[0], `history_handoff: false` inverting itself, `context_inject_files`
+    iterated per character, the unknown-key error path raising TypeError, and
+    `history_handoff: {enable: false}` ignored. Fixing them one at a time left no
+    reason to believe the next one was covered.
+
+    The field surface comes from the JSON schema's `$defs/watcher`, which sets
+    `additionalProperties: false` and so is the declared list — a field added there
+    without validation here fails locally instead of in a sixth review round.
+    """
+
+    # A wrong-typed value per field the parser reads.
+    WRONG_VALUE = {
+        "name": [],
+        "connector": False,
+        "agent": 3,
+        "room": 7,
+        "rooms": "general",
+        "exclude_room": "general",
+        "session_id": [],
+        "context_inject_files": "notes.md",
+        "online_notification": True,
+        "offline_notification": 3,
+        "history_handoff": True,
+    }
+    # `description` is annotation only and never read; `inherits` is resolved
+    # before this parser reads any field, and has its own tests.
+    NOT_READ_HERE = {"description", "inherits"}
+
+    def test_the_table_covers_every_declared_key(self):
+        schema = json.loads(
+            (Path(__file__).resolve().parents[2]
+             / "gateway" / "schema" / "config.schema.json").read_text()
+        )
+        watcher = schema["$defs"]["watcher"]
+        self.assertFalse(
+            watcher.get("additionalProperties", True),
+            "the schema no longer closes the watcher field set, so it is no longer "
+            "the declared list this test enumerates",
+        )
+        self.assertEqual(
+            set(self.WRONG_VALUE) | self.NOT_READ_HERE,
+            set(watcher["properties"]),
+            "a watcher field was added without a wrong-type case here",
+        )
+
+    def test_each_field_rejects_a_wrong_type(self):
+        for field, bad in self.WRONG_VALUE.items():
+            with self.subTest(field=field):
+                # `room` is required, so every entry carries one; the `room` case
+                # overwrites it rather than adding a second room key.
+                entry = {"room": "general", field: bad}
+                with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+                    f.write(textwrap.dedent("""\
+                        connectors:
+                          - name: rc
+                            type: rocketchat
+                            server: {url: http://localhost:3000, username: bot, password: pw}
+                        agents:
+                          default:
+                            type: claude
+                            working_directory: /tmp
+                        watchers:
+                        """) + textwrap.indent(yaml.safe_dump([entry]), "  "))
+                    path = f.name
+                with self.assertRaises(ValueError, msg=f"{field} accepted {bad!r}"):
+                    GatewayConfig.from_file(path)
 
 
 class TestContextInjectFileListValidation(unittest.TestCase):
