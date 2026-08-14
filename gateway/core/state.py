@@ -32,6 +32,19 @@ RUNTIME_DIR = Path.home() / ".agent-chat-gateway"
 # as if it had them.
 STATE_FORMAT_VERSION = 2
 
+# The config schema a frozen `rule`/`config` snapshot was taken under (§2.4). A *second*
+# number, and deliberately not the one above: that one answers "can this build read these
+# records at all" and is enforced by refusing to start, while this one answers "what did
+# this snapshot's fields mean when it was written". They change for different reasons, and
+# the whole point of the second is that a config-schema change must not refuse a file whose
+# records are perfectly readable.
+#
+# Owned by code and stamped into each record when the snapshot is frozen — never written by
+# an operator, so it cannot lie. Per-record rather than per-file because one state file
+# legitimately holds watchers frozen either side of a schema change; a file-level stamp
+# would be rewritten on every save and would silently relabel old snapshots as current.
+CONFIG_SCHEMA_VERSION = 1
+
 
 class StateFormatError(Exception):
     """A state file this build cannot read.
@@ -160,6 +173,9 @@ class WatcherState:
     rule_name: str = ""
     # The originating rule as resolved at creation: the drift baseline (§2.4).
     rule: dict = field(default_factory=dict)
+    # Which config schema the two snapshots above were written under. 0 means "no snapshot"
+    # — a record that predates rule-derived creation, or one written by the static path.
+    config_schema_version: int = 0
 
 
 # The type each persisted field must have, derived from WatcherState's own annotations
@@ -204,6 +220,7 @@ _SCALAR_FIELDS: tuple[tuple[str, object], ...] = (
     ("last_activity_at", ""),
     ("dropped_at", ""),
     ("rule_name", ""),
+    ("config_schema_version", 0),
 )
 
 

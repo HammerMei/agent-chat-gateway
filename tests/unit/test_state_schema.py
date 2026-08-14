@@ -93,6 +93,7 @@ class TestRoundTrip(_RealStateFileTestCase):
             config={"room": "eng-backend", "history_handoff": {"enabled": False}},
             rule_name="eng-rooms",
             rule={"name": "eng-rooms", "rooms": {"include": ["eng-*"]}},
+            config_schema_version=1,
         )
 
     def test_every_field_survives_a_save_and_load(self):
