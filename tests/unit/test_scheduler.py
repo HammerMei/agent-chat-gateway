@@ -1255,3 +1255,72 @@ class TestInjectMessageTimestampFormat(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestInjectionResolvesOnceAndReportsFailure(unittest.IsolatedAsyncioTestCase):
+    """`_inject` used to re-implement `_get_sm_for_watcher`, and worse than it.
+
+    Its copy resolved by *attempting delivery* into every manager in turn under
+    `except Exception: pass`, so a real failure in the manager that owns the watcher was
+    indistinguishable from "no manager has it" — the operator saw the generic message
+    either way, and other connectors' watchers were poked in the process. It resolves
+    first now, then injects once.
+    """
+
+    def _scheduler(self, managers):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = JobStore(jobs_file=Path(tmp.name) / "jobs.json")
+        store.load()
+        return JobScheduler(
+            store=store, session_managers=managers, completed_job_ttl_days=7)
+
+    async def test_a_failure_in_the_owning_manager_is_not_a_lookup_miss(self):
+        owner = _make_sm_mock()
+        owner.inject_message = AsyncMock(side_effect=RuntimeError("backend down"))
+        scheduler = self._scheduler({"rc-home": owner})
+
+        with self.assertLogs("agent-chat-gateway.core.scheduler", "ERROR") as logs:
+            delivered = await scheduler._inject(_make_job())
+
+        self.assertFalse(delivered)
+        joined = "\n".join(logs.output)
+        self.assertIn("inject_message failed", joined)
+        self.assertNotIn("no session manager", joined)
+
+    async def test_other_connectors_are_not_tried(self):
+        """The old fallback injected into every manager until one returned True, which
+        could deliver a job's message through a connector it was not scheduled on."""
+        owner = _make_sm_mock()
+        owner.inject_message = AsyncMock(return_value=False)
+        stranger = _make_sm_mock()
+        scheduler = self._scheduler({"rc-home": owner, "mm-eng": stranger})
+
+        delivered = await scheduler._inject(_make_job(connector="rc-home"))
+
+        self.assertFalse(delivered)
+        stranger.inject_message.assert_not_awaited()
+
+    async def test_a_stale_connector_name_still_resolves_by_config(self):
+        """The fallback that is worth keeping: a job written before a connector was
+        renamed still finds its owner, because that lookup asks who *has* the watcher
+        rather than trying to deliver to everyone."""
+        owner = _make_sm_mock()
+        scheduler = self._scheduler({"rc-home": owner})
+
+        delivered = await scheduler._inject(_make_job(connector="renamed-away"))
+
+        self.assertTrue(delivered)
+        owner.inject_message.assert_awaited_once()
+
+    async def test_no_owner_reports_a_lookup_miss(self):
+        stranger = _make_sm_mock()
+        stranger.get_watcher_config = MagicMock(return_value=None)
+        scheduler = self._scheduler({"mm-eng": stranger})
+
+        with self.assertLogs("agent-chat-gateway.core.scheduler", "WARNING") as logs:
+            delivered = await scheduler._inject(_make_job(connector="gone"))
+
+        self.assertFalse(delivered)
+        self.assertIn("no session manager owns watcher", "\n".join(logs.output))
+        stranger.inject_message.assert_not_awaited()

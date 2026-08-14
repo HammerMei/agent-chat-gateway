@@ -974,3 +974,65 @@ class TestSyncWatchersPrunesOnlyRemovedWatchers(unittest.IsolatedAsyncioTestCase
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestOneLookupOneFailureSemantic(unittest.IsolatedAsyncioTestCase):
+    """`self._watcher_configs` had two readers with different ideas of "not found".
+
+    One raised with a hint, the other returned None. The duplication was the smaller half:
+    which behaviour a reader got depended on which name they happened to call, and the two
+    could drift on what "found" means. There is one lookup now; only the empty case differs.
+    """
+
+    def _lifecycle(self, names=("w1",)):
+        from gateway.core.config import WatcherConfig
+        from gateway.core.watcher_lifecycle import WatcherLifecycle
+
+        lc = WatcherLifecycle.__new__(WatcherLifecycle)
+        lc._watcher_configs = [
+            WatcherConfig(name=n, connector="rc", room=n, agent="a") for n in names
+        ]
+        lc._states = {}
+        lc._processors = {}
+        return lc
+
+    def test_the_optional_reader_returns_none(self):
+        lc = self._lifecycle()
+        self.assertIsNone(lc.get_watcher_config("absent"))
+        self.assertIsNotNone(lc.get_watcher_config("w1"))
+
+    def test_the_required_reader_raises_and_lists_what_exists(self):
+        """The hint is the reason a second function existed at all; it is kept, on top of
+        the one lookup, rather than being a second lookup."""
+        lc = self._lifecycle(names=("w1", "w2"))
+        with self.assertRaises(RuntimeError) as cm:
+            lc._require_watcher_config("absent")
+        message = str(cm.exception)
+        self.assertIn("absent", message)
+        self.assertIn("w1", message)
+        self.assertIn("w2", message)
+
+    def test_both_agree_on_what_exists(self):
+        """The property the divergence threatened: one lookup, so "found" cannot mean two
+        things depending on which reader asked."""
+        lc = self._lifecycle(names=("w1", "w2"))
+        for name in ("w1", "w2"):
+            with self.subTest(name=name):
+                self.assertIs(lc._require_watcher_config(name), lc.get_watcher_config(name))
+
+    def test_both_agree_on_a_near_miss(self):
+        """Where a *second* lookup would show itself.
+
+        Asserting agreement on names that exist does not detect one: any reasonable
+        variant lookup still finds `w1` when asked for `w1`. It shows up on a name that
+        differs slightly — a second lookup that normalised case, trimmed whitespace, or
+        matched a prefix would find something here while the other reader found nothing,
+        and CLI commands would then disagree about whether a watcher exists. Written after
+        injecting exactly that fault and watching the earlier assertions stay green.
+        """
+        lc = self._lifecycle(names=("w1",))
+        for near in ("W1", " w1", "w1 ", "w", "w1x"):
+            with self.subTest(name=near):
+                self.assertIsNone(lc.get_watcher_config(near))
+                with self.assertRaises(RuntimeError):
+                    lc._require_watcher_config(near)

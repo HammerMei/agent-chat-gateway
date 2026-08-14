@@ -169,7 +169,7 @@ class WatcherLifecycle:
 
     async def pause_watcher(self, name: str) -> None:
         """Pause a watcher: stop processing messages but preserve state."""
-        self._find_watcher_config(name)
+        self._require_watcher_config(name)
         async with self._get_watcher_lock(name):
             state = self._states.get(name)
             if state and state.paused:
@@ -201,7 +201,7 @@ class WatcherLifecycle:
 
     async def resume_watcher(self, name: str) -> None:
         """Resume a paused watcher."""
-        wc = self._find_watcher_config(name)
+        wc = self._require_watcher_config(name)
         self._ensure_agent_available(wc)
         async with self._get_watcher_lock(name):
             state = self._states.get(name)
@@ -228,7 +228,7 @@ class WatcherLifecycle:
 
     async def reset_watcher(self, name: str) -> None:
         """Reset a watcher: clear session and restart with fresh state."""
-        wc = self._find_watcher_config(name)
+        wc = self._require_watcher_config(name)
         self._ensure_agent_available(wc)
         async with self._get_watcher_lock(name):
             try:
@@ -859,14 +859,22 @@ class WatcherLifecycle:
                 f"Watcher '{name}' stop completed with errors: {'; '.join(errors)}"
             )
 
-    def _find_watcher_config(self, name: str) -> WatcherConfig:
-        for wc in self._watcher_configs:
-            if wc.name == name:
-                return wc
-        raise RuntimeError(
-            f"Watcher '{name}' not found in config. "
-            f"Available: {[wc.name for wc in self._watcher_configs]}"
-        )
+    def _require_watcher_config(self, name: str) -> WatcherConfig:
+        """`get_watcher_config`, for the callers that cannot proceed without one.
+
+        There used to be two functions over `self._watcher_configs` — this one raising
+        with a hint, `get_watcher_config` returning None — and that divergence, not the
+        duplication, was the defect: which behaviour a reader gets depended on which name
+        they happened to call, and the two could drift on what "found" means. There is one
+        lookup now; this only decides what to do when it comes back empty.
+        """
+        wc = self.get_watcher_config(name)
+        if wc is None:
+            raise RuntimeError(
+                f"Watcher '{name}' not found in config. "
+                f"Available: {[wc.name for wc in self._watcher_configs]}"
+            )
+        return wc
 
     def _ensure_agent_available(self, wc: WatcherConfig) -> None:
         """Fail closed if a watcher's resolved agent is currently unavailable."""
