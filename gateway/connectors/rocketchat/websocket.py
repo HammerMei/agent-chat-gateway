@@ -521,6 +521,13 @@ class RCWebSocketClient:
                 return
 
             message_doc = args[0]
+            if not isinstance(message_doc, dict):
+                # Reachable now in a way it was not before: the room used to be read from
+                # `eventName` first, which short-circuited past this value entirely when
+                # it was present. Guarded rather than left to the outer handler, which
+                # would report a malformed frame as "error handling room message".
+                logger.debug("Ignoring frame whose first arg is not a message doc")
+                return
 
             # `rid` is authoritative, and `eventName` is only a fallback for a frame that
             # somehow carries no message.
@@ -539,11 +546,15 @@ class RCWebSocketClient:
             if not room_id:
                 return
 
-            # The access object Rocket.Chat appends: `roomParticipant`, `roomType`, and
-            # `roomName` (absent for a DM, which has none). Present on a stream that spans
-            # rooms, absent on a per-room subscription — so it is threaded through as
-            # optional rather than assumed, and the connector decides what a missing one
-            # means.
+            # The access object Rocket.Chat appends: `roomParticipant`, `roomType`, and —
+            # for rooms that have one — `roomName`. A DM's object is present and simply
+            # omits the name (`{"roomParticipant": true, "roomType": "d"}`, §6.1); it is
+            # the *field* that is missing, not the object.
+            #
+            # Observed on `__my_messages__` (§6.1). Whether a per-room subscription also
+            # carries one has not been checked, which is exactly why this is optional
+            # rather than assumed: the code threads through whatever arrives and the
+            # connector decides what a missing one means.
             access = args[1] if len(args) > 1 and isinstance(args[1], dict) else None
 
             callback = self._callbacks.get(room_id)

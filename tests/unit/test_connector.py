@@ -1845,17 +1845,35 @@ class TestSystemMessagesOnTheLivePath(unittest.TestCase):
         )
 
     def test_a_system_message_is_rejected(self):
+        """Note the bodies: Rocket.Chat puts the payload in `msg` for these — the joining
+        user's name for `uj`, the new topic for `room_changed_topic`.
+
+        The first version of this test used an empty `msg`, matching a comment I had
+        written claiming these arrived empty. They do not, and `rest.py`'s history filter
+        is the evidence: it tests `not m.get("t") and m.get("msg")`, and the first clause
+        would be redundant if a system message always had an empty body. So the agent was
+        answering a message whose text was `glin`, with nothing marking it as machinery —
+        a worse bug than the one the comment described.
+        """
         from gateway.connectors.rocketchat.normalize import filter_rc_message
 
-        for letter in ("au", "ru", "room_changed_topic", "uj"):
+        for letter, body in (
+            ("uj", "glin"),
+            ("au", "alice"),
+            ("ru", "bob"),
+            ("room_changed_topic", "new topic"),
+        ):
             with self.subTest(t=letter):
                 result = filter_rc_message(
-                    {"_id": "m1", "rid": "r1", "msg": "", "t": letter,
+                    {"_id": "m1", "rid": "r1", "msg": body, "t": letter,
                      "u": {"username": "glin"}, "ts": {"$date": 1}},
                     self._config(), room_type="channel", last_processed_ts=None,
                 )
                 self.assertFalse(result.accepted)
-                self.assertEqual(result.reason, "system message")
+                self.assertIn(
+                    letter, result.reason,
+                    "the reason names the letter, so a vanished message is traceable",
+                )
 
     def test_an_ordinary_message_still_passes(self):
         from gateway.connectors.rocketchat.normalize import filter_rc_message
@@ -1866,3 +1884,76 @@ class TestSystemMessagesOnTheLivePath(unittest.TestCase):
             self._config(), room_type="channel", last_processed_ts=None,
         )
         self.assertTrue(result.accepted)
+
+
+class TestSystemMessagesAndTheAgentChain(unittest.TestCase):
+    """The side effect of filtering at step 0, stated because nothing else would say it.
+
+    The check runs before the agent-chain step, so a system message no longer resets the
+    chain's turn budget. A human joining a listen-all room used to hand two mid-chain
+    agents a fresh five turns. A join is not a human turn, so not resetting is the better
+    answer — but it is a change, and an unstated behaviour change is how a future reader
+    concludes the reset was lost by accident.
+    """
+
+    def _config(self):
+        from gateway.connectors.rocketchat.config import RocketChatConfig
+
+        return RocketChatConfig(
+            server_url="https://x", username="bot", password="pw", name="rc",
+            owners=["glin"], require_mention=False,
+        )
+
+    def test_a_system_message_does_not_reset_the_turn_budget(self):
+        from unittest.mock import MagicMock
+
+        from gateway.connectors.rocketchat.normalize import filter_rc_message
+
+        turn_store = MagicMock()
+        filter_rc_message(
+            {"_id": "m1", "rid": "r1", "msg": "glin", "t": "uj",
+             "u": {"username": "glin"}, "ts": {"$date": 1}},
+            self._config(), room_type="channel", last_processed_ts=None,
+            turn_store=turn_store,
+        )
+
+        turn_store.reset_all.assert_not_called()
+
+    def test_an_ordinary_human_message_still_resets_it(self):
+        """Otherwise the assertion above would pass against a filter that never reaches
+        the agent-chain step at all."""
+        from unittest.mock import MagicMock
+
+        from gateway.connectors.rocketchat.normalize import filter_rc_message
+
+        turn_store = MagicMock()
+        filter_rc_message(
+            {"_id": "m1", "rid": "r1", "msg": "hello", "u": {"username": "glin"},
+             "ts": {"$date": 1}},
+            self._config(), room_type="channel", last_processed_ts=None,
+            turn_store=turn_store,
+        )
+
+        turn_store.reset_all.assert_called()
+
+
+class TestMalformedFrames(unittest.IsolatedAsyncioTestCase):
+    async def test_a_non_dict_first_arg_is_ignored(self):
+        """Reachable now in a way it was not before: the room used to be read from
+        `eventName` first, which short-circuited past `args[0]` entirely when present."""
+        from gateway.connectors.rocketchat.websocket import RCWebSocketClient
+
+        client = RCWebSocketClient("https://x", "bot", "pw")
+        client._callbacks = {"room-real": lambda *a, **k: None}
+
+        # Asserting "no queue was created" cannot tell a guard from a swallowed
+        # AttributeError — the outer handler catches it and creates no queue either. The
+        # distinction is whether the frame is *reported as an error*, so that is what this
+        # asserts. Written after injecting the fault and watching the first version pass.
+        with self.assertNoLogs("agent-chat-gateway.connectors.rocketchat.ws", "ERROR"):
+            await client._handle_room_message({
+                "msg": "changed", "collection": "stream-room-messages",
+                "fields": {"eventName": "room-real", "args": ["not a doc"]},
+            })
+
+        self.assertEqual(client._room_queues, {})
