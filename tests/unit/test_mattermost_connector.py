@@ -725,6 +725,9 @@ class TestRoutingUntrackedChannels(unittest.IsolatedAsyncioTestCase):
         # The team this connector serves. Left as a MagicMock the gate correctly refuses
         # everything, which is how the first run of these tests failed.
         connector._rest.team_id = "team-1"
+        # An allow-listed sender, resolved. Without this the sender gate refuses — which
+        # is the point of the gate, and has its own test below.
+        connector._rest.resolve_username = AsyncMock(return_value="glin")
         connector._ws.register_channel = MagicMock()
         connector._ws.unregister_channel = MagicMock()
         connector.register_handler(AsyncMock(return_value=True))
@@ -840,6 +843,51 @@ class TestRoutingUntrackedChannels(unittest.IsolatedAsyncioTestCase):
                               "message": "hi", "create_at": 1}))
         self.assertEqual(self.offered, [])
 
+    async def test_a_sender_outside_the_allow_list_cannot_cause_creation(self):
+        """§2.7 step 1 puts the sender allow-list among the cheap rejects, above the
+        room-state lookup, and this is why: someone who cannot start a turn must not be
+        able to cause a watcher and a backend session to exist.
+
+        Note what this does *not* claim. Creating a watcher early is not itself a fault —
+        an agent invited to a room will be spoken to eventually, and an existing watcher
+        makes that first real request faster. The objection is specifically to a sender the
+        operator excluded being able to cause it.
+        """
+        connector = await self._connector()
+        connector._rest.resolve_username = AsyncMock(return_value="stranger")
+
+        await connector._on_posted_event(self._event())
+
+        self.assertEqual(self.offered, [])
+
+    async def test_an_unresolvable_sender_does_not_cause_creation(self):
+        """Fail closed: if the username cannot be resolved, the allow-list cannot be
+        applied, and an unapplied allow-list must not read as permission."""
+        connector = await self._connector()
+        connector._rest.resolve_username = AsyncMock(side_effect=RuntimeError("api down"))
+
+        await connector._on_posted_event(self._event())
+
+        self.assertEqual(self.offered, [])
+
+    async def test_an_agent_sender_bypasses_the_allow_list(self):
+        """An agent-to-agent chain is authorised by being in `agent_usernames`, not by
+        appearing in a human allow-list."""
+        from gateway.core.agent_chain import AgentChainConfig
+
+        connector = _make_connector(
+            agent_chain=AgentChainConfig(agent_usernames=["other-bot"]))
+        connector._rest.team_id = "team-1"
+        connector._rest.resolve_username = AsyncMock(return_value="other-bot")
+        connector._ws.register_channel = MagicMock()
+        connector.register_handler(AsyncMock(return_value=True))
+        offered = []
+        connector.register_router(AsyncMock(side_effect=offered.append))
+
+        await connector._on_posted_event(self._event())
+
+        self.assertEqual(len(offered), 1)
+
     async def test_a_router_failure_does_not_break_delivery(self):
         connector = await self._connector()
         connector.register_router(AsyncMock(side_effect=RuntimeError("boom")))
@@ -912,9 +960,11 @@ class TestResolveRoomById(unittest.IsolatedAsyncioTestCase):
     bind an existing session to the wrong one.
     """
 
-    def _connector(self, channel):
+    def _connector(self, channel, members=()):
         connector = _make_connector()
+        connector._rest.team_id = channel.get("team_id", "")
         connector._rest.get_channel = AsyncMock(return_value=channel)
+        connector._rest.channel_member_usernames = AsyncMock(return_value=list(members))
         return connector
 
     async def test_a_channel_keeps_its_platform_name(self):
@@ -925,12 +975,14 @@ class TestResolveRoomById(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual((room.id, room.name, room.type), ("c1", "incident-42", "channel"))
 
-    async def test_a_dm_uses_its_display_name(self):
-        """A DM's platform name is the opaque `<userid>__<userid>` form, and this value
-        reaches the prompt prefix and the history header — both of which want a room a
-        human recognises."""
+    async def test_a_dm_is_described_by_its_members(self):
+        """A DM's platform name is the opaque `<userid>__<userid>` form, and its REST
+        `display_name` is **empty** — the counterpart handle Mattermost puts on a WebSocket
+        event is viewer-specific and is not part of the channel object. So the members
+        supply the description, which reaches the prompt prefix and the history header."""
         connector = self._connector(
-            {"id": "d1", "name": "u1__u2", "display_name": "alice", "type": "dm"})
+            {"id": "d1", "name": "u1__u2", "display_name": "", "type": "dm"},
+            members=["alice"])
         room = await connector.resolve_room_by_id("d1")
 
         self.assertEqual(room.name, "alice")
@@ -938,12 +990,51 @@ class TestResolveRoomById(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_group_dm_uses_its_display_name(self):
         connector = self._connector(
-            {"id": "g1", "name": "1b4c4b32", "display_name": "glin, alice",
-             "type": "group_dm"})
+            {"id": "g1", "name": "1b4c4b32", "display_name": "", "type": "group_dm"},
+            members=["glin", "alice"])
         room = await connector.resolve_room_by_id("g1")
 
         self.assertEqual(room.name, "glin, alice")
         self.assertEqual(room.type, "group_dm")
+
+    async def test_a_channel_in_another_team_is_refused(self):
+        """A channel id is globally unique, so this can reach a channel in a team the
+        connector no longer serves — the bot account may still belong to both.
+
+        Refused rather than answered, because the caller is usually boot recreating a
+        persisted record: recreating one outside the configured team means answering in a
+        room this connector was reconfigured away from, and nothing else would notice.
+        """
+        from gateway.connectors.mattermost.rest import RoomNotFoundError
+
+        connector = self._connector(
+            {"id": "c1", "name": "eng", "display_name": "", "type": "channel",
+             "team_id": "team-old"})
+        connector._rest.team_id = "team-new"
+
+        with self.assertRaises(RoomNotFoundError) as cm:
+            await connector.resolve_room_by_id("c1")
+        self.assertIn("team-old", str(cm.exception))
+        self.assertIn("team-new", str(cm.exception))
+
+    async def test_a_channel_in_the_configured_team_is_allowed(self):
+        connector = self._connector(
+            {"id": "c1", "name": "eng", "display_name": "", "type": "channel",
+             "team_id": "team-new"})
+        connector._rest.team_id = "team-new"
+        room = await connector.resolve_room_by_id("c1")
+        self.assertEqual(room.name, "eng")
+
+    async def test_a_dm_is_exempt_from_the_team_check(self):
+        """A DM belongs to no team (§6.3), so there is nothing to compare — and comparing
+        anyway would refuse every direct message on the recreation path."""
+        connector = self._connector(
+            {"id": "d1", "name": "u1__u2", "display_name": "", "type": "dm",
+             "team_id": ""},
+            members=["alice"])
+        connector._rest.team_id = "team-new"
+        room = await connector.resolve_room_by_id("d1")
+        self.assertEqual(room.name, "alice")
 
     async def test_a_nameless_channel_falls_back_to_its_id(self):
         connector = self._connector(

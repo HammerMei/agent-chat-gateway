@@ -96,6 +96,25 @@ class FilterResult:
     agent_chain_max_turns: int = 5  # from config
 
 
+def sender_allowed(config, sender_username: str) -> bool:
+    """Whether this sender may start a turn at all — synchronous, no room metadata.
+
+    Extracted because the routing path needs the same answer *before* a watcher exists
+    (§2.7 step 1 puts the sender allow-list among the cheap rejects, above the room-state
+    lookup): a sender who cannot start a turn must not be able to cause a watcher and a
+    backend session to be created. Two copies of an allow-list is one copy too many.
+
+    Agent senders bypass it deliberately — an agent-to-agent chain is authorised by being
+    in `agent_usernames`, not by appearing in a human allow-list.
+    """
+    if not config.filter_sender:
+        return True
+    return (
+        sender_username in config.allow_senders
+        or sender_username in config.agent_chain.agent_usernames
+    )
+
+
 def filter_mm_message(
     post: dict,
     mentions: list[str],
@@ -137,11 +156,10 @@ def filter_mm_message(
     is_agent = sender_username in config.agent_chain.agent_usernames
 
     # 2. Sender filter
-    if config.filter_sender:
-        if sender_username not in config.allow_senders and not is_agent:
-            return FilterResult(
-                accepted=False, sender=sender_username, reason="sender not in allow-list"
-            )
+    if not sender_allowed(config, sender_username):
+        return FilterResult(
+            accepted=False, sender=sender_username, reason="sender not in allow-list"
+        )
 
     # 3. For channels: require @mention (unless listen-all mode or agent sender)
     if config.require_mention and not is_agent and room_type != "dm":

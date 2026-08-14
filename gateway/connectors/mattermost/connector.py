@@ -48,7 +48,13 @@ from ...core.watcher_rule import RoomKind
 from .agent_chain import TurnStore
 from .config import MattermostConfig
 from .mentions import is_room_wide_mention
-from .normalize import FilterResult, filter_mm_message, normalize_mm_message, text_mentions_bot
+from .normalize import (
+    FilterResult,
+    filter_mm_message,
+    normalize_mm_message,
+    sender_allowed,
+    text_mentions_bot,
+)
 from .outbound import send_media as _send_media
 from .outbound import send_text as _send_text
 from .policy import apply_thread_policy
@@ -382,8 +388,34 @@ class MattermostConnector(Connector):
         """
         info = await self._rest.get_channel(room_id)
         kind = info["type"]
-        name = info["display_name"] if kind in ("dm", "group_dm") else info["name"]
-        return Room(id=info["id"], name=name or room_id, type=kind)
+
+        # A channel id is globally unique, so this can reach a channel in a team the
+        # connector no longer serves — the bot account may still belong to both. Rejected
+        # rather than answered, because the caller is usually boot recreating a persisted
+        # record, and recreating one outside the configured team means answering in a room
+        # this connector was reconfigured away from. DMs are exempt: they belong to no team
+        # (§6.3), so there is nothing to compare.
+        if kind not in ("dm", "group_dm"):
+            team_id = info.get("team_id", "")
+            if team_id and self._rest.team_id and team_id != self._rest.team_id:
+                raise RoomNotFoundError(
+                    f"Channel {room_id} belongs to team {team_id}, but this connector "
+                    f"serves {self._rest.team_id}"
+                )
+
+        if kind in ("dm", "group_dm"):
+            # The REST channel object's `display_name` is **empty** for a direct channel:
+            # the counterpart handle on a WebSocket event is viewer-specific and is not part
+            # of the channel. Falling back to the id would put an opaque string in the
+            # prompt prefix and the history header, where a human-recognisable room is the
+            # whole point — so the members supply it instead.
+            members = await self._rest.channel_member_usernames(
+                room_id, exclude=self._rest.bot_user_id or "")
+            name = ", ".join(members) or info["display_name"] or room_id
+        else:
+            name = info["name"] or room_id
+
+        return Room(id=info["id"], name=name, type=kind)
 
     # ── Per-channel local bookkeeping (no wire protocol — see websocket.py) ────
 
@@ -796,6 +828,33 @@ class MattermostConnector(Connector):
         room = self._room_ref_from_event(channel_id, decoded)
         if room is None:
             return
+
+        # §2.7 step 1 puts the sender allow-list among the cheap rejects, above the
+        # room-state lookup, and this is why: a sender who cannot start a turn must not be
+        # able to cause a watcher and a backend session to be created. The username costs
+        # one REST call per distinct user (`resolve_username` caches), and only for
+        # channels no watcher tracks.
+        #
+        # The *mention* gate deliberately stays out of here. It is kind-dependent —
+        # `require_mention` does not apply to a 1:1 DM but does to a group DM — so §2.7
+        # runs it after classification, and `impl/creation-path` owns that ordering along
+        # with the buffer that replays the triggering message.
+        sender_id = decoded["post"].get("user_id", "")
+        try:
+            sender_username = await self._rest.resolve_username(sender_id)
+        except Exception as e:
+            logger.warning(
+                "Could not resolve sender %s for untracked channel %s: %s",
+                sender_id, channel_id, e,
+            )
+            return
+        if not sender_allowed(self._config, sender_username):
+            logger.debug(
+                "Sender %r is not allowed to start a watcher in channel %s",
+                sender_username, channel_id,
+            )
+            return
+
         try:
             await self._router(room)
         except Exception as e:

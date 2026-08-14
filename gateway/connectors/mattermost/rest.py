@@ -438,7 +438,32 @@ class MattermostREST:
             "name": result.get("name", ""),
             "display_name": result.get("display_name", ""),
             "type": room_type_for(result.get("type")),
+            # Kept, not discarded: a channel id is globally unique, so resolving a
+            # persisted record by id can reach a channel in a team this connector no
+            # longer serves — the bot may belong to both. Without this the caller cannot
+            # tell.
+            "team_id": result.get("team_id", ""),
         }
+
+    async def channel_member_usernames(self, channel_id: str, exclude: str = "") -> list[str]:
+        """Usernames of a channel's members, for describing a room that has no name.
+
+        A direct channel's REST object carries an **empty** `display_name`: the counterpart
+        handle Mattermost puts on a WebSocket event is viewer-specific and is not part of
+        the channel itself. So a DM resolved by id has nothing to describe it, and this
+        supplies it from the membership instead.
+
+        Only ever called on the recreation path, never per message — it is one request plus
+        a cached username lookup per member.
+        """
+        members = await self._request("GET", f"channels/{channel_id}/members")
+        names = []
+        for member in members if isinstance(members, list) else []:
+            user_id = member.get("user_id", "")
+            if not user_id or user_id == exclude:
+                continue
+            names.append(await self.resolve_username(user_id))
+        return names
 
     async def resolve_room(self, room_name: str) -> dict[str, Any]:
         """Resolve a channel name to its info dict, within the configured team.
