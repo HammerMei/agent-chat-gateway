@@ -667,8 +667,15 @@ class WatcherLifecycle:
         restore then writes the *old* room's cursor onto the new room, silently
         discarding every message in it older than that timestamp. The state-file
         corruption both error messages tell operators to look for is far rarer than this.
-        An empty `room_id` is treated as "no claim to compare", not as a mismatch: it is
-        what a record written before this field carried anything looks like.
+        An empty `room_id` is a **mismatch**, not "no claim to compare". `room_id` has no
+        dataclass default, so it is in `_REQUIRED_FIELDS` and the reader fills an absent
+        one with `""` — meaning an empty value in a version-2 record is a hand-edited or
+        truncated record, which is precisely the case this refusal exists for. Treating
+        it as matching would resume an unknown room's transcript in this room. This began
+        as an exemption for "a record written before the field carried anything", which
+        was wrong twice over: no such record can be read (the format version refuses
+        them), and it contradicts the rule the identity comparison already follows —
+        unverifiable is not verified.
 
         A session id is only meaningful inside the backend store that issued it, so a
         record whose stored identity does not equal the current one is not reused —
@@ -685,9 +692,7 @@ class WatcherLifecycle:
         fresh session takes over; the old store keeps whatever it had.
         """
         if state and state.session_id:
-            if state.backend_identity == identity and (
-                not state.room_id or state.room_id == room_id
-            ):
+            if state.backend_identity == identity and state.room_id == room_id:
                 return state.session_id, False
             # The full id, deviating from the [:8] used for routine session logging.
             # This record is about to be overwritten with the new session, so this line

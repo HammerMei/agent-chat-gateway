@@ -55,6 +55,7 @@ from .core.state import (
     DuplicateSessionError,
     StateFormatError,
     check_session_uniqueness,
+    connector_name_of,
     load_state,
     state_files,
 )
@@ -356,12 +357,13 @@ def _check_session_uniqueness(result: ValidationResult) -> None:
     except DuplicateSessionError as exc:
         result.errors.append(str(exc))
         result.findings.append(Finding("error", "global", None, None, str(exc)))
-    except StateFormatError as exc:
-        # A legacy or future-format file refuses to boot too, and `check_state_formats`
-        # is likewise a daemon-only preflight. Reported rather than raised, so one
-        # unreadable connector file does not hide every other finding in the run.
-        result.errors.append(str(exc))
-        result.findings.append(Finding("error", "global", None, None, str(exc)))
+    except StateFormatError:
+        # Deliberately not reported here. `_check_state_orphans` runs immediately before
+        # this and already loads every state file, reporting the same error with the same
+        # global attribution — catching it again printed each format failure twice and
+        # inflated the error count. Swallowed rather than re-raised so an unreadable file
+        # does not abort a run that has more to say.
+        return
 
 
 def _check_state_orphans(config: GatewayConfig, result: ValidationResult) -> None:
@@ -378,7 +380,7 @@ def _check_state_orphans(config: GatewayConfig, result: ValidationResult) -> Non
     # startup, which is the failure the refusal exists to prevent.
     for path in state_files():
         try:
-            load_state(path.name[len("state."):-len(".json")])
+            load_state(connector_name_of(path))
         except StateFormatError as exc:
             msg = str(exc)
             result.errors.append(msg)

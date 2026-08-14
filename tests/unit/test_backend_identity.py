@@ -207,16 +207,24 @@ class TestSessionReuseRequiresMatchingIdentity(unittest.IsolatedAsyncioTestCase)
         agent.create_session.assert_called_once()
         self.assertEqual(lifecycle._states["w1"].session_id, "fresh-session-id")
 
-    async def test_a_record_with_no_room_is_not_treated_as_a_mismatch(self):
-        """What a record written before the field carried anything looks like: no claim
-        to compare, so it must not force everyone onto a new session."""
+    async def test_a_record_with_no_room_forces_a_fresh_session(self):
+        """An empty `room_id` is a mismatch, not an exemption.
+
+        The field has no dataclass default, so it is required and the reader fills an
+        absent one with `""` — an empty value in a version-2 record therefore means the
+        record was hand-edited or truncated, which is the case this refusal exists for.
+        The first version of this test asserted the opposite, on the theory that such a
+        record predated the field; no such record can be read (the format version refuses
+        them), and the exemption contradicted the rule the identity comparison next to it
+        already follows — unverifiable is not verified.
+        """
         lifecycle, _, agent, wc = self._make_lifecycle()
         state = self._stored("old-session-id", backend_identity("claude", "/srv/work"))
         state.room_id = ""
 
         await self._start(lifecycle, wc, state)
 
-        agent.create_session.assert_not_called()
+        agent.create_session.assert_called_once()
 
     async def test_an_empty_stored_identity_forces_a_fresh_session(self):
         """Unverifiable is not verified — and this case outlives the migration window.

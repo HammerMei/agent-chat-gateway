@@ -268,6 +268,22 @@ class TestValidateReportsWhatBlocksTheBoot(unittest.TestCase):
             f"validate must surface the condition that blocks the boot: {result.errors}",
         )
 
+    def test_a_format_failure_is_reported_once(self):
+        """`_check_state_orphans` runs first and already reports every unreadable file.
+
+        Catching it again here printed each format failure twice and inflated the error
+        count — the same fault as any rule stated in two places, in its mildest form.
+        """
+        runtime = self.root / "runtime"
+        runtime.mkdir(parents=True, exist_ok=True)
+        (runtime / "state.rc.json").write_text('{"watchers": []}')  # no version marker
+
+        result = self._validate()
+
+        legacy = [e for e in result.errors if "format" in e.lower()]
+        self.assertEqual(
+            len(legacy), 1, f"expected exactly one format error, got {legacy}")
+
     def test_a_clean_state_file_reports_nothing(self):
         """Otherwise the assertion above would pass against a check that always fires."""
         save_state("rc", [self._record("w1", "room-a", "ses-1")])
