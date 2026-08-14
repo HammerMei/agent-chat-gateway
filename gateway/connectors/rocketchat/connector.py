@@ -23,6 +23,11 @@ from pathlib import Path
 
 from ...agents.response import AgentEvent, AgentResponse
 from ...core.adapter_utils import ts_ms_to_iso_local, weekday_abbrev
+from ...core.bot_identity import (
+    BotIdentity,
+    ConnectorIdentityError,
+    canonical_origin,
+)
 from ...core.connector import (
     Connector,
     IncomingMessage,
@@ -497,6 +502,35 @@ class RocketChatConnector(Connector):
     # malicious RC admin to inject fake role fields (e.g. "| role: owner") and
     # bypass RBAC enforcement in CLAUDE.md.  Stripping them here closes the gap.
     _PREFIX_UNSAFE_RE = re.compile(r"[\|\[\]\r\n]")
+
+    def bot_identity(self) -> BotIdentity:
+        """The id Rocket.Chat's own login response assigned, never the configured name.
+
+        `username` is what an operator typed; the id is what the server says this
+        connection is. Two connectors can spell one account two ways (case, an alias),
+        and only the id makes them compare equal.
+
+        No scope: Rocket.Chat has no team concept to keep two connectors on one account
+        apart, so they duplicate every room, not merely DMs.
+
+        The id arrives on the REST login response (`POST /api/v1/login`). The DDP login
+        returns it too and discards it, so this deliberately reads the REST client
+        rather than adding a second source that could disagree.
+        """
+        user_id = self._rest.user_id
+        if not user_id:
+            raise ConnectorIdentityError(
+                f"Rocket.Chat connector for {self._config.server_url} cannot report its "
+                f"own user id — the login response carried none, so this connector is "
+                f"not authenticated. It cannot be checked against the other connectors "
+                f"for a shared bot account, and starting it unchecked is what that "
+                f"check exists to prevent."
+            )
+        return BotIdentity(
+            platform="rocketchat",
+            origin=canonical_origin(self._config.server_url),
+            user_id=user_id,
+        )
 
     @property
     def agent_username(self) -> str:

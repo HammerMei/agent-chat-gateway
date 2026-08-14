@@ -103,11 +103,37 @@ class SessionManager:
         Returns:
             List of human-readable error strings for any watchers that failed.
         """
+        await self.connect_only()
+        errors = await self.sync_only(unavailable_agents=unavailable_agents)
+        logger.info("SessionManager ready (run_once)")
+        return errors
+
+    async def connect_only(self) -> None:
+        """Phase one: authenticate. No subscription, no watcher, no room.
+
+        Split from `sync_only` so an orchestrator holding several connectors can put a
+        barrier between the phases — two connectors on one bot account have to be
+        refused *before* either subscribes, and each SessionManager owns exactly one
+        connector, so nothing at this layer can see the collision (§4.5).
+
+        A single-connector caller has no such barrier to run and should keep using
+        `run_once()`.
+        """
         self._connector.register_handler(self._dispatcher.dispatch)
         self._connector.register_capacity_check(self._dispatcher.has_capacity)
         await self._connector.connect()
+
+    async def sync_only(self, unavailable_agents: set[str] | None = None) -> list[str]:
+        """Phase two: restore watchers, subscribe, then open the inbound stream.
+
+        `start_inbound()` is last on purpose. A connector that delivers everything its
+        account can see discards events for rooms it has no state for, so reading before
+        the restore turns "not subscribed yet" into "lost" — and the errors returned
+        here are per-watcher failures, not a reason to leave the connector deaf, so the
+        stream starts regardless of them.
+        """
         errors = await self._lifecycle.sync_watchers(unavailable_agents=unavailable_agents)
-        logger.info("SessionManager ready (run_once)")
+        await self._connector.start_inbound()
         return errors
 
     async def shutdown(self) -> None:

@@ -30,6 +30,11 @@ from pathlib import Path
 
 from ...agents.response import AgentEvent, AgentResponse
 from ...core.adapter_utils import ts_ms_to_iso_local, weekday_abbrev
+from ...core.bot_identity import (
+    BotIdentity,
+    ConnectorIdentityError,
+    canonical_origin,
+)
 from ...core.connector import (
     Connector,
     IncomingMessage,
@@ -90,6 +95,11 @@ class MattermostConnector(Connector):
         room = await connector.resolve_room("town-square")
         await connector.subscribe_room(room, watcher_id="abc123")
 
+        # Required, and last: the socket is open from connect() but unread until
+        # here, so events arriving during setup are buffered rather than dropped for
+        # a channel this connector does not know yet. Subscribe first, then this.
+        await connector.start_inbound()
+
         # ... messages arrive, handler is called ...
 
         await connector.disconnect()
@@ -139,14 +149,27 @@ class MattermostConnector(Connector):
 
         self._ws.register_handler(self._on_posted_event)
         self._ws.set_reconnect_callback(self._on_ws_reconnect)
+        # The socket opens here; the listen loop starts in `start_inbound()`, after the
+        # watchers exist. Events arriving in between are buffered by the client rather
+        # than read and discarded for a channel this connector does not know yet.
         await self._ws.connect()
-        await self._ws.start()
         logger.info(
             "MattermostConnector connected to %s as %s (team=%s)",
             self._config.server_url,
             self._rest.bot_username,
             self._config.team,
         )
+
+    async def start_inbound(self) -> None:
+        """Start the listen loop, once `_channels` holds the rooms being watched.
+
+        `_on_posted_event` returns early for a channel with no state, and nothing
+        replays it afterwards — the initial watermark restore only covers channels that
+        already exist. Reading before the restore therefore turns "not yet subscribed"
+        into "permanently lost", which is why this is the last step of startup rather
+        than part of connecting.
+        """
+        await self._ws.start()
 
     async def disconnect(self) -> None:
         """Close the WebSocket and release HTTP client resources."""
@@ -396,6 +419,43 @@ class MattermostConnector(Connector):
     # containing these characters could inject fake delimiter fields into the
     # trusted header and bypass RBAC enforcement in CLAUDE.md.
     _PREFIX_UNSAFE_RE = re.compile(r"[\|\[\]\r\n]")
+
+    def bot_identity(self) -> BotIdentity:
+        """Account id from `users/me`, scoped by the **resolved** team id.
+
+        Both halves are server-resolved for the same reason: token-only auth leaves
+        `username` empty, and `team:` accepts either a team name or a team id, so two
+        connectors on one team can spell it two ways. Comparing what the operator wrote
+        would call them different and let the duplicate through — the one case this
+        exception is supposed to be safe for is exactly the case it would break.
+
+        A missing team is fatal rather than an empty scope: an empty scope means "no
+        sub-scope keeps me apart from another connector on this account", which for
+        Mattermost would silently convert a supported two-team setup into a rejected
+        one — or, worse, admit a connector whose team gate cannot work.
+        """
+        user_id = self._rest.bot_user_id
+        team_id = self._rest.team_id
+        if not user_id:
+            raise ConnectorIdentityError(
+                f"Mattermost connector for {self._config.server_url} cannot report its "
+                f"own user id — `users/me` returned none, so this connector is not "
+                f"authenticated and cannot be checked against the others for a shared "
+                f"bot account."
+            )
+        if not team_id:
+            raise ConnectorIdentityError(
+                f"Mattermost connector for {self._config.server_url} has no resolved "
+                f"team id for team '{self._config.team}'. Two connectors may share one "
+                f"bot account only when each is scoped to a different team, and that "
+                f"cannot be established here."
+            )
+        return BotIdentity(
+            platform="mattermost",
+            origin=canonical_origin(self._config.server_url),
+            user_id=user_id,
+            scope=team_id,
+        )
 
     @property
     def agent_username(self) -> str:

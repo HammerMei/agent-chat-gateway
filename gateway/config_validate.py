@@ -43,6 +43,14 @@ from .config import (
 from .connectors.mattermost.config import MattermostConfig
 from .connectors.rocketchat.config import RocketChatConfig
 from .connectors.voice.config import VoiceConfig
+from .core.bot_identity import (
+    BotIdentity,
+    ConnectorIdentity,
+    DmClaim,
+    canonical_origin,
+    dm_claims,
+    find_identity_conflicts,
+)
 from .core.state import StateFormatError, load_state, state_files
 
 # Connector types validated via their own dataclass parser. 'script' is
@@ -165,6 +173,7 @@ def validate_config(config_path: str, lint: bool = False) -> ValidationResult:
     _check_connectors(config, result)
     _check_state_orphans(config, result)
     _check_shadowed_rules(config, result)
+    _check_declared_bot_accounts(config, result)
     if lint:
         _lint_config(raw, result)
 
@@ -209,6 +218,56 @@ def _check_shadowed_rules(config: GatewayConfig, result: ValidationResult) -> No
         result.findings.append(
             Finding("warning", "watcher", finding.rule.name, "rooms", msg)
         )
+
+
+def _check_declared_bot_accounts(config: GatewayConfig, result: ValidationResult) -> None:
+    """Catch a shared bot account here when config actually declares one (§4.5).
+
+    An optimisation on the runtime barrier in `GatewayService`, never a replacement,
+    and the split is not arbitrary: Mattermost token auth leaves `username` empty and
+    two different tokens can authenticate one account, so config *cannot* decide this
+    in general. What it can do is spot the obvious case — two connectors naming one
+    server and one username — before the operator restarts the daemon to find out.
+
+    It calls `find_identity_conflicts` rather than restating the rule, so the team
+    exception and the single-DM-owner condition cannot drift between the two callers.
+
+    Its blind spots all point the same way, which is the safe one: a connector
+    authenticating by token contributes nothing to compare, and two Mattermost
+    connectors spelling one team as a name and as an id read as different scopes. Both
+    are missed duplicates that the runtime check still catches — never a rejection of a
+    configuration that would have worked.
+    """
+    claims = dm_claims(config.watchers, config.watcher_rules)
+    declared: list[ConnectorIdentity] = []
+    for connector in config.connectors:
+        validator = _CONNECTOR_VALIDATORS.get(connector.type)
+        if validator is None:
+            continue
+        try:
+            cfg = validator(connector)
+        except ValueError:
+            continue  # already reported, with a better message, by _check_connectors
+        username = getattr(cfg, "username", "")
+        server_url = getattr(cfg, "server_url", "")
+        if not username or not server_url:
+            continue  # nothing declared to compare
+        declared.append(
+            ConnectorIdentity(
+                connector_name=connector.name,
+                identity=BotIdentity(
+                    platform=connector.type,
+                    origin=canonical_origin(server_url),
+                    user_id=username,
+                    scope=getattr(cfg, "team", ""),
+                ),
+                dms=claims.get(connector.name, DmClaim()),
+            )
+        )
+
+    for msg in find_identity_conflicts(declared):
+        result.errors.append(msg)
+        result.findings.append(Finding("error", "connector", None, None, msg))
 
 
 def _looks_like_url(value: str) -> bool:

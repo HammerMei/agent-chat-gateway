@@ -350,6 +350,20 @@ Each connector represents a connection to one chat platform. Rocket.Chat and Mat
 are both fully supported today; a daemon can run one, the other, or both at once (see
 [Multi-Connector Setup](#multi-connector-setup)).
 
+> ⚠️ **One bot account per connector.** Two connectors that log in as the same account
+> on the same server receive the *identical* message stream, so any room they both cover
+> gets two agents replying to every message. The daemon checks this after logging in —
+> against the account id the server reports, not what config says, because a token can
+> authenticate an account without naming it — and refuses to start before either
+> connector subscribes to anything. Give each connector its own bot account.
+>
+> **Mattermost is the one exception**: two connectors on one account are allowed when
+> each is scoped to a **different team**, since each ignores the other team's channels.
+> Even then their direct messages must not overlap — a DM belongs to no team, so the
+> server delivers it to every connection the account has open. Watching `@alice` on one
+> and `@bob` on the other is fine; the same person on both is not, and a rule with
+> `direct:` takes *every* DM, which overlaps with any of them.
+
 ```yaml
 connectors:
   - name: rc-main                    # Unique identifier

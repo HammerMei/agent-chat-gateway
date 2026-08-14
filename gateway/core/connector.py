@@ -22,6 +22,7 @@ from enum import Enum
 from typing import Any, Awaitable, Callable, Literal
 
 from ..agents.response import AgentEvent, AgentResponse
+from .bot_identity import BotIdentity  # noqa: F401 — used in an annotation
 
 # ---------------------------------------------------------------------------
 # Roles
@@ -199,7 +200,14 @@ class Connector(ABC):
         Webhook platforms   : start HTTP server, or no-op if server is external.
         Script connector    : no-op.
 
-        Must be called once before the Connector can receive or send messages.
+        Must be called once before the Connector can send messages or subscribe.
+
+        **It does not, by itself, mean messages will arrive.** Startup is two phases —
+        `connect()`, then `subscribe_room()` for each room, then `start_inbound()` — and
+        a connector whose transport delivers every room the account can see defers
+        reading until that last call, because events for a room it has no state for are
+        discarded and never replayed. Callers embedding a connector directly must make
+        that third call; `SessionManager` makes it at the end of its sync phase.
         """
         ...
 
@@ -534,6 +542,47 @@ class Connector(ABC):
         Used by SessionManager to select timeout and retry strategies.
         """
         return "direct"
+
+    async def start_inbound(self) -> None:
+        """Begin consuming inbound events. Called after watchers are restored.
+
+        Separate from `connect()` because authenticating and *receiving* are different
+        moments, and a connector that starts both at once drops everything arriving
+        before its rooms are known. Mattermost's socket delivers every channel the
+        account can see and its handler discards events for channels with no state yet,
+        so each such message is lost with no watermark to recover it from.
+
+        The gap is not new — it already spanned each connector's own watcher restore,
+        which creates sessions and fetches history — but the identity barrier widens it
+        by every other connector's login, and this closes both: the socket is open
+        during the wait, so the client library buffers what arrives, and the listen loop
+        starts once the channels those events belong to exist.
+
+        A no-op by default. A connector whose delivery is gated per room (Rocket.Chat
+        subscribes room by room) has nothing to defer.
+        """
+        return None
+
+    def bot_identity(self) -> "BotIdentity | None":
+        """Who this connector is authenticated as, or ``None`` if it has no account.
+
+        Called once after ``connect()`` and before any subscription, so that two
+        connectors on one bot account are refused before either can start answering
+        (§4.5). Override in every connector that authenticates as an account on a
+        server other connectors could also reach.
+
+        ``None`` is a claim, not a default to fall through: it says this connector has
+        no shared account to collide over — a local stdin/stdout or script connector.
+        `tests/unit/test_bot_identity_coverage.py` enumerates the connectors in this
+        package and fails when a new one neither overrides this nor is listed there, so
+        a platform connector cannot inherit the accountless answer by omission.
+
+        Raise `ConnectorIdentityError` when the connector *does* have an account but
+        cannot establish it — a whoami that failed, an id the login response omitted.
+        Fail-closed: an unanswerable identity cannot be compared, and starting anyway is
+        the situation this check exists to prevent.
+        """
+        return None
 
     @property
     def agent_username(self) -> str:

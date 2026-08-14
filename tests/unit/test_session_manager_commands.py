@@ -22,6 +22,9 @@ def _make_manager():
     mgr._connector.register_handler = MagicMock()
     mgr._connector.register_capacity_check = MagicMock()
     mgr._connector.connect = AsyncMock()
+    # Startup's second phase ends by opening the inbound stream, once the watchers
+    # that give arriving events a destination exist.
+    mgr._connector.start_inbound = AsyncMock()
     mgr._connector.disconnect = AsyncMock()
     mgr._lifecycle = MagicMock()
     mgr._lifecycle.list_watchers = MagicMock(return_value=[])
@@ -222,6 +225,7 @@ class TestRunOnce(unittest.IsolatedAsyncioTestCase):
         errors = await mgr.run_once()
         mgr._connector.connect.assert_called_once()
         mgr._lifecycle.sync_watchers.assert_called_once()
+        mgr._connector.start_inbound.assert_awaited_once()
         self.assertEqual(errors, [])
 
     async def test_run_once_registers_handler(self):

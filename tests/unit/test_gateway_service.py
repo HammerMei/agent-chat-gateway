@@ -8,6 +8,13 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from gateway.core.bot_identity import (
+    BotIdentity,
+    ConnectorIdentityError,
+    DmClaim,
+    DuplicateBotIdentityError,
+    canonical_origin,
+)
 from gateway.service import GatewayService
 
 
@@ -19,7 +26,19 @@ def _make_service() -> GatewayService:
     service._runtime_manager = MagicMock()
     service._control = MagicMock()
     service._entries = []
+    service._dm_owner_connectors = set()
     return service
+
+
+def _accountless():
+    """A connector declaring no shared bot account, which is what these tests are.
+
+    `bot_identity()` returning None is the base class's answer for a connector with no
+    account other connectors could also authenticate as — see gateway/core/connector.py.
+    """
+    connector = MagicMock()
+    connector.bot_identity = MagicMock(return_value=None)
+    return connector
 
 
 class TestGatewayServiceRun(unittest.IsolatedAsyncioTestCase):
@@ -29,9 +48,12 @@ class TestGatewayServiceRun(unittest.IsolatedAsyncioTestCase):
         service._runtime_manager.has_active_brokers = False
         service._runtime_manager.unavailable_agents = set()
         sm = MagicMock()
-        sm.run_once = AsyncMock(return_value=[])
+        sm.connect_only = AsyncMock()
+        sm.sync_only = AsyncMock(return_value=[])
         sm.shutdown = AsyncMock()
-        service._entries = [SimpleNamespace(name="script", session_manager=sm)]
+        service._entries = [
+            SimpleNamespace(name="script", session_manager=sm, connector=_accountless())
+        ]
         service._control.start = AsyncMock(side_effect=RuntimeError("control boom"))
         service._control.stop = AsyncMock()
         service._runtime_manager.stop_all = AsyncMock()
@@ -86,10 +108,13 @@ class TestGatewayServiceRun(unittest.IsolatedAsyncioTestCase):
         good_run_once_finished = asyncio.Event()
         good_shutdown_called_before_finished = False
 
-        async def slow_good_run_once(**kwargs):
+        async def slow_good_connect(**kwargs):
             nonlocal good_shutdown_called_before_finished
             # Simulate a real RC/Mattermost connect() taking longer than a
             # bad connector's near-instant DNS/connection-refused failure.
+            # The slowness belongs to the CONNECT phase specifically: that is
+            # where a login plus handshake actually is slow, and it is the
+            # phase whose failure the identity barrier now sits behind.
             await asyncio.sleep(0.05)
             good_run_once_finished.set()
             return []
@@ -100,16 +125,26 @@ class TestGatewayServiceRun(unittest.IsolatedAsyncioTestCase):
                 good_shutdown_called_before_finished = True
 
         good_sm = MagicMock()
-        good_sm.run_once = AsyncMock(side_effect=slow_good_run_once)
+        good_sm.connect_only = AsyncMock(side_effect=slow_good_connect)
+        good_sm.sync_only = AsyncMock(return_value=[])
         good_sm.shutdown = AsyncMock(side_effect=good_shutdown)
 
         bad_sm = MagicMock()
-        bad_sm.run_once = AsyncMock(side_effect=ConnectionError("bad url: test"))
+        bad_sm.connect_only = AsyncMock(side_effect=ConnectionError("bad url: test"))
+        bad_sm.sync_only = AsyncMock(return_value=[])
         bad_sm.shutdown = AsyncMock()
 
         service._entries = [
-            SimpleNamespace(name="good-existing-connector", session_manager=good_sm),
-            SimpleNamespace(name="bad-new-connector", session_manager=bad_sm),
+            SimpleNamespace(
+                name="good-existing-connector",
+                session_manager=good_sm,
+                connector=_accountless(),
+            ),
+            SimpleNamespace(
+                name="bad-new-connector",
+                session_manager=bad_sm,
+                connector=_accountless(),
+            ),
         ]
 
         with self.assertRaises(ConnectionError):
@@ -127,6 +162,112 @@ class TestGatewayServiceRun(unittest.IsolatedAsyncioTestCase):
             "state — this is the orphaned-task race that wipes out session "
             "IDs for a connector that was never actually part of the failure.",
         )
+
+
+class TestIdentityBarrier(unittest.IsolatedAsyncioTestCase):
+    """The barrier's value is its *position*, so these assert ordering, not just refusal.
+
+    A check that rejects duplicates after one connector has subscribed prevents nothing:
+    that connector is already receiving and answering. `find_identity_conflicts` is unit
+    tested elsewhere; what cannot be tested there is that startup runs it between the
+    two phases, because a SessionManager owns one connector and can never see the pair.
+    """
+
+    def _service_with(self, *identities, dms=None):
+        service = _make_service()
+        service._runtime_manager.start_all = AsyncMock(return_value=[])
+        service._runtime_manager.has_active_brokers = False
+        service._runtime_manager.unavailable_agents = set()
+        service._runtime_manager.stop_all = AsyncMock()
+        service._control.start = AsyncMock()
+        service._control.stop = AsyncMock()
+        service._dm_claims = dict(dms or {})
+
+        entries = []
+        for i, identity in enumerate(identities):
+            sm = MagicMock()
+            sm.connect_only = AsyncMock()
+            sm.sync_only = AsyncMock(return_value=[])
+            sm.shutdown = AsyncMock()
+            connector = MagicMock()
+            connector.bot_identity = MagicMock(return_value=identity)
+            entries.append(
+                SimpleNamespace(name=f"c{i}", session_manager=sm, connector=connector))
+        service._entries = entries
+        return service
+
+    async def test_a_shared_account_is_refused_before_anything_subscribes(self):
+        same = BotIdentity("rocketchat", "https://chat.example.com", "user-abc")
+        service = self._service_with(same, same)
+
+        with self.assertRaises(DuplicateBotIdentityError):
+            await service.run(startup_fd=-1)
+
+        for entry in service._entries:
+            entry.session_manager.connect_only.assert_awaited_once()
+            entry.session_manager.sync_only.assert_not_awaited()
+
+    async def test_distinct_accounts_reach_the_second_phase(self):
+        """Otherwise the test above would pass against a barrier that refuses always."""
+        service = self._service_with(
+            BotIdentity("rocketchat", "https://chat.example.com", "user-a"),
+            BotIdentity("rocketchat", "https://chat.example.com", "user-b"),
+        )
+        service._control.start = AsyncMock(side_effect=RuntimeError("stop here"))
+
+        with self.assertRaisesRegex(RuntimeError, "stop here"):
+            await service.run(startup_fd=-1)
+
+        for entry in service._entries:
+            entry.session_manager.sync_only.assert_awaited_once()
+
+    async def test_the_url_spelling_does_not_decide_it(self):
+        """Two operators writing one server differently is a duplicate, not two."""
+        service = self._service_with(
+            BotIdentity("rocketchat", canonical_origin("https://chat.example.com/"), "user-abc"),
+            BotIdentity("rocketchat", canonical_origin("https://chat.example.com:443"), "user-abc"),
+        )
+
+        with self.assertRaises(DuplicateBotIdentityError):
+            await service.run(startup_fd=-1)
+
+    async def test_a_connector_that_cannot_identify_itself_stops_startup(self):
+        """Fail-closed: unanswerable cannot be compared, so it does not start."""
+        service = self._service_with(BotIdentity("rocketchat", "https://s", "u1"))
+        service._entries[0].connector.bot_identity = MagicMock(
+            side_effect=ConnectorIdentityError("whoami failed"))
+
+        with self.assertRaises(ConnectorIdentityError):
+            await service.run(startup_fd=-1)
+
+        service._entries[0].session_manager.sync_only.assert_not_awaited()
+
+    async def test_two_overlapping_dm_claims_across_teams_are_refused(self):
+        """The exception's condition, wired: the claims come from the service's own map,
+        derived from both watcher shapes at construction."""
+        service = self._service_with(
+            BotIdentity("mattermost", "https://mm.example.com", "user-abc", scope="team-1"),
+            BotIdentity("mattermost", "https://mm.example.com", "user-abc", scope="team-2"),
+            dms={"c0": DmClaim(direct=True), "c1": DmClaim(direct=True)},
+        )
+
+        with self.assertRaises(DuplicateBotIdentityError) as cm:
+            await service.run(startup_fd=-1)
+        self.assertIn("direct message", str(cm.exception).lower())
+
+    async def test_different_teams_without_dm_overlap_start_normally(self):
+        service = self._service_with(
+            BotIdentity("mattermost", "https://mm.example.com", "user-abc", scope="team-1"),
+            BotIdentity("mattermost", "https://mm.example.com", "user-abc", scope="team-2"),
+            dms={"c0": DmClaim(direct=True)},
+        )
+        service._control.start = AsyncMock(side_effect=RuntimeError("stop here"))
+
+        with self.assertRaisesRegex(RuntimeError, "stop here"):
+            await service.run(startup_fd=-1)
+
+        for entry in service._entries:
+            entry.session_manager.sync_only.assert_awaited_once()
 
 
 class TestGatewayServiceShutdown(unittest.IsolatedAsyncioTestCase):
