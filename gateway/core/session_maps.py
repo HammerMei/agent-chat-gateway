@@ -35,11 +35,11 @@ class SessionMaps:
     """
 
     room: dict[str, str] = field(default_factory=dict)
-    # (backend_identity, session_id) → room_id. The reverse index that makes "one
-    # session, one room" checkable: `room` above is single-valued, so it cannot detect a
-    # second binding, only absorb it. Private because it is an invariant, not routing
-    # state — nothing outside should read or write it.
-    _bound: dict[tuple[str, str], str] = field(default_factory=dict)
+    # session_id → (room_id, connector). The reverse index that makes "one session, one
+    # room" checkable: `room` above is single-valued, so it cannot detect a second
+    # binding, only absorb it. Private because it is an invariant, not routing state —
+    # nothing outside should read or write it.
+    _bound: "dict[str, tuple[str, Connector]]" = field(default_factory=dict)
     role: dict[str, str] = field(default_factory=dict)
     permission_thread: dict[str, str | None] = field(default_factory=dict)
     connector: "dict[str, Connector]" = field(default_factory=dict)
@@ -84,47 +84,59 @@ class SessionMaps:
         session_id: str,
         room_id: str,
         connector: "Connector",
-        backend_identity: str = "",
     ) -> None:
         """Register the connector-routing context for a session. One session, one room.
 
-        **A reused session is a cross-room data leak** (§4.1). A session carries the
-        room in three places — the durable identity header re-supplied every turn, the
+        **A reused session is a cross-room data leak** (§4.1). A session carries the room
+        in three places — the durable identity header re-supplied every turn, the
         transcript with that room's history and every prior `[#room | from: …]` prefix,
         and this map, which decides where a permission prompt for its tool calls
-        appears. Binding a second room to it does not split the session; it points all
-        of that at the newer room.
+        appears. Binding a second room to it does not split the session; it points all of
+        that at the newer room.
 
         The write used to be unconditional, so the second binding overwrote the first
-        with no error and no log — the failure mode was a healthy watcher quietly losing
-        its routing. It now fails closed, and *before* touching anything, so a refused
-        binding leaves the incumbent's routing exactly as it was. That matters more than
-        it sounds: the rollback path in `_start_watcher` calls `remove_session` keyed by
-        session id alone, so a late refusal would have had the loser tearing down the
-        winner's routing.
+        with no error and no log — a healthy watcher quietly losing its routing. It now
+        fails closed, and *before* touching anything, so a refused binding leaves the
+        incumbent exactly as it was. That matters more than it sounds: the rollback in
+        `_start_watcher` calls `remove_session` keyed by session id alone, so a late
+        refusal would have had the loser tearing down the winner's routing.
 
-        Keyed by `(backend_identity, session_id)` rather than the id alone: ids are
-        assigned by a backend and only unique within its own store, so the same string
-        from two different backends is two sessions. `backend_identity` defaults to `""`
-        for callers that have none to offer — those still get uniqueness among
-        themselves, which is the honest guarantee when the key material is missing.
+        **Keyed by `session_id` alone, and the connector is part of what must match.**
+        An earlier version keyed the reservation on `(backend_identity, session_id)`, on
+        the reasoning that ids are only unique within the store that issued them — but
+        every map here, and every consumer of them, is keyed by the bare `session_id`.
+        Permitting two bindings the maps cannot represent just moved the silent overwrite
+        one level down. Two backends emitting one id string is vanishingly unlikely and
+        recoverable (clear that record's session_id); a corrupted routing table is
+        neither.
 
-        Rebinding the *same* room is allowed: a watcher restarting re-binds what it
-        already held, and refusing that would make a reset unrecoverable.
+        The connector is compared as well as the room: two connectors can resolve
+        different watched rooms to the same platform room id, and the second bind would
+        otherwise pass the room check while overwriting `connector[session_id]` — sending
+        that session's permission prompts to the wrong server.
+
+        Rebinding the same room on the same connector is allowed: a watcher restarting
+        re-binds what it already held, and refusing that would make a reset unrecoverable.
         """
-        key = (backend_identity, session_id)
-        bound_to = self._bound.get(key)
-        if bound_to is not None and bound_to != room_id:
-            raise SessionAlreadyBoundError(
-                f"Session {session_id[:8]} is already bound to room '{bound_to}' and "
-                f"cannot also serve room '{room_id}'. A session carries its room in its "
-                f"transcript, its identity header and its permission routing, so "
-                f"reusing one across rooms leaks each room's conversation into the "
-                f"other. This normally means a hand-edited or corrupted state file: "
-                f"give the second watcher its own session by clearing that record's "
-                f"session_id."
-            )
-        self._bound[key] = room_id
+        bound = self._bound.get(session_id)
+        if bound is not None:
+            bound_room, bound_connector = bound
+            if bound_room != room_id or bound_connector is not connector:
+                where = (
+                    f"room '{bound_room}'"
+                    if bound_room != room_id
+                    else f"room '{bound_room}' on another connector"
+                )
+                raise SessionAlreadyBoundError(
+                    f"Session {session_id[:8]} is already bound to {where} and cannot "
+                    f"also serve room '{room_id}'. A session carries its room in its "
+                    f"transcript, its identity header and its permission routing, so "
+                    f"reusing one across rooms leaks each room's conversation into the "
+                    f"other. This normally means a hand-edited or corrupted state file: "
+                    f"give the second watcher its own session by clearing that record's "
+                    f"session_id."
+                )
+        self._bound[session_id] = (room_id, connector)
         self.room[session_id] = room_id
         self.connector[session_id] = connector
 
@@ -142,8 +154,7 @@ class SessionMaps:
         Clears the uniqueness reservation too, or a watcher could never rebind after a
         reset — the check would refuse it against its own stale entry.
         """
-        for key in [k for k in self._bound if k[1] == session_id]:
-            del self._bound[key]
+        self._bound.pop(session_id, None)
         self.room.pop(session_id, None)
         self.role.pop(session_id, None)
         self.permission_thread.pop(session_id, None)

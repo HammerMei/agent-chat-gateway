@@ -36,10 +36,10 @@ class TestOneSessionOneRoom(unittest.TestCase):
 
     def test_a_second_room_cannot_take_a_bound_session(self):
         maps = self._maps()
-        maps.bind_session("ses-1", "room-a", MagicMock(), "claude:/w")
+        maps.bind_session("ses-1", "room-a", MagicMock())
 
         with self.assertRaises(SessionAlreadyBoundError) as cm:
-            maps.bind_session("ses-1", "room-b", MagicMock(), "claude:/w")
+            maps.bind_session("ses-1", "room-b", MagicMock())
 
         self.assertIn("room-a", str(cm.exception))
         self.assertIn("room-b", str(cm.exception))
@@ -55,35 +55,51 @@ class TestOneSessionOneRoom(unittest.TestCase):
         """
         maps = self._maps()
         first_connector = MagicMock()
-        maps.bind_session("ses-1", "room-a", first_connector, "claude:/w")
+        maps.bind_session("ses-1", "room-a", first_connector)
 
         with self.assertRaises(SessionAlreadyBoundError):
-            maps.bind_session("ses-1", "room-b", MagicMock(), "claude:/w")
+            maps.bind_session("ses-1", "room-b", MagicMock())
 
         self.assertEqual(maps.room["ses-1"], "room-a")
         self.assertIs(maps.connector["ses-1"], first_connector)
 
-    def test_rebinding_the_same_room_is_allowed(self):
+    def test_rebinding_the_same_room_on_the_same_connector_is_allowed(self):
         """A watcher restarting re-binds what it already held; refusing that would make
         a reset unrecoverable without a daemon restart."""
         maps = self._maps()
-        maps.bind_session("ses-1", "room-a", MagicMock(), "claude:/w")
-        maps.bind_session("ses-1", "room-a", MagicMock(), "claude:/w")
+        connector = MagicMock()
+        maps.bind_session("ses-1", "room-a", connector)
+        maps.bind_session("ses-1", "room-a", connector)
 
-    def test_the_same_id_from_a_different_backend_is_a_different_session(self):
-        """Ids are unique within the store that issued them, not globally — the same
-        reason `backend_identity` exists at all."""
+    def test_the_same_id_is_refused_whichever_backend_issued_it(self):
+        """An earlier version keyed the reservation on `(backend_identity, session_id)`,
+        so two stores emitting one id string could both bind. Every routing map here is
+        keyed by the bare id, so that just moved the silent overwrite one level down —
+        permitting a state `SessionMaps` cannot represent."""
         maps = self._maps()
-        maps.bind_session("ses-1", "room-a", MagicMock(), "claude:/w")
-        maps.bind_session("ses-1", "room-b", MagicMock(), "opencode:/w")
+        maps.bind_session("ses-1", "room-a", MagicMock())
+        with self.assertRaises(SessionAlreadyBoundError):
+            maps.bind_session("ses-1", "room-b", MagicMock())
+
+    def test_the_same_room_on_another_connector_is_refused(self):
+        """Two connectors can resolve different watched rooms to one platform room id.
+        Comparing the room alone would pass, while the bind overwrote
+        `connector[session_id]` — routing that session's permission prompts to the wrong
+        server."""
+        maps = self._maps()
+        first = MagicMock()
+        maps.bind_session("ses-1", "room-a", first)
+        with self.assertRaises(SessionAlreadyBoundError):
+            maps.bind_session("ses-1", "room-a", MagicMock())
+        self.assertIs(maps.connector["ses-1"], first)
 
     def test_removal_releases_the_reservation(self):
         """Otherwise a watcher could never rebind after a reset: the check would refuse
         it against its own stale entry."""
         maps = self._maps()
-        maps.bind_session("ses-1", "room-a", MagicMock(), "claude:/w")
+        maps.bind_session("ses-1", "room-a", MagicMock())
         maps.remove_session("ses-1")
-        maps.bind_session("ses-1", "room-b", MagicMock(), "claude:/w")
+        maps.bind_session("ses-1", "room-b", MagicMock())
         self.assertEqual(maps.room["ses-1"], "room-b")
 
 
@@ -155,12 +171,15 @@ class TestLoadTimeSessionUniqueness(unittest.TestCase):
         ])
         check_session_uniqueness()
 
-    def test_different_backends_do_not_collide(self):
+    def test_different_backends_still_collide(self):
+        """The routing maps are keyed by the bare session id, so which backend issued it
+        does not change that two records claiming it cannot both be routed."""
         self._write("rc", [
             self._record("w1", "room-a", "ses-1", identity="claude:/w"),
             self._record("w2", "room-b", "ses-1", identity="opencode:/w"),
         ])
-        check_session_uniqueness()
+        with self.assertRaises(DuplicateSessionError):
+            check_session_uniqueness()
 
     def test_a_connector_name_containing_dots_still_parses(self):
         """The file name is sliced, not split, and this is the case that tells them
@@ -253,3 +272,65 @@ class TestConfigRefusesARoomTwice(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestARefusedBindingLeavesNothingBehind(unittest.IsolatedAsyncioTestCase):
+    """A refusal must not poison the state file.
+
+    `bind_session` raises after `self._states[wc.name]` has already been written. Left
+    alone, `sync_watchers` persists that record and the freshly created backend session
+    is never deleted — and then the *load-time* uniqueness check refuses to boot on the
+    record the runtime conflict produced. A transient collision would become a daemon
+    that will not start until someone edits JSON.
+    """
+
+    async def _start_with_refusing_bind(self):
+        from unittest.mock import AsyncMock
+
+        from gateway.core.config import AgentConfig, CoreConfig, WatcherConfig
+        from gateway.core.watcher_lifecycle import WatcherLifecycle
+
+        lc = WatcherLifecycle.__new__(WatcherLifecycle)
+        lc._states = {}
+        lc._processors = {}
+        lc._watcher_locks = {}
+        lc._permission_registry = MagicMock()
+        lc._dispatcher = MagicMock(holder=MagicMock(return_value=None))
+
+        maps = MagicMock()
+        maps.bind_session = MagicMock(side_effect=SessionAlreadyBoundError("taken"))
+        maps.remove_session = MagicMock()
+        lc._maps = maps
+
+        room = MagicMock(id="room_1", type="channel", name="general")
+        connector = MagicMock()
+        connector.resolve_room = AsyncMock(return_value=room)
+        lc._connector = connector
+
+        agent = MagicMock()
+        agent.create_session = AsyncMock(return_value="fresh-session")
+        agent.delete_session = AsyncMock(return_value=True)
+        lc._agents = {"a1": agent}
+        lc._default_agent = "a1"
+        lc._config = CoreConfig(
+            agents={"a1": AgentConfig(name="a1", working_directory="/tmp")},
+            default_agent="a1",
+        )
+        lc._injector = MagicMock()
+        wc = WatcherConfig(name="w1", connector="rc", room="general", agent="a1")
+
+        with self.assertRaises(SessionAlreadyBoundError):
+            await lc._start_watcher(wc, state=None)
+        return lc, agent
+
+    async def test_the_watcher_state_is_not_left_behind(self):
+        lc, _ = await self._start_with_refusing_bind()
+        self.assertNotIn(
+            "w1", lc._states,
+            "a refused watcher must not leave a record for sync_watchers to persist",
+        )
+
+    async def test_the_orphaned_session_is_cleaned_up(self):
+        """It was created moments earlier and nothing will ever use it."""
+        _, agent = await self._start_with_refusing_bind()
+        agent.delete_session.assert_awaited_once_with("fresh-session")

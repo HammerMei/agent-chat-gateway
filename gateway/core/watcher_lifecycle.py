@@ -421,7 +421,19 @@ class WatcherLifecycle:
             backend_identity=identity,
         )
         self._states[wc.name] = ws
-        self._maps.bind_session(session_id, room.id, self._connector, identity)
+        try:
+            self._maps.bind_session(session_id, room.id, self._connector)
+        except Exception:
+            # A refused binding must not leave this watcher looking startable. Without
+            # this, the record just written stays in `_states`, `sync_watchers` persists
+            # it, and the next boot's uniqueness preflight refuses to start at all — a
+            # transient conflict turned into a permanently unbootable state file. The
+            # freshly created backend session goes too; nothing will ever use it.
+            self._states.pop(wc.name, None)
+            await self._cleanup_startup_session_best_effort(
+                agent, session_id, created_new_session, wc.name
+            )
+            raise
 
         # 3.5 Fetch channel history for context handoff (new sessions only).
         # Only fires when created_new_session=True (reset, upgrade, first join)

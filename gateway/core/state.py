@@ -285,8 +285,10 @@ def check_session_uniqueness() -> None:
     instance shared by all of them (`GatewayService` builds it once), so two connectors'
     records can collide with each other.
 
-    Keyed by `(backend_identity, session_id)`, and records with **no** identity are
-    skipped rather than compared. That is not leniency: a record without one cannot have
+    Keyed by `session_id` alone, matching `SessionMaps`: every routing map there, and
+    every consumer of them, uses the bare id, so two records claiming one id collide
+    whichever backends issued them. Records with **no** identity are skipped rather than
+    compared. That is not leniency: a record without one cannot have
     its session reused at all — `_provision_session` treats an unverifiable identity as
     a mismatch and starts fresh — so two such records never end up sharing a live
     session, and refusing them would reject a state that heals itself on the next start.
@@ -294,15 +296,14 @@ def check_session_uniqueness() -> None:
     Two records on the *same* room are not a conflict here; that is a duplicate watcher,
     which the dispatcher refuses when the second one claims the room.
     """
-    seen: dict[tuple[str, str], tuple[str, str]] = {}
+    seen: dict[str, tuple[str, str]] = {}
     for path in state_files():
         for record in load_state(connector_name_of(path)):
             if not record.session_id or not record.backend_identity:
                 continue
-            key = (record.backend_identity, record.session_id)
-            previous = seen.get(key)
+            previous = seen.get(record.session_id)
             if previous is None:
-                seen[key] = (record.watcher_name, record.room_id)
+                seen[record.session_id] = (record.watcher_name, record.room_id)
                 continue
             other_name, other_room = previous
             if other_room == record.room_id:
