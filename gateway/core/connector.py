@@ -121,10 +121,6 @@ class IncomingMessage:
 # so that a dropped message is not silently marked as processed.
 MessageHandler = Callable[[IncomingMessage], Awaitable[bool]]
 
-# Capacity check: quick preflight to determine whether the core pipeline has
-# room to accept a message for a given room_id.  Connectors call this BEFORE
-# expensive work (normalize, attachment download) to short-circuit when the
-# queue is already full.  Returns True if at least one processor has capacity.
 class RoomCapacity(Enum):
     """Why a room can or cannot take a message right now.
 
@@ -138,6 +134,8 @@ class RoomCapacity(Enum):
     UNROUTED = "unrouted"     # no processor serves this room
 
 
+# Capacity check: a quick preflight, called BEFORE expensive work (normalize,
+# attachment download) to short-circuit when a message cannot be accepted.
 # (room_id) -> RoomCapacity. Three-valued rather than a bool because a room with no
 # processor and a room whose queue is full call for different behaviour: the first is a
 # routing miss, the second is backpressure, and reporting the first as the second made

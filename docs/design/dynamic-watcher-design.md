@@ -1345,10 +1345,11 @@ would surface in another. **A reused session is a cross-room data leak.**
 
 **Two enforcement points are needed, in opposite directions.**
 
-*One room, one processor.* Registration appends to a per-room list today and
-dispatch fans out to every entry, so a duplicate degrades silently into two
-agents answering every message. Registration becomes reject-or-replace, with a
-test asserting it.
+*One room, one processor.* Registration appended to a per-room list and dispatch
+fanned out to every entry, so a duplicate degraded silently into two agents
+answering every message. The index is now a single slot per room: a watcher
+re-registering for a room it holds replaces its own processor, and a different
+watcher raises. Implemented in `impl/uniqueness`.
 
 *One session, one room.* That is the reverse direction, and reject-or-replace
 does not cover it: it prevents two processors for one key, not one session bound
@@ -1364,9 +1365,17 @@ way, but the consequence is the cross-room leak this invariant exists to
 prevent, so it needs a positive check rather than an argument that it cannot
 happen:
 
-- Maintain a reverse index keyed by `(agent identity, session_id)` →
-  `WatcherKey`, and **fail closed** if a second key attempts to bind an
-  already-bound session.
+- Maintain a reverse index and **fail closed** if a second room attempts to bind
+  an already-bound session.
+
+  **Keyed by `session_id` alone, not by `(agent identity, session_id)`** as this
+  section originally specified. The composite key is the honest identity of a
+  session — ids are unique only within the store that issued them — but every
+  routing map in `SessionMaps`, and every consumer of them, is keyed by the bare
+  id. Permitting two bindings that those maps cannot represent moves the silent
+  overwrite one level down instead of stopping it. The connector is compared
+  alongside the room, because two connectors can resolve different watched rooms
+  to one platform room id.
 - Validate it across all persisted records at load, so a bad state file is
   caught before anything starts rather than on the unlucky second start.
 - Check it atomically during provisioning, before either processor becomes

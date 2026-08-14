@@ -844,8 +844,10 @@ class OpenCodeBackend(AgentBackend):
         await asyncio.to_thread(acg_dir.mkdir, parents=True, exist_ok=True)
         # Named by the caller-supplied ``path_key``, which is opaque here: it is scoped
         # to the watcher in a room (watcher_prompt_key), NOT to the room alone, because
-        # the key is per watcher-in-a-room; a room-only key would once have
-        # make the second overwrite the first. Do not substitute room_path_key — that one
+        # Scoped to the watcher in a room, not to the room alone. Two watchers on one
+        # connector+room are refused now (§4.1), so the collision it was written for
+        # cannot occur; the key stays because it names files on disk and re-keying
+        # would orphan every existing one.
         # is for the attachment workspace. resolve_under supplies the containment check
         # that comes with treating the key as external data (§2.3).
         path = resolve_under(acg_dir, f"{path_key}.md")

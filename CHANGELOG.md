@@ -19,7 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     pair by name, and a second claim at runtime raises. **Two watchers on one
     connector and one room no longer start.** Two agents in one room remains
     supported the way it is meant to be done — one bot account each, so one connector
-    each.
+    each. If an existing config carries such a pair, note the recovery cost: the daemon
+    refuses to start until one entry is removed, and removing it also prunes that
+    watcher's persisted record — its session id, watermark and paused flag.
   - `bind_session` overwrote an existing session→room binding without a word, which
     points a session's identity header, transcript and permission routing at a second
     room. It now fails closed, and startup refuses outright when a state file already

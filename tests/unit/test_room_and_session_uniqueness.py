@@ -158,6 +158,20 @@ class TestLoadTimeSessionUniqueness(unittest.TestCase):
         ])
         check_session_uniqueness()
 
+    def test_the_same_room_on_two_connectors_is_a_conflict(self):
+        """The twin of `bind_session`'s connector comparison, which this check was
+        missing: the runtime refuses the second binding because the connector differs,
+        so treating it as a harmless same-room duplicate here left the outcome to start
+        order — one watcher running and the other reported failed, differently per boot.
+        """
+        self._write("rc", [self._record("w1", "room-a", "ses-1")])
+        self._write("rc2", [self._record("w2", "room-a", "ses-1")])
+        with self.assertRaises(DuplicateSessionError) as cm:
+            check_session_uniqueness()
+        msg = str(cm.exception)
+        self.assertIn("rc", msg)
+        self.assertIn("rc2", msg)
+
     def test_records_without_an_identity_are_skipped(self):
         """Not leniency — such a record cannot reuse its session at all.
 
@@ -270,9 +284,6 @@ class TestConfigRefusesARoomTwice(unittest.TestCase):
         )
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TestARefusedBindingLeavesNothingBehind(unittest.IsolatedAsyncioTestCase):
     """A refusal must not poison the state file.
@@ -334,3 +345,43 @@ class TestARefusedBindingLeavesNothingBehind(unittest.IsolatedAsyncioTestCase):
         """It was created moments earlier and nothing will ever use it."""
         _, agent = await self._start_with_refusing_bind()
         agent.delete_session.assert_awaited_once_with("fresh-session")
+
+
+class TestSeenIdsStayBounded(unittest.TestCase):
+    """An unrouted room must not grow the dedup window without limit.
+
+    The record-and-evict pair existed as two copies; the unrouted branch added a third
+    that kept the appends and dropped the eviction, so a busy room with no watcher grew
+    both the deque and the set forever. It is one method now, and this pins the bound
+    rather than the call sites — the failure was a missing line, not a missing call.
+    """
+
+    def test_remember_evicts_past_the_bound(self):
+        from gateway.connectors.rocketchat.connector import (
+            _SEEN_IDS_MAXLEN,
+            _RoomSubscription,
+        )
+
+        sub = _RoomSubscription(room=MagicMock())
+        for i in range(_SEEN_IDS_MAXLEN + 50):
+            sub.remember(f"id-{i}")
+
+        self.assertEqual(len(sub.seen_ids), _SEEN_IDS_MAXLEN)
+        self.assertEqual(
+            len(sub.seen_ids_set), _SEEN_IDS_MAXLEN,
+            "the set must shrink with the deque, or membership grows unbounded",
+        )
+        self.assertNotIn("id-0", sub.seen_ids_set, "the oldest id should be evicted")
+        self.assertIn(f"id-{_SEEN_IDS_MAXLEN + 49}", sub.seen_ids_set)
+
+    def test_an_empty_id_is_ignored(self):
+        """Call sites used to guard with `if msg_id:`; folding that in keeps them from
+        each having to remember it."""
+        from gateway.connectors.rocketchat.connector import _RoomSubscription
+
+        sub = _RoomSubscription(room=MagicMock())
+        sub.remember("")
+        self.assertEqual(len(sub.seen_ids), 0)
+
+if __name__ == "__main__":
+    unittest.main()

@@ -390,7 +390,7 @@ class WatcherLifecycle:
         # this run validated — not a second derivation that could drift from it.
         identity = backend_identity(agent_cfg.type, agent_cfg.working_directory)
         session_id, created_new_session = await self._provision_session(
-            wc, state, agent, agent_cfg, identity
+            wc, state, agent, agent_cfg, identity, room.id
         )
         if created_new_session and state and state.session_id:
             # The record survived but its session did not, so the bookkeeping keyed to
@@ -648,6 +648,7 @@ class WatcherLifecycle:
         agent: AgentBackend,
         agent_cfg,
         identity: str,
+        room_id: str,
     ) -> tuple[str, bool]:
         """Determine the session ID: reuse the persisted one, or create a new one.
 
@@ -658,6 +659,16 @@ class WatcherLifecycle:
 
         There is no config-pinned option: `watchers[].session_id` is removed, so
         every session id the gateway uses is one it assigned itself.
+
+        **The room is compared as well as the identity**, and this is the reachable half.
+        Editing `room:` on an existing watcher is ordinary reconfiguration, and the
+        record survives it — so without this the old session is rebound to the new room,
+        carrying that room's transcript and identity header into it, and the watermark
+        restore then writes the *old* room's cursor onto the new room, silently
+        discarding every message in it older than that timestamp. The state-file
+        corruption both error messages tell operators to look for is far rarer than this.
+        An empty `room_id` is treated as "no claim to compare", not as a mismatch: it is
+        what a record written before this field carried anything looks like.
 
         A session id is only meaningful inside the backend store that issued it, so a
         record whose stored identity does not equal the current one is not reused —
@@ -674,7 +685,9 @@ class WatcherLifecycle:
         fresh session takes over; the old store keeps whatever it had.
         """
         if state and state.session_id:
-            if state.backend_identity == identity:
+            if state.backend_identity == identity and (
+                not state.room_id or state.room_id == room_id
+            ):
                 return state.session_id, False
             # The full id, deviating from the [:8] used for routine session logging.
             # This record is about to be overwritten with the new session, so this line
@@ -688,8 +701,11 @@ class WatcherLifecycle:
                 wc.name,
                 state.session_id,
                 (
-                    f"it was created against backend identity "
-                    f"'{state.backend_identity}', which is now '{identity}'"
+                    f"it belongs to room '{state.room_id}' and this watcher now "
+                    f"watches '{room_id}'"
+                    if state.backend_identity == identity
+                    else f"it was created against backend identity "
+                         f"'{state.backend_identity}', which is now '{identity}'"
                     if state.backend_identity
                     else f"it has no recorded backend identity to check against "
                          f"'{identity}'"

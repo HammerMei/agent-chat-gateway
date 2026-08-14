@@ -188,6 +188,36 @@ class TestSessionReuseRequiresMatchingIdentity(unittest.IsolatedAsyncioTestCase)
 
         agent.create_session.assert_called_once()
 
+    async def test_a_changed_room_forces_a_fresh_session(self):
+        """The reachable half of "one session, one room" — an ordinary config edit.
+
+        Changing `room:` on an existing watcher keeps the record, so reusing the session
+        on an identity match alone rebinds it to the new room: that room then inherits
+        the old room's transcript and identity header, and the watermark restore writes
+        the *old* room's cursor onto it, silently discarding every message in the new
+        room older than that timestamp. No error, no log, on a supported operation —
+        while both refusal messages point the operator at file corruption instead.
+        """
+        lifecycle, _, agent, wc = self._make_lifecycle()
+        state = self._stored("old-session-id", backend_identity("claude", "/srv/work"))
+        state.room_id = "some-other-room"
+
+        await self._start(lifecycle, wc, state)
+
+        agent.create_session.assert_called_once()
+        self.assertEqual(lifecycle._states["w1"].session_id, "fresh-session-id")
+
+    async def test_a_record_with_no_room_is_not_treated_as_a_mismatch(self):
+        """What a record written before the field carried anything looks like: no claim
+        to compare, so it must not force everyone onto a new session."""
+        lifecycle, _, agent, wc = self._make_lifecycle()
+        state = self._stored("old-session-id", backend_identity("claude", "/srv/work"))
+        state.room_id = ""
+
+        await self._start(lifecycle, wc, state)
+
+        agent.create_session.assert_not_called()
+
     async def test_an_empty_stored_identity_forces_a_fresh_session(self):
         """Unverifiable is not verified — and this case outlives the migration window.
 

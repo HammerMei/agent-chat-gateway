@@ -293,24 +293,31 @@ def check_session_uniqueness() -> None:
     a mismatch and starts fresh — so two such records never end up sharing a live
     session, and refusing them would reject a state that heals itself on the next start.
 
-    Two records on the *same* room are not a conflict here; that is a duplicate watcher,
-    which the dispatcher refuses when the second one claims the room.
+    Two records on the same room **of the same connector** are not a conflict here; that
+    is a duplicate watcher, which the dispatcher refuses when the second claims the room.
+    The connector is part of that comparison because `bind_session` compares it too: two
+    records with one session id and one room id but different connectors bind different
+    routing, and treating them as harmless here left the outcome to start order — one
+    watcher running, the other reported as failed, differently on each boot.
     """
-    seen: dict[str, tuple[str, str]] = {}
+    seen: dict[str, tuple[str, str, str]] = {}
     for path in state_files():
-        for record in load_state(connector_name_of(path)):
+        connector_name = connector_name_of(path)
+        for record in load_state(connector_name):
             if not record.session_id or not record.backend_identity:
                 continue
             previous = seen.get(record.session_id)
             if previous is None:
-                seen[record.session_id] = (record.watcher_name, record.room_id)
+                seen[record.session_id] = (
+                    record.watcher_name, record.room_id, connector_name)
                 continue
-            other_name, other_room = previous
-            if other_room == record.room_id:
+            other_name, other_room, other_connector = previous
+            if other_room == record.room_id and other_connector == connector_name:
                 continue
             raise DuplicateSessionError(
-                f"Watchers '{other_name}' (room '{other_room}') and "
-                f"'{record.watcher_name}' (room '{record.room_id}') both claim backend "
+                f"Watchers '{other_name}' (room '{other_room}' on connector "
+                f"'{other_connector}') and '{record.watcher_name}' (room "
+                f"'{record.room_id}' on connector '{connector_name}') both claim backend "
                 f"session {record.session_id[:8]}. A session carries its room in its "
                 f"transcript, its identity header and its permission routing, so one "
                 f"session serving two rooms leaks each room's conversation into the "

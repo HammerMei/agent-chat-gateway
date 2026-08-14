@@ -24,7 +24,6 @@ from __future__ import annotations
 import collections
 import logging
 import re
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -36,6 +35,7 @@ from ...core.bot_identity import (
     canonical_origin,
 )
 from ...core.connector import (
+    CapacityCheck,
     Connector,
     IncomingMessage,
     MessageHandler,
@@ -127,7 +127,7 @@ class MattermostConnector(Connector):
             config.server_url, token_provider=lambda: self._rest._token
         )
         self._handler: MessageHandler | None = None
-        self._capacity_check: Callable[[str], bool] | None = None
+        self._capacity_check: CapacityCheck | None = None
         self._channels: dict[str, _ChannelState] = {}  # channel_id -> state
         self._attachments_cache_base = (
             Path(config.attachments.cache_dir_global).expanduser() / config.name
