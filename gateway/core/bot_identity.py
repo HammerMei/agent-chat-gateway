@@ -65,7 +65,12 @@ def canonical_origin(url: str) -> str:
       `https://[::1:8443]` both render as `https://::1:8443`, one address-and-port and
       one address, indistinguishable. Compression matters for the opposite reason:
       `[2001:0db8:0:0:0:0:0:1]` and `[2001:db8::1]` are one address, and comparing the
-      text would miss a duplicate rather than invent one.
+      text would miss a duplicate rather than invent one. Rare, and kept anyway because
+      it is six self-contained lines: a literal in `server.url` means a deployment with
+      no usable DNS, which is unusual at the scale where IPv6 is forced but not
+      impossible — and both failure directions are silent.
+    * **A Unicode host is encoded to its IDNA form.** `bücher.example` and
+      `xn--bcher-kva.example` are one name; comparing the text misses the duplicate.
     * **A terminal DNS root dot is dropped.** `chat.example.com.` and `chat.example.com`
       resolve to one server, so keeping the dot would split one account into two keys —
       a missed duplicate, which here means two agents in the same room.
@@ -94,6 +99,14 @@ def canonical_origin(url: str) -> str:
 
 def _format_origin(scheme: str, host: str, parsed) -> str:
     """The comparable form, once the URL has parsed."""
+    if not host.isascii():
+        # `bücher.example` and `xn--bcher-kva.example` are one DNS name. Guarded on
+        # non-ASCII so the ordinary path never touches Python's quirky idna codec,
+        # which rejects empty and over-long labels that resolve perfectly well.
+        try:
+            host = host.encode("idna").decode("ascii")
+        except UnicodeError:
+            pass  # not encodable: compare it as written
     try:
         # `2001:0db8:0:0:0:0:0:1` and `2001:db8::1` are one address written two ways,
         # and a textual comparison calls them two servers — a missed duplicate.

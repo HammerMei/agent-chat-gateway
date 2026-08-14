@@ -52,6 +52,21 @@ class TestCanonicalOrigin(unittest.TestCase):
             canonical_origin("https://rc.example.com"),
         )
 
+    def test_a_unicode_host_matches_its_idna_form(self):
+        """One DNS name written two ways. The weakest case in this function by reach —
+        kept because it is four guarded lines and both spellings do resolve to one
+        server, so the failure is a missed duplicate: two agents in one room."""
+        self.assertEqual(
+            canonical_origin("https://bücher.example"),
+            canonical_origin("https://xn--bcher-kva.example"),
+        )
+
+    def test_an_ascii_host_never_touches_the_idna_codec(self):
+        """The guard matters: Python's idna codec rejects empty and over-long labels
+        that resolve perfectly well, so the ordinary path must not go through it."""
+        self.assertEqual(
+            canonical_origin("https://a.-weird-.example"), "https://a.-weird-.example")
+
     def test_a_terminal_dns_root_dot_is_dropped(self):
         """`chat.example.com.` and `chat.example.com` resolve to one server, so keeping
         the dot splits one account into two keys — a *missed* duplicate, which here means
@@ -720,3 +735,60 @@ class TestTheDocumentedLifecycleWorks(unittest.IsolatedAsyncioTestCase):
             doc.index("subscribe_room"), doc.index("start_inbound()"),
             "the example must subscribe before it starts reading",
         )
+
+
+class TestVoiceAcceptsOnlyWhenReady(unittest.IsolatedAsyncioTestCase):
+    """An accountless inbound server has the same problem as a chat socket.
+
+    The voice connector opens an HTTP listener, and a request arriving before its
+    watcher's processor exists reaches an empty dispatcher and is told the gateway is
+    busy — a wrong answer from a daemon that is merely still starting, and the identity
+    barrier widens the window to every other connector's login.
+    """
+
+    async def test_connect_binds_without_accepting_and_start_inbound_accepts(self):
+        import asyncio
+        import socket
+
+        from gateway.connectors.voice.config import VoiceConfig
+        from gateway.connectors.voice.connector import VoiceConnector
+
+        with socket.socket() as probe:  # a free port, released before the connector binds
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+
+        connector = VoiceConnector(VoiceConfig(host="127.0.0.1", port=port, secret=""))
+        await connector.connect()
+        try:
+            self.assertIsNotNone(connector._server)
+            self.assertFalse(
+                connector._server.is_serving(),
+                "accepting here would answer requests no watcher can serve yet",
+            )
+
+            await connector.start_inbound()
+            self.assertTrue(connector._server.is_serving())
+
+            # And it really accepts, rather than merely reporting that it does.
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            await connector.disconnect()
+
+    async def test_the_port_conflict_still_fails_at_connect(self):
+        """Binding stays in `connect()` on purpose: a port already in use is a startup
+        failure, and it is easiest to attribute at the moment the connector claims it."""
+        import socket
+
+        from gateway.connectors.voice.config import VoiceConfig
+        from gateway.connectors.voice.connector import VoiceConnector
+
+        with socket.socket() as taken:
+            taken.bind(("127.0.0.1", 0))
+            taken.listen(1)
+            port = taken.getsockname()[1]
+
+            connector = VoiceConnector(VoiceConfig(host="127.0.0.1", port=port, secret=""))
+            with self.assertRaises(OSError):
+                await connector.connect()

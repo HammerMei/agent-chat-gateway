@@ -107,10 +107,17 @@ class VoiceConnector(Connector):
 
     async def connect(self) -> None:
         """Start the HTTP server and log the listen address."""
+        # Bound but not accepting: `start_serving=False` keeps a port conflict a
+        # startup failure at the moment it is easiest to attribute, while leaving the
+        # listener closed until `start_inbound()`. Serving from here would answer
+        # requests that arrive before the watcher's processor is installed, and the
+        # dispatcher has nothing to route them to — the caller hears "the gateway is
+        # busy" from a gateway that is merely still starting.
         self._server = await asyncio.start_server(
             self._handle_connection,
             host=self._config.host,
             port=self._config.port,
+            start_serving=False,
         )
         addrs = ", ".join(
             str(s.getsockname()) for s in self._server.sockets or []
@@ -127,6 +134,16 @@ class VoiceConnector(Connector):
                 "VoiceConnector has no 'secret' set — any device on the network "
                 "can send voice commands to the agent. Set a bearer token in config."
             )
+
+    async def start_inbound(self) -> None:
+        """Begin accepting requests, once the watchers that answer them exist.
+
+        The socket is already bound (see `connect()`), so this only starts accepting.
+        Callers arriving before it are refused by the OS rather than told the gateway is
+        busy — an honest "not up yet" instead of a wrong answer from a healthy daemon.
+        """
+        if self._server is not None:
+            await self._server.start_serving()
 
     async def disconnect(self) -> None:
         """Stop the HTTP server."""
