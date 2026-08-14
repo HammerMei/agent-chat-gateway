@@ -51,7 +51,13 @@ from .core.bot_identity import (
     dm_claims,
     find_identity_conflicts,
 )
-from .core.state import StateFormatError, load_state, state_files
+from .core.state import (
+    DuplicateSessionError,
+    StateFormatError,
+    check_session_uniqueness,
+    load_state,
+    state_files,
+)
 
 # Connector types validated via their own dataclass parser. 'script' is
 # intentionally omitted — ScriptConnector never reads ConnectorConfig.raw
@@ -172,6 +178,7 @@ def validate_config(config_path: str, lint: bool = False) -> ValidationResult:
 
     _check_connectors(config, result)
     _check_state_orphans(config, result)
+    _check_session_uniqueness(result)
     _check_shadowed_rules(config, result)
     _check_declared_bot_accounts(config, result)
     if lint:
@@ -329,6 +336,32 @@ def _check_connectors(config: GatewayConfig, result: ValidationResult) -> None:
                 _bad_url_field("server.url", cfg.server_url)
             if not cfg.team:
                 _empty_field("server.team")
+
+
+def _check_session_uniqueness(result: ValidationResult) -> None:
+    """Report the state-file condition that now refuses to boot the daemon.
+
+    `GatewayService` runs `check_session_uniqueness()` before anything is built, so a
+    state file binding one session to two rooms stops the daemon. Adding that refusal
+    without teaching this command about it would have left `acg config validate`
+    reporting success on exactly the fault it exists to find first — the operator's only
+    way to learn about it would be a failed start.
+
+    Attributed globally: the fault is a pair of records in a state file, not a config
+    entry, so there is no row to mark. The check reads the same files
+    `_check_state_orphans` already looks at.
+    """
+    try:
+        check_session_uniqueness()
+    except DuplicateSessionError as exc:
+        result.errors.append(str(exc))
+        result.findings.append(Finding("error", "global", None, None, str(exc)))
+    except StateFormatError as exc:
+        # A legacy or future-format file refuses to boot too, and `check_state_formats`
+        # is likewise a daemon-only preflight. Reported rather than raised, so one
+        # unreadable connector file does not hide every other finding in the run.
+        result.errors.append(str(exc))
+        result.findings.append(Finding("error", "global", None, None, str(exc)))
 
 
 def _check_state_orphans(config: GatewayConfig, result: ValidationResult) -> None:

@@ -209,6 +209,72 @@ class TestLoadTimeSessionUniqueness(unittest.TestCase):
             check_session_uniqueness()
 
 
+class TestValidateReportsWhatBlocksTheBoot(unittest.TestCase):
+    """`acg config validate` must know about every refusal the daemon added.
+
+    A preflight that stops the daemon and is invisible to the validation command leaves
+    the operator only one way to discover it: a failed start. `validate_config()` already
+    reads these files for orphan records, so the fault was that the new check was not
+    among the ones it runs.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        patcher = patch("gateway.core.state.RUNTIME_DIR", self.root / "runtime")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _validate(self):
+        from gateway.config_validate import validate_config
+
+        path = self.root / "config.yaml"
+        path.write_text(textwrap.dedent(f"""
+            connectors:
+              - name: rc
+                type: rocketchat
+                server:
+                  url: https://chat.example.com
+                  username: bot
+                  password: secret
+            agents:
+              default:
+                type: claude
+                working_directory: {self.root}
+            watchers:
+              - name: w1
+                connector: rc
+                room: general
+        """))
+        return validate_config(str(path))
+
+    def _record(self, name, room, session_id):
+        return WatcherState(
+            watcher_name=name,
+            session_id=session_id,
+            room_id=room,
+            backend_identity="claude:/w",
+        )
+
+    def test_a_duplicate_session_is_reported_as_an_error(self):
+        save_state("rc", [
+            self._record("w1", "room-a", "ses-1"),
+            self._record("w2", "room-b", "ses-1"),
+        ])
+        result = self._validate()
+        self.assertTrue(
+            any("claim backend session" in e for e in result.errors),
+            f"validate must surface the condition that blocks the boot: {result.errors}",
+        )
+
+    def test_a_clean_state_file_reports_nothing(self):
+        """Otherwise the assertion above would pass against a check that always fires."""
+        save_state("rc", [self._record("w1", "room-a", "ses-1")])
+        result = self._validate()
+        self.assertFalse([e for e in result.errors if "claim backend session" in e])
+
+
 class TestConfigRefusesARoomTwice(unittest.TestCase):
     """The cheap half: name both entries at load instead of failing whichever starts
     second."""
