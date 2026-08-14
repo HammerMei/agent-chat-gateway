@@ -22,6 +22,28 @@ class RoomNotFoundError(Exception):
     """
 
 
+# Mattermost's four channel types, and what each means to the rest of the gateway.
+# `O` open/public, `P` private, `D` 1:1 DM, `G` group DM (§6.4 — Mattermost distinguishes
+# group DMs on the wire, which Rocket.Chat does not).
+#
+# Stated once because the previous mapping was inline and partial: it recognised `P` and
+# called everything else a channel, so an id-based lookup would have typed a DM as a
+# channel. Every `type == "dm"` gate would then have inverted — the mention requirement
+# would start applying to DMs, which §2.7 records as making the agent answer every message
+# from anyone in the room.
+_ROOM_TYPES = {"O": "channel", "P": "group", "D": "dm", "G": "group_dm"}
+
+
+def room_type_for(channel_type: str | None) -> str:
+    """Map a Mattermost channel type to the gateway's room type.
+
+    An unknown or missing value falls back to `channel`, which is the conservative answer:
+    a channel requires a mention where a DM does not, so guessing `channel` cannot turn a
+    quiet room into a talkative one.
+    """
+    return _ROOM_TYPES.get(channel_type or "", "channel")
+
+
 class MattermostREST:
     """Async REST client for the Mattermost v4 API.
 
@@ -401,6 +423,48 @@ class MattermostREST:
             posts = [p for p in posts if p.get("create_at", 0) >= after_ms]
         return posts
 
+    async def get_channel(self, channel_id: str) -> dict[str, Any]:
+        """Channel info by id — the fallback for a room the event could not describe.
+
+        A fallback rather than a hot-path call on purpose: name, type and team are all on
+        the wire for a channel post (§6.2), and Mattermost holds a connector-wide permit
+        for the whole handler, so a REST round trip there stalls delivery for every
+        channel. This exists for the paths that genuinely start from an id — a persisted
+        record being recreated, an operator naming a room by id.
+        """
+        result = await self._request("GET", f"channels/{channel_id}")
+        return {
+            "id": result["id"],
+            "name": result.get("name", ""),
+            "display_name": result.get("display_name", ""),
+            "type": room_type_for(result.get("type")),
+            # Kept, not discarded: a channel id is globally unique, so resolving a
+            # persisted record by id can reach a channel in a team this connector no
+            # longer serves — the bot may belong to both. Without this the caller cannot
+            # tell.
+            "team_id": result.get("team_id", ""),
+        }
+
+    async def channel_member_usernames(self, channel_id: str, exclude: str = "") -> list[str]:
+        """Usernames of a channel's members, for describing a room that has no name.
+
+        A direct channel's REST object carries an **empty** `display_name`: the counterpart
+        handle Mattermost puts on a WebSocket event is viewer-specific and is not part of
+        the channel itself. So a DM resolved by id has nothing to describe it, and this
+        supplies it from the membership instead.
+
+        Only ever called on the recreation path, never per message — it is one request plus
+        a cached username lookup per member.
+        """
+        members = await self._request("GET", f"channels/{channel_id}/members")
+        names = []
+        for member in members if isinstance(members, list) else []:
+            user_id = member.get("user_id", "")
+            if not user_id or user_id == exclude:
+                continue
+            names.append(await self.resolve_username(user_id))
+        return names
+
     async def resolve_room(self, room_name: str) -> dict[str, Any]:
         """Resolve a channel name to its info dict, within the configured team.
 
@@ -441,7 +505,7 @@ class MattermostREST:
         return {
             "id": result["id"],
             "name": result.get("name", room_name),
-            "type": "group" if result.get("type") == "P" else "channel",
+            "type": room_type_for(result.get("type")),
         }
 
 

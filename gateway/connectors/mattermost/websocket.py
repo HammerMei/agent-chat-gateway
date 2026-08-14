@@ -192,6 +192,12 @@ class MattermostWebSocketClient:
             "mentions": mentions,
             "channel_type": data.get("channel_type"),
             "channel_name": data.get("channel_name"),
+            # A DM's `channel_name` is the opaque `<userid>__<userid>` form; its
+            # `channel_display_name` is the counterpart's handle, and for a group DM it is
+            # the member list (§6.2). Kept because it is the only usable identity a DM
+            # event carries — deliberately not used as a *label*, which must not move when
+            # membership does.
+            "channel_display_name": data.get("channel_display_name"),
             "team_id": data.get("team_id"),
         }
 
