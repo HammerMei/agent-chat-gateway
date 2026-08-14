@@ -16,7 +16,7 @@ from .adapter_utils import ts_gt as _ts_gt
 from .attachment_workspace import AttachmentWorkspace
 from .config import CoreConfig, WatcherConfig
 from .connector import Connector
-from .dispatch import MessageDispatcher
+from .dispatch import MessageDispatcher, RoomAlreadyRoutedError
 from .history_context import format_history_context
 from .injected_context_builder import InjectedContextBuilder
 from .message_processor import MessageProcessor
@@ -371,12 +371,26 @@ class WatcherLifecycle:
         # 1. Resolve room
         room = await self._connector.resolve_room(wc.room)
 
+        # 1.5 Refuse a room another watcher already serves, before anything is built.
+        # The authoritative claim is step 8, after the room is subscribed — reaching it
+        # first would mean creating a session, injecting context and subscribing, then
+        # undoing all of it. `holder` is a read, so this is check-then-act; the race it
+        # cannot close is closed by the claim itself.
+        occupant = self._dispatcher.holder(room.id)
+        if occupant is not None and occupant != wc.name:
+            raise RoomAlreadyRoutedError(
+                f"Room '{wc.room}' is already served by watcher '{occupant}', so "
+                f"watcher '{wc.name}' cannot also take it: both would answer every "
+                f"message, and neither would see the other's reply. Give the second "
+                f"watcher its own connector (its own bot account) or its own room."
+            )
+
         # 2. Provision session. The identity is computed once and both compared and
         # stored below, so the value a later run compares against is the same string
         # this run validated — not a second derivation that could drift from it.
         identity = backend_identity(agent_cfg.type, agent_cfg.working_directory)
         session_id, created_new_session = await self._provision_session(
-            wc, state, agent, agent_cfg, identity
+            wc, state, agent, agent_cfg, identity, room.id
         )
         if created_new_session and state and state.session_id:
             # The record survived but its session did not, so the bookkeeping keyed to
@@ -407,7 +421,19 @@ class WatcherLifecycle:
             backend_identity=identity,
         )
         self._states[wc.name] = ws
-        self._maps.bind_session(session_id, room.id, self._connector)
+        try:
+            self._maps.bind_session(session_id, room.id, self._connector)
+        except Exception:
+            # A refused binding must not leave this watcher looking startable. Without
+            # this, the record just written stays in `_states`, `sync_watchers` persists
+            # it, and the next boot's uniqueness preflight refuses to start at all — a
+            # transient conflict turned into a permanently unbootable state file. The
+            # freshly created backend session goes too; nothing will ever use it.
+            self._states.pop(wc.name, None)
+            await self._cleanup_startup_session_best_effort(
+                agent, session_id, created_new_session, wc.name
+            )
+            raise
 
         # 3.5 Fetch channel history for context handoff (new sessions only).
         # Only fires when created_new_session=True (reset, upgrade, first join)
@@ -472,9 +498,11 @@ class WatcherLifecycle:
             to_repeat = await self._injector.ensure(
                 ws, session_id, agent, agent_cfg.working_directory, agent_cfg.timeout,
                 watcher_name=wc.name,
-                # The prompt file is per WATCHER, not per room: two watchers may bind
-                # different agents to one room, and their durable instructions differ.
-                # See watcher_prompt_key for why this is not room_path_key.
+                # The prompt file is per WATCHER, not per room. The collision it was
+                # written for — two watchers with different agents in one room — is now
+                # refused (§4.1), but the key still names files on disk and re-keying
+                # them would orphan every existing one for no gain. See
+                # watcher_prompt_key for why this is not room_path_key.
                 path_key=watcher_prompt_key(wc.connector, room.id, wc.name),
                 content=built_content,
             )
@@ -539,14 +567,34 @@ class WatcherLifecycle:
         )
         self._processors[wc.name] = processor
 
-        # 7. Subscribe (rollback everything on failure)
+        # 7-8. Subscribe, then claim the room — one rollback covers both.
+        #
+        # They were separate, and step 8 had no failure path at all: a refused claim
+        # (the room is another watcher's) left the room subscribed and the session bound
+        # with nothing to answer, which reads as a healthy watcher receiving nothing.
+        # The claim is what makes a watcher live, so it belongs inside the same undo as
+        # the subscription that feeds it.
+        subscribed = False
         try:
             await self._connector.subscribe_room(
                 room,
                 watcher_id=wc.name,
                 working_directory=agent_cfg.working_directory,
             )
+            subscribed = True
+            self._dispatcher.add_processor(room.id, processor)
         except Exception:
+            if subscribed:
+                try:
+                    await self._connector.unsubscribe_room(room.id, watcher_id=wc.name)
+                except Exception as unsub_error:  # best effort; the raise below is what matters
+                    logger.warning(
+                        "Watcher '%s': could not unsubscribe room '%s' while rolling "
+                        "back a failed start: %s",
+                        wc.name,
+                        room.id,
+                        unsub_error,
+                    )
             self._processors.pop(wc.name, None)
             # Keep ws in _states (do NOT pop) so that the context_injected flag
             # and session_id are preserved for the next _start_watcher call.
@@ -566,9 +614,6 @@ class WatcherLifecycle:
             self._maps.remove_session(session_id)
             raise
 
-        # 8. Register with dispatcher — only after subscribe succeeds.
-        self._dispatcher.add_processor(room.id, processor)
-
         # 9. Activate processor — starts the consumer loop and emits the
         # online notification.  Deferred to here so users never see "online"
         # for a watcher whose room subscription failed.
@@ -576,11 +621,13 @@ class WatcherLifecycle:
 
         # 10. Restore watermark.
         # Only advance the room-level watermark; never move it backwards.
-        # This matters when multiple watchers share the same room: a watcher that
-        # was paused or reset may have an older persisted timestamp than a sibling
-        # watcher that has been running and advancing the shared room watermark.
-        # Writing an older value back would cause duplicate message delivery for
-        # all watchers on that room after the next reconnect.
+        # A watcher that was paused or reset may hold an older persisted timestamp
+        # than the room's live cursor — the connector keeps that cursor per room and
+        # advances it as messages are accepted, independently of any one watcher's
+        # restarts. Writing the older value back would redeliver everything between
+        # the two after the next reconnect. (This used to be justified by sibling
+        # watchers sharing a room, which §4.1 no longer permits; the reason above is
+        # the one that still holds.)
         if ws.last_processed_ts:
             current_ts = self._connector.get_last_processed_ts(room.id)
             if not current_ts or _ts_gt(ws.last_processed_ts, current_ts):
@@ -601,6 +648,7 @@ class WatcherLifecycle:
         agent: AgentBackend,
         agent_cfg,
         identity: str,
+        room_id: str,
     ) -> tuple[str, bool]:
         """Determine the session ID: reuse the persisted one, or create a new one.
 
@@ -611,6 +659,23 @@ class WatcherLifecycle:
 
         There is no config-pinned option: `watchers[].session_id` is removed, so
         every session id the gateway uses is one it assigned itself.
+
+        **The room is compared as well as the identity**, and this is the reachable half.
+        Editing `room:` on an existing watcher is ordinary reconfiguration, and the
+        record survives it — so without this the old session is rebound to the new room,
+        carrying that room's transcript and identity header into it, and the watermark
+        restore then writes the *old* room's cursor onto the new room, silently
+        discarding every message in it older than that timestamp. The state-file
+        corruption both error messages tell operators to look for is far rarer than this.
+        An empty `room_id` is a **mismatch**, not "no claim to compare". `room_id` has no
+        dataclass default, so it is in `_REQUIRED_FIELDS` and the reader fills an absent
+        one with `""` — meaning an empty value in a version-2 record is a hand-edited or
+        truncated record, which is precisely the case this refusal exists for. Treating
+        it as matching would resume an unknown room's transcript in this room. This began
+        as an exemption for "a record written before the field carried anything", which
+        was wrong twice over: no such record can be read (the format version refuses
+        them), and it contradicts the rule the identity comparison already follows —
+        unverifiable is not verified.
 
         A session id is only meaningful inside the backend store that issued it, so a
         record whose stored identity does not equal the current one is not reused —
@@ -627,7 +692,7 @@ class WatcherLifecycle:
         fresh session takes over; the old store keeps whatever it had.
         """
         if state and state.session_id:
-            if state.backend_identity == identity:
+            if state.backend_identity == identity and state.room_id == room_id:
                 return state.session_id, False
             # The full id, deviating from the [:8] used for routine session logging.
             # This record is about to be overwritten with the new session, so this line
@@ -641,8 +706,11 @@ class WatcherLifecycle:
                 wc.name,
                 state.session_id,
                 (
-                    f"it was created against backend identity "
-                    f"'{state.backend_identity}', which is now '{identity}'"
+                    f"it belongs to room '{state.room_id}' and this watcher now "
+                    f"watches '{room_id}'"
+                    if state.backend_identity == identity
+                    else f"it was created against backend identity "
+                         f"'{state.backend_identity}', which is now '{identity}'"
                     if state.backend_identity
                     else f"it has no recorded backend identity to check against "
                          f"'{identity}'"

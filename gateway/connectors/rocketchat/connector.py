@@ -17,7 +17,6 @@ from __future__ import annotations
 import collections
 import logging
 import re
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -29,10 +28,12 @@ from ...core.bot_identity import (
     canonical_origin,
 )
 from ...core.connector import (
+    CapacityCheck,
     Connector,
     IncomingMessage,
     MessageHandler,
     Room,
+    RoomCapacity,
 )
 from ...core.tz_utils import local_iana_timezone as _server_local_timezone
 from .agent_chain import TurnStore
@@ -78,6 +79,21 @@ class _RoomSubscription:
     # stay in sync; the deque is used only for eviction ordering.
     seen_ids: collections.deque = field(default_factory=lambda: collections.deque())
     seen_ids_set: set = field(default_factory=set)
+
+    def remember(self, msg_id: str) -> None:
+        """Record a message id as handled, evicting the oldest past the bound.
+
+        A method because the deque and the set have to move together and the eviction
+        is easy to leave out: this existed as two copies, and a third — added for the
+        unrouted path — kept the two appends and dropped the eviction, so a busy room
+        with no watcher grew both containers without limit. One place to state it.
+        """
+        if not msg_id:
+            return
+        self.seen_ids_set.add(msg_id)
+        self.seen_ids.append(msg_id)
+        if len(self.seen_ids) > _SEEN_IDS_MAXLEN:
+            self.seen_ids_set.discard(self.seen_ids.popleft())
 
 
 @dataclass
@@ -135,7 +151,7 @@ class RocketChatConnector(Connector):
             config.server_url, config.username, config.password
         )
         self._handler: MessageHandler | None = None
-        self._capacity_check: Callable[[str], bool] | None = None
+        self._capacity_check: CapacityCheck | None = None
         self._rooms: dict[str, _RoomSubscription] = {}  # room_id -> subscription
         self._watcher_contexts: dict[
             str, list[_WatcherRoomContext]
@@ -861,7 +877,26 @@ class RocketChatConnector(Connector):
         # and the later enqueue().  This is handled correctly: enqueue() returns
         # False and the watermark is not advanced.  The preflight is a best-effort
         # optimization, not a hard guarantee.
-        if self._capacity_check and not self._capacity_check(room_id):
+        capacity = self._capacity_check(room_id) if self._capacity_check else None
+        if capacity is RoomCapacity.UNROUTED:
+            # Not backpressure: no watcher serves this room, so there is nothing to be
+            # busy with and nothing to tell its members. Telling them the gateway is
+            # busy would be a wrong answer from an idle gateway (§2.7).
+            #
+            # The id is recorded, which suppresses automated replay of this message on
+            # the next reconnect — the same treatment the full-queue branch below gives,
+            # and for the same reason: replaying a message no watcher wanted achieves
+            # nothing but a storm. The watermark is left where it is, so a user who
+            # resends is served normally once a watcher exists.
+            logger.warning(
+                "Message for room '%s' has no watcher — dropping without a reply. "
+                "A watcher that failed to start, or a room subscribed with none "
+                "configured.",
+                sub.room.name,
+            )
+            sub.remember(msg_id)
+            return
+        if capacity is RoomCapacity.FULL:
             logger.warning(
                 "Preflight rejected for message from %s in room '%s' — "
                 "all processor queues full, skipping normalize + download",
@@ -874,12 +909,7 @@ class RocketChatConnector(Connector):
             # deque and creating a phantom duplicate entry.
             # Watermark is intentionally left unchanged so the user can retry by
             # resending — we only suppress automated replay re-delivery.
-            if msg_id:
-                sub.seen_ids_set.add(msg_id)
-                sub.seen_ids.append(msg_id)
-                if len(sub.seen_ids) > _SEEN_IDS_MAXLEN:
-                    evicted = sub.seen_ids.popleft()
-                    sub.seen_ids_set.discard(evicted)
+            sub.remember(msg_id)
             # Best-effort notification so the user knows their message was dropped.
             # Suppressed during replay: replaying 200 missed messages while queues
             # are full would otherwise fire up to 200 "server busy" REST posts.
@@ -907,18 +937,13 @@ class RocketChatConnector(Connector):
         # and the message will NOT be replayed.  This is intentional — a message
         # that fails normalization is almost certainly malformed and would fail
         # again on replay, causing a poison-pill replay storm on every reconnect.
-        if msg_id:
-            sub.seen_ids_set.add(msg_id)
-            sub.seen_ids.append(msg_id)
-            if len(sub.seen_ids) > _SEEN_IDS_MAXLEN:
-                evicted = sub.seen_ids.popleft()
-                sub.seen_ids_set.discard(evicted)
+        sub.remember(msg_id)
 
         # --- Normalize (once per message) ---
         # Attachment files are downloaded to a connector-global cache directory
         # namespaced by connector name and room ID.  All processors that subscribe
         # to this room reference the same local file paths — no per-watcher copies.
-        # Fan-out to multiple processors is the SessionManager's responsibility;
+        # Routing to the room's processor is the core's responsibility;
         # the connector always calls the handler exactly once per accepted message.
         # Sanitize room_id before using it as a path component — room IDs are
         # server-controlled values and may contain path-traversal characters.
@@ -946,7 +971,7 @@ class RocketChatConnector(Connector):
         # --- Apply thread + permission-thread policy (extracted to policy.py) ---
         apply_thread_policy(msg, self._config)
 
-        # --- Hand off to core (SessionManager._dispatch fans out to all processors) ---
+        # --- Hand off to core (the dispatcher routes to the room's processor) ---
         try:
             accepted = await self._handler(msg)
         except Exception as e:

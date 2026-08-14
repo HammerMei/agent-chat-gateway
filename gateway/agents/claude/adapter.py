@@ -454,9 +454,10 @@ class ClaudeBackend(AgentBackend):
         version control (a documented, real configuration — see
         docs/user-guide.md's ``working_directory: ~/my-project`` examples).
         The file is named by ``path_key``, which the caller derives — treat it as opaque.
-        It is scoped to the *watcher in a room*, not to the room alone: two watchers may
-        bind different agents to one connector+room, and a room-only key would make the
-        second overwrite the first one's instructions. The display name used to be the
+        It is scoped to the *watcher in a room*, not to the room alone. Two watchers on one
+        connector+room are refused now (§4.1), so the collision it was written for cannot
+        occur; the key stays because it names files on disk and re-keying would orphan
+        every existing one. The display name used to be the
         path component outright, which made it load-bearing — a rename orphaned the file
         and two rooms could collide (§2.3). ``resolve_under`` re-checks containment,
         because the key is built from external connector data and a path from such data

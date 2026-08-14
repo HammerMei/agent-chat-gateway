@@ -136,7 +136,9 @@ class TestSessionReuseRequiresMatchingIdentity(unittest.IsolatedAsyncioTestCase)
             config=config,
             watcher_configs=[wc],
             state_store=state_store,
-            dispatcher=MagicMock(),
+            # `holder()` on a bare MagicMock answers with a truthy mock, which now
+            # reads as "another watcher already serves this room" (§4.1).
+            dispatcher=MagicMock(holder=MagicMock(return_value=None)),
             injector=InjectedContextBuilder(config),
             permission_registry=None,
             maps=SessionMaps(),
@@ -181,6 +183,44 @@ class TestSessionReuseRequiresMatchingIdentity(unittest.IsolatedAsyncioTestCase)
     async def test_a_changed_backend_type_forces_a_fresh_session(self):
         lifecycle, _, agent, wc = self._make_lifecycle(agent_type="opencode")
         state = self._stored("old-session-id", backend_identity("claude", "/srv/work"))
+
+        await self._start(lifecycle, wc, state)
+
+        agent.create_session.assert_called_once()
+
+    async def test_a_changed_room_forces_a_fresh_session(self):
+        """The reachable half of "one session, one room" — an ordinary config edit.
+
+        Changing `room:` on an existing watcher keeps the record, so reusing the session
+        on an identity match alone rebinds it to the new room: that room then inherits
+        the old room's transcript and identity header, and the watermark restore writes
+        the *old* room's cursor onto it, silently discarding every message in the new
+        room older than that timestamp. No error, no log, on a supported operation —
+        while both refusal messages point the operator at file corruption instead.
+        """
+        lifecycle, _, agent, wc = self._make_lifecycle()
+        state = self._stored("old-session-id", backend_identity("claude", "/srv/work"))
+        state.room_id = "some-other-room"
+
+        await self._start(lifecycle, wc, state)
+
+        agent.create_session.assert_called_once()
+        self.assertEqual(lifecycle._states["w1"].session_id, "fresh-session-id")
+
+    async def test_a_record_with_no_room_forces_a_fresh_session(self):
+        """An empty `room_id` is a mismatch, not an exemption.
+
+        The field has no dataclass default, so it is required and the reader fills an
+        absent one with `""` — an empty value in a version-2 record therefore means the
+        record was hand-edited or truncated, which is the case this refusal exists for.
+        The first version of this test asserted the opposite, on the theory that such a
+        record predated the field; no such record can be read (the format version refuses
+        them), and the exemption contradicted the rule the identity comparison next to it
+        already follows — unverifiable is not verified.
+        """
+        lifecycle, _, agent, wc = self._make_lifecycle()
+        state = self._stored("old-session-id", backend_identity("claude", "/srv/work"))
+        state.room_id = ""
 
         await self._start(lifecycle, wc, state)
 

@@ -120,7 +120,7 @@ class SessionManager:
         `run_once()`.
         """
         self._connector.register_handler(self._dispatcher.dispatch)
-        self._connector.register_capacity_check(self._dispatcher.has_capacity)
+        self._connector.register_capacity_check(self._dispatcher.capacity)
         await self._connector.connect()
 
     async def sync_only(self, unavailable_agents: set[str] | None = None) -> list[str]:

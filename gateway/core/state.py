@@ -258,6 +258,75 @@ def state_files() -> list[Path]:
     return sorted(RUNTIME_DIR.glob("state.*.json"))
 
 
+def connector_name_of(path: Path) -> str:
+    """`state.<name>.json` → `<name>`.
+
+    Sliced rather than split: a connector name may contain dots, and only the leading
+    `state.` and trailing `.json` belong to the file format. Written once because two
+    callers need it and a second spelling would differ exactly on the names that make
+    the rule worth stating.
+    """
+    return path.name[len("state."):-len(".json")]
+
+
+class DuplicateSessionError(Exception):
+    """Two persisted watchers claim one backend session for different rooms (§4.1)."""
+
+
+def check_session_uniqueness() -> None:
+    """Refuse to start when a state file binds one session to two rooms.
+
+    The runtime check in `SessionMaps.bind_session` catches this too, but only when the
+    second watcher gets that far — after the first has started answering, and with which
+    watcher "wins" decided by start order. Reading the files first turns that into a
+    refusal to boot with both records named.
+
+    Reads **every** state file, not the connector being started: `SessionMaps` is one
+    instance shared by all of them (`GatewayService` builds it once), so two connectors'
+    records can collide with each other.
+
+    Keyed by `session_id` alone, matching `SessionMaps`: every routing map there, and
+    every consumer of them, uses the bare id, so two records claiming one id collide
+    whichever backends issued them. Records with **no** identity are skipped rather than
+    compared. That is not leniency: a record without one cannot have
+    its session reused at all — `_provision_session` treats an unverifiable identity as
+    a mismatch and starts fresh — so two such records never end up sharing a live
+    session, and refusing them would reject a state that heals itself on the next start.
+
+    Two records on the same room **of the same connector** are not a conflict here; that
+    is a duplicate watcher, which the dispatcher refuses when the second claims the room.
+    The connector is part of that comparison because `bind_session` compares it too: two
+    records with one session id and one room id but different connectors bind different
+    routing, and treating them as harmless here left the outcome to start order — one
+    watcher running, the other reported as failed, differently on each boot.
+    """
+    seen: dict[str, tuple[str, str, str]] = {}
+    for path in state_files():
+        connector_name = connector_name_of(path)
+        for record in load_state(connector_name):
+            if not record.session_id or not record.backend_identity:
+                continue
+            previous = seen.get(record.session_id)
+            if previous is None:
+                seen[record.session_id] = (
+                    record.watcher_name, record.room_id, connector_name)
+                continue
+            other_name, other_room, other_connector = previous
+            if other_room == record.room_id and other_connector == connector_name:
+                continue
+            raise DuplicateSessionError(
+                f"Watchers '{other_name}' (room '{other_room}' on connector "
+                f"'{other_connector}') and '{record.watcher_name}' (room "
+                f"'{record.room_id}' on connector '{connector_name}') both claim backend "
+                f"session {record.session_id[:8]}. A session carries its room in its "
+                f"transcript, its identity header and its permission routing, so one "
+                f"session serving two rooms leaks each room's conversation into the "
+                f"other. Clear the session_id on one of those records in "
+                f"{RUNTIME_DIR} — the watcher will start a fresh session and keep "
+                f"everything else it has."
+            )
+
+
 def check_state_formats() -> None:
     """Raise on the first state file this build cannot read.
 
@@ -267,10 +336,7 @@ def check_state_formats() -> None:
     looking successful.
     """
     for path in state_files():
-        # state.<name>.json → <name>. rsplit, because a connector name may contain
-        # dots; only the leading "state." and trailing ".json" are ours.
-        connector_name = path.name[len("state."):-len(".json")]
-        load_state(connector_name)
+        load_state(connector_name_of(path))
 
 
 def ensure_runtime_dir() -> None:

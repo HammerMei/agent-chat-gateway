@@ -51,7 +51,14 @@ from .core.bot_identity import (
     dm_claims,
     find_identity_conflicts,
 )
-from .core.state import StateFormatError, load_state, state_files
+from .core.state import (
+    DuplicateSessionError,
+    StateFormatError,
+    check_session_uniqueness,
+    connector_name_of,
+    load_state,
+    state_files,
+)
 
 # Connector types validated via their own dataclass parser. 'script' is
 # intentionally omitted — ScriptConnector never reads ConnectorConfig.raw
@@ -172,6 +179,7 @@ def validate_config(config_path: str, lint: bool = False) -> ValidationResult:
 
     _check_connectors(config, result)
     _check_state_orphans(config, result)
+    _check_session_uniqueness(result)
     _check_shadowed_rules(config, result)
     _check_declared_bot_accounts(config, result)
     if lint:
@@ -331,6 +339,33 @@ def _check_connectors(config: GatewayConfig, result: ValidationResult) -> None:
                 _empty_field("server.team")
 
 
+def _check_session_uniqueness(result: ValidationResult) -> None:
+    """Report the state-file condition that now refuses to boot the daemon.
+
+    `GatewayService` runs `check_session_uniqueness()` before anything is built, so a
+    state file binding one session to two rooms stops the daemon. Adding that refusal
+    without teaching this command about it would have left `acg config validate`
+    reporting success on exactly the fault it exists to find first — the operator's only
+    way to learn about it would be a failed start.
+
+    Attributed globally: the fault is a pair of records in a state file, not a config
+    entry, so there is no row to mark. The check reads the same files
+    `_check_state_orphans` already looks at.
+    """
+    try:
+        check_session_uniqueness()
+    except DuplicateSessionError as exc:
+        result.errors.append(str(exc))
+        result.findings.append(Finding("error", "global", None, None, str(exc)))
+    except StateFormatError:
+        # Deliberately not reported here. `_check_state_orphans` runs immediately before
+        # this and already loads every state file, reporting the same error with the same
+        # global attribution — catching it again printed each format failure twice and
+        # inflated the error count. Swallowed rather than re-raised so an unreadable file
+        # does not abort a run that has more to say.
+        return
+
+
 def _check_state_orphans(config: GatewayConfig, result: ValidationResult) -> None:
     """Warn when a connector's persisted state.<connector>.json references a
     watcher name no longer present in the (expanded) config."""
@@ -345,7 +380,7 @@ def _check_state_orphans(config: GatewayConfig, result: ValidationResult) -> Non
     # startup, which is the failure the refusal exists to prevent.
     for path in state_files():
         try:
-            load_state(path.name[len("state."):-len(".json")])
+            load_state(connector_name_of(path))
         except StateFormatError as exc:
             msg = str(exc)
             result.errors.append(msg)

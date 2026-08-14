@@ -25,7 +25,7 @@ from gateway.agents.response import AgentResponse
 from gateway.connectors.mattermost.config import MattermostConfig
 from gateway.connectors.mattermost.connector import MattermostConnector
 from gateway.core.agent_chain import AgentChainConfig
-from gateway.core.connector import IncomingMessage, Room, User, UserRole
+from gateway.core.connector import IncomingMessage, Room, RoomCapacity, User, UserRole
 
 
 def _config(**overrides) -> MattermostConfig:
@@ -432,7 +432,7 @@ class TestOnPostedEvent(unittest.IsolatedAsyncioTestCase):
         connector._rest.resolve_username = AsyncMock(return_value="alice")
         connector._rest.post_message = AsyncMock()
         connector.register_handler(AsyncMock(return_value=True))
-        connector.register_capacity_check(lambda room_id: False)  # always full
+        connector.register_capacity_check(lambda room_id: RoomCapacity.FULL)
 
         await connector._on_posted_event(
             {
@@ -449,7 +449,7 @@ class TestOnPostedEvent(unittest.IsolatedAsyncioTestCase):
         connector._rest.resolve_username = AsyncMock(return_value="alice")
         connector._rest.post_message = AsyncMock()
         connector.register_handler(AsyncMock(return_value=True))
-        connector.register_capacity_check(lambda room_id: False)  # always full
+        connector.register_capacity_check(lambda room_id: RoomCapacity.FULL)
 
         await connector._on_posted_event({
             "post": {"id": "p1", "channel_id": "chan1", "user_id": "u1", "message": "@hammer.mei hi", "root_id": "", "type": "", "create_at": 1},

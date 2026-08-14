@@ -326,6 +326,9 @@ class GatewayConfig:
                 )
             )
 
+        for conflict in find_room_collisions(watchers):
+            raise ValueError(conflict)
+
         # The cross-watcher duplicate-session_id pass that used to sit here is gone
         # with the field: `session_id:` is refused per entry above, so no watcher can
         # carry one and a duplicate cannot exist. The hazard it guarded — two
@@ -1803,6 +1806,44 @@ class ShadowFinding:
     scope: str
 
 
+def find_room_collisions(watchers: list[WatcherConfig]) -> list[str]:
+    """Static watchers that would claim the same room on the same connector (§4.1).
+
+    One room on one bot account is served by one watcher. Two would both receive every
+    message and both answer it, and neither would see the other's reply — each
+    connector filters its own account's messages — so the room gets two agents talking
+    past each other. The dispatcher refuses the second claim at runtime; this catches
+    the same thing at load, where it can name both entries instead of failing whichever
+    happens to start second.
+
+    Compared on the configured room *string*, which is deliberately the weaker half of
+    the pair: two spellings that resolve to one room (a name and its id) pass here and
+    are caught by the dispatcher once resolved. A missed collision is a startup error
+    later; a false one would reject a working config, so the string comparison leans the
+    safe way.
+
+    Watchers on **different connectors** are untouched. That is the supported multi-agent
+    shape: each agent has its own bot account, so each has its own connector and its own
+    dispatcher, and two agents in one room see each other normally.
+    """
+    seen: dict[tuple[str, str], str] = {}
+    conflicts: list[str] = []
+    for w in watchers:
+        if not w.room:
+            continue
+        key = (w.connector, w.room)
+        first = seen.setdefault(key, w.name)
+        if first != w.name:
+            conflicts.append(
+                f"Watchers '{first}' and '{w.name}' both watch room '{w.room}' on "
+                f"connector '{w.connector}'. One room on one bot account belongs to one "
+                f"watcher: both would answer every message, and neither would see the "
+                f"other's reply. Give the second watcher its own connector — its own bot "
+                f"account — or its own room."
+            )
+    return conflicts
+
+
 def find_shadowed_rules(rules: list[WatcherRule]) -> list[ShadowFinding]:
     """Find reaches that can never fire because an earlier rule already takes them.
 
@@ -2331,6 +2372,12 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
     # entity dependency at all, so there's no reason an early return
     # elsewhere should ever have hardcoded these to their defaults instead
     # of actually parsing them.
+    for conflict in find_room_collisions(watchers):
+        # Attributed to "global" rather than to one of the two watchers: the fault is
+        # the pair, and blaming whichever came second would mark a row that is no more
+        # wrong than the other.
+        issues.append(ConfigIssue("global", None, conflict))
+
     max_queue_depth, scheduler_cfg = _max_queue_depth_and_scheduler_or_defaults(raw, issues)
 
     config = GatewayConfig(
