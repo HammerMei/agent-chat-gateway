@@ -228,8 +228,8 @@ class AgentBackend(ABC):
 
         Callers pass `gateway.core.paths.watcher_prompt_key(connector, room_id,
         watcher_name)`, which is scoped to the *watcher in a room* rather than to the room
-        alone. That matters for anyone implementing this method: two watchers may bind
-        different agents to one connector+room, and a room-only key makes the second
+        alone. That matters for anyone implementing this method: the key is scoped to the
+        watcher in a room, and a room-only key makes the second
         overwrite the first one's instructions silently. The room-scoped
         `room_path_key` exists for the attachment workspace, whose cache genuinely is per
         room — do not reach for it here.

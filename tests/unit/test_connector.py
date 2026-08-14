@@ -14,6 +14,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from gateway.core.connector import RoomCapacity
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
@@ -925,7 +927,7 @@ class TestOnRawDdpMessageEdgePaths(unittest.IsolatedAsyncioTestCase):
 
         connector = _make_connector()
         connector._handler = AsyncMock(return_value=True)
-        connector._capacity_check = lambda room_id: False  # always reject
+        connector._capacity_check = lambda room_id: RoomCapacity.FULL
         connector._rest.post_message = AsyncMock()
 
         doc = {"msg": "hello", "_id": "m1", "u": {"username": "alice"}, "ts": {"$date": 100}}
@@ -949,7 +951,7 @@ class TestOnRawDdpMessageEdgePaths(unittest.IsolatedAsyncioTestCase):
 
         connector = _make_connector()
         connector._handler = AsyncMock(return_value=True)
-        connector._capacity_check = lambda room_id: False
+        connector._capacity_check = lambda room_id: RoomCapacity.FULL
         connector._rest.post_message = AsyncMock(side_effect=RuntimeError("network down"))
 
         doc = {"msg": "hi", "_id": "m1", "u": {"username": "alice"}, "ts": {"$date": 100}}
@@ -1401,7 +1403,7 @@ class TestReviewFixes(unittest.IsolatedAsyncioTestCase):
 
         connector = _make_connector()
         connector._handler = AsyncMock(return_value=True)
-        connector._capacity_check = lambda room_id: False  # always reject
+        connector._capacity_check = lambda room_id: RoomCapacity.FULL
         connector._rest.post_message = AsyncMock()
 
         doc = {"msg": "hi", "_id": "cap-id", "u": {"username": "alice"}, "ts": {"$date": 100}}
@@ -1524,7 +1526,7 @@ class TestRound3Fixes(unittest.IsolatedAsyncioTestCase):
         connector = _make_connector()
         connector._rooms["room-1"].last_processed_ts = "100"
         connector._ws.subscription_statuses = {}
-        connector._capacity_check = lambda room_id: False  # always reject
+        connector._capacity_check = lambda room_id: RoomCapacity.FULL
         connector._rest.post_message = AsyncMock()
         connector._rest.get_room_history = AsyncMock(return_value=[
             {"_id": "r1", "msg": "hi", "u": {"username": "alice"}, "ts": {"$date": 200}},
@@ -1546,7 +1548,7 @@ class TestRound3Fixes(unittest.IsolatedAsyncioTestCase):
 
         connector = _make_connector()
         connector._handler = AsyncMock(return_value=True)
-        connector._capacity_check = lambda room_id: False
+        connector._capacity_check = lambda room_id: RoomCapacity.FULL
         connector._rest.post_message = AsyncMock()
 
         doc = {"_id": "live1", "msg": "hi", "u": {"username": "alice"}, "ts": {"$date": 100}}
@@ -1690,7 +1692,7 @@ class TestRound3Fixes(unittest.IsolatedAsyncioTestCase):
 
         connector = _make_connector()
         connector._handler = AsyncMock(return_value=True)
-        connector._capacity_check = lambda room_id: False
+        connector._capacity_check = lambda room_id: RoomCapacity.FULL
         connector._rest.post_message = AsyncMock()
 
         # Track whether seen_ids_set was populated before or after post_message

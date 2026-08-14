@@ -511,6 +511,12 @@ watchers:
 single-item `rooms:`) — it pins a specific watcher's identity, which is ambiguous
 across an expanded multi-room entry.
 
+> ⚠️ **One watcher per room, per connector.** Two watchers pointing at the same room
+> on the same connector are refused at config load: both would receive every message
+> and both would answer, and neither would see the other's reply — a connector filters
+> its own account's messages. To put two agents in one room, give each its own bot
+> account and its own connector, which is the supported multi-agent setup.
+
 > ⚠️ **Watcher names are persistent identifiers** — they key session state in
 > `state.<connector>.json` and they're what you type into
 > `agent-chat-gateway pause|resume|reset`. Renaming a watcher (including by switching it

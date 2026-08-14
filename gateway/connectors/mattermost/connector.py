@@ -40,6 +40,7 @@ from ...core.connector import (
     IncomingMessage,
     MessageHandler,
     Room,
+    RoomCapacity,
 )
 from ...core.tz_utils import local_iana_timezone as _server_local_timezone
 from .agent_chain import TurnStore
@@ -759,7 +760,17 @@ class MattermostConnector(Connector):
             result.sender, state.room.name, post.get("message", "")[:80],
         )
 
-        if self._capacity_check and not self._capacity_check(channel_id):
+        capacity = self._capacity_check(channel_id) if self._capacity_check else None
+        if capacity is RoomCapacity.UNROUTED:
+            # Not backpressure — see the Rocket.Chat connector's twin of this branch.
+            # No watcher serves this channel, so "server busy" would be a wrong answer
+            # from an idle gateway (§2.7).
+            logger.warning(
+                "Message for channel '%s' has no watcher — dropping without a reply.",
+                state.room.name,
+            )
+            return
+        if capacity is RoomCapacity.FULL:
             logger.warning(
                 "Preflight rejected for message from %s in channel '%s' — "
                 "all processor queues full, skipping normalize + download",

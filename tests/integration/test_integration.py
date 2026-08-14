@@ -1312,7 +1312,7 @@ class TestStartupRaceRollback(IsolatedTestCase):
         async def check_then_subscribe(*args, **kwargs):
             # Capture dispatcher state at the moment subscribe is called.
             lc = manager._lifecycle
-            has_processor = bool(lc._dispatcher._room_processors)
+            has_processor = bool(lc._dispatcher._room_processor)
             dispatcher_populated_before_subscribe.append(has_processor)
             return await original_subscribe(*args, **kwargs)
 
@@ -1349,7 +1349,7 @@ class TestStartupRaceRollback(IsolatedTestCase):
         # The dispatcher must be empty — no processor should survive a subscribe failure.
         lc = manager._lifecycle
         self.assertFalse(
-            bool(lc._dispatcher._room_processors),
+            bool(lc._dispatcher._room_processor),
             "Dispatcher must be empty after subscribe_room failure (no orphaned processors)",
         )
 

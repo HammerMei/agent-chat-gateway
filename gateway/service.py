@@ -46,7 +46,7 @@ from .core.permission import (
 from .core.scheduler import JobScheduler
 from .core.session_manager import SessionManager
 from .core.session_maps import SessionMaps
-from .core.state import check_state_formats
+from .core.state import check_session_uniqueness, check_state_formats
 
 logger = logging.getLogger("agent-chat-gateway.service")
 
@@ -267,6 +267,11 @@ class GatewayService:
         # version marker: an unreadable file must stop the boot, not be discovered as
         # an absence. See gateway/core/state.py.
         check_state_formats()
+        # Before anything is built: a state file binding one session to two rooms is a
+        # cross-room leak waiting for both watchers to start (§4.1). The runtime check
+        # in `bind_session` catches it too, but only once one of them is already
+        # answering, and which one wins would depend on start order.
+        check_session_uniqueness()
 
         core_config = CoreConfig.from_gateway_config(config)
 

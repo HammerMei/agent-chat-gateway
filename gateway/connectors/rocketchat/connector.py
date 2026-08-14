@@ -33,6 +33,7 @@ from ...core.connector import (
     IncomingMessage,
     MessageHandler,
     Room,
+    RoomCapacity,
 )
 from ...core.tz_utils import local_iana_timezone as _server_local_timezone
 from .agent_chain import TurnStore
@@ -861,7 +862,23 @@ class RocketChatConnector(Connector):
         # and the later enqueue().  This is handled correctly: enqueue() returns
         # False and the watermark is not advanced.  The preflight is a best-effort
         # optimization, not a hard guarantee.
-        if self._capacity_check and not self._capacity_check(room_id):
+        capacity = self._capacity_check(room_id) if self._capacity_check else None
+        if capacity is RoomCapacity.UNROUTED:
+            # Not backpressure: no watcher serves this room, so there is nothing to be
+            # busy with and nothing to tell its members. Telling them the gateway is
+            # busy would be a wrong answer from an idle gateway (§2.7). The watermark
+            # is left alone so a watcher starting later can still pick the message up.
+            logger.warning(
+                "Message for room '%s' has no watcher — dropping without a reply. "
+                "A watcher that failed to start, or a room subscribed with none "
+                "configured.",
+                sub.room.name,
+            )
+            if msg_id:
+                sub.seen_ids_set.add(msg_id)
+                sub.seen_ids.append(msg_id)
+            return
+        if capacity is RoomCapacity.FULL:
             logger.warning(
                 "Preflight rejected for message from %s in room '%s' — "
                 "all processor queues full, skipping normalize + download",

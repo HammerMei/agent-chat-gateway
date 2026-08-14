@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **One room is served by one watcher, and one session belongs to one room**
+  (design §4.1). Both were previously unenforced, and both failed silently:
+  - The dispatch index kept a *list* of processors per room and fanned every message
+    out to all of them, so two watchers on one connector+room meant two agents
+    answering every message — neither seeing the other's reply, since each connector
+    filters its own account. The index is now a single slot: config load rejects the
+    pair by name, and a second claim at runtime raises. **Two watchers on one
+    connector and one room no longer start.** Two agents in one room remains
+    supported the way it is meant to be done — one bot account each, so one connector
+    each.
+  - `bind_session` overwrote an existing session→room binding without a word, which
+    points a session's identity header, transcript and permission routing at a second
+    room. It now fails closed, and startup refuses outright when a state file already
+    contains such a pair, naming both records.
+- **A room with no watcher is no longer reported as backpressure.** The capacity
+  preflight returned a bool, so "no processor" and "queue full" were indistinguishable
+  and both connectors posted "server busy" into a room that an idle gateway simply was
+  not serving. It now reports `AVAILABLE` / `FULL` / `UNROUTED`, and only `FULL`
+  produces the busy notice.
+
 ### Added
 - **Two connectors may no longer run as one bot account.** Each connector reports the
   identity its platform assigned it — Rocket.Chat's login user id, Mattermost's

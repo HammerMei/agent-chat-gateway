@@ -232,6 +232,16 @@ class MessageProcessor:
         logger.info("MessageProcessor stopped: watcher=%s", self._watcher_id[:8])
 
     @property
+    def watcher_id(self) -> str:
+        """Which watcher this processor belongs to.
+
+        Public because the dispatcher has to tell "this watcher is registering again"
+        from "a second watcher wants the same room" (§4.1), and identity of the
+        *object* cannot: a restart builds a new processor for the same watcher.
+        """
+        return self._watcher_id
+
+    @property
     def is_accepting(self) -> bool:
         """True if the processor is running and has queue capacity."""
         return self._state == "running" and not self._queue.full()
@@ -242,7 +252,7 @@ class MessageProcessor:
         """Called by MessageDispatcher when a message arrives.
 
         Permission commands (approve/deny) are already intercepted at the
-        Dispatcher level before fan-out, so this method only handles
+        Dispatcher level before routing, so this method only handles
         normal message queueing.
 
         Returns:

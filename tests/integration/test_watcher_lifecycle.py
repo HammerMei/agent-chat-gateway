@@ -147,6 +147,9 @@ def _make_lifecycle_r14(watcher_names=None):
     dispatcher = MagicMock()
     dispatcher.add_processor = MagicMock()
     dispatcher.remove_processor = MagicMock()
+    # No watcher holds the room. A bare MagicMock would answer `holder()` with a truthy
+    # mock, which now means "another watcher already serves it" (§4.1).
+    dispatcher.holder = MagicMock(return_value=None)
 
     injector = MagicMock()
     injector.build = AsyncMock(return_value="built content")
@@ -199,7 +202,7 @@ class TestWatcherLifecycleLock(unittest.IsolatedAsyncioTestCase):
         lc._config = MagicMock()
         lc._watcher_configs = []
         lc._state_store = MagicMock()
-        lc._dispatcher = MagicMock()
+        lc._dispatcher = MagicMock(holder=MagicMock(return_value=None))
         lc._injector = MagicMock()
         lc._permission_registry = None
         lc._maps = MagicMock()
@@ -288,6 +291,9 @@ class TestAttachmentWorkspaceInThread(unittest.IsolatedAsyncioTestCase):
         lc._states = {}
         lc._processors = {}
         lc._watcher_locks = {}
+        # See the note on the other hand-built lifecycle: `holder()` is consulted
+        # before provisioning now, and a bare MagicMock answers it truthily.
+        lc._dispatcher = MagicMock(holder=MagicMock(return_value=None))
 
         maps = MagicMock()
         maps.bind_session = MagicMock()
@@ -365,6 +371,9 @@ class TestAttachmentWorkspaceRollback(unittest.IsolatedAsyncioTestCase):
         lc._states = {}
         lc._processors = {}
         lc._watcher_locks = {}
+        # See the note on the other hand-built lifecycle: `holder()` is consulted
+        # before provisioning now, and a bare MagicMock answers it truthily.
+        lc._dispatcher = MagicMock(holder=MagicMock(return_value=None))
 
         maps = MagicMock()
         maps.bind_session = MagicMock()
@@ -429,6 +438,9 @@ class TestContextInjectedResetOnSubscribeFailure(unittest.IsolatedAsyncioTestCas
         lc._processors = {}
         lc._watcher_locks = {}
         lc._permission_registry = MagicMock()
+        # Hand-built lifecycle: the dispatcher is consulted before the session is
+        # provisioned now, to refuse a room another watcher already holds (§4.1).
+        lc._dispatcher = MagicMock(holder=MagicMock(return_value=None))
 
         maps = MagicMock()
         maps.bind_session = MagicMock()
@@ -497,6 +509,9 @@ class TestContextInjectedResetOnSubscribeFailure(unittest.IsolatedAsyncioTestCas
         lc._processors = {}
         lc._watcher_locks = {}
         lc._permission_registry = MagicMock()
+        # Hand-built lifecycle: the dispatcher is consulted before the session is
+        # provisioned now, to refuse a room another watcher already holds (§4.1).
+        lc._dispatcher = MagicMock(holder=MagicMock(return_value=None))
 
         maps = MagicMock()
         maps.bind_session = MagicMock()
@@ -711,7 +726,7 @@ class TestSyncWatchersPreservesBlockedAgents(unittest.IsolatedAsyncioTestCase):
         lc._state_store = MagicMock()
         lc._state_store.load = MagicMock(return_value={})
         lc._state_store.save = MagicMock()
-        lc._dispatcher = MagicMock()
+        lc._dispatcher = MagicMock(holder=MagicMock(return_value=None))
         lc._injector = MagicMock()
         lc._permission_registry = None
         lc._maps = MagicMock()

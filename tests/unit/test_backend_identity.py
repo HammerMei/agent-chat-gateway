@@ -136,7 +136,9 @@ class TestSessionReuseRequiresMatchingIdentity(unittest.IsolatedAsyncioTestCase)
             config=config,
             watcher_configs=[wc],
             state_store=state_store,
-            dispatcher=MagicMock(),
+            # `holder()` on a bare MagicMock answers with a truthy mock, which now
+            # reads as "another watcher already serves this room" (§4.1).
+            dispatcher=MagicMock(holder=MagicMock(return_value=None)),
             injector=InjectedContextBuilder(config),
             permission_registry=None,
             maps=SessionMaps(),

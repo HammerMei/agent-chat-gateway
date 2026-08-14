@@ -352,6 +352,9 @@ class TestHistoryHandoffSentSeparatelyFromHeader(unittest.IsolatedAsyncioTestCas
         state_store.save = MagicMock()
         dispatcher = MagicMock()
         dispatcher.add_processor = MagicMock()
+        # No watcher holds the room: a bare MagicMock would answer this with a truthy
+        # mock, which now reads as "another watcher is already serving it" (§4.1).
+        dispatcher.holder = MagicMock(return_value=None)
         injector = InjectedContextBuilder(config)
         maps = SessionMaps()
 
@@ -454,6 +457,7 @@ class TestWatcherLifecycleHistoryHandoff(unittest.IsolatedAsyncioTestCase):
 
         dispatcher = MagicMock()
         dispatcher.add_processor = MagicMock()
+        dispatcher.holder = MagicMock(return_value=None)
 
         injector = InjectedContextBuilder(config)
 

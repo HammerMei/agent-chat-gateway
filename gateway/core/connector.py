@@ -125,7 +125,24 @@ MessageHandler = Callable[[IncomingMessage], Awaitable[bool]]
 # room to accept a message for a given room_id.  Connectors call this BEFORE
 # expensive work (normalize, attachment download) to short-circuit when the
 # queue is already full.  Returns True if at least one processor has capacity.
-CapacityCheck = Callable[[str], bool]  # (room_id: str) -> bool
+class RoomCapacity(Enum):
+    """Why a room can or cannot take a message right now.
+
+    Lives here rather than beside the dispatcher because it is part of the *connector*
+    contract — `dispatch.py` already imports this module, so the reverse would be a
+    cycle, and the enum is what a connector is handed.
+    """
+
+    AVAILABLE = "available"   # a processor is running with queue space
+    FULL = "full"             # a processor exists; its queue is full or it is draining
+    UNROUTED = "unrouted"     # no processor serves this room
+
+
+# (room_id) -> RoomCapacity. Three-valued rather than a bool because a room with no
+# processor and a room whose queue is full call for different behaviour: the first is a
+# routing miss, the second is backpressure, and reporting the first as the second made
+# an idle gateway announce that it was busy (§2.7).
+CapacityCheck = Callable[[str], RoomCapacity]
 
 
 # Connector *types* whose transport delivers unsolicited inbound — the load-time
@@ -240,6 +257,10 @@ class Connector(ABC):
 
         The default implementation is a no-op — connectors that don't perform
         expensive pre-dispatch work (e.g. ScriptConnector) need not override.
+
+        The check returns a `RoomCapacity`, not a bool: `FULL` is backpressure and
+        deserves the "server busy" reply, while `UNROUTED` means no watcher serves this
+        room, which is not something to tell the room's members about.
         """
 
     # ── Outbound ─────────────────────────────────────────────────────────────
