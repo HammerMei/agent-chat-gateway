@@ -200,7 +200,14 @@ class Connector(ABC):
         Webhook platforms   : start HTTP server, or no-op if server is external.
         Script connector    : no-op.
 
-        Must be called once before the Connector can receive or send messages.
+        Must be called once before the Connector can send messages or subscribe.
+
+        **It does not, by itself, mean messages will arrive.** Startup is two phases —
+        `connect()`, then `subscribe_room()` for each room, then `start_inbound()` — and
+        a connector whose transport delivers every room the account can see defers
+        reading until that last call, because events for a room it has no state for are
+        discarded and never replayed. Callers embedding a connector directly must make
+        that third call; `SessionManager` makes it at the end of its sync phase.
         """
         ...
 

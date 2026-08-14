@@ -95,6 +95,11 @@ class MattermostConnector(Connector):
         room = await connector.resolve_room("town-square")
         await connector.subscribe_room(room, watcher_id="abc123")
 
+        # Required, and last: the socket is open from connect() but unread until
+        # here, so events arriving during setup are buffered rather than dropped for
+        # a channel this connector does not know yet. Subscribe first, then this.
+        await connector.start_inbound()
+
         # ... messages arrive, handler is called ...
 
         await connector.disconnect()

@@ -21,6 +21,7 @@ rule has one statement. Where the two disagree, the runtime one is right.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from ipaddress import ip_address
 from urllib.parse import urlsplit
 
 from .room_pattern import is_direct_room_name
@@ -59,9 +60,12 @@ def canonical_origin(url: str) -> str:
       (`https://host/rc-one`, `https://host/rc-two`) — the REST and WebSocket clients
       both build their URLs on that prefix, so those are two servers. Dropping it would
       refuse a valid pair.
-    * **An IPv6 host keeps its brackets.** Without them `https://[::1]:8443` and
+    * **An IP literal is reduced to its canonical form, and an IPv6 host keeps its
+      brackets.** Without them `https://[::1]:8443` and
       `https://[::1:8443]` both render as `https://::1:8443`, one address-and-port and
-      one address, indistinguishable.
+      one address, indistinguishable. Compression matters for the opposite reason:
+      `[2001:0db8:0:0:0:0:0:1]` and `[2001:db8::1]` are one address, and comparing the
+      text would miss a duplicate rather than invent one.
     * **A terminal DNS root dot is dropped.** `chat.example.com.` and `chat.example.com`
       resolve to one server, so keeping the dot would split one account into two keys —
       a missed duplicate, which here means two agents in the same room.
@@ -74,9 +78,28 @@ def canonical_origin(url: str) -> str:
     The default port for the scheme is dropped, so the explicit and implicit spellings
     converge. Query and credentials are discarded: they address a request, not a server.
     """
-    parsed = urlsplit(url if "//" in url else f"//{url}", scheme="https")
-    scheme = (parsed.scheme or "https").lower()
-    host = (parsed.hostname or "").lower().rstrip(".")  # a terminal DNS root dot
+    try:
+        parsed = urlsplit(url if "//" in url else f"//{url}", scheme="https")
+        scheme = (parsed.scheme or "https").lower()
+        host = (parsed.hostname or "").lower().rstrip(".")
+    except ValueError:
+        # `urlsplit` itself rejects a bracketed host that is not an IP literal, so the
+        # earlier per-field guard was not enough: this function is called from
+        # `acg config validate`, and *any* string an operator can type must come back as
+        # a value rather than a traceback. Unparseable text is its own origin — it
+        # matches only an identical mistake.
+        return url.strip().lower().rstrip("/")
+    return _format_origin(scheme, host, parsed)
+
+
+def _format_origin(scheme: str, host: str, parsed) -> str:
+    """The comparable form, once the URL has parsed."""
+    try:
+        # `2001:0db8:0:0:0:0:0:1` and `2001:db8::1` are one address written two ways,
+        # and a textual comparison calls them two servers — a missed duplicate.
+        host = ip_address(host).compressed
+    except ValueError:
+        pass  # a name, or a malformed literal: compare it as written
     if ":" in host:  # IPv6 literal — brackets are what make host and port separable
         host = f"[{host}]"
     try:

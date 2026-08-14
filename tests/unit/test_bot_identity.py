@@ -61,6 +61,38 @@ class TestCanonicalOrigin(unittest.TestCase):
             canonical_origin("http://chat.example.com"),
         )
 
+    def test_equivalent_ipv6_spellings_are_one_origin(self):
+        """`2001:0db8:0:0:0:0:0:1` and `2001:db8::1` are one address. Comparing the text
+        would miss a duplicate — two agents in a room — which is the opposite failure
+        from the bracket case above, in the same two lines of code."""
+        self.assertEqual(
+            canonical_origin("https://[2001:0db8:0:0:0:0:0:1]"),
+            canonical_origin("https://[2001:db8::1]"),
+        )
+
+    def test_it_is_total(self):
+        """No string an operator can type may raise out of here.
+
+        Guarded as a property rather than one case per spelling, because the cases kept
+        arriving one at a time: first a non-numeric port (`urlsplit().port` raises), then
+        a bracketed non-IP host — which `urlsplit` itself rejects, so the per-field guard
+        written for the first one did not cover the second. This function is called from
+        `acg config validate`, where a traceback replaces the attributed bad-URL finding
+        the operator needs, so totality is the requirement and not the individual fixes.
+        """
+        hostile = [
+            "", "://", "https://[", "https://[not:an:address]", "https://]bad[",
+            "https://chat.example.com:notaport", "http://x:99999", "http://x:-1",
+            "https://a b c", "not a url at all", "https://ex.com:", "//", "://:",
+            "https://[::1", "https://user:pw@host:80/path?q=1#f", "\\", "https://.",
+        ]
+        for value in hostile:
+            with self.subTest(url=value):
+                result = canonical_origin(value)
+                self.assertIsInstance(result, str)
+                self.assertEqual(
+                    result, canonical_origin(value), "must be deterministic")
+
     def test_a_deployment_path_is_kept(self):
         """The opposite failure direction, and the worse one: two deployments under one
         host are two servers (both clients build their URLs on the prefix), and
@@ -635,3 +667,56 @@ class TestInboundStartsAfterWatchersExist(unittest.IsolatedAsyncioTestCase):
         from gateway.connectors.script.connector import ScriptConnector
 
         await ScriptConnector().start_inbound()
+
+
+class TestTheDocumentedLifecycleWorks(unittest.IsolatedAsyncioTestCase):
+    """Splitting startup changed a public contract, so the contract is executed here.
+
+    `MattermostConnector`'s class docstring shows an embedding using the connector
+    directly, and the base `connect()` docstring is what a new connector author reads.
+    Deferring the listen loop made "connect, then subscribe, then receive" false for
+    those callers — silently, since the handler simply never fires. This walks the
+    documented order and requires delivery, so the docs and the code fail together.
+    """
+
+    async def test_connect_subscribe_start_inbound_delivers(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from gateway.connectors.mattermost.connector import MattermostConnector
+
+        started = {}
+
+        connector = MattermostConnector.__new__(MattermostConnector)
+        connector._rest = MagicMock(
+            authenticate=AsyncMock(), get_me=AsyncMock(), resolve_team=AsyncMock(),
+            bot_username="bot", bot_user_id="bot-id")
+        connector._config = MagicMock(server_url="https://mm.example.com", team="eng")
+        connector._ws = MagicMock(
+            connect=AsyncMock(),
+            start=AsyncMock(side_effect=lambda: started.setdefault("reading", True)),
+        )
+        connector._channels = {}
+        connector._handler = MagicMock()
+
+        await connector.connect()
+        self.assertNotIn(
+            "reading", started, "reading before any room is known loses those events")
+
+        room = MagicMock(id="chan-1", name="town-square", type="channel")
+        await connector.subscribe_room(room, watcher_id="w1")
+        self.assertIn("chan-1", connector._channels)
+
+        await connector.start_inbound()
+        self.assertTrue(started["reading"], "the documented final step must start it")
+
+    def test_the_usage_example_names_the_step(self):
+        """The example is what an embedder copies; a stale one teaches a lifecycle that
+        drops every message."""
+        from gateway.connectors.mattermost.connector import MattermostConnector
+
+        doc = MattermostConnector.__doc__ or ""
+        self.assertIn("start_inbound()", doc)
+        self.assertLess(
+            doc.index("subscribe_room"), doc.index("start_inbound()"),
+            "the example must subscribe before it starts reading",
+        )
