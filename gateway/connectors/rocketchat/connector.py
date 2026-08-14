@@ -768,12 +768,14 @@ class RocketChatConnector(Connector):
     def _make_ddp_callback(self, room_id: str):
         """Return the async callback that the WebSocket client calls for each DDP message."""
 
-        async def on_raw_ddp_message(doc: dict) -> None:
-            await self._enqueue_room_doc(room_id, doc)
+        async def on_raw_ddp_message(doc: dict, access: dict | None = None) -> None:
+            await self._enqueue_room_doc(room_id, doc, access)
 
         return on_raw_ddp_message
 
-    async def _enqueue_room_doc(self, room_id: str, doc: dict) -> None:
+    async def _enqueue_room_doc(
+        self, room_id: str, doc: dict, access: dict | None = None
+    ) -> None:
         """Forward one raw DDP doc into connector normalization/dispatch.
 
         Per-room buffering and ordering already live in ``RCWebSocketClient``.
@@ -782,17 +784,25 @@ class RocketChatConnector(Connector):
         relies on the transport layer's queue and proceeds directly to the
         connector-specific normalize/filter step.
         """
-        await self._on_raw_ddp_message(room_id, doc)
+        await self._on_raw_ddp_message(room_id, doc, access=access)
 
     async def _on_raw_ddp_message(
         self,
         room_id: str,
         doc: dict,
         *,
+        access: dict | None = None,
         is_replay: bool = False,
         replay_after_ts: str | None = None,
     ) -> None:
         """Parse a raw RC DDP message doc, filter it, normalize it, fire handler.
+
+        `access` is the per-delivery object Rocket.Chat appends to the frame —
+        `roomParticipant`, `roomType`, and `roomName` for rooms that have one. It is
+        `None` on a per-room subscription and on the replay path, which reconstructs its
+        docs from REST history, so nothing here may treat its absence as a negative
+        answer: "not a participant" and "nobody said" are different, and only the first is
+        a reason to drop a message.
 
         Filtering and deduplication are room-level (done once).
         Normalization and dispatch are per-watcher so each watcher gets its own

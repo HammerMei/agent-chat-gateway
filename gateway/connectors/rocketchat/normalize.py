@@ -87,6 +87,19 @@ def filter_rc_message(
 
     Returns a FilterResult describing the outcome.
     """
+    # 0. Skip system messages.
+    #
+    # Rocket.Chat marks them with a `t` letter on the message doc — `au` for a member
+    # added, `ru` removed, `room_changed_topic`, and so on — and delivers them over DDP
+    # like any other message. Only the REST history path filtered them (`rest.py`), so a
+    # live join notification reached the agent as a turn: an empty `msg`, rendered by
+    # `_extract_text` as the literal "(empty message)", spending a model call on it.
+    #
+    # Mattermost has gated this on the live path all along (`post.get("type")`); this is
+    # the missing half of the same check.
+    if doc.get("t"):
+        return FilterResult(accepted=False, reason="system message")
+
     sender = doc.get("u", {}).get("username", "")
 
     # 1. Skip own messages

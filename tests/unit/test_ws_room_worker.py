@@ -109,14 +109,14 @@ class TestRoomWorkerCancelLogging(unittest.IsolatedAsyncioTestCase):
 
         started_callback = asyncio.Event()
 
-        async def slow_callback(d):
+        async def slow_callback(d, access=None):
             started_callback.set()
             await asyncio.sleep(300)  # blocks until cancelled
 
         ws._callbacks["room1"] = slow_callback
 
         worker_task = asyncio.create_task(ws._room_worker("room1", queue))
-        await queue.put(doc)
+        await queue.put((doc, None))
 
         # Wait until the callback starts
         await asyncio.wait_for(started_callback.wait(), timeout=2.0)
@@ -151,11 +151,11 @@ class TestRoomWorkerCancelLogging(unittest.IsolatedAsyncioTestCase):
         queue: asyncio.Queue = asyncio.Queue()
         doc = {"_id": "msg_xyz", "msg": "test"}
 
-        async def bad_callback(d):
+        async def bad_callback(d, access=None):
             raise ValueError("callback failed")
 
         ws._callbacks["room1"] = bad_callback
-        await queue.put(doc)
+        await queue.put((doc, None))
 
         # Worker should log error but continue running (no CancelledError re-raise)
         worker_task = asyncio.create_task(ws._room_worker("room1", queue))
@@ -196,7 +196,7 @@ class TestRoomWorkerQueueDrainOnCancel(unittest.IsolatedAsyncioTestCase):
         # pending when the CancelledError fires.
         callback_entered = asyncio.Event()
 
-        async def _blocking_callback(doc):
+        async def _blocking_callback(doc, access=None):
             callback_entered.set()
             await asyncio.sleep(9999)  # will be cancelled
 
@@ -205,7 +205,7 @@ class TestRoomWorkerQueueDrainOnCancel(unittest.IsolatedAsyncioTestCase):
         # Enqueue 3 messages: worker processes msg0 (blocks in callback),
         # while msg1 and msg2 wait in the queue.
         for i in range(3):
-            queue.put_nowait({"_id": f"msg{i}"})
+            queue.put_nowait(({"_id": f"msg{i}"}, None))
 
         import logging
 
@@ -248,7 +248,7 @@ class TestRoomWorkerQueueDrainOnCancel(unittest.IsolatedAsyncioTestCase):
 
         callback_entered = asyncio.Event()
 
-        async def _blocking_callback(doc):
+        async def _blocking_callback(doc, access=None):
             callback_entered.set()
             await asyncio.sleep(9999)
 
@@ -256,7 +256,7 @@ class TestRoomWorkerQueueDrainOnCancel(unittest.IsolatedAsyncioTestCase):
 
         # 1 message in callback (blocking), 2 more in queue
         for i in range(3):
-            queue.put_nowait({"_id": f"msg{i}"})
+            queue.put_nowait(({"_id": f"msg{i}"}, None))
 
         worker_task = asyncio.create_task(ws._room_worker("room-aabbcc", queue))
         await callback_entered.wait()
@@ -300,7 +300,7 @@ class TestRoomWorkerInFlightCounted(unittest.IsolatedAsyncioTestCase):
                 await task_cancel_event.wait()
 
         # Register a real callback so the worker tries to acquire the semaphore
-        async def real_callback(d):
+        async def real_callback(d, access=None):
             pass
 
         ws._callbacks[room_id] = real_callback
@@ -309,7 +309,7 @@ class TestRoomWorkerInFlightCounted(unittest.IsolatedAsyncioTestCase):
         await holder_acquired.wait()  # semaphore is now held
 
         # Put the doc in the queue
-        await queue.put(doc)
+        await queue.put((doc, None))
 
         worker_task = asyncio.create_task(ws._room_worker(room_id, queue))
 
@@ -346,7 +346,7 @@ class TestRoomWorkerInFlightCounted(unittest.IsolatedAsyncioTestCase):
         room_id = "ROOM456"
         queue: asyncio.Queue = asyncio.Queue()
 
-        async def real_callback(d):
+        async def real_callback(d, access=None):
             pass
 
         ws._callbacks[room_id] = real_callback
@@ -385,7 +385,7 @@ class TestBoundedWebSocketCallbacks(unittest.IsolatedAsyncioTestCase):
         active = []
         max_active = 0
 
-        async def slow_callback(doc):
+        async def slow_callback(doc, access=None):
             nonlocal max_active
             active.append(1)
             current = len(active)
@@ -402,7 +402,7 @@ class TestBoundedWebSocketCallbacks(unittest.IsolatedAsyncioTestCase):
             task = asyncio.create_task(client._room_worker(room_id, q))
             client._callback_tasks.add(task)
             task.add_done_callback(client._callback_tasks.discard)
-            q.put_nowait({"msg": f"m{i}"})
+            q.put_nowait(({"msg": f"m{i}"}, None))
 
         # Let workers process
         await asyncio.sleep(0.15)

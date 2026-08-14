@@ -309,7 +309,7 @@ class TestCallbackTaskTracking(unittest.IsolatedAsyncioTestCase):
         client = _make_client()
         callback_done = asyncio.Event()
 
-        async def tracking_callback(doc):
+        async def tracking_callback(doc, access=None):
             callback_done.set()
 
         client._callbacks = {"room_X": tracking_callback}
@@ -343,7 +343,7 @@ class TestCallbackTaskTracking(unittest.IsolatedAsyncioTestCase):
         client = _make_client()
         received: list[str] = []
 
-        async def collecting_callback(doc):
+        async def collecting_callback(doc, access=None):
             received.append(doc.get("msg", ""))
 
         client._callbacks = {"room_Y": collecting_callback}
@@ -371,7 +371,7 @@ class TestCallbackTaskTracking(unittest.IsolatedAsyncioTestCase):
         client = _make_client()
         barrier = asyncio.Event()
 
-        async def blocking_callback(doc):
+        async def blocking_callback(doc, access=None):
             await barrier.wait()
 
         client._callbacks = {
@@ -402,7 +402,7 @@ class TestCallbackTaskTracking(unittest.IsolatedAsyncioTestCase):
         client = _make_client()
         barrier = asyncio.Event()
 
-        async def blocking_callback(doc):
+        async def blocking_callback(doc, access=None):
             await barrier.wait()
 
         client._callbacks = {"room_W": blocking_callback}
@@ -438,7 +438,7 @@ class TestInboundOverflowState(unittest.IsolatedAsyncioTestCase):
         client._callbacks = {room_id: callback}
 
         queue: asyncio.Queue = asyncio.Queue(maxsize=1)
-        queue.put_nowait({"_id": "existing"})
+        queue.put_nowait(({"_id": "existing"}, None))
         client._room_queues[room_id] = queue
 
         blocker = asyncio.Event()

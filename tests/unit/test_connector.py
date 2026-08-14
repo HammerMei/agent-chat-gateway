@@ -1720,3 +1720,149 @@ class TestRound3Fixes(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRidIsAuthoritative(unittest.IsolatedAsyncioTestCase):
+    """Which field decides where a message goes (§6.1).
+
+    The fan-out read `eventName or rid`, with `eventName` winning. That worked only because
+    a per-room `sub` makes Rocket.Chat set `eventName` to the room id itself. On a stream
+    spanning rooms — `__my_messages__` — `eventName` is the literal *stream* name, so every
+    room resolves to one key: one callback, one queue, one worker. Per-room ordering
+    silently becomes global ordering and one slow room stalls every other.
+    """
+
+    def _client(self):
+        from gateway.connectors.rocketchat.websocket import RCWebSocketClient
+
+        client = RCWebSocketClient("https://x", "bot", "pw")
+        self.seen = []
+
+        async def callback(doc, access=None):
+            self.seen.append((doc, access))
+
+        client._callbacks = {"room-real": callback}
+        return client
+
+    def _frame(self, event_name, rid, args_extra=None):
+        args = [{"_id": "m1", "rid": rid, "msg": "hi"}]
+        if args_extra is not None:
+            args.append(args_extra)
+        return {
+            "msg": "changed",
+            "collection": "stream-room-messages",
+            "fields": {"eventName": event_name, "args": args},
+        }
+
+    async def _drain(self, client, room_id="room-real"):
+        queue = client._room_queues.get(room_id)
+        self.assertIsNotNone(queue, "no queue was created for the room")
+        item = queue.get_nowait()
+        return item
+
+    async def test_the_room_comes_from_rid_not_the_stream_name(self):
+        client = self._client()
+        await client._handle_room_message(
+            self._frame("__my_messages__", "room-real"))
+
+        self.assertIn("room-real", client._room_queues)
+        self.assertNotIn("__my_messages__", client._room_queues)
+        doc, _ = await self._drain(client)
+        self.assertEqual(doc["rid"], "room-real")
+
+    async def test_two_rooms_on_one_stream_get_their_own_queues(self):
+        """The property the old order destroyed."""
+        client = self._client()
+
+        async def callback(doc, access=None):
+            self.seen.append((doc, access))
+
+        client._callbacks["room-other"] = callback
+
+        await client._handle_room_message(self._frame("__my_messages__", "room-real"))
+        await client._handle_room_message(self._frame("__my_messages__", "room-other"))
+
+        self.assertEqual(
+            sorted(client._room_queues), ["room-other", "room-real"],
+            "each room must have its own queue, or ordering becomes global",
+        )
+
+    async def test_the_stream_name_still_answers_when_a_frame_carries_no_message(self):
+        """`eventName` survives as a fallback, not as the primary."""
+        client = self._client()
+        frame = self._frame("room-real", "")
+        frame["fields"]["args"][0].pop("rid")
+
+        await client._handle_room_message(frame)
+        self.assertIn("room-real", client._room_queues)
+
+    async def test_the_access_object_rides_with_the_message(self):
+        """It describes *this delivery* — whether the account is a participant, the room's
+        kind and name — not the room in general, so storing it per room would store a
+        snapshot of the last message rather than a property."""
+        client = self._client()
+        access = {"roomParticipant": True, "roomType": "p", "roomName": "sandbox"}
+        await client._handle_room_message(
+            self._frame("__my_messages__", "room-real", args_extra=access))
+
+        _, carried = await self._drain(client)
+        self.assertEqual(carried, access)
+
+    async def test_a_frame_with_no_access_object_carries_none(self):
+        """A per-room subscription has no access object, and the replay path reconstructs
+        its docs from REST history. Absence must stay distinguishable from a negative
+        answer: "not a participant" and "nobody said" are different."""
+        client = self._client()
+        await client._handle_room_message(self._frame("__my_messages__", "room-real"))
+
+        _, carried = await self._drain(client)
+        self.assertIsNone(carried)
+
+    async def test_a_non_dict_second_argument_is_ignored(self):
+        client = self._client()
+        await client._handle_room_message(
+            self._frame("__my_messages__", "room-real", args_extra="unexpected"))
+
+        _, carried = await self._drain(client)
+        self.assertIsNone(carried)
+
+
+class TestSystemMessagesOnTheLivePath(unittest.TestCase):
+    """A `t` letter marks a system message, and Rocket.Chat delivers them over DDP.
+
+    Only the REST history path filtered them, so a live join notification reached the agent
+    as a turn — with an empty body, which `_extract_text` renders as the literal
+    "(empty message)", spending a model call on it. Mattermost has gated this on the live
+    path all along; this is the missing half of the same check.
+    """
+
+    def _config(self):
+        from gateway.connectors.rocketchat.config import RocketChatConfig
+
+        return RocketChatConfig(
+            server_url="https://x", username="bot", password="pw", name="rc",
+            owners=["glin"], require_mention=False,
+        )
+
+    def test_a_system_message_is_rejected(self):
+        from gateway.connectors.rocketchat.normalize import filter_rc_message
+
+        for letter in ("au", "ru", "room_changed_topic", "uj"):
+            with self.subTest(t=letter):
+                result = filter_rc_message(
+                    {"_id": "m1", "rid": "r1", "msg": "", "t": letter,
+                     "u": {"username": "glin"}, "ts": {"$date": 1}},
+                    self._config(), room_type="channel", last_processed_ts=None,
+                )
+                self.assertFalse(result.accepted)
+                self.assertEqual(result.reason, "system message")
+
+    def test_an_ordinary_message_still_passes(self):
+        from gateway.connectors.rocketchat.normalize import filter_rc_message
+
+        result = filter_rc_message(
+            {"_id": "m1", "rid": "r1", "msg": "hello", "u": {"username": "glin"},
+             "ts": {"$date": 1}},
+            self._config(), room_type="channel", last_processed_ts=None,
+        )
+        self.assertTrue(result.accepted)
