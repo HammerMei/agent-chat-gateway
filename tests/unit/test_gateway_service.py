@@ -248,7 +248,7 @@ class TestIdentityBarrier(unittest.IsolatedAsyncioTestCase):
         service = self._service_with(
             BotIdentity("mattermost", "https://mm.example.com", "user-abc", scope="team-1"),
             BotIdentity("mattermost", "https://mm.example.com", "user-abc", scope="team-2"),
-            dms={"c0": DmClaim(whole_stream=True), "c1": DmClaim(whole_stream=True)},
+            dms={"c0": DmClaim(direct=True), "c1": DmClaim(direct=True)},
         )
 
         with self.assertRaises(DuplicateBotIdentityError) as cm:
@@ -259,7 +259,7 @@ class TestIdentityBarrier(unittest.IsolatedAsyncioTestCase):
         service = self._service_with(
             BotIdentity("mattermost", "https://mm.example.com", "user-abc", scope="team-1"),
             BotIdentity("mattermost", "https://mm.example.com", "user-abc", scope="team-2"),
-            dms={"c0": DmClaim(whole_stream=True)},
+            dms={"c0": DmClaim(direct=True)},
         )
         service._control.start = AsyncMock(side_effect=RuntimeError("stop here"))
 

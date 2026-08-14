@@ -187,12 +187,12 @@ class TestIdentityConflicts(unittest.TestCase):
         self.assertEqual(
             len(find_identity_conflicts([_entry("a", scope="team1"), _entry("b")])), 1)
 
-    def test_two_whole_stream_claims_on_one_account_are_rejected_across_teams(self):
+    def test_two_one_to_one_claims_on_one_account_are_rejected_across_teams(self):
         """The condition on the exception. A DM has no team, so the team gate cannot
         separate it and the platform delivers it to every open connection."""
         conflicts = find_identity_conflicts([
-            _entry("a", scope="team1", dms=DmClaim(whole_stream=True)),
-            _entry("b", scope="team2", dms=DmClaim(whole_stream=True)),
+            _entry("a", scope="team1", dms=DmClaim(direct=True)),
+            _entry("b", scope="team2", dms=DmClaim(direct=True)),
         ])
         self.assertEqual(len(conflicts), 1)
         self.assertIn("direct message", conflicts[0].lower())
@@ -200,7 +200,7 @@ class TestIdentityConflicts(unittest.TestCase):
     def test_one_dm_owner_across_teams_is_allowed(self):
         self.assertEqual(
             find_identity_conflicts([
-                _entry("a", scope="team1", dms=DmClaim(whole_stream=True)),
+                _entry("a", scope="team1", dms=DmClaim(direct=True)),
                 _entry("b", scope="team2"),
             ]),
             [],
@@ -233,7 +233,7 @@ class TestIdentityConflicts(unittest.TestCase):
         static watcher on the other connector is waiting for."""
         self.assertEqual(
             len(find_identity_conflicts([
-                _entry("a", scope="team1", dms=DmClaim(whole_stream=True)),
+                _entry("a", scope="team1", dms=DmClaim(direct=True)),
                 _entry("b", scope="team2", dms=DmClaim(rooms=frozenset({"@alice"}))),
             ])),
             1,
@@ -509,16 +509,36 @@ class TestWhoOwnsTheDmStream(unittest.TestCase):
     def test_a_static_at_room_claims_that_room_only(self):
         claims = dm_claims([self._watcher("mm-eng", "@alice")], [])
         self.assertEqual(claims["mm-eng"], DmClaim(rooms=frozenset({"@alice"})))
-        self.assertFalse(claims["mm-eng"].whole_stream)
+        self.assertFalse(claims["mm-eng"].direct, "a named room is not every 1:1 DM")
 
     def test_a_static_channel_claims_nothing(self):
         self.assertEqual(dm_claims([self._watcher("mm-eng", "incidents")], []), {})
 
-    def test_a_rule_opting_in_claims_the_whole_stream(self):
-        for kwargs in ({"direct": True}, {"group_direct": True}):
-            with self.subTest(**kwargs):
-                claims = dm_claims([], [self._rule("mm-eng", **kwargs)])
-                self.assertTrue(claims["mm-eng"].whole_stream)
+    def test_a_rule_opting_in_claims_that_class_only(self):
+        """The two DM kinds are separate in `RoomMatcher.match()`, so a rule taking one
+        must not be recorded as taking the other."""
+        one_to_one = dm_claims([], [self._rule("mm-eng", direct=True)])["mm-eng"]
+        self.assertTrue(one_to_one.direct)
+        self.assertFalse(one_to_one.group_direct)
+
+        group = dm_claims([], [self._rule("mm-eng", group_direct=True)])["mm-eng"]
+        self.assertTrue(group.group_direct)
+        self.assertFalse(group.direct)
+
+    def test_the_two_dm_classes_do_not_collide(self):
+        """A connector on 1:1 DMs and one on group DMs answer different conversations;
+        rejecting them refuses a working pairing."""
+        self.assertFalse(
+            DmClaim(direct=True).overlaps(DmClaim(group_direct=True)))
+        self.assertTrue(
+            DmClaim(group_direct=True).overlaps(DmClaim(group_direct=True)))
+
+    def test_a_named_room_is_a_one_to_one_conversation(self):
+        """`@someone` addresses one person and resolves through the direct-channel
+        endpoint, so it overlaps a 1:1 claim and never a group-DM one."""
+        named = DmClaim(rooms=frozenset({"@alice"}))
+        self.assertTrue(named.overlaps(DmClaim(direct=True)))
+        self.assertFalse(named.overlaps(DmClaim(group_direct=True)))
 
     def test_room_names_are_compared_casefolded(self):
         """One username spelled two ways is one channel, and a missed match here is the
@@ -532,11 +552,12 @@ class TestWhoOwnsTheDmStream(unittest.TestCase):
             [self._watcher("mm-sales", "@bob"), self._watcher("mm-eng", "general")],
             [self._rule("mm-eng", direct=True)],
         )
-        self.assertTrue(claims["mm-eng"].whole_stream)
+        self.assertTrue(claims["mm-eng"].direct)
         self.assertEqual(claims["mm-sales"].rooms, frozenset({"@bob"}))
 
     def test_a_connector_claiming_nothing_never_overlaps(self):
-        self.assertFalse(DmClaim().overlaps(DmClaim(whole_stream=True)))
+        self.assertFalse(DmClaim().overlaps(DmClaim(direct=True)))
+        self.assertFalse(DmClaim(direct=True).overlaps(DmClaim()))
 
 
 class TestStaticDmWatchersReachTheCheck(unittest.TestCase):
@@ -792,3 +813,52 @@ class TestVoiceAcceptsOnlyWhenReady(unittest.IsolatedAsyncioTestCase):
             connector = VoiceConnector(VoiceConfig(host="127.0.0.1", port=port, secret=""))
             with self.assertRaises(OSError):
                 await connector.connect()
+
+
+class TestDeferredInboundIsDocumented(unittest.TestCase):
+    """A connector that defers accepting must say so where an embedder will read it.
+
+    The failure is silent in the worst way: a direct embedding follows a docstring that
+    ends at `connect()`, and its handler simply never fires. This was fixed once for
+    Mattermost and missed for the voice connector in the same round — an instance patched
+    instead of a shape — so it is enumerated rather than remembered.
+    """
+
+    def _deferring_connectors(self):
+        import gateway.connectors as pkg
+        from gateway.core.connector import Connector
+
+        found = {}
+        for mod in pkgutil.walk_packages(pkg.__path__, f"{pkg.__name__}."):
+            try:
+                module = __import__(mod.name, fromlist=["_"])
+            except Exception:
+                continue
+            for name, obj in vars(module).items():
+                if (
+                    inspect.isclass(obj)
+                    and issubclass(obj, Connector)
+                    and obj.__module__ == mod.name
+                    and obj.start_inbound is not Connector.start_inbound
+                ):
+                    found[name] = obj
+        return found
+
+    def test_the_sweep_finds_the_deferring_connectors(self):
+        """Vacuously-true insurance: an empty sweep would pass every assertion below."""
+        self.assertEqual(
+            set(self._deferring_connectors()), {"MattermostConnector", "VoiceConnector"})
+
+    def test_each_one_documents_the_extra_phase(self):
+        for name, cls in sorted(self._deferring_connectors().items()):
+            with self.subTest(connector=name):
+                doc = cls.__doc__ or ""
+                self.assertIn(
+                    "start_inbound()", doc,
+                    f"{name} defers accepting input but its class docstring never says "
+                    f"so, so a direct embedding silently receives nothing",
+                )
+                self.assertLess(
+                    doc.index("connect()"), doc.index("start_inbound()"),
+                    "the documented order must match the required order",
+                )

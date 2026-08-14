@@ -87,7 +87,20 @@ class VoiceConnector(Connector):
     """HTTP voice gateway connector.
 
     One instance per ``type: voice`` connector entry in config.yaml.
-    Starts an asyncio HTTP server on ``connect()`` and stops it on ``disconnect()``.
+
+    Lifecycle, and the middle step is not optional::
+
+        await connector.connect()        # binds the port; does NOT accept yet
+        # ... watchers start, processors are installed ...
+        await connector.start_inbound()  # begins accepting requests
+        await connector.disconnect()     # closes the server
+
+    Binding and accepting are separate on purpose. Binding early keeps a port conflict
+    a startup failure where it is easy to attribute; accepting late means a request
+    never arrives before a watcher can answer it — one that did would reach a
+    dispatcher with no processor and be told the gateway is busy, which is a wrong
+    answer from a daemon that is merely still starting. An embedding that skips
+    ``start_inbound()`` gets a bound port that refuses every connection.
 
     Endpoint: ``POST /ask/<room>``
         The ``<room>`` segment is the ACG room name — matches the ``room:``
@@ -106,7 +119,11 @@ class VoiceConnector(Connector):
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def connect(self) -> None:
-        """Start the HTTP server and log the listen address."""
+        """Bind the listen address without accepting connections yet.
+
+        `start_inbound()` is what opens the door; see the class docstring for why the
+        two halves are separate.
+        """
         # Bound but not accepting: `start_serving=False` keeps a port conflict a
         # startup failure at the moment it is easiest to attribute, while leaving the
         # listener closed until `start_inbound()`. Serving from here would answer

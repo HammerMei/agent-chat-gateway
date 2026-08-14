@@ -160,25 +160,43 @@ class BotIdentity:
 class DmClaim:
     """How much of an account's direct-message traffic one connector answers.
 
-    A boolean was wrong, and wrong in the expensive direction. A rule opting in with
-    `direct:`/`group_direct:` claims the whole class — every DM the account receives.
-    A **static** watcher claims exactly one resolved channel: `subscribe_room()`
-    registers that channel and `_on_posted_event()` ignores every other, so two
-    connectors watching `@alice` and `@bob` cannot both answer one message. Treating
-    both shapes as "owns DMs" refused a configuration that works.
+    Three claims, not one flag, because collapsing them refuses configurations that
+    work — and this check answers a collision by refusing to start:
+
+    * `direct` — every 1:1 DM the account receives (`rooms.direct` on a rule).
+    * `group_direct` — every group DM (`rooms.group_direct`). A separate class in
+      `RoomMatcher.match()`, so a connector claiming only this cannot collide with one
+      claiming only 1:1 DMs.
+    * `rooms` — the specific conversations named by **static** watchers. Such a watcher
+      claims exactly one resolved channel: `subscribe_room()` registers that channel and
+      `_on_posted_event()` ignores every other, so two connectors watching `@alice` and
+      `@bob` cannot both answer one message.
     """
 
-    whole_stream: bool = False
-    rooms: frozenset[str] = frozenset()
+    direct: bool = False        # every 1:1 DM
+    group_direct: bool = False  # every group DM
+    rooms: frozenset[str] = frozenset()  # named 1:1 conversations
 
     def overlaps(self, other: "DmClaim") -> bool:
-        """Whether both connectors could answer the same direct message."""
-        if not (self.whole_stream or self.rooms):
-            return False
-        if not (other.whole_stream or other.rooms):
-            return False
-        if self.whole_stream or other.whole_stream:
-            return True  # one of them takes every DM, including the other's
+        """Whether both connectors could answer the same direct message.
+
+        1:1 and group DMs are separate classes, not one stream: `RoomMatcher.match()`
+        gates `RoomKind.DM` on `direct` and `RoomKind.GROUP_DM` on `group_direct`
+        independently, so a connector claiming only one of them cannot collide with a
+        connector claiming only the other. Collapsing them refused that pairing.
+
+        A named room is a 1:1 conversation — `@someone` addresses one person, and both
+        connectors resolve it through their direct-channel endpoint — so it overlaps a
+        1:1 claim but never a group-DM one.
+        """
+        mine_1to1 = self.direct or bool(self.rooms)
+        theirs_1to1 = other.direct or bool(other.rooms)
+        if self.direct and theirs_1to1:
+            return True
+        if other.direct and mine_1to1:
+            return True
+        if self.group_direct and other.group_direct:
+            return True
         return bool(self.rooms & other.rooms)
 
 
@@ -206,11 +224,8 @@ def dm_claims(watchers, watcher_rules) -> dict[str, DmClaim]:
     Takes the two lists rather than a `GatewayConfig` because this module is in
     `gateway.core`, which the config layer imports and must not import back.
     """
-    whole: set[str] = {
-        rule.connector
-        for rule in watcher_rules
-        if rule.rooms.direct or rule.rooms.group_direct
-    }
+    direct = {r.connector for r in watcher_rules if r.rooms.direct}
+    group = {r.connector for r in watcher_rules if r.rooms.group_direct}
     rooms: dict[str, set[str]] = {}
     for w in watchers:
         if is_direct_room_name(w.room):
@@ -218,8 +233,11 @@ def dm_claims(watchers, watcher_rules) -> dict[str, DmClaim]:
 
     return {
         name: DmClaim(
-            whole_stream=name in whole, rooms=frozenset(rooms.get(name, ())))
-        for name in whole | rooms.keys()
+            direct=name in direct,
+            group_direct=name in group,
+            rooms=frozenset(rooms.get(name, ())),
+        )
+        for name in direct | group | rooms.keys()
     }
 
 
@@ -267,11 +285,12 @@ def find_identity_conflicts(entries: list[ConnectorIdentity]) -> list[str]:
                 pair = ", ".join(
                     sorted(f"'{e.connector_name}'" for e in (a, b)))
                 shared = sorted(a.dms.rooms & b.dms.rooms)
-                detail = (
-                    f"both watch {', '.join(shared)}"
-                    if shared
-                    else "one of them takes every direct message the account receives"
-                )
+                if shared:
+                    detail = f"both watch {', '.join(shared)}"
+                elif a.dms.direct or b.dms.direct:
+                    detail = "one of them takes every 1:1 direct message"
+                else:
+                    detail = "both take every group direct message"
                 conflicts.append(
                     f"Connectors {pair} share the bot account {user_id} on {origin} and "
                     f"their direct-message coverage overlaps — {detail}. Different teams "
