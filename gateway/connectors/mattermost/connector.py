@@ -43,6 +43,8 @@ from ...core.connector import (
     RoomCapacity,
 )
 from ...core.tz_utils import local_iana_timezone as _server_local_timezone
+from ...core.watcher_manager import RoomRef
+from ...core.watcher_rule import RoomKind
 from .agent_chain import TurnStore
 from .config import MattermostConfig
 from .mentions import is_room_wide_mention
@@ -80,6 +82,18 @@ class _ChannelState:
     seen_ids: collections.deque = field(default_factory=lambda: collections.deque())
     seen_ids_set: set = field(default_factory=set)
     watcher_ids: set = field(default_factory=set)
+
+
+# Mattermost channel type → the gateway's room kind. `room_type_for` in rest.py maps the
+# same four letters to the *string* room type an `IncomingMessage` carries; this maps them
+# to the enum routing uses. Two mappings because they answer to two different consumers,
+# and both are stated once.
+_ROOM_KINDS = {
+    "O": RoomKind.CHANNEL,
+    "P": RoomKind.GROUP,
+    "D": RoomKind.DM,
+    "G": RoomKind.GROUP_DM,
+}
 
 
 class MattermostConnector(Connector):
@@ -128,6 +142,7 @@ class MattermostConnector(Connector):
         )
         self._handler: MessageHandler | None = None
         self._capacity_check: CapacityCheck | None = None
+        self._router = None
         self._channels: dict[str, _ChannelState] = {}  # channel_id -> state
         self._attachments_cache_base = (
             Path(config.attachments.cache_dir_global).expanduser() / config.name
@@ -350,6 +365,25 @@ class MattermostConnector(Connector):
             name=info.get("name", room_name),
             type=info.get("type", "channel"),
         )
+
+    async def resolve_room_by_id(self, room_id: str) -> Room:
+        """A `Room` for a channel id, for callers that never had a name.
+
+        Boot and recreation resolve by id, never by a persisted name: a name freed by a
+        rename can be reused by a different room, and resolving by name would bind an
+        existing session to the wrong one (§2.3).
+
+        The name this returns is the **server's**, where `resolve_room` returns the
+        configured string for a DM (`@alice`). That divergence is deliberate and bounded:
+        the value reaches the prompt prefix and the history header, and both want a
+        human-meaningful room — but a DM's server-side name is the opaque
+        `<userid>__<userid>` form, so the display name is used for the DM kinds and the
+        channel name otherwise.
+        """
+        info = await self._rest.get_channel(room_id)
+        kind = info["type"]
+        name = info["display_name"] if kind in ("dm", "group_dm") else info["name"]
+        return Room(id=info["id"], name=name or room_id, type=kind)
 
     # ── Per-channel local bookkeeping (no wire protocol — see websocket.py) ────
 
@@ -654,6 +688,119 @@ class MattermostConnector(Connector):
 
     # ── Internal: posted-event dispatch ──────────────────────────────────────
 
+    def register_router(self, router) -> None:
+        """Register the callback consulted for a channel no watcher is tracking.
+
+        Replaces "unknown channel → discard" with "unknown channel → ask". The connector
+        supplies a `RoomRef`; deciding whether a watcher should exist for it is the core's
+        business (a rule has to match, §2.2), and creating one is a later increment's.
+
+        Optional on purpose: with no router registered the connector behaves exactly as
+        before, which is what keeps this branch runnable while creation is still driven by
+        static config.
+        """
+        self._router = router
+
+    def reap_room(self, room_id: str) -> None:
+        """Forget a channel's local state without touching watcher bookkeeping.
+
+        Unsubscribing is a *watcher* releasing a room; reaping is the room going away — a
+        channel the bot was removed from, or one whose watcher expired. Keeping them
+        separate matters because `unsubscribe_room` returns early while any other watcher
+        holds the room, which is the wrong answer when the room itself is gone.
+
+        Idempotent: reaping an unknown channel is not an error, since the caller is
+        reacting to an event that may arrive more than once.
+        """
+        if self._channels.pop(room_id, None) is not None:
+            self._ws.unregister_channel(room_id)
+            logger.info("Reaped channel state for %s", room_id)
+
+    def _room_ref_from_event(self, channel_id: str, decoded: dict) -> "RoomRef | None":
+        """Build a `RoomRef` from the event, or None when the event cannot describe a room.
+
+        Everything needed is on the wire for a channel post — name, type and team — so this
+        costs no REST call, which matters because Mattermost holds a connector-wide permit
+        for the whole handler (§6.2).
+
+        **Returns None when the metadata is absent, and that is not a defensive
+        formality.** The reconnect-replay path synthesizes its decoded events from REST
+        history, which carries bare posts with no channel metadata at all — every field
+        here is `None` on every replayed message. A router asked to judge one of those
+        would be judging `channel_type=None`, and a team gate reading the same fields would
+        silently swallow the entire replay window.
+        """
+        channel_type = decoded.get("channel_type")
+        if not channel_type:
+            return None
+
+        kind = _ROOM_KINDS.get(channel_type)
+        if kind is None:
+            logger.debug(
+                "Channel %s has unknown type %r — not routable", channel_id, channel_type)
+            return None
+
+        display = decoded.get("channel_display_name") or ""
+        if kind is RoomKind.DM:
+            # `channel_name` is `<userid>__<userid>`; the display name is the counterpart.
+            participants = (display,) if display else ()
+        elif kind is RoomKind.GROUP_DM:
+            # The display name is the member list, including the bot itself. Split for the
+            # participants column; never used as a label, which must not move when
+            # membership does (§2.3).
+            participants = tuple(p.strip() for p in display.split(",") if p.strip())
+        else:
+            participants = ()
+
+        return RoomRef(
+            id=channel_id,
+            kind=kind,
+            name="" if kind in (RoomKind.DM, RoomKind.GROUP_DM)
+            else (decoded.get("channel_name") or ""),
+            participants=participants,
+        )
+
+    def _in_scope(self, decoded: dict) -> bool:
+        """Whether this event belongs to the team this connector serves (§6.3).
+
+        The socket spans every team the account belongs to, so a connector scoped to one
+        team must discard another team's channels itself.
+
+        **Two things pass the gate that a naive equality check would reject**, and both
+        would be silent losses:
+
+        * **A DM has no team.** `data.team_id` is empty for DMs and `broadcast.team_id` is
+          empty always (§6.2), so gating on equality would reject every direct message —
+          disabling DM support by way of a team filter.
+        * **A replayed message has no metadata at all.** The reconnect path synthesizes
+          events from REST history with `team_id=None`, so an equality check would drop
+          the entire replay window after every disconnect. Those posts were fetched for
+          channels this connector already tracks, so their scope is established by the
+          subscription that fetched them.
+        """
+        team_id = decoded.get("team_id")
+        if not team_id:
+            return True
+        return team_id == self._rest.team_id
+
+    async def _offer_to_router(self, channel_id: str, decoded: dict) -> None:
+        """Hand an untracked channel to the router, if there is one and it is in scope."""
+        if self._router is None:
+            return
+        if not self._in_scope(decoded):
+            logger.debug(
+                "Channel %s belongs to another team — not offering to the router",
+                channel_id,
+            )
+            return
+        room = self._room_ref_from_event(channel_id, decoded)
+        if room is None:
+            return
+        try:
+            await self._router(room)
+        except Exception as e:
+            logger.error("Router failed for channel %s: %s", channel_id, e)
+
     async def _on_posted_event(
         self,
         decoded: dict,
@@ -706,9 +853,27 @@ class MattermostConnector(Connector):
 
         post = decoded["post"]
         channel_id = post.get("channel_id", "")
+
+        # System and own messages are rejected before the channel is looked up. Both are
+        # delivered by Mattermost (§6.2), and both are rejected for reasons that have
+        # nothing to do with which channel they arrived in — so checking the channel first
+        # only decided *where* they died. It matters now because an unknown channel is no
+        # longer the end of the road: it is a candidate for routing, and a join
+        # notification is not something to create a watcher for.
+        #
+        # The dedup below cannot move with them: `seen_ids` lives on the channel's state,
+        # so there is nothing to check against until the channel is known.
+        if post.get("type"):
+            return  # A system message (join/leave/…), never a turn.
+
+        sender_id = post.get("user_id", "")
+        if sender_id == self._rest.bot_user_id:
+            return  # Own message — also skipped before spending a resolve_username call.
+
         state = self._channels.get(channel_id)
         if not state:
-            return  # Not a channel any watcher is tracking — ignore.
+            await self._offer_to_router(channel_id, decoded)
+            return
 
         msg_id = post.get("id", "")
         if msg_id and msg_id in state.seen_ids_set:
@@ -718,13 +883,6 @@ class MattermostConnector(Connector):
         # System messages carry no useful sender identity to resolve — and
         # filter_mm_message rejects them anyway — so skip the async username
         # resolution entirely for them.
-        if post.get("type"):
-            return
-
-        sender_id = post.get("user_id", "")
-        if sender_id == self._rest.bot_user_id:
-            return  # Own message — skip before spending a resolve_username call.
-
         # Register BEFORE the first await (resolve_username) — see the
         # seen_ids registration timing note in the docstring above.
         if msg_id:
