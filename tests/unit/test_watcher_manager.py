@@ -73,6 +73,37 @@ class TestLabels(unittest.TestCase):
         self.assertEqual(room_label(a), room_label(a))
         self.assertNotEqual(room_label(a), room_label(b))
 
+    def test_an_unsafe_character_is_percent_encoded(self):
+        """Platforms differ in what they allow. Rocket.Chat and Mattermost emit slugs, but
+        the voice connector takes its room from a URL path — `/ask/a/b` gives room `a/b` —
+        and a raw label would carry a character the static config path rejects in a watcher
+        name, leaving dynamic and static watchers with incompatible handle syntax.
+
+        Percent-encoding rather than the old collapse-to-`-`, which mapped every unsafe
+        character onto one so two different rooms could label identically (§2.3).
+        """
+        room = RoomRef(id="r1", kind=RoomKind.CHANNEL, name="a/b")
+        self.assertEqual(watcher_label("voice", room), "voice-a%2Fb")
+
+    def test_two_rooms_differing_only_in_unsafe_characters_stay_distinct(self):
+        a = RoomRef(id="r1", kind=RoomKind.CHANNEL, name="a/b")
+        b = RoomRef(id="r2", kind=RoomKind.CHANNEL, name="a:b")
+        self.assertNotEqual(room_label(a), room_label(b))
+
+    def test_a_long_name_is_truncated_with_a_hash(self):
+        """A display bound, not a correctness one — paths key on a digest. The hash keeps
+        two long names sharing a prefix distinguishable."""
+        a = RoomRef(id="r1", kind=RoomKind.CHANNEL, name="x" * 200)
+        b = RoomRef(id="r2", kind=RoomKind.CHANNEL, name="x" * 200)
+        self.assertLessEqual(len(room_label(a)), 48)
+        self.assertNotEqual(room_label(a), room_label(b))
+
+    def test_encoding_never_raises(self):
+        for name in ("", " ", "%", "%%", "研發", "a b/c:d", "\n", "\u0000"):
+            with self.subTest(name=name):
+                self.assertIsInstance(
+                    room_label(RoomRef(id="r1", kind=RoomKind.CHANNEL, name=name)), str)
+
     def test_a_nameless_channel_still_gets_a_label(self):
         """A label is cosmetic, so refusing to name a room would be a worse failure than
         naming it dully."""
@@ -180,6 +211,40 @@ class TestRuleSnapshot(unittest.TestCase):
         snapshot = rule_snapshot(_rule(include=["eng-*", "incident-?"]))
         self.assertEqual(snapshot["rooms"]["include"], ["eng-*", "incident-?"])
 
+    def test_every_rule_field_reaches_the_snapshot(self):
+        """Enumerated rather than listed, because the listed version was wrong.
+
+        The first serializer hand-wrote its fields and omitted
+        `history_handoff.max_fetch_count`, so two rules differing only in that cap produced
+        identical digests and drift could not report it. Walking the dataclass means a
+        field added later fails here instead of going missing in a snapshot.
+        """
+        from dataclasses import fields as dataclass_fields
+
+        snapshot = rule_snapshot(_rule(include=["eng-*"]))
+        for field in dataclass_fields(WatcherRule):
+            with self.subTest(field=field.name):
+                self.assertIn(field.name, snapshot)
+
+    def test_every_nested_config_field_reaches_the_snapshot(self):
+        from dataclasses import fields as dataclass_fields
+
+        from gateway.core.config import HistoryHandoffConfig
+
+        snapshot = rule_snapshot(_rule(include=["eng-*"]))
+        for field in dataclass_fields(HistoryHandoffConfig):
+            with self.subTest(field=field.name):
+                self.assertIn(field.name, snapshot["history_handoff"])
+
+    def test_the_on_demand_cap_changes_the_digest(self):
+        """The specific field the hand-written list dropped."""
+        from gateway.core.config import HistoryHandoffConfig
+
+        base = rule_snapshot(_rule(include=["eng-*"]))
+        capped = rule_snapshot(_rule(
+            include=["eng-*"], history_handoff=HistoryHandoffConfig(max_fetch_count=99)))
+        self.assertNotEqual(snapshot_digest(base), snapshot_digest(capped))
+
     def test_the_dm_opt_ins_are_part_of_the_baseline(self):
         snapshot = rule_snapshot(_rule(direct=True, group_direct=False))
         self.assertTrue(snapshot["rooms"]["direct"])
@@ -242,6 +307,23 @@ class TestFirstMatchingRule(unittest.TestCase):
         ]
         room = RoomRef(id="r1", kind=RoomKind.CHANNEL, name="eng-backend")
         self.assertEqual(first_matching_rule(rules, "mm-eng", room).name, "mine")
+
+    def test_a_named_room_with_no_name_matches_nothing(self):
+        """Rather than falling back to its id.
+
+        An earlier version substituted `room.id`, so a room whose opaque id happened to
+        look like a configured pattern could be claimed — or *excluded* — on the strength
+        of a string the operator never wrote and cannot see. `room_label` still falls back
+        to a digest for such a room, because a label is cosmetic; a match is not.
+        """
+        rules = [_rule(include=["*"])]
+        nameless = RoomRef(id="eng-backend", kind=RoomKind.CHANNEL, name="")
+        self.assertIsNone(first_matching_rule(rules, "mm-eng", nameless))
+
+    def test_an_id_that_looks_like_a_pattern_target_is_not_matched(self):
+        rules = [_rule(include=["eng-*"])]
+        nameless = RoomRef(id="eng-secret", kind=RoomKind.GROUP, name="")
+        self.assertIsNone(first_matching_rule(rules, "mm-eng", nameless))
 
     def test_no_rule_claiming_the_room_returns_none(self):
         rules = [_rule(include=["ops-*"])]

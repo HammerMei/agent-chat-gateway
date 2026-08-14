@@ -23,9 +23,11 @@ breaks on that divergence, which is why room resolution goes by `room_id` (§2.3
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass, replace
+import json
+from dataclasses import dataclass, fields, is_dataclass, replace
 
 from .config import WatcherConfig
+from .room_pattern import RoomPattern
 from .watcher_rule import RoomKind, RuleMatch, WatcherRule
 
 WatcherKey = tuple[str, str]  # (connector, room_id)
@@ -34,6 +36,18 @@ WatcherKey = tuple[str, str]  # (connector, room_id)
 # design's figure (§2.3): short enough to type from a `list` row, and collisions are
 # cosmetic — two identical-looking rows and nothing worse, since the label is never a key.
 _GROUP_DM_LABEL_DIGITS = 8
+
+# Characters a label may carry verbatim. Anything else is percent-encoded (§2.3): the old
+# sanitizer collapsed them to `-` and raised on an empty result, which made two different
+# rooms label identically and could refuse to name a room at all.
+_LABEL_SAFE = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+
+# A display bound, not a correctness one — paths key on a digest, so nothing breaks if a
+# label is long; a table column that is several hundred characters wide does. Over the cap
+# the label is truncated and given a short room-id hash, so two long names that share a
+# prefix stay distinguishable.
+_LABEL_MAX = 48
 
 
 @dataclass(frozen=True)
@@ -76,10 +90,11 @@ def room_label(room: RoomRef) -> str:
         # One counterpart by definition. Falling back to the digest rather than raising:
         # a label is cosmetic, and refusing to name a room would be a worse failure than
         # naming it dully.
-        return f"dm-{room.participants[0]}" if room.participants else f"dm-{_digest(room.id)}"
+        counterpart = room.participants[0] if room.participants else _digest(room.id)
+        return _encode(f"dm-{counterpart}", room.id)
     if room.kind is RoomKind.GROUP_DM:
         return f"gdm-{_digest(room.id)}"
-    return room.name or _digest(room.id)
+    return _encode(room.name, room.id) if room.name else _digest(room.id)
 
 
 def watcher_label(connector: str, room: RoomRef) -> str:
@@ -140,11 +155,17 @@ def materialize(rule: WatcherRule, room: RoomRef) -> WatcherConfig:
 def rule_snapshot(rule: WatcherRule) -> dict:
     """The rule as resolved at creation, in a JSON-safe form — the drift baseline (§2.4).
 
-    Not `dataclasses.asdict`: a rule's patterns are `RoomPattern` objects (a `__slots__`
-    class, compiled at load so an invalid pattern cannot reach the delivery path), and
-    `asdict` leaves them as objects, so the record would fail to serialize on the first
-    save. Patterns are stored as the raw strings they were compiled from, which is also
-    the only form an operator can compare against their own `config.yaml`.
+    **Derived from the dataclass, not from a hand-written field list.** The first version
+    listed every field, and review found `history_handoff.max_fetch_count` missing: two
+    rules differing only in that cap produced identical snapshots, so drift could not
+    report it. A list that has to be updated whenever a field is added is the same shape
+    as the hand-maintained type table `state.py` deliberately derives instead.
+
+    `dataclasses.asdict` still cannot do it: a rule's patterns are `RoomPattern` objects (a
+    `__slots__` class, compiled at load so an invalid pattern cannot reach the delivery
+    path), which `asdict` leaves as objects — the record would fail to serialize on its
+    first save. Patterns become the raw strings they were compiled from, which is also the
+    only form an operator can compare against their own `config.yaml`.
 
     **Stored resolved, after `inherits:` has been applied.** Template inheritance is
     flattened at parse time, so the resolved form is what the parser naturally produces —
@@ -155,28 +176,23 @@ def rule_snapshot(rule: WatcherRule) -> dict:
     overwritten by construction, so diffing it against a rule would report those two
     fields as changed every time.
     """
-    matcher = rule.rooms
-    return {
-        "name": rule.name,
-        "connector": rule.connector,
-        "agent": rule.agent,
-        "rooms": {
-            "include": [p.raw for p in matcher.include],
-            "except_for": [p.raw for p in matcher.except_for],
-            "direct": matcher.direct,
-            "group_direct": matcher.group_direct,
-        },
-        "session_idle_days": rule.session_idle_days,
-        "session_expire_days": rule.session_expire_days,
-        "context_inject_files": list(rule.context_inject_files),
-        "online_notification": rule.online_notification,
-        "offline_notification": rule.offline_notification,
-        "history_handoff": {
-            "enabled": rule.history_handoff.enabled,
-            "fetch_count": rule.history_handoff.fetch_count,
-            "verbatim_tail": rule.history_handoff.verbatim_tail,
-        },
-    }
+    return _jsonable(rule)
+
+
+def _jsonable(value):
+    """Recursively convert a rule into JSON-safe data, walking dataclass fields.
+
+    Only one type needs special handling — `RoomPattern`, which is not a dataclass — so
+    everything else is reached generically and a field added to any rule dataclass appears
+    in the snapshot without this function changing.
+    """
+    if isinstance(value, RoomPattern):
+        return value.raw
+    if is_dataclass(value) and not isinstance(value, type):
+        return {f.name: _jsonable(getattr(value, f.name)) for f in fields(value)}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    return value
 
 
 def snapshot_digest(snapshot: dict) -> str:
@@ -190,8 +206,6 @@ def snapshot_digest(snapshot: dict) -> str:
     *above* mine starts winning for my room without any rule's content changing, so that
     is detected by re-running the match against the current ordered list, never by this.
     """
-    import json
-
     return hashlib.sha256(
         json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
@@ -210,7 +224,16 @@ def first_matching_rule(
 
     Rules for other connectors are skipped rather than matched-and-discarded: a rule's
     `connector` is part of what it claims, not a filter applied afterwards.
+
+    **A named room with no name matches nothing**, rather than falling back to its id.
+    An earlier version substituted `room.id`, so a room whose opaque id happened to look
+    like a configured pattern could be claimed — or excluded — on the strength of a string
+    the operator never wrote and cannot see. `room_label` still falls back to a digest for
+    such a room, because a label is cosmetic; a *match* is not.
     """
+    if room.kind not in (RoomKind.DM, RoomKind.GROUP_DM) and not room.name:
+        return None
+
     for rule in rules:
         if rule.connector != connector:
             continue
@@ -220,12 +243,37 @@ def first_matching_rule(
         # version passed the *label* for group DMs, to avoid a pattern matching a digest —
         # a branch whose premise the matcher makes impossible, found by injecting the
         # fault and watching nothing fail.
-        verdict = rule.match(room.name or room.id, room.kind)
+        verdict = rule.match(room.name, room.kind)
         if verdict is RuleMatch.CLAIMED:
             return rule
         if verdict is RuleMatch.DECLINED:
             return None
     return None
+
+
+def _encode(raw: str, room_id: str) -> str:
+    """A label component made safe to print and to type, per §2.3.
+
+    Percent-encoding rather than the old collapse-to-`-`: that mapped every unsafe
+    character onto one, so two different rooms could produce identical labels, and it
+    raised when nothing survived. This never raises and is reversible by eye.
+
+    Platforms differ in what they allow — Rocket.Chat and Mattermost emit slugs, but the
+    voice connector takes its room from a URL path, so `/ask/a/b` yields the room `a/b`,
+    and a raw label would carry a character the static config path rejects in a watcher
+    name. Encoding here keeps one handle syntax across both shapes.
+
+    Over the length cap the label is truncated and a short room-id hash appended, so two
+    long names sharing a prefix remain distinguishable.
+    """
+    encoded = "".join(
+        c if c in _LABEL_SAFE else "".join(f"%{b:02X}" for b in c.encode())
+        for c in raw
+    )
+    if len(encoded) <= _LABEL_MAX:
+        return encoded
+    keep = _LABEL_MAX - _GROUP_DM_LABEL_DIGITS - 1
+    return f"{encoded[:keep]}-{_digest(room_id)}"
 
 
 def _digest(room_id: str) -> str:
