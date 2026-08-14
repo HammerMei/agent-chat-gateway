@@ -499,19 +499,6 @@ class ControlServer:
             return {"ok": False, "error": str(e)}
         return {"ok": True, "next_run": job.next_run}
 
-    def _find_connector_for_watcher(self, watcher_name: str) -> str:
-        """Find the connector name for a watcher by searching all entries."""
-        for entry in self._entries:
-            sm = entry.session_manager
-            # Check running watcher state first (watcher is active)
-            if sm.get_watcher_state(watcher_name) is not None:
-                return entry.name
-        # Fallback: check watcher configs (watcher defined but may be paused/stopped)
-        for entry in self._entries:
-            if entry.session_manager.get_watcher_config(watcher_name) is not None:
-                return entry.name
-        return ""
-
     def _list_all_watcher_names(self) -> str:
         """Return a comma-separated string of all configured watcher names."""
         names: list[str] = []

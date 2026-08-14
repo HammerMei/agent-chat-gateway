@@ -482,25 +482,23 @@ class JobScheduler:
     async def _inject(self, job: ScheduledJob) -> bool:
         """Inject the job message into the target watcher via SessionManager.
 
-        Tries the connector-specific SessionManager first; falls back to
-        searching all managers if connector is not specified or not found.
+        Resolution goes through `_get_sm_for_watcher`, which this method used to duplicate
+        — and the copy was not merely redundant, it was worse. It resolved by *attempting
+        delivery* into every manager in turn with `except Exception: pass`, so a real
+        failure in the manager that actually owns the watcher was indistinguishable from
+        "no manager has it", and the operator saw the generic message either way. Resolving
+        first and then injecting once means a failure is reported as a failure.
         """
-        sm = self._session_managers.get(job.connector)
-        if sm is not None:
-            try:
-                return await sm.inject_message(job.watcher, job.message)
-            except Exception as e:
-                logger.error("Job %s: inject_message failed on connector %r: %s", job.id, job.connector, e)
-                return False
-
-        # Fallback: search all session managers
-        for connector_name, manager in self._session_managers.items():
-            try:
-                result = await manager.inject_message(job.watcher, job.message)
-                if result:
-                    return True
-            except Exception:
-                pass
-
-        logger.warning("Job %s: no session manager could deliver message to watcher %r", job.id, job.watcher)
-        return False
+        sm = self._get_sm_for_watcher(job)
+        if sm is None:
+            logger.warning(
+                "Job %s: no session manager owns watcher %r", job.id, job.watcher)
+            return False
+        try:
+            return await sm.inject_message(job.watcher, job.message)
+        except Exception as e:
+            logger.error(
+                "Job %s: inject_message failed for watcher %r: %s",
+                job.id, job.watcher, e,
+            )
+            return False
