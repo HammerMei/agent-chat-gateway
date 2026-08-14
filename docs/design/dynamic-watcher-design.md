@@ -1646,12 +1646,42 @@ one upgrade.
 1. acg list                      # record what exists, and what is paused
 2. acg schedule list             # record scheduled jobs
 3. stop the gateway
-4. rewrite config.yaml: concrete watchers → rules (§5.4)
-      – a paused watcher becomes an `except_for:` entry, not a rule
+4. rewrite config.yaml as rules (§5.4) — see "not a 1:1 rewrite" below
       – drop any `session_id:`; it no longer exists (§2.4)
 5. remove the old state files:  ~/.agent-chat-gateway/state.*.json
 6. start, then re-create the scheduled jobs from step 2
 ```
+
+**This is not a 1:1 rewrite, and the guide should not present one.**
+
+The mapping people will look for — one concrete watcher becomes one rule — teaches the
+model the release is replacing. A concrete watcher answers *which room does this agent
+sit in*; a rule answers *which rooms may this agent be drawn into*. An operator who
+transcribes entry by entry ends up with a rule per room, which is the old shape wearing
+new syntax, and never sees the point of the change. The guide's job is to make them
+restate their intent, not to save them typing.
+
+**A long-lived paused watcher is the clearest case of that.** Pause exists for temporary
+operational reasons — mute this agent while something is being fixed. A watcher that has
+been paused for weeks is a question about why it was created, not a state to carry
+forward. So the upgrade offers no translation for it, and instead two honest paths:
+
+- **The room is not the agent's to engage with** — then it needs no rule at all. This is
+  where `include: ["*"]` with an `except_for:` list genuinely earns its place: it says
+  *everywhere except these*, which is a statement about scope, not about state.
+- **The pause really was temporary** — then write the ordinary rule, let the watcher
+  start normally, and pause it with the CLI. Pause belongs to `state.<connector>.json`
+  and to the operator's hands (§2.5); expressing it in config would conflate "which
+  rooms are in scope" with "what is this watcher doing right now", and the two change
+  for entirely different reasons and on entirely different timescales.
+
+**And this is the same reasoning that rules out an automatic migration.** A converter
+would have to produce exactly the 1:1 mapping described above — it has nothing else to
+work from — so it would encode the old model into the new config and keep a second schema
+alive in the loader to read it. The trade is deliberate: worse upgrade UX in exchange for
+markedly less permanent complexity, taken while the installed base is small enough for
+that to be the cheaper side. With a large installed base the calculation changes, and so
+should the answer.
 
 **What is lost, stated plainly rather than discovered:**
 
@@ -1659,7 +1689,7 @@ one upgrade.
 |---|---|
 | Agent sessions | Every room starts a fresh session. Conversational memory inside the agent is gone; history handoff refetches recent room messages, so there is partial continuity from the room's own transcript |
 | `last_processed_ts` watermarks | A one-off boundary effect per room: a message either side of the cut may be reprocessed or skipped once |
-| Paused state | **The dangerous one.** A paused room becomes active unless its pause is re-expressed. Step 4 turns it into `except_for:`, which is the better home anyway (§2.5) — declarative, and effective before the first message rather than after |
+| Paused state | A paused room becomes active again unless the operator decides what it was for. Pause is an operational verb — mute this watcher for now — and it is not a way to express "this room is not ours", so it does not translate into config. See "not a 1:1 rewrite" below |
 | Scheduled jobs | Jobs key on a watcher name that no longer exists; they are re-created in step 6 |
 | Pinned `session_id` | The field is gone (§2.4). A config that sets it fails to load, naming the replacement: have the agent summarise its session to a file and read that back in the new one — which also survives the backend expiring a session, as pinning never did |
 
