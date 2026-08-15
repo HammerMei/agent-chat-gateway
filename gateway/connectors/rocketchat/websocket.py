@@ -80,7 +80,7 @@ class RCWebSocketClient:
         # room. Bounded, because an unbounded routing backlog under subscribe-all is every
         # message in every readable channel.
         self._routing_queue: asyncio.Queue = asyncio.Queue(maxsize=self._ROOM_QUEUE_DEPTH)
-        self._routing_worker: asyncio.Task | None = None
+        self._routing_workers: list[asyncio.Task] = []
 
     async def connect(self) -> None:
         """Connect, perform DDP handshake, and login.
@@ -221,6 +221,17 @@ class RCWebSocketClient:
             keep_callback_on_failure=False,
         )
 
+    @property
+    def stream_active(self) -> bool:
+        """Whether the stream is currently carrying every room.
+
+        Asked rather than remembered by the connector. A restore that fails leaves the
+        transport on per-room subscriptions while a connector-side flag would still say
+        otherwise — and a watcher added after that would register a callback for a room
+        nobody had subscribed to, and receive nothing, silently.
+        """
+        return self._stream_sub_id is not None
+
     def register_room_callback(self, room_id: str, callback: Callable) -> None:
         """Route a room to its own callback without subscribing to it.
 
@@ -271,6 +282,13 @@ class RCWebSocketClient:
         maps *rooms* to their subscription ids. Storing a stream there would make
         `unsubscribe_room` able to tear down every room's delivery by name of one.
         """
+        # Intent is recorded before the attempt, not after it succeeds. A timeout, a send
+        # failing during a brief disconnect, or any transient error used to return False
+        # with the intent never set — so every later reconnect saw no stream to restore and
+        # the connector stayed on per-room delivery for the rest of its life, having asked
+        # for the stream exactly once.
+        self._wants_stream = True
+
         sub_id = self._new_id()
         future: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending_subs[sub_id] = future
@@ -307,7 +325,6 @@ class RCWebSocketClient:
             self._pending_subs.pop(sub_id, None)
 
         self._stream_sub_id = sub_id
-        self._wants_stream = True
         logger.info("Subscribed to __my_messages__ — delivery is no longer per room")
         return True
 
@@ -611,6 +628,11 @@ class RCWebSocketClient:
     # usage under burst load instead of creating unbounded tasks.
     _ROOM_QUEUE_DEPTH = 50
 
+    # Concurrent consumers of the shared routing queue. Small, because routing decides
+    # whether a room should exist rather than answering anyone — but more than one, since a
+    # single consumer serializes every room behind the slowest classification lookup.
+    _ROUTING_WORKERS = 4
+
     async def _handle_room_message(self, msg: dict) -> None:
         """Extract room message and dispatch to per-room worker queue.
 
@@ -735,11 +757,17 @@ class RCWebSocketClient:
 
     def _queue_for_routing(self, doc: dict, access: dict | None) -> None:
         """Hand an untracked room's message to the shared routing worker."""
-        if self._routing_worker is None or self._routing_worker.done():
-            self._routing_worker = asyncio.create_task(
-                self._route_worker(), name="rc-routing-worker")
-            self._callback_tasks.add(self._routing_worker)
-            self._routing_worker.add_done_callback(self._callback_tasks.discard)
+        self._routing_workers = [t for t in self._routing_workers if not t.done()]
+        while len(self._routing_workers) < self._ROUTING_WORKERS:
+            # A pool, not one worker. One worker serializes every room behind the slowest
+            # classification — Rocket.Chat needs a REST lookup to tell a 1:1 from a group
+            # DM — and the shared queue then overflows, dropping rooms that would have been
+            # discovered. A pool is not per-room either, so nothing accumulates.
+            task = asyncio.create_task(
+                self._route_worker(), name=f"rc-routing-worker-{len(self._routing_workers)}")
+            self._routing_workers.append(task)
+            self._callback_tasks.add(task)
+            task.add_done_callback(self._callback_tasks.discard)
         try:
             self._routing_queue.put_nowait((doc, access))
         except asyncio.QueueFull:
@@ -967,6 +995,14 @@ class RCWebSocketClient:
             # losing the outage are not the same thing, and the `return` conflated them.
             rooms = [] if stream_restored else list(self._callbacks.items())
             if stream_restored:
+                # `_reconnect` marks every state `reconnecting` before this runs, and the
+                # per-room confirmations that would clear it are exactly what the stream
+                # makes unnecessary. Left alone, every tracked room reads as reconnecting
+                # forever — status output lies, and the replay path warns about rooms that
+                # are fine.
+                for state in self._subscription_states.values():
+                    state.status = "active"
+                    state.last_error = None
                 logger.info("Stream restored — per-room resubscription is not needed")
             results = await asyncio.gather(
                 *[

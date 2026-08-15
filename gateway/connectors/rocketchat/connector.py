@@ -590,7 +590,12 @@ class RocketChatConnector(Connector):
         self._room_refcount[room.id] = 1
 
         try:
-            if self._subscribe_all:
+            if self._ws.stream_active:
+                # Asked, not remembered: a restore that failed leaves the transport on
+                # per-room subscriptions, and a connector-side flag saying otherwise would
+                # register this room's callback without anyone having subscribed to it —
+                # a watcher that receives nothing, silently.
+                #
                 # Local bookkeeping only (§5.2). The stream already delivers this room, so
                 # a per-room `sub` would ask the server to send it twice — and the frames
                 # are indistinguishable, so the second copy would be deduped by message id
@@ -1017,6 +1022,13 @@ class RocketChatConnector(Connector):
         if access is not None and access.get("roomParticipant") is False:
             logger.info(
                 "No longer a participant in room %s — dropping message", room_id)
+            # Recorded, or the rejection lasts only until the next reconnect. History is
+            # fetched from an unchanged watermark and re-injected with no access object,
+            # and absence is deliberately not a negative — so the same post would come
+            # back and be accepted, and the removed bot would answer in the room again.
+            # The one thing the live path knows and the replay path cannot is this
+            # rejection; remembering the id is how it is carried across.
+            sub.remember(doc.get("_id", ""))
             return
 
         msg_id = doc.get("_id", "")

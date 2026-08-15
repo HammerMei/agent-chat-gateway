@@ -739,3 +739,52 @@ class TestStreamIntentSurvivesFailure(unittest.IsolatedAsyncioTestCase):
             await client._resubscribe_all_rooms()
 
         client._subscribe_with_confirmation.assert_awaited()
+
+
+class TestStreamIntentAndStates(unittest.IsolatedAsyncioTestCase):
+    async def test_intent_is_recorded_before_the_attempt(self):
+        """A timeout, or a send failing during a brief disconnect, used to return False
+        with the intent never set — so every later reconnect saw no stream to restore, and
+        the connector stayed on per-room delivery for life having asked exactly once."""
+        from unittest.mock import AsyncMock
+
+        client = _make_client()
+        client._send = AsyncMock(side_effect=RuntimeError("socket gone"))
+
+        ok = await client.subscribe_all(timeout=0.01)
+
+        self.assertFalse(ok)
+        self.assertTrue(client._wants_stream, "intent must survive a failed attempt")
+
+    async def test_a_restored_stream_marks_rooms_active_again(self):
+        """`_reconnect` marks every state `reconnecting`, and the per-room confirmations
+        that would clear it are what the stream makes unnecessary — so without this every
+        tracked room reads as reconnecting forever."""
+        from unittest.mock import AsyncMock
+
+        from gateway.connectors.rocketchat.websocket import SubscriptionState
+
+        client = _make_client()
+        client._wants_stream = True
+        client._callbacks = {"r1": AsyncMock()}
+        client._subscription_states = {
+            "r1": SubscriptionState(room_id="r1", callback=AsyncMock(),
+                                    status="reconnecting")
+        }
+        client.subscribe_all = AsyncMock(return_value=True)
+
+        await client._resubscribe_all_rooms()
+
+        self.assertEqual(client._subscription_states["r1"].status, "active")
+
+    def test_stream_active_reports_the_transport_not_an_intention(self):
+        client = _make_client()
+        client._wants_stream = True
+        client._stream_sub_id = None
+        self.assertFalse(
+            client.stream_active,
+            "wanting the stream is not having it — a watcher added while it is down needs "
+            "its own subscription",
+        )
+        client._stream_sub_id = "sub-1"
+        self.assertTrue(client.stream_active)

@@ -672,6 +672,9 @@ class TestRCRefcount(unittest.IsolatedAsyncioTestCase):
         connector._config = config
         connector._rest = MagicMock()
         connector._ws = MagicMock()
+        # Asked, not remembered: a bare MagicMock answers truthily and would skip every
+        # subscription. These tests exercise per-room delivery.
+        connector._ws.stream_active = False
         connector._ws.subscribe_room = AsyncMock()
         connector._ws.unsubscribe_room = AsyncMock()
         connector._handler = None
@@ -752,6 +755,9 @@ class TestMultiWatcherDispatch(unittest.IsolatedAsyncioTestCase):
         connector._config = config
         connector._rest = MagicMock()
         connector._ws = MagicMock()
+        # Asked, not remembered: a bare MagicMock answers truthily and would skip every
+        # subscription. These tests exercise per-room delivery.
+        connector._ws.stream_active = False
         connector._ws.subscribe_room = AsyncMock()
         connector._ws.unsubscribe_room = AsyncMock()
         connector._handler = None
@@ -1516,6 +1522,9 @@ class TestAttachmentCachePath(unittest.IsolatedAsyncioTestCase):
         connector._config = config
         connector._rest = MagicMock()
         connector._ws = MagicMock()
+        # Asked, not remembered: a bare MagicMock answers truthily and would skip every
+        # subscription. These tests exercise per-room delivery.
+        connector._ws.stream_active = False
         connector._ws.subscribe_room = AsyncMock()
         connector._ws.unsubscribe_room = AsyncMock()
         connector._handler = None

@@ -62,6 +62,9 @@ def _make_connector():
     connector._dm_kinds = {}
     connector._rest = MagicMock()
     connector._ws = MagicMock()
+    # The connector asks the transport whether the stream is carrying rooms, rather than
+    # remembering it; a bare MagicMock would answer truthily and skip every subscription.
+    connector._ws.stream_active = False
     connector._config = _make_config()
     connector._attachments_cache_base = Path("/tmp/test-cache")
     room = Room(id="room-1", name="general", type="channel")
@@ -901,6 +904,9 @@ class TestSubscribeRoomRollback(unittest.IsolatedAsyncioTestCase):
 
         connector = _make_connector()
         connector._ws = MagicMock()
+        # Per-room delivery, which is the path that can fail this way at all: under the
+        # stream, subscribe_room registers a callback and never talks to the server.
+        connector._ws.stream_active = False
         connector._ws.subscribe_room = AsyncMock(side_effect=RuntimeError("DDP error"))
 
         room = Room(id="new-room", name="test", type="channel")
@@ -1979,6 +1985,7 @@ class TestSubscribeAll(unittest.IsolatedAsyncioTestCase):
         connector._ws.register_default_callback = MagicMock()
         connector._ws.register_room_callback = MagicMock()
         connector._ws.subscribe_room = AsyncMock()
+        connector._ws.stream_active = False
         connector._ws.unsubscribe_rooms_keeping_callbacks = AsyncMock()
         connector._rest = MagicMock(login=AsyncMock())
         if with_router:
@@ -2056,7 +2063,7 @@ class TestSubscribeAll(unittest.IsolatedAsyncioTestCase):
         from gateway.core.connector import Room
 
         connector = self._connector()
-        connector._subscribe_all = True
+        connector._ws.stream_active = True
 
         await connector.subscribe_room(Room(id="r1", name="eng", type="channel"),
                                        watcher_id="w1")
@@ -2068,7 +2075,7 @@ class TestSubscribeAll(unittest.IsolatedAsyncioTestCase):
         from gateway.core.connector import Room
 
         connector = self._connector()
-        connector._subscribe_all = False
+        connector._ws.stream_active = False
 
         await connector.subscribe_room(Room(id="r1", name="eng", type="channel"),
                                        watcher_id="w1")
@@ -2405,3 +2412,44 @@ class TestUncertainStreamIsCancelled(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(ok)
         self.assertEqual([f["msg"] for f in sent], ["sub", "unsub"])
         self.assertEqual(sent[0]["id"], sent[1]["id"], "must cancel the same subscription")
+
+
+class TestMembershipRejectionSurvivesReplay(unittest.IsolatedAsyncioTestCase):
+    """A rejection the live path knows and the replay path cannot.
+
+    History is fetched from an unchanged watermark and re-injected with no access object,
+    and absence is deliberately not a negative — so without recording the id, a message
+    rejected because the bot was removed comes back after the next reconnect and is
+    accepted, and the removed bot answers in the room again.
+    """
+
+    async def test_the_rejected_id_is_remembered(self):
+        connector = _make_connector()
+        connector._config = _make_config(owners=["glin"], require_mention=False)
+        connector.register_handler(AsyncMock(return_value=True))
+
+        await connector._on_raw_ddp_message(
+            "room-1",
+            {"_id": "m-rejected", "rid": "room-1", "msg": "hi",
+             "u": {"username": "glin"}, "ts": {"$date": 1}},
+            access={"roomParticipant": False, "roomType": "c", "roomName": "eng"},
+        )
+
+        self.assertIn("m-rejected", connector._rooms["room-1"].seen_ids_set)
+
+    async def test_the_replayed_copy_is_then_dropped(self):
+        """The consequence, asserted rather than inferred: the same post arriving again
+        through the replay path — with no access object — must not be dispatched."""
+        connector = _make_connector()
+        connector._config = _make_config(owners=["glin"], require_mention=False)
+        connector._capacity_check = lambda room_id: RoomCapacity.AVAILABLE
+        connector.register_handler(AsyncMock(return_value=True))
+        doc = {"_id": "m-rejected", "rid": "room-1", "msg": "hi",
+               "u": {"username": "glin"}, "ts": {"$date": 1}}
+
+        await connector._on_raw_ddp_message(
+            "room-1", doc,
+            access={"roomParticipant": False, "roomType": "c", "roomName": "eng"})
+        await connector._on_raw_ddp_message("room-1", doc, is_replay=True)
+
+        connector._handler.assert_not_awaited()
