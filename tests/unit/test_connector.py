@@ -4072,7 +4072,7 @@ class TestARemovalDuringTheHandlerLeavesNoWindowBehind(unittest.IsolatedAsyncioT
         self.assertEqual(sub.replay_boundary, "400")
 
 
-class TestOwnMessagesAreRecognisedByIdentity(unittest.TestCase):
+class TestOwnMessagesAreRecognisedByIdentity(unittest.IsolatedAsyncioTestCase):
     """Rocket.Chat's login is not spelling-exact, so a name test is not an identity test.
 
     Probed against Rocket.Chat 6.12: an account whose canonical username is `ProbeBot9207`
@@ -4136,13 +4136,37 @@ class TestOwnMessagesAreRecognisedByIdentity(unittest.TestCase):
 
         self.assertTrue(result.accepted)
 
-    def test_the_connector_hands_the_filter_its_own_id(self):
-        """The wiring, not the filter: an id the connector never passes cannot help."""
-        connector = _make_connector()
+    async def test_the_connector_hands_the_filter_its_own_id(self):
+        """The wiring, not the filter: an id the connector never passes cannot help.
 
-        self.assertTrue(
-            connector._rest.user_id,
-            "the fixture must model a logged-in connector for this to mean anything",
+        This test existed and asserted nothing — it checked that the *fixture* had a user
+        id, which is a property of the test, not of the code. The production call was later
+        shipped as `bot_user_id=""` and every test here still passed, because each one
+        hands the filter an id itself. External review caught it; this assertion is what
+        should have.
+        """
+        from gateway.connectors.rocketchat import connector as rc_connector
+
+        connector = _make_connector()
+        connector._rest.user_id = "BOT_ID"
+        connector._handler = AsyncMock(return_value=True)
+        seen = {}
+
+        real = rc_connector.filter_rc_message
+
+        def _spy(*args, **kwargs):
+            seen.update(kwargs)
+            return real(*args, **kwargs)
+
+        with patch.object(rc_connector, "filter_rc_message", _spy):
+            await connector._on_raw_ddp_message("room-1", {
+                "_id": "m1", "msg": "hi", "u": {"username": "alice", "_id": "U1"},
+                "rid": "room-1", "ts": {"$date": 500}})
+
+        self.assertEqual(
+            seen.get("bot_user_id"), "BOT_ID",
+            "the filter cannot recognise the account's own posts with an id it is never "
+            "given, and every other test in this class supplies one itself",
         )
 
 

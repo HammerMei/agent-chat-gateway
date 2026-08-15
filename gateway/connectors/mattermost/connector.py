@@ -1170,9 +1170,12 @@ class MattermostConnector(Connector):
     def _release_turn_for(self, post: dict, result, generation: int, reason: str) -> None:
         """Give back the turn a post took, for a post that was not delivered.
 
-        One place, because Mattermost has three ways to decline a post after the filter has
-        already charged it — the preflight for a replay, the preflight for live traffic,
-        and the handler queue — and they were added one at a time.
+        One place, because Mattermost has **six** ways to decline a post after the filter
+        has already charged it — no watcher for the channel, the preflight for a replay,
+        the preflight for live traffic, normalization raising, the handler raising, and the
+        handler queue — and they were added one at a time. The count is in the comment
+        because it was wrong here once: it said three, which was true when three of the six
+        released and nobody had counted the rest.
         """
         if not result.agent_chain_token or self._turn_store is None:
             return

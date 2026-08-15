@@ -12,9 +12,13 @@ asking it twice is how it ends up answered once. It is deliberately **not** an a
 make the connectors behave alike. Everything platform-specific stays with the platform:
 
 * **Which branches are hand-backs** is control flow, and the two connectors' differ.
-* **What else can invalidate a window.** Rocket.Chat's per-room subscriptions mean a
-  membership change mid-flight has to close it; Mattermost's delivery tracks membership at
-  the server (§6.2), so there is nothing equivalent to guard and none is added.
+* **What else can invalidate a window.** Rocket.Chat closes one on a confirmed membership
+  removal, because under subscribe-all the stream keeps delivering a channel the account
+  has been removed from. Mattermost's *live* delivery tracks membership at the server
+  (§6.2), so it needs no live gate — but that says nothing about its replay, which is a
+  REST fetch and is not membership-gated on either platform. Mattermost has no equivalent
+  guard today; that is a gap, not a property, and it is recorded as such rather than
+  excused here.
 * **Why an outage window is captured at all.** Rocket.Chat resubscribes rooms one at a
   time, so a room that is live again while others are still confirming moves its watermark
   past the whole gap — that is what `_snapshot_replay_boundaries` exists for. Mattermost
@@ -125,7 +129,8 @@ class ReplayWindow:
         Distinct from `discharge_boundary`: that one reports a window as *read*, this one
         says it should never be read. Rocket.Chat's membership removal is the only caller —
         a window that spans a removal would replay the interval the account was not a member
-        for — and Mattermost has no equivalent, by §6.2.
+        for. Mattermost has no caller because it has no membership signal to act on, not
+        because it cannot need one.
         """
         self.replay_boundary = None
         self.boundary_claims = 0

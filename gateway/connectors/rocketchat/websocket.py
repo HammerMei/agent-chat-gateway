@@ -467,8 +467,11 @@ class RCWebSocketClient:
           attempt would then mark it active and report success for a subscription the
           server no longer has. `sub_id` is the only thing here that names *one attempt*.
 
-        The third clause is why this is a method: the same ownership question is asked by
-        both rollback arms below, and it was answered three different ways.
+        The third clause is the one this predicate was created for. The `except` arm below
+        deliberately does *not* call this — it tests `_subscriptions.get(room_id) == sub_id`
+        alone, because a failing attempt should roll back what it still owns even when the
+        room's state object has been replaced under it. Two questions that look alike and
+        are not.
         """
         return (
             room_id not in self._rooms_unsubscribing

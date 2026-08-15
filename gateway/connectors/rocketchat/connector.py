@@ -1682,10 +1682,11 @@ class RocketChatConnector(Connector):
             # reported the batch complete on the strength of the id this branch has just
             # removed. Whoever drops a message owns keeping it reachable.
             #
-            # `or`, so an older window already open is not narrowed to this one — and
-            # falling through to this message's own timestamp, because both marks are
-            # empty for the first delivery into a new room and for the first after a
-            # membership reset. Leaving no boundary there loses the message outright:
+            # `claim_boundary` takes the *oldest* candidate, so an older window already
+            # open is not narrowed to this one — and neither is this message overtaken by a
+            # watermark that a concurrent worker has already pushed above it. This message's
+            # own timestamp is offered last because both other marks are empty for the first
+            # delivery into a new room and for the first after a membership reset. Leaving no boundary there loses the message outright:
             # replay skips a room whose window is falsy, and the next accepted message
             # advances the cursor past this one for good.
             #
