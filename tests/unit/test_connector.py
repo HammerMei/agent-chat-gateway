@@ -3599,6 +3599,7 @@ class TestHandingAMessageBackReturnsItsTurn(unittest.IsolatedAsyncioTestCase):
         connector._handler = AsyncMock(return_value=True)
         connector._turn_store = MagicMock()
         connector._turn_store.release_turn = MagicMock(return_value=0)
+        connector._turn_store.generation = MagicMock(return_value=7)
         return connector
 
     def _result(self, turn=1):
@@ -3626,7 +3627,7 @@ class TestHandingAMessageBackReturnsItsTurn(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(handed_back)
         connector._turn_store.release_turn.assert_called_once_with(
-            "room-1", None, "agent-a")
+            "room-1", None, "agent-a", 1, connector._turn_store.generation.return_value)
 
     async def test_a_handler_queue_full_drop_returns_the_turn(self):
         connector = self._connector()
@@ -3645,7 +3646,7 @@ class TestHandingAMessageBackReturnsItsTurn(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(handed_back)
         connector._turn_store.release_turn.assert_called_once_with(
-            "room-1", None, "agent-a")
+            "room-1", None, "agent-a", 1, connector._turn_store.generation.return_value)
 
     async def test_a_delivered_message_keeps_its_turn(self):
         """The near miss: releasing on the success path would make the budget

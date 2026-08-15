@@ -70,6 +70,10 @@ def build_agent_chain_context(turn: int, max_turns: int) -> str:
 class _TurnContext:
     turns: int = 0
     last_updated: float = field(default_factory=time.monotonic)
+    # Incremented by every reset. A turn number cannot identify the increment that
+    # produced it, because a reset starts the next count at one again — so a delivery
+    # still in flight would match a turn that belongs to someone else. See `release_turn`.
+    generation: int = 0
 
 
 class TurnStore:
@@ -104,6 +108,18 @@ class TurnStore:
     def _key(room_id: str, thread_id: str | None, sender: str) -> tuple[str, str | None, str]:
         return (room_id, thread_id, sender)
 
+    def generation(self, room_id: str, thread_id: str | None, sender: str) -> int:
+        """How many times this context has been reset, and therefore which count is live.
+
+        A turn number alone cannot identify the increment that produced it: a reset drops
+        the counter and the next agent message starts again at one, so an in-flight
+        delivery holding "I took turn 1" would match a turn 1 that belongs to somebody
+        else. This distinguishes them, and it survives the reset because a reset zeroes
+        the context rather than removing it.
+        """
+        ctx = self._store.get(self._key(room_id, thread_id, sender))
+        return ctx.generation if ctx else 0
+
     def check_and_increment(
         self,
         room_id: str,
@@ -131,7 +147,14 @@ class TurnStore:
         ctx.last_updated = time.monotonic()
         return True, ctx.turns
 
-    def release_turn(self, room_id: str, thread_id: str | None, sender: str) -> int:
+    def release_turn(
+        self,
+        room_id: str,
+        thread_id: str | None,
+        sender: str,
+        taken_turn: int,
+        generation: int,
+    ) -> int:
         """Give back a turn taken by `check_and_increment` for a message not delivered.
 
         The budget counts *turns an agent took*, and a message the gateway hands back for
@@ -141,16 +164,30 @@ class TurnStore:
         on a message that was never dispatched: the filter then rejects it as complete,
         the replay reports success, and the window closes over a message nobody saw.
 
-        Returns the turn count after the release, and floors at zero rather than raising —
-        a caller releasing more than it took is a bug that should not also lose the room's
-        counter.
+        `taken_turn` is the number `check_and_increment` returned to *this* delivery, and
+        the release happens only while the counter still stands there. Deliveries overlap
+        by design — replay and live traffic run concurrently — and in between, a human
+        message can reset the context and another agent message can start a fresh count.
+        An unconditional decrement would then take a turn away from a delivery that
+        succeeded, and the chain could run past `max_turns`: a burn incident rather than a
+        bookkeeping slip, which is why the check is on the value rather than on
+        `turns > 0`.
+
+        When the counter has moved on, the turn is simply not returned. That leaves the
+        budget marginally stricter than it needs to be, which is the safe direction: too
+        few turns costs one retryable message its budget slot, too many costs an unbounded
+        agent conversation.
         """
         key = self._key(room_id, thread_id, sender)
         ctx = self._store.get(key)
         if ctx is None:
+            # Garbage-collected since this delivery took its turn; nothing of it remains.
             return 0
-        if ctx.turns > 0:
-            ctx.turns -= 1
+        if ctx.generation != generation or ctx.turns != taken_turn:
+            # A reset started a fresh count (which begins at one again, so the turn number
+            # alone cannot tell them apart), or another delivery has taken a turn since.
+            return ctx.turns
+        ctx.turns -= 1
         ctx.last_updated = time.monotonic()
         return ctx.turns
 
@@ -161,18 +198,34 @@ class TurnStore:
         return ctx.turns if ctx else 0
 
     def reset_sender(self, room_id: str, thread_id: str | None, sender: str) -> None:
-        """Reset turn counter for a specific sender (call on any drop)."""
+        """Reset turn counter for a specific sender (call on any drop).
+
+        Zeroed rather than dropped, so the generation survives: a delivery still in flight
+        has to be able to tell that the count it took its turn from is gone. `_gc` still
+        reclaims the entry once it goes quiet, by which time no delivery can be holding a
+        turn from it.
+        """
         key = self._key(room_id, thread_id, sender)
-        self._store.pop(key, None)
+        ctx = self._store.get(key)
+        if ctx is not None:
+            ctx.turns = 0
+            ctx.generation += 1
+            ctx.last_updated = time.monotonic()
         logger.debug("Agent chain counter reset for sender=%s thread=%s", sender, thread_id)
 
     def reset_all(self, room_id: str, thread_id: str | None) -> None:
         """Reset all agent counters for a room/thread context (call on human message)."""
+        # Zeroed rather than dropped, for the reason `reset_sender` gives: an in-flight
+        # delivery must be able to tell that the count it took its turn from is gone.
         keys_to_remove = [
             k for k in self._store if k[0] == room_id and k[1] == thread_id
         ]
         for k in keys_to_remove:
-            del self._store[k]
+            ctx = self._store[k]
+            ctx = self._store[k]
+            ctx.turns = 0
+            ctx.generation += 1
+            ctx.last_updated = time.monotonic()
         if keys_to_remove:
             logger.debug(
                 "Agent chain counters reset for room=%s thread=%s (%d entries)",

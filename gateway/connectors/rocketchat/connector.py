@@ -1225,7 +1225,7 @@ class RocketChatConnector(Connector):
         """
         await self._on_raw_ddp_message(room_id, doc, access=access)
 
-    def _hand_back(self, doc: dict, result, reason: str) -> bool:
+    def _hand_back(self, doc: dict, result, reason: str, generation: int) -> bool:
         """Report a message as still owed, and give back what taking it consumed.
 
         Every path that answers False has already run the filter, and the filter is not
@@ -1240,7 +1240,8 @@ class RocketChatConnector(Connector):
         """
         if result.agent_chain_turn and self._turn_store is not None:
             remaining = self._turn_store.release_turn(
-                doc.get("rid", ""), doc.get("tmid") or None, result.sender
+                doc.get("rid", ""), doc.get("tmid") or None, result.sender,
+                result.agent_chain_turn, generation,
             )
             logger.debug(
                 "Released an agent-chain turn for %s (%s) — now at %d",
@@ -1378,6 +1379,14 @@ class RocketChatConnector(Connector):
             last_processed_ts=filter_ts,
             turn_store=self._turn_store,
         )
+        # Captured here, with no await between the filter's increment and this read, so
+        # it names the count that increment belonged to. `_hand_back` compares it before
+        # giving the turn back.
+        turn_generation = (
+            self._turn_store.generation(room_id, doc.get("tmid") or None, result.sender)
+            if (result.agent_chain_turn and self._turn_store is not None)
+            else 0
+        )
         if not result.accepted:
             logger.debug(
                 "Message filtered: %s (sender=%s)", result.reason, result.sender
@@ -1452,7 +1461,8 @@ class RocketChatConnector(Connector):
                     "keeping it replayable rather than recording it as handled",
                     sub.room.name,
                 )
-                return self._hand_back(doc, result, "replay preflight, queues full")
+                return self._hand_back(
+                    doc, result, "replay preflight, queues full", turn_generation)
 
             # Record _id BEFORE the first await so a concurrent delivery of the
             # same msg_id (e.g. live DDP racing a replay) hits the dedup check
@@ -1557,7 +1567,7 @@ class RocketChatConnector(Connector):
             # The one outcome that leaves this message pending: its id was just forgotten
             # precisely so a later replay can bring it back, and a boundary spent on a
             # batch containing it would remove the only thing that could.
-            return self._hand_back(doc, result, "handler queue full")
+            return self._hand_back(doc, result, "handler queue full", turn_generation)
 
         # --- Advance dedup watermark AFTER confirmed acceptance ---
         # Update the watermark only once the handler has confirmed the message
