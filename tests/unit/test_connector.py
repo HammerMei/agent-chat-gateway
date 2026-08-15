@@ -1979,6 +1979,7 @@ class TestSubscribeAll(unittest.IsolatedAsyncioTestCase):
         connector._ws.register_default_callback = MagicMock()
         connector._ws.register_room_callback = MagicMock()
         connector._ws.subscribe_room = AsyncMock()
+        connector._ws.unsubscribe_rooms_keeping_callbacks = AsyncMock()
         connector._rest = MagicMock(login=AsyncMock())
         if with_router:
             connector.register_router(AsyncMock())
@@ -2007,6 +2008,25 @@ class TestSubscribeAll(unittest.IsolatedAsyncioTestCase):
         await connector.start_inbound()
 
         self.assertTrue(connector._subscribe_all)
+
+    async def test_a_confirmed_stream_releases_the_per_room_subscriptions(self):
+        """Watchers are restored before `start_inbound`, so each tracked room already has
+        one. Left in place they deliver every message twice — dedup hides the duplicate
+        handler call, not the queue slot it takes."""
+        connector = self._connector()
+        connector._ws.subscribe_all = AsyncMock(return_value=True)
+
+        await connector.start_inbound()
+
+        connector._ws.unsubscribe_rooms_keeping_callbacks.assert_awaited_once()
+
+    async def test_a_refused_stream_leaves_them_alone(self):
+        connector = self._connector()
+        connector._ws.subscribe_all = AsyncMock(return_value=False)
+
+        await connector.start_inbound()
+
+        connector._ws.unsubscribe_rooms_keeping_callbacks.assert_not_awaited()
 
     async def test_a_refused_stream_falls_back_to_per_room(self):
         """`nosub` is a capability answer, not an error: a server without the stream must

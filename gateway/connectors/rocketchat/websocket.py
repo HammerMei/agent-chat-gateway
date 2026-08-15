@@ -231,6 +231,30 @@ class RCWebSocketClient:
         """
         self._callbacks[room_id] = callback
 
+    async def unsubscribe_rooms_keeping_callbacks(self) -> None:
+        """Drop every per-room server subscription, keeping the local routing.
+
+        For the moment the stream takes over. Watcher restoration subscribes each room
+        before `start_inbound()` runs, so without this every tracked message arrives twice
+        once the stream is confirmed — dedup hides the second handler call, but both copies
+        occupy a queue slot and a worker turn, and the drop when a queue fills is a real
+        message.
+
+        The callbacks stay: the room is still tracked, and which handler owns it is a
+        separate question from who asked the server for it — the same separation
+        `register_room_callback` exists for.
+        """
+        for room_id, sub_id in list(self._subscriptions.items()):
+            self._subscriptions.pop(room_id, None)
+            state = self._subscription_states.get(room_id)
+            if state is not None:
+                state.sub_id = None
+            try:
+                await self._send({"msg": "unsub", "id": sub_id})
+            except Exception as e:
+                logger.warning(
+                    "Could not release the per-room subscription for %s: %s", room_id, e)
+
     def register_default_callback(self, callback: Callable) -> None:
         """Register the handler for rooms with no per-room callback (subscribe-all)."""
         self._default_callback = callback
@@ -932,15 +956,18 @@ class RCWebSocketClient:
                         "are being resubscribed individually as a fallback"
                     )
 
+            # The stream carries every tracked room too, so resubscribing them one by one
+            # would have the server send each message twice. Dedup would suppress the
+            # second dispatch, but not the queue slot or the round trip — and the
+            # initial-connect path deliberately avoids exactly this.
+            #
+            # Skipping the *resubscription* only. An earlier version returned here, which
+            # also skipped the reconnect callback below — the one that replays what was
+            # sent to tracked rooms while the socket was down. Restoring delivery and
+            # losing the outage are not the same thing, and the `return` conflated them.
+            rooms = [] if stream_restored else list(self._callbacks.items())
             if stream_restored:
-                # The stream carries every tracked room too, so resubscribing them one by
-                # one would have the server send each message twice. Dedup would suppress
-                # the second dispatch, but not the queue slot or the round trip — and the
-                # initial-connect path deliberately avoids exactly this.
                 logger.info("Stream restored — per-room resubscription is not needed")
-                return
-
-            rooms = list(self._callbacks.items())
             results = await asyncio.gather(
                 *[
                     self._subscribe_with_confirmation(

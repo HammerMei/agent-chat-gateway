@@ -231,6 +231,11 @@ class RocketChatConnector(Connector):
         if self._router is None:
             return
         self._subscribe_all = await self._ws.subscribe_all()
+        if self._subscribe_all:
+            # Watchers are restored before this call, so every tracked room already has a
+            # per-room subscription. Left in place they deliver every message a second
+            # time — dedup hides the duplicate handler call, not the queue slot it takes.
+            await self._ws.unsubscribe_rooms_keeping_callbacks()
         logger.info(
             "Rocket.Chat delivery: %s",
             "all rooms" if self._subscribe_all else "per room",

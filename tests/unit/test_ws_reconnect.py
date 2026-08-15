@@ -689,6 +689,28 @@ class TestStreamIntentSurvivesFailure(unittest.IsolatedAsyncioTestCase):
         await client._resubscribe_all_rooms()
         client.subscribe_all.assert_awaited_once()
 
+    async def test_a_restored_stream_still_replays_the_outage(self):
+        """Restoring delivery and losing the outage are not the same thing.
+
+        An earlier version returned as soon as the stream came back, which also skipped
+        the reconnect callback — the one that fetches what was sent to tracked rooms while
+        the socket was down. Those messages were permanently missed.
+        """
+        from unittest.mock import AsyncMock
+
+        client = _make_client()
+        client._wants_stream = True
+        client._callbacks = {"r1": AsyncMock()}
+        client.subscribe_all = AsyncMock(return_value=True)
+        client._subscribe_with_confirmation = AsyncMock(return_value="s")
+        replayed = AsyncMock()
+        client.register_reconnect_callback(replayed)
+
+        await client._resubscribe_all_rooms()
+
+        replayed.assert_awaited_once()
+        client._subscribe_with_confirmation.assert_not_awaited()
+
     async def test_a_restored_stream_skips_per_room_resubscription(self):
         """The stream carries tracked rooms too; resubscribing them would have the server
         send every message twice."""
