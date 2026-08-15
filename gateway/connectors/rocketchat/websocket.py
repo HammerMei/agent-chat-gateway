@@ -219,6 +219,16 @@ class RCWebSocketClient:
             await asyncio.gather(*all_tasks, return_exceptions=True)
         self._callback_tasks.clear()
         self._room_queues.clear()
+        # Its sibling, and missed for the same reason siblings usually are: the per-room
+        # queues are cleared here and the shared routing queue was not. Frames left in it
+        # belong to a connection that no longer exists — a later reuse would start workers
+        # that offer rooms from old activity, carrying an old `roomParticipant: true`
+        # snapshot into a membership decision made after the gap.
+        while not self._routing_queue.empty():
+            try:
+                self._routing_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
         self._room_workers.clear()
         if self._ws:
             await self._ws.close()
@@ -477,6 +487,22 @@ class RCWebSocketClient:
             except Exception as e:
                 logger.warning(
                     "Could not release the superseded subscription for %s: %s", room_id, e
+                )
+            # A watcher removal can *complete* inside that await, and completing is
+            # precisely what clears `_rooms_unsubscribing` — so the marker cannot be the
+            # test here; the later check for it would see a room that has already finished
+            # being removed and install a subscription for it anyway, re-registering the
+            # callback and opening a server subscription after the last watcher left.
+            #
+            # The state object can be the test. `unsubscribe_room` pops it, so a different
+            # object (or none) means this room is no longer the one this call was asked to
+            # subscribe. Identity, not membership: a room removed and immediately re-added
+            # is also not this call's room.
+            if self._subscription_states.get(room_id) is not state:
+                self._pending_subs.pop(sub_id, None)
+                raise RuntimeError(
+                    f"Room {room_id} was unsubscribed while its previous subscription "
+                    "was being released"
                 )
 
         # Installed only now, and synchronously: nothing may await between claiming the

@@ -488,7 +488,8 @@ class TestPendingSubsCancelledOnReconnect(unittest.IsolatedAsyncioTestCase):
     """Pending subscription futures must be cancelled/errored during _reconnect()."""
 
     def _make_ws(self):
-        ws = RCWebSocketClient.__new__(RCWebSocketClient)
+        ws = RCWebSocketClient(
+            server_url="http://localhost:3000", username="t", password="t")
         ws._ws = None
         ws._running = False
         ws._callbacks = {}
@@ -542,7 +543,8 @@ class TestReconnectClearsPendingSubsOnCancel(unittest.IsolatedAsyncioTestCase):
     """_reconnect must resolve pending_subs futures in a finally block."""
 
     def _make_ws(self):
-        ws = RCWebSocketClient.__new__(RCWebSocketClient)
+        ws = RCWebSocketClient(
+            server_url="http://localhost:3000", username="t", password="t")
         ws._ws = None
         ws._running = True
         ws._callbacks = {}
@@ -1204,6 +1206,31 @@ class TestSharedStreamBookkeepingHasAnOwner(unittest.IsolatedAsyncioTestCase):
             "transport half",
         )
 
+    async def test_stop_leaves_no_queued_work_behind(self):
+        """Derived like the field check above, and for the same reason it exists.
+
+        `stop()` cleared the per-room queues and not the shared routing queue — siblings,
+        and missed the way siblings usually are. Frames left in one belong to a connection
+        that no longer exists: a later reuse would offer rooms from old activity, carrying
+        an old `roomParticipant: true` snapshot into a membership decision made after the
+        gap.
+        """
+        client = _make_client()
+        queues = {
+            name: value for name, value in vars(client).items()
+            if isinstance(value, asyncio.Queue)
+        }
+        self.assertTrue(queues, "the introspection must actually find the queues")
+        for q in queues.values():
+            q.put_nowait(("stale", None))
+
+        await client.stop()
+
+        for name, q in queues.items():
+            self.assertTrue(
+                q.empty(), f"{name} still holds work from a connection that is gone",
+            )
+
     async def test_an_attempt_does_not_erase_a_newer_attempts_identity(self):
         """A socket drop during the confirmation starts a replacement attempt, and
         `_reconnect` spawns it *before* it fails the old future — so the newer attempt can
@@ -1599,3 +1626,72 @@ class TestASupersededSubscriptionStaysFindableUntilItIsGone(unittest.IsolatedAsy
             [f.get("msg") for f in sent].index("sub"),
             "released before the successor is even asked for",
         )
+
+
+class TestARemovalThatCompletesDuringTheReleaseIsStillNoticed(unittest.IsolatedAsyncioTestCase):
+    """Releasing the predecessor added an await, and the removal guard could not reach it.
+
+    `_rooms_unsubscribing` is cleared by the removal *completing*, so a removal that starts
+    and finishes inside that await leaves no marker for the later check to find — and the
+    successor is then installed for a room whose last watcher has gone, re-registering its
+    callback and opening a server subscription for it.
+    """
+
+    async def test_a_completed_removal_aborts_the_successor(self):
+        from gateway.connectors.rocketchat.websocket import SubscriptionState
+
+        client = _make_client()
+        client._subscriptions = {"r1": "old-sub"}
+        client._callbacks = {"r1": AsyncMock()}
+        client._subscription_states = {
+            "r1": SubscriptionState(room_id="r1", callback=AsyncMock(), sub_id="old-sub")
+        }
+        sent: list[dict] = []
+
+        async def _send_and_remove(payload):
+            sent.append(payload)
+            if payload.get("msg") == "unsub":
+                # The whole removal happens here, marker raised and cleared.
+                client._rooms_unsubscribing.add("r1")
+                client._subscriptions.pop("r1", None)
+                client._callbacks.pop("r1", None)
+                client._subscription_states.pop("r1", None)
+                client._rooms_unsubscribing.discard("r1")
+
+        client._send = _send_and_remove
+
+        with self.assertRaises(RuntimeError):
+            await client._subscribe_with_confirmation(
+                room_id="r1", callback=AsyncMock(), timeout=5,
+                keep_callback_on_failure=True,
+            )
+
+        self.assertNotIn(
+            "r1", client._callbacks,
+            "the room's last watcher left; nothing may put its callback back",
+        )
+        self.assertNotIn("r1", client._subscriptions)
+        self.assertEqual(
+            [f for f in sent if f.get("msg") == "sub"], [],
+            "and no subscription may be opened for it on the server",
+        )
+
+    async def test_a_room_nobody_removed_still_gets_its_successor(self):
+        """The near miss: the identity check must not reject ordinary resubscription."""
+        client = _make_client()
+        client._subscriptions = {"r1": "old-sub"}
+        sent: list[dict] = []
+
+        async def _send(payload):
+            sent.append(payload)
+            if payload.get("msg") == "sub":
+                fut = client._pending_subs.get(payload["id"])
+                if fut and not fut.done():
+                    fut.set_result(True)
+
+        client._send = _send
+        new_id = await client._subscribe_with_confirmation(
+            room_id="r1", callback=AsyncMock(), timeout=5,
+            keep_callback_on_failure=True,
+        )
+        self.assertEqual(client._subscriptions["r1"], new_id)
