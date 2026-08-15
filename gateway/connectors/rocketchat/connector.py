@@ -1491,7 +1491,7 @@ class RocketChatConnector(Connector):
             room_type=sub.room.type,
             last_processed_ts=filter_ts,
             turn_store=self._turn_store,
-            bot_user_id="",
+            bot_user_id=self._rest.user_id or "",
         )
         # Captured here, with no await between the filter's increment and this read, so
         # it names the count that increment belonged to. `_hand_back` compares it before
