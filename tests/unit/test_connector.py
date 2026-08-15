@@ -3323,3 +3323,60 @@ class TestAPageFilledWithSystemEventsIsNotAnEmptyWindow(unittest.IsolatedAsyncio
         await connector._on_ws_reconnect()
 
         self.assertIsNone(connector._rooms["room-1"].replay_boundary)
+
+
+class TestAnInFlightDeliveryCannotReopenAClosedEpoch(unittest.IsolatedAsyncioTestCase):
+    """The watermark commit is the write a later re-add would replay from.
+
+    A message delivered with `roomParticipant: true` moments before a removal spends a
+    long time in flight — normalization, attachments, the handler — and committing its
+    watermark on the far side restores exactly the mark the removal cleared.
+    """
+
+    def _connector(self):
+        connector = _make_connector()
+        connector._config.require_mention = False
+        connector._handler = AsyncMock(return_value=True)
+        return connector
+
+    async def test_a_delivery_that_outlived_its_membership_commits_nothing(self):
+        connector = self._connector()
+        sub = connector._rooms["room-1"]
+        sub.last_processed_ts = "100"
+
+        async def _handler(msg):
+            # The REST membership check confirms removal while this is in flight.
+            sub.replay_boundary = None
+            sub.last_processed_ts = None
+            sub.membership_epoch += 1
+            return True
+
+        connector._handler = _handler
+
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
+            handled = await connector._on_raw_ddp_message(
+                "room-1",
+                {"_id": "m9", "msg": "hi", "u": {"username": "alice"},
+                 "ts": {"$date": 500}},
+            )
+
+        self.assertTrue(handled, "the message was handled; only its mark is refused")
+        self.assertIsNone(
+            sub.last_processed_ts,
+            "restoring it would have a later re-add replay from before the removal",
+        )
+
+    async def test_an_ordinary_delivery_still_commits(self):
+        """The near miss: the epoch check must not stop the watermark advancing at all."""
+        connector = self._connector()
+        sub = connector._rooms["room-1"]
+        sub.last_processed_ts = "100"
+
+        await connector._on_raw_ddp_message(
+            "room-1",
+            {"_id": "m9", "msg": "hi", "u": {"username": "alice"},
+             "ts": {"$date": 500}},
+        )
+
+        self.assertIsNotNone(sub.last_processed_ts)
+        self.assertNotEqual(sub.last_processed_ts, "100")

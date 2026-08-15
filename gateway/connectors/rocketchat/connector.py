@@ -1240,6 +1240,14 @@ class RocketChatConnector(Connector):
             logger.warning("Received message for unknown room_id=%s", room_id)
             return True
 
+        # Which membership era this delivery belongs to, read before the first await. Every
+        # path from here to the watermark commit is long — normalization, attachment
+        # downloads, the handler itself — and a message that was delivered with
+        # `roomParticipant: true` moments before a removal is entitled to nothing on the
+        # other side of it. The commit at the end is the write that matters: it is what a
+        # later re-add would replay from.
+        entry_epoch = sub.membership_epoch
+
         # --- _id dedup (live + replay race guard) ---
         # A message can arrive on both the live DDP stream and the reconnect
         # history replay path within the same short window.  The ts-based
@@ -1474,6 +1482,18 @@ class RocketChatConnector(Connector):
         # This is a much smaller race than waiting for the entire handler
         # duration, so the previous "advance before handler" behaviour did not
         # meaningfully reduce reconnect duplication in practice.
+        if sub.membership_epoch != entry_epoch:
+            # The account left this room while this message was in flight. Committing now
+            # would restore the very watermark the removal cleared, and a later re-add
+            # would replay from before the removal — delivering the interval the account
+            # was not a member for. The message itself is already handled; only the mark
+            # it would leave behind is refused.
+            logger.warning(
+                "Room %s: discarding the watermark of a message that was in flight when "
+                "this account left", room_id,
+            )
+            return True
+
         sub.last_processed_ts = result.msg_ts
         # msg_id was already added to seen_ids_set by the optimistic registration
         # block above (before the first await).  No second add needed here.

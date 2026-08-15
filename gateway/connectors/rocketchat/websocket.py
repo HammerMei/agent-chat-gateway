@@ -552,12 +552,20 @@ class RCWebSocketClient:
                 )
             state.status = "active"
             state.dropped_messages = 0
-        except (asyncio.TimeoutError, RuntimeError) as e:
-            # Subscription failed — roll back local state, but only the part of it this
-            # attempt still owns. A newer attempt for the same room may already have
-            # installed its own, and this one's failure is often *caused* by that: the
-            # replacement releases its predecessor, and the release is what this future is
-            # being rejected for.
+        except Exception as e:
+            # One arm, not two. There used to be a `(TimeoutError, RuntimeError)` arm and a
+            # generic one doing the same thing, and the ownership rule was added to the
+            # first only — so a `_send` raising a transport error after a successor had
+            # installed itself took the successor's state down through the other door. A
+            # rule stated twice is a rule that will be applied once.
+            #
+            # `CancelledError` is a `BaseException` and still propagates untouched: a
+            # cancelled attempt has a caller waiting to decide what its state means.
+            #
+            # Roll back only the part this attempt still owns. A newer attempt for this
+            # room may already have installed its own, and this one's failure is often
+            # *caused* by that: the replacement releases its predecessor, and the release
+            # is what this future is being rejected for.
             owns = self._subscriptions.get(room_id) == sub_id
             if owns:
                 self._subscriptions.pop(room_id, None)
@@ -566,16 +574,6 @@ class RCWebSocketClient:
                 state.status = "failed"
                 state.last_error = str(e)
             if owns and not keep_callback_on_failure:
-                self._callbacks.pop(room_id, None)
-                self._subscription_states.pop(room_id, None)
-            self._pending_subs.pop(sub_id, None)
-            raise
-        except Exception as e:
-            self._subscriptions.pop(room_id, None)
-            state.sub_id = None
-            state.status = "failed"
-            state.last_error = str(e)
-            if not keep_callback_on_failure:
                 self._callbacks.pop(room_id, None)
                 self._subscription_states.pop(room_id, None)
             self._pending_subs.pop(sub_id, None)
