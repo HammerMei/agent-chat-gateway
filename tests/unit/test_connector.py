@@ -2847,6 +2847,27 @@ class TestTheLiveGateClosesTheReplayWindowToo(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(handled, "a rejected message is finished with, not owed a retry")
         self.assertIsNone(sub.replay_boundary)
         self.assertIsNone(sub.last_processed_ts)
+        self.assertEqual(
+            sub.membership_epoch, 1,
+            "clearing the marks cannot reach a replay already holding a snapshot of "
+            "them; the epoch is what it checks",
+        )
+
+    async def test_a_participant_message_does_not_bump_the_epoch(self):
+        """The near miss: bumping on every message would abort every replay."""
+        connector = _make_connector()
+        connector._handler = AsyncMock(return_value=True)
+        connector._config.require_mention = False
+        sub = connector._rooms["room-1"]
+
+        await connector._on_raw_ddp_message(
+            "room-1",
+            {"_id": "m9", "msg": "hi", "u": {"username": "alice"},
+             "ts": {"$date": 500}},
+            access={"roomParticipant": True},
+        )
+
+        self.assertEqual(sub.membership_epoch, 0)
 
     async def test_a_participant_message_leaves_the_marks_alone(self):
         """The near miss: closing the window on every message would disable replay."""
@@ -3060,3 +3081,152 @@ class TestAQueuedFrameDoesNotReofferATrackedRoom(unittest.IsolatedAsyncioTestCas
 
 async def _noop():
     return None
+
+
+class TestAReplayStopsWhenMembershipIsRevokedUnderIt(unittest.IsolatedAsyncioTestCase):
+    """A replay holds a snapshot; clearing the marks cannot reach it.
+
+    The membership check is a REST round trip and the dispatch loop is up to 200 handler
+    calls. A live `roomParticipant=False` arriving anywhere inside that is the news the
+    batch must act on — otherwise the account is confirmed removed and the agent keeps
+    delivering the room's history anyway.
+    """
+
+    def _connector(self, msgs):
+        connector = _make_connector()
+        connector._rooms["room-1"].last_processed_ts = "100"
+        connector._ws.subscription_statuses = {}
+        connector._rest.is_room_member = AsyncMock(return_value=True)
+        connector._rest.get_room_history = AsyncMock(return_value=msgs)
+        return connector
+
+    def _msgs(self, n):
+        return [
+            {"_id": f"m{i}", "msg": "hi", "u": {"username": "alice"},
+             "ts": {"$date": 200 + i}}
+            for i in range(n)
+        ]
+
+    async def test_a_rejection_during_the_membership_check_abandons_the_batch(self):
+        connector = self._connector(self._msgs(3))
+        sub = connector._rooms["room-1"]
+
+        async def _check(_room_id):
+            sub.membership_epoch += 1     # the live gate fires during the lookup
+            return True
+
+        connector._rest.is_room_member = AsyncMock(side_effect=_check)
+
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
+            await connector._on_ws_reconnect()
+
+        connector._rest.get_room_history.assert_not_awaited()
+
+    async def test_a_rejection_during_the_fetch_discards_the_batch(self):
+        connector = self._connector(self._msgs(3))
+        sub = connector._rooms["room-1"]
+        dispatched: list[str] = []
+        connector._on_raw_ddp_message = AsyncMock(
+            side_effect=lambda room_id, doc, **kw: dispatched.append(doc["_id"]) or True
+        )
+
+        async def _history(*a, **k):
+            sub.membership_epoch += 1
+            return self._msgs(3)
+
+        connector._rest.get_room_history = AsyncMock(side_effect=_history)
+
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
+            await connector._on_ws_reconnect()
+
+        self.assertEqual(dispatched, [], "not one message from a room we have left")
+
+    async def test_a_rejection_mid_dispatch_drops_the_remainder(self):
+        connector = self._connector(self._msgs(4))
+        sub = connector._rooms["room-1"]
+        dispatched: list[str] = []
+
+        async def _dispatch(room_id, doc, **kw):
+            dispatched.append(doc["_id"])
+            if len(dispatched) == 2:
+                sub.membership_epoch += 1
+            return True
+
+        connector._on_raw_ddp_message = _dispatch
+
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
+            await connector._on_ws_reconnect()
+
+        self.assertEqual(dispatched, ["m0", "m1"], "the rest belong to a room we left")
+
+    async def test_an_undisturbed_replay_still_delivers(self):
+        """The near miss: the epoch check must not abandon ordinary replays."""
+        connector = self._connector(self._msgs(3))
+        dispatched: list[str] = []
+        connector._on_raw_ddp_message = AsyncMock(
+            side_effect=lambda room_id, doc, **kw: dispatched.append(doc["_id"]) or True
+        )
+        await connector._on_ws_reconnect()
+        self.assertEqual(dispatched, ["m0", "m1", "m2"])
+
+
+class TestADroppedMessageKeepsItsOwnWindow(unittest.IsolatedAsyncioTestCase):
+    """Forgetting the id is not enough to bring a queue-full message back.
+
+    The watermark has not advanced past it — that happens only on acceptance — but the
+    next accepted message moves it past for good, and a replay copy racing this one may
+    already have reported its batch complete on the strength of the id just removed.
+    """
+
+    def _connector(self, accepted):
+        connector = _make_connector()
+        # The default config requires a mention and filters senders; this suite is about
+        # what happens *at the handler*, so the message has to be able to reach it.
+        connector._config.require_mention = False
+        connector._handler = AsyncMock(return_value=accepted)
+        return connector
+
+    async def test_a_queue_full_drop_opens_the_window_itself(self):
+        connector = self._connector(accepted=False)
+        sub = connector._rooms["room-1"]
+        sub.last_processed_ts = "100"
+
+        handled = await connector._on_raw_ddp_message(
+            "room-1",
+            {"_id": "m9", "msg": "hi", "u": {"username": "alice"},
+             "ts": {"$date": 500}},
+        )
+
+        self.assertFalse(handled)
+        self.assertEqual(
+            sub.replay_boundary, "100",
+            "pinned before the dropped message, so a later recovery can fetch it again",
+        )
+        self.assertNotIn("m9", sub.seen_ids_set)
+
+    async def test_an_older_window_is_not_narrowed(self):
+        connector = self._connector(accepted=False)
+        sub = connector._rooms["room-1"]
+        sub.last_processed_ts = "800"
+        sub.replay_boundary = "100"          # an outage still owed from earlier
+
+        await connector._on_raw_ddp_message(
+            "room-1",
+            {"_id": "m9", "msg": "hi", "u": {"username": "alice"},
+             "ts": {"$date": 900}},
+        )
+
+        self.assertEqual(sub.replay_boundary, "100")
+
+    async def test_an_accepted_message_opens_no_window(self):
+        connector = self._connector(accepted=True)
+        sub = connector._rooms["room-1"]
+        sub.last_processed_ts = "100"
+
+        await connector._on_raw_ddp_message(
+            "room-1",
+            {"_id": "m9", "msg": "hi", "u": {"username": "alice"},
+             "ts": {"$date": 500}},
+        )
+
+        self.assertIsNone(sub.replay_boundary)

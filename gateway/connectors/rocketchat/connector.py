@@ -80,6 +80,11 @@ class _RoomSubscription:
     # the time replay runs, because the first live message through the new subscription
     # has already moved it past the gap.
     replay_boundary: str | None = None
+    # Bumped whenever this account is confirmed to have left the room. A replay reads it
+    # before its history fetch and again as it dispatches: the fetch and the dispatch loop
+    # are long, and a live rejection arriving inside them is exactly the news that the
+    # batch must not be delivered.
+    membership_epoch: int = 0
     # Bounded FIFO set of recently-seen message _id values.  Used to deduplicate
     # messages that arrive on both the live DDP stream and the reconnect history
     # replay path.  deque provides O(1) append and fast len() checks while the
@@ -331,7 +336,19 @@ class RocketChatConnector(Connector):
             # removed from a public channel mid-outage still replays that channel — REST
             # history for a public channel does not require membership, so the fetch
             # succeeds and the agent answers in a room it was thrown out of.
+            # Read before the lookup, and compared again around every await below. The
+            # fetch is a REST round trip and the dispatch loop is up to 200 handler calls;
+            # a live rejection arriving anywhere inside that is news this batch has to act
+            # on, and it cannot see the cleared marks because it is holding a snapshot.
+            epoch = sub.membership_epoch
             member = await self._rest.is_room_member(sub.room.id)
+            if sub.membership_epoch != epoch:
+                logger.warning(
+                    "Room '%s': this account was removed while its membership was being "
+                    "checked — abandoning the replay",
+                    sub.room.name,
+                )
+                continue
             if member is False:
                 # Removed, confirmed. Both marks are dropped, not just the boundary: an
                 # account that is later re-added would otherwise replay from before its
@@ -380,6 +397,14 @@ class RocketChatConnector(Connector):
                 )
                 continue
 
+            if sub.membership_epoch != epoch:
+                logger.warning(
+                    "Room '%s': this account was removed while its history was being "
+                    "fetched — discarding %d message(s) rather than dispatching them",
+                    sub.room.name, len(raw_msgs),
+                )
+                continue
+
             if not raw_msgs:
                 # A read that found nothing is still a read: the window is closed.
                 sub.replay_boundary = None
@@ -420,6 +445,13 @@ class RocketChatConnector(Connector):
                 # removed while we were awaiting get_room_history, skip the
                 # remaining docs rather than logging spurious "unknown room_id"
                 # warnings for each one.
+                if sub.membership_epoch != epoch:
+                    logger.warning(
+                        "Room '%s': this account was removed mid-replay — dropping the "
+                        "remaining %d message(s)",
+                        sub.room.name, len(raw_msgs) - idx,
+                    )
+                    break
                 if room_id not in self._rooms:
                     logger.debug(
                         "Room '%s' was unsubscribed during replay — "
@@ -1212,6 +1244,10 @@ class RocketChatConnector(Connector):
             # was ever delivered.
             sub.replay_boundary = None
             sub.last_processed_ts = None
+            # A replay may be mid-flight with a snapshot taken before this news; the epoch
+            # is how it finds out. Clearing the marks alone cannot reach it — it is holding
+            # its own copy of them.
+            sub.membership_epoch += 1
             return True
 
         msg_id = doc.get("_id", "")
@@ -1380,6 +1416,15 @@ class RocketChatConnector(Connector):
                     sub.seen_ids.remove(msg_id)
                 except ValueError:
                     pass
+            # Pin the outage window at "before this message", because forgetting the id is
+            # not enough on its own to bring it back. The watermark has not advanced past
+            # it — that only happens on acceptance — but the *next* accepted message moves
+            # it past for good, and a replay copy of this same message may already have
+            # reported the batch complete on the strength of the id this branch has just
+            # removed. Whoever drops a message owns keeping it reachable.
+            #
+            # `or`, so an older window already open is not narrowed to this one.
+            sub.replay_boundary = sub.replay_boundary or sub.last_processed_ts
             # The one outcome that leaves this message pending: its id was just forgotten
             # precisely so a later replay can bring it back, and a boundary spent on a
             # batch containing it would remove the only thing that could.
