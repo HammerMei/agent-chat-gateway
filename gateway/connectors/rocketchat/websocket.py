@@ -532,11 +532,19 @@ class RCWebSocketClient:
             # local state so the room is not left as an active subscription
             # after the caller intended to remove it.
             if room_id in self._rooms_unsubscribing:
-                self._subscriptions.pop(room_id, None)
-                self._callbacks.pop(room_id, None)
-                state.sub_id = None
-                state.status = "failed"
-                state.last_error = "unsubscribed concurrently during resubscription"
+                # Only what this attempt still owns. A recovery starting while a direct
+                # `subscribe_room` is mid-confirmation makes two attempts for one room, and
+                # the loser's rollback used to take the winner's mapping, callback and
+                # state with it — leaving a subscription live on the server that nothing
+                # tracks, whose messages then take the unrouted path and are discarded
+                # because the connector considers the room tracked.
+                if self._subscriptions.get(room_id) == sub_id:
+                    self._subscriptions.pop(room_id, None)
+                    self._callbacks.pop(room_id, None)
+                if state.sub_id == sub_id:
+                    state.sub_id = None
+                    state.status = "failed"
+                    state.last_error = "unsubscribed concurrently during resubscription"
                 self._pending_subs.pop(sub_id, None)
                 raise RuntimeError(
                     f"Room {room_id} was unsubscribed while resubscription was "
@@ -545,12 +553,19 @@ class RCWebSocketClient:
             state.status = "active"
             state.dropped_messages = 0
         except (asyncio.TimeoutError, RuntimeError) as e:
-            # Subscription failed — roll back local state.
-            self._subscriptions.pop(room_id, None)
-            state.sub_id = None
-            state.status = "failed"
-            state.last_error = str(e)
-            if not keep_callback_on_failure:
+            # Subscription failed — roll back local state, but only the part of it this
+            # attempt still owns. A newer attempt for the same room may already have
+            # installed its own, and this one's failure is often *caused* by that: the
+            # replacement releases its predecessor, and the release is what this future is
+            # being rejected for.
+            owns = self._subscriptions.get(room_id) == sub_id
+            if owns:
+                self._subscriptions.pop(room_id, None)
+            if state.sub_id == sub_id:
+                state.sub_id = None
+                state.status = "failed"
+                state.last_error = str(e)
+            if owns and not keep_callback_on_failure:
                 self._callbacks.pop(room_id, None)
                 self._subscription_states.pop(room_id, None)
             self._pending_subs.pop(sub_id, None)

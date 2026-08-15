@@ -384,12 +384,13 @@ class RocketChatConnector(Connector):
                 continue
 
             try:
-                raw_msgs = await self._rest.get_room_history(
+                page = await self._rest.get_room_history_page(
                     sub.room.id,
                     sub.room.type,
                     count=self._REPLAY_HISTORY_COUNT,
                     after_ts=watermark,
                 )
+                raw_msgs = page.messages
             except Exception as e:
                 logger.warning(
                     "Room '%s': failed to fetch history for replay: %s",
@@ -406,15 +407,29 @@ class RocketChatConnector(Connector):
                 continue
 
             if not raw_msgs:
-                # A read that found nothing is still a read: the window is closed.
-                sub.replay_boundary = None
+                if page.was_full:
+                    # Not an empty window — a page the server filled entirely with system
+                    # events, because the count is applied before they are filtered out.
+                    # Every user message older than this page is still waiting behind it,
+                    # and reporting the outage as read would skip them silently. This is
+                    # the same bound the warning below describes, reached from the one
+                    # direction that produced no evidence at all.
+                    logger.warning(
+                        "Room '%s': the newest %d history entries are all system events "
+                        "— any user messages older than them cannot be reached in one "
+                        "page and may be permanently missed",
+                        sub.room.name, self._REPLAY_HISTORY_COUNT,
+                    )
+                else:
+                    # A read that found nothing is still a read: the window is closed.
+                    sub.replay_boundary = None
                 logger.debug(
                     "Room '%s': no missed messages since %s",
                     sub.room.name, watermark,
                 )
                 continue
 
-            if len(raw_msgs) == self._REPLAY_HISTORY_COUNT:
+            if page.was_full:
                 logger.warning(
                     "Room '%s': replay fetched the maximum %d message(s) — "
                     "the outage window may have produced more; some messages "

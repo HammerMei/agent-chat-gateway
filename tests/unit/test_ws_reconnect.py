@@ -1695,3 +1695,94 @@ class TestARemovalThatCompletesDuringTheReleaseIsStillNoticed(unittest.IsolatedA
             keep_callback_on_failure=True,
         )
         self.assertEqual(client._subscriptions["r1"], new_id)
+
+
+class TestALosingAttemptRollsBackOnlyItsOwnState(unittest.IsolatedAsyncioTestCase):
+    """Two attempts for one room, and the loser cleaning up after the winner.
+
+    A recovery starting while a direct `subscribe_room` is mid-confirmation produces
+    exactly that, and the loser's failure is often *caused* by the winner: installing a
+    subscription releases its predecessor, and that release is what rejects this future.
+    Rolling back unconditionally then leaves a subscription live on the server that nothing
+    tracks — its messages take the unrouted path and are dropped, because the connector
+    still considers the room tracked.
+    """
+
+    def _client_with_winner(self):
+        from gateway.connectors.rocketchat.websocket import SubscriptionState
+
+        client = _make_client()
+        self.winner_cb = AsyncMock()
+        client._subscriptions = {}
+        client._callbacks = {}
+        client._subscription_states = {
+            "r1": SubscriptionState(room_id="r1", callback=AsyncMock())
+        }
+        return client
+
+    async def _run_losing_attempt(self, client, *, unsubscribing: bool):
+        sent: list[dict] = []
+
+        async def _send(payload):
+            sent.append(payload)
+            if payload.get("msg") == "sub":
+                # The winner installs itself while this attempt waits.
+                client._subscriptions["r1"] = "winner-sub"
+                client._callbacks["r1"] = self.winner_cb
+                client._subscription_states["r1"].sub_id = "winner-sub"
+                if unsubscribing:
+                    client._rooms_unsubscribing.add("r1")
+                fut = client._pending_subs.get(payload["id"])
+                if fut and not fut.done():
+                    if unsubscribing:
+                        fut.set_result(True)
+                    else:
+                        fut.set_exception(RuntimeError("released by its successor"))
+
+        client._send = _send
+        with self.assertRaises(RuntimeError):
+            await client._subscribe_with_confirmation(
+                room_id="r1", callback=AsyncMock(), timeout=5,
+                keep_callback_on_failure=False,
+            )
+
+    async def test_a_rejected_attempt_leaves_the_winner_alone(self):
+        client = self._client_with_winner()
+        await self._run_losing_attempt(client, unsubscribing=False)
+
+        self.assertEqual(client._subscriptions.get("r1"), "winner-sub")
+        self.assertIs(
+            client._callbacks.get("r1"), self.winner_cb,
+            "removing the winner's callback is what makes its subscription untracked",
+        )
+        self.assertEqual(client._subscription_states["r1"].sub_id, "winner-sub")
+
+    async def test_the_unsubscribe_rollback_leaves_the_winner_alone_too(self):
+        """Both cleanup paths, because they are the same rule and were both unconditional."""
+        client = self._client_with_winner()
+        await self._run_losing_attempt(client, unsubscribing=True)
+
+        self.assertEqual(client._subscriptions.get("r1"), "winner-sub")
+        self.assertIs(client._callbacks.get("r1"), self.winner_cb)
+
+    async def test_an_attempt_with_no_rival_still_rolls_itself_back(self):
+        """The near miss: the ownership check must not turn rollback into a no-op."""
+        client = _make_client()
+        client._callbacks = {}
+        client._subscriptions = {}
+
+        async def _send(payload):
+            if payload.get("msg") == "sub":
+                fut = client._pending_subs.get(payload["id"])
+                if fut and not fut.done():
+                    fut.set_exception(RuntimeError("rejected"))
+
+        client._send = _send
+        with self.assertRaises(RuntimeError):
+            await client._subscribe_with_confirmation(
+                room_id="r1", callback=AsyncMock(), timeout=5,
+                keep_callback_on_failure=False,
+            )
+
+        self.assertNotIn("r1", client._subscriptions)
+        self.assertNotIn("r1", client._callbacks)

@@ -4,6 +4,7 @@ import asyncio
 import logging
 import mimetypes
 import secrets
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -38,6 +39,26 @@ def room_type_for(letter: str | None) -> str:
     answers unprompted.
     """
     return _ROOM_TYPES.get(letter or "", "channel")
+
+
+@dataclass(frozen=True)
+class HistoryPage:
+    """One page of history, and whether the server had more to give.
+
+    `raw_count` counts what the server returned *before* system and empty-body events were
+    dropped, because the limit is applied before that filtering. A page of two hundred
+    joins comes back as an empty `messages` list with `raw_count == limit`, and a caller
+    that cannot tell that from a genuinely empty window will report an outage as read when
+    every user message in it is still waiting behind that page.
+    """
+
+    messages: list[dict]
+    raw_count: int
+    limit: int
+
+    @property
+    def was_full(self) -> bool:
+        return self.raw_count >= self.limit
 
 
 class RocketChatREST:
@@ -476,6 +497,26 @@ class RocketChatREST:
                        only messages with ``ts >= after_ts`` are returned.
                        Omitted when None.
         """
+        return await self._get_room_history_raw(
+            room_id, room_type, count=count, before_ts=before_ts, after_ts=after_ts,
+            _filtered=True,
+        )
+
+    async def _get_room_history_raw(
+        self,
+        room_id: str,
+        room_type: str,
+        count: int,
+        before_ts: str | None,
+        after_ts: str | None,
+        _filtered: bool = False,
+    ) -> list[dict]:
+        """One history request. Returns the server's messages, newest-first, unfiltered.
+
+        `_filtered` is the compatibility shim for `get_room_history`, whose contract is the
+        filtered chronological list; `get_room_history_page` wants the unfiltered page so
+        it can say how full it was.
+        """
         endpoint_map = {
             "channel": "channels.history",
             "group":   "groups.history",
@@ -501,10 +542,36 @@ class RocketChatREST:
                 f"{result.get('error', result)}"
             )
         msgs = result.get("messages", [])
+        if not _filtered:
+            return msgs
         # Exclude system events (type field ``t`` present) and empty messages.
         text_msgs = [m for m in msgs if not m.get("t") and m.get("msg")]
         # RC REST API returns newest-first; reverse to chronological order.
         return list(reversed(text_msgs))
+
+    async def get_room_history_page(
+        self,
+        room_id: str,
+        room_type: str,
+        count: int = 50,
+        before_ts: str | None = None,
+        after_ts: str | None = None,
+    ) -> "HistoryPage":
+        """`get_room_history`, plus how full the page was *before* filtering.
+
+        The server applies `count` and only then are system and empty-body events
+        dropped, so an empty result does not mean an empty window: a page filled by
+        joins and topic changes hides every older user message behind it. The caller
+        cannot tell those apart from the filtered list alone, and the difference decides
+        whether it may report the outage as read.
+        """
+        raw = await self._get_room_history_raw(
+            room_id, room_type, count=count, before_ts=before_ts, after_ts=after_ts,
+        )
+        text_msgs = [m for m in raw if not m.get("t") and m.get("msg")]
+        return HistoryPage(
+            messages=list(reversed(text_msgs)), raw_count=len(raw), limit=count
+        )
 
     async def dm_members(self, room_id: str) -> list[str]:
         """How many people are in a direct room — the only way to tell a 1:1 from a group.

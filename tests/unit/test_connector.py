@@ -43,6 +43,19 @@ def _make_config(
     )
 
 
+
+def _page(msgs, limit=200):
+    """A `HistoryPage` for the replay path's mocks.
+
+    The replay path asks for a page rather than a list because an empty *filtered* list
+    and an empty *window* are different facts (the count is applied before system events
+    are dropped). Tests that only care about the messages go through here so the
+    distinction lives in one place.
+    """
+    from gateway.connectors.rocketchat.rest import HistoryPage
+    return HistoryPage(messages=list(msgs), raw_count=len(msgs), limit=limit)
+
+
 def _make_connector():
     from gateway.connectors.rocketchat.connector import (
         RocketChatConnector,
@@ -1194,7 +1207,7 @@ class TestOnWsReconnect(unittest.IsolatedAsyncioTestCase):
         """Build a connector with one room, pre-wired for replay tests."""
         connector = _make_connector()
         connector._rooms["room-1"].last_processed_ts = last_processed_ts
-        connector._rest.get_room_history = AsyncMock(return_value=[])
+        connector._rest.get_room_history_page = AsyncMock(return_value=_page([]))
         # Still a member — the default for tests about *what* is replayed. The
         # membership gate itself is exercised in TestReplayMembershipGate.
         connector._rest.is_room_member = AsyncMock(return_value=True)
@@ -1209,14 +1222,14 @@ class TestOnWsReconnect(unittest.IsolatedAsyncioTestCase):
         """Rooms without a watermark must not trigger a history fetch."""
         connector = self._make_reconnect_connector(last_processed_ts=None)
         await connector._on_ws_reconnect()
-        connector._rest.get_room_history.assert_not_awaited()
+        connector._rest.get_room_history_page.assert_not_awaited()
 
     async def test_fetches_history_with_correct_watermark(self):
         """History fetch must use last_processed_ts as after_ts."""
         connector = self._make_reconnect_connector(last_processed_ts="999")
         await connector._on_ws_reconnect()
-        connector._rest.get_room_history.assert_awaited_once()
-        call_kwargs = connector._rest.get_room_history.call_args
+        connector._rest.get_room_history_page.assert_awaited_once()
+        call_kwargs = connector._rest.get_room_history_page.call_args
         self.assertEqual(call_kwargs[1].get("after_ts"), "999")
         self.assertEqual(call_kwargs[0][0], "room-1")  # room_id
 
@@ -1227,7 +1240,7 @@ class TestOnWsReconnect(unittest.IsolatedAsyncioTestCase):
             {"_id": "m2", "msg": "hi", "u": {"username": "alice"}, "ts": {"$date": 200}},
             {"_id": "m3", "msg": "hey", "u": {"username": "alice"}, "ts": {"$date": 300}},
         ]
-        connector._rest.get_room_history = AsyncMock(return_value=missed)
+        connector._rest.get_room_history_page = AsyncMock(return_value=_page(missed))
 
         dispatched: list[dict] = []
 
@@ -1244,7 +1257,7 @@ class TestOnWsReconnect(unittest.IsolatedAsyncioTestCase):
     async def test_no_fetch_when_history_is_empty(self):
         """When history returns no messages, nothing is dispatched."""
         connector = self._make_reconnect_connector(last_processed_ts="100")
-        connector._rest.get_room_history = AsyncMock(return_value=[])
+        connector._rest.get_room_history_page = AsyncMock(return_value=_page([]))
 
         dispatched: list = []
 
@@ -1258,7 +1271,7 @@ class TestOnWsReconnect(unittest.IsolatedAsyncioTestCase):
     async def test_rest_failure_does_not_raise(self):
         """A REST history error must be logged and skipped, not propagated."""
         connector = self._make_reconnect_connector(last_processed_ts="100")
-        connector._rest.get_room_history = AsyncMock(
+        connector._rest.get_room_history_page = AsyncMock(
             side_effect=RuntimeError("API down")
         )
         # Must not raise
@@ -1274,7 +1287,8 @@ class TestOnWsReconnect(unittest.IsolatedAsyncioTestCase):
             {"_id": f"m{i}", "msg": "x", "u": {"username": "alice"}, "ts": {"$date": i}}
             for i in range(limit)
         ]
-        connector._rest.get_room_history = AsyncMock(return_value=full_page)
+        connector._rest.get_room_history_page = AsyncMock(
+            return_value=_page(full_page, limit=len(full_page)))
 
         dispatched: list = []
 
@@ -1424,11 +1438,11 @@ class TestReplayBoundary(unittest.IsolatedAsyncioTestCase):
         connector._rooms["room-1"].last_processed_ts = ts
         connector._ws.subscription_statuses = {}
         connector._rest.is_room_member = AsyncMock(return_value=True)
-        connector._rest.get_room_history = AsyncMock(return_value=[])
+        connector._rest.get_room_history_page = AsyncMock(return_value=_page([]))
         return connector
 
     def _after_ts(self, connector):
-        return connector._rest.get_room_history.call_args[1].get("after_ts")
+        return connector._rest.get_room_history_page.call_args[1].get("after_ts")
 
     async def test_a_message_arriving_during_recovery_does_not_shrink_the_window(self):
         connector = self._connector(ts="100")
@@ -1490,7 +1504,7 @@ class TestReplayBoundary(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_failed_history_fetch_keeps_the_boundary_too(self):
         connector = self._connector(ts="100")
-        connector._rest.get_room_history = AsyncMock(side_effect=RuntimeError("502"))
+        connector._rest.get_room_history_page = AsyncMock(side_effect=RuntimeError("502"))
         await connector._snapshot_replay_boundaries()
 
         with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
@@ -1527,11 +1541,11 @@ class TestReplayMembershipGate(unittest.IsolatedAsyncioTestCase):
         connector._rooms["room-1"].last_processed_ts = "100"
         connector._ws.subscription_statuses = {}
         connector._rest.is_room_member = AsyncMock(return_value=member)
-        connector._rest.get_room_history = AsyncMock(
-            return_value=[
+        connector._rest.get_room_history_page = AsyncMock(
+            return_value=_page([
                 {"_id": "m2", "msg": "hi", "u": {"username": "alice"},
                  "ts": {"$date": 200}},
-            ]
+            ])
         )
         return connector
 
@@ -1541,7 +1555,7 @@ class TestReplayMembershipGate(unittest.IsolatedAsyncioTestCase):
         connector = self._connector(member=False)
         with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
             await connector._on_ws_reconnect()
-        connector._rest.get_room_history.assert_not_awaited()
+        connector._rest.get_room_history_page.assert_not_awaited()
 
     async def test_membership_that_cannot_be_established_is_not_membership(self):
         """A lookup that failed has not said the account is still in the room. The next
@@ -1550,14 +1564,14 @@ class TestReplayMembershipGate(unittest.IsolatedAsyncioTestCase):
         connector = self._connector(member=None)
         with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
             await connector._on_ws_reconnect()
-        connector._rest.get_room_history.assert_not_awaited()
+        connector._rest.get_room_history_page.assert_not_awaited()
 
     async def test_a_member_still_gets_the_outage_replayed(self):
         """The gate must not be a way to skip every replay — the near miss that would make
         the two tests above pass against a connector that replays nothing at all."""
         connector = self._connector(member=True)
         await connector._on_ws_reconnect()
-        connector._rest.get_room_history.assert_awaited_once()
+        connector._rest.get_room_history_page.assert_awaited_once()
 
     async def test_membership_is_checked_before_the_history_is_fetched(self):
         """Order is the point. Checking afterwards still spends the call, and worse, tempts
@@ -1567,8 +1581,8 @@ class TestReplayMembershipGate(unittest.IsolatedAsyncioTestCase):
         connector._rest.is_room_member = AsyncMock(
             side_effect=lambda rid: order.append("member") or True
         )
-        connector._rest.get_room_history = AsyncMock(
-            side_effect=lambda *a, **k: order.append("history") or []
+        connector._rest.get_room_history_page = AsyncMock(
+            side_effect=lambda *a, **k: order.append("history") or _page([])
         )
         await connector._on_ws_reconnect()
         self.assertEqual(order, ["member", "history"])
@@ -1627,9 +1641,9 @@ class TestReviewFixes(unittest.IsolatedAsyncioTestCase):
         sub.seen_ids.append("cap-id")
 
         # Replay returns the same message.
-        connector._rest.get_room_history = AsyncMock(return_value=[
+        connector._rest.get_room_history_page = AsyncMock(return_value=_page([
             {"msg": "hi", "_id": "cap-id", "u": {"username": "alice"}, "ts": {"$date": 100}},
-        ])
+        ]))
         connector._rest.post_message = AsyncMock()
 
         with _patch("gateway.connectors.rocketchat.connector.filter_rc_message") as mock_filter:
@@ -1647,9 +1661,9 @@ class TestReviewFixes(unittest.IsolatedAsyncioTestCase):
 
         connector = _make_connector()
         connector._rooms["room-1"].last_processed_ts = "100"
-        connector._rest.get_room_history = AsyncMock(return_value=[
+        connector._rest.get_room_history_page = AsyncMock(return_value=_page([
             {"_id": "m1", "msg": "hi", "u": {"username": "alice"}, "ts": {"$date": 200}},
-        ])
+        ]))
         # Simulate failed DDP subscription status from the WS layer.
         connector._ws.subscription_statuses = {
             "room-1": {"status": "failed", "sub_id": None, "last_error": "rejected"}
@@ -1686,7 +1700,7 @@ class TestReviewFixes(unittest.IsolatedAsyncioTestCase):
             {"_id": "m1", "msg": "first", "u": {"username": "alice"}, "ts": {"$date": 200}},
             {"_id": "m2", "msg": "second", "u": {"username": "alice"}, "ts": {"$date": 300}},
         ]
-        connector._rest.get_room_history = AsyncMock(return_value=msgs)
+        connector._rest.get_room_history_page = AsyncMock(return_value=_page(msgs))
 
         dispatched: list = []
 
@@ -1720,9 +1734,9 @@ class TestRound3Fixes(unittest.IsolatedAsyncioTestCase):
         connector._ws.subscription_statuses = {}
         connector._capacity_check = lambda room_id: RoomCapacity.FULL
         connector._rest.post_message = AsyncMock()
-        connector._rest.get_room_history = AsyncMock(return_value=[
+        connector._rest.get_room_history_page = AsyncMock(return_value=_page([
             {"_id": "r1", "msg": "hi", "u": {"username": "alice"}, "ts": {"$date": 200}},
-        ])
+        ]))
 
         with _patch("gateway.connectors.rocketchat.connector.filter_rc_message") as mock_filter:
             from gateway.connectors.rocketchat.normalize import FilterResult
@@ -1805,9 +1819,9 @@ class TestRound3Fixes(unittest.IsolatedAsyncioTestCase):
             # Simulate a live message advancing the watermark while we await
             connector._rooms["room-1"].last_processed_ts = "999"
             captured_after_ts.append(after_ts)
-            return []
+            return _page([])
 
-        connector._rest.get_room_history = fake_history
+        connector._rest.get_room_history_page = fake_history
         await connector._on_ws_reconnect()
 
         # Must use the watermark that was snapshotted BEFORE the await (100),
@@ -2665,7 +2679,7 @@ class TestReplayWindowsDoNotSpanMembership(unittest.IsolatedAsyncioTestCase):
         connector._rooms["room-1"].last_processed_ts = "100"
         connector._ws.subscription_statuses = {}
         connector._rest.is_room_member = AsyncMock(return_value=member)
-        connector._rest.get_room_history = AsyncMock(return_value=[])
+        connector._rest.get_room_history_page = AsyncMock(return_value=_page([]))
         return connector
 
     async def test_a_confirmed_removal_closes_the_window(self):
@@ -2690,7 +2704,7 @@ class TestReplayWindowsDoNotSpanMembership(unittest.IsolatedAsyncioTestCase):
         await connector._on_ws_reconnect()
 
         self.assertEqual(
-            connector._rest.get_room_history.call_args[1].get("after_ts"), "900",
+            connector._rest.get_room_history_page.call_args[1].get("after_ts"), "900",
             "the window starts at the re-add, not before the removal",
         )
 
@@ -2720,7 +2734,7 @@ class TestTheBoundaryIsSpentOnDispatchNotOnFetch(unittest.IsolatedAsyncioTestCas
         connector._rooms["room-1"].last_processed_ts = "100"
         connector._ws.subscription_statuses = {}
         connector._rest.is_room_member = AsyncMock(return_value=True)
-        connector._rest.get_room_history = AsyncMock(return_value=msgs)
+        connector._rest.get_room_history_page = AsyncMock(return_value=_page(msgs))
         return connector
 
     def _msgs(self, n):
@@ -2782,7 +2796,7 @@ class TestARemovalDropsTheFallbackBoundaryToo(unittest.IsolatedAsyncioTestCase):
         connector._rooms["room-1"].last_processed_ts = "100"
         connector._ws.subscription_statuses = {}
         connector._rest.is_room_member = AsyncMock(return_value=False)
-        connector._rest.get_room_history = AsyncMock(return_value=[])
+        connector._rest.get_room_history_page = AsyncMock(return_value=_page([]))
         return connector
 
     async def test_a_removal_leaves_no_mark_to_replay_from(self):
@@ -2807,7 +2821,7 @@ class TestARemovalDropsTheFallbackBoundaryToo(unittest.IsolatedAsyncioTestCase):
         await connector._snapshot_replay_boundaries()
         await connector._on_ws_reconnect()
 
-        connector._rest.get_room_history.assert_not_awaited()
+        connector._rest.get_room_history_page.assert_not_awaited()
 
     async def test_an_unknown_lookup_keeps_the_watermark(self):
         """The near miss: unknown is not removal, and a watermark dropped on a flaky
@@ -2900,11 +2914,11 @@ class TestABatchHandedBackKeepsItsWindow(unittest.IsolatedAsyncioTestCase):
         connector._rooms["room-1"].last_processed_ts = "100"
         connector._ws.subscription_statuses = {}
         connector._rest.is_room_member = AsyncMock(return_value=True)
-        connector._rest.get_room_history = AsyncMock(return_value=[
+        connector._rest.get_room_history_page = AsyncMock(return_value=_page([
             {"_id": f"m{i}", "msg": "hi", "u": {"username": "alice"},
              "ts": {"$date": 200 + i}}
             for i in range(len(accepted_per_message))
-        ])
+        ]))
         answers = list(accepted_per_message)
 
         async def _dispatch(room_id, doc, **kw):
@@ -3097,7 +3111,7 @@ class TestAReplayStopsWhenMembershipIsRevokedUnderIt(unittest.IsolatedAsyncioTes
         connector._rooms["room-1"].last_processed_ts = "100"
         connector._ws.subscription_statuses = {}
         connector._rest.is_room_member = AsyncMock(return_value=True)
-        connector._rest.get_room_history = AsyncMock(return_value=msgs)
+        connector._rest.get_room_history_page = AsyncMock(return_value=_page(msgs))
         return connector
 
     def _msgs(self, n):
@@ -3120,7 +3134,7 @@ class TestAReplayStopsWhenMembershipIsRevokedUnderIt(unittest.IsolatedAsyncioTes
         with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
             await connector._on_ws_reconnect()
 
-        connector._rest.get_room_history.assert_not_awaited()
+        connector._rest.get_room_history_page.assert_not_awaited()
 
     async def test_a_rejection_during_the_fetch_discards_the_batch(self):
         connector = self._connector(self._msgs(3))
@@ -3132,9 +3146,9 @@ class TestAReplayStopsWhenMembershipIsRevokedUnderIt(unittest.IsolatedAsyncioTes
 
         async def _history(*a, **k):
             sub.membership_epoch += 1
-            return self._msgs(3)
+            return _page(self._msgs(3))
 
-        connector._rest.get_room_history = AsyncMock(side_effect=_history)
+        connector._rest.get_room_history_page = AsyncMock(side_effect=_history)
 
         with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
             await connector._on_ws_reconnect()
@@ -3263,3 +3277,49 @@ class TestADroppedMessageKeepsItsOwnWindow(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIsNone(sub.replay_boundary)
+
+
+class TestAPageFilledWithSystemEventsIsNotAnEmptyWindow(unittest.IsolatedAsyncioTestCase):
+    """The count is applied before system events are filtered out.
+
+    So a page of two hundred joins comes back as an empty message list while every user
+    message older than it is still waiting behind it. Reporting the outage as read there
+    skips them permanently, and the old code did it without even the warning the
+    non-empty truncation case gets.
+    """
+
+    def _connector(self, page):
+        connector = _make_connector()
+        connector._rooms["room-1"].last_processed_ts = "100"
+        connector._ws.subscription_statuses = {}
+        connector._rest.is_room_member = AsyncMock(return_value=True)
+        connector._rest.get_room_history_page = AsyncMock(return_value=page)
+        return connector
+
+    async def test_a_full_page_of_system_events_keeps_the_window(self):
+        from gateway.connectors.rocketchat.rest import HistoryPage
+
+        connector = self._connector(
+            HistoryPage(messages=[], raw_count=200, limit=200)
+        )
+        await connector._snapshot_replay_boundaries()
+
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
+            await connector._on_ws_reconnect()
+
+        self.assertEqual(
+            connector._rooms["room-1"].replay_boundary, "100",
+            "nothing in that window has been read, so it is not closed",
+        )
+
+    async def test_a_genuinely_empty_window_is_closed(self):
+        """The near miss: an empty page that was *not* full is a real answer, and keeping
+        the window open for it would leave the boundary open for good."""
+        from gateway.connectors.rocketchat.rest import HistoryPage
+
+        connector = self._connector(HistoryPage(messages=[], raw_count=0, limit=200))
+        await connector._snapshot_replay_boundaries()
+
+        await connector._on_ws_reconnect()
+
+        self.assertIsNone(connector._rooms["room-1"].replay_boundary)

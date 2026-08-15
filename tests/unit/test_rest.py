@@ -1527,3 +1527,53 @@ class TestTheVerifiedSubscriptionContract(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
             self.assertIsNone(await rest.is_room_member("r1"))
+
+
+class TestHistoryPageReportsHowFullItWas(unittest.IsolatedAsyncioTestCase):
+    """`count` is applied by the server; filtering happens here, after it."""
+
+    async def test_a_page_of_system_events_is_full_but_empty(self):
+        from gateway.connectors.rocketchat.rest import HistoryPage  # noqa: F401
+
+        rest = _make_rest()
+        rest._request = AsyncMock(return_value={
+            "success": True,
+            "messages": [{"_id": f"s{i}", "t": "uj", "msg": "someone"} for i in range(5)],
+        })
+
+        page = await rest.get_room_history_page("r1", "channel", count=5)
+
+        self.assertEqual(page.messages, [])
+        self.assertEqual(page.raw_count, 5)
+        self.assertTrue(
+            page.was_full,
+            "the caller cannot tell this from an empty window without it",
+        )
+
+    async def test_a_short_page_of_real_messages_is_not_full(self):
+        rest = _make_rest()
+        rest._request = AsyncMock(return_value={
+            "success": True,
+            "messages": [{"_id": "m1", "msg": "hi"}, {"_id": "m2", "msg": "there"}],
+        })
+
+        page = await rest.get_room_history_page("r1", "channel", count=200)
+
+        self.assertEqual([m["_id"] for m in page.messages], ["m2", "m1"])
+        self.assertFalse(page.was_full)
+
+    async def test_the_plain_list_call_still_filters_and_reverses(self):
+        """`get_room_history` keeps its contract — other callers are unchanged."""
+        rest = _make_rest()
+        rest._request = AsyncMock(return_value={
+            "success": True,
+            "messages": [
+                {"_id": "m2", "msg": "second"},
+                {"_id": "sys", "t": "uj", "msg": "joined"},
+                {"_id": "m1", "msg": "first"},
+            ],
+        })
+
+        msgs = await rest.get_room_history("r1", "channel", count=200)
+
+        self.assertEqual([m["_id"] for m in msgs], ["m1", "m2"])
