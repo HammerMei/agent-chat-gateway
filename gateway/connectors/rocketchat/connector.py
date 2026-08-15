@@ -36,6 +36,8 @@ from ...core.connector import (
     Room,
     RoomCapacity,
 )
+from ...core.replay_window import ReplayWindow
+from ...core.replay_window import just_before as _just_before
 from ...core.sender_policy import sender_allowed
 from ...core.tz_utils import local_iana_timezone as _server_local_timezone
 from ...core.watcher_manager import RoomRef
@@ -68,7 +70,7 @@ _SEEN_IDS_MAXLEN = 200
 
 
 @dataclass
-class _RoomSubscription:
+class _RoomSubscription(ReplayWindow):
     """Connector-level room state: platform subscription + shared dedup watermark.
 
     Owned by the connector, not by any individual watcher.
@@ -117,7 +119,7 @@ class _RoomSubscription:
         * `membership_epoch` — how work already in flight finds out. Clearing the marks
           cannot reach a replay or a dispatch holding its own copy of them.
         """
-        self.replay_boundary = None
+        self.discard_boundary()
         # `""`, not `None`, and the difference is what survives a restart. Both are falsy
         # everywhere this value is read, but the lifecycle's save step only copies the
         # connector's watermark when it has an opinion — `None` means "this room had no
@@ -125,52 +127,7 @@ class _RoomSubscription:
         # exactly wrong here. Empty says "cleared on purpose", so the stored record is
         # overwritten and a restart cannot hand the pre-removal mark back.
         self.last_processed_ts = ""
-        self.boundary_claims = 0
         self.membership_epoch += 1
-
-    def claim_boundary(self, *fallbacks: str | None) -> int:
-        """Record that someone still needs the outage window read. Returns the claim count.
-
-        The window is the *oldest* mark that anyone owes a read of, so an open one is
-        never narrowed: the first truthy of the current value and the fallbacks wins, in
-        that order. `_snapshot_replay_boundaries` offers the live watermark; a live
-        hand-back offers the watermark and then a point just below its own message,
-        because both marks are empty for the first delivery into a new room.
-
-        **The count is what makes this a method rather than the `or` expression it used to
-        be at each site.** Two claimants routinely want the same timestamp — a hand-back
-        during a replay of the very window it is claiming — and the value cannot tell them
-        apart. The batch then reads its own snapshot back unchanged and closes a window
-        the live message is still waiting on; the next accepted message moves the
-        watermark past it and nothing points below it any more. Only `discharge_boundary`
-        may close it, and only against a count read before the claim could have happened.
-
-        A fully falsy claim writes and counts nothing: there is no window to owe a read of
-        and no replay will look at this room.
-        """
-        boundary = next((c for c in (self.replay_boundary, *fallbacks) if c), None)
-        if not boundary:
-            return self.boundary_claims
-        self.replay_boundary = boundary
-        self.boundary_claims += 1
-        return self.boundary_claims
-
-    def discharge_boundary(self, claims_at_entry: int) -> bool:
-        """Close the outage window, unless it was claimed again since `claims_at_entry`.
-
-        Both places a replay can decide it has read the window — a dispatched batch and a
-        fetch that came back empty — go through here. The empty-fetch one is why this is
-        a method: it cleared the boundary unconditionally, and its distance from the
-        snapshot is a membership check plus a REST round trip, which is ample room for the
-        live hand-back this guard exists for.
-
-        False means the window is now owed to somebody else and has been left open.
-        """
-        if self.boundary_claims != claims_at_entry:
-            return False
-        self.replay_boundary = None
-        self.boundary_claims = 0
-        return True
 
     def remember(self, msg_id: str) -> None:
         """Record a message id as handled, evicting the oldest past the bound.
@@ -186,24 +143,6 @@ class _RoomSubscription:
         self.seen_ids.append(msg_id)
         if len(self.seen_ids) > _SEEN_IDS_MAXLEN:
             self.seen_ids_set.discard(self.seen_ids.popleft())
-
-
-def _just_before(ts: str) -> str:
-    """The largest timestamp strictly below `ts`, as a replay lower bound.
-
-    A replay boundary is handed to the filter as `last_processed_ts`, and the filter
-    rejects `msg_ts <= last_ts`. So a boundary *equal* to the message it exists to bring
-    back fetches it and then discards it — the boundary has to sit below it.
-
-    Rocket.Chat timestamps are epoch milliseconds (`normalize._extract_ts`), so one
-    millisecond below is exact rather than an epsilon. A value that will not parse is
-    returned unchanged: an unusable boundary is better than a fabricated one, and the
-    caller's alternative is no boundary at all.
-    """
-    try:
-        return str(int(float(ts)) - 1)
-    except (TypeError, ValueError):
-        return ts
 
 
 @dataclass

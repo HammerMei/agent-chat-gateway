@@ -26,6 +26,7 @@ from gateway.connectors.mattermost.config import MattermostConfig
 from gateway.connectors.mattermost.connector import MattermostConnector
 from gateway.core.agent_chain import AgentChainConfig
 from gateway.core.connector import IncomingMessage, Room, RoomCapacity, User, UserRole
+from gateway.core.replay_window import just_before
 from gateway.core.watcher_rule import RoomKind
 
 
@@ -1221,3 +1222,111 @@ class TestTheMattermostWatermarkNeverMovesBackwards(unittest.IsolatedAsyncioTest
         await connector._on_posted_event(self._event("p2", 900))
 
         self.assertEqual(state.last_processed_ts, "900")
+
+
+class TestARejectedPostStaysReachableAcrossReconnects(unittest.IsolatedAsyncioTestCase):
+    """Forgetting the id is only half of it — the watermark still has to point below it.
+
+    Mattermost gets the hand-back half of `core.replay_window` and not the outage half:
+    one connection resumes every channel at once, so there is no staggered-resubscribe
+    race to capture a window for. This mark exists purely because ACG refuses messages
+    when its own queues are full.
+    """
+
+    async def _connector(self):
+        connector = _make_connector(owners=["alice"])
+        room = Room(id="chan1", name="general", type="channel")
+        connector._ws.register_channel = MagicMock()
+        await connector.subscribe_room(room, watcher_id="w1")
+        connector._rest.resolve_username = AsyncMock(return_value="alice")
+        connector.register_handler(AsyncMock(return_value=True))
+        return connector
+
+    def _event(self, post_id, ts):
+        return {"post": {"id": post_id, "channel_id": "chan1", "user_id": "u1",
+                         "message": "@hammer.mei hi", "root_id": "", "type": "",
+                         "create_at": ts},
+                "mentions": ["bot-id-1"]}
+
+    async def test_a_later_success_cannot_strand_a_handed_back_post(self):
+        connector = await self._connector()
+        state = connector._channels["chan1"]
+        state.last_processed_ts = "400"
+
+        # The post at 500 is refused: the queues are full.
+        connector.register_handler(AsyncMock(return_value=False))
+        await connector._on_posted_event(self._event("p500", 500))
+        # Capacity frees up and a newer post is accepted, moving the watermark past it.
+        connector.register_handler(AsyncMock(return_value=True))
+        await connector._on_posted_event(self._event("p900", 900))
+
+        self.assertEqual(state.last_processed_ts, "900")
+        self.assertEqual(
+            state.replay_boundary, "400",
+            "the next reconnect must fetch from below the refused post, not from 900",
+        )
+
+    async def test_the_reconnect_fetches_from_the_boundary(self):
+        connector = await self._connector()
+        state = connector._channels["chan1"]
+        state.last_processed_ts = "900"
+        state.claim_boundary("400")
+        connector._rest.get_room_history = AsyncMock(return_value=[])
+
+        await connector._on_ws_reconnect()
+
+        self.assertEqual(
+            connector._rest.get_room_history.await_args.kwargs["after_ts"], "400",
+            "the watermark alone would skip everything the refused post is behind",
+        )
+
+    async def test_a_read_window_is_closed_again(self):
+        """The near miss: never closing leaves every channel replaying from the same
+        point for the life of the process."""
+        connector = await self._connector()
+        state = connector._channels["chan1"]
+        state.last_processed_ts = "900"
+        state.claim_boundary("400")
+        connector._rest.get_room_history = AsyncMock(
+            return_value=[{"id": "p500", "channel_id": "chan1", "user_id": "u1",
+                           "message": "hi", "root_id": "", "type": "", "create_at": 500}])
+
+        await connector._on_ws_reconnect()
+
+        self.assertIsNone(state.replay_boundary)
+
+    async def test_a_window_claimed_mid_batch_is_left_open(self):
+        """A hand-back during the batch claims the window this batch is reading, and
+        writes back the same timestamp — which is why the count decides, not the value."""
+        connector = await self._connector()
+        state = connector._channels["chan1"]
+        state.last_processed_ts = "900"
+        state.claim_boundary("400")
+        connector._rest.get_room_history = AsyncMock(
+            return_value=[{"id": "p500", "channel_id": "chan1", "user_id": "u1",
+                           "message": "hi", "root_id": "", "type": "", "create_at": 500}])
+
+        async def _dispatch(decoded, **kw):
+            # Exactly what a live hand-back does, same call, same arguments.
+            state.claim_boundary(state.last_processed_ts, just_before("450"))
+
+        connector._on_posted_event = _dispatch
+
+        with self.assertLogs("agent-chat-gateway.connectors.mattermost", "INFO"):
+            await connector._on_ws_reconnect()
+
+        self.assertEqual(
+            state.replay_boundary, "400",
+            "the live hand-back still depends on the window this batch did not read",
+        )
+
+    async def test_an_empty_fetch_closes_the_window_it_came_in_for(self):
+        connector = await self._connector()
+        state = connector._channels["chan1"]
+        state.last_processed_ts = "900"
+        state.claim_boundary("400")
+        connector._rest.get_room_history = AsyncMock(return_value=[])
+
+        await connector._on_ws_reconnect()
+
+        self.assertIsNone(state.replay_boundary)

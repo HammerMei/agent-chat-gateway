@@ -42,6 +42,7 @@ from ...core.connector import (
     Room,
     RoomCapacity,
 )
+from ...core.replay_window import ReplayWindow, just_before
 from ...core.tz_utils import local_iana_timezone as _server_local_timezone
 from ...core.watcher_manager import RoomRef
 from ...core.watcher_rule import RoomKind
@@ -74,7 +75,7 @@ _SEEN_IDS_MAXLEN = 200
 
 
 @dataclass
-class _ChannelState:
+class _ChannelState(ReplayWindow):
     """Connector-level channel state: dedup watermark + local subscriber tracking.
 
     Unlike RC's _RoomSubscription, there is no wire-protocol subscription to
@@ -85,6 +86,17 @@ class _ChannelState:
 
     room: Room
     last_processed_ts: str | None = None
+    # Where to resume from when the watermark alone would skip something. Declared here
+    # rather than inherited so it sits beside the watermark it qualifies — see
+    # `core.replay_window`, which owns the rule for who may clear it.
+    #
+    # Mattermost gets the *hand-back* half of that module and not the outage half: there is
+    # no per-channel subscribe handshake, so one connection resumes every channel at the
+    # same instant and the staggered-resubscribe race Rocket.Chat captures a window for
+    # cannot happen here. This mark exists only because ACG itself refuses messages when
+    # its queues are full.
+    replay_boundary: str | None = None
+    boundary_claims: int = 0
     seen_ids: collections.deque = field(default_factory=lambda: collections.deque())
     seen_ids_set: set = field(default_factory=set)
     watcher_ids: set = field(default_factory=set)
@@ -228,7 +240,14 @@ class MattermostConnector(Connector):
             # allowed to advance the watermark mid-replay and cause the rest
             # of this channel's replay window to be skipped as "already
             # processed".
-            watermark = state.last_processed_ts
+            # Captured before the fetch so the close below can tell whether anyone has
+            # claimed this window since. A hand-back landing while this batch is dispatching
+            # claims the very window it is reading and writes back the same timestamp, so a
+            # value comparison would report "unchanged" in exactly the case it exists to
+            # catch. Replay is not serialized against live traffic here — it calls
+            # `_on_posted_event` directly rather than through the per-channel worker.
+            claims_at_entry = state.boundary_claims
+            watermark = state.replay_boundary or state.last_processed_ts
             if not watermark:
                 logger.debug("Channel '%s': no watermark yet — skipping replay", state.room.name)
                 continue
@@ -242,6 +261,9 @@ class MattermostConnector(Connector):
 
             if not raw_msgs:
                 logger.debug("Channel '%s': no missed messages since %s", state.room.name, watermark)
+                # A read that found nothing is still a read — of the window this replay came
+                # in for, not one claimed during the fetch above.
+                state.discharge_boundary(claims_at_entry)
                 continue
 
             if len(raw_msgs) == self._REPLAY_HISTORY_COUNT:
@@ -266,6 +288,16 @@ class MattermostConnector(Connector):
                     break
                 decoded = self._synthesize_decoded_for_replay(post)
                 await self._on_posted_event(decoded, is_replay=True, replay_after_ts=watermark)
+            else:
+                # `for`/`else`, so a cancellation or the `break` above does not reach it: a
+                # window is spent once its batch has been *dispatched*, not once it was
+                # fetched. Any hand-back during the batch — this replay's own or a live one
+                # — left a newer claim, and the window stays open for the next recovery.
+                if not state.discharge_boundary(claims_at_entry):
+                    logger.info(
+                        "Channel '%s': the replay window was claimed again while this batch "
+                        "was being dispatched — leaving it open", state.room.name,
+                    )
 
     def _synthesize_decoded_for_replay(self, post: dict) -> dict:
         """Build a decoded-event dict for a REST-history post (replay path only).
@@ -1017,12 +1049,7 @@ class MattermostConnector(Connector):
                     "keeping it replayable rather than recording it as handled",
                     state.room.name,
                 )
-                if msg_id:
-                    state.seen_ids_set.discard(msg_id)
-                    try:
-                        state.seen_ids.remove(msg_id)
-                    except ValueError:
-                        pass
+                self._keep_replayable(state, msg_id, result)
                 self._release_turn_for(post, result, turn_generation, "replay preflight")
                 return
 
@@ -1069,12 +1096,7 @@ class MattermostConnector(Connector):
 
         if not accepted:
             logger.warning("Message from %s was dropped (queue full)", result.sender)
-            if msg_id:
-                state.seen_ids_set.discard(msg_id)
-                try:
-                    state.seen_ids.remove(msg_id)
-                except ValueError:
-                    pass
+            self._keep_replayable(state, msg_id, result)
             # Forgetting the id is not enough: the filter already spent a turn of this
             # sender's agent-chain budget, before anything knew whether the post could be
             # delivered. Every retry spends another, and once the budget is gone the
@@ -1095,6 +1117,26 @@ class MattermostConnector(Connector):
         # the rewind; across a save and a restart it does not.
         if ts_gt(result.msg_ts, state.last_processed_ts or ""):
             state.last_processed_ts = result.msg_ts
+
+    @staticmethod
+    def _keep_replayable(state: "_ChannelState", msg_id: str, result) -> None:
+        """Forget a post's id, and leave a mark below it so a replay can still find it.
+
+        The two go together, and separating them is the bug: forgetting the id alone makes
+        the post retryable only for as long as nothing else succeeds, because the *next*
+        accepted post moves the watermark past it and the next reconnect fetches from
+        there. Whoever drops a message owns keeping it reachable.
+
+        `claim_boundary` never narrows an open window, and falls through to a point just
+        below this post because both marks are empty for the first delivery into a channel.
+        """
+        if msg_id:
+            state.seen_ids_set.discard(msg_id)
+            try:
+                state.seen_ids.remove(msg_id)
+            except ValueError:
+                pass
+        state.claim_boundary(state.last_processed_ts, just_before(result.msg_ts))
 
     def _release_turn_for(self, post: dict, result, generation: int, reason: str) -> None:
         """Give back the turn a post took, for a post that was not delivered.
