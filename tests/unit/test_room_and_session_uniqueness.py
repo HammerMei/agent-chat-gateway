@@ -537,3 +537,75 @@ class TestAClearedWatermarkSurvivesToDisk(unittest.IsolatedAsyncioTestCase):
         await lc._stop_processor("w1")
 
         self.assertEqual(state.last_processed_ts, "900")
+
+
+class TestEveryWatermarkCopySpeaksTheSameLanguage(unittest.IsolatedAsyncioTestCase):
+    """`None` is "no opinion"; `""` is "cleared on purpose". Three sites read that.
+
+    Two of them write the connector's value into the record — `_stop_processor` and
+    `StateStore.save` — and one writes the record back into the connector on restore. A
+    site that still tests truthiness treats a deliberate clear as an absence, and whichever
+    of them runs first decides whether a removal survives.
+    """
+
+    def _save(self, *, live_ts, states):
+        """Drive the real `StateStore.save` against a temp state file."""
+        from unittest.mock import patch
+
+        from gateway.core.state_store import StateStore
+
+        store = StateStore.__new__(StateStore)
+        connector = MagicMock()
+        connector.get_last_processed_ts = MagicMock(return_value=live_ts)
+        store._connector = connector
+        store._state_name = "test"
+        with patch("gateway.core.state_store.load_state", return_value={}), \
+             patch("gateway.core.state_store.save_state") as saved:
+            store.save(states)
+        return saved
+
+    def test_the_save_path_propagates_a_deliberate_clear(self):
+        from gateway.core.state import WatcherState
+
+        ws = WatcherState(
+            watcher_name="w1", session_id="s1", room_id="room-1",
+            last_processed_ts="100",
+        )
+        self._save(live_ts="", states={"w1": ws})
+
+        self.assertEqual(
+            ws.last_processed_ts, "",
+            "a process that exits without a clean stop must not leave the pre-removal "
+            "mark on disk",
+        )
+
+    def test_the_save_path_leaves_a_quiet_room_alone(self):
+        from gateway.core.state import WatcherState
+
+        ws = WatcherState(
+            watcher_name="w1", session_id="s1", room_id="room-1",
+            last_processed_ts="100",
+        )
+        self._save(live_ts=None, states={"w1": ws})
+
+        self.assertEqual(ws.last_processed_ts, "100")
+
+    def test_no_copy_site_still_tests_truthiness(self):
+        """Derived from the source, because the list of sites is the thing that keeps
+        being incomplete — twice now, once with the second site named in the finding."""
+        import inspect
+
+        from gateway.core import state_store, watcher_lifecycle
+
+        for mod in (state_store, watcher_lifecycle):
+            src = inspect.getsource(mod)
+            self.assertNotIn(
+                "if live_ts:", src,
+                f"{mod.__name__}: a truthiness test cannot tell a deliberate clear from "
+                f"an absence — use `is not None`",
+            )
+            self.assertNotIn(
+                "if not current_ts or", src,
+                f"{mod.__name__}: same rule on the restore side — an empty live cursor "
+                f"is a connector saying it cleared the mark",
+            )

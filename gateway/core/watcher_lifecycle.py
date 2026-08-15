@@ -628,9 +628,16 @@ class WatcherLifecycle:
         # the two after the next reconnect. (This used to be justified by sibling
         # watchers sharing a room, which §4.1 no longer permits; the reason above is
         # the one that still holds.)
+        #
+        # The third site of one rule, and the only one that reads rather than writes: an
+        # empty live cursor is a connector saying "cleared on purpose", not "I have
+        # nothing". Writing the stored mark back over it would undo a removal that has not
+        # yet reached the record — the same interval-replay the clear exists to prevent,
+        # arriving from the restore side instead of the save side. `None` still means the
+        # connector has no state for this room, which is what this restore is for.
         if ws.last_processed_ts:
             current_ts = self._connector.get_last_processed_ts(room.id)
-            if not current_ts or _ts_gt(ws.last_processed_ts, current_ts):
+            if current_ts is None or _ts_gt(ws.last_processed_ts, current_ts):
                 self._connector.update_last_processed_ts(room.id, ws.last_processed_ts)
 
         logger.info(
@@ -777,7 +784,7 @@ class WatcherLifecycle:
         a room pops the connector's per-room state (``self._rooms`` on
         Rocket.Chat, ``self._channels`` on Mattermost), and the watermark lives
         in exactly that entry.  Reading it afterwards returned None — silently,
-        because ``dict.get`` does not raise, so ``if live_ts:`` simply never
+        because ``dict.get`` does not raise, so the copy below simply never
         fired and the stale value was persisted.  On restart every message
         between the stale watermark and the true one was redelivered.
 
