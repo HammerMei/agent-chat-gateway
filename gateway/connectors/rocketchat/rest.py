@@ -6,11 +6,12 @@ import logging
 import math
 import mimetypes
 import secrets
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 import httpx
+
+from ...core.connector import HistoryPage
 
 logger = logging.getLogger("agent-chat-gateway.connectors.rocketchat.rest")
 
@@ -93,26 +94,6 @@ def room_type_for(letter: str | None) -> str:
     answers unprompted.
     """
     return _ROOM_TYPES.get(letter or "", "channel")
-
-
-@dataclass(frozen=True)
-class HistoryPage:
-    """One page of history, and whether the server had more to give.
-
-    `raw_count` counts what the server returned *before* system and empty-body events were
-    dropped, because the limit is applied before that filtering. A page of two hundred
-    joins comes back as an empty `messages` list with `raw_count == limit`, and a caller
-    that cannot tell that from a genuinely empty window will report an outage as read when
-    every user message in it is still waiting behind that page.
-    """
-
-    messages: list[dict]
-    raw_count: int
-    limit: int
-
-    @property
-    def was_full(self) -> bool:
-        return self.raw_count >= self.limit
 
 
 class RocketChatREST:
