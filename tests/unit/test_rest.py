@@ -1478,3 +1478,52 @@ class TestIsRoomMember(unittest.IsolatedAsyncioTestCase):
         args, kwargs = rest._request.call_args
         self.assertEqual(args[1], "subscriptions.getOne")
         self.assertEqual(kwargs["params"], {"roomId": "room-xyz"})
+
+
+class TestTheVerifiedSubscriptionContract(unittest.IsolatedAsyncioTestCase):
+    """Pinned to Rocket.Chat's actual handler, not to a guess about it.
+
+    `subscriptions.getOne` is `success({subscription: findOneByRoomIdAndUserId(...)})`, so a
+    room the caller is not in is a 200 with a null subscription. Its declared failures are
+    400 for a malformed request and 401 for authentication; neither is a membership answer,
+    which is why every HTTP error here stays *unknown*.
+    """
+
+    async def test_a_null_subscription_on_200_is_the_negative_answer(self):
+        rest = _make_rest()
+        rest._request = AsyncMock(return_value={"success": True, "subscription": None})
+        self.assertIs(await rest.is_room_member("r1"), False)
+
+    async def test_a_malformed_request_is_not_a_membership_answer(self):
+        """400 means the request lacked `roomId`, which says nothing about the account.
+
+        Reading it as "not a member" would let a caller bug close the replay window and
+        drop the watermark — silent message loss from an unrelated defect.
+        """
+        rest = _make_rest()
+        req = httpx.Request("GET", "http://x")
+        rest._request = AsyncMock(
+            side_effect=httpx.HTTPStatusError(
+                "400", request=req,
+                response=httpx.Response(
+                    400, request=req,
+                    json={"success": False,
+                          "error": "must have required property 'roomId'"},
+                ),
+            )
+        )
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
+            self.assertIsNone(await rest.is_room_member("r1"))
+
+    async def test_an_auth_failure_is_not_a_membership_answer(self):
+        rest = _make_rest()
+        req = httpx.Request("GET", "http://x")
+        rest._request = AsyncMock(
+            side_effect=httpx.HTTPStatusError(
+                "401", request=req,
+                response=httpx.Response(401, request=req,
+                                        json={"status": "error", "message": "unauthorized"}),
+            )
+        )
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
+            self.assertIsNone(await rest.is_room_member("r1"))

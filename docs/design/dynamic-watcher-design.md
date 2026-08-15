@@ -1947,10 +1947,14 @@ only `disconnect` returns a connector to `absent`.
 
    It is read from the account's subscription record for the room
    (`subscriptions.getOne`), which is what Rocket.Chat removes on leaving or being kicked;
-   a *hidden* room keeps its record and is still membership. Versions differ in how they
-   answer for a room with no record — a 200 with a null body, or a 4xx — and neither is
-   distinguishable from a server that is merely unwell, so both report **unknown**, and
-   unknown skips the replay with a warning rather than assuming either answer. That is the
+   a *hidden* room keeps its record and is still membership. A room with no record is a
+   **200 with a null subscription** — verified against the endpoint's handler, which is a
+   plain `success({subscription: findOneByRoomIdAndUserId(...)})`, and against its own
+   end-to-end tests; its declared failures are 400 for a malformed request and 401 for
+   authentication, neither of which says anything about membership. So an HTTP error is
+   **unknown**, and must stay unknown: answering "not a member" there would let an auth
+   failure close the replay window and drop the watermark, which is silent message loss
+   caused by an unrelated defect. That is the
    safe direction to be wrong in: a message withheld can still be read in the room it was
    sent to, and one sent to a room the agent was removed from cannot be taken back.
 6. **The replay boundary is where delivery stopped, not where replay starts.** Rooms are

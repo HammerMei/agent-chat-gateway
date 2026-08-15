@@ -558,10 +558,18 @@ class RocketChatREST:
                 "GET", "subscriptions.getOne", params={"roomId": room_id}
             )
         except httpx.HTTPStatusError as e:
-            # 403/400 here is Rocket.Chat's way of saying "no such subscription for you" on
-            # some versions, where others answer 200 with a null body. Neither is reliably
-            # distinguishable from a server that is merely unwell, so both are reported as
-            # unknown and the decision is left to the caller.
+            # No HTTP error from this endpoint means "not a member", and that is checked
+            # rather than assumed. The handler is
+            # `API.v1.success({subscription: await Subscriptions.findOneByRoomIdAndUserId(...)})`
+            # — a missing record is a **200 with a null subscription**, which is the branch
+            # below. Its declared failures are 400 for a malformed request (its own
+            # end-to-end test asserts `must have required property 'roomId'`) and 401 for
+            # authentication; neither says anything about membership.
+            #
+            # So every status error here is genuinely unknown, and must stay unknown:
+            # answering `False` would let an auth failure or a request bug close the replay
+            # window and drop the watermark, which is silent message loss caused by an
+            # unrelated defect.
             logger.warning(
                 "Could not read the subscription record for room %s (%s) — "
                 "membership is unknown",

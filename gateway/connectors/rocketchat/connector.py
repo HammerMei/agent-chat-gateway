@@ -611,6 +611,13 @@ class RocketChatConnector(Connector):
         room_id = doc.get("rid", "")
         if not room_id:
             return
+        if room_id in self._rooms:
+            # Tracked already. The queue is bounded and the workers are a pool, so a frame
+            # can wait in it while the offer it would have duplicated completes and creates
+            # the room's watcher — by which time the reservation below has been released
+            # and would let this one through. The room being tracked is the durable answer
+            # the reservation is only a proxy for.
+            return
         if room_id in self._rooms_being_routed:
             # Coalesced, not queued: the offer in flight is for this same room, and a
             # second one would create a second watcher for it. Nothing is lost — offering a

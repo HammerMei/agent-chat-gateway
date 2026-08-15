@@ -3016,3 +3016,47 @@ class TestARoomIsOfferedOnceAtATime(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(attempts), 2)
         self.assertEqual(connector._rooms_being_routed, set())
+
+
+class TestAQueuedFrameDoesNotReofferATrackedRoom(unittest.IsolatedAsyncioTestCase):
+    """The reservation covers offers in flight; it cannot cover one still in the queue.
+
+    With every worker busy, a frame can wait until the offer it would have duplicated has
+    completed and created the room's watcher — by which time the reservation is released
+    and would let it through. Being tracked is the durable answer the reservation is only
+    a proxy for.
+    """
+
+    def _connector(self):
+        connector = _make_connector()
+        connector._config.filter_sender = False
+        return connector
+
+    async def test_a_frame_that_arrives_after_creation_is_dropped(self):
+        connector = self._connector()
+        offered: list[str] = []
+        connector.register_router(lambda room: offered.append(room.id) or _noop())
+
+        doc = {"_id": "m1", "msg": "hi", "u": {"username": "alice"}, "rid": "room-1"}
+        access = {"roomParticipant": True, "roomType": "c", "roomName": "general"}
+
+        # `room-1` is already tracked by `_make_connector`, i.e. its watcher exists.
+        await connector._on_unrouted_message(doc, access)
+
+        self.assertEqual(offered, [], "a tracked room must never be offered again")
+
+    async def test_an_untracked_room_is_still_offered(self):
+        """The near miss: the tracked check must not swallow first contact."""
+        connector = self._connector()
+        offered: list[str] = []
+        connector.register_router(lambda room: offered.append(room.id) or _noop())
+
+        doc = {"_id": "m1", "msg": "hi", "u": {"username": "alice"}, "rid": "brand-new"}
+        access = {"roomParticipant": True, "roomType": "c", "roomName": "general"}
+        await connector._on_unrouted_message(doc, access)
+
+        self.assertEqual(offered, ["brand-new"])
+
+
+async def _noop():
+    return None
