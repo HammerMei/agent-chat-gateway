@@ -937,3 +937,145 @@ class TestTheStreamIsLostWhileTheSocketStaysUp(unittest.IsolatedAsyncioTestCase)
 
         self.assertIsInstance(pending.exception(), RuntimeError)
         self.assertEqual([f for f in sent if f.get("msg") == "sub"], [])
+
+
+class TestTheOutageBoundaryIsAnnouncedBeforeDeliveryReturns(unittest.IsolatedAsyncioTestCase):
+    """Whatever must be measured from where the outage started has to be measured while
+    nothing is subscribed.
+
+    Once the first room is confirmed, live traffic resumes for it while the others are
+    still subscribing — so anything read after that is a mix of two eras.
+    """
+
+    def _client(self) -> RCWebSocketClient:
+        client = _make_client()
+        client._callbacks = {"r1": AsyncMock(), "r2": AsyncMock()}
+        return client
+
+    def _record(self, client) -> list[str]:
+        events: list[str] = []
+        client.register_outage_callback(AsyncMock(side_effect=lambda: events.append("outage")))
+        client.register_reconnect_callback(AsyncMock(side_effect=lambda: events.append("replay")))
+
+        async def _sub(room_id, callback, timeout, keep_callback_on_failure):
+            events.append(f"sub:{room_id}")
+            return "s"
+
+        client._subscribe_with_confirmation = _sub
+        return events
+
+    async def test_the_reconnect_path_announces_before_it_subscribes(self):
+        client = self._client()
+        client._wants_stream = False
+        events = self._record(client)
+
+        await client._resubscribe_all_rooms()
+
+        self.assertEqual(events[0], "outage")
+        self.assertEqual(events[-1], "replay")
+        self.assertEqual(sorted(events[1:-1]), ["sub:r1", "sub:r2"])
+
+    async def test_the_stream_fallback_announces_before_it_subscribes(self):
+        client = self._client()
+        events = self._record(client)
+
+        await client._restore_per_room_delivery()
+
+        self.assertEqual(events[0], "outage")
+        self.assertEqual(events[-1], "replay")
+
+    async def test_the_stream_restore_happens_after_the_announcement_too(self):
+        """`subscribe_all` restores delivery for every room at once, so it is inside the
+        window the boundary has to precede."""
+        client = self._client()
+        client._wants_stream = True
+        events = self._record(client)
+
+        async def _subscribe_all(*a, **k):
+            events.append("stream")
+            return True
+
+        client.subscribe_all = _subscribe_all
+
+        await client._resubscribe_all_rooms()
+
+        self.assertEqual(events[:2], ["outage", "stream"])
+
+    async def test_a_client_with_no_outage_callback_still_recovers(self):
+        client = self._client()
+        client._wants_stream = False
+        replayed = AsyncMock()
+        client.register_reconnect_callback(replayed)
+        client._subscribe_with_confirmation = AsyncMock(return_value="s")
+
+        await client._resubscribe_all_rooms()
+
+        replayed.assert_awaited_once()
+
+    async def test_a_failing_outage_callback_does_not_abort_the_recovery(self):
+        """Losing the boundary degrades replay to the old behaviour; losing the recovery
+        would leave every room dark."""
+        client = self._client()
+        client._wants_stream = False
+        client.register_outage_callback(AsyncMock(side_effect=RuntimeError("boom")))
+        client._subscribe_with_confirmation = AsyncMock(return_value="s")
+        replayed = AsyncMock()
+        client.register_reconnect_callback(replayed)
+
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat.ws", "WARNING"):
+            await client._resubscribe_all_rooms()
+
+        replayed.assert_awaited_once()
+
+
+class TestAWatcherAddedDuringTheRestoreIsNotDeliveredTwice(unittest.IsolatedAsyncioTestCase):
+    """The restore window is a window in which `stream_active` correctly answers False.
+
+    `_resubscribe_all_rooms` clears the stream id before re-asking for it, so a watcher
+    added while `subscribe_all()` is awaiting confirmation is told — truthfully — that the
+    stream is down, and opens its own subscription. If the stream then comes back, that
+    room has two delivery paths for the rest of the process's life.
+    """
+
+    async def test_a_subscription_opened_mid_restore_is_released(self):
+        client = _make_client()
+        client._wants_stream = True
+        client._callbacks = {"r1": AsyncMock()}
+        sent: list[dict] = []
+        client._send = AsyncMock(side_effect=lambda d: sent.append(d))
+
+        async def _subscribe_all(*a, **k):
+            # A watcher is created while the confirmation is in flight.
+            client._subscriptions["r1"] = "sub-mid-restore"
+            return True
+
+        client.subscribe_all = _subscribe_all
+
+        await client._resubscribe_all_rooms()
+
+        self.assertEqual(
+            client._subscriptions, {},
+            "the stream carries the room now, so nothing else may also carry it",
+        )
+        self.assertIn(
+            {"msg": "unsub", "id": "sub-mid-restore"}, sent,
+            "released on the server too — a local drop leaves the server sending both",
+        )
+        self.assertIn(
+            "r1", client._callbacks,
+            "the room is still tracked; only who asked the server for it changed",
+        )
+
+    async def test_a_failed_restore_keeps_per_room_delivery(self):
+        """The near miss: releasing unconditionally would drop the very subscriptions the
+        fallback depends on."""
+        client = _make_client()
+        client._wants_stream = True
+        client._callbacks = {"r1": AsyncMock()}
+        client.subscribe_all = AsyncMock(return_value=False)
+        client._subscribe_with_confirmation = AsyncMock(return_value="s")
+
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat.ws", "ERROR"):
+            await client._resubscribe_all_rooms()
+
+        client._subscribe_with_confirmation.assert_awaited()

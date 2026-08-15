@@ -420,8 +420,30 @@ gives up on readability:
 | Room kind | Label | Stable? |
 |---|---|---|
 | channel / private group | the channel name | until renamed |
-| 1:1 DM | `dm-<counterpart>` | yes — a username is stable |
+| 1:1 DM | `dm-<counterpart>` | until the counterpart is renamed — and see below |
 | group DM | `gdm-<first 8 of a room_id hash>` | yes, by construction |
+
+**A renamed counterpart is a known inconsistency, deliberately left.** This
+table used to claim a username was stable. It is not — Rocket.Chat allows a
+rename, the room id does not change with it, and the row now says so. A channel
+rename is picked up immediately, because the new name arrives on every frame; a
+username is not on the frame, so it comes from an `im.members` lookup cached per
+room. Within one process a renamed counterpart therefore keeps its old label,
+while a restart produces the new one — the same room, labelled two ways
+depending on process age.
+
+The cache stays anyway, and the reason is worth stating rather than implying:
+it is what stops a DM that **no rule claims** from calling `im.members` on
+every message it ever receives, since an unclaimed room is offered to the router
+again each time. Caching user ids instead would not avoid that lookup — the
+label needs names, so ids would have to be resolved to names at the same point.
+
+What the verified immutability of DM membership (§6.4) justifies is caching the
+**kind**; the names are a snapshot and are documented here as one. Making the
+label follow a rename means deciding what a rename does to a *live* watcher's
+identity — whether it is renamed, or left alone and diverges from its room —
+and that is a §2.3 identity question, not a caching one. Deferred until watcher
+identity is revisited.
 
 **Group DMs deliberately do not encode their members in the label.** The
 tempting alternative is Mattermost's `channel_display_name`, which is exactly
@@ -1914,7 +1936,22 @@ only `disconnect` returns a connector to `absent`.
    unknown skips the replay with a warning rather than assuming either answer. That is the
    safe direction to be wrong in: a message withheld can still be read in the room it was
    sent to, and one sent to a room the agent was removed from cannot be taken back.
-6. **An unknown classification is not a default.** Rocket.Chat cannot distinguish a 1:1
+6. **The replay boundary is where delivery stopped, not where replay starts.** Rooms are
+   resubscribed one at a time, so the first is live again while the last is still
+   confirming — and a message arriving in that window is dispatched at once and moves that
+   room's watermark past the whole outage. Replay, reading the watermark when it finally
+   runs, then asks for history *after* the gap and never fetches it. The boundary must be
+   captured while nothing is subscribed, before either the stream restore or the first
+   per-room `sub`, and carried into the replay. Freezing the watermark instead would break
+   live dedup during the recovery; the two marks are separate facts and both are needed.
+
+   A boundary is spent when the window it names has been *read*, not when a replay was
+   attempted. The two ways a replay declines — membership unknown, the history fetch
+   failing — are both correlated with the outage, since the network has only just come
+   back, so they are the likely path rather than the exotic one; clearing the mark there
+   would close a gap nobody looked at. For the same reason a new outage does not overwrite
+   an unread boundary: the older mark covers both windows, and dedup bounds the cost.
+7. **An unknown classification is not a default.** Rocket.Chat cannot distinguish a 1:1
    from a group DM without a lookup, and a failed lookup answering "1:1" is not a
    conservative guess: it lets a group DM be claimed by a `direct: true` rule *and* skip
    the mention gate, so the agent answers everyone in it. Unknown means do not offer the

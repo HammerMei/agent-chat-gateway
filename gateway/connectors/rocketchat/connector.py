@@ -75,6 +75,11 @@ class _RoomSubscription:
 
     room: Room
     last_processed_ts: str | None = None
+    # Where the outage started, captured before delivery is restored — see
+    # `_snapshot_replay_boundaries`. `last_processed_ts` cannot answer that question by
+    # the time replay runs, because the first live message through the new subscription
+    # has already moved it past the gap.
+    replay_boundary: str | None = None
     # Bounded FIFO set of recently-seen message _id values.  Used to deduplicate
     # messages that arrive on both the live DDP stream and the reconnect history
     # replay path.  deque provides O(1) append and fast len() checks while the
@@ -206,6 +211,7 @@ class RocketChatConnector(Connector):
         """Login via REST and establish the DDP WebSocket connection."""
         await self._rest.login(self._config.username, self._config.password)
         await self._ws.connect()
+        self._ws.register_outage_callback(self._snapshot_replay_boundaries)
         self._ws.register_reconnect_callback(self._on_ws_reconnect)
         await self._ws.start()
 
@@ -251,6 +257,32 @@ class RocketChatConnector(Connector):
         await self._rest.close()
         logger.info("RocketChatConnector disconnected")
 
+    async def _snapshot_replay_boundaries(self) -> None:
+        """Record where each room's outage starts, before delivery is restored.
+
+        Called by the transport at the point delivery is known lost and nothing is
+        subscribed yet, so no live message can be dispatched while this runs.
+
+        Replay used to read `last_processed_ts` when it ran, which is *after* every room
+        has been resubscribed — and rooms are confirmed one by one, so a message arriving
+        in the first room while the last is still subscribing was dispatched immediately
+        and moved that room's watermark past the whole gap. History was then requested
+        from the new position and the outage's messages were skipped for good. The window
+        is small and the loss is silent, which is the combination that makes it worth a
+        second field rather than a comment.
+
+        Snapshotting the *boundary* rather than freezing `last_processed_ts` keeps live
+        dedup working normally during the recovery: the watermark stays free to advance,
+        and only replay reads the older mark.
+        """
+        for sub in self._rooms.values():
+            # An unconsumed boundary is an outage nobody has read yet, and it is older than
+            # this one — overwriting it would advance past a gap while claiming to record
+            # where a gap starts, which is the bug this field exists to prevent. The older
+            # mark covers both windows; dedup and `_REPLAY_HISTORY_COUNT` bound what that
+            # costs.
+            sub.replay_boundary = sub.replay_boundary or sub.last_processed_ts
+
     async def _on_ws_reconnect(self) -> None:
         """Replay messages missed during a WebSocket outage.
 
@@ -273,7 +305,13 @@ class RocketChatConnector(Connector):
             # subsequent rooms to advance their last_processed_ts.  If we read the
             # watermark inside the await we would use a newer ts that skips the
             # entire outage window for those rooms.
-            watermark = sub.last_processed_ts
+            # The outage boundary if one was captured, and the live watermark only as a
+            # fallback for a replay that no outage callback preceded. Cleared where the
+            # history is actually read, not here — a replay that declines below (membership
+            # unknown, or the fetch failing) has not read the window, and dropping the mark
+            # would close a gap nobody looked at. Those two failures are correlated with the
+            # outage itself, so this is the likely path, not the exotic one.
+            watermark = sub.replay_boundary or sub.last_processed_ts
             if not watermark:
                 logger.debug(
                     "Room '%s': no watermark yet — skipping replay", sub.room.name
@@ -312,6 +350,10 @@ class RocketChatConnector(Connector):
                     sub.room.name, e,
                 )
                 continue
+
+            # The window has now been read, so the mark that named it is spent. An empty
+            # result is a read: there was nothing in the gap.
+            sub.replay_boundary = None
 
             if not raw_msgs:
                 logger.debug(
@@ -570,6 +612,13 @@ class RocketChatConnector(Connector):
         `im.create` returns a **different room id** for a different member set. A group DM
         is therefore a separate room and never a mutated 1:1, so there is nothing for an
         invalidation path to catch (§6.4).
+
+        The *kind* is what that immutability justifies caching. The participant names are a
+        snapshot: a counterpart who is renamed keeps the old name here until the process
+        restarts. Left that way on purpose — the cache is what stops a DM no rule claims
+        from calling `im.members` on every message, and making the label follow a rename is
+        an identity question (what a rename does to a live watcher) rather than a caching
+        one. Recorded in §2.3.
 
         A failed lookup returns `None` — unknown — and caches nothing. It deliberately does
         not fall back to 1:1: this answer decides whether the mention gate applies at all, so

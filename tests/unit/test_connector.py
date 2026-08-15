@@ -1408,6 +1408,109 @@ class TestSeenIdsDedup(unittest.IsolatedAsyncioTestCase):
         self.assertIn(f"id-{_SEEN_IDS_MAXLEN}", sub.seen_ids_set)
 
 
+class TestReplayBoundary(unittest.IsolatedAsyncioTestCase):
+    """Replay must start where delivery stopped, not where replay started.
+
+    Rooms are resubscribed one at a time, so the first room is live again while the last is
+    still confirming. A message arriving in that window is dispatched immediately and moves
+    the room's watermark past the entire outage — and replay, reading the watermark when it
+    finally runs, then asks for history *after* the gap and never fetches it.
+    """
+
+    def _connector(self, ts="100"):
+        connector = _make_connector()
+        connector._rooms["room-1"].last_processed_ts = ts
+        connector._ws.subscription_statuses = {}
+        connector._rest.is_room_member = AsyncMock(return_value=True)
+        connector._rest.get_room_history = AsyncMock(return_value=[])
+        return connector
+
+    def _after_ts(self, connector):
+        return connector._rest.get_room_history.call_args[1].get("after_ts")
+
+    async def test_a_message_arriving_during_recovery_does_not_shrink_the_window(self):
+        connector = self._connector(ts="100")
+        await connector._snapshot_replay_boundaries()
+        # The first room's subscription is confirmed and a live message lands while the
+        # rest are still subscribing.
+        connector._rooms["room-1"].last_processed_ts = "500"
+
+        await connector._on_ws_reconnect()
+
+        self.assertEqual(
+            self._after_ts(connector), "100",
+            "history must be fetched from the outage boundary; asking from 500 skips "
+            "everything sent during the gap, permanently and without a warning",
+        )
+
+    async def test_a_replay_with_no_snapshot_still_uses_the_live_watermark(self):
+        """The near miss: a boundary of `None` must not become 'replay everything' or
+        'replay nothing'."""
+        connector = self._connector(ts="250")
+        await connector._on_ws_reconnect()
+        self.assertEqual(self._after_ts(connector), "250")
+
+    async def test_the_boundary_is_consumed_by_the_replay_that_uses_it(self):
+        """A boundary left behind would re-open a window the next replay has closed."""
+        connector = self._connector(ts="100")
+        await connector._snapshot_replay_boundaries()
+        await connector._on_ws_reconnect()
+        self.assertIsNone(connector._rooms["room-1"].replay_boundary)
+
+        connector._rooms["room-1"].last_processed_ts = "900"
+        await connector._on_ws_reconnect()
+        self.assertEqual(self._after_ts(connector), "900")
+
+    async def test_a_replay_that_declined_keeps_the_boundary(self):
+        """The two ways replay declines — membership unknown, history fetch failing — are
+        both *correlated* with the outage, because the network has only just come back. So
+        this is the likely path, and dropping the mark here loses the gap for good: the
+        next snapshot would record a watermark live traffic has already moved past it.
+        """
+        connector = self._connector(ts="100")
+        connector._rest.is_room_member = AsyncMock(return_value=None)
+        await connector._snapshot_replay_boundaries()
+
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
+            await connector._on_ws_reconnect()
+        self.assertEqual(connector._rooms["room-1"].replay_boundary, "100")
+
+        # The room goes on receiving live traffic, then a second recovery happens.
+        connector._rooms["room-1"].last_processed_ts = "800"
+        connector._rest.is_room_member = AsyncMock(return_value=True)
+        await connector._snapshot_replay_boundaries()
+        await connector._on_ws_reconnect()
+
+        self.assertEqual(
+            self._after_ts(connector), "100",
+            "the unread window still starts where the first outage did",
+        )
+
+    async def test_a_failed_history_fetch_keeps_the_boundary_too(self):
+        connector = self._connector(ts="100")
+        connector._rest.get_room_history = AsyncMock(side_effect=RuntimeError("502"))
+        await connector._snapshot_replay_boundaries()
+
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
+            await connector._on_ws_reconnect()
+
+        self.assertEqual(connector._rooms["room-1"].replay_boundary, "100")
+
+    async def test_the_snapshot_covers_every_room(self):
+        from gateway.connectors.rocketchat.connector import _RoomSubscription
+        from gateway.core.connector import Room
+
+        connector = self._connector(ts="100")
+        connector._rooms["room-2"] = _RoomSubscription(
+            room=Room(id="room-2", name="other", type="channel"),
+            last_processed_ts="200",
+        )
+        await connector._snapshot_replay_boundaries()
+        self.assertEqual(
+            {r.replay_boundary for r in connector._rooms.values()}, {"100", "200"},
+        )
+
+
 class TestReplayMembershipGate(unittest.IsolatedAsyncioTestCase):
     """Replay must re-establish membership; it cannot inherit the live path's answer.
 

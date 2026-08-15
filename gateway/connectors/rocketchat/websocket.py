@@ -59,6 +59,8 @@ class RCWebSocketClient:
         # Optional callback invoked after every successful reconnect + resubscribe.
         # Registered by the connector to replay messages missed during the outage.
         self._on_reconnect_cb: Callable[[], Any] | None = None
+        # Fired before a recovery subscribes anything — see `register_outage_callback`.
+        self._on_outage_cb: Callable[[], Any] | None = None
         # Set of room IDs currently being unsubscribed.  Checked inside
         # _subscribe_with_confirmation to detect a race where
         # _resubscribe_all_rooms re-registers a room that unsubscribe_room
@@ -971,6 +973,10 @@ class RCWebSocketClient:
         """
         task = asyncio.current_task()
         try:
+            # Before anything is subscribed: whatever has to be measured from where the
+            # outage started must be measured now. Once the first room is confirmed, live
+            # traffic resumes for it while the rest are still subscribing.
+            await self._fire_outage_callback()
             stream_restored = False
             if self._wants_stream:
                 # `_stream_sub_id` is the *current* subscription; `_wants_stream` is the
@@ -998,6 +1004,14 @@ class RCWebSocketClient:
             # losing the outage are not the same thing, and the `return` conflated them.
             rooms = [] if stream_restored else list(self._callbacks.items())
             if stream_restored:
+                # A watcher added while the restore was still in flight saw `stream_active`
+                # answer False — correctly, the stream was down — and opened its own
+                # subscription for its room. The stream now carries that room as well, so
+                # the room would be delivered twice for the rest of the process's life:
+                # dedup hides the second dispatch, not the queue slot it takes, and a full
+                # queue drops a real message. The same release the initial-connect path
+                # performs after `subscribe_all`, for the same reason.
+                await self.unsubscribe_rooms_keeping_callbacks()
                 # `_reconnect` marks every state `reconnecting` before this runs, and the
                 # per-room confirmations that would clear it are exactly what the stream
                 # makes unnecessary. Left alone, every tracked room reads as reconnecting
@@ -1067,6 +1081,30 @@ class RCWebSocketClient:
         elif rooms:
             logger.info("%s re-confirmed %d room subscription(s)", context, success)
 
+    def register_outage_callback(self, cb: Callable[[], Any]) -> None:
+        """Register the handler told that delivery has stopped, before it is restored.
+
+        Separate from the reconnect callback because the two answer different questions at
+        different moments: this one runs while nothing is subscribed, so what it observes is
+        the state the outage started from; the other runs once delivery is back. Anything
+        that has to be true *of the gap* has to be captured here — by the time the replay
+        callback runs, live traffic has already moved on.
+        """
+        self._on_outage_cb = cb
+
+    async def _fire_outage_callback(self) -> None:
+        """Announce the outage boundary. Must precede every `sub` frame of a recovery."""
+        if not self._on_outage_cb:
+            return
+        try:
+            await self._on_outage_cb()
+        except Exception as cb_err:
+            logger.warning(
+                "Outage callback raised an unexpected error (replay may fetch from the "
+                "wrong point): %s",
+                cb_err,
+            )
+
     async def _fire_reconnect_callback(self) -> None:
         """Ask the connector to recover whatever the gap in delivery lost."""
         if not self._on_reconnect_cb:
@@ -1123,6 +1161,7 @@ class RCWebSocketClient:
         """
         task = asyncio.current_task()
         try:
+            await self._fire_outage_callback()
             await self._subscribe_rooms_individually(
                 list(self._callbacks.items()), context="Stream fallback"
             )
