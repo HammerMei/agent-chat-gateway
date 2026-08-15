@@ -24,8 +24,14 @@ def _to_rc_ts(value: str | None) -> str | None:
     the request still succeeds. Probed against Rocket.Chat 6.12 **and 8.5.1**, five
     messages in a room, asking for everything at or after the third — same result on both:
 
-        oldest="1786816166131"            -> HTTP 200 success=True, 5 messages
-        oldest="2026-08-15T17:49:26.131Z" -> HTTP 200 success=True, 3 messages
+        oldest="1786816166131"                 -> HTTP 200 success=True, 5 messages
+        oldest="2026-08-15T17:49:26.131000Z"   -> HTTP 200 success=True, 3 messages
+
+    The second is the string this function emits, six fractional digits and all — the
+    probe was re-run on the real output rather than on a hand-written three-digit form,
+    because six digits is outside the ECMAScript Date Time String Format and therefore
+    lands in implementation-specific parsing. It works; the point is that it was checked
+    rather than assumed from a shorter string that also works.
 
     Not a quirk of an old server, and not something to wait out: `isChannelsHistoryProps`
     on `develop` types `oldest` as `{type: 'string', minLength: 1}` with no `date-time`

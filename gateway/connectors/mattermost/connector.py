@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ...agents.response import AgentEvent, AgentResponse
-from ...core.adapter_utils import ts_ms_to_iso_local, weekday_abbrev
+from ...core.adapter_utils import ts_gt, ts_ms_to_iso_local, weekday_abbrev
 from ...core.bot_identity import (
     BotIdentity,
     ConnectorIdentityError,
@@ -1002,17 +1002,42 @@ class MattermostConnector(Connector):
                 "all processor queues full, skipping normalize + download",
                 result.sender, state.room.name,
             )
-            # msg_id was already registered before the resolve_username await
-            # above — no second registration needed here.
-            if not is_replay:
-                try:
-                    await self._rest.post_message(
-                        channel_id,
-                        "⚠️ Server busy — your message was dropped. Please retry.",
-                        root_id=post.get("root_id") or None,
-                    )
-                except Exception as exc:
-                    logger.debug("Best-effort busy notification failed: %s", exc)
+            if is_replay:
+                # A replayed post rejected for capacity has to stay replayable, and the id
+                # registered before the `resolve_username` await above is what stops that:
+                # the next recovery skips it at the dedup check and reports the window
+                # read. Nothing tells the sender either — the busy notice below is
+                # suppressed for replays — so the message is gone silently and for good.
+                #
+                # Rocket.Chat has two hand-back sites, not one: the handler-queue-full
+                # branch and this preflight. The round that swept for Mattermost parity
+                # carried the first and declared the rule applied; this is the second.
+                logger.info(
+                    "Channel '%s': a replayed post could not be accepted (queues full) — "
+                    "keeping it replayable rather than recording it as handled",
+                    state.room.name,
+                )
+                if msg_id:
+                    state.seen_ids_set.discard(msg_id)
+                    try:
+                        state.seen_ids.remove(msg_id)
+                    except ValueError:
+                        pass
+                self._release_turn_for(post, result, turn_generation, "replay preflight")
+                return
+
+            try:
+                await self._rest.post_message(
+                    channel_id,
+                    "⚠️ Server busy — your message was dropped. Please retry.",
+                    root_id=post.get("root_id") or None,
+                )
+            except Exception as exc:
+                logger.debug("Best-effort busy notification failed: %s", exc)
+            # A live post keeps its id: the sender was told, and can resend. The turn it
+            # spent is still given back — the filter charged it before anything knew the
+            # post could not be delivered.
+            self._release_turn_for(post, result, turn_generation, "live preflight")
             return
 
         try:
@@ -1057,18 +1082,37 @@ class MattermostConnector(Connector):
             # the one it can never deliver. Same rule as the Rocket.Chat hand-back; it was
             # written for one connector and a comment here asserted the other had no
             # hand-back path, which this branch is.
-            if result.agent_chain_token and self._turn_store is not None:
-                remaining = self._turn_store.release_turn(
-                    post.get("channel_id", ""), post.get("root_id") or None,
-                    result.sender, result.agent_chain_token, turn_generation,
-                )
-                logger.debug(
-                    "Released an agent-chain turn for %s (handler queue full) — now at %d",
-                    result.sender, remaining,
-                )
+            self._release_turn_for(post, result, turn_generation, "handler queue full")
             return
 
-        state.last_processed_ts = result.msg_ts
+        # Never backwards, for the reason Rocket.Chat's sibling site gives: replay calls
+        # `_on_posted_event` directly rather than through the per-channel worker, so a
+        # replayed post awaiting `normalize_mm_message` — an attachment download — can be
+        # overtaken by live traffic that commits a newer cursor, and an unconditional
+        # assignment then rewinds it. The replayed post is not rejected on the way in
+        # because its filter timestamp is pinned to `replay_after_ts`; the pin that makes
+        # replay work is what makes the regression reachable. In memory `seen_ids` hides
+        # the rewind; across a save and a restart it does not.
+        if ts_gt(result.msg_ts, state.last_processed_ts or ""):
+            state.last_processed_ts = result.msg_ts
+
+    def _release_turn_for(self, post: dict, result, generation: int, reason: str) -> None:
+        """Give back the turn a post took, for a post that was not delivered.
+
+        One place, because Mattermost has three ways to decline a post after the filter has
+        already charged it — the preflight for a replay, the preflight for live traffic,
+        and the handler queue — and they were added one at a time.
+        """
+        if not result.agent_chain_token or self._turn_store is None:
+            return
+        remaining = self._turn_store.release_turn(
+            post.get("channel_id", ""), post.get("root_id") or None,
+            result.sender, result.agent_chain_token, generation,
+        )
+        logger.debug(
+            "Released an agent-chain turn for %s (%s) — now at %d",
+            result.sender, reason, remaining,
+        )
 
     @staticmethod
     def _remember_seen(state: _ChannelState, msg_id: str) -> None:

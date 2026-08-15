@@ -76,6 +76,7 @@ def filter_rc_message(
     room_type: str,
     last_processed_ts: str | None,
     turn_store: "TurnStore | None" = None,
+    bot_user_id: str = "",
 ) -> FilterResult:
     """Decide whether a raw RC DDP message document should be processed.
 
@@ -128,7 +129,24 @@ def filter_rc_message(
 
     sender = doc.get("u", {}).get("username", "")
 
-    # 1. Skip own messages
+    # 1. Skip own messages — by id first, name only as a fallback for frames carrying no
+    #    id. Rocket.Chat's login is not spelling-exact: probed against 6.12, an account
+    #    whose canonical username is `ProbeBot9207` logs in as `probebot9207` or by email
+    #    address, and `me.username` in the response is still `ProbeBot9207`. The connector
+    #    stores what the operator configured, so `config.username` is whatever they typed
+    #    and `u.username` on every frame is the canonical spelling.
+    #
+    #    A name-only test therefore fails to recognise the bot's own posts under an
+    #    ordinary configuration. With `filter_sender` open and a DM — which skips the
+    #    mention gate entirely — the bot's own reply reads as user activity, is dispatched,
+    #    and the answer to it arrives as the next own message: an unbounded self-reply
+    #    loop, with no turn budget in the way because the bot is not in `agent_usernames`.
+    #
+    #    `_on_unrouted_message` already tests by id; this is the same rule on the tracked
+    #    path, which is the one that carries the traffic. Mattermost's filter has taken a
+    #    `bot_user_id` for exactly this all along.
+    if bot_user_id and doc.get("u", {}).get("_id") == bot_user_id:
+        return FilterResult(accepted=False, reason="own message")
     if sender == config.username:
         return FilterResult(accepted=False, reason="own message")
 

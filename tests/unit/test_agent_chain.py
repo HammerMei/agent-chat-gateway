@@ -715,15 +715,41 @@ class TestGenerationTombstonesAreBounded(unittest.TestCase):
         )
 
     def test_a_tombstone_survives_long_enough_to_matter(self):
-        """The near miss: pruning immediately would put the expiry hole straight back."""
-        from gateway.core.agent_chain import TurnStore
+        """The near miss: pruning immediately would put the expiry hole straight back.
 
-        store = TurnStore(ttl_seconds=60.0)
-        gen = store.generation("r1", None, "agent-a")
-        _, _, mine = store.check_and_increment("r1", None, "agent-a", max_turns=5)
-        store.reset_all("r1", None)
-        store.check_and_increment("r1", None, "agent-a", max_turns=5)
+        The context has to actually **expire** for this to test anything. An earlier
+        version used `reset_all`, which leaves the context in `_store` — so `release_turn`
+        found it and compared generations off the live object, and `_generations` was never
+        read at all. It passed with `_TOMBSTONE_TTL_FACTOR = 0`, which is literally the
+        thing its own docstring says it guards against.
+        """
+        from unittest.mock import patch
 
-        store.release_turn("r1", None, "agent-a", mine, gen)
+        from gateway.core.agent_chain import _TOMBSTONE_TTL_FACTOR, TurnStore
 
-        self.assertEqual(store.current_turns("r1", None, "agent-a"), 1)
+        ttl = 60.0
+        store = TurnStore(ttl_seconds=ttl)
+        t0 = time.monotonic()
+
+        with patch("gateway.core.agent_chain.time.monotonic", return_value=t0):
+            gen = store.generation("r1", None, "agent-a")
+            _, _, mine = store.check_and_increment("r1", None, "agent-a", max_turns=5)
+
+        # Long enough for the context to expire and be deleted, but inside the tombstone's
+        # grace period — the window this delivery is still in flight in.
+        mid = t0 + ttl * (1 + _TOMBSTONE_TTL_FACTOR) / 2
+        with patch("gateway.core.agent_chain.time.monotonic", return_value=mid):
+            store._gc()
+            self.assertNotIn(
+                store._key("r1", None, "agent-a"), store._store,
+                "the context must be gone, or the tombstone is not what answers",
+            )
+            # A new chain starts under the same key and takes a turn of its own.
+            store.check_and_increment("r1", None, "agent-a", max_turns=5)
+            # The in-flight delivery from the dead context finally comes back.
+            store.release_turn("r1", None, "agent-a", mine, gen)
+
+        self.assertEqual(
+            store.current_turns("r1", None, "agent-a"), 1,
+            "a token from an expired context may not take the new chain's turn",
+        )

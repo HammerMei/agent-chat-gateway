@@ -369,7 +369,13 @@ class RocketChatConnector(Connector):
         """Record where each room's outage starts, before delivery is restored.
 
         Called by the transport at the point delivery is known lost and nothing is
-        subscribed yet, so no live message can be dispatched while this runs.
+        subscribed on the server yet. That is not the same as nothing being dispatched
+        here: a reconnect does not clear `_room_queues` or `_room_workers` — only `stop()`
+        does — so the workers keep draining frames that were already queued when the socket
+        dropped, concurrently with this. The snapshot is safe anyway, because the loop
+        below contains no await and a queued frame that advances the watermark really was
+        delivered. **Do not add an await to it** on the strength of "nothing else is
+        running"; an earlier version of this line said that, and it was not true.
 
         Replay used to read `last_processed_ts` when it ran, which is *after* every room
         has been resubscribed — and rooms are confirmed one by one, so a message arriving
@@ -794,6 +800,12 @@ class RocketChatConnector(Connector):
         is what carries the membership answer, so no object means no answer, and creating a
         watcher on no answer is how the agent ends up in a room nobody invited it to.
         """
+        # `_router` is still tested for None: `register_router` is the only writer and
+        # this method is installed as the transport's default callback by that same call,
+        # so in principle it cannot run without one. It stays because the two are wired in
+        # separate objects and a future caller could install the callback directly — an
+        # early return is a cheaper insurance than the alternative, which is offering a
+        # room to nothing.
         if self._router is None or doc.get("t"):
             return
         sender = doc.get("u", {}).get("username", "")
@@ -1518,6 +1530,7 @@ class RocketChatConnector(Connector):
             room_type=sub.room.type,
             last_processed_ts=filter_ts,
             turn_store=self._turn_store,
+            bot_user_id=self._rest.user_id or "",
         )
         # Captured here, with no await between the filter's increment and this read, so
         # it names the count that increment belonged to. `_hand_back` compares it before

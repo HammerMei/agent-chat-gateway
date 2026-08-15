@@ -313,9 +313,16 @@ class RCWebSocketClient:
             # `unsubscribe_room` would re-send an `unsub` the server ignores. An untracked
             # live subscription is the one nothing can ever clean up.
             #
-            # The unsub goes out either way. If the mapping has already been replaced then
-            # nothing else will ever release this id — the replacement overwrote the
-            # mapping — and an unsub for an id the server no longer knows is ignored.
+            # The unsub goes out either way, because an unsub for an id the server no
+            # longer knows is ignored, and this loop cannot tell the two cases apart.
+            #
+            # It is *not* true that nothing else would release a replaced id — an earlier
+            # version of this comment said so, and believing it is what left the sibling
+            # site in `_subscribe_with_confirmation` unguarded. A replacement goes through
+            # that function, which releases its predecessor before installing itself. The
+            # release is precisely the await during which a race can occur; a model in
+            # which the replacement silently overwrites has no such await in it, and
+            # therefore no reason to guard.
             try:
                 await self._send({"msg": "unsub", "id": sub_id})
             except Exception as e:
@@ -498,10 +505,13 @@ class RCWebSocketClient:
         # releasing them, which is now a normal event rather than an exotic one, since a
         # recovery cancels whatever it displaces.
         #
-        # Captured and replaced in one synchronous block: an await between reading the old
-        # id and installing the new one is the shape this whole class of defect has had.
+        # There **is** an await between reading this and installing the replacement — the
+        # `unsub` send below — so the read has to be re-checked after it rather than
+        # trusted. An earlier version of this comment claimed the two happened in one
+        # synchronous block, which was not merely untrue: it named the exact shape this
+        # class of defect has, and asserted immunity to it eleven lines above the await.
         superseded = self._subscriptions.get(room_id)
-        if superseded is not None and superseded != sub_id:
+        if superseded is not None:
             # Released **before** the map is updated, not after. The map is the only record
             # of what can still be live on the server, so at every await point it has to
             # name something releasable. Installing first and releasing second inverts
@@ -523,15 +533,33 @@ class RCWebSocketClient:
             # being removed and install a subscription for it anyway, re-registering the
             # callback and opening a server subscription after the last watcher left.
             #
-            # The state object can be the test. `unsubscribe_room` pops it, so a different
-            # object (or none) means this room is no longer the one this call was asked to
-            # subscribe. Identity, not membership: a room removed and immediately re-added
-            # is also not this call's room.
-            if self._subscription_states.get(room_id) is not state:
+            # The state object can be the test for a *removal*. `unsubscribe_room` pops it,
+            # so a different object (or none) means this room is no longer the one this
+            # call was asked to subscribe. Identity, not membership: a room removed and
+            # immediately re-added is also not this call's room.
+            #
+            # But identity cannot see a *successor*, because the state object is shared
+            # between attempts for one room — the same reason `_still_owns` needs its third
+            # clause. A second attempt that installed its own id inside the await above
+            # leaves the object exactly where this one left it, and installing below would
+            # then overwrite the successor's mapping. The successor's own confirmation
+            # rightly declines to roll back a mapping it no longer owns, so nothing is left
+            # naming its subscription and no `unsub` can ever reach it: live on the server,
+            # invisible to `unsubscribe_room`, for the life of the socket. That is verbatim
+            # the defect the release-before-install ordering exists to prevent, reached
+            # through the other door.
+            #
+            # So the map is re-read, not assumed. `superseded` is what this attempt
+            # released and therefore what the map must still name for this attempt to be
+            # the one entitled to replace it.
+            if (
+                self._subscription_states.get(room_id) is not state
+                or self._subscriptions.get(room_id) != superseded
+            ):
                 self._pending_subs.pop(sub_id, None)
                 raise RuntimeError(
-                    f"Room {room_id} was unsubscribed while its previous subscription "
-                    "was being released"
+                    f"Room {room_id} was claimed by another subscription attempt while "
+                    "its previous subscription was being released"
                 )
 
         # Installed only now, and synchronously: nothing may await between claiming the
@@ -1011,9 +1039,11 @@ class RCWebSocketClient:
         """
         while True:
             doc, access = await self._routing_queue.get()
+            # Not re-checked for None: nothing reaches this queue until
+            # `register_default_callback` has run — `_queue_for_routing` returns early
+            # without one — and nothing ever clears it, `stop()` included. A `continue`
+            # here would have been a branch no caller can produce.
             callback = self._default_callback
-            if callback is None:
-                continue
             try:
                 await callback(doc, access)
             except Exception as e:
@@ -1214,8 +1244,11 @@ class RCWebSocketClient:
 
         1. Wait out the recovery this one replaced. Cancelling is a request; until it is
            observed the displaced run can still be inside an await.
-        2. Announce the outage boundary, while nothing is subscribed — once the first room
-           is confirmed, live traffic resumes for it while the rest are still subscribing.
+        2. Announce the outage boundary, before any `sub` frame goes out — once the first
+           room is confirmed, live traffic resumes for it while the rest are still
+           subscribing. "Before any `sub`" is the property that matters, not "while nothing
+           is running": the per-room workers survive a reconnect and keep draining frames
+           queued before the drop.
         3. Ask for the stream, if this entry point is one that should. A stream the server
            has just terminated is not worth re-requesting immediately; a fresh socket is.
         4. Give every room a delivery path — the stream, or one subscription each. Never
@@ -1233,12 +1266,26 @@ class RCWebSocketClient:
             # Now that nothing else is writing them: every tracked room is between
             # delivery paths until this recovery gives it one.
             for room_id, callback in list(self._callbacks.items()):
+                # A subscription id cannot outlive the socket that issued it, so the map
+                # is cleared here rather than left for the resubscribe to supersede. The
+                # refactor that moved this marking out of `_reconnect` dropped the clear
+                # with it, and the cost was not a stale entry: `_subscribe_with_confirmation`
+                # then found a `superseded` id for *every* room on *every* reconnect,
+                # sent an `unsub` on the new socket for an id it never knew, and opened
+                # the await window between releasing and installing each time — routinely,
+                # for a release that had nothing to release.
+                #
+                # Both callers are safe. A reconnect's ids died with the socket. A stream
+                # fallback has none: the stream took over per-room delivery, which is what
+                # emptied this map.
+                self._subscriptions.pop(room_id, None)
                 state = self._subscription_states.get(room_id)
                 if state is None:
                     state = SubscriptionState(room_id=room_id, callback=callback)
                     self._subscription_states[room_id] = state
                 else:
                     state.callback = callback
+                state.sub_id = None
                 state.status = "reconnecting"
                 state.last_error = None
 

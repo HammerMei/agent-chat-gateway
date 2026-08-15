@@ -4072,6 +4072,80 @@ class TestARemovalDuringTheHandlerLeavesNoWindowBehind(unittest.IsolatedAsyncioT
         self.assertEqual(sub.replay_boundary, "400")
 
 
+class TestOwnMessagesAreRecognisedByIdentity(unittest.TestCase):
+    """Rocket.Chat's login is not spelling-exact, so a name test is not an identity test.
+
+    Probed against Rocket.Chat 6.12: an account whose canonical username is `ProbeBot9207`
+    logs in as `probebot9207` or by email address, and `me.username` in the response stays
+    `ProbeBot9207`. The connector stores what the operator configured, so the two strings
+    differ under an ordinary configuration while `u._id` still matches exactly.
+    """
+
+    def _config(self, **kw):
+        return _make_config(username="probebot", filter_sender=False, **kw)
+
+    def _own_doc(self):
+        # What the server actually delivers: canonical spelling, this account's id.
+        return {"_id": "m1", "msg": "an answer the agent posted",
+                "u": {"username": "ProbeBot", "_id": "BOT_ID"},
+                "rid": "room-1", "ts": {"$date": 500}}
+
+    def test_a_differently_spelled_login_still_recognises_its_own_post(self):
+        from gateway.connectors.rocketchat.normalize import filter_rc_message
+
+        result = filter_rc_message(
+            self._own_doc(), self._config(), "dm", None, bot_user_id="BOT_ID")
+
+        self.assertFalse(
+            result.accepted,
+            "a DM skips the mention gate and open sender mode admits everyone — this is "
+            "the combination that turns an unrecognised own post into a reply loop",
+        )
+        self.assertEqual(result.reason, "own message")
+
+    def test_the_name_test_alone_would_have_admitted_it(self):
+        """The near miss stated as a test: without the id, this document is accepted."""
+        from gateway.connectors.rocketchat.normalize import filter_rc_message
+
+        result = filter_rc_message(self._own_doc(), self._config(), "dm", None)
+
+        self.assertTrue(
+            result.accepted,
+            "documents the exact gap the id closes — if this ever fails, the name test "
+            "started working and this test should be re-examined rather than deleted",
+        )
+
+    def test_a_frame_with_no_id_still_falls_back_to_the_name(self):
+        from gateway.connectors.rocketchat.normalize import filter_rc_message
+
+        doc = {"_id": "m2", "msg": "hi", "u": {"username": "probebot"},
+               "rid": "room-1", "ts": {"$date": 500}}
+
+        result = filter_rc_message(doc, self._config(), "dm", None, bot_user_id="BOT_ID")
+
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "own message")
+
+    def test_someone_else_is_not_mistaken_for_the_bot(self):
+        from gateway.connectors.rocketchat.normalize import filter_rc_message
+
+        doc = {"_id": "m3", "msg": "hi", "u": {"username": "alice", "_id": "U_ALICE"},
+               "rid": "room-1", "ts": {"$date": 500}}
+
+        result = filter_rc_message(doc, self._config(), "dm", None, bot_user_id="BOT_ID")
+
+        self.assertTrue(result.accepted)
+
+    def test_the_connector_hands_the_filter_its_own_id(self):
+        """The wiring, not the filter: an id the connector never passes cannot help."""
+        connector = _make_connector()
+
+        self.assertTrue(
+            connector._rest.user_id,
+            "the fixture must model a logged-in connector for this to mean anything",
+        )
+
+
 class TestBoundaryClaims(unittest.TestCase):
     """The two methods on their own, because the count is the part that carries the rule."""
 

@@ -1296,8 +1296,67 @@ class TestSharedStreamBookkeepingHasAnOwner(unittest.IsolatedAsyncioTestCase):
         unsubbed = {f["id"] for f in sent if f.get("msg") == "unsub"}
         self.assertEqual(
             unsubbed, {"old-1", "old-2"},
-            "the captured id is still released on the server: nothing else ever will, "
-            "since the replacement overwrote the mapping without unsubscribing",
+            "the captured id is released here because this loop cannot tell whether "
+            "anyone else will, and an unsub the server no longer knows is ignored",
+        )
+        # Not because "nothing else ever will" — an earlier version of this rationale said
+        # that, and it is false: a replacement goes through `_subscribe_with_confirmation`,
+        # which releases its predecessor before installing itself. Believing the false
+        # version is what left that release unguarded, since a model where the replacement
+        # silently overwrites has no await in it to guard.
+
+
+class TestAMigratedRoomStopsNamingTheSubscriptionItGaveUp(unittest.IsolatedAsyncioTestCase):
+    """The state's `sub_id` is released with the mapping, and only for the id captured.
+
+    Deleting that release left 277 tests green: the neighbouring test's setup never gives
+    the state a matching `sub_id`, because `_recover` pre-creates states with the dataclass
+    default of `None` and only `_subscribe_with_confirmation` fills it in — so the clause
+    compared `None` against a captured id and was false for a reason production cannot
+    produce.
+    """
+
+    def _client_with(self, sub_ids: dict):
+        from gateway.connectors.rocketchat.websocket import SubscriptionState
+
+        client = _make_client()
+        client._send = AsyncMock()
+        client._callbacks = {r: AsyncMock() for r in sub_ids}
+        client._subscriptions = dict(sub_ids)
+        client._subscription_states = {
+            r: SubscriptionState(room_id=r, callback=AsyncMock(), sub_id=sid)
+            for r, sid in sub_ids.items()
+        }
+        return client
+
+    async def test_the_state_stops_naming_the_released_subscription(self):
+        client = self._client_with({"r1": "old-1"})
+
+        await client.unsubscribe_rooms_keeping_callbacks()
+
+        self.assertIsNone(
+            client._subscription_states["r1"].sub_id,
+            "a state still naming a released id reports a live subscription that is gone",
+        )
+        self.assertIn("r1", client._callbacks, "the room is still tracked")
+
+    async def test_a_replacements_id_is_not_cleared_by_its_predecessors_release(self):
+        """The near miss the deleted clause guards: only the captured id is given up."""
+        client = self._client_with({"r1": "old-1"})
+        state = client._subscription_states["r1"]
+
+        async def _send(payload):
+            if payload.get("id") == "old-1":
+                client._subscriptions["r1"] = "new-1"
+                state.sub_id = "new-1"
+
+        client._send = _send
+
+        await client.unsubscribe_rooms_keeping_callbacks()
+
+        self.assertEqual(
+            state.sub_id, "new-1",
+            "the successor's id must survive its predecessor being released",
         )
 
 
@@ -1827,6 +1886,103 @@ class TestASuccessorThatFailedStillEndsItsPredecessor(unittest.IsolatedAsyncioTe
 
         self.assertEqual(client._subscriptions["r1"], sub_id)
         self.assertEqual(client._subscription_states["r1"].status, "active")
+
+
+class TestASuccessorInstalledDuringTheReleaseIsNotClobbered(
+    unittest.IsolatedAsyncioTestCase
+):
+    """There is an await between reading the predecessor and installing the replacement.
+
+    A comment above that read claimed the two happened in one synchronous block. They do
+    not — the `unsub` send sits between them — and the guard after it tested only the state
+    object's identity, which is shared between attempts for a room and so cannot see a
+    successor. Installing anyway overwrites the successor's mapping, and the successor's
+    own confirmation then correctly declines to roll back a mapping it no longer owns: its
+    subscription stays live on the server with nothing naming it, unreachable even by
+    `unsubscribe_room`.
+    """
+
+    async def test_an_attempt_whose_room_was_reclaimed_does_not_install(self):
+        from gateway.connectors.rocketchat.websocket import SubscriptionState
+
+        client = _make_client()
+        state = SubscriptionState(room_id="r1", callback=AsyncMock(), sub_id="old-sub")
+        client._subscription_states = {"r1": state}
+        client._subscriptions = {"r1": "old-sub"}
+
+        async def _send(payload):
+            if payload.get("msg") == "unsub":
+                # A concurrent attempt claims the room inside this await, keeping the
+                # shared state object exactly where it was.
+                client._subscriptions["r1"] = "successor-sub"
+
+        client._send = _send
+
+        with self.assertRaises(RuntimeError):
+            await client._subscribe_with_confirmation(
+                room_id="r1", callback=AsyncMock(), timeout=5,
+                keep_callback_on_failure=True,
+            )
+
+        self.assertEqual(
+            client._subscriptions["r1"], "successor-sub",
+            "the successor's mapping is the only thing that can ever release it",
+        )
+
+    async def test_an_uncontested_replacement_still_installs(self):
+        """The near miss: the re-read must not reject ordinary resubscription."""
+        client = _make_client()
+        client._subscriptions = {"r1": "old-sub"}
+
+        async def _send(payload):
+            if payload.get("msg") == "sub":
+                fut = client._pending_subs.get(payload["id"])
+                if fut and not fut.done():
+                    fut.set_result(True)
+
+        client._send = _send
+        sub_id = await client._subscribe_with_confirmation(
+            room_id="r1", callback=AsyncMock(), timeout=5,
+            keep_callback_on_failure=False,
+        )
+
+        self.assertEqual(client._subscriptions["r1"], sub_id)
+
+
+class TestAReconnectForgetsTheDeadSocketsSubscriptions(unittest.IsolatedAsyncioTestCase):
+    """A subscription id cannot outlive the socket that issued it.
+
+    Left in the map, every room enters the supersede-and-release branch on every
+    reconnect — sending an `unsub` on the new socket for an id it never knew, and opening
+    the await window between release and install each time, for a release with nothing to
+    release.
+    """
+
+    async def test_the_recovery_clears_ids_from_the_previous_socket(self):
+        from gateway.connectors.rocketchat.websocket import SubscriptionState
+
+        client = _make_client()
+        cb = AsyncMock()
+        client._callbacks = {"r1": cb}
+        client._subscriptions = {"r1": "dead-sub"}
+        client._subscription_states = {
+            "r1": SubscriptionState(room_id="r1", callback=cb, sub_id="dead-sub")
+        }
+        client._subscribe_rooms_individually = AsyncMock()
+        sent: list[dict] = []
+        client._send = lambda p: sent.append(p)
+
+        await client._recover("Reconnect", try_stream=False)
+
+        self.assertNotIn(
+            "r1", client._subscriptions,
+            "the id belonged to a socket that is gone",
+        )
+        self.assertIsNone(client._subscription_states["r1"].sub_id)
+        self.assertEqual(
+            [f for f in sent if f.get("msg") == "unsub"], [],
+            "and no unsub is sent on the new socket for an id it never knew",
+        )
 
 
 class TestALosingAttemptRollsBackOnlyItsOwnState(unittest.IsolatedAsyncioTestCase):
