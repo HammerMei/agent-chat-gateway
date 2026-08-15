@@ -253,6 +253,18 @@ class RCWebSocketClient:
             )
             await asyncio.wait_for(future, timeout=timeout)
         except Exception as e:
+            # A timeout is not a refusal: the server may have accepted and simply answered
+            # late. Leaving that subscription live while the connector opens per-room ones
+            # means every message arrives twice — and the connector would report per-room
+            # delivery while untracked rooms kept arriving. Cancel it explicitly; a `nosub`
+            # makes this a no-op the server ignores.
+            try:
+                await self._send({"msg": "unsub", "id": sub_id})
+            except Exception as unsub_error:
+                logger.warning(
+                    "Could not cancel the uncertain __my_messages__ subscription: %s",
+                    unsub_error,
+                )
             logger.warning(
                 "Subscribe-all (__my_messages__) refused or timed out (%s) — "
                 "falling back to per-room subscriptions",
@@ -687,7 +699,14 @@ class RCWebSocketClient:
                 item = await queue.get()
                 doc, access = item
                 in_flight = item  # record before semaphore — cancellation safe
-                callback = self._callbacks.get(room_id)
+                # The same rule the fan-out used to decide there was a handler at all.
+                # It was `self._callbacks.get(room_id)` here and
+                # `... or self._default_callback` there, so under subscribe-all every
+                # frame for an untracked room was queued and then silently discarded at
+                # dispatch — the routing path could not fire once. Re-looked-up rather
+                # than carried on the queue item, deliberately: a callback removed while
+                # the item waited must not be called, which is why this lookup is late.
+                callback = self._callbacks.get(room_id) or self._default_callback
                 if callback:
                     async with self._callback_sem:
                         # Semaphore acquired; doc is now being dispatched.
@@ -829,8 +848,25 @@ class RCWebSocketClient:
             self._pending_subs.clear()
 
     async def _resubscribe_all_rooms(self) -> None:
-        """Re-confirm all existing room subscriptions after reconnect."""
+        """Re-confirm all existing subscriptions after reconnect — the stream included.
+
+        The stream had to be named here explicitly. This loop iterates `_callbacks`, which
+        maps *rooms*, so a subscription that is not a room was invisible to it: after any
+        disconnect, untracked rooms stopped arriving forever, and — worse, because it is
+        silent — newly tracked rooms skipped their own subscription too, since the
+        connector still believed the stream was carrying them. That is the key-space split
+        biting from the other side: two kinds of subscription need two kinds of restore.
+        """
         try:
+            if self._stream_sub_id is not None:
+                self._stream_sub_id = None
+                if not await self.subscribe_all():
+                    logger.error(
+                        "Could not restore the __my_messages__ subscription after "
+                        "reconnect — untracked rooms will not arrive until the next "
+                        "successful reconnect"
+                    )
+
             rooms = list(self._callbacks.items())
             results = await asyncio.gather(
                 *[

@@ -170,7 +170,7 @@ class RocketChatConnector(Connector):
         # a type-`d` room is refused on the room's *type*, and `im.create` returns a
         # **different room id** for a different member set — so a group DM is a separate
         # room, never a mutated 1:1, and this cache cannot go stale (§6.4).
-        self._dm_kinds: dict[str, RoomKind] = {}
+        self._dm_kinds: dict[str, tuple[RoomKind, tuple[str, ...]]] = {}
         # Global attachment cache base: {cache_dir_global}/{connector_name}/{room_id}/
         # Namespaced by connector name to avoid collisions across multi-connector deployments.
         self._attachments_cache_base = (
@@ -483,8 +483,12 @@ class RocketChatConnector(Connector):
         """
         room_type = room_type_for(access.get("roomType"))
         if room_type == "dm":
-            kind = await self._direct_room_kind(room_id)
-            return RoomRef(id=room_id, kind=kind)
+            kind, participants = await self._direct_room_identity(room_id)
+            # The participants are not decoration: a direct room has no name, so they are
+            # the only thing that identifies it to a human. Without them a 1:1 watcher is
+            # labelled by a room-id digest and a group DM's *description* — what the agent
+            # is told about where it lives — becomes its own opaque label (§2.3, §2.4).
+            return RoomRef(id=room_id, kind=kind, participants=participants)
 
         name = access.get("roomName") or ""
         if not name:
@@ -493,7 +497,7 @@ class RocketChatConnector(Connector):
         kind = RoomKind.GROUP if room_type == "group" else RoomKind.CHANNEL
         return RoomRef(id=room_id, kind=kind, name=name)
 
-    async def _direct_room_kind(self, room_id: str) -> RoomKind:
+    async def _direct_room_identity(self, room_id: str) -> tuple[RoomKind, tuple[str, ...]]:
         """1:1 or group DM — the distinction Rocket.Chat does not make on the wire.
 
         Cached permanently, and that is verified rather than assumed: on 8.5.1 every route
@@ -509,12 +513,15 @@ class RocketChatConnector(Connector):
         if cached is not None:
             return cached
 
-        count = await self._rest.dm_member_count(room_id)
-        if count == 0:
-            return RoomKind.DM  # lookup failed; answer, but do not remember
-        kind = RoomKind.GROUP_DM if count > 2 else RoomKind.DM
-        self._dm_kinds[room_id] = kind
-        return kind
+        members = await self._rest.dm_members(room_id)
+        if not members:
+            return RoomKind.DM, ()  # lookup failed; answer, but do not remember
+
+        others = tuple(m for m in members if m != self._config.username)
+        kind = RoomKind.GROUP_DM if len(members) > 2 else RoomKind.DM
+        identity = (kind, others)
+        self._dm_kinds[room_id] = identity
+        return identity
 
     async def subscribe_room(
         self,
@@ -970,6 +977,21 @@ class RocketChatConnector(Connector):
         # *after* the handler returns, leaving a gap.  The seen_ids set provides
         # a fast O(1) check that eliminates exact duplicates regardless of
         # ordering.  The deque bounds memory to _SEEN_IDS_MAXLEN entries.
+        # Membership, on the tracked path. `_on_unrouted_message` gates rooms the
+        # connector does not know; this gates the ones it does, and they are not the same
+        # question. Under subscribe-all the stream keeps delivering a channel after the
+        # bot is removed from it — the account can still *read* it — so a watcher would go
+        # on answering in a room it no longer belongs to, which is exactly the state
+        # someone removing the bot was trying to produce.
+        #
+        # Only an explicit `False` counts. Absence means nobody said: a per-room
+        # subscription carries no access object and neither does the replay path, and
+        # treating those as "not a member" would drop every message on both.
+        if access is not None and access.get("roomParticipant") is False:
+            logger.info(
+                "No longer a participant in room %s — dropping message", room_id)
+            return
+
         msg_id = doc.get("_id", "")
         if msg_id and msg_id in sub.seen_ids_set:
             logger.debug("Skipping already-seen message _id=%s in room %s", msg_id, room_id)

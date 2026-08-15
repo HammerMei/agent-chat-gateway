@@ -506,7 +506,7 @@ class RocketChatREST:
         # RC REST API returns newest-first; reverse to chronological order.
         return list(reversed(text_msgs))
 
-    async def dm_member_count(self, room_id: str) -> int:
+    async def dm_members(self, room_id: str) -> list[str]:
         """How many people are in a direct room — the only way to tell a 1:1 from a group.
 
         Rocket.Chat reports both as `roomType: "d"` with no participant information in the
@@ -514,19 +514,26 @@ class RocketChatREST:
         entirely for a room typed `dm`, so a group DM misclassified as a 1:1 makes the
         agent answer **every** message from **anyone** in that group (§6.4).
 
-        Returns 0 when the lookup fails, which the caller treats as "assume a 1:1" — the
-        conservative direction is not obvious here, so it is stated: a group misread as a
-        1:1 is the loud failure (the agent talks too much and someone notices), while a
-        1:1 misread as a group is the silent one (the agent waits for a mention that a 1:1
-        user has no reason to type, and looks broken).
+        Returns the usernames, not a count, because the caller needs both: the count
+        answers 1:1-or-group, and the names *are* the room's description — a direct room
+        has no name, so its participants are the only thing that identifies it to a human
+        (§2.3).
+
+        Returns an empty list when the lookup fails, which the caller treats as "assume a
+        1:1" — the conservative direction is not obvious here, so it is stated: a group
+        misread as a 1:1 is the loud failure (the agent answers everyone and someone
+        notices), while a 1:1 misread as a group is the silent one (the agent waits for a
+        mention a 1:1 user has no reason to type, and looks broken).
         """
         try:
             result = await self._request("GET", "im.members", params={"roomId": room_id})
         except Exception as e:
             logger.warning("Could not read members of direct room %s: %s", room_id, e)
-            return 0
+            return []
         members = result.get("members") or []
-        return len(members) if isinstance(members, list) else 0
+        if not isinstance(members, list):
+            return []
+        return [m.get("username", "") for m in members if m.get("username")]
 
     async def resolve_room(self, room_name: str) -> dict[str, Any]:
         """Resolve a room name to its info dict.

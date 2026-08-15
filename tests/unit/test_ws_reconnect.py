@@ -613,3 +613,49 @@ class TestReconnectClearsPendingSubsOnCancel(unittest.IsolatedAsyncioTestCase):
                 await ws._reconnect()
 
         self.assertEqual(fut.result(), {"sub_id": "abc"})
+
+
+class TestReconnectRestoresTheStream(unittest.IsolatedAsyncioTestCase):
+    """The resubscribe loop iterates rooms, and the stream is not a room.
+
+    That is the key-space split biting from the other side: two kinds of subscription need
+    two kinds of restore. Without this, after any disconnect untracked rooms stopped
+    arriving forever — and, worse because it is silent, newly tracked rooms skipped their
+    own subscription too, since the connector still believed the stream was carrying them.
+    """
+
+    async def test_the_stream_is_resubscribed(self):
+        from unittest.mock import AsyncMock
+
+        client = _make_client()
+        client._stream_sub_id = "old-sub"
+        client.subscribe_all = AsyncMock(return_value=True)
+        client._subscribe_with_confirmation = AsyncMock(return_value="sub-1")
+
+        await client._resubscribe_all_rooms()
+
+        client.subscribe_all.assert_awaited_once()
+
+    async def test_a_client_that_never_had_a_stream_does_not_ask_for_one(self):
+        """Per-room deployments must not acquire subscribe-all by reconnecting."""
+        from unittest.mock import AsyncMock
+
+        client = _make_client()
+        client._stream_sub_id = None
+        client.subscribe_all = AsyncMock(return_value=True)
+        client._subscribe_with_confirmation = AsyncMock(return_value="sub-1")
+
+        await client._resubscribe_all_rooms()
+
+        client.subscribe_all.assert_not_awaited()
+
+    async def test_a_failed_restore_is_reported_rather_than_silent(self):
+        from unittest.mock import AsyncMock
+
+        client = _make_client()
+        client._stream_sub_id = "old-sub"
+        client.subscribe_all = AsyncMock(return_value=False)
+        client._subscribe_with_confirmation = AsyncMock(return_value="sub-1")
+
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat.ws", "ERROR"):
+            await client._resubscribe_all_rooms()

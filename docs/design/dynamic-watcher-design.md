@@ -1952,8 +1952,12 @@ getting the classification wrong, and it is why `group_direct` is a separate
 opt-in (§2.7) rather than folded into `direct`.
 
 Consequence for Rocket.Chat: honouring a separate `group_direct` there needs a
-participant-count lookup when a DM room is first seen. A DM that later gains
-members would need re-classifying, which the cache must not prevent.
+participant-count lookup when a DM room is first seen. **That answer never
+expires**, per the immutability finding above — a DM cannot gain members, and a
+different member set is a different room id — so the cache needs no invalidation
+path. An earlier draft of this paragraph said a DM that later gained members
+would need re-classifying; that was written before the 8.5.1 probe and describes
+a transition the platform does not allow.
 
 **Cross-team delivery is real, and the team gate is load-bearing.** With the
 probe account added to a second team, a post in that team's channel arrived on

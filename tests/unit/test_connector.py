@@ -26,6 +26,7 @@ def _make_config(
     password: str = "pw",
     name: str = "rc",
     owners: list[str] | None = None,
+    **overrides,
 ):
     """Build a minimal RocketChatConfig for testing."""
     from gateway.config import AttachmentConfig
@@ -37,6 +38,7 @@ def _make_config(
         name=name,
         owners=owners or ["alice"],
         attachments=AttachmentConfig(cache_dir_global="/tmp/rc-cache"),
+        **overrides,
     )
 
 
@@ -2130,11 +2132,11 @@ class TestDirectRoomClassification(unittest.IsolatedAsyncioTestCase):
     DM misclassified as a 1:1 makes the agent answer every message from anyone in it.
     """
 
-    def _connector(self, member_count=2):
+    def _connector(self, members=("bot", "alice")):
         connector = _make_connector()
         connector._ws = MagicMock(register_default_callback=MagicMock())
         connector._rest = MagicMock()
-        connector._rest.dm_member_count = AsyncMock(return_value=member_count)
+        connector._rest.dm_members = AsyncMock(return_value=list(members))
         self.offered = []
         connector._config = _make_config(owners=["glin"])
         connector.register_router(AsyncMock(side_effect=self.offered.append))
@@ -2148,29 +2150,186 @@ class TestDirectRoomClassification(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_two_members_is_a_one_to_one(self):
-        connector = self._connector(member_count=2)
+        connector = self._connector(members=("bot", "alice"))
         await self._deliver(connector)
         self.assertEqual(self.offered[0].kind, RoomKind.DM)
+        self.assertEqual(
+            self.offered[0].participants, ("alice",),
+            "a direct room has no name — the counterpart is what identifies it",
+        )
 
     async def test_three_members_is_a_group_dm(self):
-        connector = self._connector(member_count=3)
+        connector = self._connector(members=("bot", "alice", "carol"))
         await self._deliver(connector)
         self.assertEqual(self.offered[0].kind, RoomKind.GROUP_DM)
+        self.assertEqual(
+            self.offered[0].participants, ("alice", "carol"),
+            "the members are the group's description; the bot is not one of them",
+        )
 
     async def test_the_answer_is_cached_and_never_invalidated(self):
         """Verified, not assumed: on 8.5.1 every route for adding a member to a type-`d`
         room is refused on the room's *type*, and `im.create` returns a different room id
         for a different member set. A group DM is a separate room, never a mutated 1:1."""
-        connector = self._connector(member_count=3)
+        connector = self._connector(members=("bot", "alice", "carol"))
         await self._deliver(connector)
         await self._deliver(connector)
 
-        connector._rest.dm_member_count.assert_awaited_once()
+        connector._rest.dm_members.assert_awaited_once()
 
     async def test_a_failed_lookup_answers_one_to_one_without_caching_it(self):
         """A transient API failure must not fix the wrong answer in place for the life of
         the process."""
-        connector = self._connector(member_count=0)
+        connector = self._connector(members=())
         await self._deliver(connector)
         self.assertEqual(self.offered[0].kind, RoomKind.DM)
         self.assertEqual(connector._dm_kinds, {})
+
+
+class TestTheRoutingPathEndToEnd(unittest.IsolatedAsyncioTestCase):
+    """A frame for an untracked room must actually reach the router.
+
+    Every other test in this file calls `_on_unrouted_message` directly, and that is
+    exactly how the feature shipped broken: the fan-out selected the default callback and
+    the worker then re-looked-up `_callbacks` alone, discarding the item at dispatch. Under
+    subscribe-all the routing path could not fire once, and no unit test could see it —
+    they all started downstream of the discard.
+    """
+
+    async def test_a_frame_for_an_untracked_room_reaches_the_default_callback(self):
+        import asyncio
+
+        from gateway.connectors.rocketchat.websocket import RCWebSocketClient
+
+        client = RCWebSocketClient("https://x", "bot", "pw")
+        seen = asyncio.Event()
+        received: list[tuple[dict, dict | None]] = []
+
+        async def default_callback(doc, access=None):
+            received.append((doc, access))
+            seen.set()
+
+        client.register_default_callback(default_callback)
+
+        await client._handle_room_message({
+            "msg": "changed", "collection": "stream-room-messages",
+            "fields": {
+                "eventName": "__my_messages__",
+                "args": [
+                    {"_id": "m1", "rid": "r-untracked", "msg": "hi"},
+                    {"roomParticipant": True, "roomType": "c", "roomName": "sandbox"},
+                ],
+            },
+        })
+
+        try:
+            await asyncio.wait_for(seen.wait(), timeout=2.0)
+        finally:
+            for task in list(client._room_workers.values()):
+                task.cancel()
+
+        self.assertEqual(len(received), 1)
+        doc, access = received[0]
+        self.assertEqual(doc["rid"], "r-untracked")
+        self.assertEqual(access["roomName"], "sandbox")
+
+    async def test_a_tracked_room_still_goes_to_its_own_callback(self):
+        """The fallback must not shadow a registered handler."""
+        import asyncio
+
+        from gateway.connectors.rocketchat.websocket import RCWebSocketClient
+
+        client = RCWebSocketClient("https://x", "bot", "pw")
+        to_room, to_default = [], []
+
+        async def room_callback(doc, access=None):
+            to_room.append(doc)
+
+        async def default_callback(doc, access=None):
+            to_default.append(doc)
+
+        client._callbacks["r-tracked"] = room_callback
+        client.register_default_callback(default_callback)
+
+        await client._handle_room_message({
+            "msg": "changed", "collection": "stream-room-messages",
+            "fields": {"eventName": "__my_messages__",
+                       "args": [{"_id": "m1", "rid": "r-tracked", "msg": "hi"}]},
+        })
+        await asyncio.sleep(0.05)
+        for task in list(client._room_workers.values()):
+            task.cancel()
+
+        self.assertEqual(len(to_room), 1)
+        self.assertEqual(to_default, [])
+
+
+class TestMembershipOnTheTrackedPath(unittest.IsolatedAsyncioTestCase):
+    """Being removed from a channel must stop the watcher answering in it.
+
+    The stream keeps delivering a channel after the bot is removed — the account can still
+    *read* it — so without this the watcher goes on answering in a room it no longer
+    belongs to, which is the state the person removing it was trying to produce.
+    """
+
+    async def test_an_explicit_negative_drops_the_message(self):
+        connector = _make_connector()
+        # Without this the mention gate drops the message anyway and the test passes with
+        # or without the membership gate — which is how it first shipped: injecting the
+        # fault changed nothing. The room must be one where only the gate under test can
+        # reject.
+        connector._config = _make_config(owners=["glin"], require_mention=False)
+        connector._capacity_check = lambda room_id: RoomCapacity.AVAILABLE
+        connector.register_handler(AsyncMock(return_value=True))
+
+        await connector._on_raw_ddp_message(
+            "room-1",
+            {"_id": "m1", "rid": "room-1", "msg": "hi", "u": {"username": "glin"},
+             "ts": {"$date": 1}},
+            access={"roomParticipant": False, "roomType": "c", "roomName": "eng"},
+        )
+
+        connector._handler.assert_not_awaited()
+
+    async def test_absence_is_not_a_negative(self):
+        """A per-room subscription carries no access object, and neither does the replay
+        path. Reading absence as "not a member" would drop every message on both."""
+        connector = _make_connector()
+        # A listen-all room with an allow-listed sender, so the only thing that can drop
+        # this message is the membership gate under test.
+        connector._config = _make_config(owners=["glin"], require_mention=False)
+        connector.register_handler(AsyncMock(return_value=True))
+        connector._capacity_check = lambda room_id: RoomCapacity.AVAILABLE
+
+        await connector._on_raw_ddp_message(
+            "room-1",
+            {"_id": "m1", "rid": "room-1", "msg": "hi", "u": {"username": "glin"},
+             "ts": {"$date": 1}},
+            access=None,
+        )
+
+        connector._handler.assert_awaited()
+
+
+class TestUncertainStreamIsCancelled(unittest.IsolatedAsyncioTestCase):
+    """A timeout is not a refusal — the server may have accepted and answered late.
+
+    Leaving that subscription live while per-room ones open means every message arrives
+    twice, and the connector would report per-room delivery while untracked rooms kept
+    arriving.
+    """
+
+    async def test_a_timeout_sends_an_unsub(self):
+        from unittest.mock import AsyncMock as AM
+
+        from gateway.connectors.rocketchat.websocket import RCWebSocketClient
+
+        client = RCWebSocketClient("https://x", "bot", "pw")
+        sent: list[dict] = []
+        client._send = AM(side_effect=sent.append)
+
+        ok = await client.subscribe_all(timeout=0.01)
+
+        self.assertFalse(ok)
+        self.assertEqual([f["msg"] for f in sent], ["sub", "unsub"])
+        self.assertEqual(sent[0]["id"], sent[1]["id"], "must cancel the same subscription")
