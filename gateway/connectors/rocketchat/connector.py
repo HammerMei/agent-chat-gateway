@@ -93,6 +93,28 @@ class _RoomSubscription:
     seen_ids: collections.deque = field(default_factory=lambda: collections.deque())
     seen_ids_set: set = field(default_factory=set)
 
+    def left_the_room(self) -> None:
+        """Record that this account is no longer a member. Three things, one call.
+
+        A method for the same reason `remember` is one: the parts have to move together
+        and one of them is easy to leave out. They were written separately at the two
+        sites that learn this fact — the live `roomParticipant` gate and the REST
+        membership check — and the epoch was added to one of them only, so a message in
+        flight past the other one restored the watermark it had just cleared.
+
+        * `replay_boundary` — a retained window is a promise to read it later, and after a
+          removal nobody is entitled to.
+        * `last_processed_ts` — the *fallback* boundary, frozen at the removal because the
+          live gate remembers a rejected id without advancing it. Left set, a reconnect
+          arriving before the first post-re-add message replays the whole time away.
+          Empty means for a re-added room what it means for one seen for the first time.
+        * `membership_epoch` — how work already in flight finds out. Clearing the marks
+          cannot reach a replay or a dispatch holding its own copy of them.
+        """
+        self.replay_boundary = None
+        self.last_processed_ts = None
+        self.membership_epoch += 1
+
     def remember(self, msg_id: str) -> None:
         """Record a message id as handled, evicting the oldest past the bound.
 
@@ -363,8 +385,7 @@ class RocketChatConnector(Connector):
                 # frozen value and replay the whole time away. Empty means what it means
                 # for a room seen for the first time: no window, and ts-dedup off until
                 # live traffic establishes one (`normalize.py`, step 4).
-                sub.replay_boundary = None
-                sub.last_processed_ts = None
+                sub.left_the_room()
                 logger.warning(
                     "Room '%s': this account is no longer a member — skipping replay and "
                     "closing the outage window; a later re-add starts from that point, "
@@ -479,14 +500,15 @@ class RocketChatConnector(Connector):
                     room_id, doc, is_replay=True, replay_after_ts=watermark
                 )
                 if sub.membership_epoch != epoch:
-                    # The rejection landed *inside* that handler. Checking only before the
-                    # next iteration misses two cases: this being the last document, where
-                    # the `for`/`else` would then bless a revoked batch as complete, and
-                    # the dispatch itself having re-written the watermark the live gate had
-                    # just cleared — acceptance advances it, and it does not know it is
-                    # writing into a room the account has left.
-                    sub.replay_boundary = None
-                    sub.last_processed_ts = None
+                    # The removal landed *inside* that handler. The check at the top of the
+                    # loop cannot reach this: the last document has no next iteration, so
+                    # the `for`/`else` below would bless a revoked batch as complete.
+                    #
+                    # The marks are not re-cleared here. `left_the_room()` cleared them and
+                    # `_on_raw_ddp_message` refuses to commit a watermark once the epoch has
+                    # moved under it, so there is nothing left to repair — and repairing it
+                    # here as well would be the same rule in two places, which is how the
+                    # rule ends up applied in one.
                     logger.warning(
                         "Room '%s': this account was removed while message %d of %d was "
                         "being handled — dropping the rest and re-closing the window",
@@ -1281,12 +1303,7 @@ class RocketChatConnector(Connector):
             # `True` and replay from the frozen pre-removal mark — the whole interval it
             # was not a member, none of which is in the 200-id window because none of it
             # was ever delivered.
-            sub.replay_boundary = None
-            sub.last_processed_ts = None
-            # A replay may be mid-flight with a snapshot taken before this news; the epoch
-            # is how it finds out. Clearing the marks alone cannot reach it — it is holding
-            # its own copy of them.
-            sub.membership_epoch += 1
+            sub.left_the_room()
             return True
 
         msg_id = doc.get("_id", "")

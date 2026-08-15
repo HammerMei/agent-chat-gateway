@@ -3174,35 +3174,35 @@ class TestAReplayStopsWhenMembershipIsRevokedUnderIt(unittest.IsolatedAsyncioTes
         self.assertEqual(dispatched, ["m0", "m1"], "the rest belong to a room we left")
 
     async def test_a_rejection_inside_the_last_handler_is_still_caught(self):
-        """The case a pre-dispatch check cannot reach.
+        """The case a pre-dispatch check cannot reach — through the *real* dispatch path.
 
-        Checking only before the next iteration means the final document has no next
-        iteration: the `for`/`else` would bless a revoked batch as complete. And the
-        dispatch that was in flight may have advanced the watermark the live gate had just
-        cleared — acceptance writes it, and it does not know the account has left.
+        The first version of this test mocked the dispatch and wrote the watermark by
+        hand, which made it a test of the loop repairing that write. The repair is gone
+        now: `_on_raw_ddp_message` refuses to commit a watermark once the epoch has moved
+        under it, so the real writer never makes the write there was something to repair.
+        A mock cannot show that; only the real path can.
         """
         connector = self._connector(self._msgs(2))
+        connector._config.require_mention = False
         sub = connector._rooms["room-1"]
         sub.replay_boundary = "100"
-        dispatched: list[str] = []
+        handled: list[str] = []
 
-        async def _dispatch(room_id, doc, **kw):
-            dispatched.append(doc["_id"])
-            if len(dispatched) == 2:          # the *last* document
-                sub.membership_epoch += 1
-                sub.last_processed_ts = "999"  # what an accepted dispatch would write
+        async def _handler(msg):
+            handled.append(msg.text if hasattr(msg, "text") else "?")
+            if len(handled) == 2:          # the *last* document
+                sub.left_the_room()        # what the live gate does, mid-handler
             return True
 
-        connector._on_raw_ddp_message = _dispatch
+        connector._handler = _handler
 
         with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
             await connector._on_ws_reconnect()
 
-        self.assertEqual(dispatched, ["m0", "m1"])
+        self.assertEqual(len(handled), 2)
         self.assertIsNone(
             sub.last_processed_ts,
-            "the watermark the live gate cleared must not survive the dispatch that "
-            "was in flight when it fired",
+            "the dispatch in flight when the removal fired must not commit its mark",
         )
         self.assertIsNone(sub.replay_boundary)
 
@@ -3380,3 +3380,72 @@ class TestAnInFlightDeliveryCannotReopenAClosedEpoch(unittest.IsolatedAsyncioTes
 
         self.assertIsNotNone(sub.last_processed_ts)
         self.assertNotEqual(sub.last_processed_ts, "100")
+
+
+class TestEveryRemovalSiteRecordsTheSameThing(unittest.IsolatedAsyncioTestCase):
+    """Two sites learn "this account has left": the live gate and the REST check.
+
+    They were written separately and the epoch reached one of them, so a message in
+    flight past the other restored the watermark it had just cleared. The parts move
+    together in one method now — the same reason `remember` is a method — and this walks
+    both sites against it rather than trusting that they still agree.
+    """
+
+    def _connector(self):
+        connector = _make_connector()
+        connector._config.require_mention = False
+        connector._handler = AsyncMock(return_value=True)
+        connector._ws.subscription_statuses = {}
+        connector._rooms["room-1"].last_processed_ts = "100"
+        connector._rooms["room-1"].replay_boundary = "100"
+        return connector
+
+    def _assert_left(self, sub, before_epoch):
+        self.assertIsNone(sub.replay_boundary, "the window is not owed to anyone now")
+        self.assertIsNone(sub.last_processed_ts, "the fallback boundary goes with it")
+        self.assertEqual(
+            sub.membership_epoch, before_epoch + 1,
+            "work already in flight cannot see cleared marks — only the epoch",
+        )
+
+    async def test_the_live_gate_records_all_three(self):
+        connector = self._connector()
+        sub = connector._rooms["room-1"]
+        before = sub.membership_epoch
+
+        await connector._on_raw_ddp_message(
+            "room-1",
+            {"_id": "m9", "msg": "hi", "u": {"username": "alice"},
+             "ts": {"$date": 500}},
+            access={"roomParticipant": False},
+        )
+
+        self._assert_left(sub, before)
+
+    async def test_the_rest_check_records_all_three(self):
+        connector = self._connector()
+        connector._rest.is_room_member = AsyncMock(return_value=False)
+        sub = connector._rooms["room-1"]
+        before = sub.membership_epoch
+
+        await connector._snapshot_replay_boundaries()
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
+            await connector._on_ws_reconnect()
+
+        self._assert_left(sub, before)
+
+    async def test_the_method_is_what_both_sites_call(self):
+        """Derived rather than asserted twice: if a third site starts clearing the marks
+        by hand, this is the check that says so."""
+        import inspect
+
+        from gateway.connectors.rocketchat import connector as mod
+
+        src = inspect.getsource(mod)
+        body = src.split("def left_the_room")[1].split("def remember")[0]
+        outside = src.replace(body, "")
+        self.assertNotIn(
+            "last_processed_ts = None", outside,
+            "clearing the fallback boundary by hand is how the epoch gets forgotten — "
+            "call `left_the_room()`",
+        )
