@@ -21,11 +21,15 @@ def _to_rc_ts(value: str | None) -> str | None:
     The server does `new Date(oldest)` (`apps/meteor/server/api/v1/channels.ts`), and
     JavaScript's `new Date("1786816166131")` is **Invalid Date** — a string of digits is
     not one of the formats it accepts. What that produces is worse than an error, because
-    the request still succeeds. Probed against Rocket.Chat 6.12 with five messages in a
-    room, asking for everything at or after the third:
+    the request still succeeds. Probed against Rocket.Chat 6.12 **and 8.5.1**, five
+    messages in a room, asking for everything at or after the third — same result on both:
 
         oldest="1786816166131"            -> HTTP 200 success=True, 5 messages
         oldest="2026-08-15T17:49:26.131Z" -> HTTP 200 success=True, 3 messages
+
+    Not a quirk of an old server, and not something to wait out: `isChannelsHistoryProps`
+    on `develop` types `oldest` as `{type: 'string', minLength: 1}` with no `date-time`
+    format, so the digits pass validation and reach `new Date` exactly as before.
 
     So the bound is silently dropped and the server answers with the newest `count`
     messages in the room. The client-side watermark filter still rejects the ones below
