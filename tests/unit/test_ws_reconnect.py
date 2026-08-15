@@ -1697,6 +1697,76 @@ class TestARemovalThatCompletesDuringTheReleaseIsStillNoticed(unittest.IsolatedA
         self.assertEqual(client._subscriptions["r1"], new_id)
 
 
+class TestARemovalThatCompletesDuringTheConfirmationIsStillNoticed(
+    unittest.IsolatedAsyncioTestCase
+):
+    """The same rule, at the longer await — and the one it was not applied to.
+
+    `TestARemovalThatCompletesDuringTheRelease...` covers the `unsub` send. This covers
+    the wait for the server's `ready`, which spans a network round trip and is where a
+    removal is far more likely to fit. The marker cannot see it: a removal that *completes*
+    clears the marker, so the check found nothing and reported success — handing the caller
+    a room whose mapping, callback and state had all been removed, and for which a
+    processor is then installed.
+    """
+
+    async def test_a_completed_removal_fails_the_subscription(self):
+        from gateway.connectors.rocketchat.websocket import SubscriptionState
+
+        client = _make_client()
+        client._subscription_states = {
+            "r1": SubscriptionState(room_id="r1", callback=AsyncMock())
+        }
+
+        async def _send(payload):
+            if payload.get("msg") != "sub":
+                return
+            # The whole removal lands inside the confirmation wait: marker raised,
+            # everything popped, marker cleared — then the server answers.
+            client._rooms_unsubscribing.add("r1")
+            client._subscriptions.pop("r1", None)
+            client._callbacks.pop("r1", None)
+            client._subscription_states.pop("r1", None)
+            client._rooms_unsubscribing.discard("r1")
+            fut = client._pending_subs.get(payload["id"])
+            if fut and not fut.done():
+                fut.set_result(True)
+
+        client._send = _send
+
+        with self.assertRaises(RuntimeError):
+            await client._subscribe_with_confirmation(
+                room_id="r1", callback=AsyncMock(), timeout=5,
+                keep_callback_on_failure=False,
+            )
+
+        self.assertNotIn("r1", client._subscriptions)
+        self.assertNotIn("r1", client._callbacks)
+        self.assertNotIn(
+            "r1", client._subscription_states,
+            "nothing may put back the state the removal took",
+        )
+
+    async def test_an_ordinary_confirmation_still_succeeds(self):
+        """The near miss: the identity check must not reject a normal subscription."""
+        client = _make_client()
+
+        async def _send(payload):
+            if payload.get("msg") == "sub":
+                fut = client._pending_subs.get(payload["id"])
+                if fut and not fut.done():
+                    fut.set_result(True)
+
+        client._send = _send
+        sub_id = await client._subscribe_with_confirmation(
+            room_id="r1", callback=AsyncMock(), timeout=5,
+            keep_callback_on_failure=False,
+        )
+
+        self.assertEqual(client._subscriptions["r1"], sub_id)
+        self.assertEqual(client._subscription_states["r1"].status, "active")
+
+
 class TestALosingAttemptRollsBackOnlyItsOwnState(unittest.IsolatedAsyncioTestCase):
     """Two attempts for one room, and the loser cleaning up after the winner.
 

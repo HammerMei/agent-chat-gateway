@@ -968,6 +968,15 @@ class MattermostConnector(Connector):
             bot_user_id=self._rest.bot_user_id or "",
             turn_store=self._turn_store,
         )
+        # Captured with no await between the filter's increment and this read, so it names
+        # the count that increment belonged to — a reset restarts the numbering, and a
+        # token from the previous count must not take a turn from the new one.
+        turn_generation = (
+            self._turn_store.generation(
+                post.get("channel_id", ""), post.get("root_id") or None, result.sender)
+            if (result.agent_chain_token and self._turn_store is not None)
+            else 0
+        )
         if not result.accepted:
             logger.debug("Message filtered: %s (sender=%s)", result.reason, result.sender)
             return
@@ -1041,6 +1050,22 @@ class MattermostConnector(Connector):
                     state.seen_ids.remove(msg_id)
                 except ValueError:
                     pass
+            # Forgetting the id is not enough: the filter already spent a turn of this
+            # sender's agent-chain budget, before anything knew whether the post could be
+            # delivered. Every retry spends another, and once the budget is gone the
+            # filter rejects the post as complete — so the message the retry exists for is
+            # the one it can never deliver. Same rule as the Rocket.Chat hand-back; it was
+            # written for one connector and a comment here asserted the other had no
+            # hand-back path, which this branch is.
+            if result.agent_chain_token and self._turn_store is not None:
+                remaining = self._turn_store.release_turn(
+                    post.get("channel_id", ""), post.get("root_id") or None,
+                    result.sender, result.agent_chain_token, turn_generation,
+                )
+                logger.debug(
+                    "Released an agent-chain turn for %s (handler queue full) — now at %d",
+                    result.sender, remaining,
+                )
             return
 
         state.last_processed_ts = result.msg_ts

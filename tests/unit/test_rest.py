@@ -1620,3 +1620,59 @@ class TestDmMembersExcludesThisAccountById(unittest.IsolatedAsyncioTestCase):
         ])
 
         self.assertEqual(await rest.dm_members("r1"), ["alice", "carol"])
+
+
+class TestHistoryBoundsAreSentInTheFormatTheServerParses(unittest.IsolatedAsyncioTestCase):
+    """`oldest`/`latest` reach `new Date(...)` on the server, which rejects epoch digits.
+
+    Verified against Rocket.Chat 6.12 rather than reasoned about: a room with five
+    messages, asked for everything at or after the third.
+
+        oldest="1786816166131"            -> HTTP 200 success=True, 5 messages back
+        oldest="2026-08-15T17:49:26.131Z" -> HTTP 200 success=True, 3 messages back
+
+    The request *succeeds* either way — the bound is dropped, not refused — so nothing
+    upstream can notice. That is why this is pinned here at the wire, where the format is
+    decided, and not at a caller.
+    """
+
+    def _rest(self):
+        rest = RocketChatREST("http://rc.example.com")
+        rest._request = AsyncMock(return_value={"success": True, "messages": []})
+        return rest
+
+    def _params(self, rest):
+        return rest._request.await_args.kwargs["params"]
+
+    async def test_an_epoch_millisecond_watermark_is_converted(self):
+        rest = self._rest()
+        await rest.get_room_history_page("r1", "channel", count=10, after_ts="1786816166131")
+
+        self.assertEqual(self._params(rest)["oldest"], "2026-08-15T17:49:26.131000Z")
+
+    async def test_an_iso_bound_is_passed_through_untouched(self):
+        """The history-handoff caller documents ISO and must not be double-converted."""
+        rest = self._rest()
+        await rest.get_room_history(
+            "r1", "channel", count=10,
+            before_ts="2026-08-15T18:00:00Z", after_ts="2026-08-15T17:00:00Z",
+        )
+
+        params = self._params(rest)
+        self.assertEqual(params["oldest"], "2026-08-15T17:00:00Z")
+        self.assertEqual(params["latest"], "2026-08-15T18:00:00Z")
+
+    async def test_the_upper_bound_is_converted_too(self):
+        """Same parameter family, same server-side `new Date` — one rule, both bounds."""
+        rest = self._rest()
+        await rest.get_room_history("r1", "channel", count=10, before_ts="1786816166131")
+
+        self.assertEqual(self._params(rest)["latest"], "2026-08-15T17:49:26.131000Z")
+
+    async def test_no_bound_stays_absent(self):
+        rest = self._rest()
+        await rest.get_room_history_page("r1", "channel", count=10)
+
+        params = self._params(rest)
+        self.assertNotIn("oldest", params)
+        self.assertNotIn("latest", params)

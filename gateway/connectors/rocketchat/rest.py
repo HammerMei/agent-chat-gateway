@@ -1,6 +1,7 @@
 """Thin Rocket.Chat REST API client for login, post_message, upload_file, and room resolution."""
 
 import asyncio
+import datetime
 import logging
 import mimetypes
 import secrets
@@ -11,6 +12,40 @@ from typing import Any, Callable
 import httpx
 
 logger = logging.getLogger("agent-chat-gateway.connectors.rocketchat.rest")
+
+
+def _to_rc_ts(value: str | None) -> str | None:
+    """Normalise a history bound to what Rocket.Chat's `oldest`/`latest` actually parse.
+
+    The server does `new Date(oldest)` (`apps/meteor/server/api/v1/channels.ts`), and
+    JavaScript's `new Date("1786816166131")` is **Invalid Date** — a string of digits is
+    not one of the formats it accepts. What that produces is worse than an error, because
+    the request still succeeds. Probed against Rocket.Chat 6.12 with five messages in a
+    room, asking for everything at or after the third:
+
+        oldest="1786816166131"            -> HTTP 200 success=True, 5 messages
+        oldest="2026-08-15T17:49:26.131Z" -> HTTP 200 success=True, 3 messages
+
+    So the bound is silently dropped and the server answers with the newest `count`
+    messages in the room. The client-side watermark filter still rejects the ones below
+    the cursor, which is why this never showed up as duplicate delivery — it shows up as
+    a full page fetched on every reconnect, `was_full` reporting "messages could be
+    permanently lost" for any room with more history than the page size, and a window of
+    system events that cannot be read past.
+
+    Two callers pass this parameter in two formats: the reconnect replay passes the DDP
+    watermark, which is epoch milliseconds (`normalize._extract_ts`), and the history
+    handoff passes ISO 8601, as its docstring says. Normalising here rather than at either
+    caller is the point — the wire format belongs to the client that owns the request, and
+    a rule kept at the call sites is a rule the next call site will not know about.
+    """
+    if not value:
+        return value
+    if value.lstrip("-").isdigit():
+        return datetime.datetime.fromtimestamp(
+            int(value) / 1000, tz=datetime.timezone.utc
+        ).isoformat().replace("+00:00", "Z")
+    return value
 
 
 class RoomNotFoundError(Exception):
@@ -525,9 +560,9 @@ class RocketChatREST:
         endpoint = endpoint_map.get(room_type, "channels.history")
         params: dict = {"roomId": room_id, "count": count, "unreads": "false"}
         if before_ts:
-            params["latest"] = before_ts
+            params["latest"] = _to_rc_ts(before_ts)
         if after_ts:
-            params["oldest"] = after_ts
+            params["oldest"] = _to_rc_ts(after_ts)
             # RC treats 'oldest' as exclusive by default (ts > oldest).
             # Set inclusive=true to get ts >= oldest — matching the documented
             # contract that --after is an inclusive lower bound.

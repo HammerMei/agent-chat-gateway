@@ -97,6 +97,10 @@ class FilterResult:
     reason: str = ""  # debug only
     is_agent_chain: bool = False   # True when sender is a known ACG agent
     agent_chain_turn: int = 0      # current turn (1-based, after increment)
+    # Names the increment rather than counting it — the same field, for the same reason,
+    # as the Rocket.Chat result. `agent_chain_turn` is the live count and moves in both
+    # directions, so it cannot identify a delivery. Zero when no turn was taken.
+    agent_chain_token: int = 0
     agent_chain_max_turns: int = 5  # from config
 
 
@@ -175,10 +179,9 @@ def filter_mm_message(
 
     # 5. Agent chain turn budget
     agent_chain_turn = 0
+    agent_chain_token = 0
     if is_agent and turn_store is not None:
-        # The token is what a release would need; Mattermost has no path that hands a
-        # message back, so it is discarded here rather than carried.
-        allowed, agent_chain_turn, _token = turn_store.check_and_increment(
+        allowed, agent_chain_turn, agent_chain_token = turn_store.check_and_increment(
             room_id=post.get("channel_id", ""),
             thread_id=post.get("root_id") or None,
             sender=sender_username,
@@ -205,6 +208,7 @@ def filter_mm_message(
         msg_ts=msg_ts,
         is_agent_chain=is_agent,
         agent_chain_turn=agent_chain_turn,
+        agent_chain_token=agent_chain_token,
         agent_chain_max_turns=config.agent_chain.max_turns,
     )
 

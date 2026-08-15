@@ -1042,3 +1042,65 @@ class TestResolveRoomById(unittest.IsolatedAsyncioTestCase):
         room = await connector.resolve_room_by_id("c9")
 
         self.assertEqual(room.name, "c9")
+
+
+class TestAHandedBackPostGivesItsTurnBack(unittest.IsolatedAsyncioTestCase):
+    """The filter spends a turn before anything knows the post can be delivered.
+
+    Mattermost has a hand-back path — the `not accepted` branch forgets the id so a retry
+    can bring the post back — and a comment in `normalize.py` asserted it did not. Without
+    the release, every retry spends another turn; once the budget is gone the filter
+    rejects the post as complete, so the message the retry exists for is the one it can
+    never deliver.
+    """
+
+    async def _connector(self):
+        connector = _make_connector(
+            owners=["alice"],
+            agent_chain=AgentChainConfig(agent_usernames=["peer"], max_turns=2),
+        )
+        room = Room(id="chan1", name="general", type="channel")
+        connector._ws.register_channel = MagicMock()
+        await connector.subscribe_room(room, watcher_id="w1")
+        connector._rest.resolve_username = AsyncMock(return_value="peer")
+        return connector
+
+    def _post(self, post_id):
+        return {
+            "post": {"id": post_id, "channel_id": "chan1", "user_id": "u1",
+                     "message": "@hammer.mei hi", "root_id": "", "type": "",
+                     "create_at": 12345},
+            "mentions": ["bot-id-1"],
+        }
+
+    async def test_a_rejected_post_does_not_spend_a_turn(self):
+        connector = await self._connector()
+        connector.register_handler(AsyncMock(return_value=False))   # queue full
+
+        await connector._on_posted_event(self._post("p1"))
+
+        self.assertEqual(
+            connector._turn_store.current_turns("chan1", None, "peer"), 0,
+            "the post was never delivered, so it took no turn",
+        )
+
+    async def test_retrying_past_the_budget_still_reaches_the_handler(self):
+        """The failure this prevents: max_turns=2, so a third attempt used to be refused
+        by the filter before the handler ever saw it."""
+        connector = await self._connector()
+        handler = AsyncMock(return_value=False)
+        connector.register_handler(handler)
+
+        for i in range(5):
+            await connector._on_posted_event(self._post(f"p{i}"))
+
+        self.assertEqual(handler.await_count, 5)
+
+    async def test_a_delivered_post_keeps_its_turn(self):
+        """The near miss: releasing unconditionally would uncap the chain."""
+        connector = await self._connector()
+        connector.register_handler(AsyncMock(return_value=True))
+
+        await connector._on_posted_event(self._post("p1"))
+
+        self.assertEqual(connector._turn_store.current_turns("chan1", None, "peer"), 1)

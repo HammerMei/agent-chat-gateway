@@ -531,7 +531,19 @@ class RCWebSocketClient:
             # our sub before processing the unsub.  We must roll back the
             # local state so the room is not left as an active subscription
             # after the caller intended to remove it.
-            if room_id in self._rooms_unsubscribing:
+            # Both tests, because the marker only catches a removal still *in progress*.
+            # The reasoning is already written above, at the release await: completing is
+            # what clears `_rooms_unsubscribing`, so a removal that finishes entirely
+            # inside this confirmation wait leaves nothing for the marker to see — and
+            # this wait is far longer than that one, since it spans a server round trip.
+            # The rule was stated there and applied there only; this is the site that
+            # needed it more. Reported as success, it hands the caller a room whose
+            # mapping, callback and state have all been removed, and a processor is
+            # installed for a subscription nothing tracks.
+            if (
+                room_id in self._rooms_unsubscribing
+                or self._subscription_states.get(room_id) is not state
+            ):
                 # Only what this attempt still owns. A recovery starting while a direct
                 # `subscribe_room` is mid-confirmation makes two attempts for one room, and
                 # the loser's rollback used to take the winner's mapping, callback and
