@@ -1907,7 +1907,8 @@ rather than against the last thing someone noticed.
 | **live** | the server confirmed and has not stopped it | the stream | the stream, for every room |
 | **lost** | wanted but not live: refused, timed out, stopped, or the socket dropped | each tracked room | its own subscription |
 
-Transitions: `absent → wanted` when a router is registered; `wanted → live` on `ready`;
+Transitions: `absent → wanted` when a router is registered; `wanted → live` on a `ready`
+**that still stands when the caller acts on it** (invariant 7);
 `live → lost` on `nosub` for the stream id, on a socket drop, or on an explicit stop;
 `lost → live` on a successful resubscribe. **Intent is not a state that failure clears** —
 only `disconnect` returns a connector to `absent`.
@@ -1967,7 +1968,18 @@ only `disconnect` returns a connector to `absent`.
    back, so they are the likely path rather than the exotic one; clearing the mark there
    would close a gap nobody looked at. For the same reason a new outage does not overwrite
    an unread boundary: the older mark covers both windows, and dedup bounds the cost.
-7. **An unknown classification is not a default.** Rocket.Chat cannot distinguish a 1:1
+7. **A confirmation is only as good as the transport's last word about it.** `ready` and
+   `nosub` for the same subscription can arrive in one batch of frames, and the receive
+   loop processes both before the coroutine awaiting the confirmation is scheduled again —
+   resolving a future only *schedules* its waiter, and reading an already-buffered frame
+   does not yield. In that window the subscription has an id, a resolved future, and no
+   entry in `_stream_sub_id`: the rejection path sees a future with nothing left to
+   reject, and the stream path does not recognise its own subscription. So the id has to
+   be published *before* the wait, and the caller has to re-check that its confirmation
+   still stands before recording it. Recording a revoked one claims delivery the server
+   has already stopped — and the connector releases every per-room subscription on that
+   claim.
+8. **An unknown classification is not a default.** Rocket.Chat cannot distinguish a 1:1
    from a group DM without a lookup, and a failed lookup answering "1:1" is not a
    conservative guess: it lets a group DM be claimed by a `direct: true` rule *and* skip
    the mention gate, so the agent answers everyone in it. Unknown means do not offer the

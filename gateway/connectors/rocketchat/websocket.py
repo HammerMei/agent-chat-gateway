@@ -78,6 +78,14 @@ class RCWebSocketClient:
         # Whether this client should have the stream at all, as distinct from whether it
         # currently does. A failed restore clears the id; only `disconnect` clears intent.
         self._wants_stream = False
+        # The stream subscription that has been sent but not yet recorded. Its own field,
+        # because between `ready` and the caller resuming there is a window in which the
+        # subscription has an id, a confirmation, and no entry in `_stream_sub_id` — and a
+        # `nosub` arriving in it belongs to the stream even though nothing yet says so.
+        self._pending_stream_sub_id: str | None = None
+        # Set when that `nosub` arrives, and read by the caller before it records success:
+        # a confirmation is only as good as the transport's last word about it.
+        self._revoked_stream_sub_id: str | None = None
         # One queue and one worker for every untracked room, rather than one of each per
         # room. Bounded, because an unbounded routing backlog under subscribe-all is every
         # message in every readable channel.
@@ -294,6 +302,10 @@ class RCWebSocketClient:
         sub_id = self._new_id()
         future: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending_subs[sub_id] = future
+        # Published before the send, not after the confirmation: a `nosub` can arrive in the
+        # same batch of frames as the `ready` that resolved this future, and until this is
+        # set nothing in the receive loop can tell that such a frame is about the stream.
+        self._pending_stream_sub_id = sub_id
         try:
             await self._send(
                 {
@@ -325,6 +337,20 @@ class RCWebSocketClient:
             return False
         finally:
             self._pending_subs.pop(sub_id, None)
+            self._pending_stream_sub_id = None
+            revoked = self._revoked_stream_sub_id == sub_id
+            self._revoked_stream_sub_id = None
+
+        if revoked:
+            # Confirmed and then terminated before this coroutine was scheduled again. The
+            # confirmation is stale, and recording it would claim delivery the server has
+            # already stopped — after which the connector releases every per-room
+            # subscription and no room receives anything at all.
+            logger.warning(
+                "Subscribe-all (__my_messages__) was confirmed and then terminated before "
+                "it took effect — falling back to per-room subscriptions"
+            )
+            return False
 
         self._stream_sub_id = sub_id
         logger.info("Subscribed to __my_messages__ — delivery is no longer per room")
@@ -597,6 +623,19 @@ class RCWebSocketClient:
                         )
                     elif nosub_id and nosub_id == self._stream_sub_id:
                         self._on_stream_lost(nosub_error)
+                    elif nosub_id and nosub_id == self._pending_stream_sub_id:
+                        # `ready` then `nosub`, before `subscribe_all` resumed. The future
+                        # exists but is already resolved, so the branch above sees nothing
+                        # to reject, and `_stream_sub_id` is still unset, so the stream
+                        # branch does not recognise its own subscription. Left unhandled the
+                        # caller went on to record a dead id as live, and the connector then
+                        # released every per-room subscription — all rooms dark, silently,
+                        # until an unrelated reconnect.
+                        self._revoked_stream_sub_id = nosub_id
+                        logger.warning(
+                            "The __my_messages__ stream was terminated between its "
+                            "confirmation and being recorded (%s)", nosub_error,
+                        )
                     else:
                         logger.warning(
                             "Subscription rejected (no pending future): %s", msg

@@ -1079,3 +1079,89 @@ class TestAWatcherAddedDuringTheRestoreIsNotDeliveredTwice(unittest.IsolatedAsyn
             await client._resubscribe_all_rooms()
 
         client._subscribe_with_confirmation.assert_awaited()
+
+
+class TestAConfirmationRevokedBeforeItTookEffect(unittest.IsolatedAsyncioTestCase):
+    """`ready` and `nosub` for the stream, in one batch of frames.
+
+    The receive loop can process both before the coroutine awaiting the confirmation is
+    scheduled again: resolving a future only *schedules* its waiter, and reading an
+    already-buffered frame does not yield. In that window the future exists but is done —
+    so the rejection branch sees nothing to reject — and `_stream_sub_id` is still unset,
+    so the stream branch does not recognise its own subscription. The caller then recorded
+    a dead id as live and the connector released every per-room subscription behind it.
+    """
+
+    async def _run(self, frames_after_sub) -> tuple[bool, RCWebSocketClient, list[dict]]:
+        client = _make_client()
+        client._ws = AsyncMock()
+        sent: list[dict] = []
+
+        async def _send(payload):
+            sent.append(payload)
+
+        client._send = _send
+        task = asyncio.create_task(client.subscribe_all(timeout=5))
+        while not sent:
+            await asyncio.sleep(0)
+        sub_id = sent[0]["id"]
+
+        frames = [json.dumps(f(sub_id)) for f in frames_after_sub]
+
+        async def _recv():
+            # Returns without awaiting anything, exactly as a buffered frame does — so the
+            # loop drains both frames before the waiter runs. A test that yielded here
+            # would be testing a different, benign interleaving.
+            if frames:
+                return frames.pop(0)
+            client._running = False
+            raise asyncio.CancelledError()
+
+        client._ws.recv = _recv
+        client._running = True
+        with self.assertRaises(asyncio.CancelledError):
+            await client._listen_loop()
+
+        return await task, client, sent
+
+    async def test_a_stream_terminated_right_after_ready_is_not_recorded_as_live(self):
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat.ws", "WARNING"):
+            ok, client, _sent = await self._run([
+                lambda sid: {"msg": "ready", "subs": [sid]},
+                lambda sid: {"msg": "nosub", "id": sid, "error": {"message": "stopped"}},
+            ])
+
+        self.assertFalse(ok, "the caller must report the capability as unavailable")
+        self.assertFalse(
+            client.stream_active,
+            "recording it would claim delivery the server has already stopped — and the "
+            "connector releases every per-room subscription on that claim",
+        )
+        self.assertTrue(client._wants_stream, "still wanted; only this attempt failed")
+
+    async def test_a_plain_confirmation_is_still_a_confirmation(self):
+        """The near miss: the revocation check must not reject every subscription."""
+        ok, client, _sent = await self._run([
+            lambda sid: {"msg": "ready", "subs": [sid]},
+        ])
+        self.assertTrue(ok)
+        self.assertTrue(client.stream_active)
+
+    async def test_a_nosub_for_an_unrelated_id_does_not_revoke_the_stream(self):
+        ok, client, _sent = await self._run([
+            lambda sid: {"msg": "ready", "subs": [sid]},
+            lambda sid: {"msg": "nosub", "id": "someone-elses-sub",
+                         "error": {"message": "no"}},
+        ])
+        self.assertTrue(ok)
+        self.assertTrue(client.stream_active)
+
+    async def test_a_later_attempt_is_not_poisoned_by_the_revoked_one(self):
+        """The revocation is consumed by the attempt it belongs to."""
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat.ws", "WARNING"):
+            first, client, _ = await self._run([
+                lambda sid: {"msg": "ready", "subs": [sid]},
+                lambda sid: {"msg": "nosub", "id": sid, "error": {"message": "stopped"}},
+            ])
+        self.assertFalse(first)
+        self.assertIsNone(client._revoked_stream_sub_id)
