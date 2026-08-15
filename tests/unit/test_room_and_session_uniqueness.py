@@ -590,6 +590,40 @@ class TestEveryWatermarkCopySpeaksTheSameLanguage(unittest.IsolatedAsyncioTestCa
 
         self.assertEqual(ws.last_processed_ts, "100")
 
+    def test_a_cleared_cursor_is_never_written_over(self):
+        """The behaviour, not the shape of the guard.
+
+        The form check below passed a version of this rule that did nothing: the second
+        clause still ran, and `ts_gt("100", "")` is True, so the stale mark went back over
+        the deliberate clear anyway. A test of what the code *says* is not a test of what
+        it *does*, and this is the one that would have caught it.
+        """
+        from gateway.core.watcher_lifecycle import _should_restore_watermark
+
+        self.assertFalse(
+            _should_restore_watermark("100", ""),
+            "an empty live cursor is the connector saying it cleared the mark",
+        )
+
+    def test_a_connector_with_no_state_for_the_room_is_restored(self):
+        from gateway.core.watcher_lifecycle import _should_restore_watermark
+
+        self.assertTrue(_should_restore_watermark("100", None))
+
+    def test_a_record_behind_the_live_cursor_is_not_written_back(self):
+        """Never backwards: the connector advances the cursor as messages are accepted,
+        and an older record would redeliver everything between the two."""
+        from gateway.core.watcher_lifecycle import _should_restore_watermark
+
+        self.assertFalse(_should_restore_watermark("100", "900"))
+        self.assertTrue(_should_restore_watermark("900", "100"))
+
+    def test_an_empty_record_restores_nothing(self):
+        from gateway.core.watcher_lifecycle import _should_restore_watermark
+
+        self.assertFalse(_should_restore_watermark("", "100"))
+        self.assertFalse(_should_restore_watermark("", None))
+
     def test_no_copy_site_still_tests_truthiness(self):
         """Derived from the source, because the list of sites is the thing that keeps
         being incomplete — twice now, once with the second site named in the finding."""

@@ -29,6 +29,32 @@ from .state_store import StateStore
 logger = logging.getLogger("agent-chat-gateway.core.watcher_lifecycle")
 
 
+def _should_restore_watermark(stored: str, live: str | None) -> bool:
+    """Whether a watcher's persisted watermark may be written into the connector.
+
+    The connector gives three answers, and the middle one is why this is a function
+    rather than a condition:
+
+    * ``None`` — no state for this room. The record is all there is; restore it.
+    * ``""``   — cleared on purpose, because the account is no longer in the room.
+      Restoring would undo that, and a later re-add would replay the interval it was
+      absent for. This is the case a `not current_ts` test got wrong in one direction
+      and a bare `is None` test got wrong in the other: the comparison below still
+      ran, and `ts_gt(anything, "")` is True.
+    * a value  — the room's live cursor. Restore only when the record is ahead of it,
+      never backwards: the connector advances that cursor as messages are accepted,
+      independently of any one watcher's restarts, and writing an older value back
+      would redeliver everything between the two at the next reconnect.
+    """
+    if not stored:
+        return False
+    if live is None:
+        return True
+    if live == "":
+        return False
+    return _ts_gt(stored, live)
+
+
 class WatcherLifecycle:
     """Manages watcher start/stop/pause/resume/reset and related bookkeeping.
 
@@ -629,16 +655,12 @@ class WatcherLifecycle:
         # watchers sharing a room, which §4.1 no longer permits; the reason above is
         # the one that still holds.)
         #
-        # The third site of one rule, and the only one that reads rather than writes: an
-        # empty live cursor is a connector saying "cleared on purpose", not "I have
-        # nothing". Writing the stored mark back over it would undo a removal that has not
-        # yet reached the record — the same interval-replay the clear exists to prevent,
-        # arriving from the restore side instead of the save side. `None` still means the
-        # connector has no state for this room, which is what this restore is for.
-        if ws.last_processed_ts:
-            current_ts = self._connector.get_last_processed_ts(room.id)
-            if current_ts is None or _ts_gt(ws.last_processed_ts, current_ts):
-                self._connector.update_last_processed_ts(room.id, ws.last_processed_ts)
+        # The third site of one rule, and the only one that reads rather than writes. The
+        # decision has a name because it has three answers and I got it wrong twice while
+        # it was spelled out inline — see `_should_restore_watermark`.
+        current_ts = self._connector.get_last_processed_ts(room.id)
+        if _should_restore_watermark(ws.last_processed_ts, current_ts):
+            self._connector.update_last_processed_ts(room.id, ws.last_processed_ts)
 
         logger.info(
             "Started watcher '%s' for room '%s' using agent '%s' (session %s)",
