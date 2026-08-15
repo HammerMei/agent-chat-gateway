@@ -521,9 +521,41 @@ class RCWebSocketClient:
                 return
 
             message_doc = args[0]
-            room_id = fields.get("eventName") or message_doc.get("rid")
+            if not isinstance(message_doc, dict):
+                # Reachable now in a way it was not before: the room used to be read from
+                # `eventName` first, which short-circuited past this value entirely when
+                # it was present. Guarded rather than left to the outer handler, which
+                # would report a malformed frame as "error handling room message".
+                logger.debug("Ignoring frame whose first arg is not a message doc")
+                return
+
+            # `rid` is authoritative, and `eventName` is only a fallback for a frame that
+            # somehow carries no message.
+            #
+            # The order used to be the other way round, which worked only because a
+            # per-room `sub` makes Rocket.Chat set `eventName` to the room id itself. On a
+            # stream that spans rooms — `__my_messages__` — `eventName` is the **literal
+            # stream name** (§6.1), so every room would resolve to one key, and with it one
+            # callback, one queue and one worker: per-room ordering silently becomes global
+            # ordering, and a single slow room stalls every other.
+            #
+            # This is the key-space split. The room key identifies where a message goes;
+            # the *stream* key identifies what was subscribed to. They coincide today
+            # because we subscribe per room, and they stop coinciding the moment we do not.
+            room_id = message_doc.get("rid") or fields.get("eventName")
             if not room_id:
                 return
+
+            # The access object Rocket.Chat appends: `roomParticipant`, `roomType`, and —
+            # for rooms that have one — `roomName`. A DM's object is present and simply
+            # omits the name (`{"roomParticipant": true, "roomType": "d"}`, §6.1); it is
+            # the *field* that is missing, not the object.
+            #
+            # Observed on `__my_messages__` (§6.1). Whether a per-room subscription also
+            # carries one has not been checked, which is exactly why this is optional
+            # rather than assumed: the code threads through whatever arrives and the
+            # connector decides what a missing one means.
+            access = args[1] if len(args) > 1 and isinstance(args[1], dict) else None
 
             callback = self._callbacks.get(room_id)
             if not callback:
@@ -558,7 +590,11 @@ class RCWebSocketClient:
                 task.add_done_callback(self._callback_tasks.discard)
 
             try:
-                self._room_queues[room_id].put_nowait(message_doc)
+                # The access object rides with the message: it describes *this delivery*
+                # (is the account a participant, what kind of room, what is it called),
+                # not the room in general, so storing it per room would be storing a
+                # snapshot of the last message rather than a property.
+                self._room_queues[room_id].put_nowait((message_doc, access))
             except asyncio.QueueFull:
                 state = self._subscription_states.get(room_id)
                 if state is None:
@@ -586,8 +622,9 @@ class RCWebSocketClient:
         in_flight: object = None
         try:
             while True:
-                doc = await queue.get()
-                in_flight = doc  # record before semaphore — cancellation safe
+                item = await queue.get()
+                doc, access = item
+                in_flight = item  # record before semaphore — cancellation safe
                 callback = self._callbacks.get(room_id)
                 if callback:
                     async with self._callback_sem:
@@ -597,7 +634,7 @@ class RCWebSocketClient:
                         # already accounts for it if cancelled here).
                         in_flight = None
                         try:
-                            await callback(doc)
+                            await callback(doc, access)
                         except asyncio.CancelledError:
                             # Worker was cancelled *while* the callback was in
                             # flight — the current message (doc) is lost.  Log

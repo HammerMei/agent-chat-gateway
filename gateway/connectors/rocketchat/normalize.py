@@ -87,6 +87,41 @@ def filter_rc_message(
 
     Returns a FilterResult describing the outcome.
     """
+    # 0. Skip messages carrying a type letter.
+    #
+    # Rocket.Chat marks system events with `t` on the message doc — `uj` joined, `au`
+    # added, `ru` removed, `room_changed_topic` — and delivers them over DDP like any
+    # other message. Only the REST history path filtered them, so they reached the agent
+    # as turns.
+    #
+    # **And they do not look empty.** RC puts the payload in `msg`: the joining user's
+    # name for `uj`, the added user's for `au`, the new topic for `room_changed_topic`.
+    # The history filter is the evidence — `not m.get("t") and m.get("msg")` in `rest.py`
+    # tests both, and the first clause would be redundant if a system message always had
+    # an empty body. So in a DM or a listen-all room the agent was answering a message
+    # whose text was `glin`, with nothing to mark it as machinery.
+    #
+    # The letter is not exclusively for system events: `e2e` marks an
+    # end-to-end-encrypted body (every user message in such a room carries it, and this
+    # turns unreadable ciphertext into a clean drop — a bot cannot complete the key
+    # exchange anyway), and `discussion-created` / `message_pinned` are user actions.
+    # Dropping all of them as *turns* is the intent: none is someone talking to the
+    # agent. The letter is named in the reason so a vanished message is traceable rather
+    # than mysterious.
+    #
+    # One deliberate side effect, stated because nothing else would say it: this runs
+    # before the agent-chain step, so a system message no longer resets the chain's turn
+    # budget. A human joining a room used to hand two mid-chain agents a fresh five turns.
+    # A join is not a human turn, so not resetting is the better answer — but it is a
+    # change, not a no-op.
+    #
+    # Mattermost has gated this on the live path all along (`post.get("type")`).
+    message_type = doc.get("t")
+    if message_type:
+        return FilterResult(
+            accepted=False, reason=f"system message (t={message_type})"
+        )
+
     sender = doc.get("u", {}).get("username", "")
 
     # 1. Skip own messages

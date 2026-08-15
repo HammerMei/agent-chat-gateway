@@ -308,7 +308,7 @@ class TestHandleRoomMessage(unittest.IsolatedAsyncioTestCase):
 
         # Also put an old queue with a pending item (to trigger warning log)
         old_q: asyncio.Queue = asyncio.Queue()
-        old_q.put_nowait({"old": "msg"})
+        old_q.put_nowait(({"old": "msg"}, None))
         client._room_queues[room_id] = old_q
 
         msg = self._make_msg(args=[{"rid": room_id, "text": "hi"}], rid=room_id)
@@ -343,7 +343,7 @@ class TestRoomWorker(unittest.IsolatedAsyncioTestCase):
         client = _make_client()
         room_id = "room-x"
         q: asyncio.Queue = asyncio.Queue()
-        q.put_nowait({"_id": "msg-1"})
+        q.put_nowait(({"_id": "msg-1"}, None))
 
         # No callback registered for this room
         task = asyncio.create_task(client._room_worker(room_id, q))
@@ -368,7 +368,7 @@ class TestRoomWorker(unittest.IsolatedAsyncioTestCase):
         client._callbacks[room_id] = _bad_callback
 
         q: asyncio.Queue = asyncio.Queue()
-        q.put_nowait({"_id": "msg-2"})
+        q.put_nowait(({"_id": "msg-2"}, None))
 
         task = asyncio.create_task(client._room_worker(room_id, q))
         await asyncio.sleep(0)  # let worker process the message
@@ -381,7 +381,7 @@ class TestRoomWorker(unittest.IsolatedAsyncioTestCase):
             client2 = _make_client()
             client2._callbacks[room_id] = _bad_callback
             q2: asyncio.Queue = asyncio.Queue()
-            q2.put_nowait({"_id": "msg-3"})
+            q2.put_nowait(({"_id": "msg-3"}, None))
             task2 = asyncio.create_task(client2._room_worker(room_id, q2))
             await asyncio.sleep(0.05)
             task2.cancel()
@@ -405,7 +405,7 @@ class TestRoomWorker(unittest.IsolatedAsyncioTestCase):
         client._callbacks[room_id] = _exploding_callback
 
         q: asyncio.Queue = asyncio.Queue()
-        q.put_nowait({"_id": "x"})
+        q.put_nowait(({"_id": "x"}, None))
 
         with patch(
             "gateway.connectors.rocketchat.websocket.logger"

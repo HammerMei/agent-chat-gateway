@@ -906,7 +906,10 @@ class TestMultiWatcherDispatch(unittest.IsolatedAsyncioTestCase):
 
         processed: list[tuple[str, str]] = []
 
-        async def slow_process(process_room_id: str, doc: dict) -> None:
+        async def slow_process(
+            process_room_id: str, doc: dict, *, access: dict | None = None, **kwargs
+        ) -> None:
+            # The transport now hands the per-delivery access object down with the doc.
             processed.append((process_room_id, doc["_id"]))
 
         connector._on_raw_ddp_message = slow_process  # type: ignore[method-assign]
