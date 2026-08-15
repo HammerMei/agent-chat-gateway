@@ -26,6 +26,8 @@ What is genuinely common is only this: a mark, and the rule for who may clear it
 
 from __future__ import annotations
 
+from .adapter_utils import ts_to_float
+
 
 def just_before(ts: str) -> str:
     """The largest timestamp strictly below `ts`, as a replay lower bound.
@@ -68,9 +70,20 @@ class ReplayWindow:
     def claim_boundary(self, *fallbacks: str | None) -> int:
         """Record that someone still needs this window read. Returns the claim count.
 
-        The window is the *oldest* mark anyone owes a read of, so an open one is never
-        narrowed: the first truthy of the current value and the fallbacks wins, in that
-        order.
+        The window is the *oldest* mark anyone owes a read of, so **the oldest candidate
+        wins** — not the first one offered.
+
+        Order mattered and was wrong. The hand-back sites offer the live watermark before
+        the point just below the refused message, on the assumption that the watermark is
+        the older of the two. It usually is; it is not always. Replay is not serialized
+        against the per-room worker on either connector, so a newer message can be accepted
+        while an older one is still in the handler — and then the watermark is *above* the
+        message being refused. Taking the first offer put the mark past the very message it
+        was opened for, which is the one thing it may never do.
+
+        A candidate that will not parse sorts as the oldest, deliberately: a lower bound
+        that is too low costs a re-fetch that dedup absorbs, and one that is too high loses
+        a message. That is the same choice `just_before` makes for the same reason.
 
         **The count is what makes this a method rather than an `or` expression at each
         site.** Two claimants routinely want the same timestamp — a hand-back that lands
@@ -83,10 +96,13 @@ class ReplayWindow:
         A fully falsy claim writes and counts nothing: there is no window to owe a read of,
         and no replay will look at this room.
         """
-        boundary = next((c for c in (self.replay_boundary, *fallbacks) if c), None)
-        if not boundary:
+        candidates = [c for c in (self.replay_boundary, *fallbacks) if c]
+        if not candidates:
             return self.boundary_claims
-        self.replay_boundary = boundary
+        self.replay_boundary = min(
+            candidates,
+            key=lambda c: ts_to_float(c) if ts_to_float(c) is not None else float("-inf"),
+        )
         self.boundary_claims += 1
         return self.boundary_claims
 
