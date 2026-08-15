@@ -788,3 +788,152 @@ class TestStreamIntentAndStates(unittest.IsolatedAsyncioTestCase):
         )
         client._stream_sub_id = "sub-1"
         self.assertTrue(client.stream_active)
+
+
+class TestTheStreamIsLostWhileTheSocketStaysUp(unittest.IsolatedAsyncioTestCase):
+    """`nosub` for a confirmed stream — the one `live → lost` nothing else can see.
+
+    A socket drop reconnects, and a reconnect resubscribes. This does neither: the
+    connection is healthy, so no recovery path is triggered by anything. Meanwhile every
+    tracked room released its own subscription when the stream took over, so at the instant
+    the stream stops, *no room has any delivery path at all* — and the gateway looks idle
+    rather than broken.
+    """
+
+    def _connected_client(self) -> RCWebSocketClient:
+        client = _make_client()
+        client._running = True
+        client._ws = AsyncMock()
+        client._wants_stream = True
+        client._stream_sub_id = "stream-1"
+        return client
+
+    async def _feed(self, client: RCWebSocketClient, frame: dict) -> list[dict]:
+        """Run one frame through the real listen loop; return the frames it sent.
+
+        `_send` doubles as the server here: a `sub` is confirmed the moment it is sent, so
+        the recovery completes without the listen loop that would normally resolve it.
+        """
+        sent: list[dict] = []
+
+        async def _fake_send(payload):
+            sent.append(payload)
+            if payload.get("msg") == "sub":
+                fut = client._pending_subs.get(payload.get("id"))
+                if fut and not fut.done():
+                    fut.set_result(True)
+
+        client._send = _fake_send
+
+        delivered = False
+
+        async def _recv():
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return json.dumps(frame)
+            client._running = False
+            raise asyncio.CancelledError()
+
+        client._ws.recv = _recv
+        with self.assertRaises(asyncio.CancelledError):
+            await client._listen_loop()
+
+        task = client._resubscribe_task
+        if task is not None:
+            await task
+        return sent
+
+    async def test_every_tracked_room_gets_its_own_subscription_back(self):
+        client = self._connected_client()
+        client._callbacks = {"r1": AsyncMock(), "r2": AsyncMock()}
+
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat.ws", "ERROR"):
+            sent = await self._feed(
+                client, {"msg": "nosub", "id": "stream-1", "error": {"message": "gone"}}
+            )
+
+        subscribed = {
+            f["params"][0] for f in sent if f.get("msg") == "sub"
+        }
+        self.assertEqual(
+            subscribed, {"r1", "r2"},
+            "clearing the id records the loss; the transition is not complete until "
+            "every tracked room can receive again",
+        )
+
+    async def test_the_stream_stops_claiming_to_be_live(self):
+        client = self._connected_client()
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat.ws", "ERROR"):
+            await self._feed(
+                client, {"msg": "nosub", "id": "stream-1", "error": {"message": "gone"}}
+            )
+        self.assertFalse(
+            client.stream_active,
+            "a watcher added now must be told to subscribe to its own room",
+        )
+
+    async def test_the_intent_to_have_a_stream_survives_losing_it(self):
+        client = self._connected_client()
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat.ws", "ERROR"):
+            await self._feed(
+                client, {"msg": "nosub", "id": "stream-1", "error": {"message": "gone"}}
+            )
+        self.assertEqual(
+            (client.stream_active, client._wants_stream), (False, True),
+            "lost *and still wanted* is the whole state — asserting the intent alone "
+            "cannot tell this apart from a stream that was never noticed as gone",
+        )
+
+    async def test_the_gap_in_delivery_is_replayed(self):
+        """An outage that leaves the socket up is still an outage.
+
+        Between the stream stopping and the per-room confirmations, messages to tracked
+        rooms reached nobody. Restoring delivery and recovering what was lost are two
+        obligations, and a path that discharges only the first loses messages quietly.
+        """
+        client = self._connected_client()
+        client._callbacks = {"r1": AsyncMock()}
+        replayed = AsyncMock()
+        client.register_reconnect_callback(replayed)
+
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat.ws", "ERROR"):
+            await self._feed(
+                client, {"msg": "nosub", "id": "stream-1", "error": {"message": "gone"}}
+            )
+
+        replayed.assert_awaited_once()
+
+    async def test_a_nosub_for_something_else_is_not_the_stream_dying(self):
+        """The near miss: a rejected *room* subscription must not tear down the stream."""
+        client = self._connected_client()
+        client._callbacks = {"r1": AsyncMock()}
+
+        sent = await self._feed(
+            client, {"msg": "nosub", "id": "some-room-sub", "error": {"message": "no"}}
+        )
+
+        self.assertTrue(client.stream_active, "the stream was never mentioned")
+        self.assertEqual(
+            [f for f in sent if f.get("msg") == "sub"], [],
+            "nothing was lost, so nothing needs restoring",
+        )
+
+    async def test_a_stream_still_awaiting_confirmation_fails_its_caller_instead(self):
+        """`subscribe_all` owns the refusal it is waiting for.
+
+        Recovering here as well would race the caller's own fallback, and there is nothing
+        to recover: a stream that was never confirmed never displaced a room subscription.
+        """
+        client = self._connected_client()
+        client._stream_sub_id = None
+        pending: asyncio.Future = asyncio.get_running_loop().create_future()
+        client._pending_subs["stream-2"] = pending
+        client._callbacks = {"r1": AsyncMock()}
+
+        sent = await self._feed(
+            client, {"msg": "nosub", "id": "stream-2", "error": {"message": "refused"}}
+        )
+
+        self.assertIsInstance(pending.exception(), RuntimeError)
+        self.assertEqual([f for f in sent if f.get("msg") == "sub"], [])

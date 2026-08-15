@@ -61,6 +61,10 @@ def _make_connector():
     connector._subscribe_all = False
     connector._dm_kinds = {}
     connector._rest = MagicMock()
+    # Membership is the ordinary case, so replay tests are not all about the gate. A bare
+    # MagicMock would answer with a truthy object that is still `is not True`, which reads
+    # as "removed" and would make every replay test pass by replaying nothing.
+    connector._rest.is_room_member = AsyncMock(return_value=True)
     connector._ws = MagicMock()
     # The connector asks the transport whether the stream is carrying rooms, rather than
     # remembering it; a bare MagicMock would answer truthily and skip every subscription.
@@ -1189,6 +1193,9 @@ class TestOnWsReconnect(unittest.IsolatedAsyncioTestCase):
         connector = _make_connector()
         connector._rooms["room-1"].last_processed_ts = last_processed_ts
         connector._rest.get_room_history = AsyncMock(return_value=[])
+        # Still a member — the default for tests about *what* is replayed. The
+        # membership gate itself is exercised in TestReplayMembershipGate.
+        connector._rest.is_room_member = AsyncMock(return_value=True)
         # Prevent spurious DDP-sub-not-active warnings: the ws mock's
         # subscription_statuses would otherwise return a truthy MagicMock,
         # triggering the warning branch in _on_ws_reconnect for every test
@@ -1399,6 +1406,72 @@ class TestSeenIdsDedup(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("id-0", sub.seen_ids_set)
         # Newest entry must still be present
         self.assertIn(f"id-{_SEEN_IDS_MAXLEN}", sub.seen_ids_set)
+
+
+class TestReplayMembershipGate(unittest.IsolatedAsyncioTestCase):
+    """Replay must re-establish membership; it cannot inherit the live path's answer.
+
+    `roomParticipant` is computed server-side per delivered message, so it exists only on
+    live-stream frames. History fetched after an outage carries none — and the removal
+    itself is a system message the history filter drops, so nothing in the replayed batch
+    says the account left. An outage is exactly when membership can change unobserved.
+    """
+
+    def _connector(self, member):
+        connector = _make_connector()
+        connector._rooms["room-1"].last_processed_ts = "100"
+        connector._ws.subscription_statuses = {}
+        connector._rest.is_room_member = AsyncMock(return_value=member)
+        connector._rest.get_room_history = AsyncMock(
+            return_value=[
+                {"_id": "m2", "msg": "hi", "u": {"username": "alice"},
+                 "ts": {"$date": 200}},
+            ]
+        )
+        return connector
+
+    async def test_a_room_this_account_was_removed_from_is_not_replayed(self):
+        """REST history for a public channel does not require membership, so the fetch
+        would succeed and the agent would answer in a room it was thrown out of."""
+        connector = self._connector(member=False)
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
+            await connector._on_ws_reconnect()
+        connector._rest.get_room_history.assert_not_awaited()
+
+    async def test_membership_that_cannot_be_established_is_not_membership(self):
+        """A lookup that failed has not said the account is still in the room. The next
+        reconnect asks again; a message wrongly withheld can still be read by a human,
+        while one wrongly sent cannot be taken back."""
+        connector = self._connector(member=None)
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
+            await connector._on_ws_reconnect()
+        connector._rest.get_room_history.assert_not_awaited()
+
+    async def test_a_member_still_gets_the_outage_replayed(self):
+        """The gate must not be a way to skip every replay — the near miss that would make
+        the two tests above pass against a connector that replays nothing at all."""
+        connector = self._connector(member=True)
+        await connector._on_ws_reconnect()
+        connector._rest.get_room_history.assert_awaited_once()
+
+    async def test_membership_is_checked_before_the_history_is_fetched(self):
+        """Order is the point. Checking afterwards still spends the call, and worse, tempts
+        the next reader into 'we already have the messages, why waste them'."""
+        connector = self._connector(member=True)
+        order: list[str] = []
+        connector._rest.is_room_member = AsyncMock(
+            side_effect=lambda rid: order.append("member") or True
+        )
+        connector._rest.get_room_history = AsyncMock(
+            side_effect=lambda *a, **k: order.append("history") or []
+        )
+        await connector._on_ws_reconnect()
+        self.assertEqual(order, ["member", "history"])
+
+    async def test_the_room_asked_about_is_the_room_being_replayed(self):
+        connector = self._connector(member=True)
+        await connector._on_ws_reconnect()
+        connector._rest.is_room_member.assert_awaited_once_with("room-1")
 
 
 # ── Tests: review-round fixes ────────────────────────────────────────────────
@@ -2220,13 +2293,31 @@ class TestDirectRoomClassification(unittest.IsolatedAsyncioTestCase):
 
         connector._rest.dm_members.assert_awaited_once()
 
-    async def test_a_failed_lookup_answers_one_to_one_without_caching_it(self):
-        """A transient API failure must not fix the wrong answer in place for the life of
-        the process."""
+    async def test_a_failed_lookup_offers_nothing_and_caches_nothing(self):
+        """Unknown is not a kind.
+
+        Answering `dm` on a failed lookup would let a group DM be claimed by a `direct: true`
+        rule and skip the mention gate with it — the agent then answers everyone in the
+        group. Nothing is lost by declining: the room's next message asks again, which is
+        also why the failure must not be cached.
+        """
         connector = self._connector(members=())
         await self._deliver(connector)
-        self.assertEqual(self.offered[0].kind, RoomKind.DM)
+        self.assertEqual(self.offered, [], "an unclassifiable room must not be offered")
         self.assertEqual(connector._dm_kinds, {})
+
+    async def test_a_lookup_that_recovers_offers_the_room_it_declined(self):
+        """The decline is for this message only — the retry is the whole reason it is safe."""
+        connector = self._connector(members=())
+        await self._deliver(connector)
+        self.assertEqual(self.offered, [])
+
+        connector._rest.dm_members = AsyncMock(
+            return_value=[{"username": u} for u in ("bot", "alice", "carol")]
+        )
+        await self._deliver(connector)
+        self.assertEqual(len(self.offered), 1)
+        self.assertEqual(self.offered[0].kind, RoomKind.GROUP_DM)
 
 
 class TestTheRoutingPathEndToEnd(unittest.IsolatedAsyncioTestCase):

@@ -519,11 +519,12 @@ class RocketChatREST:
         has no name, so its participants are the only thing that identifies it to a human
         (§2.3).
 
-        Returns an empty list when the lookup fails, which the caller treats as "assume a
-        1:1" — the conservative direction is not obvious here, so it is stated: a group
-        misread as a 1:1 is the loud failure (the agent answers everyone and someone
-        notices), while a 1:1 misread as a group is the silent one (the agent waits for a
-        mention a 1:1 user has no reason to type, and looks broken).
+        Returns an empty list when the lookup fails. That is *no answer*, and the caller
+        treats it as one: it declines to classify the room rather than assuming either kind.
+        There is no safe default to pick. Reading a group as a 1:1 drops the mention gate and
+        the agent answers everyone in it; reading a 1:1 as a group makes it wait for a
+        mention its user has no reason to type, and it looks broken. Both are wrong, so the
+        room simply waits for its next message and the question is asked again.
         """
         try:
             result = await self._request("GET", "im.members", params={"roomId": room_id})
@@ -534,6 +535,45 @@ class RocketChatREST:
         if not isinstance(members, list):
             return []
         return [m.get("username", "") for m in members if m.get("username")]
+
+    async def is_room_member(self, room_id: str) -> bool | None:
+        """Is this account still in the room — `True`, `False`, or **`None` for unknown**.
+
+        Three answers, not two, and the third is the point: a lookup that fails has not said
+        the account is a member, and it has not said it was removed. Collapsing it either way
+        is a guess, and the caller (replay) can afford to do neither — it can wait for the
+        next round.
+
+        Membership is read as "does this account have a subscription record for the room",
+        which is what Rocket.Chat removes when someone is kicked or leaves. A *hidden* room
+        keeps its record (`open: false`) and is still membership — being hidden is a display
+        choice, not a departure.
+
+        Only the live path gets this answer for free: `roomParticipant` is computed
+        server-side per delivered message. Replay reconstructs its documents from REST, so it
+        has to ask.
+        """
+        try:
+            result = await self._request(
+                "GET", "subscriptions.getOne", params={"roomId": room_id}
+            )
+        except httpx.HTTPStatusError as e:
+            # 403/400 here is Rocket.Chat's way of saying "no such subscription for you" on
+            # some versions, where others answer 200 with a null body. Neither is reliably
+            # distinguishable from a server that is merely unwell, so both are reported as
+            # unknown and the decision is left to the caller.
+            logger.warning(
+                "Could not read the subscription record for room %s (%s) — "
+                "membership is unknown",
+                room_id, e,
+            )
+            return None
+        except Exception as e:
+            logger.warning(
+                "Membership lookup for room %s failed: %s", room_id, e
+            )
+            return None
+        return bool(result.get("subscription"))
 
     async def resolve_room(self, room_name: str) -> dict[str, Any]:
         """Resolve a room name to its info dict.

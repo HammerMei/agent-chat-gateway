@@ -168,9 +168,13 @@ class RocketChatConnector(Connector):
         ] = {}  # room_id -> [watcher...]
         self._room_refcount: dict[str, int] = {}  # room_id -> subscriber count
         self._router = None
-        # True once `__my_messages__` is confirmed. Delivery then reaches every room the
-        # account can see, so `subscribe_room` stops being what makes a room deliver and
-        # becomes local bookkeeping only (§5.2).
+        # What `start_inbound` decided, once — **not** whether the stream is live now, and
+        # nothing may read it as that. The stream can die under a healthy socket, and a copy
+        # of its liveness would go on saying otherwise while a watcher added in that window
+        # registered a callback for a room nobody had subscribed to (§6.1, invariant 2).
+        # Ask `self._ws.stream_active` for the current fact; this only records that delivery
+        # started out reaching every room the account can see, which is why `subscribe_room`
+        # became local bookkeeping rather than what makes a room deliver (§5.2).
         self._subscribe_all = False
         # room_id → RoomKind for direct rooms. Never invalidated, and that is a verified
         # property rather than an optimisation: on 8.5.1 every route for adding a member to
@@ -275,6 +279,26 @@ class RocketChatConnector(Connector):
                     "Room '%s': no watermark yet — skipping replay", sub.room.name
                 )
                 continue
+
+            # Membership is re-established before the outage is replayed, because the
+            # outage is exactly when it can have changed and nobody was listening. The
+            # live path is gated on `roomParticipant` (see `_on_raw_ddp_message`); replay
+            # has no access object to read it from, so it asks. Without this, an account
+            # removed from a public channel mid-outage still replays that channel — REST
+            # history for a public channel does not require membership, so the fetch
+            # succeeds and the agent answers in a room it was thrown out of.
+            member = await self._rest.is_room_member(sub.room.id)
+            if member is not True:
+                logger.warning(
+                    "Room '%s': %s — skipping replay; live delivery is unaffected "
+                    "and the next reconnect will ask again",
+                    sub.room.name,
+                    "membership could not be established"
+                    if member is None
+                    else "this account is no longer a member",
+                )
+                continue
+
             try:
                 raw_msgs = await self._rest.get_room_history(
                     sub.room.id,
@@ -510,7 +534,19 @@ class RocketChatConnector(Connector):
         """
         room_type = room_type_for(access.get("roomType"))
         if room_type == "dm":
-            kind, participants = await self._direct_room_identity(room_id)
+            identity = await self._direct_room_identity(room_id)
+            if identity is None:
+                # An unknown classification is not a kind. Answering `dm` here would create
+                # a 1:1 watcher for what may be a group DM, and a room typed `dm` skips the
+                # mention gate entirely (§6.4) — so the agent would answer every message
+                # from everyone in that group. The room is not lost: the next message from
+                # it arrives on the same unrouted path and asks again.
+                logger.warning(
+                    "Direct room %s could not be classified — not routing it this time",
+                    room_id,
+                )
+                return None
+            kind, participants = identity
             # The participants are not decoration: a direct room has no name, so they are
             # the only thing that identifies it to a human. Without them a 1:1 watcher is
             # labelled by a room-id digest and a group DM's *description* — what the agent
@@ -524,7 +560,9 @@ class RocketChatConnector(Connector):
         kind = RoomKind.GROUP if room_type == "group" else RoomKind.CHANNEL
         return RoomRef(id=room_id, kind=kind, name=name)
 
-    async def _direct_room_identity(self, room_id: str) -> tuple[RoomKind, tuple[str, ...]]:
+    async def _direct_room_identity(
+        self, room_id: str
+    ) -> tuple[RoomKind, tuple[str, ...]] | None:
         """1:1 or group DM — the distinction Rocket.Chat does not make on the wire.
 
         Cached permanently, and that is verified rather than assumed: on 8.5.1 every route
@@ -533,8 +571,9 @@ class RocketChatConnector(Connector):
         is therefore a separate room and never a mutated 1:1, so there is nothing for an
         invalidation path to catch (§6.4).
 
-        A failed lookup answers 1:1 and is **not** cached, so a transient API failure does
-        not fix the wrong answer in place for the process's lifetime.
+        A failed lookup returns `None` — unknown — and caches nothing. It deliberately does
+        not fall back to 1:1: this answer decides whether the mention gate applies at all, so
+        a wrong one is not a slightly-off label but a watcher that replies to everyone.
         """
         cached = self._dm_kinds.get(room_id)
         if cached is not None:
@@ -542,7 +581,7 @@ class RocketChatConnector(Connector):
 
         members = await self._rest.dm_members(room_id)
         if not members:
-            return RoomKind.DM, ()  # lookup failed; answer, but do not remember
+            return None  # unknown, and unknown is not a kind
 
         others = tuple(m for m in members if m != self._config.username)
         kind = RoomKind.GROUP_DM if len(members) > 2 else RoomKind.DM

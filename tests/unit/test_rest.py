@@ -1424,3 +1424,57 @@ class TestGetRoomHistory(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["params"].get("latest"), before)
         self.assertEqual(kwargs["params"].get("oldest"), after)
         self.assertEqual(kwargs["params"].get("inclusive"), "true")
+
+
+class TestIsRoomMember(unittest.IsolatedAsyncioTestCase):
+    """Three answers, and the third is the one worth having.
+
+    A lookup that fails has not said the account is a member, and has not said it was
+    removed. The caller — outage replay — can afford to do neither and simply ask again.
+    """
+
+    async def test_a_subscription_record_is_membership(self):
+        rest = _make_rest()
+        rest._request = AsyncMock(return_value={"success": True, "subscription": {"rid": "r1"}})
+        self.assertIs(await rest.is_room_member("r1"), True)
+
+    async def test_a_hidden_room_is_still_membership(self):
+        """`open: false` is a display choice — the record is what membership is read from,
+        and leaving a room is what removes it."""
+        rest = _make_rest()
+        rest._request = AsyncMock(
+            return_value={"success": True, "subscription": {"rid": "r1", "open": False}}
+        )
+        self.assertIs(await rest.is_room_member("r1"), True)
+
+    async def test_no_subscription_record_is_removal(self):
+        rest = _make_rest()
+        rest._request = AsyncMock(return_value={"success": True, "subscription": None})
+        self.assertIs(await rest.is_room_member("r1"), False)
+
+    async def test_an_http_error_is_unknown_rather_than_either_answer(self):
+        """Some versions answer 400/403 where others answer 200 with a null body, and
+        neither is distinguishable from a server that is merely unwell."""
+        rest = _make_rest()
+        rest._request = AsyncMock(
+            side_effect=httpx.HTTPStatusError(
+                "403", request=httpx.Request("GET", "http://x"),
+                response=httpx.Response(403, request=httpx.Request("GET", "http://x")),
+            )
+        )
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
+            self.assertIsNone(await rest.is_room_member("r1"))
+
+    async def test_any_other_failure_is_unknown_too(self):
+        rest = _make_rest()
+        rest._request = AsyncMock(side_effect=RuntimeError("connection reset"))
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
+            self.assertIsNone(await rest.is_room_member("r1"))
+
+    async def test_it_asks_about_the_room_it_was_given(self):
+        rest = _make_rest()
+        rest._request = AsyncMock(return_value={"success": True, "subscription": {}})
+        await rest.is_room_member("room-xyz")
+        args, kwargs = rest._request.call_args
+        self.assertEqual(args[1], "subscriptions.getOne")
+        self.assertEqual(kwargs["params"], {"roomId": "room-xyz"})

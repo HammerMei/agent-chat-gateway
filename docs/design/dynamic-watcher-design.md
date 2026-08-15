@@ -1851,6 +1851,76 @@ for rooms the account never per-room-subscribed to. Frame shape:
 | `roomType` uses Rocket.Chat's raw letters: `c` public channel, `p` private group, `d` direct | Needs mapping to the internal `channel`/`group`/`dm` vocabulary that history fetching depends on. |
 | Second `sub` parameter `false` (what ACG sends) vs `true` (what Rocket.Chat's own SDK sends) | No observable difference in the emitted frames. No change needed. |
 
+#### Subscribe-all: the stream's lifecycle, and what depends on it
+
+Written after six review rounds on the implementation, every one of which found a
+consequence of the previous round's fix. The findings were not unrelated: switching
+delivery to one stream introduces a **state machine** and a set of invariants that hold
+across it, and discovering those one review at a time is how the same defect keeps coming
+back wearing a different hat. Stated here so the code can be checked against a model
+rather than against the last thing someone noticed.
+
+**States**, per connector:
+
+| State | Meaning | Who is subscribed | Who delivers |
+|---|---|---|---|
+| **absent** | no router registered; nothing wants the stream | each tracked room | its own subscription |
+| **wanted** | a router exists, the stream is intended | — | — |
+| **live** | the server confirmed and has not stopped it | the stream | the stream, for every room |
+| **lost** | wanted but not live: refused, timed out, stopped, or the socket dropped | each tracked room | its own subscription |
+
+Transitions: `absent → wanted` when a router is registered; `wanted → live` on `ready`;
+`live → lost` on `nosub` for the stream id, on a socket drop, or on an explicit stop;
+`lost → live` on a successful resubscribe. **Intent is not a state that failure clears** —
+only `disconnect` returns a connector to `absent`.
+
+**Invariants**, each of which a review round found violated:
+
+1. **Exactly one delivery path per tracked room.** Never both — a room subscribed while
+   the stream is live receives every message twice, and message-id dedup hides the second
+   dispatch but not the queue slot it occupies. Never neither — a room whose subscription
+   was released when the stream went live, and never restored when it went lost, receives
+   nothing at all and looks healthy.
+2. **Liveness is a transport fact, never a copy.** A connector-side flag saying the stream
+   is live disagrees with reality the moment a restore fails, and a watcher added in that
+   window registers a callback for a room nobody subscribed to.
+3. **Intent survives failure; only the subscription id is per-attempt.** Recording intent
+   on success means one transient failure leaves a connector on per-room delivery for the
+   rest of its life, having asked for the stream exactly once.
+4. **`live → lost` is not complete until every tracked room has its own subscription.**
+   The transition is the point at which delivery would otherwise stop silently. Of the
+   three ways it happens, only the socket drop reconnects — a `nosub` for a confirmed
+   stream leaves a healthy socket, so nothing else will notice and nothing else will
+   recover it.
+
+   Completing the transition restores *delivery*; it does not recover what the gap lost.
+   Between the stream stopping and the per-room confirmations, messages to tracked rooms
+   reached nobody, and that is an outage whether or not a socket went down with it. The
+   history replay therefore runs after this recovery exactly as it does after a reconnect —
+   restoring delivery and recovering the outage are two separate obligations, and a path
+   that discharges only the first loses messages quietly.
+5. **Replay may not assume membership.** The access object — and with it
+   `roomParticipant` — exists only on live-stream frames. History fetched after an outage
+   carries none, and the removal itself is a system event the history filter drops. So a
+   bot removed from a room *during* an outage replays that room's missed messages as
+   though nothing happened. **Membership must be revalidated per room before replay is
+   dispatched**, not inferred from what the live path happened to see.
+
+   It is read from the account's subscription record for the room
+   (`subscriptions.getOne`), which is what Rocket.Chat removes on leaving or being kicked;
+   a *hidden* room keeps its record and is still membership. Versions differ in how they
+   answer for a room with no record — a 200 with a null body, or a 4xx — and neither is
+   distinguishable from a server that is merely unwell, so both report **unknown**, and
+   unknown skips the replay with a warning rather than assuming either answer. That is the
+   safe direction to be wrong in: a message withheld can still be read in the room it was
+   sent to, and one sent to a room the agent was removed from cannot be taken back.
+6. **An unknown classification is not a default.** Rocket.Chat cannot distinguish a 1:1
+   from a group DM without a lookup, and a failed lookup answering "1:1" is not a
+   conservative guess: it lets a group DM be claimed by a `direct: true` rule *and* skip
+   the mention gate, so the agent answers everyone in it. Unknown means do not offer the
+   room; the next message asks again. (The same rule as §2.4's session identity —
+   unverifiable is not verified.)
+
 ### 6.2 Mattermost: delivery tracks membership, not readability
 
 The docstring claim holds, verified with an explicit preflight so that "no event"
