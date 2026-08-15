@@ -73,6 +73,14 @@ class RCWebSocketClient:
         # `_subscriptions`, which maps rooms to their own subscription ids — the whole
         # point of the key-space split is that a stream is not a room.
         self._stream_sub_id: str | None = None
+        # Whether this client should have the stream at all, as distinct from whether it
+        # currently does. A failed restore clears the id; only `disconnect` clears intent.
+        self._wants_stream = False
+        # One queue and one worker for every untracked room, rather than one of each per
+        # room. Bounded, because an unbounded routing backlog under subscribe-all is every
+        # message in every readable channel.
+        self._routing_queue: asyncio.Queue = asyncio.Queue(maxsize=self._ROOM_QUEUE_DEPTH)
+        self._routing_worker: asyncio.Task | None = None
 
     async def connect(self) -> None:
         """Connect, perform DDP handshake, and login.
@@ -275,6 +283,7 @@ class RCWebSocketClient:
             self._pending_subs.pop(sub_id, None)
 
         self._stream_sub_id = sub_id
+        self._wants_stream = True
         logger.info("Subscribed to __my_messages__ — delivery is no longer per room")
         return True
 
@@ -631,8 +640,22 @@ class RCWebSocketClient:
             # connector decides what a missing one means.
             access = args[1] if len(args) > 1 and isinstance(args[1], dict) else None
 
-            callback = self._callbacks.get(room_id) or self._default_callback
-            if not callback:
+            callback = self._callbacks.get(room_id)
+            if callback is None:
+                if self._default_callback is None:
+                    return
+                # Routing goes on one shared queue, not a per-room one.
+                #
+                # A per-room queue and worker per *untracked* room means one of each for
+                # every room that ever emits a frame — including every readable public
+                # channel the membership gate is about to reject — and nothing ever reaps
+                # them, because only `unsubscribe_room` removes those objects and an
+                # untracked room never had a subscription to remove.
+                #
+                # Per-room ordering is what the room queues exist for, and routing does not
+                # need it: the question is "should this room have a watcher", asked once
+                # per room, and the answer does not depend on message order.
+                self._queue_for_routing(message_doc, access)
                 return
 
             # Lazily create per-room queue and worker on first message.
@@ -686,6 +709,40 @@ class RCWebSocketClient:
         except Exception as e:
             logger.error("Error handling room message: %s", e)
 
+    def _queue_for_routing(self, doc: dict, access: dict | None) -> None:
+        """Hand an untracked room's message to the shared routing worker."""
+        if self._routing_worker is None or self._routing_worker.done():
+            self._routing_worker = asyncio.create_task(
+                self._route_worker(), name="rc-routing-worker")
+            self._callback_tasks.add(self._routing_worker)
+            self._routing_worker.add_done_callback(self._callback_tasks.discard)
+        try:
+            self._routing_queue.put_nowait((doc, access))
+        except asyncio.QueueFull:
+            # Dropped rather than blocking the listen loop. A lost routing frame costs the
+            # first message of a room that has no watcher yet — the next one asks again —
+            # whereas blocking here would stall delivery for every tracked room.
+            logger.warning("Routing queue full — dropping an untracked-room frame")
+
+    async def _route_worker(self) -> None:
+        """Consume routing frames sequentially, off the per-room semaphore.
+
+        Deliberately not holding `_callback_sem`: deciding whether a room should exist can
+        involve a REST lookup (Rocket.Chat cannot tell a 1:1 from a group DM without one),
+        and twenty slow lookups holding twenty permits would starve every tracked room's
+        dispatch and overflow their bounded queues — trading messages that have a watcher
+        for rooms that do not.
+        """
+        while True:
+            doc, access = await self._routing_queue.get()
+            callback = self._default_callback
+            if callback is None:
+                continue
+            try:
+                await callback(doc, access)
+            except Exception as e:
+                logger.error("Routing callback failed: %s", e)
+
     async def _room_worker(self, room_id: str, queue: asyncio.Queue) -> None:
         """Consume messages for one room sequentially with bounded global concurrency."""
         # Tracks the message currently dequeued but not yet dispatched.  When
@@ -699,14 +756,11 @@ class RCWebSocketClient:
                 item = await queue.get()
                 doc, access = item
                 in_flight = item  # record before semaphore — cancellation safe
-                # The same rule the fan-out used to decide there was a handler at all.
-                # It was `self._callbacks.get(room_id)` here and
-                # `... or self._default_callback` there, so under subscribe-all every
-                # frame for an untracked room was queued and then silently discarded at
-                # dispatch — the routing path could not fire once. Re-looked-up rather
-                # than carried on the queue item, deliberately: a callback removed while
-                # the item waited must not be called, which is why this lookup is late.
-                callback = self._callbacks.get(room_id) or self._default_callback
+                # Looked up late, deliberately: a callback removed while the item waited
+                # must not be called. Routing never arrives here — it has its own queue —
+                # so this needs no fallback, and an earlier version that had the fallback
+                # only in the fan-out discarded every routing frame at exactly this line.
+                callback = self._callbacks.get(room_id)
                 if callback:
                     async with self._callback_sem:
                         # Semaphore acquired; doc is now being dispatched.
@@ -815,7 +869,11 @@ class RCWebSocketClient:
                 state.status = "reconnecting"
                 state.last_error = None
 
-            if self._callbacks:
+            # Not guarded on `_callbacks`. With no tracked rooms that map is empty, and
+            # that is exactly the state in which the stream is the *only* subscription —
+            # so the guard skipped the restore precisely when it was the only thing left
+            # to restore.
+            if self._callbacks or self._wants_stream:
                 self._resubscribe_task = asyncio.create_task(
                     self._resubscribe_all_rooms(),
                     name="rc-resubscribe-all",
@@ -858,14 +916,29 @@ class RCWebSocketClient:
         biting from the other side: two kinds of subscription need two kinds of restore.
         """
         try:
-            if self._stream_sub_id is not None:
+            stream_restored = False
+            if self._wants_stream:
+                # `_stream_sub_id` is the *current* subscription; `_wants_stream` is the
+                # intent. Clearing the id used to clear both, so a restore that failed
+                # once removed the only marker saying it should be retried — later
+                # reconnects skipped the block, and the connector went on believing the
+                # stream was live. Intent survives failure; only the id is per-attempt.
                 self._stream_sub_id = None
-                if not await self.subscribe_all():
+                stream_restored = await self.subscribe_all()
+                if not stream_restored:
                     logger.error(
                         "Could not restore the __my_messages__ subscription after "
-                        "reconnect — untracked rooms will not arrive until the next "
-                        "successful reconnect"
+                        "reconnect — untracked rooms will not arrive, and tracked rooms "
+                        "are being resubscribed individually as a fallback"
                     )
+
+            if stream_restored:
+                # The stream carries every tracked room too, so resubscribing them one by
+                # one would have the server send each message twice. Dedup would suppress
+                # the second dispatch, but not the queue slot or the round trip — and the
+                # initial-connect path deliberately avoids exactly this.
+                logger.info("Stream restored — per-room resubscription is not needed")
+                return
 
             rooms = list(self._callbacks.items())
             results = await asyncio.gather(

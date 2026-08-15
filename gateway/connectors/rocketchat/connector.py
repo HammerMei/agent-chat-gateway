@@ -135,6 +135,13 @@ class RocketChatConnector(Connector):
             working_directory="/path/to/cwd",
         )
 
+        # Required, and last. Subscribing to every room the account can see happens here
+        # rather than in connect(), because a message arriving before the watchers exist
+        # would be treated as a room nothing tracks — offered for creation while its real
+        # watcher was still being built. With no router registered this is a no-op and
+        # delivery stays per-room.
+        await connector.start_inbound()
+
         # ... messages arrive, handler is called ...
 
         await connector.disconnect()
@@ -198,19 +205,34 @@ class RocketChatConnector(Connector):
         self._ws.register_reconnect_callback(self._on_ws_reconnect)
         await self._ws.start()
 
-        # Ask for every room the account can see. A server that refuses answers `nosub`,
-        # and the connector keeps its per-room subscriptions — a capability answer, not an
-        # error, so an older or differently configured server still runs the gateway. Only
-        # attempted when a router is registered: without one there is nothing to do with a
-        # message for a room no watcher tracks, and asking for them all would be paying
-        # delivery cost for messages the connector would immediately drop.
-        if self._router is not None:
-            self._subscribe_all = await self._ws.subscribe_all()
-
         logger.info(
-            "RocketChatConnector connected to %s as %s (delivery: %s)",
+            "RocketChatConnector connected to %s as %s",
             self._config.server_url,
             self._config.username,
+        )
+
+    async def start_inbound(self) -> None:
+        """Ask for every room the account can see — after the watchers exist.
+
+        Deliberately not in `connect()`. Startup restores watchers between connecting and
+        this call, and a message arriving in that window would take the *untracked* path:
+        offered to the router, and either dropped or turned into a second attempt to create
+        a watcher for a room whose real one was still being built. That is the same
+        ordering `start_inbound` exists for on Mattermost — this connector had it backwards
+        until review caught it.
+
+        A server that refuses answers `nosub`, and the connector keeps its per-room
+        subscriptions: a capability answer, not an error, so an older or differently
+        configured server still runs the gateway. Only attempted when a router is
+        registered — without one there is nothing to do with a message for an untracked
+        room, and asking for them all would pay delivery cost for messages the connector
+        immediately drops.
+        """
+        if self._router is None:
+            return
+        self._subscribe_all = await self._ws.subscribe_all()
+        logger.info(
+            "Rocket.Chat delivery: %s",
             "all rooms" if self._subscribe_all else "per room",
         )
 

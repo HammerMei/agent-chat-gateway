@@ -847,7 +847,9 @@ class TestDeferredInboundIsDocumented(unittest.TestCase):
     def test_the_sweep_finds_the_deferring_connectors(self):
         """Vacuously-true insurance: an empty sweep would pass every assertion below."""
         self.assertEqual(
-            set(self._deferring_connectors()), {"MattermostConnector", "VoiceConnector"})
+            set(self._deferring_connectors()),
+            {"MattermostConnector", "VoiceConnector", "RocketChatConnector"},
+        )
 
     def test_each_one_documents_the_extra_phase(self):
         for name, cls in sorted(self._deferring_connectors().items()):

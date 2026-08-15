@@ -1984,11 +1984,27 @@ class TestSubscribeAll(unittest.IsolatedAsyncioTestCase):
             connector.register_router(AsyncMock())
         return connector
 
-    async def test_a_confirmed_stream_switches_delivery(self):
+    async def test_connecting_does_not_ask_for_the_stream(self):
+        """The ordering this connector had backwards until review.
+
+        Watchers are restored between `connect()` and `start_inbound()`. A message
+        arriving in that window would take the *untracked* path — offered to the router,
+        then dropped or turned into a second attempt to create a watcher for a room whose
+        real one was still being built.
+        """
         connector = self._connector()
         connector._ws.subscribe_all = AsyncMock(return_value=True)
 
         await connector.connect()
+
+        connector._ws.subscribe_all.assert_not_awaited()
+        self.assertFalse(connector._subscribe_all)
+
+    async def test_a_confirmed_stream_switches_delivery(self):
+        connector = self._connector()
+        connector._ws.subscribe_all = AsyncMock(return_value=True)
+
+        await connector.start_inbound()
 
         self.assertTrue(connector._subscribe_all)
 
@@ -1998,7 +2014,7 @@ class TestSubscribeAll(unittest.IsolatedAsyncioTestCase):
         connector = self._connector()
         connector._ws.subscribe_all = AsyncMock(return_value=False)
 
-        await connector.connect()
+        await connector.start_inbound()
 
         self.assertFalse(connector._subscribe_all)
 
@@ -2008,7 +2024,7 @@ class TestSubscribeAll(unittest.IsolatedAsyncioTestCase):
         connector = self._connector(with_router=False)
         connector._ws.subscribe_all = AsyncMock(return_value=True)
 
-        await connector.connect()
+        await connector.start_inbound()
 
         connector._ws.subscribe_all.assert_not_awaited()
         self.assertFalse(connector._subscribe_all)
@@ -2232,6 +2248,42 @@ class TestTheRoutingPathEndToEnd(unittest.IsolatedAsyncioTestCase):
         doc, access = received[0]
         self.assertEqual(doc["rid"], "r-untracked")
         self.assertEqual(access["roomName"], "sandbox")
+
+    async def test_an_untracked_room_gets_no_per_room_worker(self):
+        """One queue and one worker for routing, not one per room.
+
+        Under subscribe-all a per-room worker for every room that *emits* a frame means one
+        for every readable public channel — including the ones the membership gate is about
+        to reject — and nothing reaps them, because only `unsubscribe_room` removes those
+        objects and an untracked room never had a subscription to remove.
+        """
+        import asyncio
+
+        from gateway.connectors.rocketchat.websocket import RCWebSocketClient
+
+        client = RCWebSocketClient("https://x", "bot", "pw")
+        seen = asyncio.Event()
+
+        async def default_callback(doc, access=None):
+            seen.set()
+
+        client.register_default_callback(default_callback)
+
+        for i in range(5):
+            await client._handle_room_message({
+                "msg": "changed", "collection": "stream-room-messages",
+                "fields": {"eventName": "__my_messages__",
+                           "args": [{"_id": f"m{i}", "rid": f"r{i}", "msg": "hi"}]},
+            })
+
+        try:
+            await asyncio.wait_for(seen.wait(), timeout=2.0)
+        finally:
+            for task in list(client._callback_tasks):
+                task.cancel()
+
+        self.assertEqual(client._room_queues, {}, "no per-room queues for untracked rooms")
+        self.assertEqual(client._room_workers, {})
 
     async def test_a_tracked_room_still_goes_to_its_own_callback(self):
         """The fallback must not shadow a registered handler."""

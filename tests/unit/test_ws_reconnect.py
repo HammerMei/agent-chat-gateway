@@ -628,6 +628,7 @@ class TestReconnectRestoresTheStream(unittest.IsolatedAsyncioTestCase):
         from unittest.mock import AsyncMock
 
         client = _make_client()
+        client._wants_stream = True
         client._stream_sub_id = "old-sub"
         client.subscribe_all = AsyncMock(return_value=True)
         client._subscribe_with_confirmation = AsyncMock(return_value="sub-1")
@@ -641,6 +642,7 @@ class TestReconnectRestoresTheStream(unittest.IsolatedAsyncioTestCase):
         from unittest.mock import AsyncMock
 
         client = _make_client()
+        client._wants_stream = False
         client._stream_sub_id = None
         client.subscribe_all = AsyncMock(return_value=True)
         client._subscribe_with_confirmation = AsyncMock(return_value="sub-1")
@@ -653,9 +655,65 @@ class TestReconnectRestoresTheStream(unittest.IsolatedAsyncioTestCase):
         from unittest.mock import AsyncMock
 
         client = _make_client()
+        client._wants_stream = True
         client._stream_sub_id = "old-sub"
         client.subscribe_all = AsyncMock(return_value=False)
         client._subscribe_with_confirmation = AsyncMock(return_value="sub-1")
 
         with self.assertLogs("agent-chat-gateway.connectors.rocketchat.ws", "ERROR"):
             await client._resubscribe_all_rooms()
+
+
+class TestStreamIntentSurvivesFailure(unittest.IsolatedAsyncioTestCase):
+    """Intent and current subscription are different facts.
+
+    Clearing the subscription id on a failed restore used to clear both, so one failure
+    removed the only marker saying the stream should be retried — every later reconnect
+    skipped it while the connector went on believing the stream was live.
+    """
+
+    async def test_a_failed_restore_still_retries_next_time(self):
+        from unittest.mock import AsyncMock
+
+        client = _make_client()
+        client._wants_stream = True
+        client._stream_sub_id = "old"
+        client._subscribe_with_confirmation = AsyncMock(return_value="s")
+        client.subscribe_all = AsyncMock(return_value=False)
+
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat.ws", "ERROR"):
+            await client._resubscribe_all_rooms()
+        self.assertTrue(client._wants_stream, "intent must outlive a failed attempt")
+
+        client.subscribe_all = AsyncMock(return_value=True)
+        await client._resubscribe_all_rooms()
+        client.subscribe_all.assert_awaited_once()
+
+    async def test_a_restored_stream_skips_per_room_resubscription(self):
+        """The stream carries tracked rooms too; resubscribing them would have the server
+        send every message twice."""
+        from unittest.mock import AsyncMock
+
+        client = _make_client()
+        client._wants_stream = True
+        client._callbacks = {"r1": AsyncMock(), "r2": AsyncMock()}
+        client.subscribe_all = AsyncMock(return_value=True)
+        client._subscribe_with_confirmation = AsyncMock(return_value="s")
+
+        await client._resubscribe_all_rooms()
+
+        client._subscribe_with_confirmation.assert_not_awaited()
+
+    async def test_a_failed_stream_falls_back_to_per_room(self):
+        from unittest.mock import AsyncMock
+
+        client = _make_client()
+        client._wants_stream = True
+        client._callbacks = {"r1": AsyncMock()}
+        client.subscribe_all = AsyncMock(return_value=False)
+        client._subscribe_with_confirmation = AsyncMock(return_value="s")
+
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat.ws", "ERROR"):
+            await client._resubscribe_all_rooms()
+
+        client._subscribe_with_confirmation.assert_awaited()
