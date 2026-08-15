@@ -1996,7 +1996,31 @@ only `disconnect` returns a connector to `absent`.
    still stands before recording it. Recording a revoked one claims delivery the server
    has already stopped — and the connector releases every per-room subscription on that
    claim.
-8. **Shared bookkeeping has an owner.** Recoveries overlap: a socket drop starts a
+8. **One recovery, one owner — structurally, not by checklist.** Restoring delivery has a
+   single entry point: `_start_recovery(reason, try_stream=…)`, which retires whatever is
+   running and installs one task in one slot. A socket drop and a stream terminated under
+   a healthy socket differ only in whether the stream is worth asking for again in that
+   instant; everything else they did was the same sequence written twice over the same
+   state, and every review round on this file found another write in it with no owner.
+
+   Two mechanisms carry the rule where a single sequence cannot reach:
+
+   - **A room has at most one subscription, and installing one releases its predecessor.**
+     A recovery interrupted partway through releasing them is a normal event now — a
+     recovery cancels whatever it displaces — so the next one must not overwrite a mapping
+     whose server-side subscription is still live. Untracked is unreleasable: removing the
+     watcher would stop only the replacement.
+   - **A generation, for work that outlives its starter.** `subscribe_all()` is called
+     directly by `start_inbound` as well as from a recovery, so it is not identifiable by
+     the slot, and `stop()` retires every attempt at once without knowing any of their
+     ids. Each attempt captures the generation and compares before publishing.
+
+   The historical form of this invariant — "an attempt clears only the ids it published, a
+   migration releases only the subscription it captured" — is what the structure now makes
+   true by construction. It was stated as a checklist first, and three further violations
+   followed in the next round alone, in nouns the checklist had not been applied to.
+
+   Recoveries overlap: a socket drop starts a
    replacement while the previous attempt is still unwinding, and a stream lost during a
    migration starts a fallback that touches rooms the migration has already read. So every
    write to shared state names what it owns — an attempt clears only the ids *it*

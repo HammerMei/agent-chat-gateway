@@ -55,7 +55,16 @@ class RCWebSocketClient:
             str, asyncio.Queue
         ] = {}  # per-room bounded inbound queues
         self._room_workers: dict[str, asyncio.Task] = {}  # per-room worker tasks
-        self._resubscribe_task: asyncio.Task | None = None
+        # One recovery at a time, in one slot. Two entry points — a socket drop and a
+        # stream terminated under a healthy socket — used to run two nearly identical
+        # sequences over shared state, and every review round found another write in them
+        # that had no owner. There is one sequence now, and the slot is what owns it.
+        self._recovery_task: asyncio.Task | None = None
+        # Bumped whenever a recovery starts and whenever the client stops. An attempt that
+        # was overtaken records nothing: it captures this at the start and compares before
+        # publishing, which is the ownership rule for work that outlives its starter and
+        # cannot be identified by an id alone.
+        self._recovery_generation = 0
         # Optional callback invoked after every successful reconnect + resubscribe.
         # Registered by the connector to replay messages missed during the outage.
         self._on_reconnect_cb: Callable[[], Any] | None = None
@@ -63,7 +72,7 @@ class RCWebSocketClient:
         self._on_outage_cb: Callable[[], Any] | None = None
         # Set of room IDs currently being unsubscribed.  Checked inside
         # _subscribe_with_confirmation to detect a race where
-        # _resubscribe_all_rooms re-registers a room that unsubscribe_room
+        # a recovery re-registers a room that unsubscribe_room
         # is concurrently removing.
         self._rooms_unsubscribing: set[str] = set()
         # Consulted for a room with no registered callback. Under per-room subscriptions
@@ -165,13 +174,19 @@ class RCWebSocketClient:
                 await self._listen_task
             except asyncio.CancelledError:
                 pass
-        if self._resubscribe_task:
-            self._resubscribe_task.cancel()
+        if self._recovery_task:
+            self._recovery_task.cancel()
             try:
-                await self._resubscribe_task
+                await self._recovery_task
             except asyncio.CancelledError:
                 pass
-            self._resubscribe_task = None
+            self._recovery_task = None
+        # Cancelling the recovery is not enough on its own: a `subscribe_all()` started
+        # directly by `start_inbound` is not held in that slot, and one whose confirmation
+        # has already arrived will resume *after* the fields below are cleared and publish
+        # its id back into them. The generation is what a coroutine outliving its starter
+        # is checked against; bumping it here retires every attempt in flight.
+        self._recovery_generation += 1
         # `→ absent`: the only transition that clears intent. The transition table says so
         # and the transport never implemented its half — a client stopped and connected
         # again went on reporting the closed socket's stream as live, so watcher
@@ -321,6 +336,12 @@ class RCWebSocketClient:
         # for the stream exactly once.
         self._wants_stream = True
 
+        # Which recovery era this attempt belongs to. An attempt is not identifiable by its
+        # subscription id alone — the id is what a *later* attempt would be erasing, not
+        # what tells this one it has been overtaken — and `stop()` retires every attempt at
+        # once without knowing any of their ids.
+        generation = self._recovery_generation
+
         sub_id = self._new_id()
         future: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending_subs[sub_id] = future
@@ -382,6 +403,22 @@ class RCWebSocketClient:
             )
             return False
 
+        if generation != self._recovery_generation:
+            # Overtaken: a newer recovery started, or the client was stopped, while this
+            # attempt was in flight. Recording it now would publish an id nobody is
+            # tracking — after `stop()` it also revives `stream_active` on a closed socket,
+            # so a reused client registers watcher callbacks and subscribes nothing.
+            logger.warning(
+                "Subscribe-all (__my_messages__) was confirmed after the recovery that "
+                "asked for it was retired — discarding it"
+            )
+            try:
+                await self._send({"msg": "unsub", "id": sub_id})
+            except Exception:
+                # Best effort: the socket this was confirmed on is usually gone already.
+                pass
+            return False
+
         self._stream_sub_id = sub_id
         logger.info("Subscribed to __my_messages__ — delivery is no longer per room")
         return True
@@ -407,11 +444,29 @@ class RCWebSocketClient:
         future: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending_subs[sub_id] = future
 
+        # A room has at most one subscription, and installing one releases its
+        # predecessor. Overwriting the mapping without releasing it left the old
+        # subscription live on the server and untracked — nothing could ever unsubscribe
+        # it, so removing the watcher stopped only the replacement while the original kept
+        # delivering. That happens whenever a recovery is interrupted partway through
+        # releasing them, which is now a normal event rather than an exotic one, since a
+        # recovery cancels whatever it displaces.
+        #
+        # Captured and replaced in one synchronous block: an await between reading the old
+        # id and installing the new one is the shape this whole class of defect has had.
+        superseded = self._subscriptions.get(room_id)
         state.sub_id = sub_id
         state.status = "pending"
         state.last_error = None
         self._subscriptions[room_id] = sub_id
         self._callbacks[room_id] = callback
+        if superseded is not None and superseded != sub_id:
+            try:
+                await self._send({"msg": "unsub", "id": superseded})
+            except Exception as e:
+                logger.warning(
+                    "Could not release the superseded subscription for %s: %s", room_id, e
+                )
 
         try:
             await self._send(
@@ -476,7 +531,7 @@ class RCWebSocketClient:
         # Mark this room as being unsubscribed before mutating any state.
         # _subscribe_with_confirmation checks this set after subscription
         # confirmation arrives; if the room is being unsubscribed concurrently
-        # (because _resubscribe_all_rooms captured it in its snapshot before
+        # (because the recovery captured it in its snapshot before
         # this call), the confirmation will be rolled back rather than
         # re-registering the room as an active subscription.
         self._rooms_unsubscribing.add(room_id)
@@ -975,36 +1030,19 @@ class RCWebSocketClient:
 
         try:
             await self.connect()
-            if self._resubscribe_task and not self._resubscribe_task.done():
-                self._resubscribe_task.cancel()
-                try:
-                    await self._resubscribe_task
-                except asyncio.CancelledError:
-                    pass
-
-            for room_id, callback in list(self._callbacks.items()):
-                self._subscriptions.pop(room_id, None)
-                state = self._subscription_states.get(room_id)
-                if state is None:
-                    state = SubscriptionState(room_id=room_id, callback=callback)
-                    self._subscription_states[room_id] = state
-                else:
-                    state.callback = callback
-                state.sub_id = None
-                state.status = "reconnecting"
-                state.last_error = None
-
+            # The state marking moved into `_recover`, after it has waited for whatever it
+            # displaced. Marking here wrote shared state while a cancelled-but-not-yet-
+            # unwound recovery could still be inside an await — the same shape every
+            # ownership finding in this file has had.
+            #
             # Not guarded on `_callbacks`. With no tracked rooms that map is empty, and
             # that is exactly the state in which the stream is the *only* subscription —
             # so the guard skipped the restore precisely when it was the only thing left
             # to restore.
             if self._callbacks or self._wants_stream:
-                self._resubscribe_task = asyncio.create_task(
-                    self._resubscribe_all_rooms(),
-                    name="rc-resubscribe-all",
-                )
-                self._callback_tasks.add(self._resubscribe_task)
-                self._resubscribe_task.add_done_callback(self._callback_tasks.discard)
+                self._start_recovery("Reconnect", try_stream=True)
+            else:
+                self._retire_recovery()
         except Exception as e:
             logger.error("Reconnect failed: %s", e)
             self._ws = None
@@ -1030,81 +1068,121 @@ class RCWebSocketClient:
                     )
             self._pending_subs.clear()
 
-    async def _resubscribe_all_rooms(self) -> None:
-        """Re-confirm all existing subscriptions after reconnect — the stream included.
+    def _retire_recovery(self) -> asyncio.Task | None:
+        """Stop the recovery in flight and invalidate whatever it started.
 
-        The stream had to be named here explicitly. This loop iterates `_callbacks`, which
-        maps *rooms*, so a subscription that is not a room was invisible to it: after any
-        disconnect, untracked rooms stopped arriving forever, and — worse, because it is
-        silent — newly tracked rooms skipped their own subscription too, since the
-        connector still believed the stream was carrying them. That is the key-space split
-        biting from the other side: two kinds of subscription need two kinds of restore.
+        Separate from `_start_recovery` because a reconnect retires the previous recovery
+        whether or not it needs a new one: with no tracked rooms and no stream intent there
+        is nothing to recover, but a recovery from before the socket dropped is still a
+        coroutine holding stale subscription state, and letting it finish would have it
+        write that state onto a connection it knows nothing about.
+        """
+        displaced = self._recovery_task
+        if displaced is not None and not displaced.done():
+            displaced.cancel()
+        self._recovery_generation += 1
+        return displaced
+
+    def _start_recovery(self, reason: str, *, try_stream: bool) -> asyncio.Task:
+        """Install the one recovery, replacing whatever was running.
+
+        Both entry points come through here — a socket drop and a stream terminated under a
+        healthy socket — because they differ only in whether the stream is worth asking for
+        again. Everything else they did was the same sequence written twice over the same
+        state, and every review round on this file found another write in it with no owner.
+
+        Cancel-and-replace, always: a recovery that is no longer the current one has nothing
+        to finish, and letting it run alongside is how two of them reached the replay
+        callback together and answered one message twice.
+        """
+        displaced = self._retire_recovery()
+        task = asyncio.create_task(
+            self._recover(reason, try_stream=try_stream, displaced=displaced),
+            name=f"rc-recovery:{reason}",
+        )
+        self._recovery_task = task
+        self._callback_tasks.add(task)
+        task.add_done_callback(self._callback_tasks.discard)
+        return task
+
+    async def _recover(
+        self,
+        reason: str,
+        *,
+        try_stream: bool,
+        displaced: asyncio.Task | None = None,
+    ) -> None:
+        """Put delivery back, then recover what the gap lost. One sequence, one owner.
+
+        The order is the whole design and every step of it was learned from a defect:
+
+        1. Wait out the recovery this one replaced. Cancelling is a request; until it is
+           observed the displaced run can still be inside an await.
+        2. Announce the outage boundary, while nothing is subscribed — once the first room
+           is confirmed, live traffic resumes for it while the rest are still subscribing.
+        3. Ask for the stream, if this entry point is one that should. A stream the server
+           has just terminated is not worth re-requesting immediately; a fresh socket is.
+        4. Give every room a delivery path — the stream, or one subscription each. Never
+           both, so a successful stream releases the per-room subscriptions.
+        5. Replay the gap. Restoring delivery and recovering the outage are two obligations
+           and a path that discharges only the first loses messages silently.
         """
         task = asyncio.current_task()
         try:
-            # Before anything is subscribed: whatever has to be measured from where the
-            # outage started must be measured now. Once the first room is confirmed, live
-            # traffic resumes for it while the rest are still subscribing.
+            if displaced is not None:
+                # `gather` absorbs its CancelledError rather than re-raising it here, where
+                # it would cancel this recovery too.
+                await asyncio.gather(displaced, return_exceptions=True)
+
+            # Now that nothing else is writing them: every tracked room is between
+            # delivery paths until this recovery gives it one.
+            for room_id, callback in list(self._callbacks.items()):
+                state = self._subscription_states.get(room_id)
+                if state is None:
+                    state = SubscriptionState(room_id=room_id, callback=callback)
+                    self._subscription_states[room_id] = state
+                else:
+                    state.callback = callback
+                state.status = "reconnecting"
+                state.last_error = None
+
             await self._fire_outage_callback()
+
             stream_restored = False
-            if self._wants_stream:
+            if try_stream and self._wants_stream:
                 # `_stream_sub_id` is the *current* subscription; `_wants_stream` is the
-                # intent. Clearing the id used to clear both, so a restore that failed
-                # once removed the only marker saying it should be retried — later
-                # reconnects skipped the block, and the connector went on believing the
-                # stream was live. Intent survives failure; only the id is per-attempt.
+                # intent. Clearing the id used to clear both, so a restore that failed once
+                # removed the only marker saying it should be retried. Intent survives
+                # failure; only the id is per-attempt.
                 self._stream_sub_id = None
                 stream_restored = await self.subscribe_all()
                 if not stream_restored:
                     logger.error(
-                        "Could not restore the __my_messages__ subscription after "
-                        "reconnect — untracked rooms will not arrive, and tracked rooms "
-                        "are being resubscribed individually as a fallback"
+                        "Could not restore the __my_messages__ subscription — untracked "
+                        "rooms will not arrive, and tracked rooms are being resubscribed "
+                        "individually as a fallback"
                     )
 
-            # The stream carries every tracked room too, so resubscribing them one by one
-            # would have the server send each message twice. Dedup would suppress the
-            # second dispatch, but not the queue slot or the round trip — and the
-            # initial-connect path deliberately avoids exactly this.
-            #
-            # Skipping the *resubscription* only. An earlier version returned here, which
-            # also skipped the reconnect callback below — the one that replays what was
-            # sent to tracked rooms while the socket was down. Restoring delivery and
-            # losing the outage are not the same thing, and the `return` conflated them.
-            rooms = [] if stream_restored else list(self._callbacks.items())
             if stream_restored:
-                # A watcher added while the restore was still in flight saw `stream_active`
-                # answer False — correctly, the stream was down — and opened its own
-                # subscription for its room. The stream now carries that room as well, so
-                # the room would be delivered twice for the rest of the process's life:
-                # dedup hides the second dispatch, not the queue slot it takes, and a full
-                # queue drops a real message. The same release the initial-connect path
-                # performs after `subscribe_all`, for the same reason.
+                # The stream carries every tracked room, so a room may not also carry
+                # itself: the server would send each message twice, and dedup hides the
+                # second dispatch but not the queue slot it takes.
                 await self.unsubscribe_rooms_keeping_callbacks()
-                # `_reconnect` marks every state `reconnecting` before this runs, and the
-                # per-room confirmations that would clear it are exactly what the stream
-                # makes unnecessary. Left alone, every tracked room reads as reconnecting
-                # forever — status output lies, and the replay path warns about rooms that
-                # are fine.
+                # The per-room confirmations that would clear `reconnecting` are exactly
+                # what the stream makes unnecessary, so they are cleared here instead.
                 for state in self._subscription_states.values():
                     state.status = "active"
                     state.last_error = None
                 logger.info("Stream restored — per-room resubscription is not needed")
-            await self._subscribe_rooms_individually(rooms, context="Reconnect")
+            else:
+                await self._subscribe_rooms_individually(
+                    list(self._callbacks.items()), context=reason
+                )
 
-            # Fire the connector's history-replay callback now that the live
-            # stream is active again.  Any messages that arrived during the
-            # outage are fetched via REST and re-injected through the normal
-            # filter/normalize path.  Errors here must not crash the reconnect
-            # loop, so we swallow them after logging.
             await self._fire_reconnect_callback()
         finally:
-            # Identity-checked for the same reason the stream fallback checks it: the slot
-            # says "the recovery currently in flight", and clearing it unconditionally would
-            # let a finishing recovery disown a newer one, which `_reconnect` then would not
-            # cancel.
-            if self._resubscribe_task is task:
-                self._resubscribe_task = None
+            if self._recovery_task is task:
+                self._recovery_task = None
 
     async def _subscribe_rooms_individually(
         self, rooms: list[tuple[str, Callable]], context: str
@@ -1207,55 +1285,11 @@ class RCWebSocketClient:
             "watcher cannot be discovered",
             reason,
         )
-        # Invariant 8 applies to the slot itself, not only to the fields: `_reconnect`
-        # cancels what it displaces and this did not, so a reconnect's recovery could still
-        # be in its replay — a long one, a REST round trip per room — while this installed
-        # a second recovery over the top of it. Both then reach the replay callback, both
-        # read the same boundary, and a message id is recorded only after its handler
-        # finishes: two agent turns for one message.
-        displaced = self._resubscribe_task
-        if displaced is not None and not displaced.done():
-            displaced.cancel()
-        task = asyncio.create_task(
-            self._restore_per_room_delivery(displaced), name="rc-stream-fallback"
-        )
-        # Parked in the same slot a reconnect's resubscribe uses, so that a socket drop
-        # during this recovery cancels it (`_reconnect` cancels that slot) instead of
-        # letting two recoveries write subscription state at each other.
-        self._resubscribe_task = task
-        self._callback_tasks.add(task)
-        task.add_done_callback(self._callback_tasks.discard)
-
-    async def _restore_per_room_delivery(
-        self, displaced: asyncio.Task | None = None
-    ) -> None:
-        """Give every tracked room its own subscription again, then recover the gap.
-
-        The second half of `live → lost`: clearing the id records that the stream is gone,
-        but the transition is not complete until each tracked room can receive again.
-
-        The replay callback fires here for the same reason it fires after a reconnect —
-        between the stream dying and these confirmations, messages to tracked rooms were
-        delivered to nobody. An outage that leaves the socket up is still an outage;
-        restoring delivery and recovering what was lost are two separate things.
-        """
-        task = asyncio.current_task()
-        try:
-            if displaced is not None:
-                # Waited for, not merely cancelled: a cancellation is a request, and until
-                # it is observed the displaced recovery can still be inside an await in the
-                # replay it was cancelled during. `gather` absorbs its CancelledError
-                # rather than re-raising it here, where it would cancel this recovery too.
-                await asyncio.gather(displaced, return_exceptions=True)
-            await self._fire_outage_callback()
-            await self._subscribe_rooms_individually(
-                list(self._callbacks.items()), context="Stream fallback"
-            )
-            await self._fire_reconnect_callback()
-        finally:
-            # Only if a reconnect has not already claimed the slot for its own recovery.
-            if self._resubscribe_task is task:
-                self._resubscribe_task = None
+        # One entry point away from a reconnect's recovery, and the same one: the only
+        # difference is that a stream the server has just terminated is not worth asking
+        # for again this instant, so `try_stream` is False and delivery goes back to
+        # per-room until the next reconnect retries it.
+        self._start_recovery("Stream fallback", try_stream=False)
 
     @staticmethod
     def _new_id() -> str:

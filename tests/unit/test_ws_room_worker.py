@@ -30,7 +30,8 @@ class TestRoomWorkerAwaiting(unittest.IsolatedAsyncioTestCase):
         ws._running = False
         ws._listen_task = None
         ws._ping_task = None
-        ws._resubscribe_task = None
+        ws._recovery_task = None
+        ws._recovery_generation = 0
         ws._callback_tasks = set()
         ws._room_queues = {}
         ws._ws = None
@@ -68,7 +69,8 @@ class TestRoomWorkerAwaiting(unittest.IsolatedAsyncioTestCase):
         ws._running = False
         ws._listen_task = None
         ws._ping_task = None
-        ws._resubscribe_task = None
+        ws._recovery_task = None
+        ws._recovery_generation = 0
         ws._callback_tasks = set()
         ws._room_queues = {}
         ws._ws = None

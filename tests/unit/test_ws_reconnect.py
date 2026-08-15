@@ -75,7 +75,7 @@ class TestReconnectResubscribes(unittest.IsolatedAsyncioTestCase):
         confirmer = asyncio.create_task(confirm_all_subscriptions())
 
         await client._reconnect()
-        await client._resubscribe_task
+        await client._recovery_task
         await confirmer
 
         # connect() must be called once
@@ -141,7 +141,7 @@ class TestReconnectResubscribes(unittest.IsolatedAsyncioTestCase):
         resolver = asyncio.create_task(resolve_pending_subs())
 
         await client._reconnect()
-        await client._resubscribe_task
+        await client._recovery_task
         await resolver
 
         self.assertEqual(client._subscription_states["room_A"].status, "active")
@@ -501,7 +501,7 @@ class TestPendingSubsCancelledOnReconnect(unittest.IsolatedAsyncioTestCase):
         ws._room_queues = {}
         ws._reconnect_delay = 0.0
         ws._max_reconnect_delay = 60.0
-        ws._resubscribe_task = None
+        ws._recovery_task = None
         ws._listen_task = None
         ws._ping_task = None
         return ws
@@ -549,7 +549,7 @@ class TestReconnectClearsPendingSubsOnCancel(unittest.IsolatedAsyncioTestCase):
         ws._subscriptions = {}
         ws._subscription_states = {}
         ws._pending_subs = {}
-        ws._resubscribe_task = None
+        ws._recovery_task = None
         ws._callback_tasks = set()
         ws._reconnect_delay = 1.0
         ws._max_reconnect_delay = 30.0
@@ -633,7 +633,7 @@ class TestReconnectRestoresTheStream(unittest.IsolatedAsyncioTestCase):
         client.subscribe_all = AsyncMock(return_value=True)
         client._subscribe_with_confirmation = AsyncMock(return_value="sub-1")
 
-        await client._resubscribe_all_rooms()
+        await client._recover("Reconnect", try_stream=True)
 
         client.subscribe_all.assert_awaited_once()
 
@@ -647,7 +647,7 @@ class TestReconnectRestoresTheStream(unittest.IsolatedAsyncioTestCase):
         client.subscribe_all = AsyncMock(return_value=True)
         client._subscribe_with_confirmation = AsyncMock(return_value="sub-1")
 
-        await client._resubscribe_all_rooms()
+        await client._recover("Reconnect", try_stream=True)
 
         client.subscribe_all.assert_not_awaited()
 
@@ -661,7 +661,7 @@ class TestReconnectRestoresTheStream(unittest.IsolatedAsyncioTestCase):
         client._subscribe_with_confirmation = AsyncMock(return_value="sub-1")
 
         with self.assertLogs("agent-chat-gateway.connectors.rocketchat.ws", "ERROR"):
-            await client._resubscribe_all_rooms()
+            await client._recover("Reconnect", try_stream=True)
 
 
 class TestStreamIntentSurvivesFailure(unittest.IsolatedAsyncioTestCase):
@@ -682,11 +682,11 @@ class TestStreamIntentSurvivesFailure(unittest.IsolatedAsyncioTestCase):
         client.subscribe_all = AsyncMock(return_value=False)
 
         with self.assertLogs("agent-chat-gateway.connectors.rocketchat.ws", "ERROR"):
-            await client._resubscribe_all_rooms()
+            await client._recover("Reconnect", try_stream=True)
         self.assertTrue(client._wants_stream, "intent must outlive a failed attempt")
 
         client.subscribe_all = AsyncMock(return_value=True)
-        await client._resubscribe_all_rooms()
+        await client._recover("Reconnect", try_stream=True)
         client.subscribe_all.assert_awaited_once()
 
     async def test_a_restored_stream_still_replays_the_outage(self):
@@ -706,7 +706,7 @@ class TestStreamIntentSurvivesFailure(unittest.IsolatedAsyncioTestCase):
         replayed = AsyncMock()
         client.register_reconnect_callback(replayed)
 
-        await client._resubscribe_all_rooms()
+        await client._recover("Reconnect", try_stream=True)
 
         replayed.assert_awaited_once()
         client._subscribe_with_confirmation.assert_not_awaited()
@@ -722,7 +722,7 @@ class TestStreamIntentSurvivesFailure(unittest.IsolatedAsyncioTestCase):
         client.subscribe_all = AsyncMock(return_value=True)
         client._subscribe_with_confirmation = AsyncMock(return_value="s")
 
-        await client._resubscribe_all_rooms()
+        await client._recover("Reconnect", try_stream=True)
 
         client._subscribe_with_confirmation.assert_not_awaited()
 
@@ -736,7 +736,7 @@ class TestStreamIntentSurvivesFailure(unittest.IsolatedAsyncioTestCase):
         client._subscribe_with_confirmation = AsyncMock(return_value="s")
 
         with self.assertLogs("agent-chat-gateway.connectors.rocketchat.ws", "ERROR"):
-            await client._resubscribe_all_rooms()
+            await client._recover("Reconnect", try_stream=True)
 
         client._subscribe_with_confirmation.assert_awaited()
 
@@ -773,7 +773,7 @@ class TestStreamIntentAndStates(unittest.IsolatedAsyncioTestCase):
         }
         client.subscribe_all = AsyncMock(return_value=True)
 
-        await client._resubscribe_all_rooms()
+        await client._recover("Reconnect", try_stream=True)
 
         self.assertEqual(client._subscription_states["r1"].status, "active")
 
@@ -839,7 +839,7 @@ class TestTheStreamIsLostWhileTheSocketStaysUp(unittest.IsolatedAsyncioTestCase)
         with self.assertRaises(asyncio.CancelledError):
             await client._listen_loop()
 
-        task = client._resubscribe_task
+        task = client._recovery_task
         if task is not None:
             await task
         return sent
@@ -969,7 +969,7 @@ class TestTheOutageBoundaryIsAnnouncedBeforeDeliveryReturns(unittest.IsolatedAsy
         client._wants_stream = False
         events = self._record(client)
 
-        await client._resubscribe_all_rooms()
+        await client._recover("Reconnect", try_stream=True)
 
         self.assertEqual(events[0], "outage")
         self.assertEqual(events[-1], "replay")
@@ -979,7 +979,7 @@ class TestTheOutageBoundaryIsAnnouncedBeforeDeliveryReturns(unittest.IsolatedAsy
         client = self._client()
         events = self._record(client)
 
-        await client._restore_per_room_delivery()
+        await client._recover("Stream fallback", try_stream=False)
 
         self.assertEqual(events[0], "outage")
         self.assertEqual(events[-1], "replay")
@@ -997,7 +997,7 @@ class TestTheOutageBoundaryIsAnnouncedBeforeDeliveryReturns(unittest.IsolatedAsy
 
         client.subscribe_all = _subscribe_all
 
-        await client._resubscribe_all_rooms()
+        await client._recover("Reconnect", try_stream=True)
 
         self.assertEqual(events[:2], ["outage", "stream"])
 
@@ -1008,7 +1008,7 @@ class TestTheOutageBoundaryIsAnnouncedBeforeDeliveryReturns(unittest.IsolatedAsy
         client.register_reconnect_callback(replayed)
         client._subscribe_with_confirmation = AsyncMock(return_value="s")
 
-        await client._resubscribe_all_rooms()
+        await client._recover("Reconnect", try_stream=True)
 
         replayed.assert_awaited_once()
 
@@ -1023,7 +1023,7 @@ class TestTheOutageBoundaryIsAnnouncedBeforeDeliveryReturns(unittest.IsolatedAsy
         client.register_reconnect_callback(replayed)
 
         with self.assertLogs("agent-chat-gateway.connectors.rocketchat.ws", "WARNING"):
-            await client._resubscribe_all_rooms()
+            await client._recover("Reconnect", try_stream=True)
 
         replayed.assert_awaited_once()
 
@@ -1031,7 +1031,7 @@ class TestTheOutageBoundaryIsAnnouncedBeforeDeliveryReturns(unittest.IsolatedAsy
 class TestAWatcherAddedDuringTheRestoreIsNotDeliveredTwice(unittest.IsolatedAsyncioTestCase):
     """The restore window is a window in which `stream_active` correctly answers False.
 
-    `_resubscribe_all_rooms` clears the stream id before re-asking for it, so a watcher
+    The recovery clears the stream id before re-asking for it, so a watcher
     added while `subscribe_all()` is awaiting confirmation is told — truthfully — that the
     stream is down, and opens its own subscription. If the stream then comes back, that
     room has two delivery paths for the rest of the process's life.
@@ -1051,7 +1051,7 @@ class TestAWatcherAddedDuringTheRestoreIsNotDeliveredTwice(unittest.IsolatedAsyn
 
         client.subscribe_all = _subscribe_all
 
-        await client._resubscribe_all_rooms()
+        await client._recover("Reconnect", try_stream=True)
 
         self.assertEqual(
             client._subscriptions, {},
@@ -1076,7 +1076,7 @@ class TestAWatcherAddedDuringTheRestoreIsNotDeliveredTwice(unittest.IsolatedAsyn
         client._subscribe_with_confirmation = AsyncMock(return_value="s")
 
         with self.assertLogs("agent-chat-gateway.connectors.rocketchat.ws", "ERROR"):
-            await client._resubscribe_all_rooms()
+            await client._recover("Reconnect", try_stream=True)
 
         client._subscribe_with_confirmation.assert_awaited()
 
@@ -1315,13 +1315,13 @@ class TestTheStreamFallbackDoesNotRaceTheRecoveryItReplaces(unittest.IsolatedAsy
                 live -= 1
 
         client.register_reconnect_callback(_slow_replay)
-        displaced = asyncio.create_task(client._resubscribe_all_rooms())
-        client._resubscribe_task = displaced
+        displaced = asyncio.create_task(client._recover("Reconnect", try_stream=True))
+        client._recovery_task = displaced
         await first_replay_started.wait()
 
         with self.assertLogs("agent-chat-gateway.connectors.rocketchat.ws", "ERROR"):
             client._on_stream_lost("server stopped it")
-        fallback = client._resubscribe_task
+        fallback = client._recovery_task
 
         release.set()
         await fallback
@@ -1348,7 +1348,7 @@ class TestTheStreamFallbackDoesNotRaceTheRecoveryItReplaces(unittest.IsolatedAsy
 
         with self.assertLogs("agent-chat-gateway.connectors.rocketchat.ws", "ERROR"):
             client._on_stream_lost("server stopped it")
-        await client._resubscribe_task
+        await client._recovery_task
 
         replayed.assert_awaited_once()
 
@@ -1361,10 +1361,124 @@ class TestTheStreamFallbackDoesNotRaceTheRecoveryItReplaces(unittest.IsolatedAsy
         done.set_result(None)
         finished = asyncio.ensure_future(asyncio.sleep(0))
         await finished
-        client._resubscribe_task = finished
+        client._recovery_task = finished
 
         with self.assertLogs("agent-chat-gateway.connectors.rocketchat.ws", "ERROR"):
             client._on_stream_lost("server stopped it")
-        await client._resubscribe_task
+        await client._recovery_task
 
         self.assertFalse(finished.cancelled())
+
+
+class TestOneRecoveryAtATime(unittest.IsolatedAsyncioTestCase):
+    """The consolidation, tested as a structure rather than as three behaviours.
+
+    Both entry points go through one launcher and one sequence, so "which of the two wrote
+    this field last" stops being a question anyone can get wrong. What is left to test is
+    that the structure holds: one slot, always cancel-and-replace, and work that outlives
+    its starter checks whether it is still wanted.
+    """
+
+    def _client(self) -> RCWebSocketClient:
+        client = _make_client()
+        client._callbacks = {"r1": AsyncMock()}
+        client._subscribe_with_confirmation = AsyncMock(return_value="s")
+        return client
+
+    async def test_a_reconnect_retires_a_recovery_even_with_nothing_to_recover(self):
+        """No tracked rooms and no stream intent is still a reason to stop the previous
+        one: it holds subscription state from before the socket dropped."""
+        client = self._client()
+        client._callbacks = {}
+        client._wants_stream = False
+        never_ends = asyncio.create_task(asyncio.sleep(9999))
+        client._recovery_task = never_ends
+        client.connect = AsyncMock()
+        client._reconnect_delay = 0
+
+        with patch("asyncio.sleep", new=AsyncMock()):
+            await client._reconnect()
+        await asyncio.sleep(0)
+
+        self.assertTrue(never_ends.cancelled())
+
+    async def test_an_overtaken_stream_attempt_records_nothing(self):
+        """`subscribe_all` outlives the recovery that asked for it — `start_inbound` calls
+        it directly, so it is not even in the slot. Publishing an id after a newer recovery
+        has started claims delivery that recovery knows nothing about."""
+        client = self._client()
+        sent: list[dict] = []
+        client._send = AsyncMock(side_effect=lambda d: sent.append(d))
+
+        task = asyncio.create_task(client.subscribe_all(timeout=5))
+        while not sent:
+            await asyncio.sleep(0)
+        sub_id = sent[0]["id"]
+
+        client._recovery_generation += 1        # a newer recovery starts
+        fut = client._pending_subs.get(sub_id)
+        fut.set_result(True)                     # ...then the old confirmation lands
+
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat.ws", "WARNING"):
+            self.assertFalse(await task)
+
+        self.assertFalse(
+            client.stream_active,
+            "an id published by a retired attempt is one nobody is tracking",
+        )
+        self.assertIn(
+            {"msg": "unsub", "id": sub_id}, sent,
+            "and it is released, not merely forgotten",
+        )
+
+    async def test_a_stopped_client_does_not_get_its_stream_back(self):
+        """`stop()` clears the fields; the finding was that a confirmed-but-unresumed
+        attempt then puts one of them back, and `_wants_stream=False` means no reconnect
+        ever undoes that."""
+        client = self._client()
+        client._send = AsyncMock()
+        task = asyncio.create_task(client.subscribe_all(timeout=5))
+        while not client._pending_subs:
+            await asyncio.sleep(0)
+        sub_id = next(iter(client._pending_subs))
+
+        await client.stop()
+        fut = client._pending_subs.get(sub_id)
+        if fut is not None and not fut.done():
+            fut.set_result(True)
+
+        try:
+            await task
+        except Exception:
+            pass
+
+        self.assertFalse(client.stream_active)
+        self.assertFalse(client._wants_stream)
+
+    async def test_installing_a_subscription_releases_the_one_it_replaces(self):
+        """A recovery cancelled partway through releasing per-room subscriptions leaves
+        some still live. The next recovery resubscribes those rooms — and without this,
+        overwrote the mapping while the original kept delivering, untracked and
+        unreleasable."""
+        client = _make_client()
+        sent: list[dict] = []
+        client._send = AsyncMock(side_effect=lambda d: sent.append(d))
+        client._subscriptions = {"r1": "left-behind"}
+        cb = AsyncMock()
+
+        task = asyncio.create_task(
+            client._subscribe_with_confirmation(
+                room_id="r1", callback=cb, timeout=5, keep_callback_on_failure=True,
+            )
+        )
+        while not any(f.get("msg") == "sub" for f in sent):
+            await asyncio.sleep(0)
+        new_id = next(f["id"] for f in sent if f.get("msg") == "sub")
+        client._pending_subs[new_id].set_result(True)
+        await task
+
+        self.assertIn(
+            {"msg": "unsub", "id": "left-behind"}, sent,
+            "the predecessor is released on the server, or nothing ever can be",
+        )
+        self.assertEqual(client._subscriptions["r1"], new_id)
