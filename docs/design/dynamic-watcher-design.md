@@ -1989,6 +1989,17 @@ only `disconnect` returns a connector to `absent`.
    back, so they are the likely path rather than the exotic one; clearing the mark there
    would close a gap nobody looked at. For the same reason a new outage does not overwrite
    an unread boundary: the older mark covers both windows, and dedup bounds the cost.
+
+   Because the window is never narrowed, **the timestamp cannot say who is owed a read of
+   it, and a count of claims has to.** A live message handed back for capacity while a
+   replay is dispatching claims the very window that replay is reading, so the value it
+   writes back is the one already there. A batch that compares the boundary it snapshotted
+   against the boundary it finds therefore sees "unchanged" in exactly the case the
+   comparison exists to catch, closes the window, and the next accepted message moves the
+   watermark past the handed-back message for good. Every claim increments a counter, and
+   a window is closed only against a count read before the claim could have happened — at
+   *both* sites that can decide a replay has read it, the dispatched batch and the fetch
+   that came back empty, since a REST round trip is ample room for a hand-back.
 7. **A confirmation is only as good as the transport's last word about it.** `ready` and
    `nosub` for the same subscription can arrive in one batch of frames, and the receive
    loop processes both before the coroutine awaiting the confirmation is scheduled again —

@@ -81,6 +81,11 @@ class _RoomSubscription:
     # the time replay runs, because the first live message through the new subscription
     # has already moved it past the gap.
     replay_boundary: str | None = None
+    # How many claims have been made on `replay_boundary`. Bumped by `claim_boundary`
+    # even when the value it writes is the one already there — which is the whole point.
+    # A claim is a promise that someone still needs this window read; two claimants can
+    # want the same timestamp, and the timestamp cannot tell them apart.
+    boundary_claims: int = 0
     # Bumped whenever this account is confirmed to have left the room. A replay reads it
     # before its history fetch and again as it dispatches: the fetch and the dispatch loop
     # are long, and a live rejection arriving inside them is exactly the news that the
@@ -120,7 +125,52 @@ class _RoomSubscription:
         # exactly wrong here. Empty says "cleared on purpose", so the stored record is
         # overwritten and a restart cannot hand the pre-removal mark back.
         self.last_processed_ts = ""
+        self.boundary_claims = 0
         self.membership_epoch += 1
+
+    def claim_boundary(self, *fallbacks: str | None) -> int:
+        """Record that someone still needs the outage window read. Returns the claim count.
+
+        The window is the *oldest* mark that anyone owes a read of, so an open one is
+        never narrowed: the first truthy of the current value and the fallbacks wins, in
+        that order. `_snapshot_replay_boundaries` offers the live watermark; a live
+        hand-back offers the watermark and then a point just below its own message,
+        because both marks are empty for the first delivery into a new room.
+
+        **The count is what makes this a method rather than the `or` expression it used to
+        be at each site.** Two claimants routinely want the same timestamp — a hand-back
+        during a replay of the very window it is claiming — and the value cannot tell them
+        apart. The batch then reads its own snapshot back unchanged and closes a window
+        the live message is still waiting on; the next accepted message moves the
+        watermark past it and nothing points below it any more. Only `discharge_boundary`
+        may close it, and only against a count read before the claim could have happened.
+
+        A fully falsy claim writes and counts nothing: there is no window to owe a read of
+        and no replay will look at this room.
+        """
+        boundary = next((c for c in (self.replay_boundary, *fallbacks) if c), None)
+        if not boundary:
+            return self.boundary_claims
+        self.replay_boundary = boundary
+        self.boundary_claims += 1
+        return self.boundary_claims
+
+    def discharge_boundary(self, claims_at_entry: int) -> bool:
+        """Close the outage window, unless it was claimed again since `claims_at_entry`.
+
+        Both places a replay can decide it has read the window — a dispatched batch and a
+        fetch that came back empty — go through here. The empty-fetch one is why this is
+        a method: it cleared the boundary unconditionally, and its distance from the
+        snapshot is a membership check plus a REST round trip, which is ample room for the
+        live hand-back this guard exists for.
+
+        False means the window is now owed to somebody else and has been left open.
+        """
+        if self.boundary_claims != claims_at_entry:
+            return False
+        self.replay_boundary = None
+        self.boundary_claims = 0
+        return True
 
     def remember(self, msg_id: str) -> None:
         """Record a message id as handled, evicting the oldest past the bound.
@@ -339,7 +389,7 @@ class RocketChatConnector(Connector):
             # where a gap starts, which is the bug this field exists to prevent. The older
             # mark covers both windows; dedup and `_REPLAY_HISTORY_COUNT` bound what that
             # costs.
-            sub.replay_boundary = sub.replay_boundary or sub.last_processed_ts
+            sub.claim_boundary(sub.last_processed_ts)
 
     async def _on_ws_reconnect(self) -> None:
         """Replay messages missed during a WebSocket outage.
@@ -363,12 +413,17 @@ class RocketChatConnector(Connector):
             # subsequent rooms to advance their last_processed_ts.  If we read the
             # watermark inside the await we would use a newer ts that skips the
             # entire outage window for those rooms.
-            # Captured so the completion below can tell whether the window it is about to
-            # close is still the one it read. A live message rejected for capacity while
-            # this batch is dispatching opens or keeps a boundary of its own, and clearing
-            # that one on this batch's success loses the live message: the next accepted
-            # message advances the watermark past it and nothing points below it any more.
-            boundary_at_entry = sub.replay_boundary
+            # Captured so the completion below can tell whether anyone has claimed this
+            # window since. A live message rejected for capacity while this batch is
+            # dispatching claims the boundary, and closing it on this batch's success
+            # loses that message: the next accepted message advances the watermark past it
+            # and nothing points below it any more.
+            #
+            # The *claim count*, not the value. A hand-back inside a replay claims the
+            # window the replay is already reading, so it writes back the same timestamp —
+            # comparing values reports "unchanged" for precisely the case this guard is
+            # for. That was the bug, and it read as correct for four review rounds.
+            claims_at_entry = sub.boundary_claims
 
             # The outage boundary if one was captured, and the live watermark only as a
             # fallback for a replay that no outage callback preceded. Cleared where the
@@ -473,9 +528,16 @@ class RocketChatConnector(Connector):
                         "page and may be permanently missed",
                         sub.room.name, self._REPLAY_HISTORY_COUNT,
                     )
-                else:
-                    # A read that found nothing is still a read: the window is closed.
-                    sub.replay_boundary = None
+                elif not sub.discharge_boundary(claims_at_entry):
+                    # A read that found nothing is still a read — but only of the window
+                    # this replay came in for. The membership check and the history fetch
+                    # above are both awaits, and a live hand-back inside either of them
+                    # claims a window this fetch has not looked below.
+                    logger.info(
+                        "Room '%s': the outage window was claimed again while its history "
+                        "was being fetched — leaving it open",
+                        sub.room.name,
+                    )
                 logger.debug(
                     "Room '%s': no missed messages since %s",
                     sub.room.name, watermark,
@@ -566,14 +628,13 @@ class RocketChatConnector(Connector):
                 # hands the message back and forgets its id so a later replay can bring it
                 # back. Spending the boundary on a batch that contains one of those removes
                 # the only mark that could — the live watermark has moved past it by then.
-                if all_accepted and sub.replay_boundary == boundary_at_entry:
-                    sub.replay_boundary = None
-                elif all_accepted:
-                    logger.info(
-                        "Room '%s': the outage window was replaced while this batch was "
-                        "being dispatched — leaving the newer one open",
-                        sub.room.name,
-                    )
+                if all_accepted:
+                    if not sub.discharge_boundary(claims_at_entry):
+                        logger.info(
+                            "Room '%s': the outage window was claimed again while this "
+                            "batch was being dispatched — leaving it open",
+                            sub.room.name,
+                        )
                 else:
                     logger.warning(
                         "Room '%s': part of the replayed batch was handed back (queue "
@@ -1657,11 +1718,7 @@ class RocketChatConnector(Connector):
             #
             # Rocket.Chat timestamps are epoch milliseconds, so "just below" is a real
             # value rather than an approximation.
-            sub.replay_boundary = (
-                sub.replay_boundary
-                or sub.last_processed_ts
-                or _just_before(result.msg_ts)
-            )
+            sub.claim_boundary(sub.last_processed_ts, _just_before(result.msg_ts))
             # The one outcome that leaves this message pending: its id was just forgotten
             # precisely so a later replay can bring it back, and a boundary spent on a
             # batch containing it would remove the only thing that could.

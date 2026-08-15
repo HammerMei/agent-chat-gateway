@@ -581,6 +581,95 @@ class TestExpiryDoesNotReissueAnInFlightIdentity(unittest.TestCase):
         self.assertEqual(store.current_turns("r1", None, "agent-a"), 0)
 
 
+class TestReleasedTokenBookkeepingIsBounded(unittest.TestCase):
+    """A retry loop hands the same message back indefinitely, and the TTL cannot help.
+
+    Every attempt takes a fresh token and gives it back, and every attempt's *increment*
+    refreshes `last_updated` — so `_gc` never reclaims the context and a set of released
+    tokens would grow for as long as the processor stays full.
+    """
+
+    def setUp(self):
+        from gateway.core.agent_chain import TurnStore
+
+        self.store = TurnStore()
+
+    def _ctx(self):
+        return self.store._store[self.store._key("r1", None, "agent-a")]
+
+    def test_a_long_retry_loop_does_not_accumulate_tokens(self):
+        for _ in range(500):
+            allowed, _turn, tok = self.store.check_and_increment(
+                "r1", None, "agent-a", max_turns=5)
+            self.assertTrue(allowed, "each release frees the turn the retry takes")
+            self.store.release_turn("r1", None, "agent-a", tok, generation=0)
+
+        ctx = self._ctx()
+        self.assertEqual(ctx.issued, 500)
+        self.assertEqual(
+            ctx.released, set(),
+            "sequential releases collapse into the prefix, leaving nothing to hold",
+        )
+        self.assertEqual(ctx.released_below, 500)
+
+    def test_an_out_of_order_release_is_held_until_the_gap_closes(self):
+        toks = [
+            self.store.check_and_increment("r1", None, "agent-a", max_turns=5)[2]
+            for _ in range(3)
+        ]
+        self.store.release_turn("r1", None, "agent-a", toks[2], generation=0)
+        self.assertEqual(self._ctx().released, {3}, "token 1 has not come back yet")
+
+        self.store.release_turn("r1", None, "agent-a", toks[0], generation=0)
+        self.store.release_turn("r1", None, "agent-a", toks[1], generation=0)
+        self.assertEqual(self._ctx().released, set())
+        self.assertEqual(self._ctx().released_below, 3)
+
+    def test_a_collapsed_token_is_still_refused_a_second_release(self):
+        """The prefix must forget nothing — it is a compaction, not an eviction."""
+        for _ in range(10):
+            _a, _t, tok = self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
+            self.store.release_turn("r1", None, "agent-a", tok, generation=0)
+
+        _a, _t, live = self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
+        self.assertEqual(self.store.current_turns("r1", None, "agent-a"), 1)
+        self.store.release_turn("r1", None, "agent-a", 1, generation=0)
+        self.assertEqual(
+            self.store.current_turns("r1", None, "agent-a"), 1,
+            "the oldest token is long collapsed, and releasing it again must not take "
+            "the turn the live delivery is using",
+        )
+        self.assertEqual(live, 11)
+
+    def test_a_reset_clears_the_prefix_as_well(self):
+        for _ in range(5):
+            _a, _t, tok = self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
+            self.store.release_turn("r1", None, "agent-a", tok, generation=0)
+        self.assertEqual(self._ctx().released_below, 5)
+
+        self.store.reset_sender("r1", None, "agent-a")
+        gen = self._ctx().generation
+        _a, _t, tok = self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
+        self.assertEqual(tok, 1, "a fresh count reissues from one")
+        self.assertEqual(
+            self.store.release_turn("r1", None, "agent-a", tok, generation=gen), 0,
+            "a stale prefix would report this token as already given back",
+        )
+
+    def test_reset_all_clears_the_prefix_as_well(self):
+        for _ in range(5):
+            _a, _t, tok = self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
+            self.store.release_turn("r1", None, "agent-a", tok, generation=0)
+
+        self.store.reset_all("r1", None)
+        gen = self._ctx().generation
+        _a, _t, tok = self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
+        self.assertEqual(
+            self.store.release_turn("r1", None, "agent-a", tok, generation=gen), 0,
+            "the room-wide reset carries the same rule as the per-sender one",
+        )
+
+
 class TestGenerationTombstonesAreBounded(unittest.TestCase):
     """The key includes a thread id, so "one per room" was never the bound.
 

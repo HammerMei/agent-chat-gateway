@@ -86,7 +86,48 @@ class _TurnContext:
     # Tokens already given back, so a repeated release is a no-op rather than a second
     # decrement, and an earlier delivery can still release after a later one has taken
     # its turn.
+    #
+    # Two fields rather than one set, because the set alone has no reason to shrink. A
+    # message handed back repeatedly — a processor that stays full through a reconnect
+    # loop — takes a fresh token per attempt and gives every one of them back, and each
+    # attempt's *increment* refreshes `last_updated`, so the TTL never reclaims the
+    # context either. `released_below` is the prefix `1..n` that has been given back in
+    # full; `released` holds only the tokens above it, which is the handful still
+    # outstanding at any moment. In the retry loop the prefix absorbs each token as it
+    # arrives and the set stays empty.
+    #
+    # Exact, not an approximation: nothing is forgotten, so a double release is still
+    # refused however old the token is. Capping or evicting the set would have made that
+    # refusal depend on how recent the caller's bug was.
+    released_below: int = 0
     released: set = field(default_factory=set)
+
+    def is_released(self, token: int) -> bool:
+        return token <= self.released_below or token in self.released
+
+    def mark_released(self, token: int) -> None:
+        self.released.add(token)
+        while (self.released_below + 1) in self.released:
+            self.released_below += 1
+            self.released.discard(self.released_below)
+
+    def start_fresh_count(self) -> None:
+        """Zero the count and invalidate every token of the previous one.
+
+        Zeroed rather than dropped, so the generation survives: a delivery still in flight
+        has to be able to tell that the count it took its turn from is gone.
+
+        A method because the two resets — one sender, a whole room — did this as two
+        copies of five lines, and `released_below` would have been the sixth. Left behind,
+        it says the first token of the *new* count has already been given back, and that
+        release is refused: the budget stays spent on a message that was never sent.
+        """
+        self.turns = 0
+        self.generation += 1
+        self.issued = 0
+        self.released_below = 0
+        self.released.clear()
+        self.last_updated = time.monotonic()
 
 
 class TurnStore:
@@ -230,11 +271,11 @@ class TurnStore:
             # A reset started a fresh count. Nothing in it belongs to this delivery, and
             # the numbers cannot say so on their own: a fresh count begins at one again.
             return ctx.turns
-        if token <= 0 or token > ctx.issued or token in ctx.released:
+        if token <= 0 or token > ctx.issued or ctx.is_released(token):
             # Never issued here, or already given back. Either is a caller bug, and
             # neither may take a turn from a delivery that is still using it.
             return ctx.turns
-        ctx.released.add(token)
+        ctx.mark_released(token)
         ctx.turns -= 1
         ctx.last_updated = time.monotonic()
         return ctx.turns
@@ -248,37 +289,25 @@ class TurnStore:
     def reset_sender(self, room_id: str, thread_id: str | None, sender: str) -> None:
         """Reset turn counter for a specific sender (call on any drop).
 
-        Zeroed rather than dropped, so the generation survives: a delivery still in flight
-        has to be able to tell that the count it took its turn from is gone. `_gc` still
+        Zeroed rather than dropped — see `_TurnContext.start_fresh_count`. `_gc` still
         reclaims the entry once it goes quiet, by which time no delivery can be holding a
         turn from it.
         """
         key = self._key(room_id, thread_id, sender)
         ctx = self._store.get(key)
         if ctx is not None:
-            ctx.turns = 0
-            ctx.generation += 1
-            ctx.issued = 0
-            ctx.released.clear()
-            ctx.last_updated = time.monotonic()
+            ctx.start_fresh_count()
             self._generations[key] = (ctx.generation, time.monotonic())
         logger.debug("Agent chain counter reset for sender=%s thread=%s", sender, thread_id)
 
     def reset_all(self, room_id: str, thread_id: str | None) -> None:
         """Reset all agent counters for a room/thread context (call on human message)."""
-        # Zeroed rather than dropped, for the reason `reset_sender` gives: an in-flight
-        # delivery must be able to tell that the count it took its turn from is gone.
         keys_to_remove = [
             k for k in self._store if k[0] == room_id and k[1] == thread_id
         ]
         for k in keys_to_remove:
             ctx = self._store[k]
-            ctx = self._store[k]
-            ctx.turns = 0
-            ctx.generation += 1
-            ctx.issued = 0
-            ctx.released.clear()
-            ctx.last_updated = time.monotonic()
+            ctx.start_fresh_count()
             self._generations[k] = (ctx.generation, time.monotonic())
         if keys_to_remove:
             logger.debug(

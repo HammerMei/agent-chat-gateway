@@ -15,6 +15,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from gateway.connectors.rocketchat.connector import _just_before
 from gateway.core.connector import RoomCapacity
 from gateway.core.watcher_rule import RoomKind
 
@@ -3926,7 +3927,15 @@ class TestABatchClearsOnlyTheWindowItRead(unittest.IsolatedAsyncioTestCase):
     below it any more.
     """
 
-    async def test_a_window_replaced_mid_batch_is_left_open(self):
+    async def test_a_window_claimed_mid_batch_is_left_open(self):
+        """The claim writes back the *same* timestamp, which is the whole difficulty.
+
+        An earlier version of this test had the fake dispatch assign `"50"`. Production
+        does not: the live hand-back claims through `claim_boundary`, which never narrows
+        an open window, so the value it leaves is the one the batch already read. Testing
+        the friendlier situation is why a value comparison passed for four rounds — so the
+        claim here goes through the same call the hand-back makes.
+        """
         connector = _make_connector()
         connector._rooms["room-1"].last_processed_ts = "100"
         connector._ws.subscription_statuses = {}
@@ -3937,7 +3946,9 @@ class TestABatchClearsOnlyTheWindowItRead(unittest.IsolatedAsyncioTestCase):
         sub = connector._rooms["room-1"]
 
         async def _dispatch(room_id, doc, **kw):
-            sub.replay_boundary = "50"      # a live hand-back opens its own window
+            # Exactly the call `_on_raw_ddp_message` makes when a live message is handed
+            # back for capacity — same method, same arguments.
+            sub.claim_boundary(sub.last_processed_ts, _just_before("400"))
             return True
 
         connector._on_raw_ddp_message = _dispatch
@@ -3947,9 +3958,50 @@ class TestABatchClearsOnlyTheWindowItRead(unittest.IsolatedAsyncioTestCase):
             await connector._on_ws_reconnect()
 
         self.assertEqual(
-            sub.replay_boundary, "50",
-            "the live message still depends on the window this batch did not read",
+            sub.replay_boundary, "100",
+            "the live message still depends on the window this batch did not read — "
+            "and it is the same timestamp the batch read, not a different one",
         )
+
+    async def test_a_window_claimed_during_the_fetch_is_left_open(self):
+        """The other closing site: a fetch that comes back empty also reports a read.
+
+        Its distance from the snapshot is a membership check plus a REST round trip. It
+        used to clear unconditionally, which is the same defect one `await` earlier.
+        """
+        connector = _make_connector()
+        sub = connector._rooms["room-1"]
+        sub.last_processed_ts = "100"
+        connector._ws.subscription_statuses = {}
+        connector._rest.is_room_member = AsyncMock(return_value=True)
+
+        async def _empty_page(*a, **kw):
+            sub.claim_boundary(sub.last_processed_ts, _just_before("400"))
+            return _page([])
+
+        connector._rest.get_room_history_page = _empty_page
+        await connector._snapshot_replay_boundaries()
+
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "INFO"):
+            await connector._on_ws_reconnect()
+
+        self.assertEqual(
+            sub.replay_boundary, "100",
+            "the fetch read the window it came in for, not the one claimed after it",
+        )
+
+    async def test_an_empty_fetch_still_closes_its_own_window(self):
+        """The near miss for the branch above: never closing leaves it open for good."""
+        connector = _make_connector()
+        connector._rooms["room-1"].last_processed_ts = "100"
+        connector._ws.subscription_statuses = {}
+        connector._rest.is_room_member = AsyncMock(return_value=True)
+        connector._rest.get_room_history_page = AsyncMock(return_value=_page([]))
+
+        await connector._snapshot_replay_boundaries()
+        await connector._on_ws_reconnect()
+
+        self.assertIsNone(connector._rooms["room-1"].replay_boundary)
 
     async def test_its_own_window_is_still_closed(self):
         """The near miss: never clearing would leave every window open for good."""
@@ -3966,6 +4018,57 @@ class TestABatchClearsOnlyTheWindowItRead(unittest.IsolatedAsyncioTestCase):
         await connector._on_ws_reconnect()
 
         self.assertIsNone(connector._rooms["room-1"].replay_boundary)
+
+
+class TestBoundaryClaims(unittest.TestCase):
+    """The two methods on their own, because the count is the part that carries the rule."""
+
+    def _sub(self):
+        from gateway.connectors.rocketchat.connector import _RoomSubscription
+        from gateway.core.connector import Room
+
+        return _RoomSubscription(room=Room(id="r", name="r"))
+
+    def test_an_open_window_is_never_narrowed(self):
+        sub = self._sub()
+        sub.claim_boundary("100")
+        sub.claim_boundary("400")
+        self.assertEqual(sub.replay_boundary, "100", "the older mark covers both windows")
+
+    def test_a_second_claim_counts_even_at_the_same_value(self):
+        sub = self._sub()
+        first = sub.claim_boundary("100")
+        second = sub.claim_boundary("100")
+        self.assertNotEqual(
+            first, second,
+            "two claimants wanting the same timestamp is the case the value cannot see",
+        )
+
+    def test_a_claim_with_nothing_to_point_at_writes_nothing(self):
+        sub = self._sub()
+        self.assertEqual(sub.claim_boundary(None, ""), 0)
+        self.assertIsNone(sub.replay_boundary)
+
+    def test_discharge_refuses_once_someone_else_has_claimed(self):
+        sub = self._sub()
+        at_entry = sub.claim_boundary("100")
+        sub.claim_boundary("100")
+        self.assertFalse(sub.discharge_boundary(at_entry))
+        self.assertEqual(sub.replay_boundary, "100")
+
+    def test_discharge_closes_the_window_it_read(self):
+        sub = self._sub()
+        at_entry = sub.claim_boundary("100")
+        self.assertTrue(sub.discharge_boundary(at_entry))
+        self.assertIsNone(sub.replay_boundary)
+        self.assertEqual(sub.boundary_claims, 0, "a closed window owes nobody a read")
+
+    def test_leaving_the_room_discharges_every_claim(self):
+        sub = self._sub()
+        sub.claim_boundary("100")
+        sub.left_the_room()
+        self.assertIsNone(sub.replay_boundary)
+        self.assertEqual(sub.boundary_claims, 0)
 
 
 class TestAWatermarkNeverMovesBackwards(unittest.IsolatedAsyncioTestCase):
