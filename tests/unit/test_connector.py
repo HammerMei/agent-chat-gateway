@@ -3607,7 +3607,7 @@ class TestHandingAMessageBackReturnsItsTurn(unittest.IsolatedAsyncioTestCase):
 
         return FilterResult(
             accepted=True, sender="agent-a", msg_ts="200", reason="",
-            is_agent_chain=True, agent_chain_turn=turn,
+            is_agent_chain=True, agent_chain_turn=turn, agent_chain_token=turn,
         )
 
     async def test_a_replayed_preflight_rejection_returns_the_turn(self):
@@ -3682,3 +3682,81 @@ class TestHandingAMessageBackReturnsItsTurn(unittest.IsolatedAsyncioTestCase):
             )
 
         connector._turn_store.release_turn.assert_not_called()
+
+
+class TestTheMessageThatCreatedTheWatcherIsDelivered(unittest.IsolatedAsyncioTestCase):
+    """Offering a room is not delivering a message.
+
+    A brand-new room has no watermark for a replay to fetch from, and the per-room
+    callback is registered *after* the frame was routed here — so without an explicit
+    delivery, the message that caused the watcher to exist is the one message it never
+    sees, and its sender waits for an answer that needs a second message to arrive.
+    """
+
+    def _connector(self):
+        connector = _make_connector()
+        connector._config.require_mention = False
+        connector._config.filter_sender = False
+        connector._handler = AsyncMock(return_value=True)
+        return connector
+
+    def _frame(self, rid="new-room"):
+        return (
+            {"_id": "m1", "rid": rid, "msg": "hi", "u": {"username": "alice"},
+             "ts": {"$date": 500}},
+            {"roomParticipant": True, "roomType": "c", "roomName": "general"},
+        )
+
+    async def test_the_trigger_is_dispatched_after_the_watcher_exists(self):
+        from gateway.connectors.rocketchat.connector import _RoomSubscription
+        from gateway.core.connector import Room
+
+        connector = self._connector()
+        dispatched: list[str] = []
+        connector._on_raw_ddp_message = AsyncMock(
+            side_effect=lambda rid, doc, **kw: dispatched.append(doc["_id"]) or True
+        )
+
+        async def _router(room):
+            # what creating a watcher does to the connector
+            connector._rooms[room.id] = _RoomSubscription(
+                room=Room(id=room.id, name="general", type="channel"))
+
+        connector.register_router(_router)
+        doc, access = self._frame()
+        await connector._on_unrouted_message(doc, access)
+
+        self.assertEqual(
+            dispatched, ["m1"],
+            "the message that created the watcher must reach it",
+        )
+
+    async def test_a_failed_creation_dispatches_nothing(self):
+        """The near miss: delivering into a room with no watcher would be dropped as
+        unknown and would hide the creation failure."""
+        connector = self._connector()
+        connector._on_raw_ddp_message = AsyncMock(return_value=True)
+
+        async def _router(room):
+            raise RuntimeError("creation failed")
+
+        connector.register_router(_router)
+        doc, access = self._frame()
+        await connector._on_unrouted_message(doc, access)
+
+        connector._on_raw_ddp_message.assert_not_awaited()
+
+    async def test_a_frame_for_a_room_created_meanwhile_is_delivered_not_reoffered(self):
+        """The other half: a frame routed here before the watcher existed, arriving after
+        it does. Nobody else will deliver it — the callback was registered after this
+        frame had already been routed."""
+        connector = self._connector()
+        offered: list[str] = []
+        connector.register_router(lambda room: offered.append(room.id) or _noop())
+        connector._on_raw_ddp_message = AsyncMock(return_value=True)
+
+        doc, access = self._frame(rid="room-1")   # already tracked by the fixture
+        await connector._on_unrouted_message(doc, access)
+
+        self.assertEqual(offered, [], "a tracked room is not offered again")
+        connector._on_raw_ddp_message.assert_awaited_once()

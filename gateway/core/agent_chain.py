@@ -74,6 +74,14 @@ class _TurnContext:
     # produced it, because a reset starts the next count at one again — so a delivery
     # still in flight would match a turn that belongs to someone else. See `release_turn`.
     generation: int = 0
+    # Monotonic within a generation: the token handed to each increment. `turns` is the
+    # *live* count and moves in both directions, so it cannot name a delivery — two
+    # overlapping deliveries would be told "you took turn 2" if one released in between.
+    issued: int = 0
+    # Tokens already given back, so a repeated release is a no-op rather than a second
+    # decrement, and an earlier delivery can still release after a later one has taken
+    # its turn.
+    released: set = field(default_factory=set)
 
 
 class TurnStore:
@@ -130,8 +138,13 @@ class TurnStore:
         """Check turn budget and increment if allowed.
 
         Returns:
-            (allowed, current_turn_after_increment)
-            allowed=False means the message should be dropped.
+            (allowed, current_turn_after_increment, token)
+
+            `allowed=False` means the message should be dropped, and the token is 0.
+            The token names *this* increment and is what `release_turn` needs: the turn
+            number cannot, because it is the live count and moves in both directions —
+            two overlapping deliveries would both be told "turn 2" if one released in
+            between.
         """
         self._gc()
         key = self._key(room_id, thread_id, sender)
@@ -141,18 +154,19 @@ class TurnStore:
             self._store[key] = ctx
 
         if ctx.turns >= max_turns:
-            return False, ctx.turns
+            return False, ctx.turns, 0
 
         ctx.turns += 1
+        ctx.issued += 1
         ctx.last_updated = time.monotonic()
-        return True, ctx.turns
+        return True, ctx.turns, ctx.issued
 
     def release_turn(
         self,
         room_id: str,
         thread_id: str | None,
         sender: str,
-        taken_turn: int,
+        token: int,
         generation: int,
     ) -> int:
         """Give back a turn taken by `check_and_increment` for a message not delivered.
@@ -164,29 +178,36 @@ class TurnStore:
         on a message that was never dispatched: the filter then rejects it as complete,
         the replay reports success, and the window closes over a message nobody saw.
 
-        `taken_turn` is the number `check_and_increment` returned to *this* delivery, and
-        the release happens only while the counter still stands there. Deliveries overlap
-        by design — replay and live traffic run concurrently — and in between, a human
-        message can reset the context and another agent message can start a fresh count.
-        An unconditional decrement would then take a turn away from a delivery that
-        succeeded, and the chain could run past `max_turns`: a burn incident rather than a
-        bookkeeping slip, which is why the check is on the value rather than on
-        `turns > 0`.
+        `token` is what `check_and_increment` handed *this* delivery. Deliveries overlap
+        by design — replay and live traffic run concurrently — so the release has to name
+        the increment it is undoing rather than the state it expects to find:
 
-        When the counter has moved on, the turn is simply not returned. That leaves the
-        budget marginally stricter than it needs to be, which is the safe direction: too
-        few turns costs one retryable message its budget slot, too many costs an unbounded
-        agent conversation.
+        * an unconditional decrement takes a turn from a delivery that succeeded, and the
+          chain can then run past `max_turns`;
+        * matching on the turn *number* fails the other way. A later delivery moves the
+          count past it, the release is refused, and the budget stays spent on a message
+          that was never sent — after which `check_and_increment` refuses the retry as
+          exhausted, the filter reports it complete, and the replay closes its window over
+          it. "Marginally stricter" is not the safe direction it looks like; it loses the
+          message.
+
+        The generation is still checked, because a reset makes every token of the previous
+        count meaningless and a fresh count reissues the same numbers.
         """
         key = self._key(room_id, thread_id, sender)
         ctx = self._store.get(key)
         if ctx is None:
             # Garbage-collected since this delivery took its turn; nothing of it remains.
             return 0
-        if ctx.generation != generation or ctx.turns != taken_turn:
-            # A reset started a fresh count (which begins at one again, so the turn number
-            # alone cannot tell them apart), or another delivery has taken a turn since.
+        if ctx.generation != generation:
+            # A reset started a fresh count. Nothing in it belongs to this delivery, and
+            # the numbers cannot say so on their own: a fresh count begins at one again.
             return ctx.turns
+        if token <= 0 or token > ctx.issued or token in ctx.released:
+            # Never issued here, or already given back. Either is a caller bug, and
+            # neither may take a turn from a delivery that is still using it.
+            return ctx.turns
+        ctx.released.add(token)
         ctx.turns -= 1
         ctx.last_updated = time.monotonic()
         return ctx.turns
@@ -210,6 +231,8 @@ class TurnStore:
         if ctx is not None:
             ctx.turns = 0
             ctx.generation += 1
+            ctx.issued = 0
+            ctx.released.clear()
             ctx.last_updated = time.monotonic()
         logger.debug("Agent chain counter reset for sender=%s thread=%s", sender, thread_id)
 
@@ -225,6 +248,8 @@ class TurnStore:
             ctx = self._store[k]
             ctx.turns = 0
             ctx.generation += 1
+            ctx.issued = 0
+            ctx.released.clear()
             ctx.last_updated = time.monotonic()
         if keys_to_remove:
             logger.debug(

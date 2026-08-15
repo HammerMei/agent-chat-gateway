@@ -703,17 +703,25 @@ class RocketChatConnector(Connector):
         if not room_id:
             return
         if room_id in self._rooms:
-            # Tracked already. The queue is bounded and the workers are a pool, so a frame
-            # can wait in it while the offer it would have duplicated completes and creates
-            # the room's watcher — by which time the reservation below has been released
-            # and would let this one through. The room being tracked is the durable answer
-            # the reservation is only a proxy for.
+            # Tracked now — so deliver it rather than offer it again. The frame reached
+            # this path because the room was untracked when it was routed here, and the
+            # watcher was created while it waited: the per-room callback that would have
+            # taken it was registered after the routing decision was made, so nobody else
+            # is going to deliver it. Returning here is how the message that arrived
+            # during a creation used to be lost.
+            await self._on_raw_ddp_message(room_id, doc, access=access)
             return
         if room_id in self._rooms_being_routed:
-            # Coalesced, not queued: the offer in flight is for this same room, and a
-            # second one would create a second watcher for it. Nothing is lost — offering a
-            # room does not deliver the message that prompted it, so the frame this call
-            # was handling was never going to be dispatched by anyone.
+            # An offer for this room is in flight and a second one would create a second
+            # watcher. This frame is dropped: the watcher does not exist yet, so there is
+            # nothing to deliver it to, and holding it would need a queue per room being
+            # created. The window is the duration of one creation, and the frames in it
+            # are the residue this coalescing costs — stated rather than implied, because
+            # the comment that used to be here called the loss "nothing".
+            logger.debug(
+                "Room %s is being created; dropping a frame that arrived during it",
+                room_id,
+            )
             return
         self._rooms_being_routed.add(room_id)
         try:
@@ -724,6 +732,20 @@ class RocketChatConnector(Connector):
                 await self._router(room)
             except Exception as e:
                 logger.error("Router failed for room %s: %s", room_id, e)
+                return
+            # The message that prompted the creation is delivered now, through the
+            # ordinary path. Offering a room is not delivering a message, and a brand-new
+            # room has no watermark for the replay to fetch it from later, so without this
+            # the message that caused the watcher to exist is the one message it never
+            # sees — and its sender waits for an answer that needs a second message to
+            # arrive.
+            #
+            # Through `_on_raw_ddp_message` rather than around it, so every gate that
+            # applies to a tracked room's message applies to this one: the mention gate,
+            # the sender policy, dedup, the capacity preflight. Creating a watcher and
+            # answering unprompted are separate decisions, and this keeps them separate.
+            if room_id in self._rooms:
+                await self._on_raw_ddp_message(room_id, doc, access=access)
         finally:
             # Released whatever happened. A room that failed to be offered must be
             # offerable again on its next message — holding the reservation would make one
@@ -1238,10 +1260,10 @@ class RocketChatConnector(Connector):
         One place, because there are two ways to hand a message back and they are the two
         that kept being fixed one at a time.
         """
-        if result.agent_chain_turn and self._turn_store is not None:
+        if result.agent_chain_token and self._turn_store is not None:
             remaining = self._turn_store.release_turn(
                 doc.get("rid", ""), doc.get("tmid") or None, result.sender,
-                result.agent_chain_turn, generation,
+                result.agent_chain_token, generation,
             )
             logger.debug(
                 "Released an agent-chain turn for %s (%s) — now at %d",
@@ -1384,7 +1406,7 @@ class RocketChatConnector(Connector):
         # giving the turn back.
         turn_generation = (
             self._turn_store.generation(room_id, doc.get("tmid") or None, result.sender)
-            if (result.agent_chain_turn and self._turn_store is not None)
+            if (result.agent_chain_token and self._turn_store is not None)
             else 0
         )
         if not result.accepted:

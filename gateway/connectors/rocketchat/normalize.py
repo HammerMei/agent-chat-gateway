@@ -63,6 +63,10 @@ class FilterResult:
     reason: str = ""  # debug only
     is_agent_chain: bool = False   # True when sender is a known ACG agent
     agent_chain_turn: int = 0      # current turn (1-based, after increment)
+    # Names the increment rather than counting it. `agent_chain_turn` is the live count
+    # and moves in both directions, so it cannot identify a delivery; releasing a turn
+    # needs this. Zero when no turn was taken.
+    agent_chain_token: int = 0
     agent_chain_max_turns: int = 5  # from config
 
 
@@ -174,8 +178,9 @@ def filter_rc_message(
     # 5. Agent chain turn budget (only for agent senders) — state mutation only
     #    after dedup confirms this is a fresh, previously-unseen message.
     agent_chain_turn = 0
+    agent_chain_token = 0
     if is_agent and turn_store is not None:
-        allowed, agent_chain_turn = turn_store.check_and_increment(
+        allowed, agent_chain_turn, agent_chain_token = turn_store.check_and_increment(
             room_id=doc.get("rid", ""),
             thread_id=doc.get("tmid") or None,
             sender=sender,
@@ -206,6 +211,7 @@ def filter_rc_message(
         msg_ts=msg_ts,
         is_agent_chain=is_agent,
         agent_chain_turn=agent_chain_turn,
+        agent_chain_token=agent_chain_token,
         agent_chain_max_turns=config.agent_chain.max_turns,
     )
 

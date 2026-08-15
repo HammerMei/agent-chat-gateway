@@ -176,7 +176,9 @@ def filter_mm_message(
     # 5. Agent chain turn budget
     agent_chain_turn = 0
     if is_agent and turn_store is not None:
-        allowed, agent_chain_turn = turn_store.check_and_increment(
+        # The token is what a release would need; Mattermost has no path that hands a
+        # message back, so it is discarded here rather than carried.
+        allowed, agent_chain_turn, _token = turn_store.check_and_increment(
             room_id=post.get("channel_id", ""),
             thread_id=post.get("root_id") or None,
             sender=sender_username,

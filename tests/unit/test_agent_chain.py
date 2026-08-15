@@ -83,11 +83,11 @@ def _make_doc(
 class TestTurnStore(unittest.TestCase):
     def test_check_and_increment_within_budget(self):
         store = TurnStore()
-        allowed, turn = store.check_and_increment("room1", None, "agentA", max_turns=5)
+        allowed, turn, _tok = store.check_and_increment("room1", None, "agentA", max_turns=5)
         self.assertTrue(allowed)
         self.assertEqual(turn, 1)
 
-        allowed2, turn2 = store.check_and_increment("room1", None, "agentA", max_turns=5)
+        allowed2, turn2, _tok = store.check_and_increment("room1", None, "agentA", max_turns=5)
         self.assertTrue(allowed2)
         self.assertEqual(turn2, 2)
 
@@ -96,7 +96,7 @@ class TestTurnStore(unittest.TestCase):
         for _ in range(3):
             store.check_and_increment("room1", None, "agentA", max_turns=3)
 
-        allowed, turn = store.check_and_increment("room1", None, "agentA", max_turns=3)
+        allowed, turn, _tok = store.check_and_increment("room1", None, "agentA", max_turns=3)
         self.assertFalse(allowed)
         self.assertEqual(turn, 3)  # current count (not incremented)
 
@@ -107,7 +107,7 @@ class TestTurnStore(unittest.TestCase):
 
         store.reset_sender("room1", None, "agentA")
 
-        allowed, turn = store.check_and_increment("room1", None, "agentA", max_turns=3)
+        allowed, turn, _tok = store.check_and_increment("room1", None, "agentA", max_turns=3)
         self.assertTrue(allowed)
         self.assertEqual(turn, 1)
 
@@ -399,13 +399,13 @@ class TestReleasingATurnTakenByAMessageNotDelivered(unittest.TestCase):
         self.store = TurnStore()
 
     def test_a_released_turn_is_available_again(self):
-        allowed, turn = self.store.check_and_increment("r1", None, "agent-a", max_turns=2)
+        allowed, turn, _tok = self.store.check_and_increment("r1", None, "agent-a", max_turns=2)
         self.assertTrue(allowed)
         self.assertEqual(turn, 1)
 
         self.assertEqual(self.store.release_turn("r1", None, "agent-a", turn, 0), 0)
 
-        allowed, turn = self.store.check_and_increment("r1", None, "agent-a", max_turns=2)
+        allowed, turn, _tok = self.store.check_and_increment("r1", None, "agent-a", max_turns=2)
         self.assertTrue(allowed)
         self.assertEqual(turn, 1, "the retry takes the same turn, not the next one")
 
@@ -413,38 +413,71 @@ class TestReleasingATurnTakenByAMessageNotDelivered(unittest.TestCase):
         """The scenario, in the small: the same document retried more times than the
         budget allows must still be deliverable."""
         for _ in range(5):
-            allowed, taken = self.store.check_and_increment(
+            allowed, _, tok = self.store.check_and_increment(
                 "r1", None, "agent-a", max_turns=2)
             self.assertTrue(allowed, "a retried message must never be refused for budget")
-            self.store.release_turn("r1", None, "agent-a", taken, 0)
+            self.store.release_turn("r1", None, "agent-a", tok, 0)
 
-        allowed, turn = self.store.check_and_increment("r1", None, "agent-a", max_turns=2)
+        allowed, turn, _tok = self.store.check_and_increment("r1", None, "agent-a", max_turns=2)
         self.assertTrue(allowed)
         self.assertEqual(turn, 1)
 
     def test_a_second_release_of_the_same_turn_does_nothing(self):
         """A caller bug must not corrupt the counter — the second release no longer owns
         the number it names."""
-        _, taken = self.store.check_and_increment("r1", None, "agent-a", max_turns=2)
+        _, taken, _tok = self.store.check_and_increment("r1", None, "agent-a", max_turns=2)
         self.store.release_turn("r1", None, "agent-a", taken, 0)
         self.store.release_turn("r1", None, "agent-a", taken, 0)
 
         self.assertEqual(self.store.current_turns("r1", None, "agent-a"), 0)
 
-    def test_a_turn_taken_by_someone_else_is_not_released(self):
-        """Deliveries overlap by design. A release that no longer owns the counter must
-        leave it alone: taking a turn away from a delivery that succeeded would let the
-        chain run past `max_turns`, which is a burn incident rather than a slip."""
+    def test_an_earlier_delivery_can_release_after_a_later_one_took_its_turn(self):
+        """Overlapping deliveries, no reset — and the earlier one must still be able to
+        hand its turn back.
+
+        This assertion used to say the opposite, on the reasoning that a moved counter
+        meant the release no longer owned anything. That reasoning loses the message: the
+        budget stays spent on something never sent, `check_and_increment` then refuses the
+        retry as exhausted, the filter reports it complete, and the replay closes its
+        window over it. A turn is owned by the delivery that took it, not by the position
+        of the count.
+        """
         gen = self.store.generation("r1", None, "agent-a")
-        _, mine = self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
-        self.store.check_and_increment("r1", None, "agent-a", max_turns=5)  # a second one
+        _, _, mine = self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
+        self.store.check_and_increment("r1", None, "agent-a", max_turns=5)  # a later one
 
         self.store.release_turn("r1", None, "agent-a", mine, gen)
 
         self.assertEqual(
-            self.store.current_turns("r1", None, "agent-a"), 2,
-            "the second delivery's turn is not mine to give back",
+            self.store.current_turns("r1", None, "agent-a"), 1,
+            "the later delivery keeps its turn; only the earlier one is given back",
         )
+
+    def test_a_released_token_cannot_be_released_twice(self):
+        gen = self.store.generation("r1", None, "agent-a")
+        _, _, mine = self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
+        self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
+
+        self.store.release_turn("r1", None, "agent-a", mine, gen)
+        self.store.release_turn("r1", None, "agent-a", mine, gen)
+
+        self.assertEqual(self.store.current_turns("r1", None, "agent-a"), 1)
+
+    def test_a_budget_full_of_handed_back_turns_still_admits_a_retry(self):
+        """The failure the finding describes, end to end: every turn taken and handed
+        back, then a retry must still be allowed."""
+        gen = self.store.generation("r1", None, "agent-a")
+        tokens = []
+        for _ in range(2):
+            allowed, _, tok = self.store.check_and_increment(
+                "r1", None, "agent-a", max_turns=2)
+            self.assertTrue(allowed)
+            tokens.append(tok)
+        for tok in tokens:
+            self.store.release_turn("r1", None, "agent-a", tok, gen)
+
+        allowed, _, _ = self.store.check_and_increment("r1", None, "agent-a", max_turns=2)
+        self.assertTrue(allowed, "a budget spent only on undelivered messages is not spent")
 
     def test_a_reset_between_take_and_release_is_respected(self):
         """The case a turn number alone cannot see.
@@ -454,11 +487,11 @@ class TestReleasingATurnTakenByAMessageNotDelivered(unittest.TestCase):
         are deliberately identical here; only the generation separates them.
         """
         gen = self.store.generation("r1", None, "agent-a")
-        _, mine = self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
+        _, mine, _tok = self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
         self.assertEqual(mine, 1)
 
         self.store.reset_all("r1", None)                       # a human spoke
-        _, theirs = self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
+        _, theirs, _tok = self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
         self.assertEqual(theirs, 1, "the fresh count starts at the same number")
 
         self.store.release_turn("r1", None, "agent-a", mine, gen)
@@ -472,7 +505,7 @@ class TestReleasingATurnTakenByAMessageNotDelivered(unittest.TestCase):
     def test_a_sender_reset_between_take_and_release_is_respected(self):
         """`reset_sender` is the other reset, and it had the same hole."""
         gen = self.store.generation("r1", None, "agent-a")
-        _, mine = self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
+        _, mine, _tok = self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
 
         self.store.reset_sender("r1", None, "agent-a")
         self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
@@ -487,10 +520,10 @@ class TestReleasingATurnTakenByAMessageNotDelivered(unittest.TestCase):
     def test_a_delivered_turn_is_not_released(self):
         """The near miss: releasing unconditionally would make the budget unenforceable."""
         for expected in (1, 2):
-            allowed, turn = self.store.check_and_increment(
+            allowed, turn, _tok = self.store.check_and_increment(
                 "r1", None, "agent-a", max_turns=2)
             self.assertTrue(allowed)
             self.assertEqual(turn, expected)
 
-        allowed, _ = self.store.check_and_increment("r1", None, "agent-a", max_turns=2)
+        allowed, _, _tok = self.store.check_and_increment("r1", None, "agent-a", max_turns=2)
         self.assertFalse(allowed, "the budget still stops a genuine chain")
