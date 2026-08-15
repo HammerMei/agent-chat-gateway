@@ -112,7 +112,13 @@ class _RoomSubscription:
           cannot reach a replay or a dispatch holding its own copy of them.
         """
         self.replay_boundary = None
-        self.last_processed_ts = None
+        # `""`, not `None`, and the difference is what survives a restart. Both are falsy
+        # everywhere this value is read, but the lifecycle's save step only copies the
+        # connector's watermark when it has an opinion — `None` means "this room had no
+        # activity in this run, keep what is on disk", which is right for a quiet room and
+        # exactly wrong here. Empty says "cleared on purpose", so the stored record is
+        # overwritten and a restart cannot hand the pre-removal mark back.
+        self.last_processed_ts = ""
         self.membership_epoch += 1
 
     def remember(self, msg_id: str) -> None:
@@ -856,11 +862,27 @@ class RocketChatConnector(Connector):
             else:
                 await self._ws.subscribe_room(room.id, self._make_ddp_callback(room.id))
         except Exception:
-            # DDP subscription failed — roll back the connector-level state so
-            # there is no dangling entry with a refcount of 1 and no live subscription.
+            # DDP subscription failed — roll back the connector-level state so there is no
+            # dangling entry with a refcount of 1 and no live subscription. Only this call
+            # can be here: the already-subscribed branch above returns before the transport
+            # is touched, so a failure always belongs to the watcher that created the room.
             self._rooms.pop(room.id, None)
             self._watcher_contexts.pop(room.id, None)
             self._room_refcount.pop(room.id, None)
+            # And the transport's state with it. A concurrent recovery can install its own
+            # subscription for this room and release this one — which is what made the
+            # await raise — and the transport's own rollback deliberately leaves a
+            # successor it does not own alone. Without this the successor goes on
+            # delivering into a room the connector has just forgotten: dropped as unknown,
+            # and never offered to the router either, because a registered callback keeps
+            # those frames off the routing path.
+            try:
+                await self._ws.unsubscribe_room(room.id)
+            except Exception as cleanup_error:
+                logger.warning(
+                    "Room '%s': could not release the transport state of a failed "
+                    "subscription: %s", room.name, cleanup_error,
+                )
             raise
 
         logger.info(

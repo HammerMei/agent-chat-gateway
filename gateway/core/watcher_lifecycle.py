@@ -810,7 +810,13 @@ class WatcherLifecycle:
         # room entry it lives in — the unsubscribe below pops that entry.
         if state and state.room_id:
             live_ts = self._connector.get_last_processed_ts(state.room_id)
-            if live_ts:
+            # `is not None`, so a connector that has *cleared* its watermark can say so.
+            # `None` still means "no opinion — this room saw no activity in this run", and
+            # must not erase what is on disk. An empty string is an opinion: a connector
+            # that learned this account is no longer in the room clears the mark precisely
+            # so a later re-add cannot replay the interval it was absent for, and a save
+            # that skipped it would hand that mark straight back on the next start.
+            if live_ts is not None:
                 state.last_processed_ts = live_ts
 
         # Step 3: Unsubscribe from the connector (stop delivery for this room).

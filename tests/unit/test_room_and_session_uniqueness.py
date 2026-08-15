@@ -467,3 +467,73 @@ class TestSeenIdsStayBounded(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAClearedWatermarkSurvivesToDisk(unittest.IsolatedAsyncioTestCase):
+    """A connector that has cleared its watermark on purpose must be able to say so.
+
+    The save step copies the connector's live watermark, and it used to copy it only when
+    truthy — so "this account was removed, forget the mark" was indistinguishable from
+    "this room saw no activity in this run, keep what is on disk". The stale pre-removal
+    value then came back at the next start, and a later re-add replayed the interval the
+    account was not a member for.
+    """
+
+    def _lifecycle(self, live_ts):
+        from unittest.mock import AsyncMock
+
+        from gateway.core.watcher_lifecycle import WatcherLifecycle
+
+        lc = WatcherLifecycle.__new__(WatcherLifecycle)
+        lc._processors = {}
+        lc._states = {}
+        lc._dispatcher = MagicMock()
+        lc._permission_registry = MagicMock()
+        lc._maps = MagicMock()
+        lc._injector = MagicMock()
+        lc._watcher_locks = {}
+        connector = MagicMock()
+        connector.get_last_processed_ts = MagicMock(return_value=live_ts)
+        connector.unsubscribe_room = AsyncMock()
+        lc._connector = connector
+        return lc
+
+    def _state(self):
+        from gateway.core.state import WatcherState
+
+        return WatcherState(
+            watcher_name="w1", session_id="s1", room_id="room-1",
+            last_processed_ts="100",
+        )
+
+    async def test_a_deliberate_clear_erases_the_stored_mark(self):
+        lc = self._lifecycle(live_ts="")
+        state = self._state()
+
+        lc._states["w1"] = state
+        await lc._stop_processor("w1")
+
+        self.assertEqual(
+            state.last_processed_ts, "",
+            "the removal has to reach the record, or a restart hands the mark back",
+        )
+
+    async def test_no_opinion_leaves_the_stored_mark_alone(self):
+        """The near miss: a quiet room reports `None`, and erasing on that would lose the
+        outage window across every restart."""
+        lc = self._lifecycle(live_ts=None)
+        state = self._state()
+
+        lc._states["w1"] = state
+        await lc._stop_processor("w1")
+
+        self.assertEqual(state.last_processed_ts, "100")
+
+    async def test_a_live_watermark_is_still_copied(self):
+        lc = self._lifecycle(live_ts="900")
+        state = self._state()
+
+        lc._states["w1"] = state
+        await lc._stop_processor("w1")
+
+        self.assertEqual(state.last_processed_ts, "900")

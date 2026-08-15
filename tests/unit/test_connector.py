@@ -60,6 +60,7 @@ def _make_connector():
     from gateway.connectors.rocketchat.connector import (
         RocketChatConnector,
         _RoomSubscription,
+        _WatcherRoomContext,
     )
     from gateway.core.connector import Room
 
@@ -88,7 +89,12 @@ def _make_connector():
     connector._attachments_cache_base = Path("/tmp/test-cache")
     room = Room(id="room-1", name="general", type="channel")
     connector._rooms["room-1"] = _RoomSubscription(room=room, last_processed_ts=None)
-    connector._watcher_contexts["room-1"] = []
+    # The room's sibling bookkeeping, which `subscribe_room` maintains together with the
+    # entry itself. A fixture that sets the entry and leaves the refcount empty describes
+    # a room no code path could have produced, and the first test to take the
+    # already-subscribed branch finds out — by KeyError, several layers from the cause.
+    connector._watcher_contexts["room-1"] = [_WatcherRoomContext(watcher_id="w1")]
+    connector._room_refcount["room-1"] = 1
     connector._turn_store = None  # no agent chain configured
 
     return connector
@@ -2807,7 +2813,7 @@ class TestARemovalDropsTheFallbackBoundaryToo(unittest.IsolatedAsyncioTestCase):
 
         sub = connector._rooms["room-1"]
         self.assertIsNone(sub.replay_boundary)
-        self.assertIsNone(sub.last_processed_ts)
+        self.assertEqual(sub.last_processed_ts, "")
 
     async def test_a_reconnect_before_any_new_message_replays_nothing(self):
         """The exact interleaving: re-added, then a reconnect that beats the first live
@@ -2860,7 +2866,7 @@ class TestTheLiveGateClosesTheReplayWindowToo(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(handled, "a rejected message is finished with, not owed a retry")
         self.assertIsNone(sub.replay_boundary)
-        self.assertIsNone(sub.last_processed_ts)
+        self.assertEqual(sub.last_processed_ts, "")
         self.assertEqual(
             sub.membership_epoch, 1,
             "clearing the marks cannot reach a replay already holding a snapshot of "
@@ -3200,7 +3206,7 @@ class TestAReplayStopsWhenMembershipIsRevokedUnderIt(unittest.IsolatedAsyncioTes
             await connector._on_ws_reconnect()
 
         self.assertEqual(len(handled), 2)
-        self.assertIsNone(
+        self.assertFalse(
             sub.last_processed_ts,
             "the dispatch in flight when the removal fired must not commit its mark",
         )
@@ -3402,7 +3408,11 @@ class TestEveryRemovalSiteRecordsTheSameThing(unittest.IsolatedAsyncioTestCase):
 
     def _assert_left(self, sub, before_epoch):
         self.assertIsNone(sub.replay_boundary, "the window is not owed to anyone now")
-        self.assertIsNone(sub.last_processed_ts, "the fallback boundary goes with it")
+        self.assertEqual(
+            sub.last_processed_ts, "",
+            "cleared on purpose, which is not the same as never having had one — the "
+            "difference is what the lifecycle's save step reads",
+        )
         self.assertEqual(
             sub.membership_epoch, before_epoch + 1,
             "work already in flight cannot see cleared marks — only the epoch",
@@ -3449,3 +3459,48 @@ class TestEveryRemovalSiteRecordsTheSameThing(unittest.IsolatedAsyncioTestCase):
             "clearing the fallback boundary by hand is how the epoch gets forgotten — "
             "call `left_the_room()`",
         )
+
+
+class TestAFailedSubscribeReleasesTheTransportToo(unittest.IsolatedAsyncioTestCase):
+    """The connector's rollback has to reach the layer below it.
+
+    A recovery installing its own subscription for this room releases this one, and that
+    release is what makes the await raise — while the transport's own rollback
+    deliberately leaves the successor alone, because it does not own it. So the successor
+    survives with its callback registered, delivering into a room the connector has just
+    forgotten: dropped as unknown, and never offered to the router either, since a
+    registered callback keeps those frames off the routing path.
+    """
+
+    async def test_the_room_is_released_at_the_transport_as_well(self):
+        from gateway.core.connector import Room
+
+        connector = _make_connector()
+        connector._ws.stream_active = False
+        connector._ws.subscribe_room = AsyncMock(side_effect=RuntimeError("released"))
+        connector._ws.unsubscribe_room = AsyncMock()
+
+        room = Room(id="brand-new", name="other", type="channel")
+        with self.assertRaises(RuntimeError):
+            await connector.subscribe_room(room, watcher_id="w9", working_directory="/tmp")
+
+        self.assertNotIn("brand-new", connector._rooms)
+        connector._ws.unsubscribe_room.assert_awaited_once_with("brand-new")
+
+    async def test_a_transport_cleanup_failure_does_not_mask_the_original(self):
+        """The near miss: the caller has to see why the subscription failed, not why the
+        cleanup after it did."""
+        from gateway.core.connector import Room
+
+        connector = _make_connector()
+        connector._ws.stream_active = False
+        connector._ws.subscribe_room = AsyncMock(side_effect=RuntimeError("released"))
+        connector._ws.unsubscribe_room = AsyncMock(side_effect=RuntimeError("also down"))
+
+        room = Room(id="brand-new", name="other", type="channel")
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
+            with self.assertRaises(RuntimeError) as caught:
+                await connector.subscribe_room(
+                    room, watcher_id="w9", working_directory="/tmp")
+
+        self.assertIn("released", str(caught.exception))
