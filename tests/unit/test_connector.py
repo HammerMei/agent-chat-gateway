@@ -3863,3 +3863,186 @@ class TestTheRouterIsToldWhatTriggeredTheOffer(unittest.IsolatedAsyncioTestCase)
             seen, [("new-room", "trigger-1", {"$date": 500})],
             "the creation path needs the id and the timestamp to bound its history fetch",
         )
+
+
+class TestARetryBoundaryIsBelowTheMessageItBringsBack(unittest.IsolatedAsyncioTestCase):
+    """A boundary equal to the message fetches it and then throws it away.
+
+    The replay hands its boundary to the filter as `last_processed_ts`, and the filter
+    rejects `msg_ts <= last_ts` as already processed. So the fetch is inclusive and the
+    filter is not, and a boundary set to the message's own timestamp changes nothing at
+    all — which is what the previous version of this did.
+    """
+
+    async def test_the_boundary_is_strictly_below_the_rejected_message(self):
+        connector = _make_connector()
+        connector._config.require_mention = False
+        connector._handler = AsyncMock(return_value=False)       # queue full
+        sub = connector._rooms["room-1"]
+        sub.last_processed_ts = None
+        sub.replay_boundary = None
+
+        await connector._on_raw_ddp_message(
+            "room-1",
+            {"_id": "m1", "msg": "hi", "u": {"username": "alice"},
+             "ts": {"$date": 500}},
+        )
+
+        self.assertEqual(sub.replay_boundary, "499")
+
+    async def test_the_message_survives_the_filter_on_the_retry(self):
+        """The behaviour the boundary exists for, through the real filter."""
+        from gateway.connectors.rocketchat.normalize import filter_rc_message
+
+        connector = _make_connector()
+        connector._config.require_mention = False
+        doc = {"_id": "m1", "msg": "hi", "u": {"username": "alice"},
+               "ts": {"$date": 500}}
+
+        result = filter_rc_message(
+            doc=doc, config=connector._config, room_type="channel",
+            last_processed_ts="499",
+        )
+
+        self.assertTrue(
+            result.accepted,
+            "a boundary of 500 would make the retry ineligible at the filter",
+        )
+
+    async def test_an_unparseable_timestamp_is_left_alone(self):
+        """Better an unusable boundary than a fabricated one — the caller's alternative
+        is no boundary at all."""
+        from gateway.connectors.rocketchat.connector import _just_before
+
+        self.assertEqual(_just_before("not-a-time"), "not-a-time")
+        self.assertEqual(_just_before(""), "")
+
+
+class TestABatchClearsOnlyTheWindowItRead(unittest.IsolatedAsyncioTestCase):
+    """A live message can open a window while a replay batch is dispatching.
+
+    The batch succeeding says nothing about that message, and clearing its window loses
+    it: the next accepted message advances the watermark past it, and nothing points
+    below it any more.
+    """
+
+    async def test_a_window_replaced_mid_batch_is_left_open(self):
+        connector = _make_connector()
+        connector._rooms["room-1"].last_processed_ts = "100"
+        connector._ws.subscription_statuses = {}
+        connector._rest.is_room_member = AsyncMock(return_value=True)
+        connector._rest.get_room_history_page = AsyncMock(return_value=_page([
+            {"_id": "r1", "msg": "hi", "u": {"username": "alice"}, "ts": {"$date": 200}},
+        ]))
+        sub = connector._rooms["room-1"]
+
+        async def _dispatch(room_id, doc, **kw):
+            sub.replay_boundary = "50"      # a live hand-back opens its own window
+            return True
+
+        connector._on_raw_ddp_message = _dispatch
+        await connector._snapshot_replay_boundaries()
+
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "INFO"):
+            await connector._on_ws_reconnect()
+
+        self.assertEqual(
+            sub.replay_boundary, "50",
+            "the live message still depends on the window this batch did not read",
+        )
+
+    async def test_its_own_window_is_still_closed(self):
+        """The near miss: never clearing would leave every window open for good."""
+        connector = _make_connector()
+        connector._rooms["room-1"].last_processed_ts = "100"
+        connector._ws.subscription_statuses = {}
+        connector._rest.is_room_member = AsyncMock(return_value=True)
+        connector._rest.get_room_history_page = AsyncMock(return_value=_page([
+            {"_id": "r1", "msg": "hi", "u": {"username": "alice"}, "ts": {"$date": 200}},
+        ]))
+        connector._on_raw_ddp_message = AsyncMock(return_value=True)
+
+        await connector._snapshot_replay_boundaries()
+        await connector._on_ws_reconnect()
+
+        self.assertIsNone(connector._rooms["room-1"].replay_boundary)
+
+
+class TestAWatermarkNeverMovesBackwards(unittest.IsolatedAsyncioTestCase):
+    """Replay and restored live delivery run at once, and the older one can finish last.
+
+    In memory the seen-id window hides a rewound cursor. Across a save and a restart it
+    does not, and history after the regressed cursor is dispatched a second time.
+    """
+
+    def _connector(self):
+        connector = _make_connector()
+        connector._config.require_mention = False
+        connector._handler = AsyncMock(return_value=True)
+        return connector
+
+    async def test_an_older_replay_completion_does_not_rewind_the_cursor(self):
+        connector = self._connector()
+        sub = connector._rooms["room-1"]
+        sub.last_processed_ts = "900"        # live traffic already got here
+
+        await connector._on_raw_ddp_message(
+            "room-1",
+            {"_id": "old", "msg": "hi", "u": {"username": "alice"},
+             "ts": {"$date": 200}},
+            is_replay=True, replay_after_ts="100",
+        )
+
+        self.assertEqual(sub.last_processed_ts, "900")
+
+    async def test_a_newer_message_still_advances_it(self):
+        connector = self._connector()
+        sub = connector._rooms["room-1"]
+        sub.last_processed_ts = "100"
+
+        await connector._on_raw_ddp_message(
+            "room-1",
+            {"_id": "new", "msg": "hi", "u": {"username": "alice"},
+             "ts": {"$date": 900}},
+        )
+
+        self.assertEqual(sub.last_processed_ts, "900")
+
+
+class TestAnOwnMessageIsRecognisedById(unittest.IsolatedAsyncioTestCase):
+    """Who someone is, not how their name is spelled — the same rule as `dm_members`."""
+
+    def _connector(self):
+        connector = _make_connector()
+        connector._config.filter_sender = False
+        connector._rest.user_id = "BOT_ID"
+        connector._rooms.clear()
+        self.offered = []
+        connector.register_router(
+            AsyncMock(side_effect=lambda room, trigger: self.offered.append(room)))
+        return connector
+
+    async def test_an_own_post_is_not_offered_when_the_casing_differs(self):
+        connector = self._connector()
+
+        await connector._on_unrouted_message(
+            {"_id": "m1", "rid": "new-room", "msg": "hi",
+             "u": {"_id": "BOT_ID", "username": "Bot"}, "ts": {"$date": 1}},
+            {"roomParticipant": True, "roomType": "c", "roomName": "general"},
+        )
+
+        self.assertEqual(
+            self.offered, [],
+            "its own message must not read as the user activity that creates a watcher",
+        )
+
+    async def test_a_real_user_is_still_offered(self):
+        connector = self._connector()
+
+        await connector._on_unrouted_message(
+            {"_id": "m1", "rid": "new-room", "msg": "hi",
+             "u": {"_id": "U1", "username": "alice"}, "ts": {"$date": 1}},
+            {"roomParticipant": True, "roomType": "c", "roomName": "general"},
+        )
+
+        self.assertEqual([r.id for r in self.offered], ["new-room"])

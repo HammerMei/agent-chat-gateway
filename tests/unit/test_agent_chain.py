@@ -579,3 +579,44 @@ class TestExpiryDoesNotReissueAnInFlightIdentity(unittest.TestCase):
         store.release_turn("r1", None, "agent-a", mine, gen)
 
         self.assertEqual(store.current_turns("r1", None, "agent-a"), 0)
+
+
+class TestGenerationTombstonesAreBounded(unittest.TestCase):
+    """The key includes a thread id, so "one per room" was never the bound.
+
+    A long-lived connector meets an unbounded number of threads, and a tombstone per
+    sender in each would outlive every context and defeat the reclamation the TTL exists
+    for. A tombstone only has to outlive a delivery still in flight.
+    """
+
+    def test_tombstones_do_not_accumulate_for_dead_threads(self):
+        import time as _time
+
+        from gateway.core.agent_chain import TurnStore
+
+        store = TurnStore(ttl_seconds=0.0)
+        for i in range(50):
+            store.check_and_increment("r1", f"thread-{i}", "agent-a", max_turns=5)
+
+        # Every context has expired, and so has every tombstone's grace period.
+        _time.sleep(0.01)
+        store.check_and_increment("r1", "thread-final", "agent-a", max_turns=5)
+
+        self.assertLessEqual(
+            len(store._generations), 2,
+            "a tombstone per thread, kept forever, is the leak this replaced",
+        )
+
+    def test_a_tombstone_survives_long_enough_to_matter(self):
+        """The near miss: pruning immediately would put the expiry hole straight back."""
+        from gateway.core.agent_chain import TurnStore
+
+        store = TurnStore(ttl_seconds=60.0)
+        gen = store.generation("r1", None, "agent-a")
+        _, _, mine = store.check_and_increment("r1", None, "agent-a", max_turns=5)
+        store.reset_all("r1", None)
+        store.check_and_increment("r1", None, "agent-a", max_turns=5)
+
+        store.release_turn("r1", None, "agent-a", mine, gen)
+
+        self.assertEqual(store.current_turns("r1", None, "agent-a"), 1)

@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ...agents.response import AgentEvent, AgentResponse
+from ...core.adapter_utils import ts_gt as _ts_gt
 from ...core.adapter_utils import ts_ms_to_iso_local, weekday_abbrev
 from ...core.bot_identity import (
     BotIdentity,
@@ -135,6 +136,24 @@ class _RoomSubscription:
         self.seen_ids.append(msg_id)
         if len(self.seen_ids) > _SEEN_IDS_MAXLEN:
             self.seen_ids_set.discard(self.seen_ids.popleft())
+
+
+def _just_before(ts: str) -> str:
+    """The largest timestamp strictly below `ts`, as a replay lower bound.
+
+    A replay boundary is handed to the filter as `last_processed_ts`, and the filter
+    rejects `msg_ts <= last_ts`. So a boundary *equal* to the message it exists to bring
+    back fetches it and then discards it — the boundary has to sit below it.
+
+    Rocket.Chat timestamps are epoch milliseconds (`normalize._extract_ts`), so one
+    millisecond below is exact rather than an epsilon. A value that will not parse is
+    returned unchanged: an unusable boundary is better than a fabricated one, and the
+    caller's alternative is no boundary at all.
+    """
+    try:
+        return str(int(float(ts)) - 1)
+    except (TypeError, ValueError):
+        return ts
 
 
 @dataclass
@@ -344,6 +363,13 @@ class RocketChatConnector(Connector):
             # subsequent rooms to advance their last_processed_ts.  If we read the
             # watermark inside the await we would use a newer ts that skips the
             # entire outage window for those rooms.
+            # Captured so the completion below can tell whether the window it is about to
+            # close is still the one it read. A live message rejected for capacity while
+            # this batch is dispatching opens or keeps a boundary of its own, and clearing
+            # that one on this batch's success loses the live message: the next accepted
+            # message advances the watermark past it and nothing points below it any more.
+            boundary_at_entry = sub.replay_boundary
+
             # The outage boundary if one was captured, and the live watermark only as a
             # fallback for a replay that no outage callback preceded. Cleared where the
             # history is actually read, not here — a replay that declines below (membership
@@ -540,8 +566,14 @@ class RocketChatConnector(Connector):
                 # hands the message back and forgets its id so a later replay can bring it
                 # back. Spending the boundary on a batch that contains one of those removes
                 # the only mark that could — the live watermark has moved past it by then.
-                if all_accepted:
+                if all_accepted and sub.replay_boundary == boundary_at_entry:
                     sub.replay_boundary = None
+                elif all_accepted:
+                    logger.info(
+                        "Room '%s': the outage window was replaced while this batch was "
+                        "being dispatched — leaving the newer one open",
+                        sub.room.name,
+                    )
                 else:
                     logger.warning(
                         "Room '%s': part of the replayed batch was handed back (queue "
@@ -704,7 +736,17 @@ class RocketChatConnector(Connector):
         if self._router is None or doc.get("t"):
             return
         sender = doc.get("u", {}).get("username", "")
-        if sender == self._config.username:
+        if doc.get("u", {}).get("_id") == self._rest.user_id or (
+            sender == self._config.username
+        ):
+            # By id first, and by name only as a fallback for frames that carry no id.
+            # A login whose canonical username differs in casing, or which is an alias,
+            # made the name test miss the account's own posts — and with sender filtering
+            # open, its own message in an untracked room then read as user activity and
+            # created a watcher for it. In a DM the replies that followed would skip the
+            # mention gate too, because a room typed `dm` does not have one.
+            #
+            # The same rule as `dm_members`: who someone is, not how their name is spelled.
             return
         if not access or not access.get("roomParticipant"):
             return
@@ -1606,11 +1648,19 @@ class RocketChatConnector(Connector):
             # replay skips a room whose window is falsy, and the next accepted message
             # advances the cursor past this one for good.
             #
-            # Its own timestamp is the right mark because the history fetch is inclusive
-            # of its lower bound (`inclusive=true` on `oldest`), so a window that starts
-            # here contains this message.
+            # One millisecond below this message, not its own timestamp. The fetch would
+            # include it either way — `oldest` is inclusive — but the replay hands the
+            # same boundary to the filter as `last_processed_ts`, and the filter rejects
+            # `msg_ts <= last_ts` as already processed. A boundary equal to the message
+            # therefore fetches it and then throws it away, which is a fix that changes
+            # nothing: the previous version of this line did exactly that.
+            #
+            # Rocket.Chat timestamps are epoch milliseconds, so "just below" is a real
+            # value rather than an approximation.
             sub.replay_boundary = (
-                sub.replay_boundary or sub.last_processed_ts or result.msg_ts
+                sub.replay_boundary
+                or sub.last_processed_ts
+                or _just_before(result.msg_ts)
             )
             # The one outcome that leaves this message pending: its id was just forgotten
             # precisely so a later replay can bring it back, and a boundary spent on a
@@ -1642,7 +1692,13 @@ class RocketChatConnector(Connector):
             )
             return True
 
-        sub.last_processed_ts = result.msg_ts
+        # Never backwards. Restored live delivery can accept a newer message while this
+        # replay is still awaiting normalization or a handler for an older fetched one,
+        # and an unconditional assignment then rewinds the cursor. In memory the seen-id
+        # window hides that; across a save and a restart it does not, and history after
+        # the regressed cursor is dispatched a second time.
+        if _ts_gt(result.msg_ts, sub.last_processed_ts or ""):
+            sub.last_processed_ts = result.msg_ts
         # msg_id was already added to seen_ids_set by the optimistic registration
         # block above (before the first await).  No second add needed here.
         return True

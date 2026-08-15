@@ -18,6 +18,11 @@ import logging
 import time
 from dataclasses import dataclass, field
 
+# How long a generation tombstone outlives the context it replaced, as a multiple of
+# the context TTL. It only has to cover a delivery still in flight when the context
+# expired; past that, keeping it costs more than the one turn it would protect.
+_TOMBSTONE_TTL_FACTOR = 2
+
 logger = logging.getLogger("agent-chat-gateway.core.agent_chain")
 
 # Sentinel the LLM outputs to self-terminate an agent chain turn.
@@ -114,9 +119,19 @@ class TurnStore:
         # once it goes quiet, and recreating it at generation zero would make an old
         # delivery's token match a fresh context — the reset case again, arriving through
         # expiry instead. Kept here, so the number a key has reached is never reused.
-        # One integer per (room, thread, sender) that has ever spoken; the keys are
-        # bounded by the rooms the gateway serves.
-        self._generations: dict[tuple[str, str | None, str], int] = {}
+        #
+        # `(generation, recorded_at)`, and pruned, because the key includes a **thread
+        # id**: a long-lived connector meets an unbounded number of threads, and one
+        # tombstone per sender in each would outlive every context and defeat the very
+        # reclamation the TTL exists for. An earlier comment here claimed these were
+        # bounded by the rooms served, which was wrong — threads are not rooms.
+        #
+        # A tombstone only has to outlive a delivery that is still in flight, so it is
+        # kept for `_TOMBSTONE_TTL_FACTOR` times the context TTL and then dropped. Beyond
+        # that the release it would have refused is one whose delivery has been running
+        # for hours; a wrongly-honoured release costs one turn, and an unbounded map costs
+        # the process.
+        self._generations: dict[tuple[str, str | None, str], tuple[int, float]] = {}
 
     # Key helpers
     @staticmethod
@@ -134,7 +149,10 @@ class TurnStore:
         """
         key = self._key(room_id, thread_id, sender)
         ctx = self._store.get(key)
-        return ctx.generation if ctx else self._generations.get(key, 0)
+        if ctx is not None:
+            return ctx.generation
+        remembered = self._generations.get(key)
+        return remembered[0] if remembered else 0
 
     def check_and_increment(
         self,
@@ -158,7 +176,8 @@ class TurnStore:
         key = self._key(room_id, thread_id, sender)
         ctx = self._store.get(key)
         if ctx is None:
-            ctx = _TurnContext(generation=self._generations.get(key, 0))
+            remembered = self._generations.get(key)
+            ctx = _TurnContext(generation=remembered[0] if remembered else 0)
             self._store[key] = ctx
 
         if ctx.turns >= max_turns:
@@ -242,7 +261,7 @@ class TurnStore:
             ctx.issued = 0
             ctx.released.clear()
             ctx.last_updated = time.monotonic()
-            self._generations[key] = ctx.generation
+            self._generations[key] = (ctx.generation, time.monotonic())
         logger.debug("Agent chain counter reset for sender=%s thread=%s", sender, thread_id)
 
     def reset_all(self, room_id: str, thread_id: str | None) -> None:
@@ -260,7 +279,7 @@ class TurnStore:
             ctx.issued = 0
             ctx.released.clear()
             ctx.last_updated = time.monotonic()
-            self._generations[k] = ctx.generation
+            self._generations[k] = (ctx.generation, time.monotonic())
         if keys_to_remove:
             logger.debug(
                 "Agent chain counters reset for room=%s thread=%s (%d entries)",
@@ -270,10 +289,16 @@ class TurnStore:
     def _gc(self) -> None:
         """Remove entries older than TTL."""
         now = time.monotonic()
+        stale_tombstones = [
+            k for k, (_gen, at) in self._generations.items()
+            if now - at > self._ttl * _TOMBSTONE_TTL_FACTOR
+        ]
+        for k in stale_tombstones:
+            del self._generations[k]
         expired = [k for k, v in self._store.items() if now - v.last_updated > self._ttl]
         for k in expired:
             # The generation is carried forward rather than dropped with the context. A
             # delivery can outlive the TTL — normalization and a handler are not bounded
             # by it — and its token must not match the context that replaces this one.
-            self._generations[k] = self._store[k].generation + 1
+            self._generations[k] = (self._store[k].generation + 1, now)
             del self._store[k]
