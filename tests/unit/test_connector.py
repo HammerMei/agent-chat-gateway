@@ -2818,3 +2818,90 @@ class TestARemovalDropsTheFallbackBoundaryToo(unittest.IsolatedAsyncioTestCase):
             await connector._on_ws_reconnect()
 
         self.assertEqual(connector._rooms["room-1"].last_processed_ts, "100")
+
+
+class TestTheLiveGateClosesTheReplayWindowToo(unittest.IsolatedAsyncioTestCase):
+    """The REST membership check and the live `roomParticipant` gate learn the same fact.
+
+    Only the REST one closed the window. An account re-added before any reconnect happened
+    would then have the next check see `True` and replay from the frozen pre-removal mark —
+    the whole interval it was not a member, none of which the 200-id window can suppress
+    because none of it was ever delivered.
+    """
+
+    async def test_a_live_rejection_closes_both_marks(self):
+        connector = _make_connector()
+        connector._handler = AsyncMock(return_value=True)
+        sub = connector._rooms["room-1"]
+        sub.last_processed_ts = "100"
+        sub.replay_boundary = "100"
+
+        handled = await connector._on_raw_ddp_message(
+            "room-1",
+            {"_id": "m9", "msg": "hi", "u": {"username": "alice"},
+             "ts": {"$date": 500}},
+            access={"roomParticipant": False},
+        )
+
+        self.assertTrue(handled, "a rejected message is finished with, not owed a retry")
+        self.assertIsNone(sub.replay_boundary)
+        self.assertIsNone(sub.last_processed_ts)
+
+    async def test_a_participant_message_leaves_the_marks_alone(self):
+        """The near miss: closing the window on every message would disable replay."""
+        connector = _make_connector()
+        sub = connector._rooms["room-1"]
+        sub.last_processed_ts = "100"
+        sub.replay_boundary = "100"
+        connector._handler = AsyncMock(return_value=True)
+
+        await connector._on_raw_ddp_message(
+            "room-1",
+            {"_id": "m9", "msg": "hi", "u": {"username": "alice"},
+             "ts": {"$date": 500}},
+            access={"roomParticipant": True},
+        )
+
+        self.assertEqual(sub.replay_boundary, "100")
+
+
+class TestABatchHandedBackKeepsItsWindow(unittest.IsolatedAsyncioTestCase):
+    """Completing the call is not the handler accepting it.
+
+    A full processor queue hands the message back and forgets its id precisely so a later
+    replay can bring it back. Spending the boundary on a batch containing one of those
+    removes the only mark that could — the live watermark has moved past it by then.
+    """
+
+    def _connector(self, accepted_per_message):
+        connector = _make_connector()
+        connector._rooms["room-1"].last_processed_ts = "100"
+        connector._ws.subscription_statuses = {}
+        connector._rest.is_room_member = AsyncMock(return_value=True)
+        connector._rest.get_room_history = AsyncMock(return_value=[
+            {"_id": f"m{i}", "msg": "hi", "u": {"username": "alice"},
+             "ts": {"$date": 200 + i}}
+            for i in range(len(accepted_per_message))
+        ])
+        answers = list(accepted_per_message)
+
+        async def _dispatch(room_id, doc, **kw):
+            return answers.pop(0)
+
+        connector._on_raw_ddp_message = _dispatch
+        return connector
+
+    async def test_a_queue_full_drop_keeps_the_window_open(self):
+        connector = self._connector([True, False, True])
+        await connector._snapshot_replay_boundaries()
+
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
+            await connector._on_ws_reconnect()
+
+        self.assertEqual(connector._rooms["room-1"].replay_boundary, "100")
+
+    async def test_a_fully_accepted_batch_spends_it(self):
+        connector = self._connector([True, True, True])
+        await connector._snapshot_replay_boundaries()
+        await connector._on_ws_reconnect()
+        self.assertIsNone(connector._rooms["room-1"].replay_boundary)

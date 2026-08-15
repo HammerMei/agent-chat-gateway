@@ -408,6 +408,7 @@ class RocketChatConnector(Connector):
                     sub.room.name, ws_status.get("status"),
                 )
 
+            all_accepted = True
             for idx, doc in enumerate(raw_msgs):
                 # Guard against concurrent unsubscribe_room: if the room was
                 # removed while we were awaiting get_room_history, skip the
@@ -421,9 +422,10 @@ class RocketChatConnector(Connector):
                         len(raw_msgs) - idx,
                     )
                     break
-                await self._on_raw_ddp_message(
+                if not await self._on_raw_ddp_message(
                     room_id, doc, is_replay=True, replay_after_ts=watermark
-                )
+                ):
+                    all_accepted = False
             else:
                 # Only once the batch has actually been *dispatched*. Fetching it is not
                 # reading it: a shutdown or another disconnect cancelling this loop midway
@@ -436,7 +438,19 @@ class RocketChatConnector(Connector):
                 # The cancellation case is the one this exists for; the `break` means the
                 # room stopped being tracked mid-replay, and leaving a boundary on a
                 # subscription nobody holds any more costs nothing.
-                sub.replay_boundary = None
+                #
+                # Completing the call is not the handler accepting: a full processor queue
+                # hands the message back and forgets its id so a later replay can bring it
+                # back. Spending the boundary on a batch that contains one of those removes
+                # the only mark that could — the live watermark has moved past it by then.
+                if all_accepted:
+                    sub.replay_boundary = None
+                else:
+                    logger.warning(
+                        "Room '%s': part of the replayed batch was handed back (queue "
+                        "full) — keeping the outage window open for the next recovery",
+                        sub.room.name,
+                    )
 
     # ── Inbound ──────────────────────────────────────────────────────────────
 
@@ -1086,8 +1100,20 @@ class RocketChatConnector(Connector):
         access: dict | None = None,
         is_replay: bool = False,
         replay_after_ts: str | None = None,
-    ) -> None:
+    ) -> bool:
         """Parse a raw RC DDP message doc, filter it, normalize it, fire handler.
+
+        Returns **False only when this message is still owed a retry** — the queue-full
+        drop, which deliberately forgets the message id so a later replay can bring it
+        back. Every other outcome returns True, including messages filtered out on
+        purpose: they are finished with, not pending. The distinction exists because the
+        replay loop cannot otherwise tell "dispatched" from "handed back", and a boundary
+        spent on a batch that was handed back loses it (§6.1, invariant 6).
+
+        A handler *exception* also returns True, and deliberately: the id is left
+        registered in that path, so a redo could not re-deliver the message anyway, and
+        holding the window open for something no redo can produce would keep it open for
+        good.
 
         `access` is the per-delivery object Rocket.Chat appends to the frame —
         `roomParticipant`, `roomType`, and `roomName` for rooms that have one. It is
@@ -1118,12 +1144,12 @@ class RocketChatConnector(Connector):
                              remaining replay message as "already processed".
         """
         if not self._handler:
-            return
+            return True
 
         sub = self._rooms.get(room_id)
         if not sub:
             logger.warning("Received message for unknown room_id=%s", room_id)
-            return
+            return True
 
         # --- _id dedup (live + replay race guard) ---
         # A message can arrive on both the live DDP stream and the reconnect
@@ -1152,12 +1178,20 @@ class RocketChatConnector(Connector):
             # The one thing the live path knows and the replay path cannot is this
             # rejection; remembering the id is how it is carried across.
             sub.remember(doc.get("_id", ""))
-            return
+            # And the window closes here, exactly as it does on the REST membership check
+            # (§6.1, invariant 6): this rejection is the same fact, learned earlier. Left
+            # open, an account re-added before any reconnect would have the next one see
+            # `True` and replay from the frozen pre-removal mark — the whole interval it
+            # was not a member, none of which is in the 200-id window because none of it
+            # was ever delivered.
+            sub.replay_boundary = None
+            sub.last_processed_ts = None
+            return True
 
         msg_id = doc.get("_id", "")
         if msg_id and msg_id in sub.seen_ids_set:
             logger.debug("Skipping already-seen message _id=%s in room %s", msg_id, room_id)
-            return
+            return True
 
         # --- Filter (room-level, evaluated once) ---
         # During replay, use the watermark that was snapshotted at the START of
@@ -1183,7 +1217,7 @@ class RocketChatConnector(Connector):
             logger.debug(
                 "Message filtered: %s (sender=%s)", result.reason, result.sender
             )
-            return
+            return True
 
         logger.info(
             "Filter passed for message from %s in room '%s' — dispatching: %s",
@@ -1219,7 +1253,7 @@ class RocketChatConnector(Connector):
                 sub.room.name,
             )
             sub.remember(msg_id)
-            return
+            return True
         if capacity is RoomCapacity.FULL:
             logger.warning(
                 "Preflight rejected for message from %s in room '%s' — "
@@ -1290,7 +1324,7 @@ class RocketChatConnector(Connector):
             )
         except Exception as e:
             logger.error("Failed to normalize message: %s", e)
-            return
+            return True
 
         # --- Apply thread + permission-thread policy (extracted to policy.py) ---
         apply_thread_policy(msg, self._config)
@@ -1300,7 +1334,7 @@ class RocketChatConnector(Connector):
             accepted = await self._handler(msg)
         except Exception as e:
             logger.error("Handler error for message from %s: %s", result.sender, e)
-            return
+            return True
 
         if not accepted:
             logger.warning(
@@ -1320,7 +1354,10 @@ class RocketChatConnector(Connector):
                     sub.seen_ids.remove(msg_id)
                 except ValueError:
                     pass
-            return
+            # The one outcome that leaves this message pending: its id was just forgotten
+            # precisely so a later replay can bring it back, and a boundary spent on a
+            # batch containing it would remove the only thing that could.
+            return False
 
         # --- Advance dedup watermark AFTER confirmed acceptance ---
         # Update the watermark only once the handler has confirmed the message
@@ -1338,6 +1375,7 @@ class RocketChatConnector(Connector):
         sub.last_processed_ts = result.msg_ts
         # msg_id was already added to seen_ids_set by the optimistic registration
         # block above (before the first await).  No second add needed here.
+        return True
 
     async def _handler_send_busy(self, room_id: str, doc: dict) -> None:
         """Best-effort 'server busy' notification to the user when preflight rejects."""
