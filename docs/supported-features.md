@@ -354,6 +354,23 @@ watchers:
 
 ## Known Limitations & Constraints
 
+### Message Delivery
+
+- 🔶 **No zero-loss guarantee under sustained overload.** ACG applies backpressure: when
+  every processor queue for a room is full, an inbound message is refused rather than
+  queued without bound. A refused message is normally recoverable — its dedup id is
+  forgotten and a mark is left below it so the next reconnect re-fetches it — but that
+  mark lives only in memory. If the gateway restarts *before* the next reconnect, the
+  message is not recovered and nothing reports it.
+  - Requires all queues full **and** a restart before the next socket reconnect, so it
+    needs sustained overload rather than a burst.
+  - A live message refused by the capacity preflight still gets a "server busy" reply, so
+    the sender knows to resend. A message refused while replaying a reconnect window does
+    not — 200 such replies would be worse than the loss.
+  - **Deliberate.** Persisting the mark was assessed and declined: guaranteeing delivery
+    through overload is not a goal ACG trades complexity for. Both chat connectors behave
+    the same way here.
+
 ### Platform Support
 
 - ❌ **No Slack, Discord, Microsoft Teams, or WhatsApp connectors**
