@@ -1577,3 +1577,46 @@ class TestHistoryPageReportsHowFullItWas(unittest.IsolatedAsyncioTestCase):
         msgs = await rest.get_room_history("r1", "channel", count=200)
 
         self.assertEqual([m["_id"] for m in msgs], ["m1", "m2"])
+
+
+class TestDmMembersExcludesThisAccountById(unittest.IsolatedAsyncioTestCase):
+    """Identity is the user id, not the spelling of a configured username.
+
+    A login whose canonical username differs in casing, or which uses an alias, left the
+    account in its own participant list — a 1:1 room described by its own bot, and, if the
+    API lists it first, every such room deriving the same `dm-<bot>` label instead of
+    distinct counterparts.
+    """
+
+    def _rest(self, members):
+        rest = _make_rest()
+        rest.user_id = "BOT_ID"
+        rest._request = AsyncMock(return_value={"success": True, "members": members})
+        return rest
+
+    async def test_the_account_is_dropped_however_its_name_is_spelled(self):
+        rest = self._rest([
+            {"_id": "BOT_ID", "username": "Bot"},       # canonical casing differs
+            {"_id": "U1", "username": "alice"},
+        ])
+
+        self.assertEqual(await rest.dm_members("r1"), ["alice"])
+
+    async def test_a_namesake_that_is_not_this_account_is_kept(self):
+        """The near miss: excluding by name would drop a different user who happens to
+        share the spelling."""
+        rest = self._rest([
+            {"_id": "BOT_ID", "username": "bot"},
+            {"_id": "U2", "username": "bot"},           # someone else, same name
+        ])
+
+        self.assertEqual(await rest.dm_members("r1"), ["bot"])
+
+    async def test_a_group_direct_room_returns_every_counterpart(self):
+        rest = self._rest([
+            {"_id": "BOT_ID", "username": "bot"},
+            {"_id": "U1", "username": "alice"},
+            {"_id": "U2", "username": "carol"},
+        ])
+
+        self.assertEqual(await rest.dm_members("r1"), ["alice", "carol"])

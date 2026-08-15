@@ -527,3 +527,55 @@ class TestReleasingATurnTakenByAMessageNotDelivered(unittest.TestCase):
 
         allowed, _, _tok = self.store.check_and_increment("r1", None, "agent-a", max_turns=2)
         self.assertFalse(allowed, "the budget still stops a genuine chain")
+
+
+class TestExpiryDoesNotReissueAnInFlightIdentity(unittest.TestCase):
+    """A context can be garbage-collected while a delivery still holds a turn from it.
+
+    Nothing bounds a delivery by the store's TTL — normalization, an attachment download
+    and a handler are not on that clock — so the context can expire, a later message can
+    recreate the key, and the old delivery's release would then land on a fresh count.
+    This is the reset case arriving through expiry, and the generation has to survive the
+    entry it belonged to.
+    """
+
+    def setUp(self):
+        from gateway.core.agent_chain import TurnStore
+
+        self.store = TurnStore(ttl_seconds=0.0)   # everything is expired on the next call
+
+    def test_a_token_from_an_expired_context_is_not_honoured(self):
+        gen = self.store.generation("r1", None, "agent-a")
+        _, _, mine = self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
+
+        # A later message: `_gc` drops the quiet context, and this recreates the key.
+        self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
+
+        self.store.release_turn("r1", None, "agent-a", mine, gen)
+
+        self.assertEqual(
+            self.store.current_turns("r1", None, "agent-a"), 1,
+            "the fresh count belongs to the message that started it",
+        )
+
+    def test_the_generation_keeps_climbing_across_expiry(self):
+        first = self.store.generation("r1", None, "agent-a")
+        self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
+        self.store.check_and_increment("r1", None, "agent-a", max_turns=5)   # gc + recreate
+
+        self.assertGreater(
+            self.store.generation("r1", None, "agent-a"), first,
+            "a number that resets is a number that can be matched by a stale delivery",
+        )
+
+    def test_a_live_delivery_can_still_release_within_one_generation(self):
+        """The near miss: bumping on every call would make every release a no-op."""
+        from gateway.core.agent_chain import TurnStore
+
+        store = TurnStore()          # a normal TTL: nothing expires here
+        gen = store.generation("r1", None, "agent-a")
+        _, _, mine = store.check_and_increment("r1", None, "agent-a", max_turns=5)
+
+        store.release_turn("r1", None, "agent-a", mine, gen)
+
+        self.assertEqual(store.current_turns("r1", None, "agent-a"), 0)

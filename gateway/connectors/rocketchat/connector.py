@@ -663,6 +663,18 @@ class RocketChatConnector(Connector):
     def register_router(self, router) -> None:
         """Register the callback consulted for a room no watcher is tracking.
 
+        Called as `router(room, trigger)`, where `trigger` is the document that prompted
+        the offer. The room alone is not enough, and the reason is not hypothetical: a
+        creation that starts a session with `history_handoff` fetches the room's recent
+        messages with no upper bound, so it picks up the trigger — which this connector
+        then dispatches as the live prompt, and the agent sees the same user message twice,
+        once as history and once as the turn it is answering.
+
+        The trigger is passed rather than a timestamp because the creation path decides
+        what it needs from it: `fetch_room_history` takes a `before_ts`, and excluding by
+        id is also open to it. A contract that made the correct behaviour impossible would
+        be a defect in the contract, not in whoever implements it.
+
         Only ever consulted under subscribe-all: with per-room subscriptions a message for
         an unwatched room cannot arrive at all. Optional, so a deployment whose server
         refuses `__my_messages__` behaves exactly as before.
@@ -729,7 +741,7 @@ class RocketChatConnector(Connector):
             if room is None:
                 return
             try:
-                await self._router(room)
+                await self._router(room, doc)
             except Exception as e:
                 logger.error("Router failed for room %s: %s", room_id, e)
                 return
@@ -820,8 +832,11 @@ class RocketChatConnector(Connector):
         if not members:
             return None  # unknown, and unknown is not a kind
 
-        others = tuple(m for m in members if m != self._config.username)
-        kind = RoomKind.GROUP_DM if len(members) > 2 else RoomKind.DM
+        # `dm_members` has already excluded this account, by id rather than by the
+        # spelling of its configured username — so everything here is a counterpart, and
+        # one counterpart means a 1:1.
+        others = tuple(members)
+        kind = RoomKind.GROUP_DM if len(others) > 1 else RoomKind.DM
         identity = (kind, others)
         self._dm_kinds[room_id] = identity
         return identity
@@ -1584,8 +1599,19 @@ class RocketChatConnector(Connector):
             # reported the batch complete on the strength of the id this branch has just
             # removed. Whoever drops a message owns keeping it reachable.
             #
-            # `or`, so an older window already open is not narrowed to this one.
-            sub.replay_boundary = sub.replay_boundary or sub.last_processed_ts
+            # `or`, so an older window already open is not narrowed to this one — and
+            # falling through to this message's own timestamp, because both marks are
+            # empty for the first delivery into a new room and for the first after a
+            # membership reset. Leaving no boundary there loses the message outright:
+            # replay skips a room whose window is falsy, and the next accepted message
+            # advances the cursor past this one for good.
+            #
+            # Its own timestamp is the right mark because the history fetch is inclusive
+            # of its lower bound (`inclusive=true` on `oldest`), so a window that starts
+            # here contains this message.
+            sub.replay_boundary = (
+                sub.replay_boundary or sub.last_processed_ts or result.msg_ts
+            )
             # The one outcome that leaves this message pending: its id was just forgotten
             # precisely so a later replay can bring it back, and a boundary spent on a
             # batch containing it would remove the only thing that could.

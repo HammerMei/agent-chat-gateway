@@ -110,6 +110,13 @@ class TurnStore:
     def __init__(self, ttl_seconds: float = 3600.0) -> None:
         self._ttl = ttl_seconds
         self._store: dict[tuple[str, str | None, str], _TurnContext] = {}
+        # Generations outlive the contexts they belong to. A context is dropped by `_gc`
+        # once it goes quiet, and recreating it at generation zero would make an old
+        # delivery's token match a fresh context — the reset case again, arriving through
+        # expiry instead. Kept here, so the number a key has reached is never reused.
+        # One integer per (room, thread, sender) that has ever spoken; the keys are
+        # bounded by the rooms the gateway serves.
+        self._generations: dict[tuple[str, str | None, str], int] = {}
 
     # Key helpers
     @staticmethod
@@ -125,8 +132,9 @@ class TurnStore:
         else. This distinguishes them, and it survives the reset because a reset zeroes
         the context rather than removing it.
         """
-        ctx = self._store.get(self._key(room_id, thread_id, sender))
-        return ctx.generation if ctx else 0
+        key = self._key(room_id, thread_id, sender)
+        ctx = self._store.get(key)
+        return ctx.generation if ctx else self._generations.get(key, 0)
 
     def check_and_increment(
         self,
@@ -150,7 +158,7 @@ class TurnStore:
         key = self._key(room_id, thread_id, sender)
         ctx = self._store.get(key)
         if ctx is None:
-            ctx = _TurnContext()
+            ctx = _TurnContext(generation=self._generations.get(key, 0))
             self._store[key] = ctx
 
         if ctx.turns >= max_turns:
@@ -234,6 +242,7 @@ class TurnStore:
             ctx.issued = 0
             ctx.released.clear()
             ctx.last_updated = time.monotonic()
+            self._generations[key] = ctx.generation
         logger.debug("Agent chain counter reset for sender=%s thread=%s", sender, thread_id)
 
     def reset_all(self, room_id: str, thread_id: str | None) -> None:
@@ -251,6 +260,7 @@ class TurnStore:
             ctx.issued = 0
             ctx.released.clear()
             ctx.last_updated = time.monotonic()
+            self._generations[k] = ctx.generation
         if keys_to_remove:
             logger.debug(
                 "Agent chain counters reset for room=%s thread=%s (%d entries)",
@@ -262,4 +272,8 @@ class TurnStore:
         now = time.monotonic()
         expired = [k for k, v in self._store.items() if now - v.last_updated > self._ttl]
         for k in expired:
+            # The generation is carried forward rather than dropped with the context. A
+            # delivery can outlive the TTL — normalization and a handler are not bounded
+            # by it — and its token must not match the context that replaces this one.
+            self._generations[k] = self._store[k].generation + 1
             del self._store[k]

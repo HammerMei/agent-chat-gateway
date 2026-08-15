@@ -2291,7 +2291,8 @@ class TestUnroutedMessages(unittest.IsolatedAsyncioTestCase):
         connector._rest.dm_member_count = AsyncMock(return_value=2)
         self.offered = []
         connector._config = _make_config(owners=["glin"])
-        connector.register_router(AsyncMock(side_effect=self.offered.append))
+        connector.register_router(
+            AsyncMock(side_effect=lambda room, trigger: self.offered.append(room)))
         return connector
 
     def _doc(self, **overrides):
@@ -2373,14 +2374,20 @@ class TestDirectRoomClassification(unittest.IsolatedAsyncioTestCase):
     DM misclassified as a 1:1 makes the agent answer every message from anyone in it.
     """
 
-    def _connector(self, members=("bot", "alice")):
+    def _connector(self, members=("alice",)):
+        """`members` is what `dm_members` returns — the *other* participants.
+
+        This account is excluded inside the REST call, by id rather than by the spelling
+        of its configured username, so nothing here has to know what the bot is called.
+        """
         connector = _make_connector()
         connector._ws = MagicMock(register_default_callback=MagicMock())
         connector._rest = MagicMock()
         connector._rest.dm_members = AsyncMock(return_value=list(members))
         self.offered = []
         connector._config = _make_config(owners=["glin"])
-        connector.register_router(AsyncMock(side_effect=self.offered.append))
+        connector.register_router(
+            AsyncMock(side_effect=lambda room, trigger: self.offered.append(room)))
         return connector
 
     def _deliver(self, connector):
@@ -2391,7 +2398,7 @@ class TestDirectRoomClassification(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_two_members_is_a_one_to_one(self):
-        connector = self._connector(members=("bot", "alice"))
+        connector = self._connector(members=("alice",))
         await self._deliver(connector)
         self.assertEqual(self.offered[0].kind, RoomKind.DM)
         self.assertEqual(
@@ -2400,7 +2407,7 @@ class TestDirectRoomClassification(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_three_members_is_a_group_dm(self):
-        connector = self._connector(members=("bot", "alice", "carol"))
+        connector = self._connector(members=("alice", "carol"))
         await self._deliver(connector)
         self.assertEqual(self.offered[0].kind, RoomKind.GROUP_DM)
         self.assertEqual(
@@ -2412,7 +2419,7 @@ class TestDirectRoomClassification(unittest.IsolatedAsyncioTestCase):
         """Verified, not assumed: on 8.5.1 every route for adding a member to a type-`d`
         room is refused on the room's *type*, and `im.create` returns a different room id
         for a different member set. A group DM is a separate room, never a mutated 1:1."""
-        connector = self._connector(members=("bot", "alice", "carol"))
+        connector = self._connector(members=("alice", "carol"))
         await self._deliver(connector)
         await self._deliver(connector)
 
@@ -2438,7 +2445,7 @@ class TestDirectRoomClassification(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.offered, [])
 
         connector._rest.dm_members = AsyncMock(
-            return_value=[{"username": u} for u in ("bot", "alice", "carol")]
+            return_value=["alice", "carol"]
         )
         await self._deliver(connector)
         self.assertEqual(len(self.offered), 1)
@@ -2997,7 +3004,7 @@ class TestARoomIsOfferedOnceAtATime(unittest.IsolatedAsyncioTestCase):
         offered: list[str] = []
         release = asyncio.Event()
 
-        async def _slow_router(room):
+        async def _slow_router(room, trigger):
             offered.append(room.id)
             await release.wait()
 
@@ -3021,7 +3028,7 @@ class TestARoomIsOfferedOnceAtATime(unittest.IsolatedAsyncioTestCase):
         offered: list[str] = []
         release = asyncio.Event()
 
-        async def _slow_router(room):
+        async def _slow_router(room, trigger):
             offered.append(room.id)
             await release.wait()
 
@@ -3045,7 +3052,7 @@ class TestARoomIsOfferedOnceAtATime(unittest.IsolatedAsyncioTestCase):
         connector = self._connector()
         attempts = []
 
-        async def _failing_router(room):
+        async def _failing_router(room, trigger):
             attempts.append(room.id)
             raise RuntimeError("boom")
 
@@ -3076,7 +3083,8 @@ class TestAQueuedFrameDoesNotReofferATrackedRoom(unittest.IsolatedAsyncioTestCas
     async def test_a_frame_that_arrives_after_creation_is_dropped(self):
         connector = self._connector()
         offered: list[str] = []
-        connector.register_router(lambda room: offered.append(room.id) or _noop())
+        connector.register_router(
+            lambda room, trigger: offered.append(room.id) or _noop())
 
         doc = {"_id": "m1", "msg": "hi", "u": {"username": "alice"}, "rid": "room-1"}
         access = {"roomParticipant": True, "roomType": "c", "roomName": "general"}
@@ -3090,7 +3098,8 @@ class TestAQueuedFrameDoesNotReofferATrackedRoom(unittest.IsolatedAsyncioTestCas
         """The near miss: the tracked check must not swallow first contact."""
         connector = self._connector()
         offered: list[str] = []
-        connector.register_router(lambda room: offered.append(room.id) or _noop())
+        connector.register_router(
+            lambda room, trigger: offered.append(room.id) or _noop())
 
         doc = {"_id": "m1", "msg": "hi", "u": {"username": "alice"}, "rid": "brand-new"}
         access = {"roomParticipant": True, "roomType": "c", "roomName": "general"}
@@ -3717,7 +3726,7 @@ class TestTheMessageThatCreatedTheWatcherIsDelivered(unittest.IsolatedAsyncioTes
             side_effect=lambda rid, doc, **kw: dispatched.append(doc["_id"]) or True
         )
 
-        async def _router(room):
+        async def _router(room, trigger):
             # what creating a watcher does to the connector
             connector._rooms[room.id] = _RoomSubscription(
                 room=Room(id=room.id, name="general", type="channel"))
@@ -3737,7 +3746,7 @@ class TestTheMessageThatCreatedTheWatcherIsDelivered(unittest.IsolatedAsyncioTes
         connector = self._connector()
         connector._on_raw_ddp_message = AsyncMock(return_value=True)
 
-        async def _router(room):
+        async def _router(room, trigger):
             raise RuntimeError("creation failed")
 
         connector.register_router(_router)
@@ -3752,7 +3761,8 @@ class TestTheMessageThatCreatedTheWatcherIsDelivered(unittest.IsolatedAsyncioTes
         frame had already been routed."""
         connector = self._connector()
         offered: list[str] = []
-        connector.register_router(lambda room: offered.append(room.id) or _noop())
+        connector.register_router(
+            lambda room, trigger: offered.append(room.id) or _noop())
         connector._on_raw_ddp_message = AsyncMock(return_value=True)
 
         doc, access = self._frame(rid="room-1")   # already tracked by the fixture
@@ -3760,3 +3770,96 @@ class TestTheMessageThatCreatedTheWatcherIsDelivered(unittest.IsolatedAsyncioTes
 
         self.assertEqual(offered, [], "a tracked room is not offered again")
         connector._on_raw_ddp_message.assert_awaited_once()
+
+
+class TestTheFirstMessageIntoARoomKeepsARetryCursor(unittest.IsolatedAsyncioTestCase):
+    """`boundary or watermark` is nothing when a room has neither.
+
+    That is the state of a room's very first delivery, and of the first after a membership
+    reset. Replay skips a room whose window is falsy, so a message handed back there was
+    lost outright — the id was released for a retry that could never be fetched.
+    """
+
+    def _connector(self):
+        connector = _make_connector()
+        connector._config.require_mention = False
+        connector._handler = AsyncMock(return_value=False)      # queue full
+        return connector
+
+    async def test_a_rejected_first_message_leaves_a_window_containing_itself(self):
+        connector = self._connector()
+        sub = connector._rooms["room-1"]
+        sub.last_processed_ts = None
+        sub.replay_boundary = None
+
+        await connector._on_raw_ddp_message(
+            "room-1",
+            {"_id": "m1", "msg": "hi", "u": {"username": "alice"},
+             "ts": {"$date": 500}},
+        )
+
+        self.assertTrue(
+            sub.replay_boundary,
+            "no window at all means replay skips the room and the message is gone",
+        )
+
+    async def test_an_existing_window_is_not_narrowed_to_this_message(self):
+        connector = self._connector()
+        sub = connector._rooms["room-1"]
+        sub.last_processed_ts = "800"
+        sub.replay_boundary = "100"
+
+        await connector._on_raw_ddp_message(
+            "room-1",
+            {"_id": "m1", "msg": "hi", "u": {"username": "alice"},
+             "ts": {"$date": 900}},
+        )
+
+        self.assertEqual(sub.replay_boundary, "100")
+
+    async def test_the_watermark_still_wins_over_this_message(self):
+        """The near miss: preferring the message's own timestamp would skip everything
+        between the watermark and it."""
+        connector = self._connector()
+        sub = connector._rooms["room-1"]
+        sub.last_processed_ts = "100"
+        sub.replay_boundary = None
+
+        await connector._on_raw_ddp_message(
+            "room-1",
+            {"_id": "m1", "msg": "hi", "u": {"username": "alice"},
+             "ts": {"$date": 900}},
+        )
+
+        self.assertEqual(sub.replay_boundary, "100")
+
+
+class TestTheRouterIsToldWhatTriggeredTheOffer(unittest.IsolatedAsyncioTestCase):
+    """The room alone cannot prevent the trigger appearing twice.
+
+    A creation that starts a session with `history_handoff` fetches the room's recent
+    messages with no upper bound, so it picks up the very message that prompted it — and
+    this connector then dispatches that message as the live prompt. The agent sees one
+    user message twice: once inside its history, once as the turn it is answering. A
+    contract that makes the correct behaviour impossible is a defect in the contract.
+    """
+
+    async def test_the_router_receives_the_triggering_document(self):
+        connector = _make_connector()
+        connector._config.require_mention = False
+        connector._config.filter_sender = False
+        seen: list[tuple] = []
+
+        async def _router(room, trigger):
+            seen.append((room.id, trigger.get("_id"), trigger.get("ts")))
+
+        connector.register_router(_router)
+        doc = {"_id": "trigger-1", "rid": "new-room", "msg": "hi",
+               "u": {"username": "alice"}, "ts": {"$date": 500}}
+        await connector._on_unrouted_message(
+            doc, {"roomParticipant": True, "roomType": "c", "roomName": "general"})
+
+        self.assertEqual(
+            seen, [("new-room", "trigger-1", {"$date": 500})],
+            "the creation path needs the id and the timestamp to bound its history fetch",
+        )

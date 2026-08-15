@@ -581,9 +581,10 @@ class RocketChatREST:
         entirely for a room typed `dm`, so a group DM misclassified as a 1:1 makes the
         agent answer **every** message from **anyone** in that group (§6.4).
 
-        Returns the usernames, not a count, because the caller needs both: the count
-        answers 1:1-or-group, and the names *are* the room's description — a direct room
-        has no name, so its participants are the only thing that identifies it to a human
+        Returns **the other participants' usernames** — this account is excluded by id —
+        because the caller needs both halves of that: how many there are answers
+        1:1-or-group, and the names *are* the room's description, since a direct room has
+        no name and its participants are the only thing that identifies it to a human
         (§2.3).
 
         Returns an empty list when the lookup fails. That is *no answer*, and the caller
@@ -601,7 +602,17 @@ class RocketChatREST:
         members = result.get("members") or []
         if not isinstance(members, list):
             return []
-        return [m.get("username", "") for m in members if m.get("username")]
+        # The caller is excluded here, by **id**, because this is where the ids are. The
+        # connector used to drop it by comparing usernames against its configured
+        # spelling, and a login whose canonical username differs in casing or is an alias
+        # left the account in its own participant list: a 1:1 room described by its own
+        # bot, and — if the API happens to list the bot first — every such room deriving
+        # the same `dm-<bot>` label instead of distinct counterparts.
+        return [
+            m.get("username", "")
+            for m in members
+            if m.get("username") and m.get("_id") != self.user_id
+        ]
 
     async def is_room_member(self, room_id: str) -> bool | None:
         """Is this account still in the room — `True`, `False`, or **`None` for unknown**.
