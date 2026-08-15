@@ -1027,6 +1027,7 @@ class MattermostConnector(Connector):
                 "Message for channel '%s' has no watcher — dropping without a reply.",
                 state.room.name,
             )
+            self._release_turn_for(post, result, turn_generation, "no watcher")
             return
         if capacity is RoomCapacity.FULL:
             logger.warning(
@@ -1084,6 +1085,7 @@ class MattermostConnector(Connector):
             )
         except Exception as e:
             logger.error("Failed to normalize message: %s", e)
+            self._release_turn_for(post, result, turn_generation, "normalize failed")
             return
 
         apply_thread_policy(msg, self._config)
@@ -1092,6 +1094,7 @@ class MattermostConnector(Connector):
             accepted = await self._handler(msg)
         except Exception as e:
             logger.error("Handler error for message from %s: %s", result.sender, e)
+            self._release_turn_for(post, result, turn_generation, "handler raised")
             return
 
         if not accepted:

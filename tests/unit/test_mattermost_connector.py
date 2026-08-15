@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from gateway.agents.response import AgentResponse
 from gateway.connectors.mattermost.config import MattermostConfig
@@ -1330,3 +1330,76 @@ class TestARejectedPostStaysReachableAcrossReconnects(unittest.IsolatedAsyncioTe
         await connector._on_ws_reconnect()
 
         self.assertIsNone(state.replay_boundary)
+
+
+class TestEveryWayOfNotDeliveringGivesTheTurnBack(unittest.IsolatedAsyncioTestCase):
+    """The same surface as Rocket.Chat's twin, enumerated for the same reason.
+
+    Review found one un-released path on Rocket.Chat; sweeping both connectors found three
+    more there and three here. The budget belongs to ACG, not to either platform, so the
+    rule is the same on both — and the enumeration is what stops the next one being found
+    in a review round instead of locally.
+    """
+
+    async def _connector(self, capacity=RoomCapacity.AVAILABLE):
+        connector = _make_connector(
+            filter_sender=False,
+            agent_chain=AgentChainConfig(agent_usernames=["peer"], max_turns=3),
+        )
+        connector._config.require_mention = False
+        room = Room(id="chan1", name="general", type="dm")
+        connector._ws.register_channel = MagicMock()
+        await connector.subscribe_room(room, watcher_id="w1")
+        connector._rest.resolve_username = AsyncMock(return_value="peer")
+        connector.register_capacity_check(lambda *a, **kw: capacity)
+        connector.register_handler(AsyncMock(return_value=True))
+        connector._rest.post_message = AsyncMock()
+        return connector
+
+    def _event(self, post_id="p1"):
+        return {"post": {"id": post_id, "channel_id": "chan1", "user_id": "u1",
+                         "message": "hi", "root_id": "", "type": "", "create_at": 500},
+                "mentions": []}
+
+    def _turns(self, c):
+        return c._turn_store.current_turns("chan1", None, "peer")
+
+    async def test_no_watcher_for_the_channel(self):
+        c = await self._connector(RoomCapacity.UNROUTED)
+        await c._on_posted_event(self._event())
+        self.assertEqual(self._turns(c), 0)
+
+    async def test_the_live_capacity_preflight(self):
+        c = await self._connector(RoomCapacity.FULL)
+        await c._on_posted_event(self._event())
+        self.assertEqual(self._turns(c), 0)
+
+    async def test_the_replay_capacity_preflight(self):
+        c = await self._connector(RoomCapacity.FULL)
+        await c._on_posted_event(self._event(), is_replay=True, replay_after_ts="1")
+        self.assertEqual(self._turns(c), 0)
+
+    async def test_normalization_failing(self):
+        c = await self._connector()
+        with patch("gateway.connectors.mattermost.connector.normalize_mm_message",
+                   side_effect=RuntimeError("boom")):
+            await c._on_posted_event(self._event())
+        self.assertEqual(self._turns(c), 0)
+
+    async def test_the_handler_raising(self):
+        c = await self._connector()
+        c.register_handler(AsyncMock(side_effect=RuntimeError("boom")))
+        await c._on_posted_event(self._event())
+        self.assertEqual(self._turns(c), 0)
+
+    async def test_the_handler_refusing(self):
+        c = await self._connector()
+        c.register_handler(AsyncMock(return_value=False))
+        await c._on_posted_event(self._event())
+        self.assertEqual(self._turns(c), 0)
+
+    async def test_a_delivered_post_keeps_its_turn(self):
+        """The near miss: releasing unconditionally would uncap the chain."""
+        c = await self._connector()
+        await c._on_posted_event(self._event())
+        self.assertEqual(self._turns(c), 1)

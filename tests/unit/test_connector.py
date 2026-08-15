@@ -4275,3 +4275,95 @@ class TestAnOwnMessageIsRecognisedById(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual([r.id for r in self.offered], ["new-room"])
+
+
+class TestEveryWayOfNotDeliveringGivesTheTurnBack(unittest.IsolatedAsyncioTestCase):
+    """The surface, enumerated — so the next unhandled drop path fails here, not in review.
+
+    The filter charges a turn before anything knows the message can be delivered. Review
+    found the capacity preflight; sweeping the function found three more. Rather than a
+    fifth patch, every path is driven here and asserted to leave the budget untouched.
+    """
+
+    def _connector(self, capacity=RoomCapacity.AVAILABLE):
+        from gateway.connectors.rocketchat.agent_chain import TurnStore
+        from gateway.connectors.rocketchat.config import AgentChainConfig
+
+        connector = _make_connector()
+        connector._config = _make_config(
+            filter_sender=False,
+            agent_chain=AgentChainConfig(agent_usernames=["peer"], max_turns=3),
+        )
+        connector._config.require_mention = False
+        connector._turn_store = TurnStore()
+        # A DM, so the mention gate does not decide these cases for us.
+        connector._rooms["room-1"].room.type = "dm"
+        connector._capacity_check = lambda *a, **kw: capacity
+        connector._handler = AsyncMock(return_value=True)
+        connector._rest.post_message = AsyncMock()
+        connector._rest.user_id = "BOT_ID"
+        return connector
+
+    def _doc(self, msg_id="m1"):
+        return {"_id": msg_id, "msg": "hi", "u": {"username": "peer", "_id": "U_PEER"},
+                "rid": "room-1", "ts": {"$date": 500}}
+
+    def _turns(self, connector):
+        return connector._turn_store.current_turns("room-1", None, "peer")
+
+    async def test_no_watcher_for_the_room(self):
+        connector = self._connector(RoomCapacity.UNROUTED)
+        await connector._on_raw_ddp_message("room-1", self._doc())
+        self.assertEqual(self._turns(connector), 0)
+
+    async def test_the_live_capacity_preflight(self):
+        connector = self._connector(RoomCapacity.FULL)
+        await connector._on_raw_ddp_message("room-1", self._doc())
+        self.assertEqual(self._turns(connector), 0)
+
+    async def test_the_replay_capacity_preflight(self):
+        connector = self._connector(RoomCapacity.FULL)
+        await connector._on_raw_ddp_message(
+            "room-1", self._doc(), is_replay=True, replay_after_ts="1")
+        self.assertEqual(self._turns(connector), 0)
+
+    async def test_normalization_failing(self):
+        connector = self._connector()
+        with patch("gateway.connectors.rocketchat.connector.normalize_rc_message",
+                   side_effect=RuntimeError("boom")):
+            await connector._on_raw_ddp_message("room-1", self._doc())
+        self.assertEqual(self._turns(connector), 0)
+
+    async def test_the_handler_raising(self):
+        connector = self._connector()
+        connector._handler = AsyncMock(side_effect=RuntimeError("boom"))
+        await connector._on_raw_ddp_message("room-1", self._doc())
+        self.assertEqual(self._turns(connector), 0)
+
+    async def test_the_handler_refusing(self):
+        connector = self._connector()
+        connector._handler = AsyncMock(return_value=False)
+        await connector._on_raw_ddp_message("room-1", self._doc())
+        self.assertEqual(self._turns(connector), 0)
+
+    async def test_a_delivered_message_keeps_its_turn(self):
+        """The near miss: releasing unconditionally would uncap the chain."""
+        connector = self._connector()
+        await connector._on_raw_ddp_message("room-1", self._doc())
+        self.assertEqual(self._turns(connector), 1)
+
+    async def test_the_budget_survives_a_run_of_drops(self):
+        """What the release is *for*: max_turns=3, so a fourth drop used to be refused by
+        the filter before the handler ever saw it."""
+        connector = self._connector(RoomCapacity.FULL)
+        for i in range(6):
+            await connector._on_raw_ddp_message("room-1", self._doc(f"m{i}"))
+
+        connector._capacity_check = lambda *a, **kw: RoomCapacity.AVAILABLE
+        await connector._on_raw_ddp_message("room-1", self._doc("m-final"))
+
+        self.assertEqual(
+            self._turns(connector), 1,
+            "the first message to actually be delivered after the overload must still "
+            "have budget to be delivered with",
+        )

@@ -1329,16 +1329,38 @@ class RocketChatConnector(Connector):
         One place, because there are two ways to hand a message back and they are the two
         that kept being fixed one at a time.
         """
-        if result.agent_chain_token and self._turn_store is not None:
-            remaining = self._turn_store.release_turn(
-                doc.get("rid", ""), doc.get("tmid") or None, result.sender,
-                result.agent_chain_token, generation,
-            )
-            logger.debug(
-                "Released an agent-chain turn for %s (%s) — now at %d",
-                result.sender, reason, remaining,
-            )
+        self._release_unused_turn(doc, result, generation, reason)
         return False
+
+    def _release_unused_turn(self, doc: dict, result, generation: int, reason: str) -> None:
+        """Give back the turn a message took, for a message that was never delivered.
+
+        **Every** way of not delivering has to come through here, not only the two that
+        hand a message back for retry. The filter charges a turn before anything knows the
+        message can be delivered, so a path that drops it and keeps the charge spends the
+        sender's budget on a message nobody saw — and once the budget is gone the filter
+        rejects the *next* ones as complete.
+
+        Codex found one such path (the live capacity preflight). Sweeping the rest of the
+        function found three more: no watcher for the room, normalization failing, and the
+        handler raising. A rule applied at two sites of six is the shape this PR has
+        produced nine times, so the answer is one named call rather than a fifth patch.
+
+        Releasing after the handler raised is deliberate. The handler may have enqueued
+        before it threw, in which case the chain gets one extra turn; not releasing loses
+        every later message from that sender instead. `release_turn`'s own docstring
+        settles which way to be wrong: "marginally stricter" is not the safe direction.
+        """
+        if not result.agent_chain_token or self._turn_store is None:
+            return
+        remaining = self._turn_store.release_turn(
+            doc.get("rid", ""), doc.get("tmid") or None, result.sender,
+            result.agent_chain_token, generation,
+        )
+        logger.debug(
+            "Released an agent-chain turn for %s (%s) — now at %d",
+            result.sender, reason, remaining,
+        )
 
     async def _on_raw_ddp_message(
         self,
@@ -1528,6 +1550,7 @@ class RocketChatConnector(Connector):
                 sub.room.name,
             )
             sub.remember(msg_id)
+            self._release_unused_turn(doc, result, turn_generation, "no watcher")
             return True
         if capacity is RoomCapacity.FULL:
             logger.warning(
@@ -1571,7 +1594,10 @@ class RocketChatConnector(Connector):
                     "Best-effort busy notification failed for room '%s': %s",
                     room_id, exc
                 )
-            # Watermark NOT advanced — the sender has been told and can resend.
+            # Watermark NOT advanced — the sender has been told and can resend. The turn
+            # is still given back: the message was not delivered, and a resend re-enters
+            # the filter and is charged again.
+            self._release_unused_turn(doc, result, turn_generation, "live preflight")
             return True
 
         # --- Optimistic seen_ids registration (TOCTOU guard) ---
@@ -1617,6 +1643,7 @@ class RocketChatConnector(Connector):
             )
         except Exception as e:
             logger.error("Failed to normalize message: %s", e)
+            self._release_unused_turn(doc, result, turn_generation, "normalize failed")
             return True
 
         # --- Apply thread + permission-thread policy (extracted to policy.py) ---
@@ -1627,6 +1654,7 @@ class RocketChatConnector(Connector):
             accepted = await self._handler(msg)
         except Exception as e:
             logger.error("Handler error for message from %s: %s", result.sender, e)
+            self._release_unused_turn(doc, result, turn_generation, "handler raised")
             return True
 
         if not accepted:
