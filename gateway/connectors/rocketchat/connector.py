@@ -173,6 +173,12 @@ class RocketChatConnector(Connector):
         ] = {}  # room_id -> [watcher...]
         self._room_refcount: dict[str, int] = {}  # room_id -> subscriber count
         self._router = None
+        # Rooms currently being offered to the router. The routing workers are a pool, so
+        # several frames from one untracked room can be in flight at once — and offering a
+        # room is slow (a DM needs `im.members` before it can even be classified), which
+        # makes the overlap the normal case for a room that has just started talking rather
+        # than a rare one. Two offers for one room are two watchers and two sessions for it.
+        self._rooms_being_routed: set[str] = set()
         # What `start_inbound` decided, once — **not** whether the stream is live now, and
         # nothing may read it as that. The stream can die under a healthy socket, and a copy
         # of its liveness would go on saying otherwise while a watcher added in that window
@@ -605,13 +611,26 @@ class RocketChatConnector(Connector):
         room_id = doc.get("rid", "")
         if not room_id:
             return
-        room = await self._room_ref_from_access(room_id, access)
-        if room is None:
+        if room_id in self._rooms_being_routed:
+            # Coalesced, not queued: the offer in flight is for this same room, and a
+            # second one would create a second watcher for it. Nothing is lost — offering a
+            # room does not deliver the message that prompted it, so the frame this call
+            # was handling was never going to be dispatched by anyone.
             return
+        self._rooms_being_routed.add(room_id)
         try:
-            await self._router(room)
-        except Exception as e:
-            logger.error("Router failed for room %s: %s", room_id, e)
+            room = await self._room_ref_from_access(room_id, access)
+            if room is None:
+                return
+            try:
+                await self._router(room)
+            except Exception as e:
+                logger.error("Router failed for room %s: %s", room_id, e)
+        finally:
+            # Released whatever happened. A room that failed to be offered must be
+            # offerable again on its next message — holding the reservation would make one
+            # transient REST failure permanent for that room.
+            self._rooms_being_routed.discard(room_id)
 
     async def _room_ref_from_access(
         self, room_id: str, access: dict

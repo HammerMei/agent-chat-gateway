@@ -292,26 +292,33 @@ class RCWebSocketClient:
         `register_room_callback` exists for.
         """
         for room_id, sub_id in list(self._subscriptions.items()):
-            # Compare before removing: a stream lost mid-migration starts the per-room
-            # fallback, which can install a *new* subscription for a room this loop has
-            # already read. Popping unconditionally would drop the new id from the map
-            # while releasing only the old one on the server — the replacement stays live
-            # and untracked, so removing the watcher can no longer unsubscribe it and the
-            # room ends up delivered twice.
-            if self._subscriptions.get(room_id) == sub_id:
-                self._subscriptions.pop(room_id, None)
-                state = self._subscription_states.get(room_id)
-                if state is not None and state.sub_id == sub_id:
-                    state.sub_id = None
-            # The unsub is sent either way. The captured id is the one this migration is
-            # retiring, and if it has already been replaced in the map then nothing else
-            # will ever release it — the replacement overwrote the mapping without
-            # unsubscribing. An unsub for an id the server no longer knows is ignored.
+            # Released on the server *first*, and only then dropped from the map. The other
+            # order loses the subscription: this migration can be cancelled at the send —
+            # a recovery displaces whatever is running, and that is a normal event now — and
+            # a mapping already removed leaves the still-live subscription invisible to the
+            # replacement, which resubscribes the room and finds no predecessor to release.
+            #
+            # A mapping left behind by that same cancellation is the harmless direction: it
+            # names a subscription that may already be gone, and both the next install and
+            # `unsubscribe_room` would re-send an `unsub` the server ignores. An untracked
+            # live subscription is the one nothing can ever clean up.
+            #
+            # The unsub goes out either way. If the mapping has already been replaced then
+            # nothing else will ever release this id — the replacement overwrote the
+            # mapping — and an unsub for an id the server no longer knows is ignored.
             try:
                 await self._send({"msg": "unsub", "id": sub_id})
             except Exception as e:
                 logger.warning(
                     "Could not release the per-room subscription for %s: %s", room_id, e)
+            # Compare before removing: a stream lost mid-migration starts the per-room
+            # fallback, which can install a *new* subscription for a room this loop has
+            # already read, and dropping that one would leave the replacement untracked.
+            if self._subscriptions.get(room_id) == sub_id:
+                self._subscriptions.pop(room_id, None)
+                state = self._subscription_states.get(room_id)
+                if state is not None and state.sub_id == sub_id:
+                    state.sub_id = None
 
     def register_default_callback(self, callback: Callable) -> None:
         """Register the handler for rooms with no per-room callback (subscribe-all)."""

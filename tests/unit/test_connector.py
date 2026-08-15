@@ -59,6 +59,7 @@ def _make_connector():
     # Hand-built connector: `__init__` never runs, so anything the code reads has to be
     # set here. Delivery defaults to per-room, which is what these tests exercise.
     connector._router = None
+    connector._rooms_being_routed = set()
     connector._subscribe_all = False
     connector._dm_kinds = {}
     connector._rest = MagicMock()
@@ -2905,3 +2906,113 @@ class TestABatchHandedBackKeepsItsWindow(unittest.IsolatedAsyncioTestCase):
         await connector._snapshot_replay_boundaries()
         await connector._on_ws_reconnect()
         self.assertIsNone(connector._rooms["room-1"].replay_boundary)
+
+
+class TestTheHandBuiltConnectorMatchesARealOne(unittest.IsolatedAsyncioTestCase):
+    """`_make_connector` builds via `__new__`, so every field is set by hand.
+
+    Three times in one session a field added to `__init__` was missing here, and each time
+    it surfaced as an `AttributeError` in a handful of unrelated tests rather than as
+    "the helper is out of date". Derived from the real object instead of listed: the next
+    field fails here, once, with a message that says what to do.
+    """
+
+    async def test_no_field_from_init_is_missing(self):
+        from gateway.connectors.rocketchat.connector import RocketChatConnector
+
+        real = RocketChatConnector(_make_config())
+        try:
+            missing = set(vars(real)) - set(vars(_make_connector()))
+            self.assertEqual(
+                missing, set(),
+                "fields on a real connector that `_make_connector` never sets — add them "
+                "there, with the value `__init__` gives them",
+            )
+        finally:
+            await real._rest.close()
+
+
+class TestARoomIsOfferedOnceAtATime(unittest.IsolatedAsyncioTestCase):
+    """The routing workers are a pool, and offering a room is slow.
+
+    A DM cannot even be classified without `im.members`, so several frames from one room
+    that has just started talking overlap by default rather than by accident. Two offers
+    for one room are two watchers and two sessions for it.
+    """
+
+    def _connector(self):
+        connector = _make_connector()
+        connector._config.filter_sender = False
+        return connector
+
+    async def _frame(self):
+        return (
+            {"_id": "m1", "msg": "hi", "u": {"username": "alice"}, "rid": "new-room"},
+            {"roomParticipant": True, "roomType": "c", "roomName": "general"},
+        )
+
+    async def test_two_frames_for_one_room_offer_it_once(self):
+        connector = self._connector()
+        offered: list[str] = []
+        release = asyncio.Event()
+
+        async def _slow_router(room):
+            offered.append(room.id)
+            await release.wait()
+
+        connector.register_router(_slow_router)
+        doc, access = await self._frame()
+
+        first = asyncio.create_task(connector._on_unrouted_message(doc, access))
+        while not offered:
+            await asyncio.sleep(0)
+        await connector._on_unrouted_message(doc, access)   # second worker, same room
+
+        release.set()
+        await first
+
+        self.assertEqual(offered, ["new-room"])
+
+    async def test_a_different_room_is_not_blocked(self):
+        """The near miss: a global lock would serialize every room behind the slowest
+        classification, which is what the worker pool exists to avoid."""
+        connector = self._connector()
+        offered: list[str] = []
+        release = asyncio.Event()
+
+        async def _slow_router(room):
+            offered.append(room.id)
+            await release.wait()
+
+        connector.register_router(_slow_router)
+        doc, access = await self._frame()
+        other = dict(doc, rid="other-room", _id="m2")
+
+        first = asyncio.create_task(connector._on_unrouted_message(doc, access))
+        while not offered:
+            await asyncio.sleep(0)
+        second = asyncio.create_task(connector._on_unrouted_message(other, access))
+        while len(offered) < 2:
+            await asyncio.sleep(0)
+
+        release.set()
+        await asyncio.gather(first, second)
+        self.assertEqual(sorted(offered), ["new-room", "other-room"])
+
+    async def test_a_room_that_failed_to_be_offered_can_be_offered_again(self):
+        """Holding the reservation would make one transient REST failure permanent."""
+        connector = self._connector()
+        attempts = []
+
+        async def _failing_router(room):
+            attempts.append(room.id)
+            raise RuntimeError("boom")
+
+        connector.register_router(_failing_router)
+        doc, access = await self._frame()
+
+        await connector._on_unrouted_message(doc, access)
+        await connector._on_unrouted_message(doc, access)
+
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(connector._rooms_being_routed, set())

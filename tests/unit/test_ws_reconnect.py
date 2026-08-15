@@ -1482,3 +1482,51 @@ class TestOneRecoveryAtATime(unittest.IsolatedAsyncioTestCase):
             "the predecessor is released on the server, or nothing ever can be",
         )
         self.assertEqual(client._subscriptions["r1"], new_id)
+
+
+class TestAMigrationCancelledMidReleaseLosesNothing(unittest.IsolatedAsyncioTestCase):
+    """The mirror of release-on-install, and the order is the whole fix.
+
+    A recovery displaces whatever is running, so a migration cancelled at its `await
+    self._send(...)` is a normal event. Dropping the mapping before the release completes
+    hides a still-live subscription from the replacement, which resubscribes the room and
+    finds no predecessor to release.
+    """
+
+    async def test_the_mapping_outlives_a_cancelled_release(self):
+        client = _make_client()
+        client._subscriptions = {"r1": "sub-1", "r2": "sub-2"}
+        client._callbacks = {"r1": AsyncMock(), "r2": AsyncMock()}
+        started = asyncio.Event()
+
+        async def _hang_on_send(payload):
+            started.set()
+            await asyncio.sleep(9999)
+
+        client._send = _hang_on_send
+        task = asyncio.create_task(client.unsubscribe_rooms_keeping_callbacks())
+        await started.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertEqual(
+            len(client._subscriptions), 2,
+            "a mapping removed before its release completes leaves a live subscription "
+            "nothing can find; a mapping left behind only costs a redundant unsub",
+        )
+
+    async def test_a_completed_release_still_drops_the_mapping(self):
+        """The near miss: keeping the mapping unconditionally would leave every room
+        looking subscribed while the stream carries them."""
+        client = _make_client()
+        client._subscriptions = {"r1": "sub-1"}
+        client._callbacks = {"r1": AsyncMock()}
+        sent: list[dict] = []
+        client._send = AsyncMock(side_effect=lambda d: sent.append(d))
+
+        await client.unsubscribe_rooms_keeping_callbacks()
+
+        self.assertEqual(client._subscriptions, {})
+        self.assertIn({"msg": "unsub", "id": "sub-1"}, sent)
+        self.assertIn("r1", client._callbacks, "the room is still tracked")
