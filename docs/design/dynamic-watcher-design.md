@@ -428,9 +428,25 @@ table used to claim a username was stable. It is not — Rocket.Chat allows a
 rename, the room id does not change with it, and the row now says so. A channel
 rename is picked up immediately, because the new name arrives on every frame; a
 username is not on the frame, so it comes from an `im.members` lookup cached per
-room. Within one process a renamed counterpart therefore keeps its old label,
-while a restart produces the new one — the same room, labelled two ways
-depending on process age.
+room.
+
+What that costs is smaller than it first looks, and the reason is worth stating
+because it is the part a reader would get wrong. Nothing binds to the name: a
+watcher is keyed `(connector, room_id)`, the state record caches the resolved
+`room_id`, and `participants` is explicitly not part of any key (§6.4). Nor does
+a restart re-derive the label — recreation reads the **materialized config
+persisted in the state record** (§2.4), so an existing watcher keeps the name it
+was created with, and a rename cannot split its session, its watermark or its
+idle clock. The stale name is visible only where a name is *derived*: a watcher
+created after the rename — first contact, or a recreation after expiry, at which
+point the session it would have joined is gone by design anyway. Within one
+process the cache can make even that fresh creation use the old name.
+
+So the defect is a label that can lag, not an identity that can break — **and
+that is a constraint on the creation path, not merely an observation about it.**
+A recreation that re-derived the label from a fresh lookup, rather than reading
+the config the state record already holds, would turn this into a rename
+silently orphaning a session. Recreation reads the stored config.
 
 The cache stays anyway, and the reason is worth stating rather than implying:
 it is what stops a DM that **no rule claims** from calling `im.members` on

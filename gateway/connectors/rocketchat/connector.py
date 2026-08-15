@@ -614,11 +614,12 @@ class RocketChatConnector(Connector):
         invalidation path to catch (§6.4).
 
         The *kind* is what that immutability justifies caching. The participant names are a
-        snapshot: a counterpart who is renamed keeps the old name here until the process
-        restarts. Left that way on purpose — the cache is what stops a DM no rule claims
-        from calling `im.members` on every message, and making the label follow a rename is
-        an identity question (what a rename does to a live watcher) rather than a caching
-        one. Recorded in §2.3.
+        snapshot, and a renamed counterpart keeps the old name here for the life of the
+        process. Left that way on purpose: the cache is what stops a DM that no rule claims
+        from calling `im.members` on every message it ever receives, and nothing binds to
+        the name — watchers are keyed `(connector, room_id)` and recreation reads the
+        persisted config rather than re-deriving the label, so a stale name cannot split a
+        watcher's identity. Recorded in §2.3.
 
         A failed lookup returns `None` — unknown — and caches nothing. It deliberately does
         not fall back to 1:1: this answer decides whether the mention gate applies at all, so
