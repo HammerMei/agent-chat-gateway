@@ -1791,7 +1791,6 @@ class TestASuccessorThatFailedStillEndsItsPredecessor(unittest.IsolatedAsyncioTe
                 return
             # The successor runs to completion inside the confirmation wait: it takes the
             # room's subscription, then fails — keeping the shared state and callback.
-            client._subscriptions["r1"] = "successor-sub"
             client._subscriptions.pop("r1", None)
             fut = client._pending_subs.get(payload["id"])
             if fut and not fut.done():

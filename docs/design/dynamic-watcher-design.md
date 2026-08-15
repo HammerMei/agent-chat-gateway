@@ -1972,7 +1972,13 @@ only `disconnect` returns a connector to `absent`.
    unprocessed, and the restored live traffic has already moved the watermark past it, so
    a boundary cleared at fetch time makes the next recovery skip that tail for good.
 
-   And a window may not span membership epochs. A *confirmed* removal closes it —
+   And a window may not span membership epochs — at **both** marks a delivery leaves
+   behind, not only the watermark. A delivery still running when the removal lands writes
+   twice: the cursor it commits on acceptance, and the window it claims when the processor
+   hands the message back. Guarding one of them leaves the other pointing a later replay
+   below the removal, which is the worse of the two, since it is the mark a replay reads.
+
+   A *confirmed* removal closes it —
    otherwise an account that is later re-added replays from before it was removed and
    delivers everything said while it was not in the room, which the rejected-id window
    cannot prevent because those messages were never seen live at all. Unknown membership
