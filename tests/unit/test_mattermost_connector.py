@@ -19,13 +19,14 @@ from __future__ import annotations
 
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from gateway.agents.response import AgentResponse
 from gateway.connectors.mattermost.config import MattermostConfig
 from gateway.connectors.mattermost.connector import MattermostConnector
 from gateway.core.agent_chain import AgentChainConfig
 from gateway.core.connector import IncomingMessage, Room, RoomCapacity, User, UserRole
+from gateway.core.replay_window import just_before
 from gateway.core.watcher_rule import RoomKind
 
 
@@ -42,6 +43,25 @@ def _make_connector(**config_overrides) -> MattermostConnector:
     connector = MattermostConnector(_config(**config_overrides))
     connector._rest.bot_username = "hammer.mei"
     connector._rest.bot_user_id = "bot-id-1"
+
+    # Replay asks for a *page* so it can tell an empty window from a page the server
+    # filled with system posts before ACG filtered them. Derived from whatever a test
+    # sets on `get_room_history`, so a test that does not care about that distinction
+    # keeps expressing itself in messages — and one that does care sets the page mock
+    # directly and overrides this.
+    async def _page(channel_id, count=50, before_ts=None, after_ts=None):
+        from gateway.core.connector import HistoryPage
+
+        kw = {"count": count}
+        if before_ts is not None:
+            kw["before_ts"] = before_ts
+        if after_ts is not None:
+            kw["after_ts"] = after_ts
+        msgs = await connector._rest.get_room_history(channel_id, **kw)
+        return HistoryPage(messages=msgs, raw_count=len(msgs), limit=count)
+
+    connector._rest.get_room_history = AsyncMock(return_value=[])
+    connector._rest.get_room_history_page = _page
     return connector
 
 
@@ -1042,3 +1062,468 @@ class TestResolveRoomById(unittest.IsolatedAsyncioTestCase):
         room = await connector.resolve_room_by_id("c9")
 
         self.assertEqual(room.name, "c9")
+
+
+class TestAHandedBackPostGivesItsTurnBack(unittest.IsolatedAsyncioTestCase):
+    """The filter spends a turn before anything knows the post can be delivered.
+
+    Mattermost has a hand-back path — the `not accepted` branch forgets the id so a retry
+    can bring the post back — and a comment in `normalize.py` asserted it did not. Without
+    the release, every retry spends another turn; once the budget is gone the filter
+    rejects the post as complete, so the message the retry exists for is the one it can
+    never deliver.
+    """
+
+    async def _connector(self):
+        connector = _make_connector(
+            owners=["alice"],
+            agent_chain=AgentChainConfig(agent_usernames=["peer"], max_turns=2),
+        )
+        room = Room(id="chan1", name="general", type="channel")
+        connector._ws.register_channel = MagicMock()
+        await connector.subscribe_room(room, watcher_id="w1")
+        connector._rest.resolve_username = AsyncMock(return_value="peer")
+        return connector
+
+    def _post(self, post_id):
+        return {
+            "post": {"id": post_id, "channel_id": "chan1", "user_id": "u1",
+                     "message": "@hammer.mei hi", "root_id": "", "type": "",
+                     "create_at": 12345},
+            "mentions": ["bot-id-1"],
+        }
+
+    async def test_a_rejected_post_does_not_spend_a_turn(self):
+        connector = await self._connector()
+        connector.register_handler(AsyncMock(return_value=False))   # queue full
+
+        await connector._on_posted_event(self._post("p1"))
+
+        self.assertEqual(
+            connector._turn_store.current_turns("chan1", None, "peer"), 0,
+            "the post was never delivered, so it took no turn",
+        )
+
+    async def test_retrying_past_the_budget_still_reaches_the_handler(self):
+        """The failure this prevents: max_turns=2, so a third attempt used to be refused
+        by the filter before the handler ever saw it."""
+        connector = await self._connector()
+        handler = AsyncMock(return_value=False)
+        connector.register_handler(handler)
+
+        for i in range(5):
+            await connector._on_posted_event(self._post(f"p{i}"))
+
+        self.assertEqual(handler.await_count, 5)
+
+    async def test_a_delivered_post_keeps_its_turn(self):
+        """The near miss: releasing unconditionally would uncap the chain."""
+        connector = await self._connector()
+        connector.register_handler(AsyncMock(return_value=True))
+
+        await connector._on_posted_event(self._post("p1"))
+
+        self.assertEqual(connector._turn_store.current_turns("chan1", None, "peer"), 1)
+
+
+class TestAReplayedPostRejectedForCapacityStaysReplayable(unittest.IsolatedAsyncioTestCase):
+    """Rocket.Chat has two hand-back sites; the parity sweep carried one.
+
+    The preflight registers the message id before its `resolve_username` await, and the
+    busy notice is suppressed for replays — so a replayed post rejected here is skipped by
+    the next recovery's dedup check, the window is reported read, and nobody was told.
+    """
+
+    async def _connector(self, capacity):
+        connector = _make_connector(
+            owners=["alice"],
+            agent_chain=AgentChainConfig(agent_usernames=["peer"], max_turns=5),
+        )
+        room = Room(id="chan1", name="general", type="channel")
+        connector._ws.register_channel = MagicMock()
+        await connector.subscribe_room(room, watcher_id="w1")
+        connector._rest.resolve_username = AsyncMock(return_value="peer")
+        connector.register_capacity_check(lambda *a, **kw: capacity)
+        # Without this `_on_posted_event` returns on its first line and every assertion
+        # below is vacuous. Two of these tests passed that way when first written — the
+        # id was "forgotten" because it was never remembered, and the turn was "given
+        # back" because it was never taken. Only the one asserting a *positive* fact
+        # caught it, which is what the near-miss tests are for.
+        connector.register_handler(AsyncMock(return_value=True))
+        return connector
+
+    def _event(self, post_id="p1"):
+        return {"post": {"id": post_id, "channel_id": "chan1", "user_id": "u1",
+                         "message": "@hammer.mei hi", "root_id": "", "type": "",
+                         "create_at": 12345},
+                "mentions": ["bot-id-1"]}
+
+    async def test_the_id_is_forgotten_so_a_later_replay_can_bring_it_back(self):
+        connector = await self._connector(RoomCapacity.FULL)
+        state = connector._channels["chan1"]
+
+        await connector._on_posted_event(
+            self._event(), is_replay=True, replay_after_ts="1")
+
+        self.assertNotIn(
+            "p1", state.seen_ids_set,
+            "a remembered id makes the next recovery skip it and close the window",
+        )
+
+    async def test_the_turn_it_spent_is_given_back(self):
+        connector = await self._connector(RoomCapacity.FULL)
+
+        await connector._on_posted_event(
+            self._event(), is_replay=True, replay_after_ts="1")
+
+        self.assertEqual(
+            connector._turn_store.current_turns("chan1", None, "peer"), 0)
+
+    async def test_a_live_rejection_keeps_its_id_but_still_returns_the_turn(self):
+        """The sender was told and can resend, so the id stays — the turn does not."""
+        connector = await self._connector(RoomCapacity.FULL)
+        connector._rest.post_message = AsyncMock()
+        state = connector._channels["chan1"]
+
+        await connector._on_posted_event(self._event())
+
+        self.assertIn("p1", state.seen_ids_set)
+        self.assertTrue(connector._rest.post_message.await_count)
+        self.assertEqual(
+            connector._turn_store.current_turns("chan1", None, "peer"), 0)
+
+
+class TestTheMattermostWatermarkNeverMovesBackwards(unittest.IsolatedAsyncioTestCase):
+    """Replay calls `_on_posted_event` directly, so it is not serialized against live.
+
+    A replayed post awaiting its attachment download can be overtaken by live traffic that
+    commits a newer cursor; an unconditional assignment then rewinds it. `seen_ids` hides
+    that in memory and not across a restart.
+    """
+
+    async def _connector(self):
+        connector = _make_connector(owners=["alice"])
+        room = Room(id="chan1", name="general", type="channel")
+        connector._ws.register_channel = MagicMock()
+        await connector.subscribe_room(room, watcher_id="w1")
+        connector._rest.resolve_username = AsyncMock(return_value="alice")
+        connector.register_handler(AsyncMock(return_value=True))
+        return connector
+
+    def _event(self, post_id, ts):
+        return {"post": {"id": post_id, "channel_id": "chan1", "user_id": "u1",
+                         "message": "@hammer.mei hi", "root_id": "", "type": "",
+                         "create_at": ts},
+                "mentions": ["bot-id-1"]}
+
+    async def test_a_slow_replay_does_not_rewind_a_newer_live_cursor(self):
+        connector = await self._connector()
+        state = connector._channels["chan1"]
+
+        await connector._on_posted_event(self._event("live", 900))
+        self.assertEqual(state.last_processed_ts, "900")
+
+        # The replayed post is older, and its filter timestamp is pinned below it — which
+        # is what lets it through the filter at all.
+        await connector._on_posted_event(
+            self._event("replayed", 500), is_replay=True, replay_after_ts="1")
+
+        self.assertEqual(
+            state.last_processed_ts, "900",
+            "the cursor may not go below a message that was already delivered",
+        )
+
+    async def test_an_ordinary_post_still_advances_it(self):
+        connector = await self._connector()
+        state = connector._channels["chan1"]
+
+        await connector._on_posted_event(self._event("p1", 500))
+        await connector._on_posted_event(self._event("p2", 900))
+
+        self.assertEqual(state.last_processed_ts, "900")
+
+
+class TestARejectedPostStaysReachableAcrossReconnects(unittest.IsolatedAsyncioTestCase):
+    """Forgetting the id is only half of it — the watermark still has to point below it.
+
+    Mattermost gets the hand-back half of `core.replay_window` and not the outage half:
+    one connection resumes every channel at once, so there is no staggered-resubscribe
+    race to capture a window for. This mark exists purely because ACG refuses messages
+    when its own queues are full.
+    """
+
+    async def _connector(self):
+        connector = _make_connector(owners=["alice"])
+        room = Room(id="chan1", name="general", type="channel")
+        connector._ws.register_channel = MagicMock()
+        await connector.subscribe_room(room, watcher_id="w1")
+        connector._rest.resolve_username = AsyncMock(return_value="alice")
+        connector.register_handler(AsyncMock(return_value=True))
+        return connector
+
+    def _event(self, post_id, ts):
+        return {"post": {"id": post_id, "channel_id": "chan1", "user_id": "u1",
+                         "message": "@hammer.mei hi", "root_id": "", "type": "",
+                         "create_at": ts},
+                "mentions": ["bot-id-1"]}
+
+    async def test_a_later_success_cannot_strand_a_handed_back_post(self):
+        connector = await self._connector()
+        state = connector._channels["chan1"]
+        state.last_processed_ts = "400"
+
+        # The post at 500 is refused: the queues are full.
+        connector.register_handler(AsyncMock(return_value=False))
+        await connector._on_posted_event(self._event("p500", 500))
+        # Capacity frees up and a newer post is accepted, moving the watermark past it.
+        connector.register_handler(AsyncMock(return_value=True))
+        await connector._on_posted_event(self._event("p900", 900))
+
+        self.assertEqual(state.last_processed_ts, "900")
+        self.assertEqual(
+            state.replay_boundary, "400",
+            "the next reconnect must fetch from below the refused post, not from 900",
+        )
+
+    async def test_the_reconnect_fetches_from_the_boundary(self):
+        connector = await self._connector()
+        state = connector._channels["chan1"]
+        state.last_processed_ts = "900"
+        state.claim_boundary("400")
+        connector._rest.get_room_history = AsyncMock(return_value=[])
+
+        await connector._on_ws_reconnect()
+
+        self.assertEqual(
+            connector._rest.get_room_history.await_args.kwargs["after_ts"], "400",
+            "the watermark alone would skip everything the refused post is behind",
+        )
+
+    async def test_a_read_window_is_closed_again(self):
+        """The near miss: never closing leaves every channel replaying from the same
+        point for the life of the process."""
+        connector = await self._connector()
+        state = connector._channels["chan1"]
+        state.last_processed_ts = "900"
+        state.claim_boundary("400")
+        connector._rest.get_room_history = AsyncMock(
+            return_value=[{"id": "p500", "channel_id": "chan1", "user_id": "u1",
+                           "message": "hi", "root_id": "", "type": "", "create_at": 500}])
+
+        await connector._on_ws_reconnect()
+
+        self.assertIsNone(state.replay_boundary)
+
+    async def test_a_window_claimed_mid_batch_is_left_open(self):
+        """A hand-back during the batch claims the window this batch is reading, and
+        writes back the same timestamp — which is why the count decides, not the value."""
+        connector = await self._connector()
+        state = connector._channels["chan1"]
+        state.last_processed_ts = "900"
+        state.claim_boundary("400")
+        connector._rest.get_room_history = AsyncMock(
+            return_value=[{"id": "p500", "channel_id": "chan1", "user_id": "u1",
+                           "message": "hi", "root_id": "", "type": "", "create_at": 500}])
+
+        async def _dispatch(decoded, **kw):
+            # Exactly what a live hand-back does, same call, same arguments.
+            state.claim_boundary(state.last_processed_ts, just_before("450"))
+
+        connector._on_posted_event = _dispatch
+
+        with self.assertLogs("agent-chat-gateway.connectors.mattermost", "INFO"):
+            await connector._on_ws_reconnect()
+
+        self.assertEqual(
+            state.replay_boundary, "400",
+            "the live hand-back still depends on the window this batch did not read",
+        )
+
+    async def test_an_empty_fetch_closes_the_window_it_came_in_for(self):
+        connector = await self._connector()
+        state = connector._channels["chan1"]
+        state.last_processed_ts = "900"
+        state.claim_boundary("400")
+        connector._rest.get_room_history = AsyncMock(return_value=[])
+
+        await connector._on_ws_reconnect()
+
+        self.assertIsNone(state.replay_boundary)
+
+
+class TestEveryWayOfNotDeliveringGivesTheTurnBack(unittest.IsolatedAsyncioTestCase):
+    """The same surface as Rocket.Chat's twin, enumerated for the same reason.
+
+    Review found one un-released path on Rocket.Chat; sweeping both connectors found three
+    more there and three here. The budget belongs to ACG, not to either platform, so the
+    rule is the same on both — and the enumeration is what stops the next one being found
+    in a review round instead of locally.
+    """
+
+    async def _connector(self, capacity=RoomCapacity.AVAILABLE):
+        connector = _make_connector(
+            filter_sender=False,
+            agent_chain=AgentChainConfig(agent_usernames=["peer"], max_turns=3),
+        )
+        connector._config.require_mention = False
+        room = Room(id="chan1", name="general", type="dm")
+        connector._ws.register_channel = MagicMock()
+        await connector.subscribe_room(room, watcher_id="w1")
+        connector._rest.resolve_username = AsyncMock(return_value="peer")
+        connector.register_capacity_check(lambda *a, **kw: capacity)
+        connector.register_handler(AsyncMock(return_value=True))
+        connector._rest.post_message = AsyncMock()
+        return connector
+
+    def _event(self, post_id="p1"):
+        return {"post": {"id": post_id, "channel_id": "chan1", "user_id": "u1",
+                         "message": "hi", "root_id": "", "type": "", "create_at": 500},
+                "mentions": []}
+
+    def _turns(self, c):
+        return c._turn_store.current_turns("chan1", None, "peer")
+
+    async def test_no_watcher_for_the_channel(self):
+        c = await self._connector(RoomCapacity.UNROUTED)
+        await c._on_posted_event(self._event())
+        self.assertEqual(self._turns(c), 0)
+
+    async def test_the_live_capacity_preflight(self):
+        c = await self._connector(RoomCapacity.FULL)
+        await c._on_posted_event(self._event())
+        self.assertEqual(self._turns(c), 0)
+
+    async def test_the_replay_capacity_preflight(self):
+        c = await self._connector(RoomCapacity.FULL)
+        await c._on_posted_event(self._event(), is_replay=True, replay_after_ts="1")
+        self.assertEqual(self._turns(c), 0)
+
+    async def test_normalization_failing(self):
+        c = await self._connector()
+        with patch("gateway.connectors.mattermost.connector.normalize_mm_message",
+                   side_effect=RuntimeError("boom")):
+            await c._on_posted_event(self._event())
+        self.assertEqual(self._turns(c), 0)
+
+    async def test_the_handler_raising(self):
+        c = await self._connector()
+        c.register_handler(AsyncMock(side_effect=RuntimeError("boom")))
+        await c._on_posted_event(self._event())
+        self.assertEqual(self._turns(c), 0)
+
+    async def test_the_handler_refusing(self):
+        c = await self._connector()
+        c.register_handler(AsyncMock(return_value=False))
+        await c._on_posted_event(self._event())
+        self.assertEqual(self._turns(c), 0)
+
+    async def test_a_delivered_post_keeps_its_turn(self):
+        """The near miss: releasing unconditionally would uncap the chain."""
+        c = await self._connector()
+        await c._on_posted_event(self._event())
+        self.assertEqual(self._turns(c), 1)
+
+
+class TestAPageOfSystemPostsIsNotAnEmptyWindow(unittest.IsolatedAsyncioTestCase):
+    """`per_page` is applied before ACG filters system posts out.
+
+    So an empty filtered list can mean "the newest 200 entries are all joins, and every
+    user post you are looking for is behind them". Reporting the outage as read there
+    loses all of them. Rocket.Chat gained this distinction in this PR; Mattermost did not,
+    and its REST client discarded the raw count so the caller structurally could not ask.
+    """
+
+    async def _connector(self):
+        connector = _make_connector(owners=["alice"])
+        room = Room(id="chan1", name="general", type="channel")
+        connector._ws.register_channel = MagicMock()
+        await connector.subscribe_room(room, watcher_id="w1")
+        connector.register_handler(AsyncMock(return_value=True))
+        state = connector._channels["chan1"]
+        state.last_processed_ts = "900"
+        state.claim_boundary("400")
+        return connector, state
+
+    def _page(self, messages, raw_count, limit=200):
+        from gateway.core.connector import HistoryPage
+
+        return HistoryPage(messages=messages, raw_count=raw_count, limit=limit)
+
+    async def test_a_full_page_that_filtered_to_nothing_keeps_the_window_open(self):
+        connector, state = await self._connector()
+        connector._rest.get_room_history_page = AsyncMock(
+            return_value=self._page([], raw_count=200))
+
+        with self.assertLogs("agent-chat-gateway.connectors.mattermost", "WARNING"):
+            await connector._on_ws_reconnect()
+
+        self.assertEqual(
+            state.replay_boundary, "400",
+            "200 system posts is not evidence the window was read",
+        )
+
+    async def test_a_genuinely_empty_window_is_still_closed(self):
+        """The near miss: never closing would leave every channel replaying forever."""
+        connector, state = await self._connector()
+        connector._rest.get_room_history_page = AsyncMock(
+            return_value=self._page([], raw_count=0))
+
+        await connector._on_ws_reconnect()
+
+        self.assertIsNone(state.replay_boundary)
+
+    async def test_the_max_page_warning_counts_what_the_server_applied(self):
+        """A page of 200 that filtered down to 3 has still hidden older posts — the
+        warning must fire on the raw count, not the survivors."""
+        connector, _state = await self._connector()
+        posts = [{"id": f"p{i}", "channel_id": "chan1", "user_id": "u1",
+                  "message": "hi", "root_id": "", "type": "", "create_at": 500 + i}
+                 for i in range(3)]
+        connector._rest.get_room_history_page = AsyncMock(
+            return_value=self._page(posts, raw_count=200))
+
+        with self.assertLogs("agent-chat-gateway.connectors.mattermost", "WARNING") as cm:
+            await connector._on_ws_reconnect()
+
+        self.assertTrue(any("maximum" in m for m in cm.output))
+
+
+class TestATransientLookupFailureDoesNotSuppressAPost(unittest.IsolatedAsyncioTestCase):
+    """The id is registered before `resolve_username`, deliberately — so the failure path
+    has to undo it.
+
+    That REST call fires once per replayed post immediately after a reconnect, which is
+    exactly when REST is least reliable. Left recorded, the id makes every later replay
+    skip the post at the dedup check: one transient 502 suppresses it for good.
+    """
+
+    async def _connector(self):
+        connector = _make_connector(owners=["alice"])
+        room = Room(id="chan1", name="general", type="channel")
+        connector._ws.register_channel = MagicMock()
+        await connector.subscribe_room(room, watcher_id="w1")
+        connector.register_handler(AsyncMock(return_value=True))
+        connector._channels["chan1"].last_processed_ts = "400"
+        return connector
+
+    def _event(self):
+        return {"post": {"id": "p1", "channel_id": "chan1", "user_id": "u1",
+                         "message": "hi", "root_id": "", "type": "", "create_at": 500},
+                "mentions": ["bot-id-1"]}
+
+    async def test_the_id_is_forgotten_so_a_retry_can_bring_it_back(self):
+        connector = await self._connector()
+        connector._rest.resolve_username = AsyncMock(side_effect=RuntimeError("502"))
+
+        await connector._on_posted_event(self._event())
+
+        self.assertNotIn("p1", connector._channels["chan1"].seen_ids_set)
+
+    async def test_a_mark_is_left_below_it(self):
+        """Forgetting the id alone only helps until the next accepted post."""
+        connector = await self._connector()
+        connector._rest.resolve_username = AsyncMock(side_effect=RuntimeError("502"))
+
+        await connector._on_posted_event(self._event())
+
+        self.assertEqual(connector._channels["chan1"].replay_boundary, "400")

@@ -55,6 +55,33 @@ class Attachment:
     size_bytes: int = 0
 
 
+@dataclass(frozen=True)
+class HistoryPage:
+    """One page of history, and whether the server had more to give.
+
+    `raw_count` counts what the server returned *before* system and empty-body events were
+    dropped, because the limit is applied before that filtering. A page of two hundred
+    joins comes back as an empty `messages` list with `raw_count == limit`, and a caller
+    that cannot tell that from a genuinely empty window will report an outage as read when
+    every user message in it is still waiting behind that page.
+
+    In `core` rather than beside either REST client because the distinction is ACG's, not a
+    platform's: every connector filters something out of a page it did not size, so every
+    connector's replay can be handed an empty list that is not an empty window. *What* gets
+    filtered stays per-platform — Rocket.Chat drops `t`-typed events, Mattermost drops
+    `type`-tagged posts — and each client counts before its own filter.
+    """
+
+    messages: list[dict]
+    raw_count: int
+    limit: int
+
+    @property
+    def was_full(self) -> bool:
+        return self.raw_count >= self.limit
+
+
+
 @dataclass
 class Room:
     """Platform-agnostic channel / conversation descriptor.

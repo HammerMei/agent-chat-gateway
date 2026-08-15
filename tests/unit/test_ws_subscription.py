@@ -131,7 +131,8 @@ class TestUnsubscribeRacePrevented(unittest.IsolatedAsyncioTestCase):
     """unsubscribe_room must not leave a room re-registered after concurrent resubscription."""
 
     def _make_ws(self):
-        ws = RCWebSocketClient.__new__(RCWebSocketClient)
+        ws = RCWebSocketClient(
+            server_url="http://localhost:3000", username="t", password="t")
         ws._ws = MagicMock()
         ws._running = True
         ws._callbacks = {}
@@ -145,7 +146,8 @@ class TestUnsubscribeRacePrevented(unittest.IsolatedAsyncioTestCase):
         ws._callback_sem = asyncio.Semaphore(10)
         ws._room_queues = {}
         ws._room_workers = {}
-        ws._resubscribe_task = None
+        ws._recovery_task = None
+        ws._recovery_generation = 0
         ws._rooms_unsubscribing = set()
         return ws
 

@@ -63,6 +63,10 @@ class FilterResult:
     reason: str = ""  # debug only
     is_agent_chain: bool = False   # True when sender is a known ACG agent
     agent_chain_turn: int = 0      # current turn (1-based, after increment)
+    # Names the increment rather than counting it. `agent_chain_turn` is the live count
+    # and moves in both directions, so it cannot identify a delivery; releasing a turn
+    # needs this. Zero when no turn was taken.
+    agent_chain_token: int = 0
     agent_chain_max_turns: int = 5  # from config
 
 
@@ -72,6 +76,7 @@ def filter_rc_message(
     room_type: str,
     last_processed_ts: str | None,
     turn_store: "TurnStore | None" = None,
+    bot_user_id: str = "",
 ) -> FilterResult:
     """Decide whether a raw RC DDP message document should be processed.
 
@@ -124,7 +129,24 @@ def filter_rc_message(
 
     sender = doc.get("u", {}).get("username", "")
 
-    # 1. Skip own messages
+    # 1. Skip own messages — by id first, name only as a fallback for frames carrying no
+    #    id. Rocket.Chat's login is not spelling-exact: probed against 6.12, an account
+    #    whose canonical username is `ProbeBot9207` logs in as `probebot9207` or by email
+    #    address, and `me.username` in the response is still `ProbeBot9207`. The connector
+    #    stores what the operator configured, so `config.username` is whatever they typed
+    #    and `u.username` on every frame is the canonical spelling.
+    #
+    #    A name-only test therefore fails to recognise the bot's own posts under an
+    #    ordinary configuration. With `filter_sender` open and a DM — which skips the
+    #    mention gate entirely — the bot's own reply reads as user activity, is dispatched,
+    #    and the answer to it arrives as the next own message: an unbounded self-reply
+    #    loop, with no turn budget in the way because the bot is not in `agent_usernames`.
+    #
+    #    `_on_unrouted_message` already tests by id; this is the same rule on the tracked
+    #    path, which is the one that carries the traffic. Mattermost's filter has taken a
+    #    `bot_user_id` for exactly this all along.
+    if bot_user_id and doc.get("u", {}).get("_id") == bot_user_id:
+        return FilterResult(accepted=False, reason="own message")
     if sender == config.username:
         return FilterResult(accepted=False, reason="own message")
 
@@ -174,8 +196,9 @@ def filter_rc_message(
     # 5. Agent chain turn budget (only for agent senders) — state mutation only
     #    after dedup confirms this is a fresh, previously-unseen message.
     agent_chain_turn = 0
+    agent_chain_token = 0
     if is_agent and turn_store is not None:
-        allowed, agent_chain_turn = turn_store.check_and_increment(
+        allowed, agent_chain_turn, agent_chain_token = turn_store.check_and_increment(
             room_id=doc.get("rid", ""),
             thread_id=doc.get("tmid") or None,
             sender=sender,
@@ -206,6 +229,7 @@ def filter_rc_message(
         msg_ts=msg_ts,
         is_agent_chain=is_agent,
         agent_chain_turn=agent_chain_turn,
+        agent_chain_token=agent_chain_token,
         agent_chain_max_turns=config.agent_chain.max_turns,
     )
 

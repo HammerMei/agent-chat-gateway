@@ -1,0 +1,122 @@
+"""The mark that keeps a refused message reachable — the rule, not either connector.
+
+`gateway/core/replay_window.py` is shared because the question is ACG's own: both
+connectors refuse messages when their queues are full, and refusing is only honest if
+something remembers where to look. Everything platform-specific stays with the platform,
+so this file tests the rule and the connector suites test the wiring.
+"""
+
+from __future__ import annotations
+
+import unittest
+from dataclasses import dataclass
+
+from gateway.core.replay_window import ReplayWindow, just_before
+
+
+@dataclass
+class _Window(ReplayWindow):
+    replay_boundary: str | None = None
+    boundary_claims: int = 0
+
+
+class TestTheOldestCandidateWins(unittest.TestCase):
+    """Not the first one offered — that put the mark past the message it was opened for.
+
+    The hand-back sites offer the live watermark before the point just below the refused
+    message, on the assumption that the watermark is older. Replay is not serialized
+    against the per-room worker on either connector, so a newer message can be accepted
+    while an older one is still in the handler, and then it is not.
+    """
+
+    def test_a_watermark_ahead_of_the_refused_message_does_not_win(self):
+        w = _Window()
+
+        # The concurrent worker already committed 900; the message being refused is 500.
+        w.claim_boundary("900", just_before("500"))
+
+        self.assertEqual(
+            w.replay_boundary, "499",
+            "a boundary above the refused message cannot recover it — the one thing it "
+            "may never do",
+        )
+
+    def test_a_watermark_behind_it_still_wins(self):
+        """The ordinary case, and the reason the watermark is offered at all: it is the
+        older mark, so the window covers everything since."""
+        w = _Window()
+
+        w.claim_boundary("400", just_before("500"))
+
+        self.assertEqual(w.replay_boundary, "400")
+
+    def test_an_open_window_is_never_narrowed(self):
+        w = _Window()
+        w.claim_boundary("100")
+        w.claim_boundary("400", just_before("500"))
+
+        self.assertEqual(w.replay_boundary, "100", "the older mark covers both windows")
+
+    def test_an_unparseable_candidate_sorts_oldest(self):
+        """A bound too low costs a re-fetch dedup absorbs; too high loses a message."""
+        w = _Window()
+
+        w.claim_boundary("not-a-timestamp", just_before("500"))
+
+        self.assertEqual(w.replay_boundary, "not-a-timestamp")
+
+    def test_a_claim_with_nothing_to_point_at_writes_nothing(self):
+        w = _Window()
+
+        self.assertEqual(w.claim_boundary(None, ""), 0)
+        self.assertIsNone(w.replay_boundary)
+
+
+class TestOnlyTheClaimantThatReadItMayCloseIt(unittest.TestCase):
+    def test_a_second_claim_counts_even_at_the_same_value(self):
+        w = _Window()
+        first = w.claim_boundary("100")
+        second = w.claim_boundary("100")
+
+        self.assertNotEqual(
+            first, second,
+            "two claimants wanting the same timestamp is the case a value cannot see",
+        )
+
+    def test_discharge_refuses_once_someone_else_has_claimed(self):
+        w = _Window()
+        at_entry = w.claim_boundary("100")
+        w.claim_boundary("100")
+
+        self.assertFalse(w.discharge_boundary(at_entry))
+        self.assertEqual(w.replay_boundary, "100")
+
+    def test_discharge_closes_the_window_it_read(self):
+        w = _Window()
+        at_entry = w.claim_boundary("100")
+
+        self.assertTrue(w.discharge_boundary(at_entry))
+        self.assertIsNone(w.replay_boundary)
+        self.assertEqual(w.boundary_claims, 0, "a closed window owes nobody a read")
+
+    def test_discarding_is_not_the_same_as_reading(self):
+        """`discard_boundary` says the window must never be read — Rocket.Chat's
+        membership removal — and does not care who else claimed it."""
+        w = _Window()
+        w.claim_boundary("100")
+        w.claim_boundary("100")
+
+        w.discard_boundary()
+
+        self.assertIsNone(w.replay_boundary)
+        self.assertEqual(w.boundary_claims, 0)
+
+
+class TestJustBefore(unittest.TestCase):
+    def test_strictly_below(self):
+        self.assertEqual(just_before("500"), "499")
+
+    def test_an_unparseable_timestamp_is_left_alone(self):
+        """Better an unusable bound than a fabricated one."""
+        self.assertEqual(just_before("not-a-time"), "not-a-time")
+        self.assertEqual(just_before(""), "")

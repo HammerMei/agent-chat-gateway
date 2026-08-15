@@ -664,9 +664,17 @@ class TestRCRefcount(unittest.IsolatedAsyncioTestCase):
         config.password = "secret"
 
         connector = RocketChatConnector.__new__(RocketChatConnector)
+        # `__init__` never runs here, so delivery-mode state has to be set explicitly.
+        # Per-room is what these tests exercise.
+        connector._router = None
+        connector._subscribe_all = False
+        connector._dm_kinds = {}
         connector._config = config
         connector._rest = MagicMock()
         connector._ws = MagicMock()
+        # Asked, not remembered: a bare MagicMock answers truthily and would skip every
+        # subscription. These tests exercise per-room delivery.
+        connector._ws.stream_active = False
         connector._ws.subscribe_room = AsyncMock()
         connector._ws.unsubscribe_room = AsyncMock()
         connector._handler = None
@@ -739,9 +747,17 @@ class TestMultiWatcherDispatch(unittest.IsolatedAsyncioTestCase):
         config.attachments.cache_dir = "agent-chat.cache"
 
         connector = RocketChatConnector.__new__(RocketChatConnector)
+        # `__init__` never runs here, so delivery-mode state has to be set explicitly.
+        # Per-room is what these tests exercise.
+        connector._router = None
+        connector._subscribe_all = False
+        connector._dm_kinds = {}
         connector._config = config
         connector._rest = MagicMock()
         connector._ws = MagicMock()
+        # Asked, not remembered: a bare MagicMock answers truthily and would skip every
+        # subscription. These tests exercise per-room delivery.
+        connector._ws.stream_active = False
         connector._ws.subscribe_room = AsyncMock()
         connector._ws.unsubscribe_room = AsyncMock()
         connector._handler = None
@@ -1498,9 +1514,17 @@ class TestAttachmentCachePath(unittest.IsolatedAsyncioTestCase):
         config.attachments.cache_dir = "agent-chat.cache"
 
         connector = RocketChatConnector.__new__(RocketChatConnector)
+        # `__init__` never runs here, so delivery-mode state has to be set explicitly.
+        # Per-room is what these tests exercise.
+        connector._router = None
+        connector._subscribe_all = False
+        connector._dm_kinds = {}
         connector._config = config
         connector._rest = MagicMock()
         connector._ws = MagicMock()
+        # Asked, not remembered: a bare MagicMock answers truthily and would skip every
+        # subscription. These tests exercise per-room delivery.
+        connector._ws.stream_active = False
         connector._ws.subscribe_room = AsyncMock()
         connector._ws.unsubscribe_room = AsyncMock()
         connector._handler = None

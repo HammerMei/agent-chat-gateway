@@ -75,7 +75,7 @@ def room_label(room: RoomRef) -> str:
     | kind | label | stable? |
     |---|---|---|
     | channel / private group | the channel name | until renamed |
-    | 1:1 DM | `dm-<counterpart>` | yes — a username is stable |
+    | 1:1 DM | `dm-<counterpart>` | until the counterpart is renamed (§2.3) |
     | group DM | `gdm-<8 hex of the room-id digest>` | yes, by construction |
 
     **A group DM's members are deliberately not in its label.** The tempting alternative

@@ -467,3 +467,179 @@ class TestSeenIdsStayBounded(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAClearedWatermarkSurvivesToDisk(unittest.IsolatedAsyncioTestCase):
+    """A connector that has cleared its watermark on purpose must be able to say so.
+
+    The save step copies the connector's live watermark, and it used to copy it only when
+    truthy — so "this account was removed, forget the mark" was indistinguishable from
+    "this room saw no activity in this run, keep what is on disk". The stale pre-removal
+    value then came back at the next start, and a later re-add replayed the interval the
+    account was not a member for.
+    """
+
+    def _lifecycle(self, live_ts):
+        from unittest.mock import AsyncMock
+
+        from gateway.core.watcher_lifecycle import WatcherLifecycle
+
+        lc = WatcherLifecycle.__new__(WatcherLifecycle)
+        lc._processors = {}
+        lc._states = {}
+        lc._dispatcher = MagicMock()
+        lc._permission_registry = MagicMock()
+        lc._maps = MagicMock()
+        lc._injector = MagicMock()
+        lc._watcher_locks = {}
+        connector = MagicMock()
+        connector.get_last_processed_ts = MagicMock(return_value=live_ts)
+        connector.unsubscribe_room = AsyncMock()
+        lc._connector = connector
+        return lc
+
+    def _state(self):
+        from gateway.core.state import WatcherState
+
+        return WatcherState(
+            watcher_name="w1", session_id="s1", room_id="room-1",
+            last_processed_ts="100",
+        )
+
+    async def test_a_deliberate_clear_erases_the_stored_mark(self):
+        lc = self._lifecycle(live_ts="")
+        state = self._state()
+
+        lc._states["w1"] = state
+        await lc._stop_processor("w1")
+
+        self.assertEqual(
+            state.last_processed_ts, "",
+            "the removal has to reach the record, or a restart hands the mark back",
+        )
+
+    async def test_no_opinion_leaves_the_stored_mark_alone(self):
+        """The near miss: a quiet room reports `None`, and erasing on that would lose the
+        outage window across every restart."""
+        lc = self._lifecycle(live_ts=None)
+        state = self._state()
+
+        lc._states["w1"] = state
+        await lc._stop_processor("w1")
+
+        self.assertEqual(state.last_processed_ts, "100")
+
+    async def test_a_live_watermark_is_still_copied(self):
+        lc = self._lifecycle(live_ts="900")
+        state = self._state()
+
+        lc._states["w1"] = state
+        await lc._stop_processor("w1")
+
+        self.assertEqual(state.last_processed_ts, "900")
+
+
+class TestEveryWatermarkCopySpeaksTheSameLanguage(unittest.IsolatedAsyncioTestCase):
+    """`None` is "no opinion"; `""` is "cleared on purpose". Three sites read that.
+
+    Two of them write the connector's value into the record — `_stop_processor` and
+    `StateStore.save` — and one writes the record back into the connector on restore. A
+    site that still tests truthiness treats a deliberate clear as an absence, and whichever
+    of them runs first decides whether a removal survives.
+    """
+
+    def _save(self, *, live_ts, states):
+        """Drive the real `StateStore.save` against a temp state file."""
+        from unittest.mock import patch
+
+        from gateway.core.state_store import StateStore
+
+        store = StateStore.__new__(StateStore)
+        connector = MagicMock()
+        connector.get_last_processed_ts = MagicMock(return_value=live_ts)
+        store._connector = connector
+        store._state_name = "test"
+        with patch("gateway.core.state_store.load_state", return_value={}), \
+             patch("gateway.core.state_store.save_state") as saved:
+            store.save(states)
+        return saved
+
+    def test_the_save_path_propagates_a_deliberate_clear(self):
+        from gateway.core.state import WatcherState
+
+        ws = WatcherState(
+            watcher_name="w1", session_id="s1", room_id="room-1",
+            last_processed_ts="100",
+        )
+        self._save(live_ts="", states={"w1": ws})
+
+        self.assertEqual(
+            ws.last_processed_ts, "",
+            "a process that exits without a clean stop must not leave the pre-removal "
+            "mark on disk",
+        )
+
+    def test_the_save_path_leaves_a_quiet_room_alone(self):
+        from gateway.core.state import WatcherState
+
+        ws = WatcherState(
+            watcher_name="w1", session_id="s1", room_id="room-1",
+            last_processed_ts="100",
+        )
+        self._save(live_ts=None, states={"w1": ws})
+
+        self.assertEqual(ws.last_processed_ts, "100")
+
+    def test_a_cleared_cursor_is_never_written_over(self):
+        """The behaviour, not the shape of the guard.
+
+        The form check below passed a version of this rule that did nothing: the second
+        clause still ran, and `ts_gt("100", "")` is True, so the stale mark went back over
+        the deliberate clear anyway. A test of what the code *says* is not a test of what
+        it *does*, and this is the one that would have caught it.
+        """
+        from gateway.core.watcher_lifecycle import _should_restore_watermark
+
+        self.assertFalse(
+            _should_restore_watermark("100", ""),
+            "an empty live cursor is the connector saying it cleared the mark",
+        )
+
+    def test_a_connector_with_no_state_for_the_room_is_restored(self):
+        from gateway.core.watcher_lifecycle import _should_restore_watermark
+
+        self.assertTrue(_should_restore_watermark("100", None))
+
+    def test_a_record_behind_the_live_cursor_is_not_written_back(self):
+        """Never backwards: the connector advances the cursor as messages are accepted,
+        and an older record would redeliver everything between the two."""
+        from gateway.core.watcher_lifecycle import _should_restore_watermark
+
+        self.assertFalse(_should_restore_watermark("100", "900"))
+        self.assertTrue(_should_restore_watermark("900", "100"))
+
+    def test_an_empty_record_restores_nothing(self):
+        from gateway.core.watcher_lifecycle import _should_restore_watermark
+
+        self.assertFalse(_should_restore_watermark("", "100"))
+        self.assertFalse(_should_restore_watermark("", None))
+
+    def test_no_copy_site_still_tests_truthiness(self):
+        """Derived from the source, because the list of sites is the thing that keeps
+        being incomplete — twice now, once with the second site named in the finding."""
+        import inspect
+
+        from gateway.core import state_store, watcher_lifecycle
+
+        for mod in (state_store, watcher_lifecycle):
+            src = inspect.getsource(mod)
+            self.assertNotIn(
+                "if live_ts:", src,
+                f"{mod.__name__}: a truthiness test cannot tell a deliberate clear from "
+                f"an absence — use `is not None`",
+            )
+            self.assertNotIn(
+                "if not current_ts or", src,
+                f"{mod.__name__}: same rule on the restore side — an empty live cursor "
+                f"is a connector saying it cleared the mark",
+            )

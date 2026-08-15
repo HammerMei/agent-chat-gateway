@@ -65,7 +65,14 @@ class StateStore:
             if ws.room_id:
                 try:
                     live_ts = self._connector.get_last_processed_ts(ws.room_id)
-                    if live_ts:
+                    # `is not None`, so a connector that has *cleared* its watermark can
+                    # say so — the same distinction `_stop_processor` makes, and it has to
+                    # be made in both places or the one that runs first wins. `None` means
+                    # "no opinion, this room saw no activity in this run"; an empty string
+                    # is an opinion, written by a connector that learned this account is no
+                    # longer in the room. Skipping it here leaves the pre-removal mark on
+                    # disk for any process that exits without a clean stop.
+                    if live_ts is not None:
                         ws.last_processed_ts = live_ts
                 except Exception as e:
                     logger.warning(

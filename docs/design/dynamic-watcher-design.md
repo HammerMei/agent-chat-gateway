@@ -420,8 +420,46 @@ gives up on readability:
 | Room kind | Label | Stable? |
 |---|---|---|
 | channel / private group | the channel name | until renamed |
-| 1:1 DM | `dm-<counterpart>` | yes — a username is stable |
+| 1:1 DM | `dm-<counterpart>` | until the counterpart is renamed — and see below |
 | group DM | `gdm-<first 8 of a room_id hash>` | yes, by construction |
+
+**A renamed counterpart is a known inconsistency, deliberately left.** This
+table used to claim a username was stable. It is not — Rocket.Chat allows a
+rename, the room id does not change with it, and the row now says so. A channel
+rename is picked up immediately, because the new name arrives on every frame; a
+username is not on the frame, so it comes from an `im.members` lookup cached per
+room.
+
+What that costs is smaller than it first looks, and the reason is worth stating
+because it is the part a reader would get wrong. Nothing binds to the name: a
+watcher is keyed `(connector, room_id)`, the state record caches the resolved
+`room_id`, and `participants` is explicitly not part of any key (§6.4). Nor does
+a restart re-derive the label — recreation reads the **materialized config
+persisted in the state record** (§2.4), so an existing watcher keeps the name it
+was created with, and a rename cannot split its session, its watermark or its
+idle clock. The stale name is visible only where a name is *derived*: a watcher
+created after the rename — first contact, or a recreation after expiry, at which
+point the session it would have joined is gone by design anyway. Within one
+process the cache can make even that fresh creation use the old name.
+
+So the defect is a label that can lag, not an identity that can break — **and
+that is a constraint on the creation path, not merely an observation about it.**
+A recreation that re-derived the label from a fresh lookup, rather than reading
+the config the state record already holds, would turn this into a rename
+silently orphaning a session. Recreation reads the stored config.
+
+The cache stays anyway, and the reason is worth stating rather than implying:
+it is what stops a DM that **no rule claims** from calling `im.members` on
+every message it ever receives, since an unclaimed room is offered to the router
+again each time. Caching user ids instead would not avoid that lookup — the
+label needs names, so ids would have to be resolved to names at the same point.
+
+What the verified immutability of DM membership (§6.4) justifies is caching the
+**kind**; the names are a snapshot and are documented here as one. Making the
+label follow a rename means deciding what a rename does to a *live* watcher's
+identity — whether it is renamed, or left alone and diverges from its room —
+and that is a §2.3 identity question, not a caching one. Deferred until watcher
+identity is revisited.
 
 **Group DMs deliberately do not encode their members in the label.** The
 tempting alternative is Mattermost's `channel_display_name`, which is exactly
@@ -1851,6 +1889,188 @@ for rooms the account never per-room-subscribed to. Frame shape:
 | `roomType` uses Rocket.Chat's raw letters: `c` public channel, `p` private group, `d` direct | Needs mapping to the internal `channel`/`group`/`dm` vocabulary that history fetching depends on. |
 | Second `sub` parameter `false` (what ACG sends) vs `true` (what Rocket.Chat's own SDK sends) | No observable difference in the emitted frames. No change needed. |
 
+#### Subscribe-all: the stream's lifecycle, and what depends on it
+
+Written after six review rounds on the implementation, every one of which found a
+consequence of the previous round's fix. The findings were not unrelated: switching
+delivery to one stream introduces a **state machine** and a set of invariants that hold
+across it, and discovering those one review at a time is how the same defect keeps coming
+back wearing a different hat. Stated here so the code can be checked against a model
+rather than against the last thing someone noticed.
+
+**States**, per connector:
+
+| State | Meaning | Who is subscribed | Who delivers |
+|---|---|---|---|
+| **absent** | no router registered; nothing wants the stream | each tracked room | its own subscription |
+| **wanted** | a router exists, the stream is intended | — | — |
+| **live** | the server confirmed and has not stopped it | the stream | the stream, for every room |
+| **lost** | wanted but not live: refused, timed out, stopped, or the socket dropped | each tracked room | its own subscription |
+
+Transitions: `absent → wanted` when a router is registered; `wanted → live` on a `ready`
+**that still stands when the caller acts on it** (invariant 7);
+`live → lost` on `nosub` for the stream id, on a socket drop, or on an explicit stop;
+`lost → live` on a successful resubscribe. **Intent is not a state that failure clears** —
+only `disconnect` returns a connector to `absent`.
+
+**Invariants**, each of which a review round found violated:
+
+1. **Exactly one delivery path per tracked room.** Never both — a room subscribed while
+   the stream is live receives every message twice, and message-id dedup hides the second
+   dispatch but not the queue slot it occupies. Never neither — a room whose subscription
+   was released when the stream went live, and never restored when it went lost, receives
+   nothing at all and looks healthy.
+2. **Liveness is a transport fact, never a copy.** A connector-side flag saying the stream
+   is live disagrees with reality the moment a restore fails, and a watcher added in that
+   window registers a callback for a room nobody subscribed to.
+3. **Intent survives failure; only the subscription id is per-attempt.** Recording intent
+   on success means one transient failure leaves a connector on per-room delivery for the
+   rest of its life, having asked for the stream exactly once.
+4. **`live → lost` is not complete until every tracked room has its own subscription.**
+   The transition is the point at which delivery would otherwise stop silently. Of the
+   three ways it happens, only the socket drop reconnects — a `nosub` for a confirmed
+   stream leaves a healthy socket, so nothing else will notice and nothing else will
+   recover it.
+
+   Completing the transition restores *delivery*; it does not recover what the gap lost.
+   Between the stream stopping and the per-room confirmations, messages to tracked rooms
+   reached nobody, and that is an outage whether or not a socket went down with it. The
+   history replay therefore runs after this recovery exactly as it does after a reconnect —
+   restoring delivery and recovering the outage are two separate obligations, and a path
+   that discharges only the first loses messages quietly.
+5. **Replay may not assume membership.** The access object — and with it
+   `roomParticipant` — exists only on live-stream frames. History fetched after an outage
+   carries none, and the removal itself is a system event the history filter drops. So a
+   bot removed from a room *during* an outage replays that room's missed messages as
+   though nothing happened. **Membership must be revalidated per room before replay is
+   dispatched**, not inferred from what the live path happened to see.
+
+   It is read from the account's subscription record for the room
+   (`subscriptions.getOne`), which is what Rocket.Chat removes on leaving or being kicked;
+   a *hidden* room keeps its record and is still membership. A room with no record is a
+   **200 with a null subscription** — verified against the endpoint's handler, which is a
+   plain `success({subscription: findOneByRoomIdAndUserId(...)})`, and against its own
+   end-to-end tests; its declared failures are 400 for a malformed request and 401 for
+   authentication, neither of which says anything about membership. So an HTTP error is
+   **unknown**, and must stay unknown: answering "not a member" there would let an auth
+   failure close the replay window and drop the watermark, which is silent message loss
+   caused by an unrelated defect. That is the
+   safe direction to be wrong in: a message withheld can still be read in the room it was
+   sent to, and one sent to a room the agent was removed from cannot be taken back.
+6. **The replay boundary is where delivery stopped, not where replay starts.** Rooms are
+   resubscribed one at a time, so the first is live again while the last is still
+   confirming — and a message arriving in that window is dispatched at once and moves that
+   room's watermark past the whole outage. Replay, reading the watermark when it finally
+   runs, then asks for history *after* the gap and never fetches it. The boundary must be
+   captured while nothing is subscribed, before either the stream restore or the first
+   per-room `sub`, and carried into the replay. Freezing the watermark instead would break
+   live dedup during the recovery; the two marks are separate facts and both are needed.
+
+   A boundary is spent when the window it names has been **dispatched**, not when it was
+   fetched and not when a replay was attempted. Fetching a batch is not reading it: a
+   shutdown or a second disconnect cancelling the loop midway leaves the tail
+   unprocessed, and the restored live traffic has already moved the watermark past it, so
+   a boundary cleared at fetch time makes the next recovery skip that tail for good.
+
+   And a window may not span membership epochs — at **both** marks a delivery leaves
+   behind, not only the watermark. A delivery still running when the removal lands writes
+   twice: the cursor it commits on acceptance, and the window it claims when the processor
+   hands the message back. Guarding one of them leaves the other pointing a later replay
+   below the removal, which is the worse of the two, since it is the mark a replay reads.
+
+   A *confirmed* removal closes it —
+   otherwise an account that is later re-added replays from before it was removed and
+   delivers everything said while it was not in the room, which the rejected-id window
+   cannot prevent because those messages were never seen live at all. Unknown membership
+   is not removal and still keeps the window open.
+
+   Closing it means dropping the watermark as well, not only the boundary. The watermark
+   *is* the fallback boundary, and it is frozen at the moment of removal — the live
+   membership gate remembers a rejected id without advancing it — so a reconnect arriving
+   before the first post-re-add message would snapshot that frozen value and replay the
+   whole time away regardless. An empty watermark means for a re-added room exactly what
+   it means for one seen for the first time: no window, and no ts-dedup until live traffic
+   establishes one. The two ways a replay declines — membership unknown, the history fetch
+   failing — are both correlated with the outage, since the network has only just come
+   back, so they are the likely path rather than the exotic one; clearing the mark there
+   would close a gap nobody looked at. For the same reason a new outage does not overwrite
+   an unread boundary: the older mark covers both windows, and dedup bounds the cost.
+
+   Because the window is never narrowed, **the timestamp cannot say who is owed a read of
+   it, and a count of claims has to.** A live message handed back for capacity while a
+   replay is dispatching claims the very window that replay is reading, so the value it
+   writes back is the one already there. A batch that compares the boundary it snapshotted
+   against the boundary it finds therefore sees "unchanged" in exactly the case the
+   comparison exists to catch, closes the window, and the next accepted message moves the
+   watermark past the handed-back message for good. Every claim increments a counter, and
+   a window is closed only against a count read before the claim could have happened — at
+   *both* sites that can decide a replay has read it, the dispatched batch and the fetch
+   that came back empty, since a REST round trip is ample room for a hand-back.
+7. **A confirmation is only as good as the transport's last word about it.** `ready` and
+   `nosub` for the same subscription can arrive in one batch of frames, and the receive
+   loop processes both before the coroutine awaiting the confirmation is scheduled again —
+   resolving a future only *schedules* its waiter, and reading an already-buffered frame
+   does not yield. In that window the subscription has an id, a resolved future, and no
+   entry in `_stream_sub_id`: the rejection path sees a future with nothing left to
+   reject, and the stream path does not recognise its own subscription. So the id has to
+   be published *before* the wait, and the caller has to re-check that its confirmation
+   still stands before recording it. Recording a revoked one claims delivery the server
+   has already stopped — and the connector releases every per-room subscription on that
+   claim.
+8. **One recovery, one owner — structurally, not by checklist.** Restoring delivery has a
+   single entry point: `_start_recovery(reason, try_stream=…)`, which retires whatever is
+   running and installs one task in one slot. A socket drop and a stream terminated under
+   a healthy socket differ only in whether the stream is worth asking for again in that
+   instant; everything else they did was the same sequence written twice over the same
+   state, and every review round on this file found another write in it with no owner.
+
+   Two mechanisms carry the rule where a single sequence cannot reach:
+
+   - **A room has at most one subscription, and installing one releases its predecessor —
+     releasing *before* the map records the successor.** The map is the only record of
+     what can still be live on the server, so at every await point it must name something
+     releasable. The other order leaves it naming an id whose `sub` frame has not gone out
+     while the predecessor is live and invisible. This has two sites — the migration loop
+     and the install path — and fixing one of them is how the second was found.
+     A recovery interrupted partway through releasing them is a normal event now — a
+     recovery cancels whatever it displaces — so the next one must not overwrite a mapping
+     whose server-side subscription is still live. Untracked is unreleasable: removing the
+     watcher would stop only the replacement.
+   - **A generation, for work that outlives its starter.** `subscribe_all()` is called
+     directly by `start_inbound` as well as from a recovery, so it is not identifiable by
+     the slot, and `stop()` retires every attempt at once without knowing any of their
+     ids. Each attempt captures the generation and compares before publishing.
+
+   The historical form of this invariant — "an attempt clears only the ids it published, a
+   migration releases only the subscription it captured" — is what the structure now makes
+   true by construction. It was stated as a checklist first, and three further violations
+   followed in the next round alone, in nouns the checklist had not been applied to.
+
+   Recoveries overlap: a socket drop starts a
+   replacement while the previous attempt is still unwinding, and a stream lost during a
+   migration starts a fallback that touches rooms the migration has already read. So every
+   write to shared state names what it owns — an attempt clears only the ids *it*
+   published, a migration releases only the subscription id *it* captured, and `stop()`
+   owns all of it, being the transport half of `→ absent`. Unconditional clears are how
+   the last attempt to finish wins, and the last to finish is not the current one.
+
+   It covers the *task slot* as much as the fields in it: a recovery that displaces
+   another stops it first and waits for the cancellation to be observed. Two recoveries
+   both reaching the replay callback read the same boundary, and a message id is recorded
+   only once its handler finishes — so the visible failure is one message answered twice.
+
+   Two of the three violations that produced this rule were introduced by the fixes for
+   the two invariants above it: each added a shared field without adding an owner. That is
+   the argument for stating it as a rule and for testing the *surface* — the check that
+   `stop()` clears every stream field is derived from the object, so the next field added
+   fails locally rather than in a review.
+9. **An unknown classification is not a default.** Rocket.Chat cannot distinguish a 1:1
+   from a group DM without a lookup, and a failed lookup answering "1:1" is not a
+   conservative guess: it lets a group DM be claimed by a `direct: true` rule *and* skip
+   the mention gate, so the agent answers everyone in it. Unknown means do not offer the
+   room; the next message asks again. (The same rule as §2.4's session identity —
+   unverifiable is not verified.)
+
 ### 6.2 Mattermost: delivery tracks membership, not readability
 
 The docstring claim holds, verified with an explicit preflight so that "no event"
@@ -1952,8 +2172,12 @@ getting the classification wrong, and it is why `group_direct` is a separate
 opt-in (§2.7) rather than folded into `direct`.
 
 Consequence for Rocket.Chat: honouring a separate `group_direct` there needs a
-participant-count lookup when a DM room is first seen. A DM that later gains
-members would need re-classifying, which the cache must not prevent.
+participant-count lookup when a DM room is first seen. **That answer never
+expires**, per the immutability finding above — a DM cannot gain members, and a
+different member set is a different room id — so the cache needs no invalidation
+path. An earlier draft of this paragraph said a DM that later gained members
+would need re-classifying; that was written before the 8.5.1 probe and describes
+a transition the platform does not allow.
 
 **Cross-team delivery is real, and the team gate is load-bearing.** With the
 probe account added to a second team, a post in that team's channel arrived on

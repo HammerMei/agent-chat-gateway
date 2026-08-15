@@ -1424,3 +1424,270 @@ class TestGetRoomHistory(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["params"].get("latest"), before)
         self.assertEqual(kwargs["params"].get("oldest"), after)
         self.assertEqual(kwargs["params"].get("inclusive"), "true")
+
+
+class TestIsRoomMember(unittest.IsolatedAsyncioTestCase):
+    """Three answers, and the third is the one worth having.
+
+    A lookup that fails has not said the account is a member, and has not said it was
+    removed. The caller — outage replay — can afford to do neither and simply ask again.
+    """
+
+    async def test_a_subscription_record_is_membership(self):
+        rest = _make_rest()
+        rest._request = AsyncMock(return_value={"success": True, "subscription": {"rid": "r1"}})
+        self.assertIs(await rest.is_room_member("r1"), True)
+
+    async def test_a_hidden_room_is_still_membership(self):
+        """`open: false` is a display choice — the record is what membership is read from,
+        and leaving a room is what removes it."""
+        rest = _make_rest()
+        rest._request = AsyncMock(
+            return_value={"success": True, "subscription": {"rid": "r1", "open": False}}
+        )
+        self.assertIs(await rest.is_room_member("r1"), True)
+
+    async def test_no_subscription_record_is_removal(self):
+        rest = _make_rest()
+        rest._request = AsyncMock(return_value={"success": True, "subscription": None})
+        self.assertIs(await rest.is_room_member("r1"), False)
+
+    async def test_an_http_error_is_unknown_rather_than_either_answer(self):
+        """Some versions answer 400/403 where others answer 200 with a null body, and
+        neither is distinguishable from a server that is merely unwell."""
+        rest = _make_rest()
+        rest._request = AsyncMock(
+            side_effect=httpx.HTTPStatusError(
+                "403", request=httpx.Request("GET", "http://x"),
+                response=httpx.Response(403, request=httpx.Request("GET", "http://x")),
+            )
+        )
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
+            self.assertIsNone(await rest.is_room_member("r1"))
+
+    async def test_any_other_failure_is_unknown_too(self):
+        rest = _make_rest()
+        rest._request = AsyncMock(side_effect=RuntimeError("connection reset"))
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
+            self.assertIsNone(await rest.is_room_member("r1"))
+
+    async def test_it_asks_about_the_room_it_was_given(self):
+        rest = _make_rest()
+        rest._request = AsyncMock(return_value={"success": True, "subscription": {}})
+        await rest.is_room_member("room-xyz")
+        args, kwargs = rest._request.call_args
+        self.assertEqual(args[1], "subscriptions.getOne")
+        self.assertEqual(kwargs["params"], {"roomId": "room-xyz"})
+
+
+class TestTheVerifiedSubscriptionContract(unittest.IsolatedAsyncioTestCase):
+    """Pinned to Rocket.Chat's actual handler, not to a guess about it.
+
+    `subscriptions.getOne` is `success({subscription: findOneByRoomIdAndUserId(...)})`, so a
+    room the caller is not in is a 200 with a null subscription. Its declared failures are
+    400 for a malformed request and 401 for authentication; neither is a membership answer,
+    which is why every HTTP error here stays *unknown*.
+    """
+
+    async def test_a_null_subscription_on_200_is_the_negative_answer(self):
+        rest = _make_rest()
+        rest._request = AsyncMock(return_value={"success": True, "subscription": None})
+        self.assertIs(await rest.is_room_member("r1"), False)
+
+    async def test_a_malformed_request_is_not_a_membership_answer(self):
+        """400 means the request lacked `roomId`, which says nothing about the account.
+
+        Reading it as "not a member" would let a caller bug close the replay window and
+        drop the watermark — silent message loss from an unrelated defect.
+        """
+        rest = _make_rest()
+        req = httpx.Request("GET", "http://x")
+        rest._request = AsyncMock(
+            side_effect=httpx.HTTPStatusError(
+                "400", request=req,
+                response=httpx.Response(
+                    400, request=req,
+                    json={"success": False,
+                          "error": "must have required property 'roomId'"},
+                ),
+            )
+        )
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
+            self.assertIsNone(await rest.is_room_member("r1"))
+
+    async def test_an_auth_failure_is_not_a_membership_answer(self):
+        rest = _make_rest()
+        req = httpx.Request("GET", "http://x")
+        rest._request = AsyncMock(
+            side_effect=httpx.HTTPStatusError(
+                "401", request=req,
+                response=httpx.Response(401, request=req,
+                                        json={"status": "error", "message": "unauthorized"}),
+            )
+        )
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
+            self.assertIsNone(await rest.is_room_member("r1"))
+
+
+class TestHistoryPageReportsHowFullItWas(unittest.IsolatedAsyncioTestCase):
+    """`count` is applied by the server; filtering happens here, after it."""
+
+    async def test_a_page_of_system_events_is_full_but_empty(self):
+        from gateway.connectors.rocketchat.rest import HistoryPage  # noqa: F401
+
+        rest = _make_rest()
+        rest._request = AsyncMock(return_value={
+            "success": True,
+            "messages": [{"_id": f"s{i}", "t": "uj", "msg": "someone"} for i in range(5)],
+        })
+
+        page = await rest.get_room_history_page("r1", "channel", count=5)
+
+        self.assertEqual(page.messages, [])
+        self.assertEqual(page.raw_count, 5)
+        self.assertTrue(
+            page.was_full,
+            "the caller cannot tell this from an empty window without it",
+        )
+
+    async def test_a_short_page_of_real_messages_is_not_full(self):
+        rest = _make_rest()
+        rest._request = AsyncMock(return_value={
+            "success": True,
+            "messages": [{"_id": "m1", "msg": "hi"}, {"_id": "m2", "msg": "there"}],
+        })
+
+        page = await rest.get_room_history_page("r1", "channel", count=200)
+
+        self.assertEqual([m["_id"] for m in page.messages], ["m2", "m1"])
+        self.assertFalse(page.was_full)
+
+    async def test_the_plain_list_call_still_filters_and_reverses(self):
+        """`get_room_history` keeps its contract — other callers are unchanged."""
+        rest = _make_rest()
+        rest._request = AsyncMock(return_value={
+            "success": True,
+            "messages": [
+                {"_id": "m2", "msg": "second"},
+                {"_id": "sys", "t": "uj", "msg": "joined"},
+                {"_id": "m1", "msg": "first"},
+            ],
+        })
+
+        msgs = await rest.get_room_history("r1", "channel", count=200)
+
+        self.assertEqual([m["_id"] for m in msgs], ["m1", "m2"])
+
+
+class TestDmMembersExcludesThisAccountById(unittest.IsolatedAsyncioTestCase):
+    """Identity is the user id, not the spelling of a configured username.
+
+    A login whose canonical username differs in casing, or which uses an alias, left the
+    account in its own participant list — a 1:1 room described by its own bot, and, if the
+    API lists it first, every such room deriving the same `dm-<bot>` label instead of
+    distinct counterparts.
+    """
+
+    def _rest(self, members):
+        rest = _make_rest()
+        rest.user_id = "BOT_ID"
+        rest._request = AsyncMock(return_value={"success": True, "members": members})
+        return rest
+
+    async def test_the_account_is_dropped_however_its_name_is_spelled(self):
+        rest = self._rest([
+            {"_id": "BOT_ID", "username": "Bot"},       # canonical casing differs
+            {"_id": "U1", "username": "alice"},
+        ])
+
+        self.assertEqual(await rest.dm_members("r1"), ["alice"])
+
+    async def test_a_namesake_that_is_not_this_account_is_kept(self):
+        """The near miss: excluding by name would drop a different user who happens to
+        share the spelling."""
+        rest = self._rest([
+            {"_id": "BOT_ID", "username": "bot"},
+            {"_id": "U2", "username": "bot"},           # someone else, same name
+        ])
+
+        self.assertEqual(await rest.dm_members("r1"), ["bot"])
+
+    async def test_a_group_direct_room_returns_every_counterpart(self):
+        rest = self._rest([
+            {"_id": "BOT_ID", "username": "bot"},
+            {"_id": "U1", "username": "alice"},
+            {"_id": "U2", "username": "carol"},
+        ])
+
+        self.assertEqual(await rest.dm_members("r1"), ["alice", "carol"])
+
+
+class TestHistoryBoundsAreSentInTheFormatTheServerParses(unittest.IsolatedAsyncioTestCase):
+    """`oldest`/`latest` reach `new Date(...)` on the server, which rejects epoch digits.
+
+    Verified against Rocket.Chat 6.12 rather than reasoned about: a room with five
+    messages, asked for everything at or after the third.
+
+        oldest="1786816166131"            -> HTTP 200 success=True, 5 messages back
+        oldest="2026-08-15T17:49:26.131Z" -> HTTP 200 success=True, 3 messages back
+
+    The request *succeeds* either way — the bound is dropped, not refused — so nothing
+    upstream can notice. That is why this is pinned here at the wire, where the format is
+    decided, and not at a caller.
+    """
+
+    def _rest(self):
+        rest = RocketChatREST("http://rc.example.com")
+        rest._request = AsyncMock(return_value={"success": True, "messages": []})
+        return rest
+
+    def _params(self, rest):
+        return rest._request.await_args.kwargs["params"]
+
+    async def test_an_epoch_millisecond_watermark_is_converted(self):
+        rest = self._rest()
+        await rest.get_room_history_page("r1", "channel", count=10, after_ts="1786816166131")
+
+        self.assertEqual(self._params(rest)["oldest"], "2026-08-15T17:49:26.131000Z")
+
+    async def test_an_iso_bound_is_passed_through_untouched(self):
+        """The history-handoff caller documents ISO and must not be double-converted."""
+        rest = self._rest()
+        await rest.get_room_history(
+            "r1", "channel", count=10,
+            before_ts="2026-08-15T18:00:00Z", after_ts="2026-08-15T17:00:00Z",
+        )
+
+        params = self._params(rest)
+        self.assertEqual(params["oldest"], "2026-08-15T17:00:00Z")
+        self.assertEqual(params["latest"], "2026-08-15T18:00:00Z")
+
+    async def test_the_upper_bound_is_converted_too(self):
+        """Same parameter family, same server-side `new Date` — one rule, both bounds."""
+        rest = self._rest()
+        await rest.get_room_history("r1", "channel", count=10, before_ts="1786816166131")
+
+        self.assertEqual(self._params(rest)["latest"], "2026-08-15T17:49:26.131000Z")
+
+    async def test_no_bound_stays_absent(self):
+        rest = self._rest()
+        await rest.get_room_history_page("r1", "channel", count=10)
+
+        params = self._params(rest)
+        self.assertNotIn("oldest", params)
+        self.assertNotIn("latest", params)
+
+    async def test_a_float_watermark_is_converted_too(self):
+        """`str()` of whatever JSON put in `$date`. A digit-string test misses this one,
+        and missing it fails the same silent way the conversion exists to prevent."""
+        rest = self._rest()
+        await rest.get_room_history_page("r1", "channel", count=10, after_ts="1786816166131.0")
+
+        self.assertEqual(self._params(rest)["oldest"], "2026-08-15T17:49:26.131000Z")
+
+    async def test_an_unparseable_bound_is_left_alone(self):
+        """Better an unusable bound reaching the server than a fabricated one."""
+        rest = self._rest()
+        await rest.get_room_history_page("r1", "channel", count=10, after_ts="nan")
+
+        self.assertEqual(self._params(rest)["oldest"], "nan")

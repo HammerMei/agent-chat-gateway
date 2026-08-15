@@ -26,11 +26,13 @@ class TestRoomWorkerAwaiting(unittest.IsolatedAsyncioTestCase):
         """A worker removed from _callback_tasks by done-callback must still be awaited."""
         from gateway.connectors.rocketchat.websocket import RCWebSocketClient
 
-        ws = RCWebSocketClient.__new__(RCWebSocketClient)
+        ws = RCWebSocketClient(
+            server_url="http://localhost:3000", username="t", password="t")
         ws._running = False
         ws._listen_task = None
         ws._ping_task = None
-        ws._resubscribe_task = None
+        ws._recovery_task = None
+        ws._recovery_generation = 0
         ws._callback_tasks = set()
         ws._room_queues = {}
         ws._ws = None
@@ -64,11 +66,13 @@ class TestRoomWorkerAwaiting(unittest.IsolatedAsyncioTestCase):
         """A room worker that raises must not cause stop() to raise."""
         from gateway.connectors.rocketchat.websocket import RCWebSocketClient
 
-        ws = RCWebSocketClient.__new__(RCWebSocketClient)
+        ws = RCWebSocketClient(
+            server_url="http://localhost:3000", username="t", password="t")
         ws._running = False
         ws._listen_task = None
         ws._ping_task = None
-        ws._resubscribe_task = None
+        ws._recovery_task = None
+        ws._recovery_generation = 0
         ws._callback_tasks = set()
         ws._room_queues = {}
         ws._ws = None
@@ -98,7 +102,8 @@ class TestRoomWorkerCancelLogging(unittest.IsolatedAsyncioTestCase):
         """CancelledError mid-callback must produce a warning log with the message ID."""
         from gateway.connectors.rocketchat.websocket import RCWebSocketClient
 
-        ws = RCWebSocketClient.__new__(RCWebSocketClient)
+        ws = RCWebSocketClient(
+            server_url="http://localhost:3000", username="t", password="t")
         ws._callbacks = {}
         ws._callback_sem = asyncio.Semaphore(10)
         ws._room_workers = {}
@@ -144,7 +149,8 @@ class TestRoomWorkerCancelLogging(unittest.IsolatedAsyncioTestCase):
         """A regular exception in the callback must not trigger the cancel log path."""
         from gateway.connectors.rocketchat.websocket import RCWebSocketClient
 
-        ws = RCWebSocketClient.__new__(RCWebSocketClient)
+        ws = RCWebSocketClient(
+            server_url="http://localhost:3000", username="t", password="t")
         ws._callbacks = {}
         ws._callback_sem = asyncio.Semaphore(10)
 
@@ -181,7 +187,8 @@ class TestRoomWorkerQueueDrainOnCancel(unittest.IsolatedAsyncioTestCase):
     def _make_ws(self):
         from gateway.connectors.rocketchat.websocket import RCWebSocketClient
 
-        ws = RCWebSocketClient.__new__(RCWebSocketClient)
+        ws = RCWebSocketClient(
+            server_url="http://localhost:3000", username="t", password="t")
         ws._callbacks = {}
         ws._callback_sem = asyncio.Semaphore(10)
         return ws
@@ -277,7 +284,8 @@ class TestRoomWorkerInFlightCounted(unittest.IsolatedAsyncioTestCase):
     def _make_ws(self):
         from gateway.connectors.rocketchat.websocket import RCWebSocketClient
 
-        ws = RCWebSocketClient.__new__(RCWebSocketClient)
+        ws = RCWebSocketClient(
+            server_url="http://localhost:3000", username="t", password="t")
         ws._callbacks = {}
         ws._callback_sem = asyncio.Semaphore(1)
         return ws
@@ -376,7 +384,8 @@ class TestBoundedWebSocketCallbacks(unittest.IsolatedAsyncioTestCase):
         """Room workers share the _callback_sem to bound global concurrency."""
         from gateway.connectors.rocketchat.websocket import RCWebSocketClient
 
-        client = RCWebSocketClient.__new__(RCWebSocketClient)
+        client = RCWebSocketClient(
+            server_url="http://localhost:3000", username="t", password="t")
         client._callback_sem = asyncio.Semaphore(2)
         client._callbacks = {}
         client._callback_tasks = set()

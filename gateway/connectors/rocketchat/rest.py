@@ -1,7 +1,9 @@
 """Thin Rocket.Chat REST API client for login, post_message, upload_file, and room resolution."""
 
 import asyncio
+import datetime
 import logging
+import math
 import mimetypes
 import secrets
 from pathlib import Path
@@ -9,7 +11,61 @@ from typing import Any, Callable
 
 import httpx
 
+from ...core.connector import HistoryPage
+
 logger = logging.getLogger("agent-chat-gateway.connectors.rocketchat.rest")
+
+
+def _to_rc_ts(value: str | None) -> str | None:
+    """Normalise a history bound to what Rocket.Chat's `oldest`/`latest` actually parse.
+
+    The server does `new Date(oldest)` (`apps/meteor/server/api/v1/channels.ts`), and
+    JavaScript's `new Date("1786816166131")` is **Invalid Date** — a string of digits is
+    not one of the formats it accepts. What that produces is worse than an error, because
+    the request still succeeds. Probed against Rocket.Chat 6.12 **and 8.5.1**, five
+    messages in a room, asking for everything at or after the third — same result on both:
+
+        oldest="1786816166131"                 -> HTTP 200 success=True, 5 messages
+        oldest="2026-08-15T17:49:26.131000Z"   -> HTTP 200 success=True, 3 messages
+
+    The second is the string this function emits, six fractional digits and all — the
+    probe was re-run on the real output rather than on a hand-written three-digit form,
+    because six digits is outside the ECMAScript Date Time String Format and therefore
+    lands in implementation-specific parsing. It works; the point is that it was checked
+    rather than assumed from a shorter string that also works.
+
+    Not a quirk of an old server, and not something to wait out: `isChannelsHistoryProps`
+    on `develop` types `oldest` as `{type: 'string', minLength: 1}` with no `date-time`
+    format, so the digits pass validation and reach `new Date` exactly as before.
+
+    So the bound is silently dropped and the server answers with the newest `count`
+    messages in the room. The client-side watermark filter still rejects the ones below
+    the cursor, which is why this never showed up as duplicate delivery — it shows up as
+    a full page fetched on every reconnect, `was_full` reporting "messages could be
+    permanently lost" for any room with more history than the page size, and a window of
+    system events that cannot be read past.
+
+    Two callers pass this parameter in two formats: the reconnect replay passes the DDP
+    watermark, which is epoch milliseconds (`normalize._extract_ts`), and the history
+    handoff passes ISO 8601, as its docstring says. Normalising here rather than at either
+    caller is the point — the wire format belongs to the client that owns the request, and
+    a rule kept at the call sites is a rule the next call site will not know about.
+    """
+    if not value:
+        return value
+    # "Does this parse as a number", not "is it all digits". A watermark is `str()` of
+    # whatever JSON put in `$date`, and a float there — `"1786816166131.0"` — is not a
+    # digit string. It would pass straight through, be Invalid Date on the server, and
+    # fail the same silent way this function exists to prevent. ISO 8601 raises here.
+    try:
+        ms = float(value)
+    except ValueError:
+        return value
+    if not math.isfinite(ms):
+        return value
+    return datetime.datetime.fromtimestamp(
+        ms / 1000, tz=datetime.timezone.utc
+    ).isoformat().replace("+00:00", "Z")
 
 
 class RoomNotFoundError(Exception):
@@ -19,6 +75,25 @@ class RoomNotFoundError(Exception):
     so callers can distinguish a missing room from a broader infrastructure
     problem.
     """
+
+
+# Rocket.Chat's room-type letters. `c` public channel, `p` private group, `d` direct —
+# which covers a 1:1 **and** a group DM, because Rocket.Chat reports them identically
+# (§6.4). Telling those apart needs a participant lookup and is done by the connector.
+#
+# Nothing mapped these before: a room's type came from *which REST endpoint answered*,
+# which works when resolving by name and not at all when the type arrives on a message.
+_ROOM_TYPES = {"c": "channel", "p": "group", "d": "dm"}
+
+
+def room_type_for(letter: str | None) -> str:
+    """Map a Rocket.Chat room-type letter to the gateway's room type.
+
+    An unknown or missing letter falls back to `channel`: a channel requires a mention
+    where a DM does not, so guessing `channel` cannot turn a quiet room into one the agent
+    answers unprompted.
+    """
+    return _ROOM_TYPES.get(letter or "", "channel")
 
 
 class RocketChatREST:
@@ -457,6 +532,26 @@ class RocketChatREST:
                        only messages with ``ts >= after_ts`` are returned.
                        Omitted when None.
         """
+        return await self._get_room_history_raw(
+            room_id, room_type, count=count, before_ts=before_ts, after_ts=after_ts,
+            _filtered=True,
+        )
+
+    async def _get_room_history_raw(
+        self,
+        room_id: str,
+        room_type: str,
+        count: int,
+        before_ts: str | None,
+        after_ts: str | None,
+        _filtered: bool = False,
+    ) -> list[dict]:
+        """One history request. Returns the server's messages, newest-first, unfiltered.
+
+        `_filtered` is the compatibility shim for `get_room_history`, whose contract is the
+        filtered chronological list; `get_room_history_page` wants the unfiltered page so
+        it can say how full it was.
+        """
         endpoint_map = {
             "channel": "channels.history",
             "group":   "groups.history",
@@ -465,9 +560,9 @@ class RocketChatREST:
         endpoint = endpoint_map.get(room_type, "channels.history")
         params: dict = {"roomId": room_id, "count": count, "unreads": "false"}
         if before_ts:
-            params["latest"] = before_ts
+            params["latest"] = _to_rc_ts(before_ts)
         if after_ts:
-            params["oldest"] = after_ts
+            params["oldest"] = _to_rc_ts(after_ts)
             # RC treats 'oldest' as exclusive by default (ts > oldest).
             # Set inclusive=true to get ts >= oldest — matching the documented
             # contract that --after is an inclusive lower bound.
@@ -482,10 +577,124 @@ class RocketChatREST:
                 f"{result.get('error', result)}"
             )
         msgs = result.get("messages", [])
+        if not _filtered:
+            return msgs
         # Exclude system events (type field ``t`` present) and empty messages.
         text_msgs = [m for m in msgs if not m.get("t") and m.get("msg")]
         # RC REST API returns newest-first; reverse to chronological order.
         return list(reversed(text_msgs))
+
+    async def get_room_history_page(
+        self,
+        room_id: str,
+        room_type: str,
+        count: int = 50,
+        before_ts: str | None = None,
+        after_ts: str | None = None,
+    ) -> "HistoryPage":
+        """`get_room_history`, plus how full the page was *before* filtering.
+
+        The server applies `count` and only then are system and empty-body events
+        dropped, so an empty result does not mean an empty window: a page filled by
+        joins and topic changes hides every older user message behind it. The caller
+        cannot tell those apart from the filtered list alone, and the difference decides
+        whether it may report the outage as read.
+        """
+        raw = await self._get_room_history_raw(
+            room_id, room_type, count=count, before_ts=before_ts, after_ts=after_ts,
+        )
+        text_msgs = [m for m in raw if not m.get("t") and m.get("msg")]
+        return HistoryPage(
+            messages=list(reversed(text_msgs)), raw_count=len(raw), limit=count
+        )
+
+    async def dm_members(self, room_id: str) -> list[str]:
+        """How many people are in a direct room — the only way to tell a 1:1 from a group.
+
+        Rocket.Chat reports both as `roomType: "d"` with no participant information in the
+        frame, and this is not a cosmetic distinction: `require_mention` is skipped
+        entirely for a room typed `dm`, so a group DM misclassified as a 1:1 makes the
+        agent answer **every** message from **anyone** in that group (§6.4).
+
+        Returns **the other participants' usernames** — this account is excluded by id —
+        because the caller needs both halves of that: how many there are answers
+        1:1-or-group, and the names *are* the room's description, since a direct room has
+        no name and its participants are the only thing that identifies it to a human
+        (§2.3).
+
+        Returns an empty list when the lookup fails. That is *no answer*, and the caller
+        treats it as one: it declines to classify the room rather than assuming either kind.
+        There is no safe default to pick. Reading a group as a 1:1 drops the mention gate and
+        the agent answers everyone in it; reading a 1:1 as a group makes it wait for a
+        mention its user has no reason to type, and it looks broken. Both are wrong, so the
+        room simply waits for its next message and the question is asked again.
+        """
+        try:
+            result = await self._request("GET", "im.members", params={"roomId": room_id})
+        except Exception as e:
+            logger.warning("Could not read members of direct room %s: %s", room_id, e)
+            return []
+        members = result.get("members") or []
+        if not isinstance(members, list):
+            return []
+        # The caller is excluded here, by **id**, because this is where the ids are. The
+        # connector used to drop it by comparing usernames against its configured
+        # spelling, and a login whose canonical username differs in casing or is an alias
+        # left the account in its own participant list: a 1:1 room described by its own
+        # bot, and — if the API happens to list the bot first — every such room deriving
+        # the same `dm-<bot>` label instead of distinct counterparts.
+        return [
+            m.get("username", "")
+            for m in members
+            if m.get("username") and m.get("_id") != self.user_id
+        ]
+
+    async def is_room_member(self, room_id: str) -> bool | None:
+        """Is this account still in the room — `True`, `False`, or **`None` for unknown**.
+
+        Three answers, not two, and the third is the point: a lookup that fails has not said
+        the account is a member, and it has not said it was removed. Collapsing it either way
+        is a guess, and the caller (replay) can afford to do neither — it can wait for the
+        next round.
+
+        Membership is read as "does this account have a subscription record for the room",
+        which is what Rocket.Chat removes when someone is kicked or leaves. A *hidden* room
+        keeps its record (`open: false`) and is still membership — being hidden is a display
+        choice, not a departure.
+
+        Only the live path gets this answer for free: `roomParticipant` is computed
+        server-side per delivered message. Replay reconstructs its documents from REST, so it
+        has to ask.
+        """
+        try:
+            result = await self._request(
+                "GET", "subscriptions.getOne", params={"roomId": room_id}
+            )
+        except httpx.HTTPStatusError as e:
+            # No HTTP error from this endpoint means "not a member", and that is checked
+            # rather than assumed. The handler is
+            # `API.v1.success({subscription: await Subscriptions.findOneByRoomIdAndUserId(...)})`
+            # — a missing record is a **200 with a null subscription**, which is the branch
+            # below. Its declared failures are 400 for a malformed request (its own
+            # end-to-end test asserts `must have required property 'roomId'`) and 401 for
+            # authentication; neither says anything about membership.
+            #
+            # So every status error here is genuinely unknown, and must stay unknown:
+            # answering `False` would let an auth failure or a request bug close the replay
+            # window and drop the watermark, which is silent message loss caused by an
+            # unrelated defect.
+            logger.warning(
+                "Could not read the subscription record for room %s (%s) — "
+                "membership is unknown",
+                room_id, e,
+            )
+            return None
+        except Exception as e:
+            logger.warning(
+                "Membership lookup for room %s failed: %s", room_id, e
+            )
+            return None
+        return bool(result.get("subscription"))
 
     async def resolve_room(self, room_name: str) -> dict[str, Any]:
         """Resolve a room name to its info dict.

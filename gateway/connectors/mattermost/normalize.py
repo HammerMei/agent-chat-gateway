@@ -33,6 +33,10 @@ from typing import TYPE_CHECKING
 
 from ...core.adapter_utils import ts_to_float as _ts_to_float
 from ...core.connector import Attachment, IncomingMessage, Room, User, UserRole
+from ...core.sender_policy import sender_allowed  # noqa: F401 — re-exported for
+
+# this module's existing importers; the rule itself lives in core now that both
+# connectors ask it.
 from .mentions import text_has_room_wide_mention
 
 if TYPE_CHECKING:
@@ -93,26 +97,11 @@ class FilterResult:
     reason: str = ""  # debug only
     is_agent_chain: bool = False   # True when sender is a known ACG agent
     agent_chain_turn: int = 0      # current turn (1-based, after increment)
+    # Names the increment rather than counting it — the same field, for the same reason,
+    # as the Rocket.Chat result. `agent_chain_turn` is the live count and moves in both
+    # directions, so it cannot identify a delivery. Zero when no turn was taken.
+    agent_chain_token: int = 0
     agent_chain_max_turns: int = 5  # from config
-
-
-def sender_allowed(config, sender_username: str) -> bool:
-    """Whether this sender may start a turn at all — synchronous, no room metadata.
-
-    Extracted because the routing path needs the same answer *before* a watcher exists
-    (§2.7 step 1 puts the sender allow-list among the cheap rejects, above the room-state
-    lookup): a sender who cannot start a turn must not be able to cause a watcher and a
-    backend session to be created. Two copies of an allow-list is one copy too many.
-
-    Agent senders bypass it deliberately — an agent-to-agent chain is authorised by being
-    in `agent_usernames`, not by appearing in a human allow-list.
-    """
-    if not config.filter_sender:
-        return True
-    return (
-        sender_username in config.allow_senders
-        or sender_username in config.agent_chain.agent_usernames
-    )
 
 
 def filter_mm_message(
@@ -190,8 +179,9 @@ def filter_mm_message(
 
     # 5. Agent chain turn budget
     agent_chain_turn = 0
+    agent_chain_token = 0
     if is_agent and turn_store is not None:
-        allowed, agent_chain_turn = turn_store.check_and_increment(
+        allowed, agent_chain_turn, agent_chain_token = turn_store.check_and_increment(
             room_id=post.get("channel_id", ""),
             thread_id=post.get("root_id") or None,
             sender=sender_username,
@@ -218,6 +208,7 @@ def filter_mm_message(
         msg_ts=msg_ts,
         is_agent_chain=is_agent,
         agent_chain_turn=agent_chain_turn,
+        agent_chain_token=agent_chain_token,
         agent_chain_max_turns=config.agent_chain.max_turns,
     )
 

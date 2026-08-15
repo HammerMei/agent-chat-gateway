@@ -29,6 +29,32 @@ from .state_store import StateStore
 logger = logging.getLogger("agent-chat-gateway.core.watcher_lifecycle")
 
 
+def _should_restore_watermark(stored: str, live: str | None) -> bool:
+    """Whether a watcher's persisted watermark may be written into the connector.
+
+    The connector gives three answers, and the middle one is why this is a function
+    rather than a condition:
+
+    * ``None`` — no state for this room. The record is all there is; restore it.
+    * ``""``   — cleared on purpose, because the account is no longer in the room.
+      Restoring would undo that, and a later re-add would replay the interval it was
+      absent for. This is the case a `not current_ts` test got wrong in one direction
+      and a bare `is None` test got wrong in the other: the comparison below still
+      ran, and `ts_gt(anything, "")` is True.
+    * a value  — the room's live cursor. Restore only when the record is ahead of it,
+      never backwards: the connector advances that cursor as messages are accepted,
+      independently of any one watcher's restarts, and writing an older value back
+      would redeliver everything between the two at the next reconnect.
+    """
+    if not stored:
+        return False
+    if live is None:
+        return True
+    if live == "":
+        return False
+    return _ts_gt(stored, live)
+
+
 class WatcherLifecycle:
     """Manages watcher start/stop/pause/resume/reset and related bookkeeping.
 
@@ -628,10 +654,13 @@ class WatcherLifecycle:
         # the two after the next reconnect. (This used to be justified by sibling
         # watchers sharing a room, which §4.1 no longer permits; the reason above is
         # the one that still holds.)
-        if ws.last_processed_ts:
-            current_ts = self._connector.get_last_processed_ts(room.id)
-            if not current_ts or _ts_gt(ws.last_processed_ts, current_ts):
-                self._connector.update_last_processed_ts(room.id, ws.last_processed_ts)
+        #
+        # The third site of one rule, and the only one that reads rather than writes. The
+        # decision has a name because it has three answers and I got it wrong twice while
+        # it was spelled out inline — see `_should_restore_watermark`.
+        current_ts = self._connector.get_last_processed_ts(room.id)
+        if _should_restore_watermark(ws.last_processed_ts, current_ts):
+            self._connector.update_last_processed_ts(room.id, ws.last_processed_ts)
 
         logger.info(
             "Started watcher '%s' for room '%s' using agent '%s' (session %s)",
@@ -777,7 +806,7 @@ class WatcherLifecycle:
         a room pops the connector's per-room state (``self._rooms`` on
         Rocket.Chat, ``self._channels`` on Mattermost), and the watermark lives
         in exactly that entry.  Reading it afterwards returned None — silently,
-        because ``dict.get`` does not raise, so ``if live_ts:`` simply never
+        because ``dict.get`` does not raise, so the copy below simply never
         fired and the stale value was persisted.  On restart every message
         between the stale watermark and the true one was redelivered.
 
@@ -810,7 +839,13 @@ class WatcherLifecycle:
         # room entry it lives in — the unsubscribe below pops that entry.
         if state and state.room_id:
             live_ts = self._connector.get_last_processed_ts(state.room_id)
-            if live_ts:
+            # `is not None`, so a connector that has *cleared* its watermark can say so.
+            # `None` still means "no opinion — this room saw no activity in this run", and
+            # must not erase what is on disk. An empty string is an opinion: a connector
+            # that learned this account is no longer in the room clears the mark precisely
+            # so a later re-add cannot replay the interval it was absent for, and a save
+            # that skipped it would hand that mark straight back on the next start.
+            if live_ts is not None:
                 state.last_processed_ts = live_ts
 
         # Step 3: Unsubscribe from the connector (stop delivery for this room).

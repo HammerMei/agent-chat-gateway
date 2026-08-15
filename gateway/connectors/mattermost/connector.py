@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ...agents.response import AgentEvent, AgentResponse
-from ...core.adapter_utils import ts_ms_to_iso_local, weekday_abbrev
+from ...core.adapter_utils import ts_gt, ts_ms_to_iso_local, weekday_abbrev
 from ...core.bot_identity import (
     BotIdentity,
     ConnectorIdentityError,
@@ -42,6 +42,7 @@ from ...core.connector import (
     Room,
     RoomCapacity,
 )
+from ...core.replay_window import ReplayWindow, just_before
 from ...core.tz_utils import local_iana_timezone as _server_local_timezone
 from ...core.watcher_manager import RoomRef
 from ...core.watcher_rule import RoomKind
@@ -74,7 +75,7 @@ _SEEN_IDS_MAXLEN = 200
 
 
 @dataclass
-class _ChannelState:
+class _ChannelState(ReplayWindow):
     """Connector-level channel state: dedup watermark + local subscriber tracking.
 
     Unlike RC's _RoomSubscription, there is no wire-protocol subscription to
@@ -85,6 +86,17 @@ class _ChannelState:
 
     room: Room
     last_processed_ts: str | None = None
+    # Where to resume from when the watermark alone would skip something. Declared here
+    # rather than inherited so it sits beside the watermark it qualifies — see
+    # `core.replay_window`, which owns the rule for who may clear it.
+    #
+    # Mattermost gets the *hand-back* half of that module and not the outage half: there is
+    # no per-channel subscribe handshake, so one connection resumes every channel at the
+    # same instant and the staggered-resubscribe race Rocket.Chat captures a window for
+    # cannot happen here. This mark exists only because ACG itself refuses messages when
+    # its queues are full.
+    replay_boundary: str | None = None
+    boundary_claims: int = 0
     seen_ids: collections.deque = field(default_factory=lambda: collections.deque())
     seen_ids_set: set = field(default_factory=set)
     watcher_ids: set = field(default_factory=set)
@@ -228,23 +240,50 @@ class MattermostConnector(Connector):
             # allowed to advance the watermark mid-replay and cause the rest
             # of this channel's replay window to be skipped as "already
             # processed".
-            watermark = state.last_processed_ts
+            # Captured before the fetch so the close below can tell whether anyone has
+            # claimed this window since. A hand-back landing while this batch is dispatching
+            # claims the very window it is reading and writes back the same timestamp, so a
+            # value comparison would report "unchanged" in exactly the case it exists to
+            # catch. Replay is not serialized against live traffic here — it calls
+            # `_on_posted_event` directly rather than through the per-channel worker.
+            claims_at_entry = state.boundary_claims
+            watermark = state.replay_boundary or state.last_processed_ts
             if not watermark:
                 logger.debug("Channel '%s': no watermark yet — skipping replay", state.room.name)
                 continue
             try:
-                raw_msgs = await self._rest.get_room_history(
+                page = await self._rest.get_room_history_page(
                     channel_id, count=self._REPLAY_HISTORY_COUNT, after_ts=watermark
                 )
+                raw_msgs = page.messages
             except Exception as e:
                 logger.warning("Channel '%s': failed to fetch history for replay: %s", state.room.name, e)
                 continue
 
             if not raw_msgs:
-                logger.debug("Channel '%s': no missed messages since %s", state.room.name, watermark)
+                if page.was_full:
+                    # Not an empty window — a page the server filled entirely with system
+                    # posts, because `per_page` is applied before ACG filters them out.
+                    # Every user post older than this page is still waiting behind it, and
+                    # reporting the outage as read would skip them silently. Same rule, and
+                    # same reason, as the Rocket.Chat replay: the count the server applied
+                    # is not the count that survived filtering.
+                    logger.warning(
+                        "Channel '%s': the newest %d history entries are all system posts "
+                        "— any user posts older than them cannot be reached in one page "
+                        "and may be permanently missed",
+                        state.room.name, self._REPLAY_HISTORY_COUNT,
+                    )
+                else:
+                    logger.debug(
+                        "Channel '%s': no missed messages since %s",
+                        state.room.name, watermark)
+                    # A read that found nothing is still a read — of the window this replay
+                    # came in for, not one claimed during the fetch above.
+                    state.discharge_boundary(claims_at_entry)
                 continue
 
-            if len(raw_msgs) == self._REPLAY_HISTORY_COUNT:
+            if page.was_full:
                 logger.warning(
                     "Channel '%s': replay fetched the maximum %d message(s) — "
                     "the outage window may have produced more; some messages "
@@ -266,6 +305,16 @@ class MattermostConnector(Connector):
                     break
                 decoded = self._synthesize_decoded_for_replay(post)
                 await self._on_posted_event(decoded, is_replay=True, replay_after_ts=watermark)
+            else:
+                # `for`/`else`, so a cancellation or the `break` above does not reach it: a
+                # window is spent once its batch has been *dispatched*, not once it was
+                # fetched. Any hand-back during the batch — this replay's own or a live one
+                # — left a newer claim, and the window stays open for the next recovery.
+                if not state.discharge_boundary(claims_at_entry):
+                    logger.info(
+                        "Channel '%s': the replay window was claimed again while this batch "
+                        "was being dispatched — leaving it open", state.room.name,
+                    )
 
     def _synthesize_decoded_for_replay(self, post: dict) -> dict:
         """Build a decoded-event dict for a REST-history post (replay path only).
@@ -951,6 +1000,15 @@ class MattermostConnector(Connector):
             sender_username = await self._rest.resolve_username(sender_id)
         except Exception as e:
             logger.error("Failed to resolve sender username for id=%s: %s", sender_id, e)
+            # The id was registered above, before this await, so leaving it recorded would
+            # have the next replay skip this post at the dedup check — permanently, for a
+            # REST call that failed once. And this call fires up to `_REPLAY_HISTORY_COUNT`
+            # times immediately after a reconnect, which is exactly when REST is least
+            # reliable.
+            #
+            # Unlike a normalization failure — a property of the message, which will fail
+            # again — a lookup failure is a property of the network and will not.
+            self._keep_replayable(state, msg_id, str(post.get("create_at", "")))
             return
 
         filter_ts = (
@@ -967,6 +1025,15 @@ class MattermostConnector(Connector):
             last_processed_ts=filter_ts,
             bot_user_id=self._rest.bot_user_id or "",
             turn_store=self._turn_store,
+        )
+        # Captured with no await between the filter's increment and this read, so it names
+        # the count that increment belonged to — a reset restarts the numbering, and a
+        # token from the previous count must not take a turn from the new one.
+        turn_generation = (
+            self._turn_store.generation(
+                post.get("channel_id", ""), post.get("root_id") or None, result.sender)
+            if (result.agent_chain_token and self._turn_store is not None)
+            else 0
         )
         if not result.accepted:
             logger.debug("Message filtered: %s (sender=%s)", result.reason, result.sender)
@@ -986,6 +1053,7 @@ class MattermostConnector(Connector):
                 "Message for channel '%s' has no watcher — dropping without a reply.",
                 state.room.name,
             )
+            self._release_turn_for(post, result, turn_generation, "no watcher")
             return
         if capacity is RoomCapacity.FULL:
             logger.warning(
@@ -993,17 +1061,37 @@ class MattermostConnector(Connector):
                 "all processor queues full, skipping normalize + download",
                 result.sender, state.room.name,
             )
-            # msg_id was already registered before the resolve_username await
-            # above — no second registration needed here.
-            if not is_replay:
-                try:
-                    await self._rest.post_message(
-                        channel_id,
-                        "⚠️ Server busy — your message was dropped. Please retry.",
-                        root_id=post.get("root_id") or None,
-                    )
-                except Exception as exc:
-                    logger.debug("Best-effort busy notification failed: %s", exc)
+            if is_replay:
+                # A replayed post rejected for capacity has to stay replayable, and the id
+                # registered before the `resolve_username` await above is what stops that:
+                # the next recovery skips it at the dedup check and reports the window
+                # read. Nothing tells the sender either — the busy notice below is
+                # suppressed for replays — so the message is gone silently and for good.
+                #
+                # Rocket.Chat has two hand-back sites, not one: the handler-queue-full
+                # branch and this preflight. The round that swept for Mattermost parity
+                # carried the first and declared the rule applied; this is the second.
+                logger.info(
+                    "Channel '%s': a replayed post could not be accepted (queues full) — "
+                    "keeping it replayable rather than recording it as handled",
+                    state.room.name,
+                )
+                self._keep_replayable(state, msg_id, result.msg_ts)
+                self._release_turn_for(post, result, turn_generation, "replay preflight")
+                return
+
+            try:
+                await self._rest.post_message(
+                    channel_id,
+                    "⚠️ Server busy — your message was dropped. Please retry.",
+                    root_id=post.get("root_id") or None,
+                )
+            except Exception as exc:
+                logger.debug("Best-effort busy notification failed: %s", exc)
+            # A live post keeps its id: the sender was told, and can resend. The turn it
+            # spent is still given back — the filter charged it before anything knew the
+            # post could not be delivered.
+            self._release_turn_for(post, result, turn_generation, "live preflight")
             return
 
         try:
@@ -1023,6 +1111,7 @@ class MattermostConnector(Connector):
             )
         except Exception as e:
             logger.error("Failed to normalize message: %s", e)
+            self._release_turn_for(post, result, turn_generation, "normalize failed")
             return
 
         apply_thread_policy(msg, self._config)
@@ -1031,19 +1120,73 @@ class MattermostConnector(Connector):
             accepted = await self._handler(msg)
         except Exception as e:
             logger.error("Handler error for message from %s: %s", result.sender, e)
+            self._release_turn_for(post, result, turn_generation, "handler raised")
             return
 
         if not accepted:
             logger.warning("Message from %s was dropped (queue full)", result.sender)
-            if msg_id:
-                state.seen_ids_set.discard(msg_id)
-                try:
-                    state.seen_ids.remove(msg_id)
-                except ValueError:
-                    pass
+            self._keep_replayable(state, msg_id, result.msg_ts)
+            # Forgetting the id is not enough: the filter already spent a turn of this
+            # sender's agent-chain budget, before anything knew whether the post could be
+            # delivered. Every retry spends another, and once the budget is gone the
+            # filter rejects the post as complete — so the message the retry exists for is
+            # the one it can never deliver. Same rule as the Rocket.Chat hand-back; it was
+            # written for one connector and a comment here asserted the other had no
+            # hand-back path, which this branch is.
+            self._release_turn_for(post, result, turn_generation, "handler queue full")
             return
 
-        state.last_processed_ts = result.msg_ts
+        # Never backwards, for the reason Rocket.Chat's sibling site gives: replay calls
+        # `_on_posted_event` directly rather than through the per-channel worker, so a
+        # replayed post awaiting `normalize_mm_message` — an attachment download — can be
+        # overtaken by live traffic that commits a newer cursor, and an unconditional
+        # assignment then rewinds it. The replayed post is not rejected on the way in
+        # because its filter timestamp is pinned to `replay_after_ts`; the pin that makes
+        # replay work is what makes the regression reachable. In memory `seen_ids` hides
+        # the rewind; across a save and a restart it does not.
+        if ts_gt(result.msg_ts, state.last_processed_ts or ""):
+            state.last_processed_ts = result.msg_ts
+
+    @staticmethod
+    def _keep_replayable(state: "_ChannelState", msg_id: str, msg_ts: str) -> None:
+        """Forget a post's id, and leave a mark below it so a replay can still find it.
+
+        The two go together, and separating them is the bug: forgetting the id alone makes
+        the post retryable only for as long as nothing else succeeds, because the *next*
+        accepted post moves the watermark past it and the next reconnect fetches from
+        there. Whoever drops a message owns keeping it reachable.
+
+        `claim_boundary` never narrows an open window, and falls through to a point just
+        below this post because both marks are empty for the first delivery into a channel.
+        """
+        if msg_id:
+            state.seen_ids_set.discard(msg_id)
+            try:
+                state.seen_ids.remove(msg_id)
+            except ValueError:
+                pass
+        state.claim_boundary(state.last_processed_ts, just_before(msg_ts))
+
+    def _release_turn_for(self, post: dict, result, generation: int, reason: str) -> None:
+        """Give back the turn a post took, for a post that was not delivered.
+
+        One place, because Mattermost has **six** ways to decline a post after the filter
+        has already charged it — no watcher for the channel, the preflight for a replay,
+        the preflight for live traffic, normalization raising, the handler raising, and the
+        handler queue — and they were added one at a time. The count is in the comment
+        because it was wrong here once: it said three, which was true when three of the six
+        released and nobody had counted the rest.
+        """
+        if not result.agent_chain_token or self._turn_store is None:
+            return
+        remaining = self._turn_store.release_turn(
+            post.get("channel_id", ""), post.get("root_id") or None,
+            result.sender, result.agent_chain_token, generation,
+        )
+        logger.debug(
+            "Released an agent-chain turn for %s (%s) — now at %d",
+            result.sender, reason, remaining,
+        )
 
     @staticmethod
     def _remember_seen(state: _ChannelState, msg_id: str) -> None:

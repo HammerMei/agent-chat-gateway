@@ -10,6 +10,8 @@ from typing import Any
 
 import httpx
 
+from ...core.connector import HistoryPage
+
 logger = logging.getLogger("agent-chat-gateway.connectors.mattermost.rest")
 
 
@@ -369,13 +371,13 @@ class MattermostREST:
         logger.info("Uploaded file %s to channel %s -> file_ids=%s", path.name, channel_id, file_ids)
         return file_ids
 
-    async def get_room_history(
+    async def get_room_history_page(
         self,
         channel_id: str,
         count: int = 50,
         before_ts: str | None = None,
         after_ts: str | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> HistoryPage:
         """Fetch the last ``count`` messages from a channel via the REST API.
 
         Returns messages in **chronological order** (oldest first). System
@@ -414,6 +416,7 @@ class MattermostREST:
         posts_by_id = result.get("posts", {})
         # `order` is newest-first; reverse for chronological order.
         posts = [posts_by_id[pid] for pid in reversed(order) if pid in posts_by_id]
+        raw_count = len(posts)
         posts = [p for p in posts if not p.get("type") and p.get("message")]
         if before_ts:
             before_ms = int(before_ts)
@@ -421,7 +424,23 @@ class MattermostREST:
         if after_ts:
             after_ms = int(after_ts)
             posts = [p for p in posts if p.get("create_at", 0) >= after_ms]
-        return posts
+        return HistoryPage(messages=posts, raw_count=raw_count, limit=count)
+
+    async def get_room_history(
+        self,
+        channel_id: str,
+        count: int = 50,
+        before_ts: str | None = None,
+        after_ts: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """The filtered chronological list, for callers that do not need the page shape.
+
+        The history handoff wants posts; only replay has to tell "an empty window" from
+        "a page the server filled with system posts before ACG could filter them".
+        """
+        page = await self.get_room_history_page(
+            channel_id, count=count, before_ts=before_ts, after_ts=after_ts)
+        return page.messages
 
     async def get_channel(self, channel_id: str) -> dict[str, Any]:
         """Channel info by id — the fallback for a room the event could not describe.
