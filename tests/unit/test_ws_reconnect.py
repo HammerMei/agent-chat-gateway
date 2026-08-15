@@ -1530,3 +1530,72 @@ class TestAMigrationCancelledMidReleaseLosesNothing(unittest.IsolatedAsyncioTest
         self.assertEqual(client._subscriptions, {})
         self.assertIn({"msg": "unsub", "id": "sub-1"}, sent)
         self.assertIn("r1", client._callbacks, "the room is still tracked")
+
+
+class TestASupersededSubscriptionStaysFindableUntilItIsGone(unittest.IsolatedAsyncioTestCase):
+    """The map is the only record of what can still be live on the server.
+
+    So at every await point it has to name something releasable. Installing the successor
+    first and releasing the predecessor second inverts that: a cancellation at the release
+    leaves the map naming an id whose `sub` frame has not gone out yet, while the
+    predecessor is still live and now invisible to everyone — including the watcher removal
+    that should have ended it.
+    """
+
+    async def test_a_cancelled_release_leaves_the_predecessor_findable(self):
+        client = _make_client()
+        client._subscriptions = {"r1": "old-sub"}
+        started = asyncio.Event()
+
+        async def _hang_on_unsub(payload):
+            if payload.get("msg") == "unsub":
+                started.set()
+                await asyncio.sleep(9999)
+
+        client._send = _hang_on_unsub
+        task = asyncio.create_task(
+            client._subscribe_with_confirmation(
+                room_id="r1", callback=AsyncMock(), timeout=5,
+                keep_callback_on_failure=True,
+            )
+        )
+        await started.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertEqual(
+            client._subscriptions.get("r1"), "old-sub",
+            "the successor was never sent, so naming it would hide a live predecessor "
+            "behind an id the server has never heard of",
+        )
+
+    async def test_a_completed_release_installs_the_successor(self):
+        """The near miss: holding the predecessor unconditionally would leave every
+        resubscribed room pointing at an id that has just been released."""
+        client = _make_client()
+        client._subscriptions = {"r1": "old-sub"}
+        sent: list[dict] = []
+
+        async def _send(payload):
+            sent.append(payload)
+            if payload.get("msg") == "sub":
+                fut = client._pending_subs.get(payload["id"])
+                if fut and not fut.done():
+                    fut.set_result(True)
+
+        client._send = _send
+        new_id = await client._subscribe_with_confirmation(
+            room_id="r1", callback=AsyncMock(), timeout=5,
+            keep_callback_on_failure=True,
+        )
+
+        self.assertEqual(client._subscriptions["r1"], new_id)
+        self.assertEqual(
+            [f["id"] for f in sent if f.get("msg") == "unsub"], ["old-sub"],
+        )
+        self.assertLess(
+            [f.get("msg") for f in sent].index("unsub"),
+            [f.get("msg") for f in sent].index("sub"),
+            "released before the successor is even asked for",
+        )

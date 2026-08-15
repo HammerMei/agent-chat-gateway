@@ -2005,7 +2005,12 @@ only `disconnect` returns a connector to `absent`.
 
    Two mechanisms carry the rule where a single sequence cannot reach:
 
-   - **A room has at most one subscription, and installing one releases its predecessor.**
+   - **A room has at most one subscription, and installing one releases its predecessor —
+     releasing *before* the map records the successor.** The map is the only record of
+     what can still be live on the server, so at every await point it must name something
+     releasable. The other order leaves it naming an id whose `sub` frame has not gone out
+     while the predecessor is live and invisible. This has two sites — the migration loop
+     and the install path — and fixing one of them is how the second was found.
      A recovery interrupted partway through releasing them is a normal event now — a
      recovery cancels whatever it displaces — so the next one must not overwrite a mapping
      whose server-side subscription is still live. Untracked is unreleasable: removing the

@@ -462,18 +462,30 @@ class RCWebSocketClient:
         # Captured and replaced in one synchronous block: an await between reading the old
         # id and installing the new one is the shape this whole class of defect has had.
         superseded = self._subscriptions.get(room_id)
-        state.sub_id = sub_id
-        state.status = "pending"
-        state.last_error = None
-        self._subscriptions[room_id] = sub_id
-        self._callbacks[room_id] = callback
         if superseded is not None and superseded != sub_id:
+            # Released **before** the map is updated, not after. The map is the only record
+            # of what can still be live on the server, so at every await point it has to
+            # name something releasable. Installing first and releasing second inverts
+            # that: a cancellation at this send — an ordinary event, since a recovery
+            # cancels whatever it displaces — would leave the map naming an id whose `sub`
+            # frame has not even gone out yet, while the predecessor is still live and now
+            # invisible to everyone, including the watcher removal that should have ended
+            # it. Same rule, same reason, as the migration loop in
+            # `unsubscribe_rooms_keeping_callbacks`; this is its second site.
             try:
                 await self._send({"msg": "unsub", "id": superseded})
             except Exception as e:
                 logger.warning(
                     "Could not release the superseded subscription for %s: %s", room_id, e
                 )
+
+        # Installed only now, and synchronously: nothing may await between claiming the
+        # room and recording the claim.
+        state.sub_id = sub_id
+        state.status = "pending"
+        state.last_error = None
+        self._subscriptions[room_id] = sub_id
+        self._callbacks[room_id] = callback
 
         try:
             await self._send(
