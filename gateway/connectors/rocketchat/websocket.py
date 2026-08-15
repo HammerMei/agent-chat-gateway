@@ -1266,29 +1266,41 @@ class RCWebSocketClient:
                 # it would cancel this recovery too.
                 await asyncio.gather(displaced, return_exceptions=True)
 
+            # Released, then dropped — not dropped. Every per-room subscription this
+            # recovery is about to replace goes through the same release-before-remove
+            # loop a stream migration uses, which compares before removing so a
+            # replacement installed mid-release stays tracked.
+            #
+            # The predecessor of this line popped the map instead, on the stated grounds
+            # that "a reconnect's ids died with the socket, and a stream fallback has
+            # none". The second half is false: a `subscribe_room` can land while a
+            # recovery is running — the recovery's own comments say so elsewhere — and a
+            # migration cancelled partway leaves ids behind. Dropping those without an
+            # `unsub` left them live on the server and untracked, unreachable even by
+            # `unsubscribe_room`.
+            #
+            # On a reconnect the frames go to a socket that never knew the ids and the
+            # server ignores them, which is the cost of not having to know which case
+            # this is. Clearing the map is still what stops the resubscribe finding a
+            # `superseded` id for every room.
+            await self.unsubscribe_rooms_keeping_callbacks()
+
             # Now that nothing else is writing them: every tracked room is between
             # delivery paths until this recovery gives it one.
             for room_id, callback in list(self._callbacks.items()):
-                # A subscription id cannot outlive the socket that issued it, so the map
-                # is cleared here rather than left for the resubscribe to supersede. The
-                # refactor that moved this marking out of `_reconnect` dropped the clear
-                # with it, and the cost was not a stale entry: `_subscribe_with_confirmation`
-                # then found a `superseded` id for *every* room on *every* reconnect,
-                # sent an `unsub` on the new socket for an id it never knew, and opened
-                # the await window between releasing and installing each time — routinely,
-                # for a release that had nothing to release.
-                #
-                # Both callers are safe. A reconnect's ids died with the socket. A stream
-                # fallback has none: the stream took over per-room delivery, which is what
-                # emptied this map.
-                self._subscriptions.pop(room_id, None)
                 state = self._subscription_states.get(room_id)
                 if state is None:
                     state = SubscriptionState(room_id=room_id, callback=callback)
                     self._subscription_states[room_id] = state
                 else:
                     state.callback = callback
-                state.sub_id = None
+                # Not unconditionally `None`. The release above awaits once per room, and a
+                # `subscribe_room` landing in one of those awaits installs an id this
+                # recovery never released — blanking it here would leave that subscription
+                # live on the server with nothing naming it, which is the same leak the
+                # release-before-install ordering exists to prevent.
+                if self._subscriptions.get(room_id) is None:
+                    state.sub_id = None
                 state.status = "reconnecting"
                 state.last_error = None
 
