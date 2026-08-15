@@ -172,6 +172,17 @@ class RCWebSocketClient:
             except asyncio.CancelledError:
                 pass
             self._resubscribe_task = None
+        # `→ absent`: the only transition that clears intent. The transition table says so
+        # and the transport never implemented its half — a client stopped and connected
+        # again went on reporting the closed socket's stream as live, so watcher
+        # restoration registered callbacks without subscribing, and a `subscribe_all` that
+        # then failed left every restored room with no delivery at all.
+        #
+        # Not a violation of "intent survives failure": a stop is not a failure.
+        self._stream_sub_id = None
+        self._wants_stream = False
+        self._pending_stream_sub_id = None
+        self._revoked_stream_sub_id = None
         # Cancel room workers explicitly and collect them for the drain gather.
         # Room workers add themselves to _callback_tasks but also register a
         # done-callback that discards them from that set when they complete.
@@ -266,10 +277,21 @@ class RCWebSocketClient:
         `register_room_callback` exists for.
         """
         for room_id, sub_id in list(self._subscriptions.items()):
-            self._subscriptions.pop(room_id, None)
-            state = self._subscription_states.get(room_id)
-            if state is not None:
-                state.sub_id = None
+            # Compare before removing: a stream lost mid-migration starts the per-room
+            # fallback, which can install a *new* subscription for a room this loop has
+            # already read. Popping unconditionally would drop the new id from the map
+            # while releasing only the old one on the server — the replacement stays live
+            # and untracked, so removing the watcher can no longer unsubscribe it and the
+            # room ends up delivered twice.
+            if self._subscriptions.get(room_id) == sub_id:
+                self._subscriptions.pop(room_id, None)
+                state = self._subscription_states.get(room_id)
+                if state is not None and state.sub_id == sub_id:
+                    state.sub_id = None
+            # The unsub is sent either way. The captured id is the one this migration is
+            # retiring, and if it has already been replaced in the map then nothing else
+            # will ever release it — the replacement overwrote the mapping without
+            # unsubscribing. An unsub for an id the server no longer knows is ignored.
             try:
                 await self._send({"msg": "unsub", "id": sub_id})
             except Exception as e:
@@ -337,9 +359,17 @@ class RCWebSocketClient:
             return False
         finally:
             self._pending_subs.pop(sub_id, None)
-            self._pending_stream_sub_id = None
+            # Only what this attempt published. A socket drop while the confirmation was
+            # in flight starts a replacement attempt — `_reconnect` spawns the resubscribe
+            # task *before* its `finally` fails the old future — so the newer attempt can
+            # have published its own id by the time this runs. Erasing it would leave the
+            # replacement unrecognisable to the receive loop, which is exactly the window
+            # the previous round closed, reopened from the other side.
+            if self._pending_stream_sub_id == sub_id:
+                self._pending_stream_sub_id = None
             revoked = self._revoked_stream_sub_id == sub_id
-            self._revoked_stream_sub_id = None
+            if revoked:
+                self._revoked_stream_sub_id = None
 
         if revoked:
             # Confirmed and then terminated before this coroutine was scheduled again. The

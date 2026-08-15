@@ -1165,3 +1165,110 @@ class TestAConfirmationRevokedBeforeItTookEffect(unittest.IsolatedAsyncioTestCas
             ])
         self.assertFalse(first)
         self.assertIsNone(client._revoked_stream_sub_id)
+
+
+class TestSharedStreamBookkeepingHasAnOwner(unittest.IsolatedAsyncioTestCase):
+    """Three findings in one round, one genre: state written by whichever attempt finished
+    last, with nothing recording which attempt it belonged to.
+
+    Two of the three were introduced by the fixes for the two rounds before it — each added
+    a shared field without adding an owner. So the answer here is the rule, and a test that
+    walks the surface rather than a list someone has to remember to extend.
+    """
+
+    async def test_stop_clears_every_stream_field_there_is(self):
+        """Derived from the object, not from a hand-written list.
+
+        A hand list is a defect with a delay on it: the next stream field would be added,
+        `stop()` would not clear it, and nothing would fail until a client was reused and a
+        dead socket's subscription was reported as live.
+        """
+        fresh = _make_client()
+        expected = {
+            name: value for name, value in vars(fresh).items() if "stream" in name
+        }
+        self.assertTrue(expected, "the introspection must actually find the fields")
+
+        client = _make_client()
+        client._stream_sub_id = "s-live"
+        client._wants_stream = True
+        client._pending_stream_sub_id = "s-pending"
+        client._revoked_stream_sub_id = "s-revoked"
+
+        await client.stop()
+
+        actual = {name: value for name, value in vars(client).items() if "stream" in name}
+        self.assertEqual(
+            actual, expected,
+            "`→ absent` is the one transition that clears intent, and stop() is its "
+            "transport half",
+        )
+
+    async def test_an_attempt_does_not_erase_a_newer_attempts_identity(self):
+        """A socket drop during the confirmation starts a replacement attempt, and
+        `_reconnect` spawns it *before* it fails the old future — so the newer attempt can
+        publish its id first. The straggler must not take it with it."""
+        client = _make_client()
+        client._ws = AsyncMock()
+        client._send = AsyncMock()
+        sent: list[dict] = []
+        client._send = AsyncMock(side_effect=lambda d: sent.append(d))
+
+        task = asyncio.create_task(client.subscribe_all(timeout=0.05))
+        while not sent:
+            await asyncio.sleep(0)
+        old_id = sent[0]["id"]
+
+        # The replacement publishes before the straggler's timeout unwinds.
+        client._pending_stream_sub_id = "newer-attempt"
+        client._revoked_stream_sub_id = "newer-attempt"
+
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat.ws", "WARNING"):
+            self.assertFalse(await task)
+
+        self.assertEqual(client._pending_stream_sub_id, "newer-attempt")
+        self.assertEqual(
+            client._revoked_stream_sub_id, "newer-attempt",
+            "erasing this reopens the previous round's window from the other side",
+        )
+        self.assertNotEqual(old_id, "newer-attempt")
+
+    async def test_a_migration_releases_only_the_subscription_it_captured(self):
+        """A stream lost mid-migration starts the fallback, which can install a new
+        subscription for a room this loop has already read."""
+        client = _make_client()
+        sent: list[dict] = []
+        client._send = AsyncMock(side_effect=lambda d: sent.append(d))
+        client._callbacks = {"r1": AsyncMock(), "r2": AsyncMock()}
+        client._subscriptions = {"r1": "old-1", "r2": "old-2"}
+        from gateway.connectors.rocketchat.websocket import SubscriptionState
+        client._subscription_states = {
+            "r1": SubscriptionState(room_id="r1", callback=AsyncMock(), sub_id="old-1"),
+            "r2": SubscriptionState(room_id="r2", callback=AsyncMock(), sub_id="old-2"),
+        }
+
+        original_send = client._send
+
+        async def _send_and_replace(payload):
+            await original_send(payload)
+            # While r1 is being released, the fallback resubscribes r2.
+            if payload.get("id") == "old-1":
+                client._subscriptions["r2"] = "new-2"
+                client._subscription_states["r2"].sub_id = "new-2"
+
+        client._send = _send_and_replace
+
+        await client.unsubscribe_rooms_keeping_callbacks()
+
+        self.assertEqual(
+            client._subscriptions, {"r2": "new-2"},
+            "the replacement must stay tracked — untracked means removing the watcher "
+            "can never release it",
+        )
+        self.assertEqual(client._subscription_states["r2"].sub_id, "new-2")
+        unsubbed = {f["id"] for f in sent if f.get("msg") == "unsub"}
+        self.assertEqual(
+            unsubbed, {"old-1", "old-2"},
+            "the captured id is still released on the server: nothing else ever will, "
+            "since the replacement overwrote the mapping without unsubscribing",
+        )

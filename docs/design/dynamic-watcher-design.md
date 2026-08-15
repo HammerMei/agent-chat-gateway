@@ -1979,7 +1979,20 @@ only `disconnect` returns a connector to `absent`.
    still stands before recording it. Recording a revoked one claims delivery the server
    has already stopped — and the connector releases every per-room subscription on that
    claim.
-8. **An unknown classification is not a default.** Rocket.Chat cannot distinguish a 1:1
+8. **Shared bookkeeping has an owner.** Recoveries overlap: a socket drop starts a
+   replacement while the previous attempt is still unwinding, and a stream lost during a
+   migration starts a fallback that touches rooms the migration has already read. So every
+   write to shared state names what it owns — an attempt clears only the ids *it*
+   published, a migration releases only the subscription id *it* captured, and `stop()`
+   owns all of it, being the transport half of `→ absent`. Unconditional clears are how
+   the last attempt to finish wins, and the last to finish is not the current one.
+
+   Two of the three violations that produced this rule were introduced by the fixes for
+   the two invariants above it: each added a shared field without adding an owner. That is
+   the argument for stating it as a rule and for testing the *surface* — the check that
+   `stop()` clears every stream field is derived from the object, so the next field added
+   fails locally rather than in a review.
+9. **An unknown classification is not a default.** Rocket.Chat cannot distinguish a 1:1
    from a group DM without a lookup, and a failed lookup answering "1:1" is not a
    conservative guess: it lets a group DM be claimed by a `direct: true` rule *and* skip
    the mention gate, so the agent answers everyone in it. Unknown means do not offer the
