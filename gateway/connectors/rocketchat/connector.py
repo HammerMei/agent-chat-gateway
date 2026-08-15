@@ -326,14 +326,37 @@ class RocketChatConnector(Connector):
             # history for a public channel does not require membership, so the fetch
             # succeeds and the agent answers in a room it was thrown out of.
             member = await self._rest.is_room_member(sub.room.id)
-            if member is not True:
+            if member is False:
+                # Removed, confirmed. Both marks are dropped, not just the boundary: an
+                # account that is later re-added would otherwise replay from before its
+                # removal, delivering everything said while it was not in the room. A
+                # retained boundary is a promise to read that window later, and after a
+                # removal nobody is entitled to read it.
+                #
+                # The watermark has to go with it, because the watermark *is* the fallback
+                # boundary and it is frozen at the moment of removal — the live gate
+                # remembers a rejected id without advancing it. Left in place, a reconnect
+                # that arrives before the first post-re-add message would snapshot that
+                # frozen value and replay the whole time away. Empty means what it means
+                # for a room seen for the first time: no window, and ts-dedup off until
+                # live traffic establishes one (`normalize.py`, step 4).
+                sub.replay_boundary = None
+                sub.last_processed_ts = None
                 logger.warning(
-                    "Room '%s': %s — skipping replay; live delivery is unaffected "
-                    "and the next reconnect will ask again",
+                    "Room '%s': this account is no longer a member — skipping replay and "
+                    "closing the outage window; a later re-add starts from that point, "
+                    "not from before the removal",
                     sub.room.name,
-                    "membership could not be established"
-                    if member is None
-                    else "this account is no longer a member",
+                )
+                continue
+            if member is None:
+                # Unknown is not removal. The lookup failing is correlated with the outage
+                # itself, so this is the likely path, and the window stays open for the
+                # next attempt to read.
+                logger.warning(
+                    "Room '%s': membership could not be established — skipping replay; "
+                    "live delivery is unaffected and the next reconnect will ask again",
+                    sub.room.name,
                 )
                 continue
 
@@ -351,11 +374,9 @@ class RocketChatConnector(Connector):
                 )
                 continue
 
-            # The window has now been read, so the mark that named it is spent. An empty
-            # result is a read: there was nothing in the gap.
-            sub.replay_boundary = None
-
             if not raw_msgs:
+                # A read that found nothing is still a read: the window is closed.
+                sub.replay_boundary = None
                 logger.debug(
                     "Room '%s': no missed messages since %s",
                     sub.room.name, watermark,
@@ -403,6 +424,19 @@ class RocketChatConnector(Connector):
                 await self._on_raw_ddp_message(
                     room_id, doc, is_replay=True, replay_after_ts=watermark
                 )
+            else:
+                # Only once the batch has actually been *dispatched*. Fetching it is not
+                # reading it: a shutdown or another disconnect cancelling this loop midway
+                # leaves the tail unprocessed, and by then the restored live traffic has
+                # moved `last_processed_ts` past it — so a boundary cleared at fetch time
+                # would have the next recovery snapshot the newer mark and skip the tail
+                # for good.
+                #
+                # `for`/`else`, so neither a cancellation nor the `break` above reaches it.
+                # The cancellation case is the one this exists for; the `break` means the
+                # room stopped being tracked mid-replay, and leaving a boundary on a
+                # subscription nobody holds any more costs nothing.
+                sub.replay_boundary = None
 
     # ── Inbound ──────────────────────────────────────────────────────────────
 

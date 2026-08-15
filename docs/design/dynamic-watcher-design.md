@@ -1962,8 +1962,25 @@ only `disconnect` returns a connector to `absent`.
    per-room `sub`, and carried into the replay. Freezing the watermark instead would break
    live dedup during the recovery; the two marks are separate facts and both are needed.
 
-   A boundary is spent when the window it names has been *read*, not when a replay was
-   attempted. The two ways a replay declines — membership unknown, the history fetch
+   A boundary is spent when the window it names has been **dispatched**, not when it was
+   fetched and not when a replay was attempted. Fetching a batch is not reading it: a
+   shutdown or a second disconnect cancelling the loop midway leaves the tail
+   unprocessed, and the restored live traffic has already moved the watermark past it, so
+   a boundary cleared at fetch time makes the next recovery skip that tail for good.
+
+   And a window may not span membership epochs. A *confirmed* removal closes it —
+   otherwise an account that is later re-added replays from before it was removed and
+   delivers everything said while it was not in the room, which the rejected-id window
+   cannot prevent because those messages were never seen live at all. Unknown membership
+   is not removal and still keeps the window open.
+
+   Closing it means dropping the watermark as well, not only the boundary. The watermark
+   *is* the fallback boundary, and it is frozen at the moment of removal — the live
+   membership gate remembers a rejected id without advancing it — so a reconnect arriving
+   before the first post-re-add message would snapshot that frozen value and replay the
+   whole time away regardless. An empty watermark means for a re-added room exactly what
+   it means for one seen for the first time: no window, and no ts-dedup until live traffic
+   establishes one. The two ways a replay declines — membership unknown, the history fetch
    failing — are both correlated with the outage, since the network has only just come
    back, so they are the likely path rather than the exotic one; clearing the mark there
    would close a gap nobody looked at. For the same reason a new outage does not overwrite
@@ -1986,6 +2003,11 @@ only `disconnect` returns a connector to `absent`.
    published, a migration releases only the subscription id *it* captured, and `stop()`
    owns all of it, being the transport half of `→ absent`. Unconditional clears are how
    the last attempt to finish wins, and the last to finish is not the current one.
+
+   It covers the *task slot* as much as the fields in it: a recovery that displaces
+   another stops it first and waits for the cancellation to be observed. Two recoveries
+   both reaching the replay callback read the same boundary, and a message id is recorded
+   only once its handler finishes — so the visible failure is one message answered twice.
 
    Two of the three violations that produced this rule were introduced by the fixes for
    the two invariants above it: each added a shared field without adding an owner. That is

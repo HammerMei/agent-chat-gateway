@@ -10,6 +10,7 @@ Run with:
 
 from __future__ import annotations
 
+import asyncio
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -2647,3 +2648,173 @@ class TestMembershipRejectionSurvivesReplay(unittest.IsolatedAsyncioTestCase):
         await connector._on_raw_ddp_message("room-1", doc, is_replay=True)
 
         connector._handler.assert_not_awaited()
+
+
+class TestReplayWindowsDoNotSpanMembership(unittest.IsolatedAsyncioTestCase):
+    """A retained boundary is a promise to read that window later.
+
+    Keeping it across a *confirmed* removal turns that promise into a licence: an account
+    re-added afterwards would replay from before it was removed, delivering everything
+    said while it was not in the room. The 200-id rejected window cannot help — those
+    messages were never seen live at all.
+    """
+
+    def _connector(self, member):
+        connector = _make_connector()
+        connector._rooms["room-1"].last_processed_ts = "100"
+        connector._ws.subscription_statuses = {}
+        connector._rest.is_room_member = AsyncMock(return_value=member)
+        connector._rest.get_room_history = AsyncMock(return_value=[])
+        return connector
+
+    async def test_a_confirmed_removal_closes_the_window(self):
+        connector = self._connector(member=False)
+        await connector._snapshot_replay_boundaries()
+
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
+            await connector._on_ws_reconnect()
+
+        self.assertIsNone(connector._rooms["room-1"].replay_boundary)
+
+    async def test_a_re_add_does_not_replay_the_time_away(self):
+        connector = self._connector(member=False)
+        await connector._snapshot_replay_boundaries()
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
+            await connector._on_ws_reconnect()
+
+        # Re-added later; live traffic has moved on in the meantime.
+        connector._rooms["room-1"].last_processed_ts = "900"
+        connector._rest.is_room_member = AsyncMock(return_value=True)
+        await connector._snapshot_replay_boundaries()
+        await connector._on_ws_reconnect()
+
+        self.assertEqual(
+            connector._rest.get_room_history.call_args[1].get("after_ts"), "900",
+            "the window starts at the re-add, not before the removal",
+        )
+
+    async def test_an_unknown_lookup_still_keeps_the_window(self):
+        """The near miss: unknown is not removal, and collapsing the two would undo the
+        protection that exists because a failed lookup is correlated with the outage."""
+        connector = self._connector(member=None)
+        await connector._snapshot_replay_boundaries()
+
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
+            await connector._on_ws_reconnect()
+
+        self.assertEqual(connector._rooms["room-1"].replay_boundary, "100")
+
+
+class TestTheBoundaryIsSpentOnDispatchNotOnFetch(unittest.IsolatedAsyncioTestCase):
+    """Fetching a batch is not reading it.
+
+    A shutdown or another disconnect cancelling the replay midway leaves the tail
+    undispatched — and the restored live traffic has already moved `last_processed_ts`
+    past it, so a boundary cleared at fetch time makes the next recovery snapshot the
+    newer mark and skip the tail permanently.
+    """
+
+    def _connector(self, msgs):
+        connector = _make_connector()
+        connector._rooms["room-1"].last_processed_ts = "100"
+        connector._ws.subscription_statuses = {}
+        connector._rest.is_room_member = AsyncMock(return_value=True)
+        connector._rest.get_room_history = AsyncMock(return_value=msgs)
+        return connector
+
+    def _msgs(self, n):
+        return [
+            {"_id": f"m{i}", "msg": "hi", "u": {"username": "alice"},
+             "ts": {"$date": 200 + i}}
+            for i in range(n)
+        ]
+
+    async def test_a_replay_cancelled_midway_keeps_its_window(self):
+        connector = self._connector(self._msgs(4))
+        dispatched: list[str] = []
+
+        async def _dispatch(room_id, doc, **kw):
+            dispatched.append(doc["_id"])
+            if len(dispatched) == 2:
+                raise asyncio.CancelledError()
+
+        connector._on_raw_ddp_message = _dispatch
+        await connector._snapshot_replay_boundaries()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await connector._on_ws_reconnect()
+
+        self.assertEqual(
+            connector._rooms["room-1"].replay_boundary, "100",
+            "the undispatched tail is still owed, so the window is still open",
+        )
+
+    async def test_a_completed_batch_spends_its_window(self):
+        """The near miss: a boundary that is never spent re-opens a closed window on
+        every later recovery."""
+        connector = self._connector(self._msgs(3))
+        connector._on_raw_ddp_message = AsyncMock()
+        await connector._snapshot_replay_boundaries()
+
+        await connector._on_ws_reconnect()
+
+        self.assertIsNone(connector._rooms["room-1"].replay_boundary)
+
+    async def test_an_empty_batch_spends_its_window_too(self):
+        connector = self._connector([])
+        await connector._snapshot_replay_boundaries()
+        await connector._on_ws_reconnect()
+        self.assertIsNone(connector._rooms["room-1"].replay_boundary)
+
+
+class TestARemovalDropsTheFallbackBoundaryToo(unittest.IsolatedAsyncioTestCase):
+    """Closing the window is not enough while the watermark can reopen it.
+
+    `last_processed_ts` is the fallback boundary, and it is frozen at the moment of
+    removal: the live membership gate remembers a rejected id without advancing it. So a
+    reconnect arriving before the first post-re-add message would snapshot that frozen
+    value and replay the entire time away.
+    """
+
+    def _connector(self):
+        connector = _make_connector()
+        connector._rooms["room-1"].last_processed_ts = "100"
+        connector._ws.subscription_statuses = {}
+        connector._rest.is_room_member = AsyncMock(return_value=False)
+        connector._rest.get_room_history = AsyncMock(return_value=[])
+        return connector
+
+    async def test_a_removal_leaves_no_mark_to_replay_from(self):
+        connector = self._connector()
+        await connector._snapshot_replay_boundaries()
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
+            await connector._on_ws_reconnect()
+
+        sub = connector._rooms["room-1"]
+        self.assertIsNone(sub.replay_boundary)
+        self.assertIsNone(sub.last_processed_ts)
+
+    async def test_a_reconnect_before_any_new_message_replays_nothing(self):
+        """The exact interleaving: re-added, then a reconnect that beats the first live
+        message. Without dropping the watermark this replays the whole time away."""
+        connector = self._connector()
+        await connector._snapshot_replay_boundaries()
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
+            await connector._on_ws_reconnect()
+
+        connector._rest.is_room_member = AsyncMock(return_value=True)
+        await connector._snapshot_replay_boundaries()
+        await connector._on_ws_reconnect()
+
+        connector._rest.get_room_history.assert_not_awaited()
+
+    async def test_an_unknown_lookup_keeps_the_watermark(self):
+        """The near miss: unknown is not removal, and a watermark dropped on a flaky
+        lookup would lose the outage it was there to describe."""
+        connector = self._connector()
+        connector._rest.is_room_member = AsyncMock(return_value=None)
+        await connector._snapshot_replay_boundaries()
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
+            await connector._on_ws_reconnect()
+
+        self.assertEqual(connector._rooms["room-1"].last_processed_ts, "100")

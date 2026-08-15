@@ -1207,8 +1207,17 @@ class RCWebSocketClient:
             "watcher cannot be discovered",
             reason,
         )
+        # Invariant 8 applies to the slot itself, not only to the fields: `_reconnect`
+        # cancels what it displaces and this did not, so a reconnect's recovery could still
+        # be in its replay — a long one, a REST round trip per room — while this installed
+        # a second recovery over the top of it. Both then reach the replay callback, both
+        # read the same boundary, and a message id is recorded only after its handler
+        # finishes: two agent turns for one message.
+        displaced = self._resubscribe_task
+        if displaced is not None and not displaced.done():
+            displaced.cancel()
         task = asyncio.create_task(
-            self._restore_per_room_delivery(), name="rc-stream-fallback"
+            self._restore_per_room_delivery(displaced), name="rc-stream-fallback"
         )
         # Parked in the same slot a reconnect's resubscribe uses, so that a socket drop
         # during this recovery cancels it (`_reconnect` cancels that slot) instead of
@@ -1217,7 +1226,9 @@ class RCWebSocketClient:
         self._callback_tasks.add(task)
         task.add_done_callback(self._callback_tasks.discard)
 
-    async def _restore_per_room_delivery(self) -> None:
+    async def _restore_per_room_delivery(
+        self, displaced: asyncio.Task | None = None
+    ) -> None:
         """Give every tracked room its own subscription again, then recover the gap.
 
         The second half of `live → lost`: clearing the id records that the stream is gone,
@@ -1230,6 +1241,12 @@ class RCWebSocketClient:
         """
         task = asyncio.current_task()
         try:
+            if displaced is not None:
+                # Waited for, not merely cancelled: a cancellation is a request, and until
+                # it is observed the displaced recovery can still be inside an await in the
+                # replay it was cancelled during. `gather` absorbs its CancelledError
+                # rather than re-raising it here, where it would cancel this recovery too.
+                await asyncio.gather(displaced, return_exceptions=True)
             await self._fire_outage_callback()
             await self._subscribe_rooms_individually(
                 list(self._callbacks.items()), context="Stream fallback"

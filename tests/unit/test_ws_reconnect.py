@@ -1272,3 +1272,99 @@ class TestSharedStreamBookkeepingHasAnOwner(unittest.IsolatedAsyncioTestCase):
             "the captured id is still released on the server: nothing else ever will, "
             "since the replacement overwrote the mapping without unsubscribing",
         )
+
+
+class TestTheStreamFallbackDoesNotRaceTheRecoveryItReplaces(unittest.IsolatedAsyncioTestCase):
+    """Invariant 8 is about the task slot too, not only the fields in it.
+
+    A reconnect's recovery can still be inside its replay — one REST round trip per room —
+    when the restored stream is dropped. Installing a second recovery over the top left
+    both running, both reaching the replay callback, and both reading the same boundary.
+    A message id is recorded only once its handler finishes, so that is two agent turns
+    for one message.
+    """
+
+    async def test_two_replays_are_never_live_at_once(self):
+        """The symptom the finding names, asserted directly.
+
+        Concurrency is the defect — a message id is recorded only after its handler
+        finishes, so two replays reading the same boundary produce two agent turns for one
+        message. Asserting "the displaced one did not finish" would not catch it: both
+        recoveries call the *same* callback, so a finish can belong to either.
+        """
+        client = _make_client()
+        client._wants_stream = True
+        client._stream_sub_id = "stream-1"
+        client._callbacks = {"r1": AsyncMock()}
+        client._subscribe_with_confirmation = AsyncMock(return_value="s")
+        client.subscribe_all = AsyncMock(return_value=True)
+
+        live = 0
+        peak = 0
+        first_replay_started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _slow_replay():
+            nonlocal live, peak
+            live += 1
+            peak = max(peak, live)
+            first_replay_started.set()
+            try:
+                await release.wait()
+            finally:
+                live -= 1
+
+        client.register_reconnect_callback(_slow_replay)
+        displaced = asyncio.create_task(client._resubscribe_all_rooms())
+        client._resubscribe_task = displaced
+        await first_replay_started.wait()
+
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat.ws", "ERROR"):
+            client._on_stream_lost("server stopped it")
+        fallback = client._resubscribe_task
+
+        release.set()
+        await fallback
+
+        self.assertEqual(
+            peak, 1,
+            "two recoveries reached the replay callback at once — same boundary, "
+            "two agent turns for one message",
+        )
+        self.assertTrue(
+            displaced.cancelled(),
+            "the recovery this one displaced must be stopped, not merely forgotten",
+        )
+
+    async def test_the_fallback_still_recovers_when_nothing_was_displaced(self):
+        """The near miss: awaiting a displaced task must not become a requirement."""
+        client = _make_client()
+        client._wants_stream = True
+        client._stream_sub_id = "stream-1"
+        client._callbacks = {"r1": AsyncMock()}
+        client._subscribe_with_confirmation = AsyncMock(return_value="s")
+        replayed = AsyncMock()
+        client.register_reconnect_callback(replayed)
+
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat.ws", "ERROR"):
+            client._on_stream_lost("server stopped it")
+        await client._resubscribe_task
+
+        replayed.assert_awaited_once()
+
+    async def test_a_finished_recovery_is_not_cancelled(self):
+        client = _make_client()
+        client._wants_stream = True
+        client._stream_sub_id = "stream-1"
+        client._callbacks = {}
+        done: asyncio.Future = asyncio.get_running_loop().create_future()
+        done.set_result(None)
+        finished = asyncio.ensure_future(asyncio.sleep(0))
+        await finished
+        client._resubscribe_task = finished
+
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat.ws", "ERROR"):
+            client._on_stream_lost("server stopped it")
+        await client._resubscribe_task
+
+        self.assertFalse(finished.cancelled())
