@@ -1225,6 +1225,29 @@ class RocketChatConnector(Connector):
         """
         await self._on_raw_ddp_message(room_id, doc, access=access)
 
+    def _hand_back(self, doc: dict, result, reason: str) -> bool:
+        """Report a message as still owed, and give back what taking it consumed.
+
+        Every path that answers False has already run the filter, and the filter is not
+        read-only: it spends a turn of the sender's agent-chain budget before anything
+        knows whether the message can be delivered. A retry re-enters it and spends
+        another, so a message handed back often enough exhausts a budget it never used —
+        after which the filter rejects it as complete, the replay reports success, and the
+        window closes over a message nobody saw.
+
+        One place, because there are two ways to hand a message back and they are the two
+        that kept being fixed one at a time.
+        """
+        if result.agent_chain_turn and self._turn_store is not None:
+            remaining = self._turn_store.release_turn(
+                doc.get("rid", ""), doc.get("tmid") or None, result.sender
+            )
+            logger.debug(
+                "Released an agent-chain turn for %s (%s) — now at %d",
+                result.sender, reason, remaining,
+            )
+        return False
+
     async def _on_raw_ddp_message(
         self,
         room_id: str,
@@ -1429,7 +1452,7 @@ class RocketChatConnector(Connector):
                     "keeping it replayable rather than recording it as handled",
                     sub.room.name,
                 )
-                return False
+                return self._hand_back(doc, result, "replay preflight, queues full")
 
             # Record _id BEFORE the first await so a concurrent delivery of the
             # same msg_id (e.g. live DDP racing a replay) hits the dedup check
@@ -1534,7 +1557,7 @@ class RocketChatConnector(Connector):
             # The one outcome that leaves this message pending: its id was just forgotten
             # precisely so a later replay can bring it back, and a boundary spent on a
             # batch containing it would remove the only thing that could.
-            return False
+            return self._hand_back(doc, result, "handler queue full")
 
         # --- Advance dedup watermark AFTER confirmed acceptance ---
         # Update the watermark only once the handler has confirmed the message

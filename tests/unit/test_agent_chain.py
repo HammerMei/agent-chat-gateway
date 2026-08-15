@@ -381,3 +381,65 @@ class TestFilterRcMessageAgentChain(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReleasingATurnTakenByAMessageNotDelivered(unittest.TestCase):
+    """The budget counts turns an agent *took*, not messages the filter looked at.
+
+    The filter spends a turn before anything knows whether the message can be delivered,
+    and a message handed back for a later retry re-enters it. Without a release, retrying
+    the same document exhausts a budget it never used — after which the filter rejects it
+    as complete, the replay reports success, and the window closes over a message nobody
+    saw.
+    """
+
+    def setUp(self):
+        from gateway.core.agent_chain import TurnStore
+
+        self.store = TurnStore()
+
+    def test_a_released_turn_is_available_again(self):
+        allowed, turn = self.store.check_and_increment("r1", None, "agent-a", max_turns=2)
+        self.assertTrue(allowed)
+        self.assertEqual(turn, 1)
+
+        self.assertEqual(self.store.release_turn("r1", None, "agent-a"), 0)
+
+        allowed, turn = self.store.check_and_increment("r1", None, "agent-a", max_turns=2)
+        self.assertTrue(allowed)
+        self.assertEqual(turn, 1, "the retry takes the same turn, not the next one")
+
+    def test_retrying_a_handed_back_message_does_not_exhaust_the_budget(self):
+        """The scenario, in the small: the same document retried more times than the
+        budget allows must still be deliverable."""
+        for _ in range(5):
+            allowed, _ = self.store.check_and_increment(
+                "r1", None, "agent-a", max_turns=2)
+            self.assertTrue(allowed, "a retried message must never be refused for budget")
+            self.store.release_turn("r1", None, "agent-a")
+
+        allowed, turn = self.store.check_and_increment("r1", None, "agent-a", max_turns=2)
+        self.assertTrue(allowed)
+        self.assertEqual(turn, 1)
+
+    def test_releasing_more_than_was_taken_floors_at_zero(self):
+        """A caller bug must not corrupt the room's counter into a negative budget."""
+        self.store.check_and_increment("r1", None, "agent-a", max_turns=2)
+        self.store.release_turn("r1", None, "agent-a")
+        self.store.release_turn("r1", None, "agent-a")
+
+        self.assertEqual(self.store.current_turns("r1", None, "agent-a"), 0)
+
+    def test_releasing_an_unknown_sender_is_a_no_op(self):
+        self.assertEqual(self.store.release_turn("r1", None, "nobody"), 0)
+
+    def test_a_delivered_turn_is_not_released(self):
+        """The near miss: releasing unconditionally would make the budget unenforceable."""
+        for expected in (1, 2):
+            allowed, turn = self.store.check_and_increment(
+                "r1", None, "agent-a", max_turns=2)
+            self.assertTrue(allowed)
+            self.assertEqual(turn, expected)
+
+        allowed, _ = self.store.check_and_increment("r1", None, "agent-a", max_turns=2)
+        self.assertFalse(allowed, "the budget still stops a genuine chain")

@@ -131,6 +131,29 @@ class TurnStore:
         ctx.last_updated = time.monotonic()
         return True, ctx.turns
 
+    def release_turn(self, room_id: str, thread_id: str | None, sender: str) -> int:
+        """Give back a turn taken by `check_and_increment` for a message not delivered.
+
+        The budget counts *turns an agent took*, and a message the gateway hands back for
+        a later retry has not taken one — but the increment already happened, because the
+        filter runs before the capacity preflight and before the handler. Every retry of
+        the same document would otherwise spend another turn, and the budget would run out
+        on a message that was never dispatched: the filter then rejects it as complete,
+        the replay reports success, and the window closes over a message nobody saw.
+
+        Returns the turn count after the release, and floors at zero rather than raising —
+        a caller releasing more than it took is a bug that should not also lose the room's
+        counter.
+        """
+        key = self._key(room_id, thread_id, sender)
+        ctx = self._store.get(key)
+        if ctx is None:
+            return 0
+        if ctx.turns > 0:
+            ctx.turns -= 1
+        ctx.last_updated = time.monotonic()
+        return ctx.turns
+
     def current_turns(self, room_id: str, thread_id: str | None, sender: str) -> int:
         """Return current turn count for a sender (0 if not tracked)."""
         key = self._key(room_id, thread_id, sender)

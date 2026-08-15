@@ -3582,3 +3582,102 @@ class TestAReplayedMessageRejectedByPreflightStaysReplayable(unittest.IsolatedAs
 
         self.assertIn("live-1", sub.seen_ids_set)
         connector._rest.post_message.assert_awaited()
+
+
+class TestHandingAMessageBackReturnsItsTurn(unittest.IsolatedAsyncioTestCase):
+    """Both retryable paths give back the agent-chain turn the filter spent.
+
+    The filter runs before the capacity preflight and before the handler, and it is not
+    read-only. A message handed back re-enters it on every retry, so without a release the
+    budget runs out on a message that was never dispatched — and the filter then rejects
+    it as complete, which reads as success.
+    """
+
+    def _connector(self):
+        connector = _make_connector()
+        connector._config.require_mention = False
+        connector._handler = AsyncMock(return_value=True)
+        connector._turn_store = MagicMock()
+        connector._turn_store.release_turn = MagicMock(return_value=0)
+        return connector
+
+    def _result(self, turn=1):
+        from gateway.connectors.rocketchat.normalize import FilterResult
+
+        return FilterResult(
+            accepted=True, sender="agent-a", msg_ts="200", reason="",
+            is_agent_chain=True, agent_chain_turn=turn,
+        )
+
+    async def test_a_replayed_preflight_rejection_returns_the_turn(self):
+        connector = self._connector()
+        connector._capacity_check = lambda room_id: RoomCapacity.FULL
+
+        with patch(
+            "gateway.connectors.rocketchat.connector.filter_rc_message",
+            return_value=self._result(),
+        ):
+            handed_back = await connector._on_raw_ddp_message(
+                "room-1",
+                {"_id": "r1", "rid": "room-1", "msg": "hi",
+                 "u": {"username": "agent-a"}, "ts": {"$date": 200}},
+                is_replay=True,
+            )
+
+        self.assertFalse(handed_back)
+        connector._turn_store.release_turn.assert_called_once_with(
+            "room-1", None, "agent-a")
+
+    async def test_a_handler_queue_full_drop_returns_the_turn(self):
+        connector = self._connector()
+        connector._capacity_check = lambda room_id: RoomCapacity.AVAILABLE
+        connector._handler = AsyncMock(return_value=False)   # queue filled at dispatch
+
+        with patch(
+            "gateway.connectors.rocketchat.connector.filter_rc_message",
+            return_value=self._result(),
+        ):
+            handed_back = await connector._on_raw_ddp_message(
+                "room-1",
+                {"_id": "r1", "rid": "room-1", "msg": "hi",
+                 "u": {"username": "agent-a"}, "ts": {"$date": 200}},
+            )
+
+        self.assertFalse(handed_back)
+        connector._turn_store.release_turn.assert_called_once_with(
+            "room-1", None, "agent-a")
+
+    async def test_a_delivered_message_keeps_its_turn(self):
+        """The near miss: releasing on the success path would make the budget
+        unenforceable."""
+        connector = self._connector()
+        connector._capacity_check = lambda room_id: RoomCapacity.AVAILABLE
+
+        with patch(
+            "gateway.connectors.rocketchat.connector.filter_rc_message",
+            return_value=self._result(),
+        ):
+            await connector._on_raw_ddp_message(
+                "room-1",
+                {"_id": "r1", "rid": "room-1", "msg": "hi",
+                 "u": {"username": "agent-a"}, "ts": {"$date": 200}},
+            )
+
+        connector._turn_store.release_turn.assert_not_called()
+
+    async def test_a_non_agent_sender_releases_nothing(self):
+        connector = self._connector()
+        connector._capacity_check = lambda room_id: RoomCapacity.FULL
+
+        with patch(
+            "gateway.connectors.rocketchat.connector.filter_rc_message",
+            return_value=self._result(turn=0),   # no turn was taken
+        ):
+            await connector._on_raw_ddp_message(
+                "room-1",
+                {"_id": "r1", "rid": "room-1", "msg": "hi",
+                 "u": {"username": "alice"}, "ts": {"$date": 200}},
+                is_replay=True,
+            )
+
+        connector._turn_store.release_turn.assert_not_called()
