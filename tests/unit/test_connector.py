@@ -3159,6 +3159,39 @@ class TestAReplayStopsWhenMembershipIsRevokedUnderIt(unittest.IsolatedAsyncioTes
 
         self.assertEqual(dispatched, ["m0", "m1"], "the rest belong to a room we left")
 
+    async def test_a_rejection_inside_the_last_handler_is_still_caught(self):
+        """The case a pre-dispatch check cannot reach.
+
+        Checking only before the next iteration means the final document has no next
+        iteration: the `for`/`else` would bless a revoked batch as complete. And the
+        dispatch that was in flight may have advanced the watermark the live gate had just
+        cleared — acceptance writes it, and it does not know the account has left.
+        """
+        connector = self._connector(self._msgs(2))
+        sub = connector._rooms["room-1"]
+        sub.replay_boundary = "100"
+        dispatched: list[str] = []
+
+        async def _dispatch(room_id, doc, **kw):
+            dispatched.append(doc["_id"])
+            if len(dispatched) == 2:          # the *last* document
+                sub.membership_epoch += 1
+                sub.last_processed_ts = "999"  # what an accepted dispatch would write
+            return True
+
+        connector._on_raw_ddp_message = _dispatch
+
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
+            await connector._on_ws_reconnect()
+
+        self.assertEqual(dispatched, ["m0", "m1"])
+        self.assertIsNone(
+            sub.last_processed_ts,
+            "the watermark the live gate cleared must not survive the dispatch that "
+            "was in flight when it fired",
+        )
+        self.assertIsNone(sub.replay_boundary)
+
     async def test_an_undisturbed_replay_still_delivers(self):
         """The near miss: the epoch check must not abandon ordinary replays."""
         connector = self._connector(self._msgs(3))

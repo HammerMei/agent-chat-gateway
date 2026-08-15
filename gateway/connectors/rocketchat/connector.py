@@ -460,9 +460,25 @@ class RocketChatConnector(Connector):
                         len(raw_msgs) - idx,
                     )
                     break
-                if not await self._on_raw_ddp_message(
+                accepted = await self._on_raw_ddp_message(
                     room_id, doc, is_replay=True, replay_after_ts=watermark
-                ):
+                )
+                if sub.membership_epoch != epoch:
+                    # The rejection landed *inside* that handler. Checking only before the
+                    # next iteration misses two cases: this being the last document, where
+                    # the `for`/`else` would then bless a revoked batch as complete, and
+                    # the dispatch itself having re-written the watermark the live gate had
+                    # just cleared — acceptance advances it, and it does not know it is
+                    # writing into a room the account has left.
+                    sub.replay_boundary = None
+                    sub.last_processed_ts = None
+                    logger.warning(
+                        "Room '%s': this account was removed while message %d of %d was "
+                        "being handled — dropping the rest and re-closing the window",
+                        sub.room.name, idx + 1, len(raw_msgs),
+                    )
+                    break
+                if not accepted:
                     all_accepted = False
             else:
                 # Only once the batch has actually been *dispatched*. Fetching it is not
