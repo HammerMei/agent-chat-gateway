@@ -1383,11 +1383,20 @@ class RocketChatConnector(Connector):
             # busy with and nothing to tell its members. Telling them the gateway is
             # busy would be a wrong answer from an idle gateway (§2.7).
             #
-            # The id is recorded, which suppresses automated replay of this message on
-            # the next reconnect — the same treatment the full-queue branch below gives,
-            # and for the same reason: replaying a message no watcher wanted achieves
-            # nothing but a storm. The watermark is left where it is, so a user who
-            # resends is served normally once a watcher exists.
+            # The id is recorded, and that is a *decision* rather than an inheritance
+            # from the branch below, which no longer records during replay.
+            #
+            # The difference is whether the rejection is transient. A full queue drains,
+            # so a replayed message rejected for capacity is owed another attempt, and
+            # recording it would lose it silently. UNROUTED is not like that: it means no
+            # watcher serves this room, which is a configuration state and can persist
+            # indefinitely. Keeping the window open for it would have every recovery
+            # re-fetch a batch that can never be spent — a boundary that is never
+            # consumed is its own defect, and a worse one than a message that no watcher
+            # was ever going to see.
+            #
+            # The watermark is left where it is, so a user who resends is served normally
+            # once a watcher exists.
             logger.warning(
                 "Message for room '%s' has no watcher — dropping without a reply. "
                 "A watcher that failed to start, or a room subscribed with none "
