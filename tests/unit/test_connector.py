@@ -3504,3 +3504,81 @@ class TestAFailedSubscribeReleasesTheTransportToo(unittest.IsolatedAsyncioTestCa
                     room, watcher_id="w9", working_directory="/tmp")
 
         self.assertIn("released", str(caught.exception))
+
+
+class TestAReplayedMessageRejectedByPreflightStaysReplayable(unittest.IsolatedAsyncioTestCase):
+    """A busy processor during replay must not consume the message silently.
+
+    The live path records the id and tells the sender, who can resend. Neither half of
+    that survives being copied into replay: the busy notification is deliberately
+    suppressed there, so nobody is told, and a recorded id makes the *next* recovery skip
+    the message at the dedup check and then close the window as though the batch had been
+    delivered.
+    """
+
+    def _connector(self, capacity):
+        connector = _make_connector()
+        connector._rooms["room-1"].last_processed_ts = "100"
+        connector._ws.subscription_statuses = {}
+        connector._rest.is_room_member = AsyncMock(return_value=True)
+        connector._rest.post_message = AsyncMock()
+        connector._capacity_check = lambda room_id: capacity
+        # The capacity preflight sits behind the handler check at the top of
+        # `_on_raw_ddp_message`; without a handler the method returns before reaching it.
+        connector._handler = AsyncMock(return_value=True)
+        connector._config.require_mention = False
+        connector._rest.get_room_history_page = AsyncMock(return_value=_page([
+            {"_id": "r1", "msg": "hi", "u": {"username": "alice"}, "ts": {"$date": 200}},
+        ]))
+        return connector
+
+    async def test_the_id_is_not_remembered_so_a_later_replay_can_bring_it_back(self):
+        connector = self._connector(RoomCapacity.FULL)
+        sub = connector._rooms["room-1"]
+        await connector._snapshot_replay_boundaries()
+
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
+            await connector._on_ws_reconnect()
+
+        self.assertNotIn(
+            "r1", sub.seen_ids_set,
+            "a remembered id is what makes the next recovery skip it and then close the "
+            "window as delivered",
+        )
+        self.assertEqual(
+            sub.replay_boundary, "100",
+            "and the window stays open, because the message is still owed",
+        )
+
+    async def test_the_second_recovery_delivers_it_once_capacity_returns(self):
+        """The whole point: the loss was permanent, not delayed."""
+        connector = self._connector(RoomCapacity.FULL)
+        await connector._snapshot_replay_boundaries()
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
+            await connector._on_ws_reconnect()
+
+        dispatched: list[str] = []
+        connector._capacity_check = lambda room_id: RoomCapacity.AVAILABLE
+        connector._handler = AsyncMock(
+            side_effect=lambda msg: dispatched.append("m") or True
+        )
+        await connector._snapshot_replay_boundaries()
+        await connector._on_ws_reconnect()
+
+        self.assertEqual(len(dispatched), 1)
+        self.assertIsNone(connector._rooms["room-1"].replay_boundary)
+
+    async def test_a_live_rejection_still_records_and_notifies(self):
+        """The near miss: the live path's bargain — record the id, tell the sender — is
+        deliberate and must survive."""
+        connector = self._connector(RoomCapacity.FULL)
+        sub = connector._rooms["room-1"]
+
+        await connector._on_raw_ddp_message(
+            "room-1",
+            {"_id": "live-1", "msg": "hi", "u": {"username": "alice"},
+             "ts": {"$date": 500}},
+        )
+
+        self.assertIn("live-1", sub.seen_ids_set)
+        connector._rest.post_message.assert_awaited()

@@ -1236,10 +1236,12 @@ class RocketChatConnector(Connector):
     ) -> bool:
         """Parse a raw RC DDP message doc, filter it, normalize it, fire handler.
 
-        Returns **False only when this message is still owed a retry** — the queue-full
-        drop, which deliberately forgets the message id so a later replay can bring it
-        back. Every other outcome returns True, including messages filtered out on
-        purpose: they are finished with, not pending. The distinction exists because the
+        Returns **False only when this message is still owed a retry**. Two paths do that,
+        and both are about a full processor: the handler handing the message back, which
+        forgets its id so a later replay can bring it back, and a *replayed* message
+        rejected by the capacity preflight, which never records the id at all. Every other
+        outcome returns True, including messages filtered out on purpose: they are
+        finished with, not pending. The distinction exists because the
         replay loop cannot otherwise tell "dispatched" from "handed back", and a boundary
         spent on a batch that was handed back loses it (§6.1, invariant 6).
 
@@ -1401,6 +1403,25 @@ class RocketChatConnector(Connector):
                 result.sender,
                 sub.room.name,
             )
+            if is_replay:
+                # Nothing is remembered and nothing is announced, so the only way this
+                # message can come back is a later replay — which means the id must stay
+                # unknown and the batch must not report itself complete.
+                #
+                # The live path below remembers the id on purpose, because the sender is
+                # told and can resend. That reasoning does not survive being copied here:
+                # the busy notification is suppressed during replay (200 missed messages
+                # against full queues would fire 200 REST posts), so nobody is told, and a
+                # remembered id makes the next recovery skip it at the dedup check and
+                # then clear the window as though the batch had been delivered. Silent,
+                # and permanent.
+                logger.info(
+                    "Room '%s': a replayed message could not be accepted (queues full) — "
+                    "keeping it replayable rather than recording it as handled",
+                    sub.room.name,
+                )
+                return False
+
             # Record _id BEFORE the first await so a concurrent delivery of the
             # same msg_id (e.g. live DDP racing a replay) hits the dedup check
             # at the top of this function rather than both calls appending to the
@@ -1409,17 +1430,15 @@ class RocketChatConnector(Connector):
             # resending — we only suppress automated replay re-delivery.
             sub.remember(msg_id)
             # Best-effort notification so the user knows their message was dropped.
-            # Suppressed during replay: replaying 200 missed messages while queues
-            # are full would otherwise fire up to 200 "server busy" REST posts.
-            if not is_replay:
-                try:
-                    await self._handler_send_busy(room_id, doc)
-                except Exception as exc:
-                    logger.debug(
-                        "Best-effort busy notification failed for room '%s': %s",
-                        room_id, exc
-                    )
-            return  # watermark NOT advanced — message can be re-delivered by user resend
+            try:
+                await self._handler_send_busy(room_id, doc)
+            except Exception as exc:
+                logger.debug(
+                    "Best-effort busy notification failed for room '%s': %s",
+                    room_id, exc
+                )
+            # Watermark NOT advanced — the sender has been told and can resend.
+            return True
 
         # --- Optimistic seen_ids registration (TOCTOU guard) ---
         # Mark this message as "in-flight" before the first await so that any
