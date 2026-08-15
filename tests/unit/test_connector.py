@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from gateway.core.connector import RoomCapacity
+from gateway.core.watcher_rule import RoomKind
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -52,6 +53,11 @@ def _make_connector():
     connector._rooms = {}
     connector._watcher_contexts = {}
     connector._room_refcount = {}
+    # Hand-built connector: `__init__` never runs, so anything the code reads has to be
+    # set here. Delivery defaults to per-room, which is what these tests exercise.
+    connector._router = None
+    connector._subscribe_all = False
+    connector._dm_kinds = {}
     connector._rest = MagicMock()
     connector._ws = MagicMock()
     connector._config = _make_config()
@@ -1957,3 +1963,214 @@ class TestMalformedFrames(unittest.IsolatedAsyncioTestCase):
             })
 
         self.assertEqual(client._room_queues, {})
+
+
+class TestSubscribeAll(unittest.IsolatedAsyncioTestCase):
+    """The delivery-model switch, and the fallback that keeps it optional (§6.1)."""
+
+    def _connector(self, with_router=True):
+        connector = _make_connector()
+        connector._ws = MagicMock()
+        connector._ws.connect = AsyncMock()
+        connector._ws.start = AsyncMock()
+        connector._ws.register_reconnect_callback = MagicMock()
+        connector._ws.register_default_callback = MagicMock()
+        connector._ws.register_room_callback = MagicMock()
+        connector._ws.subscribe_room = AsyncMock()
+        connector._rest = MagicMock(login=AsyncMock())
+        if with_router:
+            connector.register_router(AsyncMock())
+        return connector
+
+    async def test_a_confirmed_stream_switches_delivery(self):
+        connector = self._connector()
+        connector._ws.subscribe_all = AsyncMock(return_value=True)
+
+        await connector.connect()
+
+        self.assertTrue(connector._subscribe_all)
+
+    async def test_a_refused_stream_falls_back_to_per_room(self):
+        """`nosub` is a capability answer, not an error: a server without the stream must
+        still run the gateway."""
+        connector = self._connector()
+        connector._ws.subscribe_all = AsyncMock(return_value=False)
+
+        await connector.connect()
+
+        self.assertFalse(connector._subscribe_all)
+
+    async def test_without_a_router_the_stream_is_not_requested(self):
+        """Nothing could be done with a message for an untracked room, so asking for every
+        room would be paying delivery cost for messages the connector drops."""
+        connector = self._connector(with_router=False)
+        connector._ws.subscribe_all = AsyncMock(return_value=True)
+
+        await connector.connect()
+
+        connector._ws.subscribe_all.assert_not_awaited()
+        self.assertFalse(connector._subscribe_all)
+
+    async def test_a_tracked_room_is_registered_but_not_subscribed(self):
+        """The stream already delivers it. A per-room `sub` would ask the server to send
+        it twice, and the frames are indistinguishable — the copy would be deduped by
+        message id rather than refused."""
+        from gateway.core.connector import Room
+
+        connector = self._connector()
+        connector._subscribe_all = True
+
+        await connector.subscribe_room(Room(id="r1", name="eng", type="channel"),
+                                       watcher_id="w1")
+
+        connector._ws.register_room_callback.assert_called_once()
+        connector._ws.subscribe_room.assert_not_awaited()
+
+    async def test_per_room_mode_still_subscribes(self):
+        from gateway.core.connector import Room
+
+        connector = self._connector()
+        connector._subscribe_all = False
+
+        await connector.subscribe_room(Room(id="r1", name="eng", type="channel"),
+                                       watcher_id="w1")
+
+        connector._ws.subscribe_room.assert_awaited_once()
+
+
+class TestUnroutedMessages(unittest.IsolatedAsyncioTestCase):
+    """What arrives under subscribe-all that never could before (§6.1)."""
+
+    def _connector(self):
+        connector = _make_connector()
+        connector._ws = MagicMock(register_default_callback=MagicMock())
+        connector._rest = MagicMock()
+        connector._rest.dm_member_count = AsyncMock(return_value=2)
+        self.offered = []
+        connector._config = _make_config(owners=["glin"])
+        connector.register_router(AsyncMock(side_effect=self.offered.append))
+        return connector
+
+    def _doc(self, **overrides):
+        doc = {"_id": "m1", "rid": "r-new", "msg": "hello",
+               "u": {"username": "glin"}, "ts": {"$date": 1}}
+        doc.update(overrides)
+        return doc
+
+    def _access(self, **overrides):
+        access = {"roomParticipant": True, "roomType": "c", "roomName": "sandbox"}
+        access.update(overrides)
+        return access
+
+    async def test_a_room_the_account_belongs_to_is_offered(self):
+        connector = self._connector()
+        await connector._on_unrouted_message(self._doc(), self._access())
+
+        self.assertEqual(len(self.offered), 1)
+        room = self.offered[0]
+        self.assertEqual((room.id, room.name), ("r-new", "sandbox"))
+        self.assertEqual(room.kind, RoomKind.CHANNEL)
+
+    async def test_a_readable_but_unjoined_channel_is_not(self):
+        """The gate that only matters under subscribe-all: the stream delivers public
+        channels the account can merely read, so without this the gateway would offer a
+        watcher for every public channel on the server."""
+        connector = self._connector()
+        await connector._on_unrouted_message(
+            self._doc(), self._access(roomParticipant=False))
+
+        self.assertEqual(self.offered, [])
+
+    async def test_no_access_object_means_no_answer_not_a_yes(self):
+        """The one place absence must not be read generously: the object is what carries
+        the membership answer, so no object means no answer — and creating a watcher on no
+        answer is how the agent ends up in a room nobody invited it to."""
+        connector = self._connector()
+        await connector._on_unrouted_message(self._doc(), None)
+
+        self.assertEqual(self.offered, [])
+
+    async def test_a_system_message_is_not_a_reason_to_create_a_watcher(self):
+        connector = self._connector()
+        await connector._on_unrouted_message(self._doc(t="uj", msg="glin"), self._access())
+
+        self.assertEqual(self.offered, [])
+
+    async def test_the_bot_s_own_message_is_not(self):
+        connector = self._connector()
+        await connector._on_unrouted_message(
+            self._doc(u={"username": connector._config.username}), self._access())
+
+        self.assertEqual(self.offered, [])
+
+    async def test_a_sender_outside_the_allow_list_is_not(self):
+        connector = self._connector()
+        await connector._on_unrouted_message(
+            self._doc(u={"username": "stranger"}), self._access())
+
+        self.assertEqual(self.offered, [])
+
+    async def test_a_private_group_maps_to_group(self):
+        connector = self._connector()
+        await connector._on_unrouted_message(self._doc(), self._access(roomType="p"))
+
+        self.assertEqual(self.offered[0].kind, RoomKind.GROUP)
+
+    async def test_a_named_room_with_no_name_is_not_routable(self):
+        connector = self._connector()
+        await connector._on_unrouted_message(self._doc(), self._access(roomName=""))
+
+        self.assertEqual(self.offered, [])
+
+
+class TestDirectRoomClassification(unittest.IsolatedAsyncioTestCase):
+    """1:1 or group — the distinction Rocket.Chat does not make on the wire (§6.4).
+
+    Not cosmetic: `require_mention` is skipped entirely for a room typed `dm`, so a group
+    DM misclassified as a 1:1 makes the agent answer every message from anyone in it.
+    """
+
+    def _connector(self, member_count=2):
+        connector = _make_connector()
+        connector._ws = MagicMock(register_default_callback=MagicMock())
+        connector._rest = MagicMock()
+        connector._rest.dm_member_count = AsyncMock(return_value=member_count)
+        self.offered = []
+        connector._config = _make_config(owners=["glin"])
+        connector.register_router(AsyncMock(side_effect=self.offered.append))
+        return connector
+
+    def _deliver(self, connector):
+        return connector._on_unrouted_message(
+            {"_id": "m1", "rid": "d1", "msg": "hi", "u": {"username": "glin"},
+             "ts": {"$date": 1}},
+            {"roomParticipant": True, "roomType": "d"},
+        )
+
+    async def test_two_members_is_a_one_to_one(self):
+        connector = self._connector(member_count=2)
+        await self._deliver(connector)
+        self.assertEqual(self.offered[0].kind, RoomKind.DM)
+
+    async def test_three_members_is_a_group_dm(self):
+        connector = self._connector(member_count=3)
+        await self._deliver(connector)
+        self.assertEqual(self.offered[0].kind, RoomKind.GROUP_DM)
+
+    async def test_the_answer_is_cached_and_never_invalidated(self):
+        """Verified, not assumed: on 8.5.1 every route for adding a member to a type-`d`
+        room is refused on the room's *type*, and `im.create` returns a different room id
+        for a different member set. A group DM is a separate room, never a mutated 1:1."""
+        connector = self._connector(member_count=3)
+        await self._deliver(connector)
+        await self._deliver(connector)
+
+        connector._rest.dm_member_count.assert_awaited_once()
+
+    async def test_a_failed_lookup_answers_one_to_one_without_caching_it(self):
+        """A transient API failure must not fix the wrong answer in place for the life of
+        the process."""
+        connector = self._connector(member_count=0)
+        await self._deliver(connector)
+        self.assertEqual(self.offered[0].kind, RoomKind.DM)
+        self.assertEqual(connector._dm_kinds, {})

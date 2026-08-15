@@ -21,6 +21,25 @@ class RoomNotFoundError(Exception):
     """
 
 
+# Rocket.Chat's room-type letters. `c` public channel, `p` private group, `d` direct —
+# which covers a 1:1 **and** a group DM, because Rocket.Chat reports them identically
+# (§6.4). Telling those apart needs a participant lookup and is done by the connector.
+#
+# Nothing mapped these before: a room's type came from *which REST endpoint answered*,
+# which works when resolving by name and not at all when the type arrives on a message.
+_ROOM_TYPES = {"c": "channel", "p": "group", "d": "dm"}
+
+
+def room_type_for(letter: str | None) -> str:
+    """Map a Rocket.Chat room-type letter to the gateway's room type.
+
+    An unknown or missing letter falls back to `channel`: a channel requires a mention
+    where a DM does not, so guessing `channel` cannot turn a quiet room into one the agent
+    answers unprompted.
+    """
+    return _ROOM_TYPES.get(letter or "", "channel")
+
+
 class RocketChatREST:
     """Async REST client for Rocket.Chat API."""
 
@@ -486,6 +505,28 @@ class RocketChatREST:
         text_msgs = [m for m in msgs if not m.get("t") and m.get("msg")]
         # RC REST API returns newest-first; reverse to chronological order.
         return list(reversed(text_msgs))
+
+    async def dm_member_count(self, room_id: str) -> int:
+        """How many people are in a direct room — the only way to tell a 1:1 from a group.
+
+        Rocket.Chat reports both as `roomType: "d"` with no participant information in the
+        frame, and this is not a cosmetic distinction: `require_mention` is skipped
+        entirely for a room typed `dm`, so a group DM misclassified as a 1:1 makes the
+        agent answer **every** message from **anyone** in that group (§6.4).
+
+        Returns 0 when the lookup fails, which the caller treats as "assume a 1:1" — the
+        conservative direction is not obvious here, so it is stated: a group misread as a
+        1:1 is the loud failure (the agent talks too much and someone notices), while a
+        1:1 misread as a group is the silent one (the agent waits for a mention that a 1:1
+        user has no reason to type, and looks broken).
+        """
+        try:
+            result = await self._request("GET", "im.members", params={"roomId": room_id})
+        except Exception as e:
+            logger.warning("Could not read members of direct room %s: %s", room_id, e)
+            return 0
+        members = result.get("members") or []
+        return len(members) if isinstance(members, list) else 0
 
     async def resolve_room(self, room_name: str) -> dict[str, Any]:
         """Resolve a room name to its info dict.

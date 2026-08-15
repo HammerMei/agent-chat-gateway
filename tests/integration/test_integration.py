@@ -664,6 +664,11 @@ class TestRCRefcount(unittest.IsolatedAsyncioTestCase):
         config.password = "secret"
 
         connector = RocketChatConnector.__new__(RocketChatConnector)
+        # `__init__` never runs here, so delivery-mode state has to be set explicitly.
+        # Per-room is what these tests exercise.
+        connector._router = None
+        connector._subscribe_all = False
+        connector._dm_kinds = {}
         connector._config = config
         connector._rest = MagicMock()
         connector._ws = MagicMock()
@@ -739,6 +744,11 @@ class TestMultiWatcherDispatch(unittest.IsolatedAsyncioTestCase):
         config.attachments.cache_dir = "agent-chat.cache"
 
         connector = RocketChatConnector.__new__(RocketChatConnector)
+        # `__init__` never runs here, so delivery-mode state has to be set explicitly.
+        # Per-room is what these tests exercise.
+        connector._router = None
+        connector._subscribe_all = False
+        connector._dm_kinds = {}
         connector._config = config
         connector._rest = MagicMock()
         connector._ws = MagicMock()
@@ -1498,6 +1508,11 @@ class TestAttachmentCachePath(unittest.IsolatedAsyncioTestCase):
         config.attachments.cache_dir = "agent-chat.cache"
 
         connector = RocketChatConnector.__new__(RocketChatConnector)
+        # `__init__` never runs here, so delivery-mode state has to be set explicitly.
+        # Per-room is what these tests exercise.
+        connector._router = None
+        connector._subscribe_all = False
+        connector._dm_kinds = {}
         connector._config = config
         connector._rest = MagicMock()
         connector._ws = MagicMock()

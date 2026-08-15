@@ -35,7 +35,10 @@ from ...core.connector import (
     Room,
     RoomCapacity,
 )
+from ...core.sender_policy import sender_allowed
 from ...core.tz_utils import local_iana_timezone as _server_local_timezone
+from ...core.watcher_manager import RoomRef
+from ...core.watcher_rule import RoomKind
 from .agent_chain import TurnStore
 from .config import RocketChatConfig
 from .mentions import is_room_wide_mention
@@ -43,7 +46,7 @@ from .normalize import FilterResult, filter_rc_message, normalize_rc_message
 from .outbound import send_media as _send_media
 from .outbound import send_text as _send_text
 from .policy import apply_thread_policy
-from .rest import RocketChatREST, RoomNotFoundError
+from .rest import RocketChatREST, RoomNotFoundError, room_type_for
 from .websocket import RCWebSocketClient
 
 logger = logging.getLogger("agent-chat-gateway.connectors.rocketchat")
@@ -157,6 +160,17 @@ class RocketChatConnector(Connector):
             str, list[_WatcherRoomContext]
         ] = {}  # room_id -> [watcher...]
         self._room_refcount: dict[str, int] = {}  # room_id -> subscriber count
+        self._router = None
+        # True once `__my_messages__` is confirmed. Delivery then reaches every room the
+        # account can see, so `subscribe_room` stops being what makes a room deliver and
+        # becomes local bookkeeping only (§5.2).
+        self._subscribe_all = False
+        # room_id → RoomKind for direct rooms. Never invalidated, and that is a verified
+        # property rather than an optimisation: on 8.5.1 every route for adding a member to
+        # a type-`d` room is refused on the room's *type*, and `im.create` returns a
+        # **different room id** for a different member set — so a group DM is a separate
+        # room, never a mutated 1:1, and this cache cannot go stale (§6.4).
+        self._dm_kinds: dict[str, RoomKind] = {}
         # Global attachment cache base: {cache_dir_global}/{connector_name}/{room_id}/
         # Namespaced by connector name to avoid collisions across multi-connector deployments.
         self._attachments_cache_base = (
@@ -183,10 +197,21 @@ class RocketChatConnector(Connector):
         await self._ws.connect()
         self._ws.register_reconnect_callback(self._on_ws_reconnect)
         await self._ws.start()
+
+        # Ask for every room the account can see. A server that refuses answers `nosub`,
+        # and the connector keeps its per-room subscriptions — a capability answer, not an
+        # error, so an older or differently configured server still runs the gateway. Only
+        # attempted when a router is registered: without one there is nothing to do with a
+        # message for a room no watcher tracks, and asking for them all would be paying
+        # delivery cost for messages the connector would immediately drop.
+        if self._router is not None:
+            self._subscribe_all = await self._ws.subscribe_all()
+
         logger.info(
-            "RocketChatConnector connected to %s as %s",
+            "RocketChatConnector connected to %s as %s (delivery: %s)",
             self._config.server_url,
             self._config.username,
+            "all rooms" if self._subscribe_all else "per room",
         )
 
     async def disconnect(self) -> None:
@@ -397,6 +422,100 @@ class RocketChatConnector(Connector):
 
     # ── Per-room subscription ─────────────────────────────────────────────────
 
+    def register_router(self, router) -> None:
+        """Register the callback consulted for a room no watcher is tracking.
+
+        Only ever consulted under subscribe-all: with per-room subscriptions a message for
+        an unwatched room cannot arrive at all. Optional, so a deployment whose server
+        refuses `__my_messages__` behaves exactly as before.
+        """
+        self._router = router
+        self._ws.register_default_callback(self._on_unrouted_message)
+
+    async def _on_unrouted_message(self, doc: dict, access: dict | None = None) -> None:
+        """A message for a room this connector has no watcher for (§2.2).
+
+        Three gates before the room is offered, in this order and for different reasons:
+
+        1. **System messages.** A join notification is not a reason to create a watcher,
+           and `t` is on the doc, so this costs nothing.
+        2. **Own messages.** The bot's own posts arrive too.
+        3. **Membership.** `roomParticipant` is server-computed per message, and under
+           subscribe-all it is load-bearing in a way it never was before: the stream
+           delivers **public channels the account can merely read**, not only the ones it
+           belongs to. Without this gate the gateway would offer a watcher for every
+           public channel on the server.
+
+        A missing access object is treated as *not* a routing candidate rather than as a
+        participant. That is the one place absence must not be read generously: the object
+        is what carries the membership answer, so no object means no answer, and creating a
+        watcher on no answer is how the agent ends up in a room nobody invited it to.
+        """
+        if self._router is None or doc.get("t"):
+            return
+        sender = doc.get("u", {}).get("username", "")
+        if sender == self._config.username:
+            return
+        if not access or not access.get("roomParticipant"):
+            return
+        if not sender_allowed(self._config, sender):
+            return
+
+        room_id = doc.get("rid", "")
+        if not room_id:
+            return
+        room = await self._room_ref_from_access(room_id, access)
+        if room is None:
+            return
+        try:
+            await self._router(room)
+        except Exception as e:
+            logger.error("Router failed for room %s: %s", room_id, e)
+
+    async def _room_ref_from_access(
+        self, room_id: str, access: dict
+    ) -> "RoomRef | None":
+        """Build a `RoomRef` from the per-delivery access object.
+
+        `roomName` is absent for direct rooms, which is why the kind is resolved before the
+        name is used: a channel without a name is a frame we cannot describe, while a DM
+        without one is normal.
+        """
+        room_type = room_type_for(access.get("roomType"))
+        if room_type == "dm":
+            kind = await self._direct_room_kind(room_id)
+            return RoomRef(id=room_id, kind=kind)
+
+        name = access.get("roomName") or ""
+        if not name:
+            logger.debug("Room %s has no name and is not direct — not routable", room_id)
+            return None
+        kind = RoomKind.GROUP if room_type == "group" else RoomKind.CHANNEL
+        return RoomRef(id=room_id, kind=kind, name=name)
+
+    async def _direct_room_kind(self, room_id: str) -> RoomKind:
+        """1:1 or group DM — the distinction Rocket.Chat does not make on the wire.
+
+        Cached permanently, and that is verified rather than assumed: on 8.5.1 every route
+        for adding a member to a type-`d` room is refused on the room's *type*, and
+        `im.create` returns a **different room id** for a different member set. A group DM
+        is therefore a separate room and never a mutated 1:1, so there is nothing for an
+        invalidation path to catch (§6.4).
+
+        A failed lookup answers 1:1 and is **not** cached, so a transient API failure does
+        not fix the wrong answer in place for the process's lifetime.
+        """
+        cached = self._dm_kinds.get(room_id)
+        if cached is not None:
+            return cached
+
+        count = await self._rest.dm_member_count(room_id)
+        if count == 0:
+            return RoomKind.DM  # lookup failed; answer, but do not remember
+        kind = RoomKind.GROUP_DM if count > 2 else RoomKind.DM
+        self._dm_kinds[room_id] = kind
+        return kind
+
     async def subscribe_room(
         self,
         room: Room,
@@ -437,7 +556,18 @@ class RocketChatConnector(Connector):
         self._room_refcount[room.id] = 1
 
         try:
-            await self._ws.subscribe_room(room.id, self._make_ddp_callback(room.id))
+            if self._subscribe_all:
+                # Local bookkeeping only (§5.2). The stream already delivers this room, so
+                # a per-room `sub` would ask the server to send it twice — and the frames
+                # are indistinguishable, so the second copy would be deduped by message id
+                # rather than refused, wasting the round trip and the queue slot.
+                #
+                # The callback still has to be registered: the fan-out prefers a per-room
+                # callback and falls back to the default one, and this room *is* tracked,
+                # so it belongs on the tracked path rather than the routing path.
+                self._ws.register_room_callback(room.id, self._make_ddp_callback(room.id))
+            else:
+                await self._ws.subscribe_room(room.id, self._make_ddp_callback(room.id))
         except Exception:
             # DDP subscription failed — roll back the connector-level state so
             # there is no dangling entry with a refcount of 1 and no live subscription.

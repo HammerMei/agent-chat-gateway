@@ -64,6 +64,15 @@ class RCWebSocketClient:
         # _resubscribe_all_rooms re-registers a room that unsubscribe_room
         # is concurrently removing.
         self._rooms_unsubscribing: set[str] = set()
+        # Consulted for a room with no registered callback. Under per-room subscriptions
+        # such a message cannot arrive, so this stays None and nothing changes; under
+        # subscribe-all every room the account can see arrives, and this is what decides
+        # whether one of them should become a watcher.
+        self._default_callback: Callable | None = None
+        # The stream this client subscribed to, when it is not a room. Kept separate from
+        # `_subscriptions`, which maps rooms to their own subscription ids — the whole
+        # point of the key-space split is that a stream is not a room.
+        self._stream_sub_id: str | None = None
 
     async def connect(self) -> None:
         """Connect, perform DDP handshake, and login.
@@ -203,6 +212,59 @@ class RCWebSocketClient:
             timeout=timeout,
             keep_callback_on_failure=False,
         )
+
+    def register_room_callback(self, room_id: str, callback: Callable) -> None:
+        """Route a room to its own callback without subscribing to it.
+
+        For subscribe-all, where the stream already delivers the room and the only thing
+        missing is which handler owns it. Kept separate from `subscribe_room` so that
+        "this room is tracked" and "ask the server for this room" stay two decisions —
+        conflating them is what made `subscribe_room` gate delivery in the first place.
+        """
+        self._callbacks[room_id] = callback
+
+    def register_default_callback(self, callback: Callable) -> None:
+        """Register the handler for rooms with no per-room callback (subscribe-all)."""
+        self._default_callback = callback
+
+    async def subscribe_all(self, timeout: float = 10.0) -> bool:
+        """Subscribe to every room this account can see, via `__my_messages__`.
+
+        Returns True when the server confirms, False when it refuses (`nosub`) or does not
+        answer in time — the caller then falls back to per-room subscriptions. A refusal is
+        not an error to raise: it is a capability answer, and an older or differently
+        configured server that lacks the stream should still run the gateway.
+
+        The subscription id is kept in `_stream_sub_id`, not in `_subscriptions`, which
+        maps *rooms* to their subscription ids. Storing a stream there would make
+        `unsubscribe_room` able to tear down every room's delivery by name of one.
+        """
+        sub_id = self._new_id()
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._pending_subs[sub_id] = future
+        try:
+            await self._send(
+                {
+                    "msg": "sub",
+                    "id": sub_id,
+                    "name": "stream-room-messages",
+                    "params": ["__my_messages__", False],
+                }
+            )
+            await asyncio.wait_for(future, timeout=timeout)
+        except Exception as e:
+            logger.warning(
+                "Subscribe-all (__my_messages__) refused or timed out (%s) — "
+                "falling back to per-room subscriptions",
+                e,
+            )
+            return False
+        finally:
+            self._pending_subs.pop(sub_id, None)
+
+        self._stream_sub_id = sub_id
+        logger.info("Subscribed to __my_messages__ — delivery is no longer per room")
+        return True
 
     async def _subscribe_with_confirmation(
         self,
@@ -557,7 +619,7 @@ class RCWebSocketClient:
             # connector decides what a missing one means.
             access = args[1] if len(args) > 1 and isinstance(args[1], dict) else None
 
-            callback = self._callbacks.get(room_id)
+            callback = self._callbacks.get(room_id) or self._default_callback
             if not callback:
                 return
 
