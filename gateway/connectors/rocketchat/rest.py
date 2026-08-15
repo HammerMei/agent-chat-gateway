@@ -3,6 +3,7 @@
 import asyncio
 import datetime
 import logging
+import math
 import mimetypes
 import secrets
 from dataclasses import dataclass
@@ -41,11 +42,19 @@ def _to_rc_ts(value: str | None) -> str | None:
     """
     if not value:
         return value
-    if value.lstrip("-").isdigit():
-        return datetime.datetime.fromtimestamp(
-            int(value) / 1000, tz=datetime.timezone.utc
-        ).isoformat().replace("+00:00", "Z")
-    return value
+    # "Does this parse as a number", not "is it all digits". A watermark is `str()` of
+    # whatever JSON put in `$date`, and a float there — `"1786816166131.0"` — is not a
+    # digit string. It would pass straight through, be Invalid Date on the server, and
+    # fail the same silent way this function exists to prevent. ISO 8601 raises here.
+    try:
+        ms = float(value)
+    except ValueError:
+        return value
+    if not math.isfinite(ms):
+        return value
+    return datetime.datetime.fromtimestamp(
+        ms / 1000, tz=datetime.timezone.utc
+    ).isoformat().replace("+00:00", "Z")
 
 
 class RoomNotFoundError(Exception):

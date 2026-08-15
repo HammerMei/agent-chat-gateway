@@ -1676,3 +1676,18 @@ class TestHistoryBoundsAreSentInTheFormatTheServerParses(unittest.IsolatedAsynci
         params = self._params(rest)
         self.assertNotIn("oldest", params)
         self.assertNotIn("latest", params)
+
+    async def test_a_float_watermark_is_converted_too(self):
+        """`str()` of whatever JSON put in `$date`. A digit-string test misses this one,
+        and missing it fails the same silent way the conversion exists to prevent."""
+        rest = self._rest()
+        await rest.get_room_history_page("r1", "channel", count=10, after_ts="1786816166131.0")
+
+        self.assertEqual(self._params(rest)["oldest"], "2026-08-15T17:49:26.131000Z")
+
+    async def test_an_unparseable_bound_is_left_alone(self):
+        """Better an unusable bound reaching the server than a fabricated one."""
+        rest = self._rest()
+        await rest.get_room_history_page("r1", "channel", count=10, after_ts="nan")
+
+        self.assertEqual(self._params(rest)["oldest"], "nan")
