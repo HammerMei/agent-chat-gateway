@@ -4020,6 +4020,58 @@ class TestABatchClearsOnlyTheWindowItRead(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(connector._rooms["room-1"].replay_boundary)
 
 
+class TestARemovalDuringTheHandlerLeavesNoWindowBehind(unittest.IsolatedAsyncioTestCase):
+    """A delivery leaves two marks behind. The removal must reach both.
+
+    The watermark commit already refuses to write once `membership_epoch` has moved under
+    it. The boundary claim on the queue-full path did not — and that mark is the one that
+    points a *later* replay below the removal. If the account is re-added first, membership
+    answers True and the entire non-member interval is delivered, which the rejected-id
+    window cannot prevent because none of it was ever seen live.
+    """
+
+    async def _connector(self):
+        connector = _make_connector()
+        connector._config.require_mention = False
+        connector._capacity_check = lambda *a, **kw: False   # queues full: hand it back
+        return connector
+
+    def _doc(self):
+        return {"_id": "m1", "msg": "hi", "u": {"username": "alice", "_id": "u-alice"},
+                "rid": "room-1", "ts": {"$date": 500}}
+
+    async def test_a_handed_back_message_does_not_reopen_a_closed_window(self):
+        connector = await self._connector()
+        sub = connector._rooms["room-1"]
+        sub.last_processed_ts = "400"
+
+        async def _handler(msg):
+            sub.left_the_room()            # what the live membership gate does
+            return False                   # ...and the processor is full
+
+        connector._handler = _handler
+
+        with self.assertLogs("agent-chat-gateway.connectors.rocketchat", "WARNING"):
+            await connector._on_raw_ddp_message("room-1", self._doc())
+
+        self.assertIsNone(
+            sub.replay_boundary,
+            "the removal closed this window; a delivery from before it may not reopen one",
+        )
+
+    async def test_an_undisturbed_hand_back_still_opens_its_window(self):
+        """The near miss: the epoch check must not stop ordinary hand-backs from
+        keeping their message reachable."""
+        connector = await self._connector()
+        sub = connector._rooms["room-1"]
+        sub.last_processed_ts = "400"
+        connector._handler = AsyncMock(return_value=False)
+
+        await connector._on_raw_ddp_message("room-1", self._doc())
+
+        self.assertEqual(sub.replay_boundary, "400")
+
+
 class TestBoundaryClaims(unittest.TestCase):
     """The two methods on their own, because the count is the part that carries the rule."""
 

@@ -1718,7 +1718,24 @@ class RocketChatConnector(Connector):
             #
             # Rocket.Chat timestamps are epoch milliseconds, so "just below" is a real
             # value rather than an approximation.
-            sub.claim_boundary(sub.last_processed_ts, _just_before(result.msg_ts))
+            # Not if the account left the room while this handler was running. The
+            # watermark commit below already refuses that, and this is the same rule for
+            # the other mark a delivery leaves behind: `left_the_room()` closed the window
+            # deliberately, and reopening it here points a later replay below a removal.
+            # If the account is re-added before that replay, membership answers True and
+            # the whole non-member interval is delivered — which is the one thing the
+            # rejected-id window cannot prevent, because those messages were never seen
+            # live at all.
+            #
+            # Nothing is owed by not claiming: this message belongs to a membership the
+            # account no longer has, so leaving it unreachable is the outcome, not a loss.
+            if sub.membership_epoch == entry_epoch:
+                sub.claim_boundary(sub.last_processed_ts, _just_before(result.msg_ts))
+            else:
+                logger.warning(
+                    "Room %s: not reopening the outage window for a message that was in "
+                    "flight when this account was removed", room_id,
+                )
             # The one outcome that leaves this message pending: its id was just forgotten
             # precisely so a later replay can bring it back, and a boundary spent on a
             # batch containing it would remove the only thing that could.

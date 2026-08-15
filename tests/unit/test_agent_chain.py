@@ -585,8 +585,13 @@ class TestReleasedTokenBookkeepingIsBounded(unittest.TestCase):
     """A retry loop hands the same message back indefinitely, and the TTL cannot help.
 
     Every attempt takes a fresh token and gives it back, and every attempt's *increment*
-    refreshes `last_updated` — so `_gc` never reclaims the context and a set of released
-    tokens would grow for as long as the processor stays full.
+    refreshes `last_updated` — so `_gc` never reclaims the context and the bookkeeping
+    would grow for as long as the processor stays full.
+
+    The first version of this test released every token in order, which is the one
+    interleaving a prefix counter handles — so it passed while the mechanism was broken
+    for every real chain. The interleaving that matters has a **delivered** token in it:
+    delivered tokens are never released, and a prefix stops dead at the first one.
     """
 
     def setUp(self):
@@ -597,75 +602,88 @@ class TestReleasedTokenBookkeepingIsBounded(unittest.TestCase):
     def _ctx(self):
         return self.store._store[self.store._key("r1", None, "agent-a")]
 
-    def test_a_long_retry_loop_does_not_accumulate_tokens(self):
-        for _ in range(500):
-            allowed, _turn, tok = self.store.check_and_increment(
-                "r1", None, "agent-a", max_turns=5)
-            self.assertTrue(allowed, "each release frees the turn the retry takes")
-            self.store.release_turn("r1", None, "agent-a", tok, generation=0)
+    def _take(self):
+        return self.store.check_and_increment("r1", None, "agent-a", max_turns=5)[2]
+
+    def _give_back(self, token):
+        return self.store.release_turn("r1", None, "agent-a", token, generation=0)
+
+    def test_a_retry_loop_behind_a_delivered_turn_stays_bounded(self):
+        """The case the prefix could not reach: token 1 is delivered and never comes back."""
+        from gateway.core.agent_chain import _RELEASED_TOKENS_REMEMBERED
+
+        self._take()                                  # token 1 — delivered, never released
+        for _ in range(_RELEASED_TOKENS_REMEMBERED * 3):
+            self._give_back(self._take())
 
         ctx = self._ctx()
-        self.assertEqual(ctx.issued, 500)
+        self.assertEqual(ctx.issued, _RELEASED_TOKENS_REMEMBERED * 3 + 1)
+        self.assertLessEqual(len(ctx.released), _RELEASED_TOKENS_REMEMBERED)
         self.assertEqual(
-            ctx.released, set(),
-            "sequential releases collapse into the prefix, leaving nothing to hold",
+            len(ctx.released_set), len(ctx.released),
+            "the index must not outlive what the queue remembers",
         )
-        self.assertEqual(ctx.released_below, 500)
 
-    def test_an_out_of_order_release_is_held_until_the_gap_closes(self):
-        toks = [
-            self.store.check_and_increment("r1", None, "agent-a", max_turns=5)[2]
-            for _ in range(3)
-        ]
-        self.store.release_turn("r1", None, "agent-a", toks[2], generation=0)
-        self.assertEqual(self._ctx().released, {3}, "token 1 has not come back yet")
+    def test_a_retry_loop_never_exhausts_the_budget(self):
+        """What the release is *for*, independent of how it is remembered."""
+        for _ in range(500):
+            token = self._take()
+            self.assertNotEqual(token, 0, "each release frees the turn the retry takes")
+            self._give_back(token)
 
-        self.store.release_turn("r1", None, "agent-a", toks[0], generation=0)
-        self.store.release_turn("r1", None, "agent-a", toks[1], generation=0)
-        self.assertEqual(self._ctx().released, set())
-        self.assertEqual(self._ctx().released_below, 3)
+        self.assertEqual(self.store.current_turns("r1", None, "agent-a"), 0)
 
-    def test_a_collapsed_token_is_still_refused_a_second_release(self):
-        """The prefix must forget nothing — it is a compaction, not an eviction."""
-        for _ in range(10):
-            _a, _t, tok = self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
-            self.store.release_turn("r1", None, "agent-a", tok, generation=0)
+    def test_a_recently_released_token_is_refused_a_second_release(self):
+        self._take()                                  # delivered
+        token = self._take()
+        self._give_back(token)
+        live = self.store.current_turns("r1", None, "agent-a")
 
-        _a, _t, live = self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
-        self.assertEqual(self.store.current_turns("r1", None, "agent-a"), 1)
-        self.store.release_turn("r1", None, "agent-a", 1, generation=0)
+        self._give_back(token)
+
         self.assertEqual(
-            self.store.current_turns("r1", None, "agent-a"), 1,
-            "the oldest token is long collapsed, and releasing it again must not take "
-            "the turn the live delivery is using",
+            self.store.current_turns("r1", None, "agent-a"), live,
+            "a second release may not take a turn a live delivery is using",
         )
-        self.assertEqual(live, 11)
 
-    def test_a_reset_clears_the_prefix_as_well(self):
+    def test_an_out_of_order_release_is_still_refused_twice(self):
+        """Releases do not arrive in issue order — replay and live traffic overlap."""
+        a, b, c = self._take(), self._take(), self._take()
+        self._give_back(c)
+        self._give_back(a)
+        after = self.store.current_turns("r1", None, "agent-a")
+
+        self._give_back(c)
+        self._give_back(a)
+
+        self.assertEqual(self.store.current_turns("r1", None, "agent-a"), after)
+        self.assertEqual(after, 1, "only b's turn is still held")
+        self.assertTrue(self._ctx().is_released(b) is False)
+
+    def test_a_reset_forgets_every_token_of_the_previous_count(self):
         for _ in range(5):
-            _a, _t, tok = self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
-            self.store.release_turn("r1", None, "agent-a", tok, generation=0)
-        self.assertEqual(self._ctx().released_below, 5)
+            self._give_back(self._take())
 
         self.store.reset_sender("r1", None, "agent-a")
         gen = self._ctx().generation
-        _a, _t, tok = self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
-        self.assertEqual(tok, 1, "a fresh count reissues from one")
+        token = self._take()
+
+        self.assertEqual(token, 1, "a fresh count reissues from one")
         self.assertEqual(
-            self.store.release_turn("r1", None, "agent-a", tok, generation=gen), 0,
-            "a stale prefix would report this token as already given back",
+            self.store.release_turn("r1", None, "agent-a", token, generation=gen), 0,
+            "stale bookkeeping would report this token as already given back",
         )
 
-    def test_reset_all_clears_the_prefix_as_well(self):
+    def test_reset_all_forgets_them_too(self):
         for _ in range(5):
-            _a, _t, tok = self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
-            self.store.release_turn("r1", None, "agent-a", tok, generation=0)
+            self._give_back(self._take())
 
         self.store.reset_all("r1", None)
         gen = self._ctx().generation
-        _a, _t, tok = self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
+        token = self._take()
+
         self.assertEqual(
-            self.store.release_turn("r1", None, "agent-a", tok, generation=gen), 0,
+            self.store.release_turn("r1", None, "agent-a", token, generation=gen), 0,
             "the room-wide reset carries the same rule as the per-sender one",
         )
 

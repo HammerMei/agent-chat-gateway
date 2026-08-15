@@ -14,6 +14,7 @@ re-exports it for backward compatibility.
 
 from __future__ import annotations
 
+import collections
 import logging
 import time
 from dataclasses import dataclass, field
@@ -22,6 +23,13 @@ from dataclasses import dataclass, field
 # the context TTL. It only has to cover a delivery still in flight when the context
 # expired; past that, keeping it costs more than the one turn it would protect.
 _TOMBSTONE_TTL_FACTOR = 2
+
+# How many released tokens a context remembers, so a repeated release of one of them is
+# refused rather than taking a turn twice. Only has to exceed the deliveries that can be
+# in flight at once for one sender in one thread — a live room worker and a replay loop —
+# so this is orders of magnitude of headroom, chosen so the bound never has to be reasoned
+# about again rather than because two hundred and fifty-six means anything.
+_RELEASED_TOKENS_REMEMBERED = 256
 
 logger = logging.getLogger("agent-chat-gateway.core.agent_chain")
 
@@ -87,29 +95,36 @@ class _TurnContext:
     # decrement, and an earlier delivery can still release after a later one has taken
     # its turn.
     #
-    # Two fields rather than one set, because the set alone has no reason to shrink. A
-    # message handed back repeatedly — a processor that stays full through a reconnect
-    # loop — takes a fresh token per attempt and gives every one of them back, and each
-    # attempt's *increment* refreshes `last_updated`, so the TTL never reclaims the
-    # context either. `released_below` is the prefix `1..n` that has been given back in
-    # full; `released` holds only the tokens above it, which is the handful still
-    # outstanding at any moment. In the retry loop the prefix absorbs each token as it
-    # arrives and the set stays empty.
+    # **Bounded, and the bound is the point.** A message handed back repeatedly — a
+    # processor that stays full through a reconnect loop — takes a fresh token per attempt
+    # and gives every one of them back, while each attempt's *increment* refreshes
+    # `last_updated`, so the TTL never reclaims the context. Remembering every token would
+    # grow for as long as that lasts.
     #
-    # Exact, not an approximation: nothing is forgotten, so a double release is still
-    # refused however old the token is. Capping or evicting the set would have made that
-    # refusal depend on how recent the caller's bug was.
-    released_below: int = 0
-    released: set = field(default_factory=set)
+    # A prefix counter was tried here first and does not work: a token that is *delivered*
+    # is never released, so the prefix stops at the first one and every later hand-back
+    # accumulates behind it. In any real chain that is token 1.
+    #
+    # Which direction to be wrong in is the whole design. Forgetting a **released** token
+    # means a second release of it is honoured, and the count goes one below the truth —
+    # the agent gets one extra turn. Forgetting an **outstanding** token means a genuine
+    # release is refused, the budget stays spent on a message that was never sent, and the
+    # filter then rejects it as complete: the message is lost. So the bound goes here and
+    # not on the outstanding side, and it has to be larger than the number of deliveries
+    # that can be in flight at once for one sender in one thread — a live worker and a
+    # replay loop, which is two.
+    released: collections.deque = field(
+        default_factory=lambda: collections.deque(maxlen=_RELEASED_TOKENS_REMEMBERED))
+    released_set: set = field(default_factory=set)
 
     def is_released(self, token: int) -> bool:
-        return token <= self.released_below or token in self.released
+        return token in self.released_set
 
     def mark_released(self, token: int) -> None:
-        self.released.add(token)
-        while (self.released_below + 1) in self.released:
-            self.released_below += 1
-            self.released.discard(self.released_below)
+        if len(self.released) == self.released.maxlen:
+            self.released_set.discard(self.released[0])
+        self.released.append(token)
+        self.released_set.add(token)
 
     def start_fresh_count(self) -> None:
         """Zero the count and invalidate every token of the previous one.
@@ -118,15 +133,15 @@ class _TurnContext:
         has to be able to tell that the count it took its turn from is gone.
 
         A method because the two resets — one sender, a whole room — did this as two
-        copies of five lines, and `released_below` would have been the sixth. Left behind,
-        it says the first token of the *new* count has already been given back, and that
-        release is refused: the budget stays spent on a message that was never sent.
+        copies of five lines, and the released-token bookkeeping would have been the sixth.
+        Left behind, it says tokens of the *new* count have already been given back, and
+        those releases are refused: the budget stays spent on messages never sent.
         """
         self.turns = 0
         self.generation += 1
         self.issued = 0
-        self.released_below = 0
         self.released.clear()
+        self.released_set.clear()
         self.last_updated = time.monotonic()
 
 

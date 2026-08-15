@@ -1767,6 +1767,69 @@ class TestARemovalThatCompletesDuringTheConfirmationIsStillNoticed(
         self.assertEqual(client._subscription_states["r1"].status, "active")
 
 
+class TestASuccessorThatFailedStillEndsItsPredecessor(unittest.IsolatedAsyncioTestCase):
+    """The state object is *shared* between attempts, so identity cannot name one attempt.
+
+    A successor reuses the room's `SubscriptionState` rather than making its own. If it
+    unsubscribes the predecessor, installs its own id, and then fails while keeping the
+    callback, the state object is exactly where the predecessor left it — so an identity
+    check passes, the predecessor marks it active and reports success, and a processor is
+    installed for a room the server is no longer sending anything for.
+
+    `sub_id` is the only value in scope that names a single attempt.
+    """
+
+    async def test_a_predecessor_whose_subscription_was_taken_does_not_report_success(self):
+        from gateway.connectors.rocketchat.websocket import SubscriptionState
+
+        client = _make_client()
+        state = SubscriptionState(room_id="r1", callback=AsyncMock())
+        client._subscription_states = {"r1": state}
+
+        async def _send(payload):
+            if payload.get("msg") != "sub":
+                return
+            # The successor runs to completion inside the confirmation wait: it takes the
+            # room's subscription, then fails — keeping the shared state and callback.
+            client._subscriptions["r1"] = "successor-sub"
+            client._subscriptions.pop("r1", None)
+            fut = client._pending_subs.get(payload["id"])
+            if fut and not fut.done():
+                fut.set_result(True)
+
+        client._send = _send
+
+        with self.assertRaises(RuntimeError):
+            await client._subscribe_with_confirmation(
+                room_id="r1", callback=AsyncMock(), timeout=5,
+                keep_callback_on_failure=True,
+            )
+
+        self.assertNotEqual(
+            state.status, "active",
+            "this attempt no longer owns the room's subscription",
+        )
+
+    async def test_the_owner_of_the_subscription_still_reports_success(self):
+        """The near miss: the ownership check must not reject the attempt that won."""
+        client = _make_client()
+
+        async def _send(payload):
+            if payload.get("msg") == "sub":
+                fut = client._pending_subs.get(payload["id"])
+                if fut and not fut.done():
+                    fut.set_result(True)
+
+        client._send = _send
+        sub_id = await client._subscribe_with_confirmation(
+            room_id="r1", callback=AsyncMock(), timeout=5,
+            keep_callback_on_failure=False,
+        )
+
+        self.assertEqual(client._subscriptions["r1"], sub_id)
+        self.assertEqual(client._subscription_states["r1"].status, "active")
+
+
 class TestALosingAttemptRollsBackOnlyItsOwnState(unittest.IsolatedAsyncioTestCase):
     """Two attempts for one room, and the loser cleaning up after the winner.
 

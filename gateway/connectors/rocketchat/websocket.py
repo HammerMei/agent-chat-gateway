@@ -440,6 +440,35 @@ class RCWebSocketClient:
         logger.info("Subscribed to __my_messages__ — delivery is no longer per room")
         return True
 
+    def _still_owns(self, room_id: str, sub_id: str, state) -> bool:
+        """Whether this subscription attempt may still speak for `room_id`.
+
+        Three things have to hold, and each was learned the hard way at a different await:
+
+        * **No removal in progress.** `_rooms_unsubscribing` is raised for the duration of
+          one `unsubscribe_room`.
+        * **The room's state object is still the one this attempt was given.**
+          `unsubscribe_room` pops it, so a *completed* removal — which clears the marker on
+          its way out — is invisible to the marker and visible here. Identity, not
+          membership: a room removed and immediately re-added is also not this attempt's
+          room.
+        * **The room's subscription is still this attempt's.** The state object is *shared*
+          between attempts for the same room — a successor reuses it rather than making a
+          new one — so identity alone cannot tell a successor apart from the original. A
+          successor that unsubscribes this attempt, installs its own id and then fails
+          while keeping the callback leaves the state object exactly where it was, and this
+          attempt would then mark it active and report success for a subscription the
+          server no longer has. `sub_id` is the only thing here that names *one attempt*.
+
+        The third clause is why this is a method: the same ownership question is asked by
+        both rollback arms below, and it was answered three different ways.
+        """
+        return (
+            room_id not in self._rooms_unsubscribing
+            and self._subscription_states.get(room_id) is state
+            and self._subscriptions.get(room_id) == sub_id
+        )
+
     async def _subscribe_with_confirmation(
         self,
         room_id: str,
@@ -540,10 +569,7 @@ class RCWebSocketClient:
             # needed it more. Reported as success, it hands the caller a room whose
             # mapping, callback and state have all been removed, and a processor is
             # installed for a subscription nothing tracks.
-            if (
-                room_id in self._rooms_unsubscribing
-                or self._subscription_states.get(room_id) is not state
-            ):
+            if not self._still_owns(room_id, sub_id, state):
                 # Only what this attempt still owns. A recovery starting while a direct
                 # `subscribe_room` is mid-confirmation makes two attempts for one room, and
                 # the loser's rollback used to take the winner's mapping, callback and
