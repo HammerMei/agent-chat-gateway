@@ -708,6 +708,23 @@ class TestCLIList(_CLITestBase):
                 f"expected {expected!r} at column {state_column} in: {row!r}",
             )
 
+    def test_a_non_string_participant_does_not_take_down_the_table(self):
+        """The loader refuses these, but the CLI reads rows off a socket — it
+        does not parse the state file — so a daemon on a different version can
+        still hand it one. A formatter must never be the thing that loses every
+        other connector's rows."""
+        from gateway.cli import _print_watcher_table
+
+        row = dict(self._ROWS[0], participants=[1, None, "@alice"])
+
+        stdout_buf = io.StringIO()
+        with redirect_stdout(stdout_buf):
+            _print_watcher_table([row])
+
+        out = stdout_buf.getvalue()
+        self.assertIn("@alice", out)
+        self.assertIn("support", out)
+
     def test_list_empty_names_the_states_that_were_asked_for(self):
         """"None" and "none you asked about" are different answers.
 
