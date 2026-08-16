@@ -481,7 +481,11 @@ def _print_watcher_table(watchers: list[dict]) -> None:
         for _, key in columns:
             value = w.get(key, "")
             if isinstance(value, list):
-                value = ", ".join(value)
+                # `str(v)`, not bare join: the loader refuses non-string
+                # elements, but a formatter is the wrong place to discover that
+                # — joining an int raises and takes down the whole table, every
+                # connector's rows with it, rather than misrendering one cell.
+                value = ", ".join(str(v) for v in value)
             row.append(str(value) if value else "—")
         rows.append(row)
 

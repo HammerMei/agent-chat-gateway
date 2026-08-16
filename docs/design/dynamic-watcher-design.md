@@ -690,7 +690,7 @@ processor, so that a subscription failure does not lose the session id or the
 injection flag. The consequence is a record that is **not paused, not dropped,
 and not running**, and calling that `active` tells
 an operator the opposite of what happened. This design previously noticed the
-same shape from the other side, while arguing that `dropped_at` cannot be
+same problem from the other side, while arguing that `dropped_at` cannot be
 inferred from `room_id`: *"the subscribe-failure rollback deliberately keeps a
 record with `room_id` populated, so a start failure is indistinguishable from a
 healthy record by that field."* It is a fifth state, and naming it is cheaper
@@ -701,17 +701,19 @@ the dividing line, and stating it that way was wrong: three of the four rollback
 paths delete the record again, deliberately, so that a half-built one cannot be
 resumed as though it were whole. Only these produce `failed`:
 
-| Failure | Record | Shows as |
-|---|---|---|
-| room subscription, or the room claim | kept on purpose — session id and injection flag survive for the next attempt | `failed` |
-| the agent was unavailable at boot, and an **earlier** boot left a record | untouched on disk | `failed` |
-| session-map bind, context injection, attachment workspace | deleted by their own rollbacks | **no row** |
-| room resolution, session creation, or an unavailable agent on a first-ever start | never written | **no row** |
+| Failure | Effect on the record |
+|---|---|
+| room subscription, or the room claim | kept on purpose — session id and injection flag survive the next attempt |
+| session-map bind, context injection, attachment workspace | deleted by their own rollbacks |
+| room resolution, session creation, an unavailable agent | never written |
 
-So `failed` means "a record survives and nothing is running for it", and the
-absence of a row does **not** mean the start never got far — it means there is no
-state to act on. Any operator-facing text offering the before/after-the-record
-rule as exhaustive is wrong.
+**But the rollbacks only remove what *this* start added.** A watcher that ran on
+an earlier boot has a record on disk, and `merged_view` keeps it, so the same
+fault shows as `failed` where a record already existed and as no row at all on a
+first-ever start. That is why the operator-facing rule has to be stated as the
+invariant — **a row exists exactly when a record does** — rather than as a table
+of failures: the table is true only of first starts, and an operator has no way
+to know which they are looking at.
 
 **It is derived, not stored.** The record says what the gateway *wants* — a
 watcher should be resident for this room; residency says what *is*. `failed` is

@@ -651,7 +651,7 @@ class TestCLIList(_CLITestBase):
             "watcher_name": "gdm-a3f9c1b2",
             # A group DM has no platform name, and the server has already
             # collapsed that to the room id (`room_name or room_id`) — the real
-            # shape for a room whose label is a hash.  (A 1:1 DM is *not* this
+            # case for a room whose label is a hash.  (A 1:1 DM is *not* this
             # case: both connectors return the configured `@handle` as its name.)
             "room_name": "rid-gdm",
             "room_id": "rid-gdm",

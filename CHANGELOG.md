@@ -29,13 +29,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Output is now an aligned table with **room id** and **participants** columns. The
     participants column is how a group DM is identified, so it is part of the default
     view rather than something to hide behind a flag.
-  - A configured watcher with **no state record** no longer appears — a start that
-    failed before the record was written (agent unavailable, room unresolvable,
-    session not created). There is nothing in such a row but its name; the failure
-    is reported by startup instead. Two things it does **not** mean: a start that
-    failed *after* the record was written keeps that record and still appears, as
-    `failed`; and the watcher can still be paused by name, which is how one that
-    fails on every boot is kept from being started again.
+  - **A watcher appears exactly when a state record exists for it** — not when it
+    is configured, and not when it started. A start that fails before the record
+    is written, or one whose rollback removes it, leaves no row; a start that
+    fails after a record already existed shows as `failed`. So the same fault can
+    present either way depending on whether the watcher has ever run, and no row
+    means "nothing left to act on" rather than "the start never got far" — the
+    startup errors say what actually failed. Such a watcher can still be paused by
+    name, which is how one that fails on every boot is kept from being retried.
   - `status` asks for every state explicitly, so its `Watchers:` count stays a total
     rather than silently inheriting `list`'s narrower default.
 - **`pause`, `resume` and `reset` act on the same records `list` shows.** They read

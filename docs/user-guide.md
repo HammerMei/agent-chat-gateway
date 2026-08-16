@@ -664,20 +664,26 @@ agent-chat-gateway reset <watcher-name> [--connector NAME]
 `list` reports the watchers the gateway has **state records** for, not the
 entries in `config.yaml`.
 
-**A row means there is state to act on; no row means there is none.** Which
-failures leave state is not simply "early" versus "late" — several late ones
-roll their record back on purpose, so that a half-built watcher cannot be
-resumed as though it were whole:
+**The rule is simply: a watcher appears if a state record exists for it.**
+Nothing more — not whether it started, not how far it got.
 
-| What failed | In `list` |
-|---|---|
-| The room subscription, or the room claim | **`failed`** — the record is kept so the session survives the next attempt |
-| The agent was unavailable, and the watcher had started on an earlier boot | **`failed`** — from the record that boot left |
-| Context injection, the attachment workspace, or session binding | **no row** — these roll the record back |
-| The room could not be resolved, the session could not be created, or the agent was unavailable on a first-ever start | **no row** — nothing was written |
+That is worth stating as a rule rather than as a list of failures, because the
+list has too many cases to keep straight. A record is written partway through
+starting a watcher; some later failures keep it, so the watcher shows as
+`failed`, and others roll it back deliberately, so that a half-built watcher
+cannot be resumed as though it were whole. A watcher that has run successfully
+**before** has a record on disk regardless, so the same fault can show as
+`failed` on one machine and as nothing at all on another that has never got it
+running.
 
-Either way the failure is reported at startup and in the gateway log; `list` is
-where you see what is left over, not the full list of what went wrong.
+Two consequences to hold on to:
+
+* **No row does not mean "the start never got far".** It means there is nothing
+  left to act on — no session, no watermark. The startup errors and the gateway
+  log are where you find out what actually failed; `list` only shows what
+  survived.
+* **A `failed` row does not mean the failure was recent.** It may be a record
+  from a boot weeks ago that has not started successfully since.
 
 A failed watcher is retried on **every daemon start**. If the underlying problem
 is unfixed it fails again and says so again — deliberately, so the gateway never

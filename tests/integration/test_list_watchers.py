@@ -252,7 +252,7 @@ class TestListStateFilter(IsolatedTestCase):
     async def test_default_shows_everything_except_idle(self):
         """A record nothing is running for reads `failed`, not `active` — see
         §2.5.  None of these records is resident, so the un-dropped, un-paused
-        one is exactly the failed-start shape."""
+        one is exactly what a failed start leaves behind."""
         manager = self._manager(
             [
                 _record("broken"),
@@ -285,7 +285,8 @@ class TestListStateFilter(IsolatedTestCase):
 
     async def test_a_watcher_being_reset_is_not_reported_as_failed(self):
         """`pause` and `reset` remove the processor first and settle the record
-        last, so mid-verb the record is the same shape a failed start leaves.
+        last, so mid-verb the record is indistinguishable from what a failed
+        start leaves behind.
 
         `reset` holds it for as long as a session, a history fetch and a model
         turn take.  Reporting `failed` there would have the recovery verb
@@ -386,7 +387,7 @@ class TestListRowContents(IsolatedTestCase):
         self.assertEqual(row["room_id"], "cib3hjsrgpydtf6tyac7frcu6o")
         self.assertEqual(row["participants"], ["@alice", "@bob"])
         # No `room_kind` in the row: nothing reads it — not the table, not the
-        # control server — and a field with no consumer is the shape this
+        # control server — and a field with no consumer is the mistake this
         # series has already been corrected on twice.
         self.assertNotIn("room_kind", row)
 

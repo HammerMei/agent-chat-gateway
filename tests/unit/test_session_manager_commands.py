@@ -89,7 +89,7 @@ class TestDispatchCommandList(unittest.IsolatedAsyncioTestCase):
         "failed to list watchers" warning, which reads as the daemon being
         broken rather than the request being wrong. (Written because injecting
         this fault changed nothing: the `TypeError` arm shipped without a test,
-        which is the shape a fix-and-test-in-one-edit always leaves.)
+        which is what a fix-and-test-in-one-edit always leaves behind.)
         """
         mgr = _make_manager()
 

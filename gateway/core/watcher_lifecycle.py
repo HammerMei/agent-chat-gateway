@@ -394,10 +394,11 @@ class WatcherLifecycle:
         A registered processor, **or** a lifecycle transition in flight. The
         second half is not a nicety: `pause` and `reset` both remove the
         processor first and settle the record last, so between the two this
-        watcher has no processor, no `paused` flag and no `dropped_at` — the
-        exact shape a failed start leaves. `reset` holds that shape for as long
-        as a fresh session, a history fetch and a full model turn take, which is
-        bounded by the agent timeout and defaults to minutes.
+        watcher has no processor, no `paused` flag and no `dropped_at` —
+        indistinguishable from what a failed start leaves behind. `reset` stays
+        that way for as long as a fresh session, a history fetch and a full
+        model turn take, which is bounded by the agent timeout and defaults to
+        minutes.
 
         Reporting `failed` there would be the worst kind of wrong: `failed` is
         documented as *the* state that means something is broken and sends the
