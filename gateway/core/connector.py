@@ -89,7 +89,11 @@ class Room:
     id   — opaque platform identifier used when sending replies (RC room _id,
             Slack channel ID, Discord channel snowflake, etc.)
     name — human-readable label (#channel, @username, "script", …)
-    type — "channel" | "group" | "dm" | "thread" | "script"
+    type — "channel" | "group" | "dm" | "group_dm" | "thread" | "script".
+            "group_dm" only ever comes from the creation path, which types the
+            room from its classified kind (§2.2) — platform resolvers that
+            cannot tell the two DM kinds apart keep answering "dm", and the
+            mention gate treats only "dm" as exempt (§6.4).
     """
 
     id: str

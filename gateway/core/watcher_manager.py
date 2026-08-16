@@ -22,13 +22,26 @@ breaks on that divergence, which is why room resolution goes by `room_id` (§2.3
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import logging
 from dataclasses import dataclass, fields, is_dataclass, replace
+from datetime import datetime
+from typing import TYPE_CHECKING
 
-from .config import WatcherConfig
+from .config import HistoryHandoffConfig, WatcherConfig
+from .connector import Room
 from .room_pattern import RoomPattern
+from .state import CONFIG_SCHEMA_VERSION, WatcherState
 from .watcher_rule import RoomKind, RuleMatch, WatcherRule
+
+if TYPE_CHECKING:
+    from .connector import Connector
+    from .message_processor import MessageProcessor
+    from .watcher_lifecycle import WatcherLifecycle
+
+logger = logging.getLogger("agent-chat-gateway.core.watcher_manager")
 
 WatcherKey = tuple[str, str]  # (connector, room_id)
 
@@ -284,3 +297,248 @@ def _digest(room_id: str) -> str:
     them would tie a display decision to a value that names files on disk.
     """
     return hashlib.sha256(room_id.encode()).hexdigest()[:_GROUP_DM_LABEL_DIGITS]
+
+
+def config_from_record(record: WatcherState) -> WatcherConfig | None:
+    """Rebuild the materialized config a record was persisted with (§2.4).
+
+    Recreation reads the record, never the current rule — that is what sticky
+    binding means. The record's `config` was written by `_jsonable(materialize(...))`,
+    so the shape is ACG's own; still, every read below tolerates absence and wrong
+    types by returning None rather than raising, because the caller's correct answer
+    to an unreadable record is "decline to recreate and log", not a traceback on the
+    routing path. A record with no `config` at all is the static model's (its
+    recreation source is `config.yaml`) and returns None for the same reason.
+    """
+    raw = record.config
+    if not isinstance(raw, dict) or not raw:
+        return None
+    if not isinstance(raw.get("name"), str) or not raw["name"]:
+        return None
+
+    def _str(key: str) -> str:
+        value = raw.get(key)
+        return value if isinstance(value, str) else ""
+
+    hh_raw = raw.get("history_handoff")
+    hh_kwargs = {}
+    if isinstance(hh_raw, dict):
+        for f in fields(HistoryHandoffConfig):
+            if f.name in hh_raw and isinstance(hh_raw[f.name], type(f.default)):
+                hh_kwargs[f.name] = hh_raw[f.name]
+    files = raw.get("context_inject_files")
+    return WatcherConfig(
+        name=raw["name"],
+        connector=_str("connector"),
+        room=_str("room"),
+        agent=_str("agent"),
+        context_inject_files=[p for p in files if isinstance(p, str)]
+        if isinstance(files, list) else [],
+        online_notification=_str("online_notification") or None,
+        offline_notification=_str("offline_notification") or None,
+        history_handoff=HistoryHandoffConfig(**hh_kwargs),
+    )
+
+
+class WatcherManager:
+    """The runtime half of §2.8: rule-derived creation on the message path.
+
+    One instance per connector, alongside that connector's `WatcherLifecycle` —
+    the lifecycle owns the start machinery and the state dicts; this class owns
+    the *decision* to create (rule match, sticky binding, single-flight, the
+    concurrent-creation cap) and the §5.3 record fields only a creation knows
+    (rule snapshot, room kind, participants, creation time).
+
+    Deliberately narrow for now: `get_or_create` is the message path and is the
+    only caller that exists. The remaining §2.8 surface (`get` for injection and
+    scheduled jobs, the operator verbs, `resolve`) lands with the increments
+    that call it — shipping it earlier would be interface with no consumer,
+    which this series has been corrected on twice.
+    """
+
+    def __init__(
+        self,
+        connector_name: str,
+        connector: "Connector",
+        lifecycle: "WatcherLifecycle",
+        rules: list[WatcherRule],
+        *,
+        creation_cap: int = 4,
+    ) -> None:
+        self._connector_name = connector_name
+        self._connector = connector
+        self._lifecycle = lifecycle
+        self._rules = rules
+        # Per-room single-flight (§2.7 step 4). The connectors' own
+        # `_rooms_being_routed` sets narrow the window but do not close it: they
+        # are released before creation's awaits finish on RC's routing workers,
+        # and this lock is what actually covers "existence check + creation" as
+        # one critical section. Entries are never removed — the map grows with
+        # distinct rooms offered, which is bounded by rooms the account can see;
+        # expiry's reclamation sweep is the owner of shrinking it.
+        self._locks: dict[str, asyncio.Lock] = {}
+        # A soft cap, checked-then-incremented under the per-room lock. Two
+        # rooms' creations can race the check and both proceed; the cap bounds
+        # pile-ups, it does not ration exactly (§2.7 step 7).
+        self._creation_cap = creation_cap
+        self._creations_in_flight = 0
+
+    async def get_or_create(
+        self,
+        connector: str,
+        room: RoomRef,
+        *,
+        history_before_ts: str | None = None,
+    ) -> "MessageProcessor | None":
+        """A ready watcher for this room, created from the first matching rule
+        if the room has never had one (§2.8). None means "no watcher": no rule
+        claims the room, its record is paused, or creation is over the cap.
+
+        `history_before_ts` bounds a new session's history handoff strictly
+        below the triggering message, so the trigger is not delivered twice.
+        """
+        if connector != self._connector_name:
+            # A wiring error, not a routing outcome — each connector's router
+            # closure names its own connector.
+            logger.error(
+                "get_or_create for connector %r reached the manager for %r",
+                connector, self._connector_name,
+            )
+            return None
+
+        lock = self._locks.setdefault(room.id, asyncio.Lock())
+        async with lock:
+            record = self._lifecycle.record_for_room(room.id)
+            if record is not None:
+                resident = self._lifecycle.processor_named(record.watcher_name)
+                if resident is not None:
+                    return resident
+                return await self._recreate(record, room, history_before_ts)
+            return await self._create(room, history_before_ts)
+
+    async def _recreate(
+        self,
+        record: WatcherState,
+        room: RoomRef,
+        history_before_ts: str | None,
+    ) -> "MessageProcessor | None":
+        """Sticky binding (§2.4): a room with a record is recreated from its own
+        persisted config; the current rules are never consulted."""
+        if record.paused:
+            # An explicit pause is never overridden by inference (§4.4). The
+            # message is deliberately dropped, not deferred.
+            logger.debug(
+                "Room %s has a paused record ('%s') — not recreating",
+                record.room_id, record.watcher_name,
+            )
+            return None
+        wc = config_from_record(record)
+        if wc is None:
+            # A static-model record (no frozen config). Its recreation source is
+            # config.yaml and its owner is sync_watchers' retry-at-every-start
+            # rule — recreating it from here would invent a second owner.
+            logger.debug(
+                "Room %s's record ('%s') carries no materialized config — "
+                "leaving it to the static path",
+                record.room_id, record.watcher_name,
+            )
+            return None
+        platform_room = Room(
+            id=record.room_id,
+            name=room_description(room),
+            type=room.kind.value,
+        )
+        try:
+            await self._lifecycle.start_watcher_in_room(
+                wc, record, platform_room, history_before_ts=history_before_ts
+            )
+        except Exception as e:
+            logger.error(
+                "Recreating watcher '%s' for room %s failed: %s",
+                wc.name, record.room_id, e,
+            )
+            return None
+        record.last_activity_at = _now_iso()
+        self._lifecycle.save_state()
+        return self._lifecycle.processor_named(wc.name)
+
+    async def _create(
+        self,
+        room: RoomRef,
+        history_before_ts: str | None,
+    ) -> "MessageProcessor | None":
+        """First-ever watcher for this room: match, cap, materialize, start,
+        and freeze the §5.3 record fields only this moment knows."""
+        rule = first_matching_rule(self._rules, self._connector_name, room)
+        if rule is None:
+            return None
+
+        if self._creations_in_flight >= self._creation_cap:
+            # §2.7 step 7: queue depth bounds messages per room; this bounds
+            # rooms being created at once. The honest answer is a visible
+            # "starting up", not a silent drop — the sender watched their
+            # message arrive.
+            logger.warning(
+                "Creation cap (%d) reached — deferring watcher creation for "
+                "room %s", self._creation_cap, room.id,
+            )
+            try:
+                await self._connector.send_to_room(
+                    room.id,
+                    "⏳ Starting up — several rooms are being set up at once. "
+                    "Please try again in a moment.",
+                )
+            except Exception:
+                logger.debug("Could not post the starting-up notice", exc_info=True)
+            return None
+
+        wc = materialize(rule, room)
+        platform_room = Room(
+            id=room.id,
+            name=room_description(room),
+            type=room.kind.value,
+        )
+        self._creations_in_flight += 1
+        try:
+            await self._lifecycle.start_watcher_in_room(
+                wc, None, platform_room, history_before_ts=history_before_ts
+            )
+        except Exception as e:
+            logger.error(
+                "Creating watcher '%s' for room %s failed: %s",
+                wc.name, room.id, e,
+            )
+            return None
+        finally:
+            self._creations_in_flight -= 1
+
+        # Freeze the record fields only the creation moment knows (§5.3, §2.4).
+        # Enriched before any save so no record ever reaches disk half-written:
+        # `start_watcher_in_room` itself never saves, and the save below is the
+        # first one that can see this record.
+        ws = self._lifecycle.get_watcher_state(wc.name)
+        if ws is not None:
+            now = _now_iso()
+            ws.room_name = room.name
+            ws.room_kind = room.kind.value
+            ws.participants = list(room.participants)
+            ws.connector = self._connector_name
+            ws.agent = self._lifecycle.resolve_agent_name(wc.agent)
+            ws.created_at = now
+            ws.last_activity_at = now
+            ws.config = _jsonable(wc)
+            ws.rule_name = rule.name
+            ws.rule = rule_snapshot(rule)
+            ws.config_schema_version = CONFIG_SCHEMA_VERSION
+        self._lifecycle.save_state()
+        logger.info(
+            "Created watcher '%s' for room %s from rule '%s'",
+            wc.name, room.id, rule.name,
+        )
+        return self._lifecycle.processor_named(wc.name)
+
+
+def _now_iso() -> str:
+    """Local-time ISO seconds — the same shape every other timestamp in the
+    state file carries."""
+    return datetime.now().astimezone().isoformat(timespec="seconds")

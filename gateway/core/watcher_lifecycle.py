@@ -15,7 +15,7 @@ from ..agents import AgentBackend
 from .adapter_utils import ts_gt as _ts_gt
 from .attachment_workspace import AttachmentWorkspace
 from .config import CoreConfig, WatcherConfig
-from .connector import Connector
+from .connector import Connector, Room
 from .dispatch import MessageDispatcher, RoomAlreadyRoutedError
 from .history_context import format_history_context
 from .injected_context_builder import InjectedContextBuilder
@@ -447,6 +447,34 @@ class WatcherLifecycle:
         """Persist current state (called before shutdown)."""
         self._state_store.save(self._states)
 
+    # ── Read surface for the WatcherManager ──────────────────────────────────
+    #
+    # The manager owns the creation path (§2.7/§2.8) and this lifecycle owns the
+    # start machinery; these three are the whole seam between them, so neither
+    # reaches into the other's dicts.
+
+    def record_for_room(self, room_id: str) -> WatcherState | None:
+        """The in-memory record bound to a room, if any (§2.4 sticky binding).
+
+        A linear scan because `_states` is keyed by watcher name until cutover
+        re-keys it to `(connector, room_id)` — and it is only consulted for
+        rooms with no live processor, which is the rare path.
+        """
+        for ws in self._states.values():
+            if ws.room_id == room_id:
+                return ws
+        return None
+
+    def processor_named(self, name: str) -> MessageProcessor | None:
+        """The live processor for a watcher name, or None when not resident."""
+        return self._processors.get(name)
+
+    def resolve_agent_name(self, ref: str) -> str:
+        """Public form of `_resolve_agent_name`, for the record's `agent` field —
+        the record must hold the *resolved* name, because recreation reads the
+        record long after the default it was resolved against may have changed."""
+        return self._resolve_agent_name(ref)
+
     # ── Internal ──────────────────────────────────────────────────────────────
 
     async def _start_watcher(
@@ -480,12 +508,34 @@ class WatcherLifecycle:
         discarded, and again live. Buffering alone does not fix that; only the
         bound does. Static starts have no trigger and pass None (unbounded).
         """
+        # 1. Resolve room. The static path's only resolver: `wc.room` here is an
+        # operator-written reference (a channel name, `@user`). The creation path must
+        # NOT come through this line — a materialized config's `room` is a description,
+        # not a lookup key (§2.4), and a group DM's description resolves to nothing. It
+        # enters at `start_watcher_in_room` with the room it already holds.
+        room = await self._connector.resolve_room(wc.room)
+        await self.start_watcher_in_room(
+            wc, state, room, history_before_ts=history_before_ts
+        )
+
+    async def start_watcher_in_room(
+        self,
+        wc: WatcherConfig,
+        state: WatcherState | None,
+        room: Room,
+        history_before_ts: str | None = None,
+    ) -> None:
+        """Phases 1.5–10 of `_start_watcher`, taking the room as already resolved.
+
+        The seam the creation path enters through (§2.7): it arrives holding a
+        classified room — id, kind, description — so resolving by name would be
+        both redundant and wrong (a group DM has no resolvable name at all).
+        Static starts call `_start_watcher`, which resolves and delegates here;
+        everything below is byte-identical for both callers.
+        """
         agent_name = self._resolve_agent_name(wc.agent)
         agent = self._agents[agent_name]
         agent_cfg = self._config.agent_config(agent_name)
-
-        # 1. Resolve room
-        room = await self._connector.resolve_room(wc.room)
 
         # 1.5 Refuse a room another watcher already serves, before anything is built.
         # The authoritative claim is step 8, after the room is subscribed — reaching it
