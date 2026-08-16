@@ -16,7 +16,7 @@ import os
 from dataclasses import MISSING, asdict, dataclass, field, fields
 from enum import Flag, auto
 from pathlib import Path
-from typing import get_args, get_origin
+from typing import get_origin
 
 logger = logging.getLogger("agent-chat-gateway.state")
 
@@ -302,22 +302,6 @@ _FIELD_TYPES: dict[str, type] = {
     if f.name != "watcher_name"
 }
 
-# The element type of every sequence-typed field, derived from the same annotations.
-# A `list[str]` whose elements are not strings passes the container check above and then
-# fails wherever something formats it — for `participants`, inside `", ".join(...)` in the
-# CLI table, which takes down the whole `list` command rather than one row. Derived rather
-# than special-cased so a second sequence field cannot be added without its elements being
-# checked too; `get_args` returns `()` for a bare `list`, which leaves it unconstrained.
-# Sentinel: `None` cannot say "no bad element found", because None is itself a value a
-# malformed payload can contain.
-_MISSING_ELEMENT = object()
-
-_FIELD_ELEMENT_TYPES: dict[str, type] = {
-    f.name: get_args(f.type)[0]
-    for f in fields(WatcherState)
-    if get_origin(f.type) is list and get_args(f.type)
-}
-
 # Fields with neither a default nor a default_factory: the dataclass requires them, so
 # the reader has to supply something when the payload omits them.
 _REQUIRED_FIELDS: frozenset[str] = frozenset(
@@ -528,16 +512,6 @@ def _record_from_dict(w: dict) -> WatcherState:
             raise _MalformedRecord(
                 f"'{field_name}' must be {want.__name__} (got {type(value).__name__})"
             )
-        element = _FIELD_ELEMENT_TYPES.get(field_name)
-        if element is not None:
-            bad = next(
-                (v for v in value if not isinstance(v, element)), _MISSING_ELEMENT
-            )
-            if bad is not _MISSING_ELEMENT:
-                raise _MalformedRecord(
-                    f"every item in '{field_name}' must be {element.__name__} "
-                    f"(got {type(bad).__name__})"
-                )
         # Copy the containers so a record never aliases the payload it came from.
         values[field_name] = (
             dict(value) if want is dict else list(value) if want is list else value

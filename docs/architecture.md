@@ -953,8 +953,9 @@ Check `~/.agent-chat-gateway/gateway.log` for errors. Common issues:
 ### Messages not being processed
 
 1. **Check the room is being watched at all** — `agent-chat-gateway list --all`
-   (plain `list` hides idle watchers). No row means no state record: the
-   watcher never started, and the reason is in the startup log.
+   (plain `list` hides idle watchers). No row means no state record survived;
+   the reason is in the startup log. See step 3 before concluding anything more
+   than that from it.
 2. **Read the STATE column.** `paused` means an operator muted it. **`failed`
    means a record exists and nothing is running for it.** The startup errors in
    the log say why. To recover: `resume` retries the start in place — except

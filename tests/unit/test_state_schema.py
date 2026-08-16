@@ -498,55 +498,5 @@ class TestCorruptionStaysGraceful(_RealStateFileTestCase):
         self.assertEqual(load_state("rc"), [])
 
 
-
-class TestSequenceElementsAreTypeChecked(unittest.TestCase):
-    """A `list[str]` whose elements are not strings passes the container check.
-
-    It then fails wherever something formats it — for `participants`, inside the
-    CLI table's `", ".join(...)`, which takes down the whole `list` command
-    rather than one row. Enumerated from the dataclass so a second sequence
-    field cannot be added without its elements being checked too.
-    """
-
-    def _record(self, **overrides):
-        base = {"watcher_name": "w1", "session_id": "s", "room_id": "r"}
-        base.update(overrides)
-        return base
-
-    def test_every_sequence_field_rejects_a_wrong_element_type(self):
-        from dataclasses import fields as dc_fields
-        from typing import get_args, get_origin
-
-        from gateway.core.state import WatcherState, _record_from_dict
-
-        sequence_fields = [
-            f.name
-            for f in dc_fields(WatcherState)
-            if get_origin(f.type) is list and get_args(f.type)
-        ]
-        self.assertTrue(sequence_fields, "no sequence field found to check")
-
-        for name in sequence_fields:
-            with self.subTest(field=name):
-                with self.assertRaises(Exception) as ctx:
-                    _record_from_dict(self._record(**{name: [1]}))
-                self.assertIn(name, str(ctx.exception))
-
-    def test_a_valid_sequence_still_loads(self):
-        from gateway.core.state import _record_from_dict
-
-        rec = _record_from_dict(self._record(participants=["@alice", "@bob"]))
-
-        self.assertEqual(rec.participants, ["@alice", "@bob"])
-
-    def test_none_inside_a_sequence_is_rejected(self):
-        """`None` is a value a payload can contain, so "no bad element" cannot
-        be signalled with `None` — this is the case that catches a sentinel
-        written as `next(..., None)`."""
-        from gateway.core.state import _record_from_dict
-
-        with self.assertRaises(Exception):
-            _record_from_dict(self._record(participants=[None]))
-
 if __name__ == "__main__":
     unittest.main()

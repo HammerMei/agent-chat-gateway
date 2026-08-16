@@ -58,11 +58,7 @@ class StateStore:
         return merged
 
     def save(
-        self,
-        states: dict[str, WatcherState],
-        *,
-        prune: set[str] | None = None,
-        serving: set[str] | None = None,
+        self, states: dict[str, WatcherState], *, prune: set[str] | None = None
     ) -> None:
         """Merge ``states`` into the persisted records and write the result.
 
@@ -89,25 +85,12 @@ class StateStore:
 
         Watermark reads are best-effort — if the connector is partially torn
         down (e.g. during shutdown), a failure for one room is logged and
-        skipped rather than aborting the save.
-
-        ``serving`` names the watchers this process actually has a processor
-        for, and **only those are polled**.  The cursor the connector holds
-        belongs to the *room*, not to the watcher whose record happens to name
-        it: a record loaded from disk can carry a `room_id` the watcher has
-        since moved away from, and the cursor at that id is now another
-        watcher's progress.  Copying it in would hand this watcher a position it
-        never reached, which its next start then restores onto the room it
-        really watches — silently discarding everything below it as already
-        seen.  This used to be guaranteed by the caller only ever holding
-        records it had started; loading a persisted record on demand removed
-        that guarantee, so it is now stated.
-
-        ``None`` means "poll every record", which is only correct for a caller
-        that holds nothing but records it started.
+        skipped rather than aborting the save.  Only the live records are
+        polled; a record read back from disk has no connector-side room state to
+        consult.
         """
-        for name, ws in states.items():
-            if ws.room_id and (serving is None or name in serving):
+        for ws in states.values():
+            if ws.room_id:
                 try:
                     live_ts = self._connector.get_last_processed_ts(ws.room_id)
                     # `is not None`, so a connector that has *cleared* its watermark can

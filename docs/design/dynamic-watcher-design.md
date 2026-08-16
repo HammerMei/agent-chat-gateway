@@ -741,12 +741,24 @@ boolean, so it stays a pure function that a tool reading state files can call �
 it simply passes `False` and gets the honest answer for a process that is not
 running any of them.
 
-**The one window where the derivation would lie is unreachable.** Between
-process start and watcher restore, nothing is resident, so every record would
-read `failed`. `list` arrives over the control socket, and the socket is opened
-after the restore phase completes (verified: `GatewayService` runs
-`sync_only()` for every entry and only then calls `ControlServer.start()`), so
-no caller can observe that window.
+**Residency has to include a transition in flight, and that is not a nicety.**
+`pause` and `reset` both remove the processor *first* and settle the record
+*last*, so between the two the record is not paused, not dropped and not
+resident — indistinguishable from a failed start. `pause` holds that for the
+drain; **`reset` holds it for a fresh session, a history fetch and a full model
+turn**, bounded by the agent timeout and defaulting to minutes. Reporting
+`failed` there would have the recovery verb accuse itself while working, and
+send an operator to a startup log with nothing in it. So residency is *a
+processor is registered **or** a lifecycle transition is in flight*, and the
+per-watcher lock is exactly that span — including being released on failure, so
+a genuinely failed start reports `failed` the moment it gives up. Erring toward
+`active` for a few seconds is self-correcting; erring toward `failed` is not.
+
+**The remaining window is unreachable.** Between process start and watcher
+restore nothing is resident, so every record would read `failed`. `list`
+arrives over the control socket, and the socket is opened after the restore
+phase completes (verified: `GatewayService` runs `sync_only()` for every entry
+and only then calls `ControlServer.start()`), so no caller can observe it.
 
 ##### Retry policy: every start, and no memory of having given up
 

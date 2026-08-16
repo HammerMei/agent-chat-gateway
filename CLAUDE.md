@@ -29,6 +29,40 @@ Two watchers sharing the same RC username in the same room is a degenerate case 
 agents cannot see each other's responses (own-message filter). This setup has no
 practical use for collaboration; it only makes sense for framework-level testing.
 
+## Test Fixtures Are Shared By Default
+
+**A test double, builder, or factory belongs in `tests/helpers.py` unless there
+is a reason it cannot.** Copying one into a suite is the exception and needs a
+justification in the same breath.
+
+This is not a style preference. Duplicated fixtures make a change to a shared
+data structure cost O(copies) instead of O(1), and the cost lands as a wall of
+unrelated red that buries whatever was actually being worked on. Adding one
+field to `WatcherLifecycle` broke nineteen tests at once, every one of them a
+hand-built `__new__` object missing a field no real instance can lack — none of
+which had anything to do with the change under test.
+
+**The reason that overrides this**: reuse must not fuse two things that are
+independent. A helper serving two layers, or growing flags so each caller can
+switch off the half it does not want, has become a second production system with
+its own bugs. When a shared builder starts needing `if` on who called it, split
+it — that is a real reason not to share, and the only one that carries weight on
+its own.
+
+Practical shape:
+
+- Prefer a **builder that runs the real constructor** and takes keyword
+  overrides for the collaborators a test needs to substitute. Bypassing
+  `__init__` with `__new__` and hand-assigning attributes produces objects in
+  states no code path can create, and those fail later, elsewhere, in a way that
+  looks like a product bug.
+- When a fixture must be local, say why in a comment. "It is small" is not a
+  reason; small fixtures duplicate just as expensively.
+- **When adding a field to a shared structure, search for hand-built instances
+  of it first.** If there are several, the fix is to consolidate them, not to
+  patch each one — patching each is what guarantees the next field costs the
+  same again.
+
 ## Code Review with Codex
 
 Every PR goes through Codex review and is not merged until it comes back clean.

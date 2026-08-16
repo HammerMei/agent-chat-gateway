@@ -176,7 +176,6 @@ def _make_lifecycle_r14(watcher_names=None):
     lifecycle._maps = maps
     lifecycle._processors = {}
     lifecycle._states = {}
-    lifecycle._started = set()
     lifecycle._watcher_locks = {}
     lifecycle._blocked_agents = set()
 
@@ -211,7 +210,6 @@ class TestWatcherLifecycleLock(unittest.IsolatedAsyncioTestCase):
         lc._blocked_agents = set()
         lc._processors = {}
         lc._states = {}
-        lc._started = set()
         lc._watcher_locks = {}
         return lc
 
@@ -291,7 +289,6 @@ class TestAttachmentWorkspaceInThread(unittest.IsolatedAsyncioTestCase):
 
         lc = WatcherLifecycle.__new__(WatcherLifecycle)
         lc._states = {}
-        lc._started = set()
         lc._blocked_agents = set()
         lc._processors = {}
         lc._watcher_locks = {}
@@ -373,7 +370,6 @@ class TestAttachmentWorkspaceRollback(unittest.IsolatedAsyncioTestCase):
 
         lc = WatcherLifecycle.__new__(WatcherLifecycle)
         lc._states = {}
-        lc._started = set()
         lc._blocked_agents = set()
         lc._processors = {}
         lc._watcher_locks = {}
@@ -441,7 +437,6 @@ class TestContextInjectedResetOnSubscribeFailure(unittest.IsolatedAsyncioTestCas
 
         lc = WatcherLifecycle.__new__(WatcherLifecycle)
         lc._states = {}
-        lc._started = set()
         lc._blocked_agents = set()
         lc._processors = {}
         lc._watcher_locks = {}
@@ -514,7 +509,6 @@ class TestContextInjectedResetOnSubscribeFailure(unittest.IsolatedAsyncioTestCas
 
         lc = WatcherLifecycle.__new__(WatcherLifecycle)
         lc._states = {}
-        lc._started = set()
         lc._blocked_agents = set()
         lc._processors = {}
         lc._watcher_locks = {}
@@ -742,7 +736,6 @@ class TestSyncWatchersPreservesBlockedAgents(unittest.IsolatedAsyncioTestCase):
         lc._maps = MagicMock()
         lc._processors = {}
         lc._states = {}
-        lc._started = set()
         lc._watcher_locks = {}
         lc._blocked_agents = set()
         lc._attachment_workspace = MagicMock()
@@ -1001,7 +994,6 @@ class TestOneLookupOneFailureSemantic(unittest.IsolatedAsyncioTestCase):
             WatcherConfig(name=n, connector="rc", room=n, agent="a") for n in names
         ]
         lc._states = {}
-        lc._started = set()
         lc._blocked_agents = set()
         lc._watcher_locks = {}
         lc._processors = {}
