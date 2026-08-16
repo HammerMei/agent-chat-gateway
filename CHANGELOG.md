@@ -18,8 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   visible consequences:
   - Output is now an aligned table with **room id** and **participants** columns. The
     participants column is how a group DM is identified, so it is part of the default
-    view rather than a verbose option; the session id is no longer printed (it is in
-    the state record, and every command takes a watcher name).
+    view rather than something to hide behind a flag.
   - A configured watcher with **no state record** — its agent was unavailable, or its
     first start raised — no longer appears. It has no session, no watermark and
     nothing to pause; the failure is reported by startup instead. One that started on

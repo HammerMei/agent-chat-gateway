@@ -335,8 +335,14 @@ def main():
             _print_watcher_table(watchers)
         elif not connector_errors:
             # Says which question was asked, because the default excludes idle:
-            # "none" and "none you asked about" are different answers.
-            print(f"No {'/'.join(states or ['active', 'paused'])} watchers")
+            # "none" and "none you asked about" are different answers.  The
+            # default case deliberately does not spell the default out — the
+            # server owns what OPERABLE means, and a second copy here would go
+            # stale silently.
+            if states:
+                print(f"No {'/'.join(states)} watchers")
+            else:
+                print("No watchers (idle ones are hidden by default — use --all)")
         # Surface per-connector failures (partial failure case)
         for ce in connector_errors:
             print(
@@ -441,6 +447,10 @@ def _print_watcher_table(watchers: list[dict]) -> None:
         ("ROOM ID", "room_id"),
         ("AGENT", "agent_name"),
         ("STATE", "state"),
+        # Kept despite the width: this is the only surface an operator can read
+        # a session id from without opening state.<connector>.json, and its
+        # remaining use is being pasted into the backend's own resume command.
+        ("SESSION", "session_id"),
         ("PARTICIPANTS", "participants"),
     )
     rows = []
@@ -454,7 +464,7 @@ def _print_watcher_table(watchers: list[dict]) -> None:
         rows.append(row)
 
     widths = [
-        max(len(header), *(len(row[i]) for row in rows))
+        max([len(header)] + [len(row[i]) for row in rows])
         for i, (header, _) in enumerate(columns)
     ]
 

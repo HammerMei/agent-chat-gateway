@@ -952,8 +952,13 @@ Check `~/.agent-chat-gateway/gateway.log` for errors. Common issues:
 
 ### Messages not being processed
 
-1. **Check if watcher is running** — `agent-chat-gateway list`
-2. **Check if watcher is paused** — `agent-chat-gateway list` (the STATE column)
+1. **Check the room is being watched at all** — `agent-chat-gateway list --all`
+   (plain `list` hides idle watchers). No row means no state record: the
+   watcher never started, and the reason is in the startup log.
+2. **Check if watcher is paused** — the STATE column of the same output. Note
+   that STATE describes the *record*, not whether a processor is loaded right
+   now; a watcher whose start failed after its record was written still reads
+   `active` until the daemon is restarted.
 3. **Check daemon logs** — `tail -f ~/.agent-chat-gateway/gateway.log`
 4. **Check connector logs** — Filter by `connectors.rocketchat` in logs
 

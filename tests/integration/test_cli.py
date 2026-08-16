@@ -670,12 +670,13 @@ class TestCLIList(_CLITestBase):
         self.assertEqual(code, 0, f"stderr: {stderr}")
         header, *rows = stdout.strip().splitlines()
         for column in ("NAME", "CONNECTOR", "ROOM", "ROOM ID", "AGENT", "STATE",
-                       "PARTICIPANTS"):
+                       "SESSION", "PARTICIPANTS"):
             self.assertIn(column, header)
         self.assertEqual(len(rows), 2)
         self.assertIn("support", rows[0])
         self.assertIn("rid-support", rows[0])
         self.assertIn("active", rows[0])
+        self.assertIn("sess-abc123", rows[0])
         self.assertIn("paused", rows[1])
         # The participants column is how a group DM is identified, so it is in
         # the default view rather than behind a verbose flag.
@@ -692,23 +693,29 @@ class TestCLIList(_CLITestBase):
         self.assertEqual(code, 0)
         header, *rows = stdout.strip().splitlines()
         state_column = header.index("STATE")
-        for row in rows:
+        for row, expected in zip(rows, ("active", "paused")):
             self.assertTrue(
-                row.startswith(row[:state_column]) and row[state_column] != " ",
-                f"STATE column misaligned in: {row!r}",
+                row[state_column:].startswith(expected),
+                f"expected {expected!r} at column {state_column} in: {row!r}",
             )
 
     def test_list_empty_names_the_states_that_were_asked_for(self):
-        """"None" and "none you asked about" are different answers, and the
-        default deliberately excludes idle."""
+        """"None" and "none you asked about" are different answers.
+
+        The default case points at `--all` without restating what the default
+        *is* — the server owns that, and a second copy in the CLI would go
+        stale silently.
+        """
         self._start_daemon({"list": {"ok": True, "data": [], "errors": []}})
 
-        stdout, _, code = self._run(["list"])
-
+        default_out, _, code = self._run(["list"])
         self.assertEqual(code, 0)
-        self.assertIn("active", stdout)
-        self.assertIn("paused", stdout)
-        self.assertNotIn("idle", stdout)
+        self.assertIn("--all", default_out)
+
+        idle_out, _, code = self._run(["list", "--idle"])
+        self.assertEqual(code, 0)
+        self.assertIn("idle", idle_out)
+        self.assertNotIn("--all", idle_out)
 
     def test_list_state_flags_are_forwarded(self):
         """The flags compose, and the default is expressed by sending nothing."""

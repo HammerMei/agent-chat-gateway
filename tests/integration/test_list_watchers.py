@@ -16,6 +16,7 @@ from gateway.agents.response import AgentResponse
 from gateway.config import AgentConfig, WatcherConfig
 from gateway.connectors.script import ScriptConnector
 from gateway.core.config import CoreConfig
+from gateway.core.connector import Room
 from gateway.core.session_manager import SessionManager
 from gateway.core.state import StateFilter, WatcherState
 from tests.helpers import IsolatedTestCase
@@ -102,7 +103,26 @@ class TestListEnumeratesRecords(IsolatedTestCase):
 
         self.assertEqual(manager.list_watchers(), [])
 
-    async def test_a_blocked_agent_is_reported_by_sync_not_by_list(self):
+    async def test_a_blocked_agent_that_ran_before_keeps_its_row(self):
+        """The docstring's other half: only a watcher that has *never* started
+        disappears.  One blocked this boot but started on an earlier one still
+        has a record on disk, with the session id that is worth seeing.
+        """
+        manager = self._manager(
+            [_record("w1", session_id="s-from-last-boot")],
+            watcher_configs=[make_watcher(name="w1")],
+        )
+
+        await manager.run_once(unavailable_agents={"default"})
+
+        rows = manager.list_watchers()
+        self.assertEqual([w["watcher_name"] for w in rows], ["w1"])
+        self.assertEqual(rows[0]["session_id"], "s-from-last-boot")
+        await manager.shutdown()
+
+    async def test_a_blocked_agent_with_no_prior_record_is_reported_by_sync(self):
+        """Only true when there is no record — see the test above for the case
+        where an earlier boot left one."""
         manager = self._manager([], watcher_configs=[make_watcher(name="w1")])
 
         errors = await manager.run_once(unavailable_agents={"default"})
@@ -249,14 +269,24 @@ class TestListRowContents(IsolatedTestCase):
 
     async def test_a_started_watcher_records_the_resolved_room_name(self):
         """`list` reads records, so the room's name has to be in the record —
-        not looked back up from the config entry that rules will replace."""
+        not looked back up from the config entry that rules will replace.
+
+        The resolved room's id and name are deliberately *different* here:
+        ScriptConnector returns the same string for both, so a test using its
+        default would pass on the `room_name or room_id` fallback alone and
+        could not tell whether the name was recorded at all.
+        """
         manager = self._manager([], watcher_configs=[make_watcher(room="script")])
 
-        await manager.run_once()
+        async def resolve(room_name):
+            return Room(id="rid-42", name="#support", type="script")
+
+        with patch.object(manager._connector, "resolve_room", side_effect=resolve):
+            await manager.run_once()
         row = manager.list_watchers()[0]
 
-        self.assertEqual(row["room_name"], "script")
-        self.assertTrue(row["room_id"])
+        self.assertEqual(row["room_name"], "#support")
+        self.assertEqual(row["room_id"], "rid-42")
         await manager.shutdown()
 
 

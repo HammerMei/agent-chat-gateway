@@ -316,8 +316,8 @@ agent-chat-gateway list
 
 Expected output:
 ```
-NAME   CONNECTOR  ROOM             ROOM ID                     AGENT     STATE   PARTICIPANTS
-dm-me  rc-home    @your-username   aBcD1234efGh5678iJkL        my-agent  active  —
+NAME   CONNECTOR  ROOM            ROOM ID               AGENT     STATE   SESSION           PARTICIPANTS
+dm-me  rc-home    @your-username  aBcD1234efGh5678iJkL  my-agent  active  agent-chat-xxxx   —
 ```
 
 ---

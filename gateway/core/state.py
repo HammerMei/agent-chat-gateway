@@ -248,19 +248,17 @@ def parse_state_filter(names: list[str] | None) -> StateFilter:
     """
     if names is None:
         return StateFilter.OPERABLE
-    if not names:
-        raise ValueError("state filter is empty — name at least one state")
-    result: StateFilter | None = None
+    result = StateFilter(0)
     for name in names:
         try:
-            flag = _NAMES_TO_STATE_FILTER[name]
+            result |= _NAMES_TO_STATE_FILTER[name]
         except (KeyError, TypeError):
             known = ", ".join(sorted(_NAMES_TO_STATE_FILTER))
             raise ValueError(
                 f"unknown watcher state {name!r} — expected one of: {known}"
             ) from None
-        result = flag if result is None else result | flag
-    assert result is not None  # non-empty `names` guarantees at least one flag
+    if not result:
+        raise ValueError("state filter is empty — name at least one state")
     return result
 
 
