@@ -1318,6 +1318,48 @@ class TestGetRoomHistory(unittest.IsolatedAsyncioTestCase):
             params={"roomId": "ROOM_ID", "count": 20, "unreads": "false"},
         )
 
+    async def test_group_dm_uses_im_history_endpoint(self):
+        """One direct endpoint serves both DM kinds — the group/1:1 distinction
+        is ACG's, not the server's (§6.4).
+
+        Reached for real: the creation path types a room from its *classified*
+        kind, so `"group_dm"` arrives here. It used to fall through to the
+        unknown-type default and ask a channel endpoint about a direct room, so
+        history handoff and outage replay failed for every group DM, forever.
+        """
+        rest = _make_rest()
+        rest._request = AsyncMock(return_value={"messages": [], "success": True})
+        await rest.get_room_history("ROOM_ID", "group_dm", count=20)
+        rest._request.assert_called_once_with(
+            "GET", "im.history",
+            params={"roomId": "ROOM_ID", "count": 20, "unreads": "false"},
+        )
+
+    async def test_every_room_type_the_gateway_produces_has_an_endpoint(self):
+        """Derived from `RoomKind`, not a hand-written list.
+
+        The group-DM miss was invisible because the map was written when three
+        room types existed and the fourth arrived somewhere else entirely. This
+        walks the enum that decides a room's type, so the next kind fails here
+        rather than in production — and the unknown-type default stays a
+        default, not the answer for a kind the gateway itself creates.
+        """
+        from gateway.core.watcher_rule import RoomKind
+
+        for kind in RoomKind:
+            with self.subTest(kind=kind.value):
+                rest = _make_rest()
+                rest._request = AsyncMock(
+                    return_value={"messages": [], "success": True})
+                await rest.get_room_history("ROOM_ID", kind.value, count=1)
+                endpoint = rest._request.call_args[0][1]
+                expected = "im.history" if kind.is_direct else (
+                    "groups.history" if kind is RoomKind.GROUP else "channels.history")
+                self.assertEqual(
+                    endpoint, expected,
+                    f"{kind.value} must not fall through to the unknown-type default",
+                )
+
     async def test_unknown_room_type_defaults_to_channels_history(self):
         rest = _make_rest()
         rest._request = AsyncMock(return_value={"messages": [], "success": True})

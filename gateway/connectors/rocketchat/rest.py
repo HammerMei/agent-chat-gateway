@@ -512,9 +512,11 @@ class RocketChatREST:
         """Fetch the last ``count`` messages from a room via the REST API.
 
         Selects the correct history endpoint based on room type:
-          - ``channel`` → ``channels.history``
-          - ``group``   → ``groups.history``
-          - ``dm``      → ``im.history``
+          - ``channel``  → ``channels.history``
+          - ``group``    → ``groups.history``
+          - ``dm``       → ``im.history``
+          - ``group_dm`` → ``im.history`` (one direct endpoint serves both DM
+            kinds; the distinction is ACG's, not the server's — §6.4)
 
         Returns messages in **chronological order** (oldest first).
         System messages (RC ``t`` field present) and messages with empty
@@ -552,10 +554,18 @@ class RocketChatREST:
         filtered chronological list; `get_room_history_page` wants the unfiltered page so
         it can say how full it was.
         """
+        # Both DM kinds go to `im.history`: Rocket.Chat has one direct-room
+        # endpoint and no group-DM equivalent, which is the same asymmetry that
+        # makes `roomType: "d"` cover both on the wire (§6.4). The creation path
+        # types a room from its *classified* kind, so `"group_dm"` reaches here
+        # for real — and defaulting it to `channels.history` asked a channel
+        # endpoint about a direct room, so history handoff and outage replay
+        # both failed for every group DM, permanently.
         endpoint_map = {
-            "channel": "channels.history",
-            "group":   "groups.history",
-            "dm":      "im.history",
+            "channel":  "channels.history",
+            "group":    "groups.history",
+            "dm":       "im.history",
+            "group_dm": "im.history",
         }
         endpoint = endpoint_map.get(room_type, "channels.history")
         params: dict = {"roomId": room_id, "count": count, "unreads": "false"}
