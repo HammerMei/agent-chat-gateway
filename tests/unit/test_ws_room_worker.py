@@ -650,24 +650,89 @@ class TestRoutingFramesDoNotOutliveARecovery(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(routed, ["fresh"])
         await ws.stop()
 
-    async def test_frames_already_in_flight_when_the_socket_drops_are_dropped(self):
-        """Through the real bump site rather than a hand-incremented counter.
+    async def test_frames_are_dropped_from_the_moment_the_socket_drops(self):
+        """Driven through the listen loop's own `ConnectionClosed` handler.
 
-        `_retire_recovery` is what a socket drop and a terminated stream both
-        go through, so this asserts the mechanism the production path uses, not
-        a counter a test moved itself.
+        Two earlier versions of this test were vacuous. The first called
+        `_retire_recovery` and claimed to use "the entry point a real drop
+        uses" — it is not; `_reconnect` sleeps out a backoff of up to a minute
+        and only bumps after `connect()` succeeds, which is precisely the
+        interval where frames were still routed on pre-drop standing. The
+        second bumped the counter by hand to "simulate what the listen loop
+        does", which tested the comparison and not the production line: with
+        that bump deleted, it still passed.
+
+        So this raises `ConnectionClosed` out of `recv()` and lets the real
+        handler run. Nothing pauses the routing workers across an outage, and a
+        socket-only failure leaves REST healthy, so the backlog would otherwise
+        drain at full speed while the client sleeps.
         """
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from websockets.exceptions import ConnectionClosedError
+
         ws = self._client()
         routed: list[str] = []
 
         async def default_cb(doc, access=None):
             routed.append(doc["_id"])
+            await asyncio.sleep(0.15)
 
         ws.register_default_callback(default_cb)
-        ws._queue_for_routing({"_id": "pre", "rid": "r1"}, {"roomParticipant": True})
+        # One routing worker, because the pool would otherwise dequeue both frames
+        # at once and there would be no backlog to hold anything back. The property
+        # under test is the generation, not the pool size.
+        ws._ROUTING_WORKERS = 1
+        # Two frames and a slow callback, because the situation is a *backlog*
+        # draining during the backoff. With one frame and an instant callback the
+        # worker finishes before the drop is even detected, and the test would be
+        # measuring scheduling order rather than the guard.
+        ws._queue_for_routing({"_id": "in-flight", "rid": "r1"}, {"roomParticipant": True})
+        ws._queue_for_routing({"_id": "still-queued", "rid": "r2"}, {"roomParticipant": True})
+        await asyncio.sleep(0.01)              # worker picks up the first and blocks
 
-        ws._retire_recovery()
-        await asyncio.sleep(0.05)
+        ws._running = True          # what `connect()` sets; the loop is gated on it
+        sock = MagicMock()
+        sock.recv = AsyncMock(side_effect=ConnectionClosedError(None, None))
+        ws._ws = sock
 
-        self.assertEqual(routed, [])
+        async def _slow_reconnect():
+            await asyncio.sleep(0.5)          # stands in for the backoff
+
+        with patch.object(ws, "_reconnect", _slow_reconnect):
+            task = asyncio.create_task(ws._listen_loop())
+            await asyncio.sleep(0.3)           # still inside the backoff
+            self.assertEqual(
+                routed, ["in-flight"],
+                "the frame still queued when the socket dropped must not be routed "
+                "during the backoff",
+            )
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        await ws.stop()
+
+    async def test_the_drop_is_reported(self):
+        """Nothing re-offers the room until its next message, so the loss has to
+        be visible — the sibling queue-full drop warns for the same reason."""
+        ws = self._client()
+
+        async def default_cb(doc, access=None):
+            pass
+
+        ws.register_default_callback(default_cb)
+        ws._queue_for_routing({"_id": "stale", "rid": "room-1"}, {"roomParticipant": True})
+        ws._recovery_generation += 1
+
+        with self.assertLogs(
+            "agent-chat-gateway.connectors.rocketchat.ws", level="WARNING"
+        ) as logs:
+            await asyncio.sleep(0.05)
+
+        self.assertTrue(
+            any("read before a recovery" in line for line in logs.output),
+            f"the drop was not reported: {logs.output}",
+        )
         await ws.stop()

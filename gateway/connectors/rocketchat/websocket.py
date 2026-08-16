@@ -866,6 +866,16 @@ class RCWebSocketClient:
                     e.code, e.reason,
                 )
                 self._ws = None
+                # Invalidate in-flight work *here*, where the outage is detected, not
+                # where recovery starts. `_reconnect` sleeps out a backoff of up to a
+                # minute and only bumps after `connect()` succeeds, and the routing
+                # workers are independent tasks that nothing pauses meanwhile — so a
+                # socket-only outage with REST still healthy drains the whole backlog
+                # during the backoff, every frame carrying pre-drop standing. That is
+                # the failure this generation exists to prevent, narrowed rather than
+                # closed. Retiring an in-flight `subscribe_all` early is correct for
+                # the same reason: its socket is already gone.
+                self._recovery_generation += 1
                 await self._reconnect()
             except json.JSONDecodeError as e:
                 # Malformed frame — log and continue without reconnecting.
@@ -1092,13 +1102,22 @@ class RCWebSocketClient:
                 # `access` describes the account's standing at read time, and the very
                 # thing a recovery re-establishes is what that standing now is — so
                 # acting on it could create a watcher for a room the account left
-                # during the outage. Dropped rather than re-checked: the replay that
-                # follows a recovery re-offers the rooms that still qualify, so the
-                # frame's information is about to arrive again, correct this time.
-                logger.debug(
-                    "Dropping a routing frame read before a recovery "
-                    "(generation %d, now %d)",
-                    generation, self._recovery_generation,
+                # during the outage.
+                #
+                # Dropped, and **nothing re-offers it**: replay iterates `self._rooms`,
+                # the *tracked* rooms, and a routing frame exists precisely because its
+                # room is not tracked. So the room waits for its next message. That is
+                # the same cost the queue-full drop eleven lines up already accepts, and
+                # it is the right trade — a stale `roomParticipant: true` creates a
+                # watcher for a room the account may have left, which is worse than a
+                # deferred one. Said plainly because an earlier version of this comment
+                # claimed replay would cover it, which would tell the next reader the
+                # loss is zero.
+                logger.warning(
+                    "Dropping a routing frame for room %s read before a recovery "
+                    "(generation %d, now %d) — the room is offered again on its next "
+                    "message, not by the replay",
+                    (doc.get("rid") or "?")[:8], generation, self._recovery_generation,
                 )
                 continue
             # Not re-checked for None: nothing reaches this queue until
