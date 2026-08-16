@@ -10,6 +10,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **`list` reports state records rather than config entries** (design §2.8), and takes
+  a state filter: `--active`, `--idle`, `--paused`, `--all`, defaulting to active +
+  paused. Under rule-derived watchers there is no static set of watchers in
+  `config.yaml` to enumerate, and deriving the rows from live processors would hide
+  idle and paused rooms from the very commands that can still act on them. Three
+  visible consequences:
+  - Output is now an aligned table with **room id** and **participants** columns. The
+    participants column is how a group DM is identified, so it is part of the default
+    view rather than a verbose option; the session id is no longer printed (it is in
+    the state record, and every command takes a watcher name).
+  - A configured watcher with **no state record** — its agent was unavailable, or its
+    first start raised — no longer appears. It has no session, no watermark and
+    nothing to pause; the failure is reported by startup instead. One that started on
+    an earlier boot still appears, because its record is on disk.
+  - `status` asks for every state explicitly, so its `Watchers:` count stays a total
+    rather than silently inheriting `list`'s narrower default.
 - **One room is served by one watcher, and one session belongs to one room**
   (design §4.1). Both were previously unenforced, and both failed silently:
   - The dispatch index kept a *list* of processors per room and fanned every message

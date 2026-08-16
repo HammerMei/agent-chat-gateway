@@ -88,11 +88,15 @@ class TestTwoWatchersOneRoom(unittest.IsolatedAsyncioTestCase):
                 any("w-a2" in e for e in errors),
                 f"the second watcher on the room should have failed to start: {errors}",
             )
-            # `list_watchers()` reports every *configured* watcher, started or not, so
-            # the count to assert is how many are actually serving.
-            active = [w for w in manager.list_watchers() if w["active"]]
+            # Which watcher is *serving* the room is a question about processors,
+            # not about records — `list_watchers()` answers the second one.
+            serving = [
+                name
+                for name in ("w-a1", "w-a2")
+                if manager.get_processor(name) is not None
+            ]
             self.assertEqual(
-                [w["watcher_name"] for w in active], ["w-a1"],
+                serving, ["w-a1"],
                 "exactly one watcher may serve a room on one connector",
             )
             await manager.shutdown()

@@ -611,6 +611,23 @@ class TestCLIStatus(_CLITestBase):
         self.assertIn("99999", stdout)          # pid shown
         self.assertIn("Watchers: 2", stdout)     # watcher count from list response
 
+    def test_status_counts_every_state(self):
+        """`status` reports a total, so it must not inherit `list`'s narrower
+        default — idle rooms would silently drop out of a number that reads as
+        "how many watchers does this daemon have"."""
+        self._write_pid_file()
+        received: list[dict] = []
+
+        def _capture(req):
+            received.append(req)
+            return {"ok": True, "data": [], "errors": []}
+
+        self._start_daemon({"list": _capture})
+        self._run(["status"])
+
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0]["states"], ["active", "idle", "paused"])
+
 
 # ---------------------------------------------------------------------------
 # Tests: list command  ← PRIMARY INTEGRATION TEST
@@ -619,56 +636,100 @@ class TestCLIStatus(_CLITestBase):
 class TestCLIList(_CLITestBase):
     """list: full integration path through socket, response parsing, formatting."""
 
+    _ROWS = [
+        {
+            "watcher_name": "support",
+            "room_name": "support-channel",
+            "room_id": "rid-support",
+            "connector": "rc-prod",
+            "agent_name": "claude",
+            "session_id": "sess-abc123",
+            "participants": [],
+            "state": "active",
+        },
+        {
+            "watcher_name": "gdm-a3f9c1b2",
+            "room_name": "",
+            "room_id": "rid-gdm",
+            "connector": "rc-prod",
+            "agent_name": "opencode",
+            "session_id": "sess-def456",
+            "participants": ["@alice", "@bob"],
+            "state": "paused",
+        },
+    ]
+
     def test_list_normal_path_shows_watchers(self):
-        """Normal path: daemon running, watchers returned, output formatted."""
+        """Normal path: daemon running, rows returned, table formatted."""
         self._start_daemon({
-            "list": {
-                "ok": True,
-                "data": [
-                    {
-                        "watcher_name": "support",
-                        "room_name": "support-channel",
-                        "connector": "rc-prod",
-                        "agent_name": "claude",
-                        "session_id": "sess-abc123",
-                        "active": True,
-                        "paused": False,
-                    },
-                    {
-                        "watcher_name": "internal",
-                        "room_name": "internal-chat",
-                        "connector": "rc-prod",
-                        "agent_name": "opencode",
-                        "session_id": "sess-def456",
-                        "active": True,
-                        "paused": True,
-                    },
-                ],
-                "errors": [],
-            }
+            "list": {"ok": True, "data": self._ROWS, "errors": []}
         })
 
         stdout, stderr, code = self._run(["list"])
 
         self.assertEqual(code, 0, f"stderr: {stderr}")
-        # Both watchers should appear
-        self.assertIn("support", stdout)
-        self.assertIn("sess-abc123", stdout)
-        self.assertIn("internal", stdout)
-        self.assertIn("sess-def456", stdout)
-        # Paused watcher should show PAUSED status
-        self.assertIn("PAUSED", stdout)
-        # Active non-paused shows "active"
-        self.assertIn("active", stdout)
+        header, *rows = stdout.strip().splitlines()
+        for column in ("NAME", "CONNECTOR", "ROOM", "ROOM ID", "AGENT", "STATE",
+                       "PARTICIPANTS"):
+            self.assertIn(column, header)
+        self.assertEqual(len(rows), 2)
+        self.assertIn("support", rows[0])
+        self.assertIn("rid-support", rows[0])
+        self.assertIn("active", rows[0])
+        self.assertIn("paused", rows[1])
+        # The participants column is how a group DM is identified, so it is in
+        # the default view rather than behind a verbose flag.
+        self.assertIn("@alice, @bob", rows[1])
 
-    def test_list_empty_shows_no_watchers_message(self):
-        """When no watchers configured, print the no-watchers message."""
+    def test_list_columns_are_aligned(self):
+        """A table whose columns do not line up is not a table."""
+        self._start_daemon({
+            "list": {"ok": True, "data": self._ROWS, "errors": []}
+        })
+
+        stdout, _, code = self._run(["list"])
+
+        self.assertEqual(code, 0)
+        header, *rows = stdout.strip().splitlines()
+        state_column = header.index("STATE")
+        for row in rows:
+            self.assertTrue(
+                row.startswith(row[:state_column]) and row[state_column] != " ",
+                f"STATE column misaligned in: {row!r}",
+            )
+
+    def test_list_empty_names_the_states_that_were_asked_for(self):
+        """"None" and "none you asked about" are different answers, and the
+        default deliberately excludes idle."""
         self._start_daemon({"list": {"ok": True, "data": [], "errors": []}})
 
         stdout, _, code = self._run(["list"])
 
         self.assertEqual(code, 0)
-        self.assertIn("No configured watchers", stdout)
+        self.assertIn("active", stdout)
+        self.assertIn("paused", stdout)
+        self.assertNotIn("idle", stdout)
+
+    def test_list_state_flags_are_forwarded(self):
+        """The flags compose, and the default is expressed by sending nothing."""
+        received: list[dict] = []
+
+        def _capture(req):
+            received.append(req)
+            return {"ok": True, "data": [], "errors": []}
+
+        self._start_daemon({"list": _capture})
+
+        self._run(["list"])
+        self._run(["list", "--idle"])
+        self._run(["list", "--active", "--paused"])
+        self._run(["list", "--all"])
+
+        self.assertNotIn("states", received[0], "the default lives on the server")
+        self.assertEqual(received[1]["states"], ["idle"])
+        self.assertEqual(received[2]["states"], ["active", "paused"])
+        self.assertEqual(received[3]["states"], ["active", "idle", "paused"])
+
 
     def test_list_with_connector_filter(self):
         """--connector flag is forwarded in the command payload."""

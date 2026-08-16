@@ -23,7 +23,13 @@ from .message_processor import MessageProcessor
 from .paths import room_path_key, watcher_prompt_key
 from .permission import PermissionRegistry
 from .session_maps import SessionMaps
-from .state import WatcherState, backend_identity
+from .state import (
+    StateFilter,
+    WatcherState,
+    backend_identity,
+    lifecycle_state,
+    state_filter_name,
+)
 from .state_store import StateStore
 
 logger = logging.getLogger("agent-chat-gateway.core.watcher_lifecycle")
@@ -297,30 +303,66 @@ class WatcherLifecycle:
             self._state_store.save(self._states)
             logger.info("Watcher '%s' reset", name)
 
-    def list_watchers(self) -> list[dict]:
-        """Return info for all configured watchers, including runtime status."""
+    def list_watchers(
+        self, state_filter: StateFilter = StateFilter.OPERABLE
+    ) -> list[dict]:
+        """Return info for persisted watcher records matching ``state_filter``.
+
+        **Enumerates records, not config and not live processors** (design §2.8).
+        Under rule-derived watchers there is no static set of watchers to read
+        out of ``config.yaml``, and deriving the rows from ``self._processors``
+        would make idle and paused rooms invisible to the very commands that can
+        still act on them.
+
+        Two consequences on the static path, both deliberate:
+
+        * A configured watcher with no record — its agent was unavailable, or
+          its first start raised before a record was written — does not appear.
+          It has no session, no watermark and nothing to pause; ``sync_watchers``
+          reports the failure through its error list, which is where a
+          start-time failure belongs.  A watcher that started on an *earlier*
+          boot does still appear, because its record is on disk.
+        * ``room_name``, ``participants`` and ``room_kind`` come from the record
+          rather than from config, so they describe the room the watcher is
+          actually bound to.
+        """
         result = []
-        for wc in self._watcher_configs:
-            state = self._states.get(wc.name)
-            processor = self._processors.get(wc.name)
-            effective_session = state.session_id if state else ""
+        for name, state in sorted(self._state_store.merged_view(self._states).items()):
+            current = lifecycle_state(state)
+            if current not in state_filter:
+                continue
             result.append(
                 {
-                    "watcher_name": wc.name,
-                    "room_name": wc.room,
-                    "connector": wc.connector,
-                    "agent_name": wc.agent,
-                    "session_id": effective_session,
-                    "paused": state.paused if state else False,
-                    "active": processor is not None,
+                    "watcher_name": name,
+                    # Falls back to the room id: a room with no name still has to
+                    # be nameable in the table, and for a DM the record carries
+                    # no name at all (the participants column identifies it).
+                    "room_name": state.room_name or state.room_id,
+                    "room_id": state.room_id,
+                    "room_kind": state.room_kind or state.room_type,
+                    "participants": list(state.participants),
+                    # The record's own connector/agent once the manager writes
+                    # them; on the static path they are empty, so fall back to
+                    # the entry this lifecycle belongs to and to config.
+                    "connector": state.connector or self._state_store.state_name,
+                    "agent_name": state.agent or self._agent_name_for(name),
+                    "session_id": state.session_id,
+                    "state": state_filter_name(current),
                     "context_injection_state": (
-                        self._injector.status_for(effective_session).state
-                        if effective_session
+                        self._injector.status_for(state.session_id).state
+                        if state.session_id
                         else "not_started"
                     ),
                 }
             )
         return result
+
+    def _agent_name_for(self, watcher_name: str) -> str:
+        """Best-effort agent name for a record the manager has not stamped yet."""
+        for wc in self._watcher_configs:
+            if wc.name == watcher_name:
+                return wc.agent
+        return ""
 
     def get_watcher_state(self, name: str):
         """Return the WatcherState for a watcher, or None if not found."""
@@ -432,6 +474,10 @@ class WatcherLifecycle:
             session_id=session_id,
             room_id=room.id,
             room_type=room.type,
+            # The resolved room's own name, so that `list` — which reads records,
+            # not config (§2.8) — can name the room without going back to the
+            # config entry that no longer exists under rule-derived watchers.
+            room_name=room.name,
             # False whenever the session is new, not merely when the record is:
             # the flag describes what a *session* has received, and a replacement
             # session has received nothing. `reset_watcher` already pairs "clear the

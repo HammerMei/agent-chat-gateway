@@ -24,6 +24,7 @@ from gateway.connectors.script import ScriptConnector
 from gateway.core.config import CoreConfig
 from gateway.core.connector import UserRole
 from gateway.core.session_manager import SessionManager
+from gateway.core.state import StateFilter
 
 # Patch load_state globally so tests never touch the live ~/.agent-chat-gateway/state.json.
 # Each test creates a fresh SessionManager; we don't want persisted production state
@@ -166,8 +167,12 @@ def make_manager(
 
 
 def _watcher_info(manager: SessionManager, name: str) -> dict | None:
-    """Return the list_watchers() entry for a specific watcher, or None."""
-    for w in manager.list_watchers():
+    """Return the list_watchers() row for a watcher, or None.
+
+    Asks for every state: `list`'s own default hides idle records, and a test
+    checking what a row *says* should not also be exercising the default.
+    """
+    for w in manager.list_watchers(StateFilter.ALL):
         if w["watcher_name"] == name:
             return w
     return None
@@ -460,8 +465,7 @@ class TestWatcherLifecycle(IsolatedTestCase):
         self.assertEqual(len(watchers), 1)
         self.assertEqual(watchers[0]["watcher_name"], "my-watcher")
         self.assertEqual(watchers[0]["room_name"], "my-room")
-        self.assertFalse(watchers[0]["paused"])
-        self.assertTrue(watchers[0]["active"])
+        self.assertEqual(watchers[0]["state"], "active")
         # When no context_inject_files are configured, inject() marks the session
         # as "injected" immediately to prevent per-message retry loops.
         self.assertEqual(watchers[0]["context_injection_state"], "injected")
@@ -481,9 +485,8 @@ class TestWatcherLifecycle(IsolatedTestCase):
         self.assertEqual(reply, "before-pause")
 
         await manager.pause_watcher("script")
-        info = _watcher_info(manager, "script")
-        self.assertFalse(info["active"])
-        self.assertTrue(info["paused"])
+        self.assertIsNone(manager.get_processor("script"))
+        self.assertEqual(_watcher_info(manager, "script")["state"], "paused")
 
         await manager.shutdown()
 
@@ -496,9 +499,8 @@ class TestWatcherLifecycle(IsolatedTestCase):
         await manager.pause_watcher("script")
         await manager.resume_watcher("script")
 
-        info = _watcher_info(manager, "script")
-        self.assertTrue(info["active"])
-        self.assertFalse(info["paused"])
+        self.assertIsNotNone(manager.get_processor("script"))
+        self.assertEqual(_watcher_info(manager, "script")["state"], "active")
 
         await connector.inject("msg-after-resume")
         reply = await connector.receive_reply(timeout=5.0)
@@ -577,8 +579,7 @@ class TestWatcherLifecycle(IsolatedTestCase):
         with self.assertRaisesRegex(RuntimeError, "agent 'default' is unavailable"):
             await manager.resume_watcher("script")
 
-        info = _watcher_info(manager, "script")
-        self.assertFalse(info["active"])
+        self.assertIsNone(manager.get_processor("script"))
 
         await manager.shutdown()
 
@@ -593,8 +594,7 @@ class TestWatcherLifecycle(IsolatedTestCase):
         with self.assertRaisesRegex(RuntimeError, "agent 'default' is unavailable"):
             await manager.reset_watcher("script")
 
-        info = _watcher_info(manager, "script")
-        self.assertFalse(info["active"])
+        self.assertIsNone(manager.get_processor("script"))
 
         await manager.shutdown()
 
@@ -1186,9 +1186,8 @@ class TestDeferredRegistration(IsolatedTestCase):
         # Startup must have failed (error reported) but no partial state stored
         self.assertTrue(len(errors) > 0)
         # No watchers should have started or left partial state
-        watchers = manager.list_watchers()
-        for w in watchers:
-            self.assertFalse(w["active"])
+        self.assertIsNone(manager.get_processor("ctx-fail"))
+        self.assertEqual(manager.list_watchers(StateFilter.ALL), [])
         self.assertIsNone(manager.get_watcher_state("ctx-fail"))
 
         await manager.shutdown()
@@ -1210,8 +1209,7 @@ class TestDeferredRegistration(IsolatedTestCase):
 
         self.assertTrue(len(errors) > 0)
         # No active processor for the failed watcher.
-        info = _watcher_info(manager, "script")
-        self.assertFalse(info["active"])
+        self.assertIsNone(manager.get_processor("script"))
         # State retains a partial entry so context_injected is not lost on retry.
         self.assertIsNotNone(manager.get_watcher_state("script"))
         self.assertFalse(manager.get_watcher_state("script").paused)
@@ -1260,8 +1258,7 @@ class TestStartupRaceRollback(IsolatedTestCase):
 
         self.assertTrue(len(errors) > 0)
         # No active processor — subscribe failed.
-        info = _watcher_info(manager, "script")
-        self.assertFalse(info["active"])
+        self.assertIsNone(manager.get_processor("script"))
         # Routing maps must be cleaned — no dangling session→room or session→connector entries.
         self.assertEqual(
             session_room_map, {}, "session_room_map must be cleaned on rollback"
@@ -1290,9 +1287,8 @@ class TestStartupRaceRollback(IsolatedTestCase):
 
         async def check_then_subscribe(*args, **kwargs):
             # At the moment subscribe is called, processor must already be registered
-            info = _watcher_info(manager, "script")
             processor_ready_at_subscribe_time.append(
-                info is not None and info["active"]
+                manager.get_processor("script") is not None
             )
             return await original_subscribe(*args, **kwargs)
 

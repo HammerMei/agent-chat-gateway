@@ -641,8 +641,14 @@ agent-chat-gateway status
 All commands require the daemon to be running.
 
 ```bash
-# List all active watchers
+# List watchers — active and paused by default
 agent-chat-gateway list [--connector NAME]
+
+# Include idle watchers (rooms the gateway knows about with nothing running),
+# or ask for one state at a time
+agent-chat-gateway list --all
+agent-chat-gateway list --idle
+agent-chat-gateway list --active --paused
 
 # Pause a watcher (stops processing messages)
 agent-chat-gateway pause <watcher-name> [--connector NAME]
@@ -653,6 +659,21 @@ agent-chat-gateway resume <watcher-name> [--connector NAME]
 # Reset a watcher (clear state, create new session)
 agent-chat-gateway reset <watcher-name> [--connector NAME]
 ```
+
+`list` reports the watchers the gateway has **state records** for, not the
+entries in `config.yaml`. A watcher that has never started — its agent was
+unavailable, or its first start failed — has no record and so does not appear;
+that failure is reported at startup and in the gateway log. The three states
+are:
+
+| State | Meaning |
+|---|---|
+| `active` | A record exists and nothing has stopped it |
+| `paused` | Muted by `pause`, waiting on a human decision — shown by default for that reason |
+| `idle` | The gateway knows the room, but nothing is running for it right now |
+
+`status` counts every state; `list` shows the two an operator is likely to act
+on unless asked otherwise.
 
 ### Direct Messaging
 

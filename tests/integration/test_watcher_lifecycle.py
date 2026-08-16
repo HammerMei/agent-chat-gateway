@@ -851,8 +851,7 @@ class TestUnavailableAgentsBlocksWatchers(IsolatedTestCase):
 
         errors = await manager.run_once(unavailable_agents={"default"})
 
-        watchers = {w["watcher_name"]: w for w in manager.list_watchers()}
-        self.assertFalse(watchers["w1"]["active"])
+        self.assertIsNone(manager.get_processor("w1"))
         self.assertTrue(
             any("default" in e for e in errors),
             f"Expected 'default' in errors: {errors}",
@@ -871,8 +870,7 @@ class TestUnavailableAgentsBlocksWatchers(IsolatedTestCase):
 
         errors = await manager.run_once(unavailable_agents={"other-agent"})
 
-        watchers = {w["watcher_name"]: w for w in manager.list_watchers()}
-        self.assertTrue(watchers["w1"]["active"])
+        self.assertIsNotNone(manager.get_processor("w1"))
         self.assertFalse(any("w1" in e for e in errors), f"Unexpected errors: {errors}")
 
         await manager.shutdown()
@@ -888,8 +886,7 @@ class TestUnavailableAgentsBlocksWatchers(IsolatedTestCase):
 
         errors = await manager.run_once(unavailable_agents=set())
 
-        watchers = {w["watcher_name"]: w for w in manager.list_watchers()}
-        self.assertTrue(watchers["w1"]["active"])
+        self.assertIsNotNone(manager.get_processor("w1"))
         self.assertEqual(errors, [])
 
         await manager.shutdown()

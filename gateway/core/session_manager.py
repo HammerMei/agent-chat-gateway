@@ -22,6 +22,7 @@ from .dispatch import MessageDispatcher
 from .injected_context_builder import InjectedContextBuilder
 from .permission import PermissionRegistry
 from .session_maps import SessionMaps
+from .state import StateFilter, parse_state_filter
 from .state_store import StateStore
 from .watcher_lifecycle import WatcherLifecycle
 
@@ -152,12 +153,24 @@ class SessionManager:
 
     # ── Public query API ──────────────────────────────────────────────────────
 
-    def list_watchers(self) -> list[dict]:
-        return self._lifecycle.list_watchers()
+    def list_watchers(
+        self, state_filter: StateFilter = StateFilter.OPERABLE
+    ) -> list[dict]:
+        return self._lifecycle.list_watchers(state_filter)
 
     def get_watcher_state(self, name: str):
         """Return the WatcherState for a watcher, or None if not found."""
         return self._lifecycle.get_watcher_state(name)
+
+    def get_processor(self, name: str):
+        """Return the running MessageProcessor for a watcher, or None.
+
+        "Is a processor running" is a different question from "what state is
+        this watcher's record in", and `list` answers only the second (§2.8).
+        Asking this one through `list` is what made idle and paused rooms
+        indistinguishable from rooms with no record at all.
+        """
+        return self._lifecycle.get_processor(name)
 
     def get_watcher_config(self, name: str):
         """Return the WatcherConfig for a watcher name, or None if not found."""
@@ -271,7 +284,14 @@ class SessionManager:
         cmd = request.get("cmd")
 
         if cmd == "list":
-            return {"ok": True, "data": self.list_watchers()}
+            # An unparseable filter is an error, not a silent fallback to the
+            # default: the caller asked a specific question and cannot tell from
+            # the rows that it was answered with a different one.
+            try:
+                state_filter = parse_state_filter(request.get("states"))
+            except ValueError as e:
+                return {"ok": False, "error": str(e)}
+            return {"ok": True, "data": self.list_watchers(state_filter)}
 
         elif cmd == "pause":
             name = request.get("watcher_name", "")

@@ -47,12 +47,31 @@ def main():
     sub.add_parser("status", help="Show gateway status")
 
     # list
-    list_p = sub.add_parser("list", help="List all watchers")
+    list_p = sub.add_parser(
+        "list", help="List watchers (default: active and paused)"
+    )
     list_p.add_argument(
         "--connector",
         default=None,
         metavar="NAME",
         help="Filter by connector name (default: show watchers across all connectors)",
+    )
+    # Additive flags rather than a mutually exclusive group: the states compose,
+    # and `--active --idle` is a meaningful question.  `--all` is the shorthand
+    # for naming all three.
+    list_p.add_argument(
+        "--active", action="store_true", help="Include active watchers"
+    )
+    list_p.add_argument(
+        "--idle",
+        action="store_true",
+        help="Include idle watchers (known rooms with nothing running)",
+    )
+    list_p.add_argument(
+        "--paused", action="store_true", help="Include paused watchers"
+    )
+    list_p.add_argument(
+        "--all", action="store_true", help="Include every state (active, idle, paused)"
     )
 
     # pause
@@ -286,7 +305,14 @@ def main():
 
             # Get watcher count from daemon
             try:
-                result = _send_command({"cmd": "list"})
+                # Explicitly every state, not the `list` default.  `status`
+                # answers "what does this daemon know about"; `list` answers
+                # "what is an operator about to act on".  Inheriting the default
+                # would silently drop idle rooms from a count that reads as a
+                # total.
+                result = _send_command(
+                    {"cmd": "list", "states": ["active", "idle", "paused"]}
+                )
                 if result["ok"]:
                     count = len(result.get("data", []))
                     print(f"Watchers: {count}")
@@ -299,20 +325,18 @@ def main():
         cmd_data = {"cmd": "list"}
         if args.connector is not None:
             cmd_data["connector"] = args.connector
+        states = _requested_states(args)
+        if states is not None:
+            cmd_data["states"] = states
         result = _send_command(cmd_data)
         watchers = result.get("data", [])
         connector_errors = result.get("errors", [])
         if watchers:
-            for w in watchers:
-                status = "PAUSED" if w.get("paused") else ("active" if w.get("active") else "inactive")
-                agent_label = f"[{w.get('agent_name', '?')}]"
-                connector_label = f"({w.get('connector', '?')})"
-                print(
-                    f"{w['watcher_name']}: {connector_label} {w['room_name']} "
-                    f"{agent_label} session={w.get('session_id', '(none)')} [{status}]"
-                )
+            _print_watcher_table(watchers)
         elif not connector_errors:
-            print("No configured watchers")
+            # Says which question was asked, because the default excludes idle:
+            # "none" and "none you asked about" are different answers.
+            print(f"No {'/'.join(states or ['active', 'paused'])} watchers")
         # Surface per-connector failures (partial failure case)
         for ce in connector_errors:
             print(
@@ -379,6 +403,69 @@ def main():
 
     elif args.command == "config":
         _run_config(args)
+
+
+def _requested_states(args) -> list[str] | None:
+    """Translate the list flags into wire state names; None means "the default".
+
+    Returning None rather than spelling out the default keeps one definition of
+    what "default" means, on the server side (``StateFilter.OPERABLE``), instead
+    of a second copy here that has to be kept in step.
+    """
+    if args.all:
+        return ["active", "idle", "paused"]
+    chosen = [
+        name
+        for name, wanted in (
+            ("active", args.active),
+            ("idle", args.idle),
+            ("paused", args.paused),
+        )
+        if wanted
+    ]
+    return chosen or None
+
+
+def _print_watcher_table(watchers: list[dict]) -> None:
+    """Print the watcher rows as an aligned table (design §2.3).
+
+    The participants column is not decoration: an opaque group-DM label is only
+    acceptable because something else in the same view answers "which group is
+    this".  It therefore belongs in the default output rather than behind a
+    verbose flag.
+    """
+    columns = (
+        ("NAME", "watcher_name"),
+        ("CONNECTOR", "connector"),
+        ("ROOM", "room_name"),
+        ("ROOM ID", "room_id"),
+        ("AGENT", "agent_name"),
+        ("STATE", "state"),
+        ("PARTICIPANTS", "participants"),
+    )
+    rows = []
+    for w in watchers:
+        row = []
+        for _, key in columns:
+            value = w.get(key, "")
+            if isinstance(value, list):
+                value = ", ".join(value)
+            row.append(str(value) if value else "—")
+        rows.append(row)
+
+    widths = [
+        max(len(header), *(len(row[i]) for row in rows))
+        for i, (header, _) in enumerate(columns)
+    ]
+
+    def _line(cells: list[str]) -> str:
+        # rstrip so a trailing empty participants column does not leave the row
+        # padded out to the header width.
+        return "  ".join(c.ljust(w) for c, w in zip(cells, widths)).rstrip()
+
+    print(_line([header for header, _ in columns]))
+    for row in rows:
+        print(_line(row))
 
 
 def _run_config(args) -> None:

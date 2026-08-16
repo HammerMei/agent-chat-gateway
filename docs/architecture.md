@@ -953,7 +953,7 @@ Check `~/.agent-chat-gateway/gateway.log` for errors. Common issues:
 ### Messages not being processed
 
 1. **Check if watcher is running** — `agent-chat-gateway list`
-2. **Check if watcher is paused** — `agent-chat-gateway list -v`
+2. **Check if watcher is paused** — `agent-chat-gateway list` (the STATE column)
 3. **Check daemon logs** — `tail -f ~/.agent-chat-gateway/gateway.log`
 4. **Check connector logs** — Filter by `connectors.rocketchat` in logs
 
