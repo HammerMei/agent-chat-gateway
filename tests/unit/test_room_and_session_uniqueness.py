@@ -385,6 +385,8 @@ class TestARefusedBindingLeavesNothingBehind(unittest.IsolatedAsyncioTestCase):
 
         lc = WatcherLifecycle.__new__(WatcherLifecycle)
         lc._states = {}
+        lc._started = set()
+        lc._blocked_agents = set()
         lc._processors = {}
         lc._watcher_locks = {}
         lc._permission_registry = MagicMock()
@@ -496,6 +498,8 @@ class TestAClearedWatermarkSurvivesToDisk(unittest.IsolatedAsyncioTestCase):
         processor.stop = AsyncMock()
         lc._processors = {"w1": processor}
         lc._states = {}
+        lc._started = set()
+        lc._blocked_agents = set()
         lc._dispatcher = MagicMock()
         lc._permission_registry = MagicMock()
         lc._maps = MagicMock()
@@ -652,3 +656,106 @@ class TestEveryWatermarkCopySpeaksTheSameLanguage(unittest.IsolatedAsyncioTestCa
                 f"{mod.__name__}: same rule on the restore side — an empty live cursor "
                 f"is a connector saying it cleared the mark",
             )
+
+
+class TestHandBuiltLifecyclesInitialiseTheirBookkeeping(unittest.TestCase):
+    """Every `WatcherLifecycle.__new__` fixture must set every bookkeeping field.
+
+    Written after a new instance attribute (`_started`) broke nineteen tests at
+    once — all of them hand-built objects missing a field no real lifecycle can
+    lack. The next such field should fail here, once, naming the fixture.
+
+    **Bookkeeping** means the fields `__init__` assigns an *empty container* to:
+    they have no external source, so an object that has some and not others is
+    in a state no constructor can produce. Collaborators are deliberately not
+    checked — a fixture substitutes doubles for exactly the ones its path needs,
+    and demanding all of them would make this a nuisance rather than a guard.
+
+    Derived from `__init__`'s AST, so it needs no instance and no second list.
+    """
+
+    def _bookkeeping_fields(self) -> set[str]:
+        import ast
+        import inspect
+
+        from gateway.core.watcher_lifecycle import WatcherLifecycle
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(WatcherLifecycle.__init__)))
+        names = set()
+        for node in ast.walk(tree):
+            # AnnAssign as well as Assign: `self._started: set[str] = set()` is
+            # an annotated assignment, and half this constructor uses that form.
+            targets = (
+                node.targets if isinstance(node, ast.Assign)
+                else [node.target] if isinstance(node, ast.AnnAssign)
+                else []
+            )
+            if not targets:
+                continue
+            empty_container = (
+                isinstance(node.value, ast.Dict) and not node.value.keys
+            ) or (
+                isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id in {"set", "dict", "list"}
+                and not node.value.args
+            )
+            if not empty_container:
+                continue
+            for t in targets:
+                if (
+                    isinstance(t, ast.Attribute)
+                    and isinstance(t.value, ast.Name)
+                    and t.value.id == "self"
+                ):
+                    names.add(t.attr)
+        return names
+
+    def _fixtures(self, path: Path) -> dict[str, set[str]]:
+        """Every `<var> = WatcherLifecycle.__new__(...)` and the attrs then set
+        on that same variable, keyed by the line the object is built on."""
+        import ast
+
+        tree = ast.parse(path.read_text())
+        assigns = [
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.Assign)
+            and isinstance(n.targets[0], ast.Name)
+            and isinstance(n.value, ast.Call)
+            and ast.unparse(n.value).startswith("WatcherLifecycle.__new__")
+        ]
+        found = {}
+        for build in assigns:
+            var = build.targets[0].id
+            attrs = {
+                t.attr
+                for n in ast.walk(tree)
+                if isinstance(n, ast.Assign)
+                for t in n.targets
+                if isinstance(t, ast.Attribute)
+                and isinstance(t.value, ast.Name)
+                and t.value.id == var
+                # same block: within a screenful after the construction
+                and build.lineno <= n.lineno <= build.lineno + 40
+            }
+            found[f"{path.name}:{build.lineno}"] = attrs
+        return found
+
+    def test_no_fixture_omits_a_bookkeeping_field(self):
+        required = self._bookkeeping_fields()
+        self.assertIn("_started", required, "the guard is reading the wrong set")
+        self.assertIn("_processors", required)
+
+        roots = [
+            Path(__file__).parent / "test_room_and_session_uniqueness.py",
+            Path(__file__).parent.parent / "integration" / "test_watcher_lifecycle.py",
+        ]
+        missing = {}
+        for root in roots:
+            for where, attrs in self._fixtures(root).items():
+                gap = required - attrs
+                if gap:
+                    missing[where] = sorted(gap)
+        self.assertEqual(
+            missing, {}, f"hand-built lifecycles missing bookkeeping: {missing}"
+        )

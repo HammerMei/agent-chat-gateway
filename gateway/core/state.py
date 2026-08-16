@@ -268,6 +268,13 @@ def parse_state_filter(names: list[str] | None) -> StateFilter:
     """
     if names is None:
         return StateFilter.OPERABLE
+    if not isinstance(names, list):
+        # Not merely "iterable": a JSON object iterates its *keys*, so
+        # `{"states": {"idle": false}}` would be accepted as an `idle` filter and
+        # the caller would get a confident answer to a query it did not make.
+        raise ValueError(
+            f"state filter must be a list of state names (got {type(names).__name__})"
+        )
     result = StateFilter(0)
     for name in names:
         try:

@@ -229,6 +229,65 @@ class TestListEnumeratesRecords(IsolatedTestCase):
         self.assertEqual(manager.get_watcher_state("w1").last_processed_ts, "old")
         await manager.shutdown()
 
+    async def test_the_final_save_still_polls_a_stopped_watcher(self):
+        """`shutdown` stops every processor and *then* saves, so keying the
+        watermark poll on "has a processor right now" left the last save
+        polling nothing — removing the backstop for a watcher whose own capture
+        failed, and silently redelivering messages after a restart.
+
+        The predicate is "this process started it", which survives the stop.
+        """
+        manager = self._manager([], watcher_configs=[make_watcher(name="script")])
+        await manager.run_once()
+
+        polled: list[str] = []
+        with patch.object(
+            manager._connector,
+            "get_last_processed_ts",
+            side_effect=lambda rid: polled.append(rid) or "T-final",
+        ):
+            await manager.shutdown()
+
+        self.assertIn("script", polled, "the final save polled no room at all")
+
+    async def test_a_hydrated_record_is_never_polled(self):
+        """The other half of the same predicate: a record this process only
+        loaded may name a room the watcher has since moved away from, so its
+        cursor belongs to somebody else."""
+        manager = self._manager(
+            [_record("w1", room_id="someone-elses-room")],
+            watcher_configs=[make_watcher(name="w1")],
+        )
+        await manager.run_once(unavailable_agents={"default"})
+
+        with patch.object(
+            manager._connector, "get_last_processed_ts", return_value="THEIRS"
+        ) as cursor:
+            await manager.pause_watcher("w1")
+            manager._lifecycle.save_state()
+
+        cursor.assert_not_called()
+        await manager.shutdown()
+
+    async def test_a_failed_watermark_read_does_not_abort_the_stop(self):
+        """The read is best-effort in `StateStore.save`; it has to be here too,
+        or a partly torn-down connector skips the unsubscribe and the drain in
+        order to preserve a watermark."""
+        manager = self._manager([], watcher_configs=[make_watcher(name="script")])
+        await manager.run_once()
+
+        def boom(_room_id):
+            raise RuntimeError("connector partly torn down")
+
+        with patch.object(
+            manager._connector, "get_last_processed_ts", side_effect=boom
+        ):
+            await manager.pause_watcher("script")
+
+        self.assertEqual(manager.list_watchers()[0]["state"], "paused")
+        self.assertIsNone(manager.get_processor("script"))
+        await manager.shutdown()
+
     async def test_rows_are_ordered_by_name(self):
         """Deterministic regardless of which side of the merge a record came from."""
         manager = self._manager([_record("zulu"), _record("alpha"), _record("mike")])

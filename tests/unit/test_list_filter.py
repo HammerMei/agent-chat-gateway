@@ -75,6 +75,20 @@ class TestParseStateFilter(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_state_filter([["active"]])
 
+    def test_a_mapping_is_refused_rather_than_iterated_as_its_keys(self):
+        """`{"idle": false}` iterates to `["idle"]`, so accepting anything
+        iterable would answer an `idle` query for a request that asked the
+        opposite — confidently, and with no way for the caller to tell."""
+        with self.assertRaises(ValueError) as ctx:
+            parse_state_filter({"idle": False})
+        self.assertIn("list", str(ctx.exception))
+
+    def test_a_bare_string_is_refused(self):
+        """`"idle"` iterates to its characters, which would fail as unknown
+        names — but for the wrong reason, and `""` would read as empty."""
+        with self.assertRaises(ValueError):
+            parse_state_filter("idle")
+
     def test_every_state_has_a_wire_name_and_round_trips(self):
         """Enumerated from ``StateFilter`` itself, not from a copy of its members.
 

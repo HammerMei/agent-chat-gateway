@@ -99,6 +99,18 @@ class WatcherLifecycle:
 
         self._processors: dict[str, MessageProcessor] = {}
         self._states: dict[str, WatcherState] = {}
+        # Watchers this process has started this run, whether or not they are
+        # still running. This — not "has a processor right now" — is what makes
+        # a record's `room_id` trustworthy enough to read the connector's cursor
+        # for: we resolved that room ourselves and subscribed to it. A record
+        # merely loaded from disk (a hydrated one, or a paused one seeded at
+        # boot) may name a room this watcher has since been moved away from.
+        #
+        # Deliberately never removed on stop: `shutdown` stops every processor
+        # and *then* saves, so a set that emptied on stop would leave the final
+        # save polling nothing — and that save is the backstop for a watcher
+        # whose own capture failed.
+        self._started: set[str] = set()
         # Per-watcher mutex: prevents concurrent pause/resume/reset commands for
         # the same watcher from racing through _stop_processor / _start_watcher.
         # The control socket can serve multiple simultaneous clients, so two
@@ -189,7 +201,7 @@ class WatcherLifecycle:
         prune = {name for name in persisted if name not in config_names}
 
         self._state_store.save(
-            self._states, prune=prune, serving=set(self._processors)
+            self._states, prune=prune, serving=self._started
         )
         return errors
 
@@ -255,7 +267,7 @@ class WatcherLifecycle:
                     room_id="",
                     paused=True,
                 )
-            self._state_store.save(self._states, serving=set(self._processors))
+            self._state_store.save(self._states, serving=self._started)
             logger.info("Watcher '%s' paused", name)
 
     async def resume_watcher(self, name: str) -> None:
@@ -270,7 +282,7 @@ class WatcherLifecycle:
                 # so no restart is needed, but the flag must be updated.
                 if state:
                     state.paused = False
-                self._state_store.save(self._states, serving=set(self._processors))
+                self._state_store.save(self._states, serving=self._started)
                 return
             try:
                 await self._start_watcher(wc, state)
@@ -282,7 +294,7 @@ class WatcherLifecycle:
             # so the next restart (or manual retry) correctly reflects the watcher's state.
             if state:
                 state.paused = False
-            self._state_store.save(self._states, serving=set(self._processors))
+            self._state_store.save(self._states, serving=self._started)
             logger.info("Watcher '%s' resumed", name)
 
     async def reset_watcher(self, name: str) -> None:
@@ -327,7 +339,7 @@ class WatcherLifecycle:
             except Exception as e:
                 logger.error("Failed to restart watcher '%s' after reset: %s", name, e)
                 raise
-            self._state_store.save(self._states, serving=set(self._processors))
+            self._state_store.save(self._states, serving=self._started)
             logger.info("Watcher '%s' reset", name)
 
     def list_watchers(
@@ -472,7 +484,7 @@ class WatcherLifecycle:
 
     def save_state(self) -> None:
         """Persist current state (called before shutdown)."""
-        self._state_store.save(self._states, serving=set(self._processors))
+        self._state_store.save(self._states, serving=self._started)
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
@@ -564,6 +576,7 @@ class WatcherLifecycle:
             backend_identity=identity,
         )
         self._states[wc.name] = ws
+        self._started.add(wc.name)
         try:
             self._maps.bind_session(session_id, room.id, self._connector)
         except Exception:
@@ -963,7 +976,20 @@ class WatcherLifecycle:
         # hand that value to this watcher at its next start, which restores it onto the
         # room it has actually moved to and silently drops everything below it.
         if processor and state and state.room_id:
-            live_ts = self._connector.get_last_processed_ts(state.room_id)
+            # Best-effort, exactly as the same read is in `StateStore.save` — one
+            # value read in two places must not have two failure policies. A
+            # connector partly torn down can raise here, and aborting would skip
+            # the unsubscribe and the drain below, leaving the teardown half
+            # done to preserve a watermark. The save is the backstop.
+            try:
+                live_ts = self._connector.get_last_processed_ts(state.room_id)
+            except Exception as e:
+                live_ts = None
+                logger.warning(
+                    "Watcher '%s': could not read the live watermark for room "
+                    "'%s': %s — keeping the stored value and continuing the stop",
+                    name, state.room_id, e,
+                )
             # `is not None`, so a connector that has *cleared* its watermark can say so.
             # `None` still means "no opinion — this room saw no activity in this run", and
             # must not erase what is on disk. An empty string is an opinion: a connector
