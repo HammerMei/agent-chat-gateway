@@ -959,56 +959,79 @@ class RCWebSocketClient:
                 self._queue_for_routing(message_doc, access)
                 return
 
-            # Lazily create per-room queue and worker on first message.
-            # Also re-create if the previous worker died (e.g. after reconnect).
-            existing_worker = self._room_workers.get(room_id)
-            if room_id not in self._room_queues or (
-                existing_worker and existing_worker.done()
-            ):
-                # Clean up dead worker if present
-                if existing_worker and existing_worker.done():
-                    old_queue = self._room_queues.pop(room_id, None)
-                    if old_queue and not old_queue.empty():
-                        logger.warning(
-                            "Room worker for %s died with %d unprocessed message(s) "
-                            "in queue — these messages are lost",
-                            room_id,
-                            old_queue.qsize(),
-                        )
-                    self._room_workers.pop(room_id, None)
-
-                q: asyncio.Queue = asyncio.Queue(maxsize=self._ROOM_QUEUE_DEPTH)
-                self._room_queues[room_id] = q
-                task = asyncio.create_task(
-                    self._room_worker(room_id, q),
-                    name=f"rc-room-worker-{room_id[:8]}",
-                )
-                self._room_workers[room_id] = task
-                self._callback_tasks.add(task)
-                task.add_done_callback(self._callback_tasks.discard)
-
-            try:
-                # The access object rides with the message: it describes *this delivery*
-                # (is the account a participant, what kind of room, what is it called),
-                # not the room in general, so storing it per room would be storing a
-                # snapshot of the last message rather than a property.
-                self._room_queues[room_id].put_nowait((message_doc, access))
-            except asyncio.QueueFull:
-                state = self._subscription_states.get(room_id)
-                if state is None:
-                    state = SubscriptionState(room_id=room_id, callback=callback)
-                    self._subscription_states[room_id] = state
-                state.dropped_messages += 1
-                if state.status not in {"failed", "reconnecting"}:
-                    state.status = "degraded"
-                state.last_error = f"inbound room queue overflow: dropped {state.dropped_messages} message(s)"
-                logger.warning(
-                    "Inbound queue full for room %s — dropping message (drop_count=%d)",
-                    room_id[:8],
-                    state.dropped_messages,
-                )
+            self.deliver_to_room(room_id, message_doc, access, callback=callback)
         except Exception as e:
             logger.error("Error handling room message: %s", e)
+
+    def deliver_to_room(
+        self,
+        room_id: str,
+        doc: dict,
+        access: dict | None = None,
+        *,
+        callback: Callable | None = None,
+    ) -> None:
+        """Put one document on this room's worker queue, creating the worker if needed.
+
+        **The only way a document should reach a room's handler.** The creation
+        path used to call the connector's dispatch directly for a frame whose
+        room became tracked while the frame waited in the routing queue — from
+        up to four routing workers at once, around the per-room queue that is
+        the thing making delivery ordered. If a newer frame is accepted before
+        an older one is handed back, the older hand-back claims a boundary
+        already past the message it is trying to preserve.
+
+        So the ordering guarantee lives here, in the transport, and the creation
+        path asks for delivery instead of performing it.
+        """
+        # Lazily create per-room queue and worker on first message.
+        # Also re-create if the previous worker died (e.g. after reconnect).
+        existing_worker = self._room_workers.get(room_id)
+        if room_id not in self._room_queues or (
+            existing_worker and existing_worker.done()
+        ):
+            # Clean up dead worker if present
+            if existing_worker and existing_worker.done():
+                old_queue = self._room_queues.pop(room_id, None)
+                if old_queue and not old_queue.empty():
+                    logger.warning(
+                        "Room worker for %s died with %d unprocessed message(s) "
+                        "in queue — these messages are lost",
+                        room_id,
+                        old_queue.qsize(),
+                    )
+                self._room_workers.pop(room_id, None)
+
+            q: asyncio.Queue = asyncio.Queue(maxsize=self._ROOM_QUEUE_DEPTH)
+            self._room_queues[room_id] = q
+            task = asyncio.create_task(
+                self._room_worker(room_id, q),
+                name=f"rc-room-worker-{room_id[:8]}",
+            )
+            self._room_workers[room_id] = task
+            self._callback_tasks.add(task)
+            task.add_done_callback(self._callback_tasks.discard)
+
+        try:
+            # The access object rides with the message: it describes *this delivery*
+            # (is the account a participant, what kind of room, what is it called),
+            # not the room in general, so storing it per room would be storing a
+            # snapshot of the last message rather than a property.
+            self._room_queues[room_id].put_nowait((doc, access))
+        except asyncio.QueueFull:
+            state = self._subscription_states.get(room_id)
+            if state is None:
+                state = SubscriptionState(room_id=room_id, callback=callback)
+                self._subscription_states[room_id] = state
+            state.dropped_messages += 1
+            if state.status not in {"failed", "reconnecting"}:
+                state.status = "degraded"
+            state.last_error = f"inbound room queue overflow: dropped {state.dropped_messages} message(s)"
+            logger.warning(
+                "Inbound queue full for room %s — dropping message (drop_count=%d)",
+                room_id[:8],
+                state.dropped_messages,
+            )
 
     def _queue_for_routing(self, doc: dict, access: dict | None) -> None:
         """Hand an untracked room's message to the shared routing worker."""

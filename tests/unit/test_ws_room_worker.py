@@ -427,3 +427,80 @@ class TestBoundedWebSocketCallbacks(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDeliverToRoom(unittest.IsolatedAsyncioTestCase):
+    """`deliver_to_room` is the only way a document should reach a room's handler.
+
+    It exists so the creation path can *ask* for delivery instead of performing
+    it. `_on_unrouted_message` runs on one of several routing workers, so a
+    caller that dispatches directly puts concurrent deliveries into a room whose
+    entire ordering guarantee is that one queue serialises them — and an older
+    frame handed back after a newer one committed claims a boundary already past
+    itself.
+    """
+
+    def _client(self):
+        from gateway.connectors.rocketchat.websocket import RCWebSocketClient
+
+        return RCWebSocketClient(
+            server_url="http://localhost:3000", username="t", password="t"
+        )
+
+    async def test_it_queues_onto_the_rooms_worker(self):
+        ws = self._client()
+        seen: list[str] = []
+
+        async def cb(doc, access=None):
+            seen.append(doc["_id"])
+
+        ws.register_room_callback("r1", cb)
+        ws.deliver_to_room("r1", {"_id": "m1"}, {"roomParticipant": True})
+
+        self.assertIn("r1", ws._room_queues, "no queue was created for the room")
+        await asyncio.sleep(0.05)
+        self.assertEqual(seen, ["m1"])
+        await ws.stop()
+
+    async def test_documents_reach_the_handler_in_the_order_delivered(self):
+        """The property the whole hand-off exists for.
+
+        Asserted through a handler that yields between documents, so a delivery
+        path that did not serialise would interleave them.
+        """
+        ws = self._client()
+        seen: list[str] = []
+
+        async def cb(doc, access=None):
+            await asyncio.sleep(0.01)
+            seen.append(doc["_id"])
+
+        ws.register_room_callback("r1", cb)
+        for mid in ("m1", "m2", "m3"):
+            ws.deliver_to_room("r1", {"_id": mid}, None)
+
+        await asyncio.sleep(0.2)
+        self.assertEqual(seen, ["m1", "m2", "m3"])
+        await ws.stop()
+
+    async def test_a_dead_worker_is_replaced_rather_than_dropped(self):
+        """Preserved from the block this was extracted from: a worker that died
+        (after a reconnect, say) must not leave the room permanently undeliverable."""
+        ws = self._client()
+        seen: list[str] = []
+
+        async def cb(doc, access=None):
+            seen.append(doc["_id"])
+
+        ws.register_room_callback("r1", cb)
+        ws.deliver_to_room("r1", {"_id": "m1"}, None)
+        await asyncio.sleep(0.05)
+
+        ws._room_workers["r1"].cancel()
+        await asyncio.sleep(0.05)
+
+        ws.deliver_to_room("r1", {"_id": "m2"}, None)
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(seen, ["m1", "m2"])
+        await ws.stop()

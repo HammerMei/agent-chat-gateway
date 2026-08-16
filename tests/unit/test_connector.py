@@ -3701,6 +3701,12 @@ class TestTheMessageThatCreatedTheWatcherIsDelivered(unittest.IsolatedAsyncioTes
     callback is registered *after* the frame was routed here — so without an explicit
     delivery, the message that caused the watcher to exist is the one message it never
     sees, and its sender waits for an answer that needs a second message to arrive.
+
+    **These assert where the document ends up, not which function was called.** They
+    used to mock `_on_raw_ddp_message` and assert it was awaited, which pinned the
+    mechanism rather than the outcome: the change that moved delivery onto the room's
+    worker broke them while delivering the message perfectly well. A test that fails
+    when the implementation improves is testing the implementation.
     """
 
     def _connector(self):
@@ -3708,44 +3714,98 @@ class TestTheMessageThatCreatedTheWatcherIsDelivered(unittest.IsolatedAsyncioTes
         connector._config.require_mention = False
         connector._config.filter_sender = False
         connector._handler = AsyncMock(return_value=True)
+        # Capture what reaches the room's queue — the observable end of delivery,
+        # whichever path put it there.
+        connector._ws.deliver_to_room = MagicMock(
+            side_effect=lambda rid, doc, access=None, **kw:
+                self.delivered.append((rid, doc["_id"]))
+        )
         return connector
 
-    def _frame(self, rid="new-room"):
+    def setUp(self):
+        self.delivered: list[tuple[str, str]] = []
+
+    def _frame(self, mid="m1", rid="new-room"):
         return (
-            {"_id": "m1", "rid": rid, "msg": "hi", "u": {"username": "alice"},
+            {"_id": mid, "rid": rid, "msg": "hi", "u": {"username": "alice"},
              "ts": {"$date": 500}},
             {"roomParticipant": True, "roomType": "c", "roomName": "general"},
         )
 
-    async def test_the_trigger_is_dispatched_after_the_watcher_exists(self):
+    def _creating_router(self, connector):
         from gateway.connectors.rocketchat.connector import _RoomSubscription
         from gateway.core.connector import Room
-
-        connector = self._connector()
-        dispatched: list[str] = []
-        connector._on_raw_ddp_message = AsyncMock(
-            side_effect=lambda rid, doc, **kw: dispatched.append(doc["_id"]) or True
-        )
 
         async def _router(room, trigger):
             # what creating a watcher does to the connector
             connector._rooms[room.id] = _RoomSubscription(
                 room=Room(id=room.id, name="general", type="channel"))
+        return _router
 
-        connector.register_router(_router)
+    async def test_the_trigger_reaches_the_room(self):
+        connector = self._connector()
+        connector.register_router(self._creating_router(connector))
         doc, access = self._frame()
+
         await connector._on_unrouted_message(doc, access)
 
         self.assertEqual(
-            dispatched, ["m1"],
+            self.delivered, [("new-room", "m1")],
             "the message that created the watcher must reach it",
         )
 
-    async def test_a_failed_creation_dispatches_nothing(self):
+    async def test_a_frame_for_a_room_created_meanwhile_reaches_the_room(self):
+        """The room became tracked while this frame waited in the routing queue.
+
+        Nobody else will deliver it — the per-room callback was registered after
+        the routing decision was made.
+        """
+        from gateway.connectors.rocketchat.connector import _RoomSubscription
+        from gateway.core.connector import Room
+
+        connector = self._connector()
+        offered: list[str] = []
+
+        async def _router(room, trigger):
+            offered.append(room.id)
+
+        connector.register_router(_router)
+        connector._rooms["new-room"] = _RoomSubscription(
+            room=Room(id="new-room", name="general", type="channel"))
+        doc, access = self._frame()
+
+        await connector._on_unrouted_message(doc, access)
+
+        self.assertEqual(offered, [], "a tracked room is not offered again")
+        self.assertEqual(self.delivered, [("new-room", "m1")])
+
+    async def test_the_connector_hands_off_rather_than_dispatching(self):
+        """Where the two layers meet.
+
+        Ordering is the *transport's* property — one queue per room — so the
+        connector's job here is to hand the frame over, not to deliver it.
+        `_on_unrouted_message` runs on one of several routing workers, so a
+        connector that dispatches directly puts concurrent deliveries into a
+        room whose whole guarantee is that they are serialised.
+
+        This asserts the hand-off across the layer boundary; that the hand-off
+        actually queues is
+        `TestDeliverToRoom.test_it_queues_onto_the_rooms_worker`.
+        """
+        connector = self._connector()
+        connector._on_raw_ddp_message = AsyncMock(return_value=True)
+        connector.register_router(self._creating_router(connector))
+        doc, access = self._frame()
+
+        await connector._on_unrouted_message(doc, access)
+
+        self.assertEqual(self.delivered, [("new-room", "m1")])
+        connector._on_raw_ddp_message.assert_not_awaited()
+
+    async def test_a_failed_creation_delivers_nothing(self):
         """The near miss: delivering into a room with no watcher would be dropped as
         unknown and would hide the creation failure."""
         connector = self._connector()
-        connector._on_raw_ddp_message = AsyncMock(return_value=True)
 
         async def _router(room, trigger):
             raise RuntimeError("creation failed")
@@ -3754,23 +3814,7 @@ class TestTheMessageThatCreatedTheWatcherIsDelivered(unittest.IsolatedAsyncioTes
         doc, access = self._frame()
         await connector._on_unrouted_message(doc, access)
 
-        connector._on_raw_ddp_message.assert_not_awaited()
-
-    async def test_a_frame_for_a_room_created_meanwhile_is_delivered_not_reoffered(self):
-        """The other half: a frame routed here before the watcher existed, arriving after
-        it does. Nobody else will deliver it — the callback was registered after this
-        frame had already been routed."""
-        connector = self._connector()
-        offered: list[str] = []
-        connector.register_router(
-            lambda room, trigger: offered.append(room.id) or _noop())
-        connector._on_raw_ddp_message = AsyncMock(return_value=True)
-
-        doc, access = self._frame(rid="room-1")   # already tracked by the fixture
-        await connector._on_unrouted_message(doc, access)
-
-        self.assertEqual(offered, [], "a tracked room is not offered again")
-        connector._on_raw_ddp_message.assert_awaited_once()
+        self.assertEqual(self.delivered, [])
 
 
 class TestTheFirstMessageIntoARoomKeepsARetryCursor(unittest.IsolatedAsyncioTestCase):

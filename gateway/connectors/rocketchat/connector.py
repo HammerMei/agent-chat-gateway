@@ -791,7 +791,13 @@ class RocketChatConnector(Connector):
             # taken it was registered after the routing decision was made, so nobody else
             # is going to deliver it. Returning here is how the message that arrived
             # during a creation used to be lost.
-            await self._on_raw_ddp_message(room_id, doc, access=access)
+            #
+            # **Onto the room's worker, not around it.** This runs on one of several
+            # routing workers, so dispatching here directly puts concurrent deliveries
+            # into a room whose whole ordering guarantee is that one queue serialises
+            # them — and an older frame handed back after a newer one committed claims
+            # a boundary already past itself.
+            self._ws.deliver_to_room(room_id, doc, access)
             return
         if room_id in self._rooms_being_routed:
             # An offer for this room is in flight and a second one would create a second
@@ -822,12 +828,16 @@ class RocketChatConnector(Connector):
             # sees — and its sender waits for an answer that needs a second message to
             # arrive.
             #
-            # Through `_on_raw_ddp_message` rather than around it, so every gate that
-            # applies to a tracked room's message applies to this one: the mention gate,
-            # the sender policy, dedup, the capacity preflight. Creating a watcher and
+            # Onto the room's worker, so every gate that applies to a tracked room's
+            # message applies to this one — the mention gate, the sender policy, dedup,
+            # the capacity preflight — and so does its ordering. Creating a watcher and
             # answering unprompted are separate decisions, and this keeps them separate.
+            #
+            # The worker demonstrably exists by now, which makes this the clearest of the
+            # bypasses: a newer frame entering it meanwhile could otherwise advance the
+            # cursor past this one, or reach the handler concurrently with it.
             if room_id in self._rooms:
-                await self._on_raw_ddp_message(room_id, doc, access=access)
+                self._ws.deliver_to_room(room_id, doc, access)
         finally:
             # Released whatever happened. A room that failed to be offered must be
             # offerable again on its next message — holding the reservation would make one
