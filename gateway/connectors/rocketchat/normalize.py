@@ -182,7 +182,7 @@ def filter_rc_message(
 
     # 4. Timestamp deduplication — run BEFORE any state mutation so replayed
     #    or reconnect-duplicated messages never corrupt turn counters.
-    msg_ts = _extract_ts(doc)
+    msg_ts = extract_ts(doc)
     msg_ts_f = _ts_to_float(msg_ts)
     last_ts_f = _ts_to_float(last_processed_ts)
     if msg_ts_f is not None and last_ts_f is not None and msg_ts_f <= last_ts_f:
@@ -317,7 +317,7 @@ async def normalize_rc_message(
 # ---------------------------------------------------------------------------
 
 
-def _extract_ts(doc: dict) -> str:
+def extract_ts(doc: dict) -> str:
     """Extract a sortable timestamp string from a DDP message document.
 
     RC timestamps are Unix-epoch milliseconds (numeric or inside ``{"$date": N}``).

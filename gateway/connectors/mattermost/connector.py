@@ -853,6 +853,22 @@ class MattermostConnector(Connector):
             self._ws.unregister_channel(room_id)
             logger.info("Reaped channel state for %s", room_id)
 
+    async def probe_missed_since(self, room: Room, after_ts: str) -> bool:
+        """See `Connector.probe_missed_since`. Raw posts, so `user_id` is still
+        on them — `fetch_room_history` maps the bot's own posts to `"me"`."""
+        raw = await self._rest.get_room_history(
+            room.id, count=self._REPLAY_HISTORY_COUNT, after_ts=after_ts
+        )
+        own_id = self._rest.bot_user_id
+        for post in raw:
+            if own_id and post.get("user_id") == own_id:
+                continue
+            # Strictly after: `after_ts` is inclusive, so the message that set
+            # this watermark is in the page and is not a gap.
+            if ts_gt(str(post.get("create_at", "")), after_ts):
+                return True
+        return False
+
     def trigger_history_bound(self, trigger) -> str | None:
         """The trigger's `post.create_at` (epoch ms) as ISO — the decoded event is
         what `_offer_to_router` hands the router."""

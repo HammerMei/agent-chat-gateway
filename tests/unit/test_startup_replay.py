@@ -92,7 +92,7 @@ class TestStartupReplay(unittest.IsolatedAsyncioTestCase):
 
         mgr = SessionManager.__new__(SessionManager)
         mgr._connector = MagicMock()
-        mgr._connector.fetch_room_history = AsyncMock(return_value=[])
+        mgr._connector.probe_missed_since = AsyncMock(return_value=False)
         mgr._connector.replay_room_since = AsyncMock()
         mgr._connector_name = "rc"
         mgr._lifecycle = MagicMock()
@@ -104,7 +104,12 @@ class TestStartupReplay(unittest.IsolatedAsyncioTestCase):
         return mgr
 
     async def test_an_empty_gap_leaves_the_room_idle(self):
-        """The lazy model working: no messages missed, nothing recreated."""
+        """The lazy model working: no messages missed, nothing recreated.
+
+        The probe is the connector's judgment, not a raw history read: the
+        agent's own last reply always sits above the watermark (which only
+        advances on accepted *inbound*), so a probe that counted it would
+        report a gap for nearly every room at every boot."""
         mgr = self._manager([_dynamic_record()])
 
         await mgr._replay_persisted_records()
@@ -113,18 +118,20 @@ class TestStartupReplay(unittest.IsolatedAsyncioTestCase):
         mgr._connector.replay_room_since.assert_not_awaited()
         # The probe asked from the stored watermark.
         self.assertEqual(
-            mgr._connector.fetch_room_history.call_args.kwargs.get("after_ts"),
-            "1786874400000",
-        )
+            mgr._connector.probe_missed_since.await_args.args[1], "1786874400000")
 
     async def test_a_gap_recreates_from_the_record_and_replays(self):
         record = _dynamic_record(room_kind="group_dm",
                                  participants=["alice", "bob"], room_name="")
         mgr = self._manager([record])
-        mgr._connector.fetch_room_history = AsyncMock(return_value=[{"ts": "x"}])
+        mgr._connector.probe_missed_since = AsyncMock(return_value=True)
 
         await mgr._replay_persisted_records()
 
+        # The probe was asked about the room typed by its *kind*, so a group DM
+        # reaches the direct-room history endpoint rather than a channel one.
+        self.assertEqual(
+            mgr._connector.probe_missed_since.await_args.args[0].type, "group_dm")
         args = mgr._watcher_manager.get_or_create.await_args
         self.assertEqual(args.args[0], "rc")
         room = args.args[1]
@@ -141,11 +148,11 @@ class TestStartupReplay(unittest.IsolatedAsyncioTestCase):
             _dynamic_record(name="w-fresh", room_id="r4", last_processed_ts=""),
         ]
         mgr = self._manager(records)
-        mgr._connector.fetch_room_history = AsyncMock(return_value=[{"ts": "x"}])
+        mgr._connector.probe_missed_since = AsyncMock(return_value=True)
 
         await mgr._replay_persisted_records()
 
-        mgr._connector.fetch_room_history.assert_not_awaited()
+        mgr._connector.probe_missed_since.assert_not_awaited()
         mgr._watcher_manager.get_or_create.assert_not_awaited()
 
     async def test_a_resident_room_is_not_probed(self):
@@ -154,7 +161,7 @@ class TestStartupReplay(unittest.IsolatedAsyncioTestCase):
 
         await mgr._replay_persisted_records()
 
-        mgr._connector.fetch_room_history.assert_not_awaited()
+        mgr._connector.probe_missed_since.assert_not_awaited()
 
     async def test_one_bad_room_does_not_kill_boot(self):
         """Best-effort per record: the probe failing, or the recreation
@@ -165,12 +172,12 @@ class TestStartupReplay(unittest.IsolatedAsyncioTestCase):
         good = _dynamic_record(name="w-good", room_id="r-good")
         mgr = self._manager([bad_probe, bad_create, good])
 
-        async def probe(room, count, after_ts=None):
+        async def probe(room, after_ts):
             if room.id == "r-bad":
                 raise RuntimeError("rest down")
-            return [{"ts": "x"}]
+            return True
 
-        mgr._connector.fetch_room_history = AsyncMock(side_effect=probe)
+        mgr._connector.probe_missed_since = AsyncMock(side_effect=probe)
         mgr._watcher_manager.get_or_create = AsyncMock(
             side_effect=[RuntimeError("backend down"), "proc"])
 
@@ -183,7 +190,7 @@ class TestStartupReplay(unittest.IsolatedAsyncioTestCase):
         mgr = self._manager([_dynamic_record()])
         mgr._watcher_manager = None
         await mgr._replay_persisted_records()
-        mgr._connector.fetch_room_history.assert_not_awaited()
+        mgr._connector.probe_missed_since.assert_not_awaited()
 
 
 if __name__ == "__main__":

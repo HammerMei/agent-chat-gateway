@@ -44,12 +44,6 @@ class SessionManager:
         await manager.run()   # blocks until cancelled
     """
 
-    # How many messages the startup replay's gap probe asks for. Only emptiness
-    # is read from the answer, but the count must be big enough that a page of
-    # filtered-out system messages does not read as "no gap" — the same
-    # count-before-filtering trap the reconnect replay documents.
-    _REPLAY_PROBE_COUNT = 50
-
     def __init__(
         self,
         connector: Connector,
@@ -201,11 +195,13 @@ class SessionManager:
             room = Room(
                 id=ws.room_id,
                 name=ws.room_name or ws.watcher_name,
-                type=ws.room_type or "channel",
+                # The record's kind, so a group DM reaches the direct-room
+                # history endpoint rather than a channel one.
+                type=ws.room_kind or ws.room_type or "channel",
             )
             try:
-                missed = await self._connector.fetch_room_history(
-                    room, self._REPLAY_PROBE_COUNT, after_ts=ws.last_processed_ts
+                missed = await self._connector.probe_missed_since(
+                    room, ws.last_processed_ts
                 )
             except Exception as e:
                 logger.warning(

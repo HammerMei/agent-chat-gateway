@@ -1110,6 +1110,34 @@ class TestRoutingUntrackedChannels(unittest.IsolatedAsyncioTestCase):
             await self._drain(connector)
 
 
+class TestProbeMissedSince(unittest.IsolatedAsyncioTestCase):
+    """Same two confounders as Rocket.Chat's probe: the bot's own posts (which
+    history includes by design, while the watermark only advances on accepted
+    inbound) and the inclusive boundary message."""
+
+    def _connector(self, posts):
+        connector = _make_connector()
+        connector._rest.get_room_history = AsyncMock(return_value=posts)
+        return connector
+
+    _ROOM = Room(id="c1", name="eng", type="channel")
+
+    def _post(self, ms, user_id="u1"):
+        return {"id": f"m{ms}", "user_id": user_id, "message": "hi", "create_at": ms}
+
+    async def test_the_bots_own_post_above_the_watermark_is_not_a_gap(self):
+        connector = self._connector([self._post(2000, user_id="bot-id-1")])
+        self.assertFalse(await connector.probe_missed_since(self._ROOM, "1000"))
+
+    async def test_the_boundary_post_itself_is_not_a_gap(self):
+        connector = self._connector([self._post(1000)])
+        self.assertFalse(await connector.probe_missed_since(self._ROOM, "1000"))
+
+    async def test_a_real_user_post_above_the_watermark_is_a_gap(self):
+        connector = self._connector([self._post(1000), self._post(2000)])
+        self.assertTrue(await connector.probe_missed_since(self._ROOM, "1000"))
+
+
 class TestTriggerHistoryBound(unittest.TestCase):
     """Mattermost's trigger is the decoded event; the bound is post.create_at."""
 

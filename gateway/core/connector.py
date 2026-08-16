@@ -471,6 +471,33 @@ class Connector(ABC):
         """
         return False
 
+    async def probe_missed_since(self, room: Room, after_ts: str) -> bool:
+        """Whether this room holds a message the gateway has not processed.
+
+        The startup replay's cheap question, asked before a watcher is
+        recreated (§2.2): recreating every recorded room at every boot would
+        pay a session resume per room for nothing, which is precisely the eager
+        cost the lazy model exists to avoid.
+
+        Two exclusions decide the answer, and both need platform knowledge,
+        which is why this lives on the connector rather than in the replay loop:
+
+        * **The bot's own messages.** History includes them by design (the
+          agent is shown what it said), but the watermark only advances on
+          *accepted inbound*, so the agent's own last reply always sits above
+          it — and a naive probe therefore reports a gap for every room that
+          ended with the agent speaking, which is nearly all of them. Compared
+          **by id, not by username**: an account whose canonical spelling
+          differs from the configured one is a real and documented case here.
+        * **The boundary message itself.** ``after_ts`` is an inclusive lower
+          bound, so the very message that set the watermark comes back — and it
+          is a user message, so the own-message rule does not remove it.
+
+        Default: ``False`` — a connector with no history API has nothing to
+        probe, and a startup replay over its records must be harmless.
+        """
+        return False
+
     async def replay_room_since(self, room_id: str) -> None:
         """Replay one tracked room's missed messages from its watermark.
 

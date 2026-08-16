@@ -51,7 +51,12 @@ from ...core.watcher_rule import RoomKind
 from .agent_chain import TurnStore
 from .config import RocketChatConfig
 from .mentions import is_room_wide_mention
-from .normalize import FilterResult, filter_rc_message, normalize_rc_message
+from .normalize import (
+    FilterResult,
+    extract_ts,
+    filter_rc_message,
+    normalize_rc_message,
+)
 from .outbound import send_media as _send_media
 from .outbound import send_text as _send_text
 from .policy import apply_thread_policy
@@ -940,6 +945,23 @@ class RocketChatConnector(Connector):
             await self.send_text(room_id, AgentResponse(text=STARTING_UP_NOTICE))
         except Exception:
             logger.debug("Could not post the starting-up notice", exc_info=True)
+
+    async def probe_missed_since(self, room: Room, after_ts: str) -> bool:
+        """See `Connector.probe_missed_since`. Raw docs, so the sender id is
+        still on them — `fetch_room_history` has already reduced the bot's own
+        posts to `username: "me"` by the time it returns."""
+        raw = await self._rest.get_room_history(
+            room.id, room.type, self._REPLAY_HISTORY_COUNT, after_ts=after_ts
+        )
+        own_id = self._rest.user_id
+        for doc in raw:
+            if own_id and doc.get("u", {}).get("_id") == own_id:
+                continue
+            # Strictly after: `after_ts` is inclusive, so the boundary message —
+            # the one that set this watermark — is in the page and is not a gap.
+            if _ts_gt(extract_ts(doc), after_ts):
+                return True
+        return False
 
     def trigger_history_bound(self, trigger) -> str | None:
         """The trigger doc's `ts` as ISO — DDP carries it as `{"$date": ms}` or a

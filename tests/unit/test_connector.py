@@ -16,7 +16,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from gateway.connectors.rocketchat.connector import _just_before
-from gateway.core.connector import RoomCapacity
+from gateway.core.connector import Room, RoomCapacity
 from gateway.core.watcher_rule import RoomKind
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -2150,6 +2150,59 @@ class TestTheMentionGateIsKindAware(unittest.TestCase):
             self._config(), room_type="dm", last_processed_ts=None,
         )
         self.assertTrue(result.accepted)
+
+
+class TestProbeMissedSince(unittest.IsolatedAsyncioTestCase):
+    """The startup replay's gap question, and the two things that make it lie.
+
+    The watermark advances only on accepted *inbound*, while history includes
+    the bot's own replies by design — so the agent's last answer always sits
+    above the watermark. And `after_ts` is an inclusive lower bound, so the very
+    message that set the watermark comes back too. A probe that counted either
+    would report a gap for nearly every room at every boot, recreating every
+    watcher on every start — the eager cost the lazy model exists to avoid.
+    """
+
+    def _connector(self, docs):
+        connector = _make_connector()
+        connector._rest = MagicMock()
+        connector._rest.user_id = "BOT_ID"
+        connector._rest.get_room_history = AsyncMock(return_value=docs)
+        return connector
+
+    def _doc(self, ms, user_id="U1"):
+        return {"_id": f"m{ms}", "msg": "hi", "u": {"_id": user_id, "username": "x"},
+                "ts": {"$date": ms}}
+
+    _ROOM = Room(id="r1", name="eng", type="channel")
+
+    async def test_only_the_bots_own_reply_above_the_watermark_is_not_a_gap(self):
+        connector = self._connector([self._doc(2000, user_id="BOT_ID")])
+        self.assertFalse(await connector.probe_missed_since(self._ROOM, "1000"))
+
+    async def test_the_boundary_message_itself_is_not_a_gap(self):
+        """It is a *user* message, so the own-message rule does not remove it —
+        only the strictly-after comparison does."""
+        connector = self._connector([self._doc(1000)])
+        self.assertFalse(await connector.probe_missed_since(self._ROOM, "1000"))
+
+    async def test_a_real_user_message_above_the_watermark_is_a_gap(self):
+        connector = self._connector([self._doc(1000), self._doc(2000)])
+        self.assertTrue(await connector.probe_missed_since(self._ROOM, "1000"))
+
+    async def test_the_bot_is_recognised_by_id_not_by_spelling(self):
+        """A login whose canonical username differs from the configured one is
+        a real, documented case here — a name comparison would count the bot's
+        own reply as a gap."""
+        connector = self._connector([
+            {"_id": "m1", "msg": "hi", "ts": {"$date": 2000},
+             "u": {"_id": "BOT_ID", "username": "ProbeBot9207"}},
+        ])
+        self.assertFalse(await connector.probe_missed_since(self._ROOM, "1000"))
+
+    async def test_an_empty_room_is_not_a_gap(self):
+        connector = self._connector([])
+        self.assertFalse(await connector.probe_missed_since(self._ROOM, "1000"))
 
 
 class TestTriggerHistoryBound(unittest.TestCase):
