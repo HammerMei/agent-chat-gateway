@@ -1,4 +1,4 @@
-.PHONY: install setup test lint start stop status clean help \
+.PHONY: install setup test coverage lint start stop status clean help \
         e2e-up e2e-down e2e-test e2e-logs e2e-reset
 
 RUNTIME_DIR := $(HOME)/.agent-chat-gateway

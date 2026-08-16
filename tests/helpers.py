@@ -95,16 +95,29 @@ class MockAgentBackend(AgentBackend):
         text = self._responses.pop(0) if self._responses else self._default_response
         return AgentResponse(text=text)
 
-    async def delete_session(self, session_id: str) -> bool:
-        self.deleted_sessions.append(session_id)
-        return True
-
     async def ensure_durable_instructions(self, *a, **kw):
         """Skip the default send()-based fallback, so watcher startup does not
         consume a canned response. A test exercising context injection should
         override this rather than rely on it (see
         tests/integration/test_injected_context_builder.py)."""
         return None
+
+
+class CleanupTrackingAgent(MockAgentBackend):
+    """`MockAgentBackend` that also *confirms* session deletion.
+
+    Kept separate on purpose. `AgentBackend.delete_session` returns `False` by
+    default — "deletion is unsupported or could not be confirmed" — and startup
+    rollback branches on that: an unconfirmed delete keeps the session and its
+    injection flag for the next attempt. Folding confirmation into the generic
+    double would quietly move every rollback test onto the other branch while
+    still passing, which is exactly the "reuse must not fuse two independent
+    things" case in CLAUDE.md.
+    """
+
+    async def delete_session(self, session_id: str) -> bool:
+        self.deleted_sessions.append(session_id)
+        return True
 
 
 def make_watcher(room="script", name=None, connector="script", agent="default", **kw):
@@ -176,7 +189,12 @@ def make_lifecycle(**overrides):
         "default_agent": "default",
         "config": make_core_config(),
         "watcher_configs": [],
-        "state_store": MagicMock(),
+        # `load()` must return a real empty mapping, not a MagicMock. A bare
+        # mock's `.get(name)` is truthy, so `sync_watchers` reads every watcher
+        # as paused, starts none of them, and returns no errors — a lifecycle
+        # test built on that passes without exercising startup at all, which is
+        # the precise failure this file exists to prevent.
+        "state_store": MagicMock(load=MagicMock(return_value={})),
         "dispatcher": MagicMock(),
         "injector": MagicMock(),
         "permission_registry": None,

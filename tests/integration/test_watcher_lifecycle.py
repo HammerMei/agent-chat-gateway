@@ -23,6 +23,7 @@ from gateway.connectors.script import ScriptConnector
 from gateway.core.config import CoreConfig
 from gateway.core.state import WatcherState
 from tests.helpers import (
+    CleanupTrackingAgent,
     IsolatedTestCase,
     MockAgentBackend,
     make_lifecycle,
@@ -40,16 +41,6 @@ _patch_save_state = patch("gateway.core.state_store.save_state")
 
 
 pytestmark = pytest.mark.integration
-
-class CleanupTrackingAgent(MockAgentBackend):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.deleted_sessions = []
-
-    async def delete_session(self, session_id: str) -> bool:
-        self.deleted_sessions.append(session_id)
-        return True
-
 
 class FailingUnsubscribeConnector(ScriptConnector):
     def __init__(self, failing_room: str):
