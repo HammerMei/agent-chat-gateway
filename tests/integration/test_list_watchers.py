@@ -11,52 +11,18 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from gateway.agents import AgentBackend
-from gateway.agents.response import AgentResponse
-from gateway.config import AgentConfig, WatcherConfig
+from gateway.config import AgentConfig
 from gateway.connectors.script import ScriptConnector
 from gateway.core.config import CoreConfig
 from gateway.core.connector import Room
 from gateway.core.session_manager import SessionManager
 from gateway.core.state import StateFilter, WatcherState
-from tests.helpers import IsolatedTestCase
-
-
-class MockAgentBackend(AgentBackend):
-    def __init__(self):
-        self._session_counter = 0
-
-    async def create_session(
-        self, working_directory, extra_args=None, session_title=None
-    ):
-        self._session_counter += 1
-        return f"mock-session-{self._session_counter:04d}"
-
-    async def send(self, session_id, prompt, working_directory, timeout, **kwargs):
-        return AgentResponse(text="ok")
-
-    async def ensure_durable_instructions(self, *a, **kw):
-        """Skip the send()-based fallback: these tests never exercise injection."""
-        return None
-
-
-def make_watcher(room="script", name=None, agent="default"):
-    return WatcherConfig(
-        name=name or room, connector="script", room=room, agent=agent
-    )
-
-
-def make_manager(connector, agent, watcher_configs=None):
-    config = CoreConfig(
-        agents={"default": AgentConfig(timeout=10)}, default_agent="default"
-    )
-    return SessionManager(
-        connector,
-        {"default": agent},
-        "default",
-        config,
-        watcher_configs=watcher_configs or [],
-    )
+from tests.helpers import (
+    IsolatedTestCase,
+    MockAgentBackend,
+    make_manager,
+    make_watcher,
+)
 
 
 def _record(name, **kwargs) -> WatcherState:
@@ -80,7 +46,7 @@ class TestListEnumeratesRecords(IsolatedTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         return make_manager(
-            ScriptConnector(), MockAgentBackend(), watcher_configs or []
+            ScriptConnector(), MockAgentBackend(), watcher_configs=watcher_configs or []
         )
 
     async def test_a_record_with_no_config_entry_is_listed(self):
@@ -154,7 +120,7 @@ class TestListStateFilter(IsolatedTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         return make_manager(
-            ScriptConnector(), MockAgentBackend(), watcher_configs or []
+            ScriptConnector(), MockAgentBackend(), watcher_configs=watcher_configs or []
         )
 
     async def test_default_shows_everything_except_idle(self):
@@ -274,7 +240,7 @@ class TestListRowContents(IsolatedTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         return make_manager(
-            ScriptConnector(), MockAgentBackend(), watcher_configs or []
+            ScriptConnector(), MockAgentBackend(), watcher_configs=watcher_configs or []
         )
 
     async def test_room_id_and_participants_are_reported(self):

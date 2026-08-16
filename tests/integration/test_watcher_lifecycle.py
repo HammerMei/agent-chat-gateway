@@ -18,14 +18,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.agents import AgentBackend
-from gateway.agents.response import AgentResponse
 from gateway.config import AgentConfig, WatcherConfig
 from gateway.connectors.script import ScriptConnector
 from gateway.core.config import CoreConfig
-from gateway.core.session_manager import SessionManager
 from gateway.core.state import WatcherState
-from tests.helpers import IsolatedTestCase
+from tests.helpers import (
+    IsolatedTestCase,
+    MockAgentBackend,
+    make_manager,
+    make_watcher,
+)
 
 # Patch load_state/save_state globally so tests never touch live state files.
 _patch_load_state = patch("gateway.core.state_store.load_state", return_value=[])
@@ -37,30 +39,6 @@ _patch_save_state = patch("gateway.core.state_store.save_state")
 
 
 pytestmark = pytest.mark.integration
-
-class MockAgentBackend(AgentBackend):
-    def __init__(self, responses=None, default_response="mock reply"):
-        self._responses = list(responses or [])
-        self._default_response = default_response
-        self.sent_messages = []
-        self._session_counter = 0
-
-    async def create_session(self, working_directory, extra_args=None, session_title=None):
-        self._session_counter += 1
-        return f"mock-session-{self._session_counter:04d}"
-
-    async def send(self, session_id, prompt, working_directory, timeout, attachments=None, env=None, append_system_prompt_file=None):
-        self.sent_messages.append({"prompt": prompt, "session_id": session_id, "attachments": attachments})
-        text = self._responses.pop(0) if self._responses else self._default_response
-        return AgentResponse(text=text)
-
-    async def ensure_durable_instructions(self, *a, **kw):
-        """Skip the default send()-based fallback so watcher startup doesn't
-        consume a canned response from self._responses — this test double is
-        for generic message-routing tests, not context-injection interactions
-        (see tests/integration/test_injected_context_builder.py for those)."""
-        return None
-
 
 class CleanupTrackingAgent(MockAgentBackend):
     def __init__(self, *args, **kwargs):
@@ -84,28 +62,8 @@ class FailingUnsubscribeConnector(ScriptConnector):
             raise RuntimeError(f"boom for {room_id}")
 
 
-def make_watcher(room="script", name=None):
-    return WatcherConfig(
-        name=name or room, connector="script", room=room, agent="default"
-    )
-
-
-def make_manager(connector, agent, watcher_configs=None, permission_registry=None):
-    agent_cfg = AgentConfig(timeout=10)
-    config = CoreConfig(agents={"default": agent_cfg}, default_agent="default")
-    return SessionManager(
-        connector,
-        {"default": agent},
-        "default",
-        config,
-        watcher_configs=watcher_configs or [],
-        permission_registry=permission_registry,
-    )
-
-
 def _make_lifecycle_r14(watcher_names=None):
     """Build a minimal WatcherLifecycle with mocked collaborators."""
-    from gateway.core.config import CoreConfig
     from gateway.core.config import WatcherConfig as CoreWatcherConfig
     from gateway.core.watcher_lifecycle import WatcherLifecycle
 
