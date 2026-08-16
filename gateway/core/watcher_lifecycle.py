@@ -546,6 +546,7 @@ class WatcherLifecycle:
         state: WatcherState | None,
         room: Room,
         history_before_ts: str | None = None,
+        provenance: dict | None = None,
     ) -> None:
         """Phases 1.5–10 of `_start_watcher`, taking the room as already resolved.
 
@@ -554,6 +555,19 @@ class WatcherLifecycle:
         both redundant and wrong (a group DM has no resolvable name at all).
         Static starts call `_start_watcher`, which resolves and delegates here;
         everything below is byte-identical for both callers.
+
+        ``provenance`` carries the §5.3 fields a start does not rebuild — the
+        frozen rule and config snapshots, the room kind, the lifecycle clocks
+        (`gateway/core/state.py`, `carried_fields`). It is applied **at
+        construction**, in step 3, rather than being written onto the record
+        afterwards, and both halves of that matter:
+
+        * a recreation that did not carry them wiped the snapshot recreation
+          itself reads, and the next boot pruned the emptied record as an
+          orphan — a room's session lost after two restarts, silently;
+        * enriching after the start meant a concurrent creation's `save_state`
+          could persist this record while it was still half-written, so a crash
+          in that window left a rule-less record on disk to be pruned.
         """
         agent_name = self._resolve_agent_name(wc.agent)
         agent = self._agents[agent_name]
@@ -611,6 +625,12 @@ class WatcherLifecycle:
             paused=False,
             last_processed_ts=state.last_processed_ts if state else "",
             backend_identity=identity,
+            # Applied here, at construction, so the record is never observable
+            # in a state that has a session but no provenance. Unknown keys are
+            # refused rather than ignored: a typo'd field name would otherwise
+            # silently mean "this field was not carried", which is the exact
+            # failure mode this parameter exists to close.
+            **(provenance or {}),
         )
         self._states[wc.name] = ws
         try:

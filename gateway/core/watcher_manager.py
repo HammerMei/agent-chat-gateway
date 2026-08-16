@@ -34,7 +34,7 @@ from .config import HistoryHandoffConfig, WatcherConfig
 from .connector import Room
 from .pending_route import STARTING_UP_NOTICE
 from .room_pattern import RoomPattern
-from .state import CONFIG_SCHEMA_VERSION, WatcherState
+from .state import CONFIG_SCHEMA_VERSION, WatcherState, carried_fields
 from .watcher_rule import RoomKind, RuleMatch, WatcherRule
 
 if TYPE_CHECKING:
@@ -457,16 +457,28 @@ class WatcherManager:
             return None
         platform_room = Room(
             id=record.room_id,
+            # The record's own kind, not the offered room's: the record is what
+            # this watcher was created against (§2.4), and a re-classification
+            # that disagreed would silently change whether the mention gate
+            # applies to a room that already has a watcher.
             name=room_description(room),
-            type=room.kind.value,
+            type=record.room_kind or room.kind.value,
         )
+        # Everything a start does not rebuild, carried out of the record being
+        # recreated — derived from the field classification in `state.py`, not
+        # listed here, so a new §5.3 field survives recreation without this line
+        # changing. The clocks move with it: the room is resident again, so it
+        # is no longer dropped, and this is activity.
+        carried = carried_fields(record)
+        carried["last_activity_at"] = _now_iso()
+        carried["dropped_at"] = ""
         # A raise propagates: recreation that failed is an abort, not a decision,
         # and the caller owns the retry (§2.2). The per-room lock releases on the
         # way out, so the retry can re-enter.
         await self._lifecycle.start_watcher_in_room(
-            wc, record, platform_room, history_before_ts=history_before_ts
+            wc, record, platform_room,
+            history_before_ts=history_before_ts, provenance=carried,
         )
-        record.last_activity_at = _now_iso()
         self._lifecycle.save_state()
         return self._lifecycle.processor_named(wc.name)
 
@@ -507,6 +519,26 @@ class WatcherManager:
             name=room_description(room),
             type=room.kind.value,
         )
+        # The §5.3 fields only this moment knows (§2.4), handed to the start so
+        # they are part of the record from its first instant. Written here rather
+        # than onto the record afterwards: an enrichment step leaves a window in
+        # which a concurrent creation's save persists this record without its
+        # rule, and a crash in that window leaves an orphan for the next boot to
+        # prune.
+        now = _now_iso()
+        provenance = {
+            "room_kind": room.kind.value,
+            "participants": list(room.participants),
+            "connector": self._connector_name,
+            "agent": self._lifecycle.resolve_agent_name(wc.agent),
+            "created_at": now,
+            "last_activity_at": now,
+            "dropped_at": "",
+            "config": _jsonable(wc),
+            "rule_name": rule.name,
+            "rule": rule_snapshot(rule),
+            "config_schema_version": CONFIG_SCHEMA_VERSION,
+        }
         self._creations_in_flight += 1
         try:
             # A raise propagates (§2.2): a creation that failed is an abort, and
@@ -514,29 +546,12 @@ class WatcherManager:
             # produces — a final answer for a non-final condition. The cap slot
             # and the per-room lock both release on the way out.
             await self._lifecycle.start_watcher_in_room(
-                wc, None, platform_room, history_before_ts=history_before_ts
+                wc, None, platform_room,
+                history_before_ts=history_before_ts, provenance=provenance,
             )
         finally:
             self._creations_in_flight -= 1
 
-        # Freeze the record fields only the creation moment knows (§5.3, §2.4).
-        # Enriched before any save so no record ever reaches disk half-written:
-        # `start_watcher_in_room` itself never saves, and the save below is the
-        # first one that can see this record.
-        ws = self._lifecycle.get_watcher_state(wc.name)
-        if ws is not None:
-            now = _now_iso()
-            ws.room_name = room.name
-            ws.room_kind = room.kind.value
-            ws.participants = list(room.participants)
-            ws.connector = self._connector_name
-            ws.agent = self._lifecycle.resolve_agent_name(wc.agent)
-            ws.created_at = now
-            ws.last_activity_at = now
-            ws.config = _jsonable(wc)
-            ws.rule_name = rule.name
-            ws.rule = rule_snapshot(rule)
-            ws.config_schema_version = CONFIG_SCHEMA_VERSION
         self._lifecycle.save_state()
         logger.info(
             "Created watcher '%s' for room %s from rule '%s'",

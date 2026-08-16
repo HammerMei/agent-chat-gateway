@@ -179,6 +179,73 @@ class WatcherState:
     config_schema_version: int = 0
 
 
+# ── What a start rebuilds, and what it must carry ────────────────────────────
+#
+# Starting a watcher constructs a fresh `WatcherState`, so every field is either
+# *rebuilt* by that start or *carried* into it from the record being recreated.
+# Getting that split wrong is silent and compounding: a recreation that rebuilt
+# the record without carrying `rule_name`/`config` wiped the very snapshot
+# recreation reads, and the next boot then pruned the emptied record as an
+# orphan — two restarts and a room's session was gone.
+#
+# These are named here, next to the dataclass, rather than being a hand-built
+# dict at the one call site that needs them. A hand-built list is a defect with
+# a delay on it: the next §5.3 field silently stops surviving recreation. The
+# enumeration test walks `fields(WatcherState)` and requires every field to be
+# in exactly one set, so a new field cannot be added without classifying it.
+
+# Rebuilt by every start, from the config and the resolved room.
+SESSION_SCOPED_FIELDS = frozenset({
+    "watcher_name",
+    "session_id",
+    "room_id",
+    "room_type",
+    "room_name",
+    "context_injected",
+    "paused",
+    "last_processed_ts",
+    "backend_identity",
+})
+
+# Written once, when the watcher is first created from a rule, and never again:
+# recreation reads them, so a start must carry them across unchanged (§2.4, §5.3).
+FROZEN_AT_CREATION_FIELDS = frozenset({
+    "room_kind",
+    "participants",
+    "connector",
+    "agent",
+    "created_at",
+    "config",
+    "rule_name",
+    "rule",
+    "config_schema_version",
+})
+
+# Neither rebuilt nor frozen: the lifecycle clocks (§2.5). They move over a
+# record's life — but they move on *lifecycle* events, not on a start, so a
+# start carries them rather than resetting them.
+LIFECYCLE_CLOCK_FIELDS = frozenset({
+    "last_activity_at",
+    "dropped_at",
+})
+
+
+def carried_fields(state: "WatcherState | None") -> dict:
+    """The fields a recreation must carry out of the record it is recreating.
+
+    Derived from the sets above rather than listed again here, so adding a
+    frozen field extends this automatically. Returns `{}` for a record that
+    does not exist (a first-ever creation) or one the static path wrote (no
+    frozen snapshot — its recreation source is `config.yaml`).
+    """
+    if state is None:
+        return {}
+    return {
+        name: getattr(state, name)
+        for name in FROZEN_AT_CREATION_FIELDS | LIFECYCLE_CLOCK_FIELDS
+    }
+
+
 class StateFilter(Flag):
     """Which lifecycle states a ``list`` should return (design §2.8).
 

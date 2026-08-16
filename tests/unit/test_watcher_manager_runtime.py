@@ -23,6 +23,7 @@ from gateway.core.watcher_manager import (
     config_from_record,
     materialize,
     rule_snapshot,
+    watcher_label,
 )
 from gateway.core.watcher_rule import RoomKind, RoomMatcher, WatcherRule
 
@@ -48,12 +49,33 @@ def _room(id="r1", kind=RoomKind.CHANNEL, name="eng-backend", participants=()):
 
 
 def _mock_lifecycle():
+    """A lifecycle double whose seam behaves like the real one.
+
+    `start_watcher_in_room` *applies* the provenance it is handed, exactly as
+    the real seam does at construction, and registers the record. A double that
+    swallowed provenance would let a manager that never sent any pass every
+    test in this file — which is the shape of defect these tests exist for.
+    """
     lifecycle = MagicMock()
+    records: dict[str, WatcherState] = {}
+
+    async def start(wc, state, room, history_before_ts=None, provenance=None):
+        records[wc.name] = WatcherState(
+            watcher_name=wc.name,
+            session_id=state.session_id if state else "sess-new",
+            room_id=room.id,
+            room_type=room.type,
+            room_name=room.name,
+            last_processed_ts=state.last_processed_ts if state else "",
+            **(provenance or {}),
+        )
+
+    lifecycle.records = records
     lifecycle.record_for_room = MagicMock(return_value=None)
     lifecycle.processor_named = MagicMock(return_value=None)
     lifecycle.resolve_agent_name = MagicMock(side_effect=lambda ref: ref or "default")
-    lifecycle.start_watcher_in_room = AsyncMock()
-    lifecycle.get_watcher_state = MagicMock(return_value=None)
+    lifecycle.start_watcher_in_room = AsyncMock(side_effect=start)
+    lifecycle.get_watcher_state = MagicMock(side_effect=records.get)
     lifecycle.save_state = MagicMock()
     return lifecycle
 
@@ -74,7 +96,7 @@ class TestCreation(unittest.IsolatedAsyncioTestCase):
         manager, lifecycle, _ = _manager()
         started = {}
 
-        async def record_start(wc, state, room, history_before_ts=None):
+        async def record_start(wc, state, room, history_before_ts=None, provenance=None):
             started["wc"] = wc
             started["room"] = room
             started["history_before_ts"] = history_before_ts
@@ -171,10 +193,9 @@ class TestTheRecordIsFrozenAtCreation(unittest.IsolatedAsyncioTestCase):
         rule = _rule()
         manager, lifecycle, _ = _manager(rules=[rule])
         room = _room()
-        ws = WatcherState(watcher_name="rc-eng-backend", session_id="s1", room_id="r1")
-        lifecycle.get_watcher_state = MagicMock(return_value=ws)
 
         await manager.get_or_create("rc", room)
+        ws = lifecycle.get_watcher_state("rc-eng-backend")
 
         self.assertEqual(ws.room_kind, "channel")
         self.assertEqual(ws.connector, "rc")
@@ -190,13 +211,14 @@ class TestTheRecordIsFrozenAtCreation(unittest.IsolatedAsyncioTestCase):
 
     async def test_participants_are_kept_for_a_group_dm(self):
         manager, lifecycle, _ = _manager(rules=[_rule(include=(), group_direct=True)])
-        ws = WatcherState(watcher_name="w", session_id="s1", room_id="g1")
-        lifecycle.get_watcher_state = MagicMock(return_value=ws)
+        room = _room(id="g1", kind=RoomKind.GROUP_DM, name="",
+                     participants=("alice", "bob"))
 
-        await manager.get_or_create(
-            "rc", _room(id="g1", kind=RoomKind.GROUP_DM, name="",
-                        participants=("alice", "bob")))
+        await manager.get_or_create("rc", room)
 
+        # Asked for by the label the product derives, not by a second copy of
+        # the label rule spelled out here.
+        ws = lifecycle.get_watcher_state(watcher_label("rc", room))
         self.assertEqual(ws.participants, ["alice", "bob"])
         self.assertEqual(ws.room_kind, "group_dm")
 
@@ -273,7 +295,7 @@ class TestSingleFlight(unittest.IsolatedAsyncioTestCase):
         release = asyncio.Event()
         starts = []
 
-        async def slow_start(wc, state, room, history_before_ts=None):
+        async def slow_start(wc, state, room, history_before_ts=None, provenance=None):
             starts.append(wc.name)
             await release.wait()
             ws = WatcherState(watcher_name=wc.name, session_id="s", room_id=room.id)
@@ -301,7 +323,7 @@ class TestSingleFlight(unittest.IsolatedAsyncioTestCase):
         gate_a = asyncio.Event()
         in_start = asyncio.Event()
 
-        async def start(wc, state, room, history_before_ts=None):
+        async def start(wc, state, room, history_before_ts=None, provenance=None):
             if room.id == "ra":
                 in_start.set()
                 await gate_a.wait()
@@ -323,7 +345,7 @@ class TestTheCreationCap(unittest.IsolatedAsyncioTestCase):
         manager, lifecycle, connector = _manager(creation_cap=1)
         release = asyncio.Event()
 
-        async def slow_start(wc, state, room, history_before_ts=None):
+        async def slow_start(wc, state, room, history_before_ts=None, provenance=None):
             await release.wait()
 
         lifecycle.start_watcher_in_room = AsyncMock(side_effect=slow_start)
@@ -382,6 +404,55 @@ class TestConfigFromRecord(unittest.TestCase):
                     "history_handoff": {"enabled": "yes", "fetch_count": "many"}})
         wc = config_from_record(record)
         self.assertEqual(wc.history_handoff, HistoryHandoffConfig())
+
+
+class TestEveryStateFieldIsClassified(unittest.TestCase):
+    """A start rebuilds a `WatcherState` from scratch, so every field is either
+    rebuilt by that start or carried into it. A field in neither set is one a
+    recreation silently drops — which is how the frozen rule snapshot was wiped,
+    leaving the next boot to prune the record as an orphan.
+
+    Enumerated rather than listed, so the *next* §5.3 field cannot be added
+    without deciding which side it is on."""
+
+    def test_no_field_is_unclassified_or_double_classified(self):
+        from dataclasses import fields as dataclass_fields
+
+        from gateway.core.state import (
+            FROZEN_AT_CREATION_FIELDS,
+            LIFECYCLE_CLOCK_FIELDS,
+            SESSION_SCOPED_FIELDS,
+        )
+
+        declared = {f.name for f in dataclass_fields(WatcherState)}
+        sets = (SESSION_SCOPED_FIELDS, FROZEN_AT_CREATION_FIELDS,
+                LIFECYCLE_CLOCK_FIELDS)
+        classified = set().union(*sets)
+
+        self.assertEqual(
+            declared - classified, set(),
+            "a WatcherState field is classified neither rebuilt nor carried — "
+            "a recreation would silently drop it",
+        )
+        self.assertEqual(classified - declared, set(), "a classified field no longer exists")
+        for i, first in enumerate(sets):
+            for second in sets[i + 1:]:
+                self.assertEqual(first & second, set(), "a field is in two sets")
+
+    def test_carried_fields_covers_everything_a_start_does_not_rebuild(self):
+        from gateway.core.state import carried_fields
+
+        record = WatcherState(watcher_name="w", session_id="s", room_id="r1",
+                              rule_name="eng", created_at="then")
+        carried = carried_fields(record)
+        self.assertEqual(carried["rule_name"], "eng")
+        self.assertEqual(carried["created_at"], "then")
+        self.assertNotIn("session_id", carried, "a start rebuilds this")
+
+    def test_a_missing_record_carries_nothing(self):
+        from gateway.core.state import carried_fields
+
+        self.assertEqual(carried_fields(None), {})
 
 
 class TestEndToEndThroughTheRealLifecycle(unittest.IsolatedAsyncioTestCase):
@@ -446,6 +517,67 @@ class TestEndToEndThroughTheRealLifecycle(unittest.IsolatedAsyncioTestCase):
         )
         # And the record is queryable through the sticky-binding lookup.
         self.assertIs(lifecycle.record_for_room("r1"), ws)
+
+    async def test_a_recreation_keeps_the_frozen_record_intact(self):
+        """The test the mocked seam could not give: a start builds a *fresh*
+        `WatcherState`, so a recreation that does not carry the frozen fields
+        wipes the snapshot recreation reads — and the next boot prunes the
+        emptied record as an orphan, discarding the session with it.
+
+        Two restarts and a room's continuity was gone, silently. Nothing in the
+        mocked-seam suite could see it, because there the seam is a mock."""
+        lifecycle, connector, _patch = self._real_lifecycle()
+        rule = _rule(agent="default")
+        manager = WatcherManager("rc", connector, lifecycle, [rule])
+        room = _room()
+
+        with _patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            await manager.get_or_create("rc", room)
+            created = lifecycle.get_watcher_state("rc-eng-backend")
+            frozen = {
+                "rule_name": created.rule_name,
+                "rule": dict(created.rule),
+                "config": dict(created.config),
+                "room_kind": created.room_kind,
+                "connector": created.connector,
+                "agent": created.agent,
+                "created_at": created.created_at,
+                "config_schema_version": created.config_schema_version,
+            }
+            session_id = created.session_id
+            # What an idle drop leaves behind: the record, no processor.
+            await lifecycle.stop_all()
+
+            recreated_proc = await manager.get_or_create("rc", room)
+
+        self.assertIsNotNone(recreated_proc)
+        ws = lifecycle.get_watcher_state("rc-eng-backend")
+        for name, value in frozen.items():
+            self.assertEqual(getattr(ws, name), value,
+                             f"recreation dropped the frozen field {name!r}")
+        self.assertEqual(ws.session_id, session_id, "the session was resumed, not re-minted")
+        # And the record still reads as rule-derived, so the next boot keeps it.
+        self.assertTrue(ws.rule_name)
+        self.assertEqual(config_from_record(ws), materialize(rule, room))
+
+    async def test_a_recreation_advances_the_idle_clock_and_clears_dropped_at(self):
+        lifecycle, connector, _patch = self._real_lifecycle()
+        manager = WatcherManager("rc", connector, lifecycle, [_rule(agent="default")])
+
+        with _patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            await manager.get_or_create("rc", _room())
+            ws = lifecycle.get_watcher_state("rc-eng-backend")
+            ws.last_activity_at = "2020-01-01T00:00:00+00:00"
+            ws.dropped_at = "2020-01-02T00:00:00+00:00"
+            await lifecycle.stop_all()
+
+            await manager.get_or_create("rc", _room())
+
+        ws = lifecycle.get_watcher_state("rc-eng-backend")
+        self.assertNotEqual(ws.last_activity_at, "2020-01-01T00:00:00+00:00")
+        self.assertEqual(ws.dropped_at, "", "a resident room is not dropped")
 
     async def test_a_second_message_reuses_the_watcher_it_created(self):
         lifecycle, connector, _patch = self._real_lifecycle()
