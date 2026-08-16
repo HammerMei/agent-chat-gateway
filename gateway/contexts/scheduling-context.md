@@ -11,7 +11,7 @@ You can schedule recurring or one-time tasks using the `agent-chat-gateway sched
 > | `active` | Delivered normally. |
 > | `idle` | Fine — the watcher is woken on demand. |
 > | `paused` | Skipped quietly and retried at the job's **next scheduled occurrence**. A finite job's remaining run count is **not** consumed. |
-> | `failed` | Same retry, and each missed delivery also posts a ⚠️ notice into the room. |
+> | `failed` | Same retry. A ⚠️ notice is posted into the room **only if the gateway loaded that watcher this run** — one whose agent was unavailable at startup never did, so its misses are silent. Do not promise the user they will be told. |
 > | not listed at all | It has never started; treat it as `failed`. |
 >
 > For `paused` or `failed`, say that the agent in that room is currently paused / not running, **and say when the retry would actually land** — "the next scheduled occurrence" means very different things:

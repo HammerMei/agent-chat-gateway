@@ -308,6 +308,41 @@ class TestRunOnce(unittest.IsolatedAsyncioTestCase):
         mgr._lifecycle.sync_watchers.assert_called_once_with(unavailable_agents=unavailable)
 
 
+
+class TestNotifyWatcherRoomNeedsLoadedState(unittest.IsolatedAsyncioTestCase):
+    """`notify_watcher_room` reads in-memory state only, so a record this
+    process never loaded gets no notice.
+
+    Pinned rather than fixed: `list` shows such a record as `failed`, so the
+    two disagree — but a disk-only record can name a room the watcher has since
+    moved away from, and posting an alert into that room is worse than posting
+    none. The policy belongs with the notification issue, not here. This test
+    exists so that changing it is a decision rather than an accident.
+    """
+
+    async def test_a_record_this_process_never_loaded_gets_no_notice(self):
+        mgr = _make_manager()
+        mgr._lifecycle.get_watcher_state = MagicMock(return_value=None)
+
+        sent = await mgr.notify_watcher_room("w1", "hello")
+
+        self.assertFalse(sent)
+        mgr._connector.send_text.assert_not_called()
+
+    async def test_a_loaded_record_does_get_one(self):
+        from gateway.core.state import WatcherState
+
+        mgr = _make_manager()
+        mgr._connector.send_text = AsyncMock()
+        mgr._lifecycle.get_watcher_state = MagicMock(
+            return_value=WatcherState(watcher_name="w1", session_id="s", room_id="r1")
+        )
+
+        sent = await mgr.notify_watcher_room("w1", "hello")
+
+        self.assertTrue(sent)
+        self.assertEqual(mgr._connector.send_text.call_args[0][0], "r1")
+
 if __name__ == "__main__":
     unittest.main()
 
