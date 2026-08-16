@@ -533,6 +533,42 @@ class TestWatcherLifecycleHistoryHandoff(unittest.IsolatedAsyncioTestCase):
 
         connector.fetch_room_history.assert_not_called()
 
+    async def test_history_bounded_by_trigger_timestamp(self):
+        """The creation path's trigger timestamp bounds the fetch (§2.7).
+
+        The trigger is buffered and replayed into the new processor as the live
+        prompt, so history must fetch strictly older than it — otherwise the
+        newest-history block contains the very message that triggered creation
+        and the agent receives it twice.
+        """
+        lifecycle, connector, _ = self._make_lifecycle(history_enabled=True)
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            await lifecycle._start_watcher(
+                lifecycle._watcher_configs[0],
+                state=None,
+                history_before_ts="2026-08-16T10:00:00+00:00",
+            )
+
+        connector.fetch_room_history.assert_called_once()
+        self.assertEqual(
+            connector.fetch_room_history.call_args.kwargs.get("before_ts"),
+            "2026-08-16T10:00:00+00:00",
+        )
+
+    async def test_static_start_fetches_unbounded_history(self):
+        """A static start has no trigger, so the fetch carries no upper bound."""
+        lifecycle, connector, _ = self._make_lifecycle(history_enabled=True)
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            await lifecycle._start_watcher(lifecycle._watcher_configs[0], state=None)
+
+        connector.fetch_room_history.assert_called_once()
+        self.assertIsNone(
+            connector.fetch_room_history.call_args.kwargs.get("before_ts"))
+
     async def test_fetch_failure_does_not_block_startup(self):
         """If fetch_room_history raises, the watcher must still start successfully."""
         lifecycle, connector, _ = self._make_lifecycle(history_enabled=True)

@@ -453,6 +453,7 @@ class WatcherLifecycle:
         self,
         wc: WatcherConfig,
         state: WatcherState | None,
+        history_before_ts: str | None = None,
     ) -> None:
         """Start a single watcher: resolve room, ensure session, start processor.
 
@@ -469,6 +470,15 @@ class WatcherLifecycle:
           8. Register processor with dispatcher (deferred until subscribe succeeds).
           9. Activate processor (start consumer loop + online notification).
          10. Restore dedup watermark.
+
+        ``history_before_ts`` bounds the history handoff (step 3.5) to messages
+        strictly older than the given ISO timestamp. The creation path passes the
+        triggering message's timestamp here (§2.7): the trigger is buffered and
+        replayed into the new processor as the live prompt, so without the bound
+        the newest-history block would contain that same message and the agent
+        would receive it twice — once inside a history turn whose response is
+        discarded, and again live. Buffering alone does not fix that; only the
+        bound does. Static starts have no trigger and pass None (unbounded).
         """
         agent_name = self._resolve_agent_name(wc.agent)
         agent = self._agents[agent_name]
@@ -554,7 +564,9 @@ class WatcherLifecycle:
         hh = wc.history_handoff
         if created_new_session and hh.enabled:
             try:
-                raw_msgs = await self._connector.fetch_room_history(room, hh.fetch_count)
+                raw_msgs = await self._connector.fetch_room_history(
+                    room, hh.fetch_count, before_ts=history_before_ts
+                )
                 fetched_at = datetime.now().astimezone().isoformat(timespec="seconds")
                 history_context = format_history_context(
                     raw_msgs, verbatim_tail=hh.verbatim_tail, fetched_at=fetched_at
