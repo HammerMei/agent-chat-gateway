@@ -43,8 +43,9 @@ class StateStore:
         plus whatever the caller holds in memory, with the in-memory copy
         authoritative because it is the newer of the two.
 
-        ``save`` writes exactly this, and ``list_watchers`` reads exactly this,
-        so the set an operator is shown is the set that would be persisted.
+        ``save`` writes this minus whatever it was explicitly told to prune, and
+        ``list_watchers`` reads it unfiltered, so the set an operator is shown is
+        the set that would be persisted.
         Spelling the merge a second time at either call site is how the two
         drift into disagreeing about whether a watcher exists — a record the
         caller never touched (skipped agent, failed start) is on disk and not in

@@ -218,8 +218,12 @@ def lifecycle_state(record: "WatcherState") -> StateFilter:
       and §4.4 has even ``get`` refuse to override it.  A record that is both
       paused and dropped is still awaiting a human, so reporting it as idle
       would hide the only one of the two that someone has to act on.
-    * **idle** is a record the manager dropped — ``dropped_at`` is written when
-      the watcher is released and cleared when it is recreated (§2.5).
+    * **idle** is a record the manager dropped. **Nothing writes ``dropped_at``
+      yet** — the watcher manager will, when it releases a watcher and clears it
+      on recreation (§2.5) — so this branch is unreachable in production today
+      and `--idle` legitimately returns nothing. The reader lands before the
+      writer on purpose: it is what makes idling observable as soon as the
+      lifecycle increment produces it.
     * **active** otherwise.
 
     Written as a named function with one answer per case rather than as a

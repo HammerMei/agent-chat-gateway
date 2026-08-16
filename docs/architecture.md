@@ -957,8 +957,11 @@ Check `~/.agent-chat-gateway/gateway.log` for errors. Common issues:
    watcher never started, and the reason is in the startup log.
 2. **Check if watcher is paused** — the STATE column of the same output. Note
    that STATE describes the *record*, not whether a processor is loaded right
-   now; a watcher whose start failed after its record was written still reads
-   `active` until the daemon is restarted.
+   now. A start that fails after the record is written (a failed room
+   subscription, say) keeps the record on purpose, so the row reads `active`
+   with no processor behind it — **and it reads `active` again after every
+   restart**, because the next boot re-reads the same record and fails the same
+   way. Restarting is not a diagnostic here; the startup errors in the log are.
 3. **Check daemon logs** — `tail -f ~/.agent-chat-gateway/gateway.log`
 4. **Check connector logs** — Filter by `connectors.rocketchat` in logs
 

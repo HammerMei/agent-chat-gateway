@@ -717,6 +717,23 @@ class TestCLIList(_CLITestBase):
         self.assertIn("idle", idle_out)
         self.assertNotIn("--all", idle_out)
 
+    def test_a_hard_failure_does_not_get_an_empty_list_answer(self):
+        """An unknown --connector comes back ok:false with no `errors` list.
+
+        "No watchers, try --all" is a substantive answer to a query the daemon
+        never ran, and it would send the operator to a flag that changes
+        nothing.
+        """
+        self._start_daemon(
+            {"list": {"ok": False, "error": "Unknown connector: bogus"}}
+        )
+
+        stdout, stderr, code = self._run(["list", "--connector", "bogus"])
+
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout.strip(), "")
+        self.assertIn("Unknown connector", stderr)
+
     def test_list_state_flags_are_forwarded(self):
         """The flags compose, and the default is expressed by sending nothing."""
         received: list[dict] = []

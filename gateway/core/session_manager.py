@@ -167,8 +167,10 @@ class SessionManager:
 
         "Is a processor running" is a different question from "what state is
         this watcher's record in", and `list` answers only the second (§2.8).
-        Asking this one through `list` is what made idle and paused rooms
-        indistinguishable from rooms with no record at all.
+        The old row answered both — `active` from the processor, `paused` from
+        the record — which is why callers could reach the first one through
+        `list`. They cannot now, and should not: under rule-derived watchers a
+        row exists for rooms with no processor by design.
         """
         return self._lifecycle.get_processor(name)
 

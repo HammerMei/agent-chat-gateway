@@ -310,9 +310,7 @@ def main():
                 # "what is an operator about to act on".  Inheriting the default
                 # would silently drop idle rooms from a count that reads as a
                 # total.
-                result = _send_command(
-                    {"cmd": "list", "states": ["active", "idle", "paused"]}
-                )
+                result = _send_command({"cmd": "list", "states": _ALL_STATES})
                 if result["ok"]:
                     count = len(result.get("data", []))
                     print(f"Watchers: {count}")
@@ -333,12 +331,17 @@ def main():
         connector_errors = result.get("errors", [])
         if watchers:
             _print_watcher_table(watchers)
-        elif not connector_errors:
+        elif not connector_errors and result["ok"]:
+            # `result["ok"]` matters: an unknown --connector comes back as a
+            # hard failure with no `errors` list, and "no watchers, try --all"
+            # is a substantive answer to a query that never ran.
             # Says which question was asked, because the default excludes idle:
             # "none" and "none you asked about" are different answers.  The
-            # default case deliberately does not spell the default out — the
-            # server owns what OPERABLE means, and a second copy here would go
-            # stale silently.
+            # default branch describes OPERABLE in prose — as does this
+            # subcommand's argparse help — so **both strings have to follow
+            # StateFilter.OPERABLE if it ever changes.**  Stating it in prose
+            # rather than listing the states is what keeps that to a reword
+            # instead of a wrong list.
             if states:
                 print(f"No {'/'.join(states)} watchers")
             else:
@@ -411,6 +414,14 @@ def main():
         _run_config(args)
 
 
+# The CLI's own spelling of every state, so `status` and `--all` cannot drift
+# apart when a fourth state is added. `StateFilter.ALL` is the authority; this
+# list is what a socket client sends, and `parse_state_filter` refuses a name
+# the two do not agree on — loudly, which is why the duplication is safe here
+# and importing `gateway.core` into the client for one list is not worth it.
+_ALL_STATES = ["active", "idle", "paused"]
+
+
 def _requested_states(args) -> list[str] | None:
     """Translate the list flags into wire state names; None means "the default".
 
@@ -419,7 +430,7 @@ def _requested_states(args) -> list[str] | None:
     of a second copy here that has to be kept in step.
     """
     if args.all:
-        return ["active", "idle", "paused"]
+        return list(_ALL_STATES)
     chosen = [
         name
         for name, wanted in (
@@ -469,8 +480,8 @@ def _print_watcher_table(watchers: list[dict]) -> None:
     ]
 
     def _line(cells: list[str]) -> str:
-        # rstrip so a trailing empty participants column does not leave the row
-        # padded out to the header width.
+        # rstrip drops the last cell's ljust padding; no cell is ever empty
+        # (an absent value renders as an em dash), so this is only cosmetic.
         return "  ".join(c.ljust(w) for c, w in zip(cells, widths)).rstrip()
 
     print(_line([header for header, _ in columns]))

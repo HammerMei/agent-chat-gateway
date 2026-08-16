@@ -19,10 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Output is now an aligned table with **room id** and **participants** columns. The
     participants column is how a group DM is identified, so it is part of the default
     view rather than something to hide behind a flag.
-  - A configured watcher with **no state record** — its agent was unavailable, or its
-    first start raised — no longer appears. It has no session, no watermark and
-    nothing to pause; the failure is reported by startup instead. One that started on
-    an earlier boot still appears, because its record is on disk.
+  - A configured watcher with **no state record** no longer appears — a start that
+    failed before the record was written (agent unavailable, room unresolvable,
+    session not created). There is nothing in such a row but its name; the failure
+    is reported by startup instead. Two things it does **not** mean: a start that
+    failed *after* the record was written keeps that record and still appears, as
+    `active`, because STATE describes the record and not whether a processor is
+    running; and the watcher can still be paused by name, which is how one that
+    fails on every boot is kept from being started again.
   - `status` asks for every state explicitly, so its `Watchers:` count stays a total
     rather than silently inheriting `list`'s narrower default.
 - **One room is served by one watcher, and one session belongs to one room**

@@ -661,10 +661,26 @@ agent-chat-gateway reset <watcher-name> [--connector NAME]
 ```
 
 `list` reports the watchers the gateway has **state records** for, not the
-entries in `config.yaml`. A watcher that has never started — its agent was
-unavailable, or its first start failed — has no record and so does not appear;
-that failure is reported at startup and in the gateway log. The three states
-are:
+entries in `config.yaml`.
+
+A record is written partway through starting a watcher, so what a failed start
+leaves behind depends on where it failed:
+
+* Failures **before** the record is written — the agent was unavailable, the
+  room could not be resolved, the session could not be created — leave no
+  record, so the watcher does not appear in `list` at all. The failure is
+  reported at startup and in the gateway log.
+* Failures **after** it — the room subscription, for instance — keep the
+  record deliberately, so the session id and injection flag survive for the
+  next attempt. Such a watcher appears with state `active`, because **STATE
+  describes the record, not whether a processor is running.** It stays that
+  way across restarts until a start succeeds.
+
+Either way the watcher can still be paused by name; pausing one with no record
+creates a paused one, which is how a watcher that fails on every boot is kept
+from being started again.
+
+The three states are:
 
 | State | Meaning |
 |---|---|

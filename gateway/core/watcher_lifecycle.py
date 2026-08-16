@@ -339,7 +339,6 @@ class WatcherLifecycle:
                     # no name at all (the participants column identifies it).
                     "room_name": state.room_name or state.room_id,
                     "room_id": state.room_id,
-                    "room_kind": state.room_kind or state.room_type,
                     "participants": list(state.participants),
                     # The record's own connector/agent once the manager writes
                     # them; on the static path they are empty, so fall back to
@@ -358,11 +357,15 @@ class WatcherLifecycle:
         return result
 
     def _agent_name_for(self, watcher_name: str) -> str:
-        """Best-effort agent name for a record the manager has not stamped yet."""
-        for wc in self._watcher_configs:
-            if wc.name == watcher_name:
-                return wc.agent
-        return ""
+        """Best-effort agent name for a record the manager has not stamped yet.
+
+        Layered on `get_watcher_config` rather than walking `_watcher_configs`
+        again: `_require_watcher_config` records that the two lookups over that
+        list were collapsed into one, and a third copy here would quietly make
+        that note false.
+        """
+        wc = self.get_watcher_config(watcher_name)
+        return wc.agent if wc else ""
 
     def get_watcher_state(self, name: str):
         """Return the WatcherState for a watcher, or None if not found."""

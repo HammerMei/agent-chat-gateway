@@ -212,7 +212,10 @@ class TestListRowContents(IsolatedTestCase):
 
         self.assertEqual(row["room_id"], "cib3hjsrgpydtf6tyac7frcu6o")
         self.assertEqual(row["participants"], ["@alice", "@bob"])
-        self.assertEqual(row["room_kind"], "group_dm")
+        # No `room_kind` in the row: nothing reads it — not the table, not the
+        # control server — and a field with no consumer is the shape this
+        # series has already been corrected on twice.
+        self.assertNotIn("room_kind", row)
 
     async def test_a_nameless_room_falls_back_to_its_id(self):
         """A DM carries no room name, and the row still has to name the room."""
