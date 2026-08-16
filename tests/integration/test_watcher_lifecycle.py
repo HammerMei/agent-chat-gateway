@@ -18,14 +18,18 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.agents import AgentBackend
-from gateway.agents.response import AgentResponse
 from gateway.config import AgentConfig, WatcherConfig
 from gateway.connectors.script import ScriptConnector
 from gateway.core.config import CoreConfig
-from gateway.core.session_manager import SessionManager
 from gateway.core.state import WatcherState
-from tests.helpers import IsolatedTestCase
+from tests.helpers import (
+    CleanupTrackingAgent,
+    IsolatedTestCase,
+    MockAgentBackend,
+    make_lifecycle,
+    make_manager,
+    make_watcher,
+)
 
 # Patch load_state/save_state globally so tests never touch live state files.
 _patch_load_state = patch("gateway.core.state_store.load_state", return_value=[])
@@ -37,40 +41,6 @@ _patch_save_state = patch("gateway.core.state_store.save_state")
 
 
 pytestmark = pytest.mark.integration
-
-class MockAgentBackend(AgentBackend):
-    def __init__(self, responses=None, default_response="mock reply"):
-        self._responses = list(responses or [])
-        self._default_response = default_response
-        self.sent_messages = []
-        self._session_counter = 0
-
-    async def create_session(self, working_directory, extra_args=None, session_title=None):
-        self._session_counter += 1
-        return f"mock-session-{self._session_counter:04d}"
-
-    async def send(self, session_id, prompt, working_directory, timeout, attachments=None, env=None, append_system_prompt_file=None):
-        self.sent_messages.append({"prompt": prompt, "session_id": session_id, "attachments": attachments})
-        text = self._responses.pop(0) if self._responses else self._default_response
-        return AgentResponse(text=text)
-
-    async def ensure_durable_instructions(self, *a, **kw):
-        """Skip the default send()-based fallback so watcher startup doesn't
-        consume a canned response from self._responses — this test double is
-        for generic message-routing tests, not context-injection interactions
-        (see tests/integration/test_injected_context_builder.py for those)."""
-        return None
-
-
-class CleanupTrackingAgent(MockAgentBackend):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.deleted_sessions = []
-
-    async def delete_session(self, session_id: str) -> bool:
-        self.deleted_sessions.append(session_id)
-        return True
-
 
 class FailingUnsubscribeConnector(ScriptConnector):
     def __init__(self, failing_room: str):
@@ -84,30 +54,9 @@ class FailingUnsubscribeConnector(ScriptConnector):
             raise RuntimeError(f"boom for {room_id}")
 
 
-def make_watcher(room="script", name=None):
-    return WatcherConfig(
-        name=name or room, connector="script", room=room, agent="default"
-    )
-
-
-def make_manager(connector, agent, watcher_configs=None, permission_registry=None):
-    agent_cfg = AgentConfig(timeout=10)
-    config = CoreConfig(agents={"default": agent_cfg}, default_agent="default")
-    return SessionManager(
-        connector,
-        {"default": agent},
-        "default",
-        config,
-        watcher_configs=watcher_configs or [],
-        permission_registry=permission_registry,
-    )
-
-
 def _make_lifecycle_r14(watcher_names=None):
     """Build a minimal WatcherLifecycle with mocked collaborators."""
-    from gateway.core.config import CoreConfig
     from gateway.core.config import WatcherConfig as CoreWatcherConfig
-    from gateway.core.watcher_lifecycle import WatcherLifecycle
 
     if watcher_names is None:
         watcher_names = ["support"]
@@ -163,7 +112,7 @@ def _make_lifecycle_r14(watcher_names=None):
     maps.bind_session = MagicMock()
     maps.remove_session = MagicMock()
 
-    lifecycle = WatcherLifecycle.__new__(WatcherLifecycle)
+    lifecycle = make_lifecycle()
     lifecycle._connector = connector
     lifecycle._agents = {"default": agent}
     lifecycle._default_agent = "default"
@@ -174,10 +123,6 @@ def _make_lifecycle_r14(watcher_names=None):
     lifecycle._injector = injector
     lifecycle._permission_registry = None
     lifecycle._maps = maps
-    lifecycle._processors = {}
-    lifecycle._states = {}
-    lifecycle._watcher_locks = {}
-    lifecycle._blocked_agents = set()
 
     workspace = MagicMock()
     workspace.setup = MagicMock(return_value="/tmp/attachments")
@@ -193,9 +138,8 @@ class TestWatcherLifecycleLock(unittest.IsolatedAsyncioTestCase):
     """pause/resume/reset must be serialized per watcher via _get_watcher_lock."""
 
     def _make_lifecycle(self):
-        from gateway.core.watcher_lifecycle import WatcherLifecycle
 
-        lc = WatcherLifecycle.__new__(WatcherLifecycle)
+        lc = make_lifecycle()
         lc._connector = MagicMock()
         lc._agents = {}
         lc._default_agent = "default"
@@ -207,10 +151,6 @@ class TestWatcherLifecycleLock(unittest.IsolatedAsyncioTestCase):
         lc._permission_registry = None
         lc._maps = MagicMock()
         lc._attachment_workspace = MagicMock()
-        lc._blocked_agents = set()
-        lc._processors = {}
-        lc._states = {}
-        lc._watcher_locks = {}
         return lc
 
     def test_get_watcher_lock_creates_lock_lazily(self):
@@ -285,13 +225,8 @@ class TestAttachmentWorkspaceInThread(unittest.IsolatedAsyncioTestCase):
 
     async def test_setup_called_via_to_thread(self):
         """setup() must be wrapped in asyncio.to_thread(), not called directly."""
-        from gateway.core.watcher_lifecycle import WatcherLifecycle
 
-        lc = WatcherLifecycle.__new__(WatcherLifecycle)
-        lc._states = {}
-        lc._blocked_agents = set()
-        lc._processors = {}
-        lc._watcher_locks = {}
+        lc = make_lifecycle()
         # See the note on the other hand-built lifecycle: `holder()` is consulted
         # before provisioning now, and a bare MagicMock answers it truthily.
         lc._dispatcher = MagicMock(holder=MagicMock(return_value=None))
@@ -366,13 +301,8 @@ class TestAttachmentWorkspaceRollback(unittest.IsolatedAsyncioTestCase):
 
     async def test_states_and_maps_rolled_back_on_setup_failure(self):
         """If attachment_workspace.setup() raises, state and maps must be cleaned up."""
-        from gateway.core.watcher_lifecycle import WatcherLifecycle
 
-        lc = WatcherLifecycle.__new__(WatcherLifecycle)
-        lc._states = {}
-        lc._blocked_agents = set()
-        lc._processors = {}
-        lc._watcher_locks = {}
+        lc = make_lifecycle()
         # See the note on the other hand-built lifecycle: `holder()` is consulted
         # before provisioning now, and a bare MagicMock answers it truthily.
         lc._dispatcher = MagicMock(holder=MagicMock(return_value=None))
@@ -433,13 +363,8 @@ class TestContextInjectedResetOnSubscribeFailure(unittest.IsolatedAsyncioTestCas
 
     async def test_context_injected_reset_when_new_session_destroyed(self):
         """If new session is destroyed after subscribe fails, context_injected must be False."""
-        from gateway.core.watcher_lifecycle import WatcherLifecycle
 
-        lc = WatcherLifecycle.__new__(WatcherLifecycle)
-        lc._states = {}
-        lc._blocked_agents = set()
-        lc._processors = {}
-        lc._watcher_locks = {}
+        lc = make_lifecycle()
         lc._permission_registry = MagicMock()
         # Hand-built lifecycle: the dispatcher is consulted before the session is
         # provisioned now, to refuse a room another watcher already holds (§4.1).
@@ -505,13 +430,8 @@ class TestContextInjectedResetOnSubscribeFailure(unittest.IsolatedAsyncioTestCas
         property under test is unchanged: `ws.session_id` must not be blanked when the
         session was not this startup's to destroy.
         """
-        from gateway.core.watcher_lifecycle import WatcherLifecycle
 
-        lc = WatcherLifecycle.__new__(WatcherLifecycle)
-        lc._states = {}
-        lc._blocked_agents = set()
-        lc._processors = {}
-        lc._watcher_locks = {}
+        lc = make_lifecycle()
         lc._permission_registry = MagicMock()
         # Hand-built lifecycle: the dispatcher is consulted before the session is
         # provisioned now, to refuse a room another watcher already holds (§4.1).
@@ -719,9 +639,8 @@ class TestSyncWatchersPreservesBlockedAgents(unittest.IsolatedAsyncioTestCase):
     """sync_watchers(unavailable_agents=None) must not reset _blocked_agents."""
 
     def _make_lifecycle(self):
-        from gateway.core.watcher_lifecycle import WatcherLifecycle
 
-        lc = WatcherLifecycle.__new__(WatcherLifecycle)
+        lc = make_lifecycle()
         lc._connector = MagicMock()
         lc._agents = {"default": MagicMock()}
         lc._default_agent = "default"
@@ -734,10 +653,6 @@ class TestSyncWatchersPreservesBlockedAgents(unittest.IsolatedAsyncioTestCase):
         lc._injector = MagicMock()
         lc._permission_registry = None
         lc._maps = MagicMock()
-        lc._processors = {}
-        lc._states = {}
-        lc._watcher_locks = {}
-        lc._blocked_agents = set()
         lc._attachment_workspace = MagicMock()
         return lc
 
@@ -772,7 +687,6 @@ class TestSyncWatchersPreservesBlockedAgents(unittest.IsolatedAsyncioTestCase):
     async def test_first_call_with_none_starts_with_empty_set(self):
         """On first startup (previously empty), None leaves _blocked_agents empty."""
         lc = self._make_lifecycle()
-        lc._blocked_agents = set()
 
         await lc.sync_watchers(unavailable_agents=None)
 
@@ -987,16 +901,11 @@ class TestOneLookupOneFailureSemantic(unittest.IsolatedAsyncioTestCase):
 
     def _lifecycle(self, names=("w1",)):
         from gateway.core.config import WatcherConfig
-        from gateway.core.watcher_lifecycle import WatcherLifecycle
 
-        lc = WatcherLifecycle.__new__(WatcherLifecycle)
+        lc = make_lifecycle()
         lc._watcher_configs = [
             WatcherConfig(name=n, connector="rc", room=n, agent="a") for n in names
         ]
-        lc._states = {}
-        lc._blocked_agents = set()
-        lc._watcher_locks = {}
-        lc._processors = {}
         return lc
 
     def test_the_optional_reader_returns_none(self):

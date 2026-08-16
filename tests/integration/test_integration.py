@@ -12,12 +12,10 @@ from __future__ import annotations
 import asyncio
 import unittest
 from pathlib import Path
-from typing import Any
 from unittest.mock import patch
 
 import pytest
 
-from gateway.agents import AgentBackend
 from gateway.agents.response import AgentResponse
 from gateway.config import WatcherConfig
 from gateway.connectors.script import ScriptConnector
@@ -25,6 +23,7 @@ from gateway.core.config import CoreConfig
 from gateway.core.connector import UserRole
 from gateway.core.session_manager import SessionManager
 from gateway.core.state import StateFilter
+from tests.helpers import MockAgentBackend, make_manager, make_watcher
 
 # Patch load_state globally so tests never touch the live ~/.agent-chat-gateway/state.json.
 # Each test creates a fresh SessionManager; we don't want persisted production state
@@ -50,120 +49,6 @@ class IsolatedTestCase(unittest.IsolatedAsyncioTestCase):
 
 
 # ── Mock agent backend ─────────────────────────────────────────────────────────
-
-
-class MockAgentBackend(AgentBackend):
-    """Configurable canned-response agent for testing.
-
-    Usage::
-
-        agent = MockAgentBackend(responses=["Hello!", "World!"])
-        # First send() returns "Hello!", second returns "World!", etc.
-        # If responses run out, returns default_response.
-
-    Set agent.side_effect to an exception class to simulate errors::
-
-        agent.side_effect = asyncio.TimeoutError
-    """
-
-    def __init__(
-        self,
-        responses: list[str] | None = None,
-        default_response: str = "mock reply",
-    ) -> None:
-        self._responses = list(responses or [])
-        self._default_response = default_response
-        self.side_effect: type[Exception] | None = None
-
-        # Captured call records for assertions
-        self.created_sessions: list[dict[str, Any]] = []
-        self.sent_messages: list[dict[str, Any]] = []
-
-        self._session_counter = 0
-
-    async def create_session(
-        self,
-        working_directory: str,
-        extra_args: list[str] | None = None,
-        session_title: str | None = None,
-    ) -> str:
-        self._session_counter += 1
-        session_id = f"mock-session-{self._session_counter:04d}"
-        self.created_sessions.append(
-            {
-                "session_id": session_id,
-                "working_directory": working_directory,
-                "extra_args": extra_args,
-                "session_title": session_title,
-            }
-        )
-        return session_id
-
-    async def send(
-        self,
-        session_id: str,
-        prompt: str,
-        working_directory: str,
-        timeout: int,
-        attachments: list[str] | None = None,
-        env: dict[str, str] | None = None,
-        append_system_prompt_file: str | None = None,
-    ) -> AgentResponse:
-        self.sent_messages.append(
-            {
-                "session_id": session_id,
-                "prompt": prompt,
-                "working_directory": working_directory,
-                "timeout": timeout,
-                "attachments": attachments,
-                "env": env,
-            }
-        )
-
-        if self.side_effect is not None:
-            raise self.side_effect()
-
-        text = self._responses.pop(0) if self._responses else self._default_response
-        return AgentResponse(text=text)
-
-    async def ensure_durable_instructions(self, *a, **kw):
-        """Skip the default send()-based fallback so watcher startup doesn't
-        consume a canned response from self._responses — this test double is
-        for generic message-routing tests, not context-injection interactions
-        (see tests/integration/test_injected_context_builder.py for those)."""
-        return None
-
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-
-def make_watcher(room: str = "script", name: str | None = None) -> WatcherConfig:
-    """Return a WatcherConfig pointing at the given room (uses ScriptConnector convention)."""
-    return WatcherConfig(
-        name=name or room,
-        connector="script",
-        room=room,
-        agent="default",
-    )
-
-
-def make_manager(
-    connector: ScriptConnector,
-    agent: MockAgentBackend,
-    timeout: int = 10,
-    watcher_configs: list[WatcherConfig] | None = None,
-) -> SessionManager:
-    from gateway.config import AgentConfig
-
-    agent_cfg = AgentConfig(timeout=timeout)
-    config = CoreConfig(agents={"default": agent_cfg}, default_agent="default")
-    return SessionManager(
-        connector,
-        {"default": agent},
-        "default",
-        config,
-        watcher_configs=watcher_configs or [],
-    )
 
 
 def _watcher_info(manager: SessionManager, name: str) -> dict | None:
@@ -955,7 +840,6 @@ class TestMultiWatcherDispatch(unittest.IsolatedAsyncioTestCase):
         """RocketChatConnector.send_text should pass text_chunk_limit through outbound helper."""
         from unittest.mock import AsyncMock
 
-        from gateway.agents.response import AgentResponse
 
         connector = self._make_connector()
         connector._rest.post_message = AsyncMock()

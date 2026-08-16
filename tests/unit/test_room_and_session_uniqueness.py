@@ -25,6 +25,7 @@ from gateway.core.state import (
     connector_name_of,
     save_state,
 )
+from tests.helpers import make_lifecycle
 
 
 class TestOneSessionOneRoom(unittest.TestCase):
@@ -381,36 +382,30 @@ class TestARefusedBindingLeavesNothingBehind(unittest.IsolatedAsyncioTestCase):
         from unittest.mock import AsyncMock
 
         from gateway.core.config import AgentConfig, CoreConfig, WatcherConfig
-        from gateway.core.watcher_lifecycle import WatcherLifecycle
-
-        lc = WatcherLifecycle.__new__(WatcherLifecycle)
-        lc._states = {}
-        lc._blocked_agents = set()
-        lc._processors = {}
-        lc._watcher_locks = {}
-        lc._permission_registry = MagicMock()
-        lc._dispatcher = MagicMock(holder=MagicMock(return_value=None))
-
         maps = MagicMock()
         maps.bind_session = MagicMock(side_effect=SessionAlreadyBoundError("taken"))
         maps.remove_session = MagicMock()
-        lc._maps = maps
 
         room = MagicMock(id="room_1", type="channel", name="general")
         connector = MagicMock()
         connector.resolve_room = AsyncMock(return_value=room)
-        lc._connector = connector
 
         agent = MagicMock()
         agent.create_session = AsyncMock(return_value="fresh-session")
         agent.delete_session = AsyncMock(return_value=True)
-        lc._agents = {"a1": agent}
-        lc._default_agent = "a1"
-        lc._config = CoreConfig(
-            agents={"a1": AgentConfig(name="a1", working_directory="/tmp")},
+
+        lc = make_lifecycle(
+            connector=connector,
+            agents={"a1": agent},
             default_agent="a1",
+            config=CoreConfig(
+                agents={"a1": AgentConfig(name="a1", working_directory="/tmp")},
+                default_agent="a1",
+            ),
+            dispatcher=MagicMock(holder=MagicMock(return_value=None)),
+            permission_registry=MagicMock(),
+            maps=maps,
         )
-        lc._injector = MagicMock()
         wc = WatcherConfig(name="w1", connector="rc", room="general", agent="a1")
 
         with self.assertRaises(SessionAlreadyBoundError):
@@ -483,30 +478,18 @@ class TestAClearedWatermarkSurvivesToDisk(unittest.IsolatedAsyncioTestCase):
     def _lifecycle(self, live_ts):
         from unittest.mock import AsyncMock
 
-        from gateway.core.watcher_lifecycle import WatcherLifecycle
-
-        lc = WatcherLifecycle.__new__(WatcherLifecycle)
-        # A processor, because every caller of `_stop_processor` is stopping a
-        # watcher this process was serving — and the capture is now gated on
-        # that. The cursor the connector holds belongs to the *room*, so a
-        # record with no processor may be naming a room some other watcher is
-        # serving, and copying that room's position into it would hand this
-        # watcher progress it never made. A record in `_states` with no
-        # processor is not a state the stop paths produce.
-        processor = MagicMock()
-        processor.stop = AsyncMock()
-        lc._processors = {"w1": processor}
-        lc._states = {}
-        lc._blocked_agents = set()
-        lc._dispatcher = MagicMock()
-        lc._permission_registry = MagicMock()
-        lc._maps = MagicMock()
-        lc._injector = MagicMock()
-        lc._watcher_locks = {}
         connector = MagicMock()
         connector.get_last_processed_ts = MagicMock(return_value=live_ts)
         connector.unsubscribe_room = AsyncMock()
-        lc._connector = connector
+
+        lc = make_lifecycle(connector=connector, permission_registry=MagicMock())
+        # A processor, because every caller of `_stop_processor` is stopping a
+        # watcher this process was serving. A record in `_states` with no
+        # processor is not a state the stop paths produce, and a fixture that
+        # builds one tests something the system cannot do.
+        processor = MagicMock()
+        processor.stop = AsyncMock()
+        lc._processors["w1"] = processor
         return lc
 
     def _state(self):

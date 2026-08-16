@@ -1,9 +1,28 @@
-"""Shared test helpers for agent-chat-gateway test suite."""
+"""Shared test helpers.
+
+**Fixtures live here by default** (see `CLAUDE.md`, *Test Fixtures Are Shared By
+Default*). A local copy in one suite is the exception and needs a reason in the
+same breath — "it is small" is not one, because small fixtures duplicate just as
+expensively. Adding one attribute to `WatcherLifecycle` once broke nineteen
+tests at a stroke, every one of them a hand-built object missing a field no real
+instance can lack.
+
+The builders below run the **real constructors** and take keyword overrides for
+the collaborators a test needs to substitute. That is the point: an object built
+through `__init__` cannot be in a state no code path can produce, so it fails
+where it is wrong rather than three layers away.
+"""
 
 from __future__ import annotations
 
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+from gateway.agents import AgentBackend
+from gateway.agents.response import AgentResponse
+from gateway.config import AgentConfig, WatcherConfig
+from gateway.core.config import CoreConfig
+from gateway.core.session_manager import SessionManager
 
 # Patch load_state/save_state globally so tests never touch live state files.
 _patch_load_state = patch("gateway.core.state_store.load_state", return_value=[])
@@ -16,3 +35,170 @@ class IsolatedTestCase(unittest.IsolatedAsyncioTestCase):
         _patch_save_state.start()
         self.addCleanup(_patch_load_state.stop)
         self.addCleanup(_patch_save_state.stop)
+
+
+class MockAgentBackend(AgentBackend):
+    """The shared agent double: canned responses, recorded calls, optional error.
+
+    A superset of the three near-identical copies it replaces, so no caller
+    loses anything::
+
+        agent = MockAgentBackend(responses=["Hello!", "World!"])
+        agent.side_effect = asyncio.TimeoutError   # make send() raise
+        agent.sent_messages[0]["prompt"]
+        agent.created_sessions[0]["working_directory"]
+    """
+
+    def __init__(self, responses=None, default_response: str = "mock reply") -> None:
+        self._responses = list(responses or [])
+        self._default_response = default_response
+        self.side_effect: type[Exception] | None = None
+
+        # Captured call records for assertions.
+        self.created_sessions: list[dict] = []
+        self.sent_messages: list[dict] = []
+        self.deleted_sessions: list[str] = []
+
+        self._session_counter = 0
+
+    async def create_session(
+        self, working_directory, extra_args=None, session_title=None
+    ) -> str:
+        self._session_counter += 1
+        session_id = f"mock-session-{self._session_counter:04d}"
+        self.created_sessions.append(
+            {
+                "session_id": session_id,
+                "working_directory": working_directory,
+                "extra_args": extra_args,
+                "session_title": session_title,
+            }
+        )
+        return session_id
+
+    async def send(
+        self, session_id, prompt, working_directory, timeout,
+        attachments=None, env=None, append_system_prompt_file=None,
+    ) -> AgentResponse:
+        self.sent_messages.append(
+            {
+                "session_id": session_id,
+                "prompt": prompt,
+                "working_directory": working_directory,
+                "timeout": timeout,
+                "attachments": attachments,
+                "env": env,
+            }
+        )
+        if self.side_effect is not None:
+            raise self.side_effect()
+        text = self._responses.pop(0) if self._responses else self._default_response
+        return AgentResponse(text=text)
+
+    async def ensure_durable_instructions(self, *a, **kw):
+        """Skip the default send()-based fallback, so watcher startup does not
+        consume a canned response. A test exercising context injection should
+        override this rather than rely on it (see
+        tests/integration/test_injected_context_builder.py)."""
+        return None
+
+
+class CleanupTrackingAgent(MockAgentBackend):
+    """`MockAgentBackend` that also *confirms* session deletion.
+
+    Kept separate on purpose. `AgentBackend.delete_session` returns `False` by
+    default — "deletion is unsupported or could not be confirmed" — and startup
+    rollback branches on that: an unconfirmed delete keeps the session and its
+    injection flag for the next attempt. Folding confirmation into the generic
+    double would quietly move every rollback test onto the other branch while
+    still passing, which is exactly the "reuse must not fuse two independent
+    things" case in CLAUDE.md.
+    """
+
+    async def delete_session(self, session_id: str) -> bool:
+        self.deleted_sessions.append(session_id)
+        return True
+
+
+def make_watcher(room="script", name=None, connector="script", agent="default", **kw):
+    """A `WatcherConfig` with the fields most tests do not care about filled in."""
+    return WatcherConfig(
+        name=name or room, connector=connector, room=room, agent=agent, **kw
+    )
+
+
+def make_core_config(timeout: int = 10, agents=None, default_agent="default", **kw):
+    """A `CoreConfig` with one agent, which is what most tests need."""
+    return CoreConfig(
+        agents=agents or {default_agent: AgentConfig(timeout=timeout)},
+        default_agent=default_agent,
+        **kw,
+    )
+
+
+def make_manager(
+    connector=None,
+    agent=None,
+    *,
+    watcher_configs=None,
+    timeout: int = 10,
+    permission_registry=None,
+    state_name: str = "default",
+    agents=None,
+    default_agent: str = "default",
+    config=None,
+    **kw,
+) -> SessionManager:
+    """A `SessionManager` wired to one connector and one agent.
+
+    Replaces three near-identical copies that differed only by which of
+    `timeout`, `permission_registry` and `state_name` they exposed.
+    """
+    from gateway.connectors.script import ScriptConnector
+
+    connector = ScriptConnector() if connector is None else connector
+    agent = MockAgentBackend() if agent is None else agent
+    return SessionManager(
+        connector,
+        agents or {default_agent: agent},
+        default_agent,
+        config or make_core_config(timeout=timeout, default_agent=default_agent),
+        state_name=state_name,
+        watcher_configs=watcher_configs or [],
+        permission_registry=permission_registry,
+        **kw,
+    )
+
+
+def make_lifecycle(**overrides):
+    """A real `WatcherLifecycle` with a double for every collaborator.
+
+    Built through `__init__`, deliberately: the thirteen hand-rolled
+    `WatcherLifecycle.__new__(...)` fixtures this replaces each assigned their
+    own subset of attributes, so every new field broke all of them at once and
+    each was free to omit one and produce a state no code path can reach.
+
+    Pass a keyword for anything the test actually exercises; everything else is
+    a `MagicMock` that will fail loudly if the test unexpectedly depends on it.
+    """
+    from gateway.core.watcher_lifecycle import WatcherLifecycle
+
+    defaults = {
+        "connector": MagicMock(),
+        "agents": {},
+        "default_agent": "default",
+        "config": make_core_config(),
+        "watcher_configs": [],
+        # `load()` must return a real empty mapping, not a MagicMock. A bare
+        # mock's `.get(name)` is truthy, so `sync_watchers` reads every watcher
+        # as paused, starts none of them, and returns no errors — a lifecycle
+        # test built on that passes without exercising startup at all, which is
+        # the precise failure this file exists to prevent.
+        "state_store": MagicMock(load=MagicMock(return_value={})),
+        "dispatcher": MagicMock(),
+        "injector": MagicMock(),
+        "permission_registry": None,
+        "maps": MagicMock(),
+    }
+    defaults.update(overrides)
+    return WatcherLifecycle(**defaults)
