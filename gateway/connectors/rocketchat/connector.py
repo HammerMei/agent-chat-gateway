@@ -14,6 +14,7 @@ connector only through the Connector ABC defined in gateway.core.connector.
 
 from __future__ import annotations
 
+import asyncio
 import collections
 import logging
 import re
@@ -128,6 +129,21 @@ class _RoomSubscription(ReplayWindow):
         # overwritten and a restart cannot hand the pre-removal mark back.
         self.last_processed_ts = ""
         self.membership_epoch += 1
+
+    def forget(self, msg_id: str) -> None:
+        """Undo `remember`, for a message that turned out not to be handled.
+
+        The mirror of `remember`, and a method for the same reason: the deque and the set
+        have to move together. This existed inline at the hand-back site and nowhere else,
+        so every later "actually, nobody handled that one" had to rediscover it.
+        """
+        if not msg_id:
+            return
+        self.seen_ids_set.discard(msg_id)
+        try:
+            self.seen_ids.remove(msg_id)
+        except ValueError:
+            pass
 
     def remember(self, msg_id: str) -> None:
         """Record a message id as handled, evicting the oldest past the bound.
@@ -1610,10 +1626,20 @@ class RocketChatConnector(Connector):
         # room state changes; a preflight-rejected message was already recorded
         # above so the duplicate add here is a no-op for that branch).
         #
-        # Consequence: if normalize or handler raises, msg_id stays in seen_ids
-        # and the message will NOT be replayed.  This is intentional — a message
-        # that fails normalization is almost certainly malformed and would fail
-        # again on replay, causing a poison-pill replay storm on every reconnect.
+        # Consequence: if normalize or handler *raises*, msg_id stays in seen_ids and the
+        # message will NOT be replayed. That is intentional — a message that fails
+        # normalization would likely fail again on replay, causing a poison-pill storm on
+        # every reconnect.
+        #
+        # Only half of that reasoning survives inspection, and it is recorded here rather
+        # than quietly acted on: `normalize_rc_message`'s first await is an attachment
+        # *download*, so a failure there can be the network rather than the message. The
+        # trade is a poison pill on every reconnect against losing a message whose
+        # attachment fetch failed once. Left as it stands, deliberately, pending a decision
+        # — not because the current answer is obviously right.
+        #
+        # **Cancellation is not covered by that reasoning at all** and is handled below:
+        # being interrupted says nothing about the message, so the registration is undone.
         sub.remember(msg_id)
 
         # --- Normalize (once per message) ---
@@ -1641,6 +1667,17 @@ class RocketChatConnector(Connector):
                 agent_chain_turn=result.agent_chain_turn,
                 agent_chain_max_turns=result.agent_chain_max_turns,
             )
+        except asyncio.CancelledError:
+            # Not a verdict on the message — this delivery was interrupted. The
+            # optimistic registration above is undone so a replay can bring it back;
+            # left in place, the next replay skips it at the dedup check, counts the skip
+            # as handled, and closes the outage window over a message nobody ever saw.
+            #
+            # `CancelledError` is a `BaseException`, so the arm below never covered this,
+            # and a recovery cancelling the one it displaces is an ordinary event here.
+            sub.forget(msg_id)
+            self._release_unused_turn(doc, result, turn_generation, "cancelled")
+            raise
         except Exception as e:
             logger.error("Failed to normalize message: %s", e)
             self._release_unused_turn(doc, result, turn_generation, "normalize failed")
@@ -1652,6 +1689,12 @@ class RocketChatConnector(Connector):
         # --- Hand off to core (the dispatcher routes to the room's processor) ---
         try:
             accepted = await self._handler(msg)
+        except asyncio.CancelledError:
+            # Same reason as the normalize arm above: an interruption is not a decision
+            # about the message.
+            sub.forget(msg_id)
+            self._release_unused_turn(doc, result, turn_generation, "cancelled")
+            raise
         except Exception as e:
             logger.error("Handler error for message from %s: %s", result.sender, e)
             self._release_unused_turn(doc, result, turn_generation, "handler raised")
@@ -1669,12 +1712,7 @@ class RocketChatConnector(Connector):
             # have drained by the time the next reconnect fires.
             # We discard from the set and remove the single deque entry to keep
             # them in sync; the O(N) deque.remove is acceptable at N ≤ 200.
-            if msg_id:
-                sub.seen_ids_set.discard(msg_id)
-                try:
-                    sub.seen_ids.remove(msg_id)
-                except ValueError:
-                    pass
+            sub.forget(msg_id)
             # Pin the outage window at "before this message", because forgetting the id is
             # not enough on its own to bring it back. The watermark has not advanced past
             # it — that only happens on acceptance — but the *next* accepted message moves
