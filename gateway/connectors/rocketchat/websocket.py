@@ -981,8 +981,16 @@ class RCWebSocketClient:
         an older one is handed back, the older hand-back claims a boundary
         already past the message it is trying to preserve.
 
-        So the ordering guarantee lives here, in the transport, and the creation
+        So the **serialisation** lives here, in the transport, and the creation
         path asks for delivery instead of performing it.
+
+        Serialisation is not ordering, and the difference matters: the queue
+        guarantees that two deliveries for one room never run at once, not that
+        they run in timestamp order. An older frame handed over from the routing
+        queue still lands *behind* a newer one that arrived live, and the filter
+        then rejects it as already processed. It is lost either way — the
+        residue the coalescing already accepts — but deterministically rather
+        than racily, and without a hand-back claiming a boundary past itself.
         """
         # Lazily create per-room queue and worker on first message.
         # Also re-create if the previous worker died (e.g. after reconnect).
@@ -1021,7 +1029,14 @@ class RCWebSocketClient:
         except asyncio.QueueFull:
             state = self._subscription_states.get(room_id)
             if state is None:
-                state = SubscriptionState(room_id=room_id, callback=callback)
+                # Falls back to the registered callback rather than to None: this is
+                # the first caller that can arrive without one, and `SubscriptionState`
+                # declares the field non-optional. Nothing reads it today, which is
+                # exactly why a wrong value here would go unnoticed.
+                state = SubscriptionState(
+                    room_id=room_id,
+                    callback=callback or self._callbacks.get(room_id),
+                )
                 self._subscription_states[room_id] = state
             state.dropped_messages += 1
             if state.status not in {"failed", "reconnecting"}:
@@ -1093,6 +1108,20 @@ class RCWebSocketClient:
                 # so this needs no fallback, and an earlier version that had the fallback
                 # only in the fan-out discarded every routing frame at exactly this line.
                 callback = self._callbacks.get(room_id)
+                if callback is None:
+                    # Not unreachable any more. `_handle_room_message` only ever
+                    # enqueued after finding a callback, so the absence used to be
+                    # impossible here; `deliver_to_room` is now also called by the
+                    # creation path, which tests `connector._rooms` — a *different*
+                    # map, populated before the callback when the per-room subscribe
+                    # has to wait for the server to confirm. Losing the frame is the
+                    # documented trade (the room has no watcher able to take it yet);
+                    # losing it without a word is not.
+                    logger.warning(
+                        "Room %s: dropping a queued message — no callback is "
+                        "registered for this room (it may still be subscribing)",
+                        room_id[:8],
+                    )
                 if callback:
                     async with self._callback_sem:
                         # Semaphore acquired; doc is now being dispatched.

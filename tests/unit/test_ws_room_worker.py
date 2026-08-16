@@ -504,3 +504,97 @@ class TestDeliverToRoom(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(seen, ["m1", "m2"])
         await ws.stop()
+
+
+class TestTheCreationPathJoinsTheRoomsQueue(unittest.IsolatedAsyncioTestCase):
+    """The seam, driven end to end through a real `RCWebSocketClient`.
+
+    The connector test asserts the hand-off and `TestDeliverToRoom` asserts the
+    queue serialises — but each is on one side of the boundary, and a revert
+    could satisfy both halves separately while losing the property. This drives
+    a frame through `_on_unrouted_message` into a room whose queue is already
+    busy, which is the situation the step exists for.
+    """
+
+    def _connector_with_real_transport(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from gateway.connectors.rocketchat.connector import (
+            RocketChatConnector,
+            _RoomSubscription,
+        )
+        from gateway.connectors.rocketchat.websocket import RCWebSocketClient
+        from gateway.core.connector import Room
+
+        c = RocketChatConnector.__new__(RocketChatConnector)
+        c._ws = RCWebSocketClient(
+            server_url="http://localhost:3000", username="t", password="t"
+        )
+        c._rooms = {
+            "r1": _RoomSubscription(room=Room(id="r1", name="general", type="channel"))
+        }
+        c._rooms_being_routed = set()
+        async def _noop_router(room, trigger):
+            pass
+
+        c._router = _noop_router
+        c._rest = MagicMock(user_id="bot-id")
+        c._config = MagicMock(require_mention=False, filter_sender=False)
+        c._on_raw_ddp_message = AsyncMock(return_value=True)
+        return c
+
+    async def test_a_frame_lands_behind_what_is_already_queued_and_never_overlaps(self):
+        c = self._connector_with_real_transport()
+        seen: list[str] = []
+        overlapping = False
+
+        async def cb(doc, access=None):
+            nonlocal overlapping
+            if seen and seen[-1].endswith("-start"):
+                overlapping = True
+            seen.append(f"{doc['_id']}-start")
+            await asyncio.sleep(0.02)
+            seen.append(doc["_id"])
+
+        c._ws.register_room_callback("r1", cb)
+        # Already in flight when the routing worker gets there.
+        c._ws.deliver_to_room("r1", {"_id": "queued"}, None)
+        await asyncio.sleep(0)
+
+        await c._on_unrouted_message(
+            {"_id": "routed", "rid": "r1", "msg": "hi",
+             "u": {"username": "alice"}, "ts": {"$date": 500}},
+            {"roomParticipant": True, "roomType": "c", "roomName": "general"},
+        )
+        await asyncio.sleep(0.2)
+
+        self.assertFalse(overlapping, "two deliveries for one room ran at once")
+        self.assertEqual(
+            [s for s in seen if not s.endswith("-start")], ["queued", "routed"],
+            "the handed-off frame must land behind what was already queued",
+        )
+        # And not around the queue.
+        c._on_raw_ddp_message.assert_not_awaited()
+        await c._ws.stop()
+
+    async def test_a_frame_for_a_room_with_no_callback_is_dropped_audibly(self):
+        """The window this step opened: `connector._rooms` and the transport's
+        callback map are populated at different moments when a per-room subscribe
+        has to wait for the server. Losing the frame is the accepted trade; losing
+        it silently is not.
+        """
+        c = self._connector_with_real_transport()
+        # Tracked by the connector, not yet by the transport.
+        self.assertNotIn("r1", c._ws._callbacks)
+
+        with self.assertLogs(
+            "agent-chat-gateway.connectors.rocketchat.ws", level="WARNING"
+        ) as logs:
+            c._ws.deliver_to_room("r1", {"_id": "m1"}, None)
+            await asyncio.sleep(0.05)
+
+        self.assertTrue(
+            any("no callback is registered" in line for line in logs.output),
+            f"the drop was not reported: {logs.output}",
+        )
+        await c._ws.stop()

@@ -794,9 +794,11 @@ class RocketChatConnector(Connector):
             #
             # **Onto the room's worker, not around it.** This runs on one of several
             # routing workers, so dispatching here directly puts concurrent deliveries
-            # into a room whose whole ordering guarantee is that one queue serialises
-            # them — and an older frame handed back after a newer one committed claims
-            # a boundary already past itself.
+            # into a room whose whole guarantee is that one queue serialises them.
+            # Serialising does not reorder: an older frame still lands behind a newer
+            # one that arrived live, and the filter rejects it as already processed.
+            # What it prevents is the two running at once, and a hand-back from the
+            # older one claiming a boundary already past itself.
             self._ws.deliver_to_room(room_id, doc, access)
             return
         if room_id in self._rooms_being_routed:
@@ -833,9 +835,11 @@ class RocketChatConnector(Connector):
             # the capacity preflight — and so does its ordering. Creating a watcher and
             # answering unprompted are separate decisions, and this keeps them separate.
             #
-            # The worker demonstrably exists by now, which makes this the clearest of the
-            # bypasses: a newer frame entering it meanwhile could otherwise advance the
-            # cursor past this one, or reach the handler concurrently with it.
+            # The worker demonstrably exists by now, which makes this the clearest of
+            # the bypasses: a newer frame entering it meanwhile could otherwise reach
+            # the handler concurrently with this one. (It can still be *ahead* of this
+            # one in the queue — serialising is not reordering — in which case this
+            # frame is filtered as already processed rather than dispatched twice.)
             if room_id in self._rooms:
                 self._ws.deliver_to_room(room_id, doc, access)
         finally:
