@@ -485,7 +485,16 @@ class TestAClearedWatermarkSurvivesToDisk(unittest.IsolatedAsyncioTestCase):
         from gateway.core.watcher_lifecycle import WatcherLifecycle
 
         lc = WatcherLifecycle.__new__(WatcherLifecycle)
-        lc._processors = {}
+        # A processor, because every caller of `_stop_processor` is stopping a
+        # watcher this process was serving — and the capture is now gated on
+        # that. The cursor the connector holds belongs to the *room*, so a
+        # record with no processor may be naming a room some other watcher is
+        # serving, and copying that room's position into it would hand this
+        # watcher progress it never made. A record in `_states` with no
+        # processor is not a state the stop paths produce.
+        processor = MagicMock()
+        processor.stop = AsyncMock()
+        lc._processors = {"w1": processor}
         lc._states = {}
         lc._dispatcher = MagicMock()
         lc._permission_registry = MagicMock()

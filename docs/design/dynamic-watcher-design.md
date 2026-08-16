@@ -675,7 +675,7 @@ it rather than embedding it.
 |---|---|---|---|
 | **active** | processor + session | record | first message in a matching room; or recreation from an idle record |
 | **idle** | nothing | record, incl. session id, watermark, `dropped_at` | no activity for `session_idle_days`; or the bot being added to a matching room (§2.7) |
-| **failed** | nothing | record, no `dropped_at` | a start or recreation that got far enough to write a record and then raised |
+| **failed** | nothing | record, no `dropped_at` | a start that left a record behind and did not finish — see below for exactly which failures those are |
 | **expired** | nothing | nothing (logged) | idle for `session_expire_days`; or the bot being removed from the room |
 | **paused** | nothing | record, `paused=True` | operator only |
 
@@ -685,16 +685,33 @@ message.
 
 #### `failed`: a record that wants to be resident and is not
 
-A start writes its record partway through — before the room subscription, the
-attachment workspace and the processor — precisely so that a later failure does
-not lose the session id or the injection flag. The consequence is a record that
-is **not paused, not dropped, and not running**, and calling that `active` tells
+A start writes its record partway through, before the room subscription and the
+processor, so that a subscription failure does not lose the session id or the
+injection flag. The consequence is a record that is **not paused, not dropped,
+and not running**, and calling that `active` tells
 an operator the opposite of what happened. This design previously noticed the
 same shape from the other side, while arguing that `dropped_at` cannot be
 inferred from `room_id`: *"the subscribe-failure rollback deliberately keeps a
 record with `room_id` populated, so a start failure is indistinguishable from a
 healthy record by that field."* It is a fifth state, and naming it is cheaper
 than the operator confusion of not naming it.
+
+**Which failures reach it, precisely.** "After the record is written" is *not*
+the dividing line, and stating it that way was wrong: three of the four rollback
+paths delete the record again, deliberately, so that a half-built one cannot be
+resumed as though it were whole. Only these produce `failed`:
+
+| Failure | Record | Shows as |
+|---|---|---|
+| room subscription, or the room claim | kept on purpose — session id and injection flag survive for the next attempt | `failed` |
+| the agent was unavailable at boot, and an **earlier** boot left a record | untouched on disk | `failed` |
+| session-map bind, context injection, attachment workspace | deleted by their own rollbacks | **no row** |
+| room resolution, session creation, or an unavailable agent on a first-ever start | never written | **no row** |
+
+So `failed` means "a record survives and nothing is running for it", and the
+absence of a row does **not** mean the start never got far — it means there is no
+state to act on. Any operator-facing text offering the before/after-the-record
+rule as exhaustive is wrong.
 
 **It is derived, not stored.** The record says what the gateway *wants* — a
 watcher should be resident for this room; residency says what *is*. `failed` is
@@ -753,8 +770,13 @@ this whole section exists to remove — a broken watcher that looks fine.
 
 ##### What the verbs do to it
 
-* `resume` and `reset` retry the start; that is already their behaviour, and
-  they are the in-place recovery once the underlying fault is fixed.
+* `resume` and `reset` retry the start, which is the in-place recovery for a
+  fault outside the gateway — a room that had gone, a server that was down.
+  **Neither can recover an unavailable agent.** Availability is decided once, at
+  boot, and both verbs refuse fail-closed on it rather than starting a watcher
+  with no permission broker. Restarting the daemon is the only thing that
+  re-evaluates it, and operator-facing text has to say so rather than offering
+  `resume` as the general answer.
 * `pause` mutes it, and the resulting `paused=True` is what stops boot from
   retrying — the honest way to say "stop trying this one for now", as against
   the system deciding that for itself.
@@ -762,10 +784,9 @@ this whole section exists to remove — a broken watcher that looks fine.
   recreated on demand. A start that keeps failing therefore surfaces as a
   failure to the caller rather than as a silently unrouted room.
 
-This also answers the question left open under *Boot recreates active records
-only*: **one watcher failing skips that watcher**, and the partial state it
-leaves is no longer a problem to be avoided, because that state now has a name
-and is visible in `list`.
+This is also what lets *Boot is serial, deliberately* (below) settle its own
+open question: a watcher failing at boot can simply be skipped, because the
+state it leaves is now named rather than indistinguishable from a healthy one.
 
 **Paused is a real state and is never reclaimed by a timer** — not idled, not
 expired. Once config no longer names rooms, pause is the only durable way to
@@ -825,8 +846,9 @@ fetch and the full model turn that delivers it.
 Boot's common case is therefore the cheap one. Parallelising is a small
 change when wanted — each start is independent and takes its own per-room
 lock — which is the argument for deferring it rather than pre-building it.
-What must be decided before boot recreation ships: whether one watcher
-failing aborts boot, skips that watcher, or can leave partial state.
+One watcher failing **skips that watcher** and boot continues; the partial
+state it leaves is no longer something to avoid, because it now has a name
+(`failed`, above) and is visible in `list`.
 
 **Expiry reclaims everything**, or it leaves bookkeeping behind: the state
 record, the backend session, injector retry state, session maps, the

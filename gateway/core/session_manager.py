@@ -291,8 +291,14 @@ class SessionManager:
             # the rows that it was answered with a different one.
             try:
                 state_filter = parse_state_filter(request.get("states"))
-            except ValueError as e:
-                return {"ok": False, "error": str(e)}
+            except (ValueError, TypeError) as e:
+                # TypeError too: `parse_state_filter` iterates what it is given,
+                # and a hand-written socket client can send `"states": 5`. The
+                # CLI always sends a list, so this arm is unreachable from it —
+                # but escaping as a TypeError turns a bad request into a
+                # per-connector "failed to list watchers", which reads as the
+                # daemon being broken rather than the request being wrong.
+                return {"ok": False, "error": f"invalid 'states' filter: {e}"}
             return {"ok": True, "data": self.list_watchers(state_filter)}
 
         elif cmd == "pause":

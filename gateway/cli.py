@@ -48,7 +48,13 @@ def main():
 
     # list
     list_p = sub.add_parser(
-        "list", help="List watchers (default: active, paused and failed)"
+        "list",
+        help="List watchers (default: every state except idle)",
+        description=(
+            "List the watchers the gateway holds state records for.  With no "
+            "state flag, shows every state except idle — the watchers an "
+            "operator is realistically about to act on."
+        ),
     )
     list_p.add_argument(
         "--connector",
@@ -58,7 +64,7 @@ def main():
     )
     # Additive flags rather than a mutually exclusive group: the states compose,
     # and `--active --idle` is a meaningful question.  `--all` is the shorthand
-    # for naming all three.
+    # for naming every one of them.
     list_p.add_argument(
         "--active", action="store_true", help="Include active watchers"
     )
@@ -342,11 +348,10 @@ def main():
             # is a substantive answer to a query that never ran.
             # Says which question was asked, because the default excludes idle:
             # "none" and "none you asked about" are different answers.  The
-            # default branch describes OPERABLE in prose — as does this
-            # subcommand's argparse help — so **both strings have to follow
-            # StateFilter.OPERABLE if it ever changes.**  Stating it in prose
-            # rather than listing the states is what keeps that to a reword
-            # instead of a wrong list.
+            # default branch names the excluded state rather than the
+            # included ones, so it survives a fourth state being added.  The
+            # argparse help below does NOT: it enumerates, and it has to be
+            # edited whenever `StateFilter.OPERABLE` changes.
             if states:
                 print(f"No {'/'.join(states)} watchers")
             else:

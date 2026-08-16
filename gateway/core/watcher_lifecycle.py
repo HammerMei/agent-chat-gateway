@@ -188,7 +188,9 @@ class WatcherLifecycle:
         config_names = {wc.name for wc in self._watcher_configs}
         prune = {name for name in persisted if name not in config_names}
 
-        self._state_store.save(self._states, prune=prune)
+        self._state_store.save(
+            self._states, prune=prune, serving=set(self._processors)
+        )
         return errors
 
     def _hydrated_state(self, name: str) -> WatcherState | None:
@@ -253,7 +255,7 @@ class WatcherLifecycle:
                     room_id="",
                     paused=True,
                 )
-            self._state_store.save(self._states)
+            self._state_store.save(self._states, serving=set(self._processors))
             logger.info("Watcher '%s' paused", name)
 
     async def resume_watcher(self, name: str) -> None:
@@ -268,7 +270,7 @@ class WatcherLifecycle:
                 # so no restart is needed, but the flag must be updated.
                 if state:
                     state.paused = False
-                self._state_store.save(self._states)
+                self._state_store.save(self._states, serving=set(self._processors))
                 return
             try:
                 await self._start_watcher(wc, state)
@@ -280,7 +282,7 @@ class WatcherLifecycle:
             # so the next restart (or manual retry) correctly reflects the watcher's state.
             if state:
                 state.paused = False
-            self._state_store.save(self._states)
+            self._state_store.save(self._states, serving=set(self._processors))
             logger.info("Watcher '%s' resumed", name)
 
     async def reset_watcher(self, name: str) -> None:
@@ -325,7 +327,7 @@ class WatcherLifecycle:
             except Exception as e:
                 logger.error("Failed to restart watcher '%s' after reset: %s", name, e)
                 raise
-            self._state_store.save(self._states)
+            self._state_store.save(self._states, serving=set(self._processors))
             logger.info("Watcher '%s' reset", name)
 
     def list_watchers(
@@ -348,23 +350,25 @@ class WatcherLifecycle:
           failure belongs.  A watcher that started on an *earlier* boot does
           still appear, because its record is on disk — as ``failed``, since it
           is not resident.
-        * ``room_name``, ``participants`` and ``room_kind`` come from the record
-          rather than from config, so they describe the room the watcher is
-          actually bound to.
+        * ``room_name`` and ``participants`` come from the record rather than
+          from config, so they describe the room the watcher is actually bound
+          to. (``room_kind`` is deliberately **not** in the row: nothing reads
+          it.)
         """
         result = []
         for name, state in sorted(self._state_store.merged_view(self._states).items()):
-            current = lifecycle_state(
-                state, resident=self._processors.get(name) is not None
-            )
+            current = lifecycle_state(state, resident=self._is_resident(name))
             if current not in state_filter:
                 continue
             result.append(
                 {
                     "watcher_name": name,
-                    # Falls back to the room id: a room with no name still has to
-                    # be nameable in the table, and for a DM the record carries
-                    # no name at all (the participants column identifies it).
+                    # Falls back to the room id so a nameless room is still
+                    # nameable in the table. Reachable: `pause` on a watcher
+                    # that has never started fabricates a record with neither
+                    # (both empty), and a rule-derived group DM has no platform
+                    # name either. NOT the DM case — both connectors return the
+                    # configured `@handle` as a DM room's name.
                     "room_name": state.room_name or state.room_id,
                     "room_id": state.room_id,
                     "participants": list(state.participants),
@@ -383,6 +387,35 @@ class WatcherLifecycle:
                 }
             )
         return result
+
+    def _is_resident(self, name: str) -> bool:
+        """Whether the lifecycle currently holds this watcher (design §2.5).
+
+        A registered processor, **or** a lifecycle transition in flight. The
+        second half is not a nicety: `pause` and `reset` both remove the
+        processor first and settle the record last, so between the two this
+        watcher has no processor, no `paused` flag and no `dropped_at` — the
+        exact shape a failed start leaves. `reset` holds that shape for as long
+        as a fresh session, a history fetch and a full model turn take, which is
+        bounded by the agent timeout and defaults to minutes.
+
+        Reporting `failed` there would be the worst kind of wrong: `failed` is
+        documented as *the* state that means something is broken and sends the
+        operator to the startup log, so the recovery verb would accuse itself
+        while working. Counting a transition as resident errs the other way —
+        `active` for a few seconds while a watcher is being stopped — which is
+        transient, self-correcting, and does not send anyone anywhere.
+
+        The per-watcher lock is exactly the right signal because it is held for
+        precisely the span of a lifecycle transition: `sync_watchers`, `pause`,
+        `resume` and `reset` all take it around their whole start or stop, and
+        release it when the operation finishes — including when it *fails*, so a
+        genuinely failed start reports `failed` the moment it gives up.
+        """
+        if self._processors.get(name) is not None:
+            return True
+        lock = self._watcher_locks.get(name)
+        return lock is not None and lock.locked()
 
     def _agent_name_for(self, watcher_name: str) -> str:
         """Best-effort agent name for a record the manager has not stamped yet.
@@ -438,7 +471,7 @@ class WatcherLifecycle:
 
     def save_state(self) -> None:
         """Persist current state (called before shutdown)."""
-        self._state_store.save(self._states)
+        self._state_store.save(self._states, serving=set(self._processors))
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
@@ -520,7 +553,13 @@ class WatcherLifecycle:
                 else False
             ),
             paused=False,
-            last_processed_ts=state.last_processed_ts if state else "",
+            # Only from a record for *this* room. `_provision_session` already refuses
+            # to replay a session id across a room change; the watermark is the same
+            # kind of value and needs the same rule, or a stale record hands this room
+            # another room's cursor and every message below it is discarded as seen.
+            last_processed_ts=(
+                state.last_processed_ts if state and state.room_id == room.id else ""
+            ),
             backend_identity=identity,
         )
         self._states[wc.name] = ws
@@ -914,7 +953,15 @@ class WatcherLifecycle:
 
         # Step 2: Capture the live watermark while the connector still holds the
         # room entry it lives in — the unsubscribe below pops that entry.
-        if state and state.room_id:
+        #
+        # Gated on `processor`, like step 1, and for a sharper reason than symmetry:
+        # the connector's cursor belongs to the *room*, not to this watcher. A record
+        # this process never started can carry a stale `room_id` — a watcher moved to
+        # another room in config, whose old record still names the first one — and the
+        # cursor at that id is now some other watcher's progress. Copying it in would
+        # hand that value to this watcher at its next start, which restores it onto the
+        # room it has actually moved to and silently drops everything below it.
+        if processor and state and state.room_id:
             live_ts = self._connector.get_last_processed_ts(state.room_id)
             # `is not None`, so a connector that has *cleared* its watermark can say so.
             # `None` still means "no opinion — this room saw no activity in this run", and

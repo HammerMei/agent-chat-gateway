@@ -164,7 +164,15 @@ class TestListEnumeratesRecords(IsolatedTestCase):
         correct, and would mask whether the record was found at all.
         """
         manager = self._manager(
-            [_record("script", last_processed_ts="2026-08-01T00:00:00Z")],
+            # `room_id` must be the room this watcher actually resolves to:
+            # a watermark is only inherited from a record for the same room, so
+            # a mismatched fixture would test the guard rather than the resume.
+            [
+                _record(
+                    "script", room_id="script",
+                    last_processed_ts="2026-08-01T00:00:00Z",
+                )
+            ],
             watcher_configs=[make_watcher(name="script")],
         )
         await manager.run_once(unavailable_agents={"default"})
@@ -176,6 +184,49 @@ class TestListEnumeratesRecords(IsolatedTestCase):
             manager.get_watcher_state("script").last_processed_ts,
             "2026-08-01T00:00:00Z",
         )
+        await manager.shutdown()
+
+    async def test_a_watermark_is_not_inherited_across_a_room_change(self):
+        """A record naming a room this watcher no longer watches carries another
+        room's cursor.  Restoring it would mark every message below it as
+        already seen — silently, and in a room the operator just pointed the
+        watcher at.
+
+        `_provision_session` already refuses to replay a *session* across a room
+        change; the watermark needed the same rule.
+        """
+        manager = self._manager(
+            [_record("script", room_id="a-room-it-has-since-left",
+                     last_processed_ts="2026-08-01T00:00:00Z")],
+            watcher_configs=[make_watcher(name="script")],
+        )
+
+        await manager.run_once()
+
+        record = manager.get_watcher_state("script")
+        self.assertEqual(record.room_id, "script")
+        self.assertEqual(record.last_processed_ts, "")
+        await manager.shutdown()
+
+    async def test_pausing_a_never_started_watcher_does_not_read_a_live_cursor(self):
+        """`_stop_processor` used to read the connector's cursor for whatever
+        `room_id` the record named, with no check that this watcher was serving
+        it.  Hydration made stale records reachable there, so pausing one could
+        copy another watcher's progress into it.
+        """
+        manager = self._manager(
+            [_record("w1", room_id="someone-elses-room", last_processed_ts="old")],
+            watcher_configs=[make_watcher(name="w1")],
+        )
+        await manager.run_once(unavailable_agents={"default"})
+
+        with patch.object(
+            manager._connector, "get_last_processed_ts", return_value="THEIRS"
+        ) as cursor:
+            await manager.pause_watcher("w1")
+
+        cursor.assert_not_called()
+        self.assertEqual(manager.get_watcher_state("w1").last_processed_ts, "old")
         await manager.shutdown()
 
     async def test_rows_are_ordered_by_name(self):
@@ -230,6 +281,33 @@ class TestListStateFilter(IsolatedTestCase):
         await manager._lifecycle._stop_processor("script")
         self.assertEqual(manager.list_watchers()[0]["state"], "failed")
 
+        await manager.shutdown()
+
+    async def test_a_watcher_being_reset_is_not_reported_as_failed(self):
+        """`pause` and `reset` remove the processor first and settle the record
+        last, so mid-verb the record is the same shape a failed start leaves.
+
+        `reset` holds it for as long as a session, a history fetch and a model
+        turn take.  Reporting `failed` there would have the recovery verb
+        accusing itself, and send the operator to a startup log with nothing in
+        it.
+        """
+        manager = self._manager([], watcher_configs=[make_watcher(name="script")])
+        await manager.run_once()
+
+        seen: list[str] = []
+        original = manager._lifecycle._start_watcher
+
+        async def observe(wc, state):
+            # Inside reset: the processor is gone and the record is not yet
+            # settled — exactly the window.
+            seen.append(manager.list_watchers()[0]["state"])
+            return await original(wc, state)
+
+        with patch.object(manager._lifecycle, "_start_watcher", side_effect=observe):
+            await manager.reset_watcher("script")
+
+        self.assertEqual(seen, ["active"], "a reset in flight must not read failed")
         await manager.shutdown()
 
     async def test_a_subscribe_failure_reads_failed_not_active(self):
@@ -313,7 +391,10 @@ class TestListRowContents(IsolatedTestCase):
         self.assertNotIn("room_kind", row)
 
     async def test_a_nameless_room_falls_back_to_its_id(self):
-        """A DM carries no room name, and the row still has to name the room."""
+        """Reachable two ways, and neither is a 1:1 DM — both connectors return
+        the configured `@handle` as a DM's room name.  It is a group DM, whose
+        label is a hash, or a record `pause` fabricated for a watcher that never
+        started, which has neither a name nor a room id."""
         manager = self._manager([_record("dm", room_id="rid-9", room_name="")])
 
         self.assertEqual(manager.list_watchers()[0]["room_name"], "rid-9")

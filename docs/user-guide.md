@@ -664,23 +664,35 @@ agent-chat-gateway reset <watcher-name> [--connector NAME]
 `list` reports the watchers the gateway has **state records** for, not the
 entries in `config.yaml`.
 
-A record is written partway through starting a watcher, so what a failed start
-leaves behind depends on where it failed:
+**A row means there is state to act on; no row means there is none.** Which
+failures leave state is not simply "early" versus "late" — several late ones
+roll their record back on purpose, so that a half-built watcher cannot be
+resumed as though it were whole:
 
-* Failures **before** the record is written — the agent was unavailable, the
-  room could not be resolved, the session could not be created — leave no
-  record, so the watcher does not appear in `list` at all. The failure is
-  reported at startup and in the gateway log.
-* Failures **after** it — the room subscription, for instance — keep the
-  record deliberately, so the session id and injection flag survive for the
-  next attempt. Such a watcher appears as **`failed`**: the record says a
-  watcher should be running for that room, and none is.
+| What failed | In `list` |
+|---|---|
+| The room subscription, or the room claim | **`failed`** — the record is kept so the session survives the next attempt |
+| The agent was unavailable, and the watcher had started on an earlier boot | **`failed`** — from the record that boot left |
+| Context injection, the attachment workspace, or session binding | **no row** — these roll the record back |
+| The room could not be resolved, the session could not be created, or the agent was unavailable on a first-ever start | **no row** — nothing was written |
 
-A failed watcher is retried on **every daemon start**. If the underlying
-problem is unfixed it fails again and says so again — deliberately, so the
-gateway never quietly settles for a broken watcher. To stop it being retried,
-`pause` it; that is also how a watcher with no record at all is kept from being
-started, since pausing one creates a paused record.
+Either way the failure is reported at startup and in the gateway log; `list` is
+where you see what is left over, not the full list of what went wrong.
+
+A failed watcher is retried on **every daemon start**. If the underlying problem
+is unfixed it fails again and says so again — deliberately, so the gateway never
+quietly settles for a broken watcher.
+
+**To recover one:** `resume` or `reset` retries the start in place, which is
+what you want when the fault was outside the gateway — a room that had gone, a
+server that was down. **If the agent backend itself was unavailable, restart the
+daemon instead:** agent availability is decided once at startup, and `resume`
+and `reset` deliberately refuse rather than start a watcher whose permission
+broker never came up.
+
+To stop a watcher being retried at all, `pause` it; that is also how a watcher
+with no record is kept from being started, since pausing one creates a paused
+record.
 
 The four states are:
 
