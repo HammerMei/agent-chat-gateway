@@ -39,11 +39,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     name, which is how one that fails on every boot is kept from being retried.
   - `status` asks for every state explicitly, so its `Watchers:` count stays a total
     rather than silently inheriting `list`'s narrower default.
-- **`pause`, `resume` and `reset` act on the same records `list` shows.** They read
-  only the records this process had loaded, so a watcher whose agent was unavailable
-  at boot — visible in `list`, with its session id — was mutated by writing a *blank*
-  record over the persisted one: session id gone, watermark reset, messages
-  redelivered on the next start. The verbs now pull the persisted record in first.
+  - **`list` can show a record the operator verbs cannot act on.** A watcher whose
+    agent was unavailable at boot has a record on disk but none in memory, and
+    `pause`/`resume`/`reset` read only the in-memory map — so pausing one writes a
+    blank record over it and loses its session id. That is pre-existing behaviour
+    which this change makes *visible* rather than introduces; it is tracked in #118
+    and deliberately not fixed here, because doing so requires writes that a
+    read-only view has no business making.
 - **One room is served by one watcher, and one session belongs to one room**
   (design §4.1). Both were previously unenforced, and both failed silently:
   - The dispatch index kept a *list* of processors per room and fanned every message
