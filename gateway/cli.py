@@ -48,7 +48,7 @@ def main():
 
     # list
     list_p = sub.add_parser(
-        "list", help="List watchers (default: active and paused)"
+        "list", help="List watchers (default: active, paused and failed)"
     )
     list_p.add_argument(
         "--connector",
@@ -71,7 +71,12 @@ def main():
         "--paused", action="store_true", help="Include paused watchers"
     )
     list_p.add_argument(
-        "--all", action="store_true", help="Include every state (active, idle, paused)"
+        "--failed",
+        action="store_true",
+        help="Include watchers whose start failed (a record, but nothing running)",
+    )
+    list_p.add_argument(
+        "--all", action="store_true", help="Include every state"
     )
 
     # pause
@@ -419,7 +424,7 @@ def main():
 # list is what a socket client sends, and `parse_state_filter` refuses a name
 # the two do not agree on — loudly, which is why the duplication is safe here
 # and importing `gateway.core` into the client for one list is not worth it.
-_ALL_STATES = ["active", "idle", "paused"]
+_ALL_STATES = ["active", "idle", "paused", "failed"]
 
 
 def _requested_states(args) -> list[str] | None:
@@ -437,6 +442,7 @@ def _requested_states(args) -> list[str] | None:
             ("active", args.active),
             ("idle", args.idle),
             ("paused", args.paused),
+            ("failed", args.failed),
         )
         if wanted
     ]

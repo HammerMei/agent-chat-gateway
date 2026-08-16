@@ -268,8 +268,8 @@ watchers:
 - ✅ `status` — Check if daemon is running
 
 #### Watcher Control
-- ✅ `list` — List watcher records and their state, active + paused by default
-  (`--active/--idle/--paused/--all`; supports multi-connector aggregation)
+- ✅ `list` — List watcher records and their state; everything but `idle` by
+  default (`--active/--idle/--paused/--failed/--all`; multi-connector aggregation)
 - ✅ `pause <watcher>` — Pause watcher (stop processing messages)
 - ✅ `resume <watcher>` — Resume paused watcher
 - ✅ `reset <watcher>` — Clear session state

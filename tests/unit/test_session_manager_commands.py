@@ -45,10 +45,59 @@ def _make_manager():
 class TestDispatchCommandList(unittest.IsolatedAsyncioTestCase):
     """dispatch_command({'cmd': 'list'}) returns watcher data."""
 
+    async def test_the_wire_filter_reaches_the_lifecycle(self):
+        """`request["states"]` → `StateFilter` is the only join between the CLI
+        and the reader, and both halves being tested in isolation left it
+        uncovered: mutating this call to ignore the request passed the entire
+        suite while the daemon silently answered every query with the default.
+        """
+        from gateway.core.state import StateFilter
+
+        mgr = _make_manager()
+
+        await mgr.dispatch_command({"cmd": "list", "states": ["idle"]})
+        self.assertEqual(
+            mgr._lifecycle.list_watchers.call_args[0][0], StateFilter.IDLE
+        )
+
+        await mgr.dispatch_command(
+            {"cmd": "list", "states": ["active", "failed"]}
+        )
+        self.assertEqual(
+            mgr._lifecycle.list_watchers.call_args[0][0],
+            StateFilter.ACTIVE | StateFilter.FAILED,
+        )
+
+    async def test_no_states_field_uses_the_server_side_default(self):
+        """The CLI expresses "the default" by sending nothing, so the default
+        has exactly one definition and it lives here."""
+        from gateway.core.state import StateFilter
+
+        mgr = _make_manager()
+
+        await mgr.dispatch_command({"cmd": "list"})
+
+        self.assertEqual(
+            mgr._lifecycle.list_watchers.call_args[0][0], StateFilter.OPERABLE
+        )
+
+    async def test_an_unparseable_filter_is_an_error_not_a_silent_default(self):
+        """A caller cannot tell from the rows that it was answered with a
+        different question than the one it asked."""
+        mgr = _make_manager()
+
+        result = await mgr.dispatch_command(
+            {"cmd": "list", "states": ["sleeping"]}
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("sleeping", result["error"])
+        mgr._lifecycle.list_watchers.assert_not_called()
+
     async def test_list_returns_watchers(self):
         mgr = _make_manager()
         mgr._lifecycle.list_watchers.return_value = [
-            {"watcher_name": "support", "active": True}
+            {"watcher_name": "support", "state": "active"}
         ]
         result = await mgr.dispatch_command({"cmd": "list"})
         self.assertTrue(result["ok"])

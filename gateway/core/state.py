@@ -184,18 +184,20 @@ class StateFilter(Flag):
 
     Composable, and the default is deliberately not ``ALL``: ``OPERABLE`` is the
     set an operator is realistically about to act on.  A paused watcher belongs
-    in the default view precisely because it is waiting on a human decision;
-    idle is informational — the bot knows about the room, but nothing is running
-    and nothing is being withheld.  Once membership events register joined rooms
-    as idle, a bot in two hundred channels would otherwise have a ``list``
-    dominated by rooms nobody has ever spoken in.
+    in the default view precisely because it is waiting on a human decision, and
+    a failed one because it is the only state that means something is *wrong*
+    (§2.5).  Idle is informational — the bot knows about the room, but nothing is
+    running and nothing is being withheld.  Once membership events register
+    joined rooms as idle, a bot in two hundred channels would otherwise have a
+    ``list`` dominated by rooms nobody has ever spoken in.
     """
 
     ACTIVE = auto()
     IDLE = auto()
     PAUSED = auto()
-    OPERABLE = ACTIVE | PAUSED
-    ALL = ACTIVE | IDLE | PAUSED
+    FAILED = auto()
+    OPERABLE = ACTIVE | PAUSED | FAILED
+    ALL = ACTIVE | IDLE | PAUSED | FAILED
 
 
 # The wire spelling of each individual state, and the only place the two
@@ -205,29 +207,41 @@ STATE_FILTER_NAMES: dict[StateFilter, str] = {
     StateFilter.ACTIVE: "active",
     StateFilter.IDLE: "idle",
     StateFilter.PAUSED: "paused",
+    StateFilter.FAILED: "failed",
 }
 _NAMES_TO_STATE_FILTER = {name: flag for flag, name in STATE_FILTER_NAMES.items()}
 
 
-def lifecycle_state(record: "WatcherState") -> StateFilter:
-    """Return the one lifecycle state ``record`` is in.
+def lifecycle_state(record: "WatcherState", *, resident: bool) -> StateFilter:
+    """Return the one lifecycle state ``record`` is in (design §2.5).
 
-    Three answers, one per record, and the precedence is the point:
+    ``resident`` is whether a processor is loaded for this watcher right now.
+    It is a **parameter rather than a lookup** so this stays a pure function:
+    something reading state files outside a running daemon passes ``False`` and
+    gets the honest answer for a process running none of them.
+
+    Four answers, one per record, and the order is load-bearing:
 
     * **paused wins over everything.**  It is an operator's explicit decision,
       and §4.4 has even ``get`` refuse to override it.  A record that is both
       paused and dropped is still awaiting a human, so reporting it as idle
       would hide the only one of the two that someone has to act on.
-    * **idle** is a record the manager dropped. **Nothing writes ``dropped_at``
-      yet** — the watcher manager will, when it releases a watcher and clears it
-      on recreation (§2.5) — so this branch is unreachable in production today
-      and `--idle` legitimately returns nothing. The reader lands before the
-      writer on purpose: it is what makes idling observable as soon as the
-      lifecycle increment produces it.
+    * **idle** is a record the manager dropped. It is checked *before*
+      residency because an idle record is supposed to have no processor;
+      reversing the two would report every idle watcher as failed. **Nothing
+      writes ``dropped_at`` yet** — the watcher manager will, when it releases a
+      watcher and clears it on recreation (§2.5) — so this branch is unreachable
+      in production today and ``--idle`` legitimately returns nothing. The
+      reader lands before the writer on purpose: it is what makes idling
+      observable as soon as the lifecycle increment produces it.
+    * **failed** is the record and reality disagreeing: it wants to be resident
+      and is not, which is what a start that got far enough to write a record
+      and then raised leaves behind. Derived rather than stored, so the next
+      successful start clears it with nobody having to remember to.
     * **active** otherwise.
 
     Written as a named function with one answer per case rather than as a
-    condition at each call site: a rule with three answers spelled as a boolean
+    condition at each call site: a rule with four answers spelled as a boolean
     expression is invisible in a diff when the clause that fires is not the
     first one.
     """
@@ -235,6 +249,8 @@ def lifecycle_state(record: "WatcherState") -> StateFilter:
         return StateFilter.PAUSED
     if record.dropped_at:
         return StateFilter.IDLE
+    if not resident:
+        return StateFilter.FAILED
     return StateFilter.ACTIVE
 
 

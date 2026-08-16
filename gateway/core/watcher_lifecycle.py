@@ -191,6 +191,31 @@ class WatcherLifecycle:
         self._state_store.save(self._states, prune=prune)
         return errors
 
+    def _hydrated_state(self, name: str) -> WatcherState | None:
+        """The watcher's record, pulled in from disk if memory does not hold it.
+
+        `list` reads the merged view — disk ∪ memory (§2.8) — so it shows records
+        this process never loaded: a watcher whose agent was unavailable at boot,
+        or whose start rolled back.  The operator verbs have to act on that same
+        set, or `pause` fabricates a blank record *over* a real one and the
+        session id it just displayed is gone for good.
+
+        It **hydrates** rather than merely reading, because `save` persists
+        `self._states`: a record mutated outside that map would not be written,
+        and the mutation would look like it had worked.
+        """
+        state = self._states.get(name)
+        if state is None:
+            state = self._state_store.load().get(name)
+            if state is not None:
+                logger.info(
+                    "Watcher '%s': loaded its persisted record on demand "
+                    "(this process had not started it)",
+                    name,
+                )
+                self._states[name] = state
+        return state
+
     def _get_watcher_lock(self, name: str) -> asyncio.Lock:
         """Return (creating if needed) the per-watcher mutex for lifecycle ops."""
         if name not in self._watcher_locks:
@@ -203,7 +228,7 @@ class WatcherLifecycle:
         """Pause a watcher: stop processing messages but preserve state."""
         self._require_watcher_config(name)
         async with self._get_watcher_lock(name):
-            state = self._states.get(name)
+            state = self._hydrated_state(name)
             if state and state.paused:
                 logger.info("Watcher '%s' is already paused", name)
                 return
@@ -236,7 +261,7 @@ class WatcherLifecycle:
         wc = self._require_watcher_config(name)
         self._ensure_agent_available(wc)
         async with self._get_watcher_lock(name):
-            state = self._states.get(name)
+            state = self._hydrated_state(name)
             if name in self._processors:
                 logger.info("Watcher '%s' is already running", name)
                 # Clear paused flag and persist — the watcher is already running
@@ -275,7 +300,7 @@ class WatcherLifecycle:
                     e,
                 )
 
-            state = self._states.get(name)
+            state = self._hydrated_state(name)
             # Clear injection retry state BEFORE resetting context_injected so
             # the new startup attempt begins with a fresh failure counter.
             # Without this, a watcher that reached ``failed_degraded`` would
@@ -318,17 +343,20 @@ class WatcherLifecycle:
 
         * A configured watcher with no record — its agent was unavailable, or
           its first start raised before a record was written — does not appear.
-          It has no session, no watermark and nothing to pause; ``sync_watchers``
-          reports the failure through its error list, which is where a
-          start-time failure belongs.  A watcher that started on an *earlier*
-          boot does still appear, because its record is on disk.
+          There is nothing in such a row but its name; ``sync_watchers`` reports
+          the failure through its error list, which is where a start-time
+          failure belongs.  A watcher that started on an *earlier* boot does
+          still appear, because its record is on disk — as ``failed``, since it
+          is not resident.
         * ``room_name``, ``participants`` and ``room_kind`` come from the record
           rather than from config, so they describe the room the watcher is
           actually bound to.
         """
         result = []
         for name, state in sorted(self._state_store.merged_view(self._states).items()):
-            current = lifecycle_state(state)
+            current = lifecycle_state(
+                state, resident=self._processors.get(name) is not None
+            )
             if current not in state_filter:
                 continue
             result.append(

@@ -641,13 +641,14 @@ agent-chat-gateway status
 All commands require the daemon to be running.
 
 ```bash
-# List watchers — active and paused by default
+# List watchers — active, failed and paused by default
 agent-chat-gateway list [--connector NAME]
 
-# Include idle watchers (rooms the gateway knows about with nothing running),
+# Include idle watchers (released on purpose, nothing running),
 # or ask for one state at a time
 agent-chat-gateway list --all
 agent-chat-gateway list --idle
+agent-chat-gateway list --failed
 agent-chat-gateway list --active --paused
 
 # Pause a watcher (stops processing messages)
@@ -672,24 +673,26 @@ leaves behind depends on where it failed:
   reported at startup and in the gateway log.
 * Failures **after** it — the room subscription, for instance — keep the
   record deliberately, so the session id and injection flag survive for the
-  next attempt. Such a watcher appears with state `active`, because **STATE
-  describes the record, not whether a processor is running.** It stays that
-  way across restarts until a start succeeds.
+  next attempt. Such a watcher appears as **`failed`**: the record says a
+  watcher should be running for that room, and none is.
 
-Either way the watcher can still be paused by name; pausing one with no record
-creates a paused one, which is how a watcher that fails on every boot is kept
-from being started again.
+A failed watcher is retried on **every daemon start**. If the underlying
+problem is unfixed it fails again and says so again — deliberately, so the
+gateway never quietly settles for a broken watcher. To stop it being retried,
+`pause` it; that is also how a watcher with no record at all is kept from being
+started, since pausing one creates a paused record.
 
-The three states are:
+The four states are:
 
 | State | Meaning |
 |---|---|
-| `active` | A record exists and nothing has stopped it |
+| `active` | A record exists and a processor is running for it |
+| `failed` | A record exists and nothing is running — a start that got as far as writing the record and then raised. **The one state that means something is wrong**, so it is in the default view |
 | `paused` | Muted by `pause`, waiting on a human decision — shown by default for that reason |
-| `idle` | The gateway knows the room, but nothing is running for it right now |
+| `idle` | The gateway knows the room, but it was released on purpose and nothing is running |
 
-`status` counts every state; `list` shows the two an operator is likely to act
-on unless asked otherwise.
+`status` counts every state; `list` shows the three an operator is likely to
+act on — everything except `idle` — unless asked otherwise.
 
 ### Direct Messaging
 

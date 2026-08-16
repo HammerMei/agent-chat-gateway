@@ -626,7 +626,7 @@ class TestCLIStatus(_CLITestBase):
         self._run(["status"])
 
         self.assertEqual(len(received), 1)
-        self.assertEqual(received[0]["states"], ["active", "idle", "paused"])
+        self.assertEqual(received[0]["states"], ["active", "idle", "paused", "failed"])
 
 
 # ---------------------------------------------------------------------------
@@ -639,7 +639,7 @@ class TestCLIList(_CLITestBase):
     _ROWS = [
         {
             "watcher_name": "support",
-            "room_name": "support-channel",
+            "room_name": "#eng-triage",
             "room_id": "rid-support",
             "connector": "rc-prod",
             "agent_name": "claude",
@@ -649,7 +649,9 @@ class TestCLIList(_CLITestBase):
         },
         {
             "watcher_name": "gdm-a3f9c1b2",
-            "room_name": "",
+            # A DM carries no name, and the server has already collapsed that to
+            # the room id (`room_name or room_id`), so this is the real shape.
+            "room_name": "rid-gdm",
             "room_id": "rid-gdm",
             "connector": "rc-prod",
             "agent_name": "opencode",
@@ -674,6 +676,9 @@ class TestCLIList(_CLITestBase):
             self.assertIn(column, header)
         self.assertEqual(len(rows), 2)
         self.assertIn("support", rows[0])
+        # Pinned separately from the watcher name: with both spelled "support",
+        # deleting the ROOM column entirely left every assertion passing.
+        self.assertIn("#eng-triage", rows[0])
         self.assertIn("rid-support", rows[0])
         self.assertIn("active", rows[0])
         self.assertIn("sess-abc123", rows[0])
@@ -681,6 +686,8 @@ class TestCLIList(_CLITestBase):
         # The participants column is how a group DM is identified, so it is in
         # the default view rather than behind a verbose flag.
         self.assertIn("@alice, @bob", rows[1])
+        # And the absent-value placeholder, which nothing else pins.
+        self.assertIn("—", rows[0])
 
     def test_list_columns_are_aligned(self):
         """A table whose columns do not line up is not a table."""
@@ -748,11 +755,20 @@ class TestCLIList(_CLITestBase):
         self._run(["list", "--idle"])
         self._run(["list", "--active", "--paused"])
         self._run(["list", "--all"])
+        self._run(["list", "--failed"])
+        self._run(["list", "--all", "--idle"])
+        self._run(["list", "--connector", "rc-prod", "--idle"])
 
         self.assertNotIn("states", received[0], "the default lives on the server")
         self.assertEqual(received[1]["states"], ["idle"])
         self.assertEqual(received[2]["states"], ["active", "paused"])
-        self.assertEqual(received[3]["states"], ["active", "idle", "paused"])
+        self.assertEqual(received[3]["states"], ["active", "idle", "paused", "failed"])
+        self.assertEqual(received[4]["states"], ["failed"])
+        # --all wins over a narrower flag rather than intersecting with it.
+        self.assertEqual(received[5]["states"], ["active", "idle", "paused", "failed"])
+        # A state filter and a connector filter compose.
+        self.assertEqual(received[6]["states"], ["idle"])
+        self.assertEqual(received[6]["connector"], "rc-prod")
 
 
     def test_list_with_connector_filter(self):

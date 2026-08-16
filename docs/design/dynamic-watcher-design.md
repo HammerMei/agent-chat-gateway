@@ -675,12 +675,97 @@ it rather than embedding it.
 |---|---|---|---|
 | **active** | processor + session | record | first message in a matching room; or recreation from an idle record |
 | **idle** | nothing | record, incl. session id, watermark, `dropped_at` | no activity for `session_idle_days`; or the bot being added to a matching room (§2.7) |
+| **failed** | nothing | record, no `dropped_at` | a start or recreation that got far enough to write a record and then raised |
 | **expired** | nothing | nothing (logged) | idle for `session_expire_days`; or the bot being removed from the room |
 | **paused** | nothing | record, `paused=True` | operator only |
 
 A watcher can therefore exist as a record before it has ever run — which is
 what makes a newly-joined room listable and pausable before its first
 message.
+
+#### `failed`: a record that wants to be resident and is not
+
+A start writes its record partway through — before the room subscription, the
+attachment workspace and the processor — precisely so that a later failure does
+not lose the session id or the injection flag. The consequence is a record that
+is **not paused, not dropped, and not running**, and calling that `active` tells
+an operator the opposite of what happened. This design previously noticed the
+same shape from the other side, while arguing that `dropped_at` cannot be
+inferred from `room_id`: *"the subscribe-failure rollback deliberately keeps a
+record with `room_id` populated, so a start failure is indistinguishable from a
+healthy record by that field."* It is a fifth state, and naming it is cheaper
+than the operator confusion of not naming it.
+
+**It is derived, not stored.** The record says what the gateway *wants* — a
+watcher should be resident for this room; residency says what *is*. `failed` is
+simply the two disagreeing:
+
+```
+paused?        → paused      (an operator's explicit decision outranks everything, §4.4)
+dropped_at?    → idle        (the manager released it on purpose)
+not resident?  → failed      (wanted resident, is not)
+otherwise      → active
+```
+
+A stored `failed` flag would need a writer *and* a clearer, and every path that
+forgot the clearer would leave a record permanently lying about itself — the
+failure mode this project has repeatedly shipped. A derived one is correct by
+construction: the next successful start makes a processor exist, and the state
+changes with no one having to remember to change it.
+
+The order matters and is not arbitrary. `idle` is checked before residency
+because an idle record is *supposed* to have no processor; reversing the two
+would report every idle watcher as failed.
+
+**Residency is an input, not a lookup.** The predicate takes the record and a
+boolean, so it stays a pure function that a tool reading state files can call —
+it simply passes `False` and gets the honest answer for a process that is not
+running any of them.
+
+**The one window where the derivation would lie is unreachable.** Between
+process start and watcher restore, nothing is resident, so every record would
+read `failed`. `list` arrives over the control socket, and the socket is opened
+after the restore phase completes (verified: `GatewayService` runs
+`sync_only()` for every entry and only then calls `ControlServer.start()`), so
+no caller can observe that window.
+
+##### Retry policy: every start, and no memory of having given up
+
+A failed watcher is retried **on every daemon start**, which is what
+`sync_watchers` already does — the record is on disk, boot reads it, and the
+start is attempted again. If the underlying problem is unfixed it fails again
+and the state reports `failed` again.
+
+That repetition is the point. The alternative — remembering the failure and
+suppressing future attempts — converts a problem the operator can fix into one
+the system has silently decided to live with, and it needs a persisted marker
+whose staleness is a second bug. Under rule-derived creation the same reasoning
+gives the per-room park a deliberately short memory: a resolve that keeps
+failing backs off and parks **in process only** (§2.7), and a restart clears the
+park and tries again.
+
+##### `failed` is in the default `list` view
+
+`StateFilter.OPERABLE` is `active | paused | failed`. Of the states an operator
+can act on, this is the one they most need to see: it is the only one that
+means something is wrong. Excluding it would reproduce, one level up, the defect
+this whole section exists to remove — a broken watcher that looks fine.
+
+##### What the verbs do to it
+
+* `resume` and `reset` retry the start; that is already their behaviour, and
+  they are the in-place recovery once the underlying fault is fixed.
+* `pause` mutes it, and the resulting `paused=True` is what stops boot from
+  retrying — the honest way to say "stop trying this one for now", as against
+  the system deciding that for itself.
+* `get` (§2.8) treats it as it treats idle: a record that is not resident is
+  recreated on demand. A start that keeps failing therefore surfaces as a
+  failure to the caller rather than as a silently unrouted room.
+
+This also answers the question left open under *Boot recreates active records
+only*: **one watcher failing skips that watcher**, and the partial state it
+leaves is no longer a problem to be avoided, because that state now has a name
+and is visible in `list`.
 
 **Paused is a real state and is never reclaimed by a timer** — not idled, not
 expired. Once config no longer names rooms, pause is the only durable way to
@@ -1228,14 +1313,17 @@ class StateFilter(Flag):
     ACTIVE = auto()
     IDLE   = auto()
     PAUSED = auto()
-    OPERABLE = ACTIVE | PAUSED        # the default
-    ALL      = ACTIVE | IDLE | PAUSED
+    FAILED = auto()
+    OPERABLE = ACTIVE | PAUSED | FAILED   # the default
+    ALL      = ACTIVE | IDLE | PAUSED | FAILED
 ```
 
-**Default is active + paused** — the watchers an operator is realistically
-about to act on. A paused watcher belongs in the default view precisely
-because it is waiting on a human decision. Idle is informational: the bot
-knows about the room, but nothing is running and nothing is being withheld.
+**Default is active + paused + failed** — the watchers an operator is
+realistically about to act on. A paused watcher belongs in the default view
+precisely because it is waiting on a human decision, and a failed one because
+it is the only state that means something is wrong (§2.5). Idle is
+informational: the bot knows about the room, but nothing is running and nothing
+is being withheld.
 
 This matters more once membership events register joined rooms as idle
 (§2.7): a bot in two hundred channels would otherwise have a `list` dominated
@@ -1292,10 +1380,11 @@ on-disk records persist, and boot then eagerly starts every room ever seen.
 - **`list` output becomes dynamic.** There is no longer a static set of
   watchers derivable from `config.yaml`; the answer to "what is being
   watched" is runtime state, so tooling must query the daemon. `acg list`
-  defaults to **active + paused** — what an operator is about to act on —
-  with `--all`, `--active`, `--idle` and `--paused` for the rest. Idle is
-  excluded by default because with membership-event registration (§2.7) it is
-  the largest and least actionable group.
+  defaults to **active + paused + failed** — what an operator is about to act
+  on — with `--all`, `--active`, `--idle`, `--paused` and `--failed` for the
+  rest. Idle is excluded by default because with membership-event registration
+  (§2.7) it is the largest and least actionable group; failed is included
+  because it is the only state that means something is wrong (§2.5).
 - **Idle and expiry are RocketChat and Mattermost only.** Script and Voice
   never reclaim, because neither has an inbound stream to wake from and
   neither supports history, so a fresh session would lose continuity with

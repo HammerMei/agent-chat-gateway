@@ -9,7 +9,7 @@ are tested here, and the rows themselves in
 from __future__ import annotations
 
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from gateway.core.state import (
     STATE_FILTER_NAMES,
@@ -37,15 +37,21 @@ class TestParseStateFilter(unittest.TestCase):
         self.assertEqual(parse_state_filter(None), StateFilter.OPERABLE)
         self.assertNotEqual(parse_state_filter(None), StateFilter.ALL)
 
+    def test_the_default_is_everything_except_idle(self):
+        """Pinned against the members rather than a literal list, so adding a
+        state forces a decision about whether it is operable."""
+        self.assertEqual(parse_state_filter(None), StateFilter.ALL & ~StateFilter.IDLE)
+
     def test_names_compose(self):
         self.assertEqual(
             parse_state_filter(["active", "idle"]),
             StateFilter.ACTIVE | StateFilter.IDLE,
         )
 
-    def test_all_three_names_equal_all(self):
+    def test_every_name_together_equals_all(self):
+        """Derived from the type: a new state that `--all` cannot name fails here."""
         self.assertEqual(
-            parse_state_filter(["active", "idle", "paused"]), StateFilter.ALL
+            parse_state_filter(list(STATE_FILTER_NAMES.values())), StateFilter.ALL
         )
 
     def test_repeated_name_is_idempotent(self):
@@ -70,26 +76,52 @@ class TestParseStateFilter(unittest.TestCase):
             parse_state_filter([["active"]])
 
     def test_every_state_has_a_wire_name_and_round_trips(self):
-        """Enumerated from the type, so a fourth state fails here rather than silently
-        becoming unaddressable from the CLI."""
-        for state in (StateFilter.ACTIVE, StateFilter.IDLE, StateFilter.PAUSED):
+        """Enumerated from ``StateFilter`` itself, not from a copy of its members.
+
+        A ``Flag`` iterates its canonical single-bit members only, so composites
+        like OPERABLE are excluded automatically — which means a fifth state
+        added without a wire name fails here rather than silently becoming
+        unaddressable from the CLI.
+        """
+        for state in StateFilter:
             with self.subTest(state=state):
                 name = state_filter_name(state)
                 self.assertEqual(parse_state_filter([name]), state)
 
 
 class TestLifecycleState(unittest.TestCase):
-    def test_plain_record_is_active(self):
-        self.assertEqual(lifecycle_state(_record()), StateFilter.ACTIVE)
+    """Four answers, and the order between them is the design (§2.5)."""
 
-    def test_dropped_record_is_idle(self):
+    def test_a_resident_record_is_active(self):
         self.assertEqual(
-            lifecycle_state(_record(dropped_at="2026-08-16T00:00:00Z")),
+            lifecycle_state(_record(), resident=True), StateFilter.ACTIVE
+        )
+
+    def test_a_record_that_wants_to_be_resident_and_is_not_is_failed(self):
+        """What a start that wrote its record and then raised leaves behind."""
+        self.assertEqual(
+            lifecycle_state(_record(), resident=False), StateFilter.FAILED
+        )
+
+    def test_dropped_record_is_idle_even_though_it_is_not_resident(self):
+        """An idle record is *supposed* to have no processor.
+
+        This is why `dropped_at` is checked before residency — the reverse order
+        would report every idle watcher as failed.
+
+        Note the fixture: nothing in the gateway writes `dropped_at` yet (the
+        watcher manager will, §2.5), so this state is constructed by hand here
+        and `--idle` returns nothing in production today.
+        """
+        self.assertEqual(
+            lifecycle_state(_record(dropped_at="2026-08-16T00:00:00Z"), resident=False),
             StateFilter.IDLE,
         )
 
     def test_paused_record_is_paused(self):
-        self.assertEqual(lifecycle_state(_record(paused=True)), StateFilter.PAUSED)
+        self.assertEqual(
+            lifecycle_state(_record(paused=True), resident=False), StateFilter.PAUSED
+        )
 
     def test_paused_outranks_dropped(self):
         """A record that is both is still awaiting a human decision.
@@ -98,23 +130,32 @@ class TestLifecycleState(unittest.TestCase):
         one state an operator has to act on.
         """
         both = _record(paused=True, dropped_at="2026-08-16T00:00:00Z")
-        self.assertEqual(lifecycle_state(both), StateFilter.PAUSED)
+        self.assertEqual(lifecycle_state(both, resident=False), StateFilter.PAUSED)
 
-    def test_exactly_one_state_per_record(self):
-        """The three answers partition the records — no record matches two."""
+    def test_paused_outranks_residency(self):
+        """A paused watcher that somehow still has a processor is still paused —
+        §4.4: an explicit pause is never overridden by inference."""
+        self.assertEqual(
+            lifecycle_state(_record(paused=True), resident=True), StateFilter.PAUSED
+        )
+
+    def test_every_answer_is_a_single_state(self):
+        """A composite return would put one record in two filters at once.
+
+        Membership (``in``) rather than identity, so a composite genuinely
+        matches more than one and the assertion can fail the way it claims to.
+        """
         for record in (
             _record(),
             _record(dropped_at="t"),
             _record(paused=True),
             _record(paused=True, dropped_at="t"),
         ):
-            with self.subTest(record=record):
-                matching = [
-                    s
-                    for s in (StateFilter.ACTIVE, StateFilter.IDLE, StateFilter.PAUSED)
-                    if lifecycle_state(record) is s
-                ]
-                self.assertEqual(len(matching), 1)
+            for resident in (True, False):
+                with self.subTest(record=record, resident=resident):
+                    answer = lifecycle_state(record, resident=resident)
+                    matching = [s for s in StateFilter if s in answer]
+                    self.assertEqual(len(matching), 1, f"{answer!r} is not one state")
 
 
 class TestMergedView(unittest.TestCase):
@@ -145,18 +186,17 @@ class TestMergedView(unittest.TestCase):
 
         self.assertEqual(view["w1"].session_id, "fresh")
 
-    def test_save_writes_exactly_what_the_view_returns(self):
-        """If the two ever disagree, an operator is shown a set that is not the
-        set being persisted."""
+    def test_save_writes_both_halves_of_the_merge(self):
+        """Asserted against the literal expectation, not against another call to
+        the method under test — comparing `merged_view` with itself would pass
+        even if it dropped the disk half entirely."""
         store = self._store([_record("only-on-disk")])
-        in_memory = {"in-memory": _record("in-memory")}
-        expected = set(store.merged_view(in_memory))
 
-        with unittest.mock.patch("gateway.core.state_store.save_state") as saved:
-            store.save(in_memory)
+        with patch("gateway.core.state_store.save_state") as saved:
+            store.save({"in-memory": _record("in-memory")})
 
         written = {ws.watcher_name for ws in saved.call_args[0][1]}
-        self.assertEqual(written, expected)
+        self.assertEqual(written, {"only-on-disk", "in-memory"})
 
 
 if __name__ == "__main__":

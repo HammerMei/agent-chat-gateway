@@ -131,6 +131,53 @@ class TestListEnumeratesRecords(IsolatedTestCase):
         self.assertTrue(any("w1" in e for e in errors), errors)
         await manager.shutdown()
 
+    async def test_a_disk_only_record_can_be_paused_without_losing_its_session(self):
+        """`list` shows records this process never loaded, so the verbs have to
+        act on the same set.  Before `_hydrated_state`, pausing one of these
+        wrote a blank record over it and the session id `list` had just
+        displayed was gone for good."""
+        manager = self._manager(
+            [_record("w1", session_id="s-PRECIOUS", last_processed_ts="2026-08-01")],
+            watcher_configs=[make_watcher(name="w1")],
+        )
+        await manager.run_once(unavailable_agents={"default"})
+        self.assertEqual(manager.list_watchers()[0]["session_id"], "s-PRECIOUS")
+
+        await manager.pause_watcher("w1")
+
+        row = manager.list_watchers()[0]
+        self.assertEqual(row["state"], "paused")
+        self.assertEqual(row["session_id"], "s-PRECIOUS")
+        record = manager.get_watcher_state("w1")
+        self.assertEqual(record.room_id, "room-w1")
+        self.assertEqual(record.last_processed_ts, "2026-08-01")
+        await manager.shutdown()
+
+    async def test_a_disk_only_record_keeps_its_watermark_across_a_resume(self):
+        """The other direction: `resume` used to pass `state=None` into
+        `_start_watcher`, which reset the watermark and so redelivered every
+        message since the record was written.
+
+        The watermark is what this asserts rather than the session id: an id is
+        only reused when the record's `backend_identity` matches, and a record
+        with none is a permanent mismatch by design — so a fresh session here is
+        correct, and would mask whether the record was found at all.
+        """
+        manager = self._manager(
+            [_record("script", last_processed_ts="2026-08-01T00:00:00Z")],
+            watcher_configs=[make_watcher(name="script")],
+        )
+        await manager.run_once(unavailable_agents={"default"})
+
+        manager._lifecycle._blocked_agents = set()
+        await manager.resume_watcher("script")
+
+        self.assertEqual(
+            manager.get_watcher_state("script").last_processed_ts,
+            "2026-08-01T00:00:00Z",
+        )
+        await manager.shutdown()
+
     async def test_rows_are_ordered_by_name(self):
         """Deterministic regardless of which side of the merge a record came from."""
         manager = self._manager([_record("zulu"), _record("alpha"), _record("mike")])
@@ -141,18 +188,23 @@ class TestListEnumeratesRecords(IsolatedTestCase):
 
 
 class TestListStateFilter(IsolatedTestCase):
-    def _manager(self, disk_records):
+    def _manager(self, disk_records, watcher_configs=None):
         patcher = patch(
             "gateway.core.state_store.load_state", return_value=list(disk_records)
         )
         patcher.start()
         self.addCleanup(patcher.stop)
-        return make_manager(ScriptConnector(), MockAgentBackend(), [])
+        return make_manager(
+            ScriptConnector(), MockAgentBackend(), watcher_configs or []
+        )
 
-    async def test_default_shows_active_and_paused_but_not_idle(self):
+    async def test_default_shows_everything_except_idle(self):
+        """A record nothing is running for reads `failed`, not `active` — see
+        §2.5.  None of these records is resident, so the un-dropped, un-paused
+        one is exactly the failed-start shape."""
         manager = self._manager(
             [
-                _record("act"),
+                _record("broken"),
                 _record("pause", paused=True),
                 _record("idle", dropped_at="2026-08-16T00:00:00Z"),
             ]
@@ -160,7 +212,41 @@ class TestListStateFilter(IsolatedTestCase):
 
         rows = {w["watcher_name"]: w["state"] for w in manager.list_watchers()}
 
-        self.assertEqual(rows, {"act": "active", "pause": "paused"})
+        self.assertEqual(rows, {"broken": "failed", "pause": "paused"})
+
+    async def test_a_started_watcher_reads_active_and_a_stopped_one_failed(self):
+        """The two halves of the residency input, through the real lifecycle."""
+        manager = self._manager([], watcher_configs=[make_watcher(name="script")])
+
+        await manager.run_once()
+        self.assertEqual(manager.list_watchers()[0]["state"], "active")
+
+        await manager.pause_watcher("script")
+        await manager.resume_watcher("script")
+        self.assertEqual(manager.list_watchers()[0]["state"], "active")
+
+        # Drop the processor without touching the record: exactly what a start
+        # that raised after writing its record leaves behind.
+        await manager._lifecycle._stop_processor("script")
+        self.assertEqual(manager.list_watchers()[0]["state"], "failed")
+
+        await manager.shutdown()
+
+    async def test_a_subscribe_failure_reads_failed_not_active(self):
+        """End to end: the rollback keeps the record on purpose, and the row
+        has to say so rather than reporting a healthy watcher."""
+        manager = self._manager([], watcher_configs=[make_watcher(name="script")])
+
+        async def boom(*a, **k):
+            raise RuntimeError("DDP subscription failed")
+
+        with patch.object(manager._connector, "subscribe_room", side_effect=boom):
+            errors = await manager.run_once()
+
+        self.assertTrue(errors)
+        rows = manager.list_watchers()
+        self.assertEqual([w["state"] for w in rows], ["failed"])
+        await manager.shutdown()
 
     async def test_idle_is_one_flag_away(self):
         manager = self._manager([_record("idle", dropped_at="2026-08-16T00:00:00Z")])
@@ -182,6 +268,15 @@ class TestListStateFilter(IsolatedTestCase):
         rows = manager.list_watchers(StateFilter.ALL)
 
         self.assertEqual(len(rows), 3)
+
+    async def test_failed_can_be_asked_for_alone(self):
+        manager = self._manager(
+            [_record("broken"), _record("idle", dropped_at="2026-08-16T00:00:00Z")]
+        )
+
+        rows = manager.list_watchers(StateFilter.FAILED)
+
+        self.assertEqual([w["watcher_name"] for w in rows], ["broken"])
 
 
 class TestListRowContents(IsolatedTestCase):
@@ -242,7 +337,7 @@ class TestListRowContents(IsolatedTestCase):
             CoreConfig(
                 agents={"default": AgentConfig(timeout=10)}, default_agent="default"
             ),
-            watcher_configs=[make_watcher(name="w1", agent="default")],
+            watcher_configs=[make_watcher(name="w1", agent="triage")],
             state_name="rc-home",
         )
         patcher = patch(
@@ -257,7 +352,9 @@ class TestListRowContents(IsolatedTestCase):
         # per-connector lifecycle always knows, and what `state.<name>.json` is
         # named after.
         self.assertEqual(row["connector"], "rc-home")
-        self.assertEqual(row["agent_name"], "default")
+        # Deliberately not "default": that is also the manager's default agent,
+        # so asserting it could not tell a config lookup from a global fallback.
+        self.assertEqual(row["agent_name"], "triage")
 
     async def test_a_stamped_record_uses_its_own_connector_and_agent(self):
         manager = self._manager(

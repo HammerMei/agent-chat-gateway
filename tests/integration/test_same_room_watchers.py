@@ -35,6 +35,7 @@ from gateway.config import AgentConfig, WatcherConfig
 from gateway.connectors.script import ScriptConnector
 from gateway.core.config import CoreConfig
 from gateway.core.session_manager import SessionManager
+from gateway.core.state import StateFilter
 
 pytestmark = pytest.mark.integration
 
@@ -90,10 +91,12 @@ class TestTwoWatchersOneRoom(unittest.IsolatedAsyncioTestCase):
             )
             # Which watcher is *serving* the room is a question about processors,
             # not about records — `list_watchers()` answers the second one.
+            # Scanned over every row rather than a hardcoded pair, so an
+            # unexpected third watcher serving the room still fails this.
             serving = [
-                name
-                for name in ("w-a1", "w-a2")
-                if manager.get_processor(name) is not None
+                w["watcher_name"]
+                for w in manager.list_watchers(StateFilter.ALL)
+                if manager.get_processor(w["watcher_name"]) is not None
             ]
             self.assertEqual(
                 serving, ["w-a1"],

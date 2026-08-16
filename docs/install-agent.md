@@ -370,7 +370,7 @@ To monitor additional rooms/channels:
 | `agent-chat-gateway start` | Start the daemon |
 | `agent-chat-gateway stop` | Stop the daemon |
 | `agent-chat-gateway status` | Show status and uptime |
-| `agent-chat-gateway list` | List active and paused watchers (`--all` for every state) |
+| `agent-chat-gateway list` | List active, failed and paused watchers (`--all` for every state) |
 | `agent-chat-gateway pause WATCHER` | Pause a watcher |
 | `agent-chat-gateway resume WATCHER` | Resume a paused watcher |
 | `agent-chat-gateway reset WATCHER` | Reset a watcher session |

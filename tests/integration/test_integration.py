@@ -451,7 +451,11 @@ class TestTimeoutHandling(IsolatedTestCase):
 class TestWatcherLifecycle(IsolatedTestCase):
     """list_watchers / pause_watcher / resume_watcher / reset_watcher."""
 
-    async def test_list_watchers_shows_config(self):
+    async def test_list_watchers_reports_the_record(self):
+        """Renamed from `..._shows_config`: rows come from records now (§2.8),
+        and a name teaching the old model is worse than no name."""
+        from gateway.core.connector import Room
+
         connector = ScriptConnector()
         agent = MockAgentBackend()
         manager = make_manager(
@@ -459,13 +463,25 @@ class TestWatcherLifecycle(IsolatedTestCase):
             agent,
             watcher_configs=[make_watcher("my-room", name="my-watcher")],
         )
-        await manager.run_once()
+
+        async def resolve(room_name):
+            # Distinct id and name: ScriptConnector returns the same string for
+            # both, which would let `room_name` be satisfied by the room-id
+            # fallback and hide whether the name was recorded at all.
+            return Room(id="rid-my-room", name="#my-room", type="script")
+
+        with patch.object(connector, "resolve_room", side_effect=resolve):
+            await manager.run_once()
 
         watchers = manager.list_watchers()
         self.assertEqual(len(watchers), 1)
         self.assertEqual(watchers[0]["watcher_name"], "my-watcher")
-        self.assertEqual(watchers[0]["room_name"], "my-room")
+        self.assertEqual(watchers[0]["room_name"], "#my-room")
+        self.assertEqual(watchers[0]["room_id"], "rid-my-room")
         self.assertEqual(watchers[0]["state"], "active")
+        # `state` is derived from the record plus residency, so the processor
+        # check the old `["active"]` assertion provided is kept explicitly.
+        self.assertIsNotNone(manager.get_processor("my-watcher"))
         # When no context_inject_files are configured, inject() marks the session
         # as "injected" immediately to prevent per-message retry loops.
         self.assertEqual(watchers[0]["context_injection_state"], "injected")
