@@ -471,6 +471,21 @@ class Connector(ABC):
         """
         return False
 
+    async def replay_room_since(self, room_id: str) -> None:
+        """Replay one tracked room's missed messages from its watermark.
+
+        The per-room half of the reconnect replay, exposed so the startup
+        replay can drive it record by record (§2.2, "abort is only retryable
+        if something replays"): reconnect iterates live subscriptions, startup
+        iterates persisted records, and this is the fetch-and-inject both
+        share. The room must already be tracked — recreation restores the
+        watermark this reads.
+
+        Default: no-op. Connectors with no history API have nothing to replay,
+        and a startup replay over their records must be harmless.
+        """
+        return None
+
     def trigger_history_bound(self, trigger: Any) -> str | None:
         """The ISO timestamp of a router trigger frame, for bounding history handoff.
 

@@ -266,87 +266,103 @@ class MattermostConnector(Connector):
             "WebSocket reconnected — replaying missed messages for %d channel(s)",
             len(self._channels),
         )
-        for channel_id, state in list(self._channels.items()):
-            # Snapshot the watermark NOW, before any await in this iteration —
-            # same race rationale as RC: a concurrent live message must not be
-            # allowed to advance the watermark mid-replay and cause the rest
-            # of this channel's replay window to be skipped as "already
-            # processed".
-            # Captured before the fetch so the close below can tell whether anyone has
-            # claimed this window since. A hand-back landing while this batch is dispatching
-            # claims the very window it is reading and writes back the same timestamp, so a
-            # value comparison would report "unchanged" in exactly the case it exists to
-            # catch. Replay is not serialized against live traffic here — it calls
-            # `_on_posted_event` directly rather than through the per-channel worker.
-            claims_at_entry = state.boundary_claims
-            watermark = state.replay_boundary or state.last_processed_ts
-            if not watermark:
-                logger.debug("Channel '%s': no watermark yet — skipping replay", state.room.name)
-                continue
-            try:
-                page = await self._rest.get_room_history_page(
-                    channel_id, count=self._REPLAY_HISTORY_COUNT, after_ts=watermark
-                )
-                raw_msgs = page.messages
-            except Exception as e:
-                logger.warning("Channel '%s': failed to fetch history for replay: %s", state.room.name, e)
-                continue
+        for channel_id in list(self._channels):
+            await self.replay_room_since(channel_id)
 
-            if not raw_msgs:
-                if page.was_full:
-                    # Not an empty window — a page the server filled entirely with system
-                    # posts, because `per_page` is applied before ACG filters them out.
-                    # Every user post older than this page is still waiting behind it, and
-                    # reporting the outage as read would skip them silently. Same rule, and
-                    # same reason, as the Rocket.Chat replay: the count the server applied
-                    # is not the count that survived filtering.
-                    logger.warning(
-                        "Channel '%s': the newest %d history entries are all system posts "
-                        "— any user posts older than them cannot be reached in one page "
-                        "and may be permanently missed",
-                        state.room.name, self._REPLAY_HISTORY_COUNT,
-                    )
-                else:
-                    logger.debug(
-                        "Channel '%s': no missed messages since %s",
-                        state.room.name, watermark)
-                    # A read that found nothing is still a read — of the window this replay
-                    # came in for, not one claimed during the fetch above.
-                    state.discharge_boundary(claims_at_entry)
-                continue
+    async def replay_room_since(self, room_id: str) -> None:
+        """Replay one tracked channel's outage window from its watermark.
 
+        The per-channel half of the reconnect replay, shared with the startup
+        replay for the same reason as RC's: what "cannot copy the reconnect
+        path" forbids is the iteration source (live channels vs persisted
+        records), not this fetch-and-inject. The channel must already be
+        tracked; startup recreates the watcher first, which restores the
+        watermark this reads.
+        """
+        state = self._channels.get(room_id)
+        if state is None:
+            return
+        channel_id = room_id
+        # Snapshot the watermark NOW, before any await in this iteration —
+        # same race rationale as RC: a concurrent live message must not be
+        # allowed to advance the watermark mid-replay and cause the rest
+        # of this channel's replay window to be skipped as "already
+        # processed".
+        # Captured before the fetch so the close below can tell whether anyone has
+        # claimed this window since. A hand-back landing while this batch is dispatching
+        # claims the very window it is reading and writes back the same timestamp, so a
+        # value comparison would report "unchanged" in exactly the case it exists to
+        # catch. Replay is not serialized against live traffic here — it calls
+        # `_on_posted_event` directly rather than through the per-channel worker.
+        claims_at_entry = state.boundary_claims
+        watermark = state.replay_boundary or state.last_processed_ts
+        if not watermark:
+            logger.debug("Channel '%s': no watermark yet — skipping replay", state.room.name)
+            return
+        try:
+            page = await self._rest.get_room_history_page(
+                channel_id, count=self._REPLAY_HISTORY_COUNT, after_ts=watermark
+            )
+            raw_msgs = page.messages
+        except Exception as e:
+            logger.warning("Channel '%s': failed to fetch history for replay: %s", state.room.name, e)
+            return
+
+        if not raw_msgs:
             if page.was_full:
+                # Not an empty window — a page the server filled entirely with system
+                # posts, because `per_page` is applied before ACG filters them out.
+                # Every user post older than this page is still waiting behind it, and
+                # reporting the outage as read would skip them silently. Same rule, and
+                # same reason, as the Rocket.Chat replay: the count the server applied
+                # is not the count that survived filtering.
                 logger.warning(
-                    "Channel '%s': replay fetched the maximum %d message(s) — "
-                    "the outage window may have produced more; some messages "
-                    "could be permanently lost",
+                    "Channel '%s': the newest %d history entries are all system posts "
+                    "— any user posts older than them cannot be reached in one page "
+                    "and may be permanently missed",
                     state.room.name, self._REPLAY_HISTORY_COUNT,
                 )
             else:
-                logger.info(
-                    "Channel '%s': replaying %d missed message(s) since %s",
-                    state.room.name, len(raw_msgs), watermark,
-                )
+                logger.debug(
+                    "Channel '%s': no missed messages since %s",
+                    state.room.name, watermark)
+                # A read that found nothing is still a read — of the window this replay
+                # came in for, not one claimed during the fetch above.
+                state.discharge_boundary(claims_at_entry)
+            return
 
-            for idx, post in enumerate(raw_msgs):
-                if channel_id not in self._channels:
-                    logger.debug(
-                        "Channel '%s' was unsubscribed during replay — skipping %d remaining message(s)",
-                        state.room.name, len(raw_msgs) - idx,
-                    )
-                    break
-                decoded = self._synthesize_decoded_for_replay(post)
-                await self._on_posted_event(decoded, is_replay=True, replay_after_ts=watermark)
-            else:
-                # `for`/`else`, so a cancellation or the `break` above does not reach it: a
-                # window is spent once its batch has been *dispatched*, not once it was
-                # fetched. Any hand-back during the batch — this replay's own or a live one
-                # — left a newer claim, and the window stays open for the next recovery.
-                if not state.discharge_boundary(claims_at_entry):
-                    logger.info(
-                        "Channel '%s': the replay window was claimed again while this batch "
-                        "was being dispatched — leaving it open", state.room.name,
-                    )
+        if page.was_full:
+            logger.warning(
+                "Channel '%s': replay fetched the maximum %d message(s) — "
+                "the outage window may have produced more; some messages "
+                "could be permanently lost",
+                state.room.name, self._REPLAY_HISTORY_COUNT,
+            )
+        else:
+            logger.info(
+                "Channel '%s': replaying %d missed message(s) since %s",
+                state.room.name, len(raw_msgs), watermark,
+            )
+
+        for idx, post in enumerate(raw_msgs):
+            if channel_id not in self._channels:
+                logger.debug(
+                    "Channel '%s' was unsubscribed during replay — skipping %d remaining message(s)",
+                    state.room.name, len(raw_msgs) - idx,
+                )
+                break
+            decoded = self._synthesize_decoded_for_replay(post)
+            await self._on_posted_event(decoded, is_replay=True, replay_after_ts=watermark)
+        else:
+            # `for`/`else`, so a cancellation or the `break` above does not reach it: a
+            # window is spent once its batch has been *dispatched*, not once it was
+            # fetched. Any hand-back during the batch — this replay's own or a live one
+            # — left a newer claim, and the window stays open for the next recovery.
+            if not state.discharge_boundary(claims_at_entry):
+                logger.info(
+                    "Channel '%s': the replay window was claimed again while this batch "
+                    "was being dispatched — leaving it open", state.room.name,
+                )
 
     def _synthesize_decoded_for_replay(self, post: dict) -> dict:
         """Build a decoded-event dict for a REST-history post (replay path only).

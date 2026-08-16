@@ -653,6 +653,8 @@ class TestInboundStartsAfterWatchersExist(unittest.IsolatedAsyncioTestCase):
         sm._connector.start_inbound = AsyncMock(side_effect=lambda: order("inbound"))
         sm._lifecycle = MagicMock()
         sm._lifecycle.sync_watchers = AsyncMock(side_effect=lambda **kw: order("sync") or [])
+        # No rules -> no creation path; sync_only's startup replay branches on this.
+        sm._watcher_manager = None
 
         await sm.sync_only()
 
@@ -670,6 +672,7 @@ class TestInboundStartsAfterWatchersExist(unittest.IsolatedAsyncioTestCase):
         sm._connector.start_inbound = AsyncMock()
         sm._lifecycle = MagicMock()
         sm._lifecycle.sync_watchers = AsyncMock(return_value=["w1 failed"])
+        sm._watcher_manager = None
 
         errors = await sm.sync_only()
 

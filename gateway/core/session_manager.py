@@ -26,6 +26,7 @@ from .state import StateFilter, parse_state_filter
 from .state_store import StateStore
 from .watcher_lifecycle import WatcherLifecycle
 from .watcher_manager import RoomRef, WatcherManager
+from .watcher_rule import RoomKind
 
 logger = logging.getLogger("agent-chat-gateway.core.session_manager")
 
@@ -42,6 +43,12 @@ class SessionManager:
                                  watcher_configs=watchers)
         await manager.run()   # blocks until cancelled
     """
+
+    # How many messages the startup replay's gap probe asks for. Only emptiness
+    # is read from the answer, but the count must be big enough that a page of
+    # filtered-out system messages does not read as "no gap" — the same
+    # count-before-filtering trap the reconnect replay documents.
+    _REPLAY_PROBE_COUNT = 50
 
     def __init__(
         self,
@@ -156,7 +163,78 @@ class SessionManager:
         """
         errors = await self._lifecycle.sync_watchers(unavailable_agents=unavailable_agents)
         await self._connector.start_inbound()
+        await self._replay_persisted_records()
         return errors
+
+    async def _replay_persisted_records(self) -> None:
+        """Recover messages that arrived while the daemon was down (§2.2).
+
+        The abort guarantee — "watermark unchanged, so redelivery can retry" —
+        is only worth something if something actually redelivers, and at
+        startup nothing did: both connectors replay from their *reconnect*
+        callback, which a process restart never fires. This walks the
+        persisted rule-derived records instead, and for each one probes the
+        gap between its stored watermark and now. An empty gap leaves the room
+        idle — that is the lazy model working. A non-empty gap recreates the
+        watcher from its own record (sticky, §2.4 — rules are not consulted)
+        and replays the window through the connector's normal pipeline, where
+        the restored watermark and the id window dedup as usual.
+
+        Best-effort per record: a room whose probe, recreation or replay fails
+        stays idle and is recovered by its next live message. Boot must not
+        die on one bad room.
+
+        The accepted residual, restated: a room that never produced a record —
+        or produced one with no watermark — has nothing to replay from, and a
+        message that arrived for it while the daemon was down is gone until
+        someone speaks again.
+        """
+        if self._watcher_manager is None:
+            return
+        for ws in list(self._lifecycle.states().values()):
+            if not ws.rule_name or ws.paused or not ws.config:
+                continue
+            if not ws.last_processed_ts or not ws.room_id:
+                continue
+            if self._lifecycle.processor_named(ws.watcher_name) is not None:
+                continue
+            room = Room(
+                id=ws.room_id,
+                name=ws.room_name or ws.watcher_name,
+                type=ws.room_type or "channel",
+            )
+            try:
+                missed = await self._connector.fetch_room_history(
+                    room, self._REPLAY_PROBE_COUNT, after_ts=ws.last_processed_ts
+                )
+            except Exception as e:
+                logger.warning(
+                    "Startup replay: could not probe room %s for watcher '%s': %s",
+                    ws.room_id, ws.watcher_name, e,
+                )
+                continue
+            if not missed:
+                continue
+            try:
+                kind = RoomKind(ws.room_kind) if ws.room_kind else RoomKind.CHANNEL
+                created = await self._watcher_manager.get_or_create(
+                    self._connector_name,
+                    RoomRef(
+                        id=ws.room_id,
+                        kind=kind,
+                        name=ws.room_name,
+                        participants=tuple(ws.participants),
+                    ),
+                )
+                if created is None:
+                    continue
+                await self._connector.replay_room_since(ws.room_id)
+            except Exception as e:
+                logger.warning(
+                    "Startup replay failed for watcher '%s' (room %s) — the room "
+                    "stays idle and its next message recovers it: %s",
+                    ws.watcher_name, ws.room_id, e,
+                )
 
     async def _route_unclaimed_room(self, room: RoomRef, trigger) -> None:
         """The router the connectors call for a room no watcher tracks (§2.2).

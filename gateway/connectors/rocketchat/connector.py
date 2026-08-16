@@ -398,241 +398,260 @@ class RocketChatConnector(Connector):
         fall below the last-processed timestamp.
         """
         logger.info("WebSocket reconnected — replaying missed messages for %d room(s)", len(self._rooms))
-        for room_id, sub in list(self._rooms.items()):
-            # Snapshot the watermark NOW, before any await in this iteration.
-            # The live DDP listen loop runs concurrently: awaiting get_room_history
-            # for an earlier room yields the event loop and allows live messages for
-            # subsequent rooms to advance their last_processed_ts.  If we read the
-            # watermark inside the await we would use a newer ts that skips the
-            # entire outage window for those rooms.
-            # Captured so the completion below can tell whether anyone has claimed this
-            # window since. A live message rejected for capacity while this batch is
-            # dispatching claims the boundary, and closing it on this batch's success
-            # loses that message: the next accepted message advances the watermark past it
-            # and nothing points below it any more.
+        for room_id in list(self._rooms):
+            await self.replay_room_since(room_id)
+
+    async def replay_room_since(self, room_id: str) -> None:
+        """Replay one tracked room's outage window from its watermark.
+
+        The per-room half of the reconnect replay, and deliberately shared with
+        the startup replay (§2.2): "cannot copy the reconnect path" forbids the
+        *iteration source* — reconnect walks live subscriptions, startup walks
+        persisted records — not the fetch-and-inject this method owns. The room
+        must already be tracked; startup recreates the watcher first, which is
+        also what restores the watermark this reads.
+
+        Everything is re-injected through the normal filter/normalize/dispatch
+        pipeline with the replay flags set, so the id window and the watermark
+        dedup the frames that also arrived live.
+        """
+        sub = self._rooms.get(room_id)
+        if sub is None:
+            return
+        # Snapshot the watermark NOW, before any await in this iteration.
+        # The live DDP listen loop runs concurrently: awaiting get_room_history
+        # for an earlier room yields the event loop and allows live messages for
+        # subsequent rooms to advance their last_processed_ts.  If we read the
+        # watermark inside the await we would use a newer ts that skips the
+        # entire outage window for those rooms.
+        # Captured so the completion below can tell whether anyone has claimed this
+        # window since. A live message rejected for capacity while this batch is
+        # dispatching claims the boundary, and closing it on this batch's success
+        # loses that message: the next accepted message advances the watermark past it
+        # and nothing points below it any more.
+        #
+        # The *claim count*, not the value. A hand-back inside a replay claims the
+        # window the replay is already reading, so it writes back the same timestamp —
+        # comparing values reports "unchanged" for precisely the case this guard is
+        # for. That was the bug, and it read as correct for four review rounds.
+        claims_at_entry = sub.boundary_claims
+
+        # The outage boundary if one was captured, and the live watermark only as a
+        # fallback for a replay that no outage callback preceded. Cleared where the
+        # history is actually read, not here — a replay that declines below (membership
+        # unknown, or the fetch failing) has not read the window, and dropping the mark
+        # would close a gap nobody looked at. Those two failures are correlated with the
+        # outage itself, so this is the likely path, not the exotic one.
+        watermark = sub.replay_boundary or sub.last_processed_ts
+        if not watermark:
+            logger.debug(
+                "Room '%s': no watermark yet — skipping replay", sub.room.name
+            )
+            return
+
+        # Membership is re-established before the outage is replayed, because the
+        # outage is exactly when it can have changed and nobody was listening. The
+        # live path is gated on `roomParticipant` (see `_on_raw_ddp_message`); replay
+        # has no access object to read it from, so it asks. Without this, an account
+        # removed from a public channel mid-outage still replays that channel — REST
+        # history for a public channel does not require membership, so the fetch
+        # succeeds and the agent answers in a room it was thrown out of.
+        # Read before the lookup, and compared again around every await below. The
+        # fetch is a REST round trip and the dispatch loop is up to 200 handler calls;
+        # a live rejection arriving anywhere inside that is news this batch has to act
+        # on, and it cannot see the cleared marks because it is holding a snapshot.
+        epoch = sub.membership_epoch
+        member = await self._rest.is_room_member(sub.room.id)
+        if sub.membership_epoch != epoch:
+            logger.warning(
+                "Room '%s': this account was removed while its membership was being "
+                "checked — abandoning the replay",
+                sub.room.name,
+            )
+            return
+        if member is False:
+            # Removed, confirmed. Both marks are dropped, not just the boundary: an
+            # account that is later re-added would otherwise replay from before its
+            # removal, delivering everything said while it was not in the room. A
+            # retained boundary is a promise to read that window later, and after a
+            # removal nobody is entitled to read it.
             #
-            # The *claim count*, not the value. A hand-back inside a replay claims the
-            # window the replay is already reading, so it writes back the same timestamp —
-            # comparing values reports "unchanged" for precisely the case this guard is
-            # for. That was the bug, and it read as correct for four review rounds.
-            claims_at_entry = sub.boundary_claims
+            # The watermark has to go with it, because the watermark *is* the fallback
+            # boundary and it is frozen at the moment of removal — the live gate
+            # remembers a rejected id without advancing it. Left in place, a reconnect
+            # that arrives before the first post-re-add message would snapshot that
+            # frozen value and replay the whole time away. Empty means what it means
+            # for a room seen for the first time: no window, and ts-dedup off until
+            # live traffic establishes one (`normalize.py`, step 4).
+            sub.left_the_room()
+            logger.warning(
+                "Room '%s': this account is no longer a member — skipping replay and "
+                "closing the outage window; a later re-add starts from that point, "
+                "not from before the removal",
+                sub.room.name,
+            )
+            return
+        if member is None:
+            # Unknown is not removal. The lookup failing is correlated with the outage
+            # itself, so this is the likely path, and the window stays open for the
+            # next attempt to read.
+            logger.warning(
+                "Room '%s': membership could not be established — skipping replay; "
+                "live delivery is unaffected and the next reconnect will ask again",
+                sub.room.name,
+            )
+            return
 
-            # The outage boundary if one was captured, and the live watermark only as a
-            # fallback for a replay that no outage callback preceded. Cleared where the
-            # history is actually read, not here — a replay that declines below (membership
-            # unknown, or the fetch failing) has not read the window, and dropping the mark
-            # would close a gap nobody looked at. Those two failures are correlated with the
-            # outage itself, so this is the likely path, not the exotic one.
-            watermark = sub.replay_boundary or sub.last_processed_ts
-            if not watermark:
-                logger.debug(
-                    "Room '%s': no watermark yet — skipping replay", sub.room.name
-                )
-                continue
+        try:
+            page = await self._rest.get_room_history_page(
+                sub.room.id,
+                sub.room.type,
+                count=self._REPLAY_HISTORY_COUNT,
+                after_ts=watermark,
+            )
+            raw_msgs = page.messages
+        except Exception as e:
+            logger.warning(
+                "Room '%s': failed to fetch history for replay: %s",
+                sub.room.name, e,
+            )
+            return
 
-            # Membership is re-established before the outage is replayed, because the
-            # outage is exactly when it can have changed and nobody was listening. The
-            # live path is gated on `roomParticipant` (see `_on_raw_ddp_message`); replay
-            # has no access object to read it from, so it asks. Without this, an account
-            # removed from a public channel mid-outage still replays that channel — REST
-            # history for a public channel does not require membership, so the fetch
-            # succeeds and the agent answers in a room it was thrown out of.
-            # Read before the lookup, and compared again around every await below. The
-            # fetch is a REST round trip and the dispatch loop is up to 200 handler calls;
-            # a live rejection arriving anywhere inside that is news this batch has to act
-            # on, and it cannot see the cleared marks because it is holding a snapshot.
-            epoch = sub.membership_epoch
-            member = await self._rest.is_room_member(sub.room.id)
-            if sub.membership_epoch != epoch:
-                logger.warning(
-                    "Room '%s': this account was removed while its membership was being "
-                    "checked — abandoning the replay",
-                    sub.room.name,
-                )
-                continue
-            if member is False:
-                # Removed, confirmed. Both marks are dropped, not just the boundary: an
-                # account that is later re-added would otherwise replay from before its
-                # removal, delivering everything said while it was not in the room. A
-                # retained boundary is a promise to read that window later, and after a
-                # removal nobody is entitled to read it.
-                #
-                # The watermark has to go with it, because the watermark *is* the fallback
-                # boundary and it is frozen at the moment of removal — the live gate
-                # remembers a rejected id without advancing it. Left in place, a reconnect
-                # that arrives before the first post-re-add message would snapshot that
-                # frozen value and replay the whole time away. Empty means what it means
-                # for a room seen for the first time: no window, and ts-dedup off until
-                # live traffic establishes one (`normalize.py`, step 4).
-                sub.left_the_room()
-                logger.warning(
-                    "Room '%s': this account is no longer a member — skipping replay and "
-                    "closing the outage window; a later re-add starts from that point, "
-                    "not from before the removal",
-                    sub.room.name,
-                )
-                continue
-            if member is None:
-                # Unknown is not removal. The lookup failing is correlated with the outage
-                # itself, so this is the likely path, and the window stays open for the
-                # next attempt to read.
-                logger.warning(
-                    "Room '%s': membership could not be established — skipping replay; "
-                    "live delivery is unaffected and the next reconnect will ask again",
-                    sub.room.name,
-                )
-                continue
+        if sub.membership_epoch != epoch:
+            logger.warning(
+                "Room '%s': this account was removed while its history was being "
+                "fetched — discarding %d message(s) rather than dispatching them",
+                sub.room.name, len(raw_msgs),
+            )
+            return
 
-            try:
-                page = await self._rest.get_room_history_page(
-                    sub.room.id,
-                    sub.room.type,
-                    count=self._REPLAY_HISTORY_COUNT,
-                    after_ts=watermark,
-                )
-                raw_msgs = page.messages
-            except Exception as e:
-                logger.warning(
-                    "Room '%s': failed to fetch history for replay: %s",
-                    sub.room.name, e,
-                )
-                continue
-
-            if sub.membership_epoch != epoch:
-                logger.warning(
-                    "Room '%s': this account was removed while its history was being "
-                    "fetched — discarding %d message(s) rather than dispatching them",
-                    sub.room.name, len(raw_msgs),
-                )
-                continue
-
-            if not raw_msgs:
-                if page.was_full:
-                    # Not an empty window — a page the server filled entirely with system
-                    # events, because the count is applied before they are filtered out.
-                    # Every user message older than this page is still waiting behind it,
-                    # and reporting the outage as read would skip them silently. This is
-                    # the same bound the warning below describes, reached from the one
-                    # direction that produced no evidence at all.
-                    logger.warning(
-                        "Room '%s': the newest %d history entries are all system events "
-                        "— any user messages older than them cannot be reached in one "
-                        "page and may be permanently missed",
-                        sub.room.name, self._REPLAY_HISTORY_COUNT,
-                    )
-                elif not sub.discharge_boundary(claims_at_entry):
-                    # A read that found nothing is still a read — but only of the window
-                    # this replay came in for. The membership check and the history fetch
-                    # above are both awaits, and a live hand-back inside either of them
-                    # claims a window this fetch has not looked below.
-                    logger.info(
-                        "Room '%s': the outage window was claimed again while its history "
-                        "was being fetched — leaving it open",
-                        sub.room.name,
-                    )
-                logger.debug(
-                    "Room '%s': no missed messages since %s",
-                    sub.room.name, watermark,
-                )
-                continue
-
+        if not raw_msgs:
             if page.was_full:
+                # Not an empty window — a page the server filled entirely with system
+                # events, because the count is applied before they are filtered out.
+                # Every user message older than this page is still waiting behind it,
+                # and reporting the outage as read would skip them silently. This is
+                # the same bound the warning below describes, reached from the one
+                # direction that produced no evidence at all.
                 logger.warning(
-                    "Room '%s': replay fetched the maximum %d message(s) — "
-                    "the outage window may have produced more; some messages "
-                    "could be permanently lost",
+                    "Room '%s': the newest %d history entries are all system events "
+                    "— any user messages older than them cannot be reached in one "
+                    "page and may be permanently missed",
                     sub.room.name, self._REPLAY_HISTORY_COUNT,
                 )
-            else:
+            elif not sub.discharge_boundary(claims_at_entry):
+                # A read that found nothing is still a read — but only of the window
+                # this replay came in for. The membership check and the history fetch
+                # above are both awaits, and a live hand-back inside either of them
+                # claims a window this fetch has not looked below.
                 logger.info(
-                    "Room '%s': replaying %d missed message(s) since %s",
-                    sub.room.name, len(raw_msgs), watermark,
+                    "Room '%s': the outage window was claimed again while its history "
+                    "was being fetched — leaving it open",
+                    sub.room.name,
                 )
+            logger.debug(
+                "Room '%s': no missed messages since %s",
+                sub.room.name, watermark,
+            )
+            return
 
-            # Warn when the live DDP subscription for this room is not healthy.
-            # History replay still proceeds — the user gets missed messages —
-            # but future live messages will be lost until the sub recovers.
-            ws_status = self._ws.subscription_statuses.get(room_id, {})
-            if ws_status.get("status") not in ("active", None, ""):
+        if page.was_full:
+            logger.warning(
+                "Room '%s': replay fetched the maximum %d message(s) — "
+                "the outage window may have produced more; some messages "
+                "could be permanently lost",
+                sub.room.name, self._REPLAY_HISTORY_COUNT,
+            )
+        else:
+            logger.info(
+                "Room '%s': replaying %d missed message(s) since %s",
+                sub.room.name, len(raw_msgs), watermark,
+            )
+
+        # Warn when the live DDP subscription for this room is not healthy.
+        # History replay still proceeds — the user gets missed messages —
+        # but future live messages will be lost until the sub recovers.
+        ws_status = self._ws.subscription_statuses.get(room_id, {})
+        if ws_status.get("status") not in ("active", None, ""):
+            logger.warning(
+                "Room '%s': DDP subscription is in '%s' state — "
+                "replaying history but future live messages will be lost "
+                "until the subscription recovers",
+                sub.room.name, ws_status.get("status"),
+            )
+
+        all_accepted = True
+        for idx, doc in enumerate(raw_msgs):
+            # Guard against concurrent unsubscribe_room: if the room was
+            # removed while we were awaiting get_room_history, skip the
+            # remaining docs rather than logging spurious "unknown room_id"
+            # warnings for each one.
+            if sub.membership_epoch != epoch:
                 logger.warning(
-                    "Room '%s': DDP subscription is in '%s' state — "
-                    "replaying history but future live messages will be lost "
-                    "until the subscription recovers",
-                    sub.room.name, ws_status.get("status"),
+                    "Room '%s': this account was removed mid-replay — dropping the "
+                    "remaining %d message(s)",
+                    sub.room.name, len(raw_msgs) - idx,
                 )
-
-            all_accepted = True
-            for idx, doc in enumerate(raw_msgs):
-                # Guard against concurrent unsubscribe_room: if the room was
-                # removed while we were awaiting get_room_history, skip the
-                # remaining docs rather than logging spurious "unknown room_id"
-                # warnings for each one.
-                if sub.membership_epoch != epoch:
-                    logger.warning(
-                        "Room '%s': this account was removed mid-replay — dropping the "
-                        "remaining %d message(s)",
-                        sub.room.name, len(raw_msgs) - idx,
-                    )
-                    break
-                if room_id not in self._rooms:
-                    logger.debug(
-                        "Room '%s' was unsubscribed during replay — "
-                        "skipping %d remaining message(s)",
+                break
+            if room_id not in self._rooms:
+                logger.debug(
+                    "Room '%s' was unsubscribed during replay — "
+                    "skipping %d remaining message(s)",
+                    sub.room.name,
+                    len(raw_msgs) - idx,
+                )
+                break
+            accepted = await self._on_raw_ddp_message(
+                room_id, doc, is_replay=True, replay_after_ts=watermark
+            )
+            if sub.membership_epoch != epoch:
+                # The removal landed *inside* that handler. The check at the top of the
+                # loop cannot reach this: the last document has no next iteration, so
+                # the `for`/`else` below would bless a revoked batch as complete.
+                #
+                # The marks are not re-cleared here. `left_the_room()` cleared them and
+                # `_on_raw_ddp_message` refuses to commit a watermark once the epoch has
+                # moved under it, so there is nothing left to repair — and repairing it
+                # here as well would be the same rule in two places, which is how the
+                # rule ends up applied in one.
+                logger.warning(
+                    "Room '%s': this account was removed while message %d of %d was "
+                    "being handled — dropping the rest and re-closing the window",
+                    sub.room.name, idx + 1, len(raw_msgs),
+                )
+                break
+            if not accepted:
+                all_accepted = False
+        else:
+            # Only once the batch has actually been *dispatched*. Fetching it is not
+            # reading it: a shutdown or another disconnect cancelling this loop midway
+            # leaves the tail unprocessed, and by then the restored live traffic has
+            # moved `last_processed_ts` past it — so a boundary cleared at fetch time
+            # would have the next recovery snapshot the newer mark and skip the tail
+            # for good.
+            #
+            # `for`/`else`, so neither a cancellation nor the `break` above reaches it.
+            # The cancellation case is the one this exists for; the `break` means the
+            # room stopped being tracked mid-replay, and leaving a boundary on a
+            # subscription nobody holds any more costs nothing.
+            #
+            # Completing the call is not the handler accepting: a full processor queue
+            # hands the message back and forgets its id so a later replay can bring it
+            # back. Spending the boundary on a batch that contains one of those removes
+            # the only mark that could — the live watermark has moved past it by then.
+            if all_accepted:
+                if not sub.discharge_boundary(claims_at_entry):
+                    logger.info(
+                        "Room '%s': the outage window was claimed again while this "
+                        "batch was being dispatched — leaving it open",
                         sub.room.name,
-                        len(raw_msgs) - idx,
                     )
-                    break
-                accepted = await self._on_raw_ddp_message(
-                    room_id, doc, is_replay=True, replay_after_ts=watermark
-                )
-                if sub.membership_epoch != epoch:
-                    # The removal landed *inside* that handler. The check at the top of the
-                    # loop cannot reach this: the last document has no next iteration, so
-                    # the `for`/`else` below would bless a revoked batch as complete.
-                    #
-                    # The marks are not re-cleared here. `left_the_room()` cleared them and
-                    # `_on_raw_ddp_message` refuses to commit a watermark once the epoch has
-                    # moved under it, so there is nothing left to repair — and repairing it
-                    # here as well would be the same rule in two places, which is how the
-                    # rule ends up applied in one.
-                    logger.warning(
-                        "Room '%s': this account was removed while message %d of %d was "
-                        "being handled — dropping the rest and re-closing the window",
-                        sub.room.name, idx + 1, len(raw_msgs),
-                    )
-                    break
-                if not accepted:
-                    all_accepted = False
             else:
-                # Only once the batch has actually been *dispatched*. Fetching it is not
-                # reading it: a shutdown or another disconnect cancelling this loop midway
-                # leaves the tail unprocessed, and by then the restored live traffic has
-                # moved `last_processed_ts` past it — so a boundary cleared at fetch time
-                # would have the next recovery snapshot the newer mark and skip the tail
-                # for good.
-                #
-                # `for`/`else`, so neither a cancellation nor the `break` above reaches it.
-                # The cancellation case is the one this exists for; the `break` means the
-                # room stopped being tracked mid-replay, and leaving a boundary on a
-                # subscription nobody holds any more costs nothing.
-                #
-                # Completing the call is not the handler accepting: a full processor queue
-                # hands the message back and forgets its id so a later replay can bring it
-                # back. Spending the boundary on a batch that contains one of those removes
-                # the only mark that could — the live watermark has moved past it by then.
-                if all_accepted:
-                    if not sub.discharge_boundary(claims_at_entry):
-                        logger.info(
-                            "Room '%s': the outage window was claimed again while this "
-                            "batch was being dispatched — leaving it open",
-                            sub.room.name,
-                        )
-                else:
-                    logger.warning(
-                        "Room '%s': part of the replayed batch was handed back (queue "
-                        "full) — keeping the outage window open for the next recovery",
-                        sub.room.name,
-                    )
+                logger.warning(
+                    "Room '%s': part of the replayed batch was handed back (queue "
+                    "full) — keeping the outage window open for the next recovery",
+                    sub.room.name,
+                )
 
     # ── Inbound ──────────────────────────────────────────────────────────────
 

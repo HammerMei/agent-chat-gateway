@@ -185,8 +185,23 @@ class WatcherLifecycle:
         # instead of being erased.  That protection would also resurrect a
         # watcher the operator genuinely deleted from config, so removal has to
         # be named.
+        #
+        # A rule-derived record is never an orphan of this loop (§2.4): its
+        # recreation source is the record itself, not a config entry, so
+        # "absent from config" is its normal state, not evidence of deletion.
+        # Pruning them here would delete cross-restart sticky binding, the
+        # paused-record drop, and the startup replay's iteration source in one
+        # line. They are hydrated into memory instead, so `record_for_room`
+        # answers for them from boot — idle, until a message or the replay
+        # recreates them.
         config_names = {wc.name for wc in self._watcher_configs}
-        prune = {name for name in persisted if name not in config_names}
+        prune = {
+            name for name, ws in persisted.items()
+            if name not in config_names and not ws.rule_name
+        }
+        for name, ws in persisted.items():
+            if ws.rule_name and name not in self._states:
+                self._states[name] = ws
 
         self._state_store.save(self._states, prune=prune)
         return errors
@@ -468,6 +483,13 @@ class WatcherLifecycle:
     def processor_named(self, name: str) -> MessageProcessor | None:
         """The live processor for a watcher name, or None when not resident."""
         return self._processors.get(name)
+
+    def states(self) -> dict[str, WatcherState]:
+        """The in-memory records, by watcher name — the startup replay's
+        iteration source. After `sync_watchers` this includes hydrated
+        rule-derived records, which is the point: they are exactly the rooms a
+        restart would otherwise forget."""
+        return self._states
 
     def resolve_agent_name(self, ref: str) -> str:
         """Public form of `_resolve_agent_name`, for the record's `agent` field —
