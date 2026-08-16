@@ -14,6 +14,7 @@ import json
 import logging
 import os
 from dataclasses import MISSING, asdict, dataclass, field, fields
+from enum import Flag, auto
 from pathlib import Path
 from typing import get_origin
 
@@ -176,6 +177,116 @@ class WatcherState:
     # Which config schema the two snapshots above were written under. 0 means "no snapshot"
     # — a record that predates rule-derived creation, or one written by the static path.
     config_schema_version: int = 0
+
+
+class StateFilter(Flag):
+    """Which lifecycle states a ``list`` should return (design §2.8).
+
+    Composable, and the default is deliberately not ``ALL``: ``OPERABLE`` is the
+    set an operator is realistically about to act on.  A paused watcher belongs
+    in the default view precisely because it is waiting on a human decision, and
+    a failed one because it is the only state that means something is *wrong*
+    (§2.5).  Idle is informational — the bot knows about the room, but nothing is
+    running and nothing is being withheld.  Once membership events register
+    joined rooms as idle, a bot in two hundred channels would otherwise have a
+    ``list`` dominated by rooms nobody has ever spoken in.
+    """
+
+    ACTIVE = auto()
+    IDLE = auto()
+    PAUSED = auto()
+    FAILED = auto()
+    OPERABLE = ACTIVE | PAUSED | FAILED
+    ALL = ACTIVE | IDLE | PAUSED | FAILED
+
+
+# The wire spelling of each individual state, and the only place the two
+# vocabularies meet.  Deriving the reverse map rather than writing it out keeps a
+# new state from being addable to one direction alone.
+STATE_FILTER_NAMES: dict[StateFilter, str] = {
+    StateFilter.ACTIVE: "active",
+    StateFilter.IDLE: "idle",
+    StateFilter.PAUSED: "paused",
+    StateFilter.FAILED: "failed",
+}
+_NAMES_TO_STATE_FILTER = {name: flag for flag, name in STATE_FILTER_NAMES.items()}
+
+
+def lifecycle_state(record: "WatcherState", *, resident: bool) -> StateFilter:
+    """Return the one lifecycle state ``record`` is in (design §2.5).
+
+    ``resident`` is whether a processor is loaded for this watcher right now.
+    It is a **parameter rather than a lookup** so this stays a pure function:
+    something reading state files outside a running daemon passes ``False`` and
+    gets the honest answer for a process running none of them.
+
+    Four answers, one per record, and the order is load-bearing:
+
+    * **paused wins over everything.**  It is an operator's explicit decision,
+      and §4.4 has even ``get`` refuse to override it.  A record that is both
+      paused and dropped is still awaiting a human, so reporting it as idle
+      would hide the only one of the two that someone has to act on.
+    * **idle** is a record the manager dropped. It is checked *before*
+      residency because an idle record is supposed to have no processor;
+      reversing the two would report every idle watcher as failed. **Nothing
+      writes ``dropped_at`` yet** — the watcher manager will, when it releases a
+      watcher and clears it on recreation (§2.5) — so this branch is unreachable
+      in production today and ``--idle`` legitimately returns nothing. The
+      reader lands before the writer on purpose: it is what makes idling
+      observable as soon as the lifecycle increment produces it.
+    * **failed** is the record and reality disagreeing: it wants to be resident
+      and is not, which is what a start that got far enough to write a record
+      and then raised leaves behind. Derived rather than stored, so the next
+      successful start clears it with nobody having to remember to.
+    * **active** otherwise.
+
+    Written as a named function with one answer per case rather than as a
+    condition at each call site: a rule with four answers spelled as a boolean
+    expression is invisible in a diff when the clause that fires is not the
+    first one.
+    """
+    if record.paused:
+        return StateFilter.PAUSED
+    if record.dropped_at:
+        return StateFilter.IDLE
+    if not resident:
+        return StateFilter.FAILED
+    return StateFilter.ACTIVE
+
+
+def state_filter_name(state: StateFilter) -> str:
+    """Return the wire/display spelling of a single lifecycle state."""
+    return STATE_FILTER_NAMES[state]
+
+
+def parse_state_filter(names: list[str] | None) -> StateFilter:
+    """Build a ``StateFilter`` from wire state names; ``None`` means the default.
+
+    An unrecognised name raises rather than being dropped: a filter that
+    silently ignores what it was asked for answers a different question than
+    the one asked, and the caller cannot tell from the result.
+    """
+    if names is None:
+        return StateFilter.OPERABLE
+    if not isinstance(names, list):
+        # Not merely "iterable": a JSON object iterates its *keys*, so
+        # `{"states": {"idle": false}}` would be accepted as an `idle` filter and
+        # the caller would get a confident answer to a query it did not make.
+        raise ValueError(
+            f"state filter must be a list of state names (got {type(names).__name__})"
+        )
+    result = StateFilter(0)
+    for name in names:
+        try:
+            result |= _NAMES_TO_STATE_FILTER[name]
+        except (KeyError, TypeError):
+            known = ", ".join(sorted(_NAMES_TO_STATE_FILTER))
+            raise ValueError(
+                f"unknown watcher state {name!r} — expected one of: {known}"
+            ) from None
+    if not result:
+        raise ValueError("state filter is empty — name at least one state")
+    return result
 
 
 # The type each persisted field must have, derived from WatcherState's own annotations

@@ -289,6 +289,7 @@ class TestAttachmentWorkspaceInThread(unittest.IsolatedAsyncioTestCase):
 
         lc = WatcherLifecycle.__new__(WatcherLifecycle)
         lc._states = {}
+        lc._blocked_agents = set()
         lc._processors = {}
         lc._watcher_locks = {}
         # See the note on the other hand-built lifecycle: `holder()` is consulted
@@ -369,6 +370,7 @@ class TestAttachmentWorkspaceRollback(unittest.IsolatedAsyncioTestCase):
 
         lc = WatcherLifecycle.__new__(WatcherLifecycle)
         lc._states = {}
+        lc._blocked_agents = set()
         lc._processors = {}
         lc._watcher_locks = {}
         # See the note on the other hand-built lifecycle: `holder()` is consulted
@@ -435,6 +437,7 @@ class TestContextInjectedResetOnSubscribeFailure(unittest.IsolatedAsyncioTestCas
 
         lc = WatcherLifecycle.__new__(WatcherLifecycle)
         lc._states = {}
+        lc._blocked_agents = set()
         lc._processors = {}
         lc._watcher_locks = {}
         lc._permission_registry = MagicMock()
@@ -506,6 +509,7 @@ class TestContextInjectedResetOnSubscribeFailure(unittest.IsolatedAsyncioTestCas
 
         lc = WatcherLifecycle.__new__(WatcherLifecycle)
         lc._states = {}
+        lc._blocked_agents = set()
         lc._processors = {}
         lc._watcher_locks = {}
         lc._permission_registry = MagicMock()
@@ -851,8 +855,7 @@ class TestUnavailableAgentsBlocksWatchers(IsolatedTestCase):
 
         errors = await manager.run_once(unavailable_agents={"default"})
 
-        watchers = {w["watcher_name"]: w for w in manager.list_watchers()}
-        self.assertFalse(watchers["w1"]["active"])
+        self.assertIsNone(manager.get_processor("w1"))
         self.assertTrue(
             any("default" in e for e in errors),
             f"Expected 'default' in errors: {errors}",
@@ -871,8 +874,7 @@ class TestUnavailableAgentsBlocksWatchers(IsolatedTestCase):
 
         errors = await manager.run_once(unavailable_agents={"other-agent"})
 
-        watchers = {w["watcher_name"]: w for w in manager.list_watchers()}
-        self.assertTrue(watchers["w1"]["active"])
+        self.assertIsNotNone(manager.get_processor("w1"))
         self.assertFalse(any("w1" in e for e in errors), f"Unexpected errors: {errors}")
 
         await manager.shutdown()
@@ -888,8 +890,7 @@ class TestUnavailableAgentsBlocksWatchers(IsolatedTestCase):
 
         errors = await manager.run_once(unavailable_agents=set())
 
-        watchers = {w["watcher_name"]: w for w in manager.list_watchers()}
-        self.assertTrue(watchers["w1"]["active"])
+        self.assertIsNotNone(manager.get_processor("w1"))
         self.assertEqual(errors, [])
 
         await manager.shutdown()
@@ -993,6 +994,8 @@ class TestOneLookupOneFailureSemantic(unittest.IsolatedAsyncioTestCase):
             WatcherConfig(name=n, connector="rc", room=n, agent="a") for n in names
         ]
         lc._states = {}
+        lc._blocked_agents = set()
+        lc._watcher_locks = {}
         lc._processors = {}
         return lc
 

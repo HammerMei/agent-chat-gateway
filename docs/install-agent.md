@@ -316,7 +316,8 @@ agent-chat-gateway list
 
 Expected output:
 ```
-dm-me: (rc-home) @your-username [my-agent] session=agent-chat-xxxx [active]
+NAME   CONNECTOR  ROOM            ROOM ID               AGENT     STATE   SESSION          PARTICIPANTS
+dm-me  rc-home    @your-username  aBcD1234efGh5678iJkL  my-agent  active  agent-chat-xxxx  —
 ```
 
 ---
@@ -369,7 +370,7 @@ To monitor additional rooms/channels:
 | `agent-chat-gateway start` | Start the daemon |
 | `agent-chat-gateway stop` | Stop the daemon |
 | `agent-chat-gateway status` | Show status and uptime |
-| `agent-chat-gateway list` | List all watchers |
+| `agent-chat-gateway list` | List active, failed and paused watchers (`--all` for every state) |
 | `agent-chat-gateway pause WATCHER` | Pause a watcher |
 | `agent-chat-gateway resume WATCHER` | Resume a paused watcher |
 | `agent-chat-gateway reset WATCHER` | Reset a watcher session |

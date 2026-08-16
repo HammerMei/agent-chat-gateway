@@ -952,10 +952,22 @@ Check `~/.agent-chat-gateway/gateway.log` for errors. Common issues:
 
 ### Messages not being processed
 
-1. **Check if watcher is running** — `agent-chat-gateway list`
-2. **Check if watcher is paused** — `agent-chat-gateway list -v`
-3. **Check daemon logs** — `tail -f ~/.agent-chat-gateway/gateway.log`
-4. **Check connector logs** — Filter by `connectors.rocketchat` in logs
+1. **Check the room is being watched at all** — `agent-chat-gateway list --all`
+   (plain `list` hides idle watchers). No row means no state record survived;
+   the reason is in the startup log. See step 3 before concluding anything more
+   than that from it.
+2. **Read the STATE column.** `paused` means an operator muted it. **`failed`
+   means a record exists and nothing is running for it.** The startup errors in
+   the log say why. To recover: `resume` retries the start in place — except
+   when the agent backend or its permission broker failed to start, which is
+   decided once at boot and which `resume` refuses fail-closed. **Restart the
+   daemon for that one.**
+3. **No row at all?** Then there is no state to act on. That is *not* proof the
+   start never got far: context injection, the attachment workspace and session
+   binding all roll their record back, so a watcher can fail well into startup
+   and still leave nothing. The log is authoritative, `list` is not.
+4. **Check daemon logs** — `tail -f ~/.agent-chat-gateway/gateway.log`
+5. **Check connector logs** — Filter by `connectors.rocketchat` in logs
 
 ### Permission requests timing out
 

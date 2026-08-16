@@ -641,8 +641,15 @@ agent-chat-gateway status
 All commands require the daemon to be running.
 
 ```bash
-# List all active watchers
+# List watchers — active, failed and paused by default
 agent-chat-gateway list [--connector NAME]
+
+# Include idle watchers (released on purpose, nothing running),
+# or ask for one state at a time
+agent-chat-gateway list --all
+agent-chat-gateway list --idle
+agent-chat-gateway list --failed
+agent-chat-gateway list --active --paused
 
 # Pause a watcher (stops processing messages)
 agent-chat-gateway pause <watcher-name> [--connector NAME]
@@ -653,6 +660,57 @@ agent-chat-gateway resume <watcher-name> [--connector NAME]
 # Reset a watcher (clear state, create new session)
 agent-chat-gateway reset <watcher-name> [--connector NAME]
 ```
+
+`list` reports the watchers the gateway has **state records** for, not the
+entries in `config.yaml`.
+
+**The rule is simply: a watcher appears if a state record exists for it.**
+Nothing more — not whether it started, not how far it got.
+
+That is worth stating as a rule rather than as a list of failures, because the
+list has too many cases to keep straight. A record is written partway through
+starting a watcher; some later failures keep it, so the watcher shows as
+`failed`, and others roll it back deliberately, so that a half-built watcher
+cannot be resumed as though it were whole. A watcher that has run successfully
+**before** has a record on disk regardless, so the same fault can show as
+`failed` on one machine and as nothing at all on another that has never got it
+running.
+
+Two consequences to hold on to:
+
+* **No row does not mean "the start never got far".** It means there is nothing
+  left to act on — no session, no watermark. The startup errors and the gateway
+  log are where you find out what actually failed; `list` only shows what
+  survived.
+* **A `failed` row does not mean the failure was recent.** It may be a record
+  from a boot weeks ago that has not started successfully since.
+
+A failed watcher is retried on **every daemon start**. If the underlying problem
+is unfixed it fails again and says so again — deliberately, so the gateway never
+quietly settles for a broken watcher.
+
+**To recover one:** `resume` or `reset` retries the start in place, which is
+what you want when the fault was outside the gateway — a room that had gone, a
+server that was down. **If the agent backend itself was unavailable, restart the
+daemon instead:** agent availability is decided once at startup, and `resume`
+and `reset` deliberately refuse rather than start a watcher whose permission
+broker never came up.
+
+To stop a watcher being retried at all, `pause` it; that is also how a watcher
+with no record is kept from being started, since pausing one creates a paused
+record.
+
+The four states are:
+
+| State | Meaning |
+|---|---|
+| `active` | A record exists and a processor is running for it |
+| `failed` | A record exists and nothing is running — a start that got as far as writing the record and then raised. **The one state that means something is wrong**, so it is in the default view |
+| `paused` | Muted by `pause`, waiting on a human decision — shown by default for that reason |
+| `idle` | The gateway knows the room, but it was released on purpose and nothing is running |
+
+`status` counts every state; `list` shows the three an operator is likely to
+act on — everything except `idle` — unless asked otherwise.
 
 ### Direct Messaging
 

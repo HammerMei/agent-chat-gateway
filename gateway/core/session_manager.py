@@ -22,6 +22,7 @@ from .dispatch import MessageDispatcher
 from .injected_context_builder import InjectedContextBuilder
 from .permission import PermissionRegistry
 from .session_maps import SessionMaps
+from .state import StateFilter, parse_state_filter
 from .state_store import StateStore
 from .watcher_lifecycle import WatcherLifecycle
 
@@ -152,12 +153,26 @@ class SessionManager:
 
     # ── Public query API ──────────────────────────────────────────────────────
 
-    def list_watchers(self) -> list[dict]:
-        return self._lifecycle.list_watchers()
+    def list_watchers(
+        self, state_filter: StateFilter = StateFilter.OPERABLE
+    ) -> list[dict]:
+        return self._lifecycle.list_watchers(state_filter)
 
     def get_watcher_state(self, name: str):
         """Return the WatcherState for a watcher, or None if not found."""
         return self._lifecycle.get_watcher_state(name)
+
+    def get_processor(self, name: str):
+        """Return the running MessageProcessor for a watcher, or None.
+
+        "Is a processor running" is a different question from "what state is
+        this watcher's record in", and `list` answers only the second (§2.8).
+        The old row answered both — `active` from the processor, `paused` from
+        the record — which is why callers could reach the first one through
+        `list`. They cannot now, and should not: under rule-derived watchers a
+        row exists for rooms with no processor by design.
+        """
+        return self._lifecycle.get_processor(name)
 
     def get_watcher_config(self, name: str):
         """Return the WatcherConfig for a watcher name, or None if not found."""
@@ -271,7 +286,20 @@ class SessionManager:
         cmd = request.get("cmd")
 
         if cmd == "list":
-            return {"ok": True, "data": self.list_watchers()}
+            # An unparseable filter is an error, not a silent fallback to the
+            # default: the caller asked a specific question and cannot tell from
+            # the rows that it was answered with a different one.
+            try:
+                state_filter = parse_state_filter(request.get("states"))
+            except (ValueError, TypeError) as e:
+                # TypeError too: `parse_state_filter` iterates what it is given,
+                # and a hand-written socket client can send `"states": 5`. The
+                # CLI always sends a list, so this arm is unreachable from it —
+                # but escaping as a TypeError turns a bad request into a
+                # per-connector "failed to list watchers", which reads as the
+                # daemon being broken rather than the request being wrong.
+                return {"ok": False, "error": f"invalid 'states' filter: {e}"}
+            return {"ok": True, "data": self.list_watchers(state_filter)}
 
         elif cmd == "pause":
             name = request.get("watcher_name", "")

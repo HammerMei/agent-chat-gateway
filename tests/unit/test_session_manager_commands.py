@@ -45,10 +45,77 @@ def _make_manager():
 class TestDispatchCommandList(unittest.IsolatedAsyncioTestCase):
     """dispatch_command({'cmd': 'list'}) returns watcher data."""
 
+    async def test_the_wire_filter_reaches_the_lifecycle(self):
+        """`request["states"]` → `StateFilter` is the only join between the CLI
+        and the reader, and both halves being tested in isolation left it
+        uncovered: mutating this call to ignore the request passed the entire
+        suite while the daemon silently answered every query with the default.
+        """
+        from gateway.core.state import StateFilter
+
+        mgr = _make_manager()
+
+        await mgr.dispatch_command({"cmd": "list", "states": ["idle"]})
+        self.assertEqual(
+            mgr._lifecycle.list_watchers.call_args[0][0], StateFilter.IDLE
+        )
+
+        await mgr.dispatch_command(
+            {"cmd": "list", "states": ["active", "failed"]}
+        )
+        self.assertEqual(
+            mgr._lifecycle.list_watchers.call_args[0][0],
+            StateFilter.ACTIVE | StateFilter.FAILED,
+        )
+
+    async def test_no_states_field_uses_the_server_side_default(self):
+        """The CLI expresses "the default" by sending nothing, so the default
+        has exactly one definition and it lives here."""
+        from gateway.core.state import StateFilter
+
+        mgr = _make_manager()
+
+        await mgr.dispatch_command({"cmd": "list"})
+
+        self.assertEqual(
+            mgr._lifecycle.list_watchers.call_args[0][0], StateFilter.OPERABLE
+        )
+
+    async def test_a_non_iterable_filter_is_a_bad_request_not_a_broken_daemon(self):
+        """`parse_state_filter` iterates what it is handed, so a hand-written
+        socket client sending `"states": 5` raises `TypeError`.
+
+        Escaping uncaught turns a malformed request into a per-connector
+        "failed to list watchers" warning, which reads as the daemon being
+        broken rather than the request being wrong. (Written because injecting
+        this fault changed nothing: the `TypeError` arm shipped without a test,
+        which is what a fix-and-test-in-one-edit always leaves behind.)
+        """
+        mgr = _make_manager()
+
+        result = await mgr.dispatch_command({"cmd": "list", "states": 5})
+
+        self.assertFalse(result["ok"])
+        self.assertIn("states", result["error"])
+        mgr._lifecycle.list_watchers.assert_not_called()
+
+    async def test_an_unparseable_filter_is_an_error_not_a_silent_default(self):
+        """A caller cannot tell from the rows that it was answered with a
+        different question than the one it asked."""
+        mgr = _make_manager()
+
+        result = await mgr.dispatch_command(
+            {"cmd": "list", "states": ["sleeping"]}
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("sleeping", result["error"])
+        mgr._lifecycle.list_watchers.assert_not_called()
+
     async def test_list_returns_watchers(self):
         mgr = _make_manager()
         mgr._lifecycle.list_watchers.return_value = [
-            {"watcher_name": "support", "active": True}
+            {"watcher_name": "support", "state": "active"}
         ]
         result = await mgr.dispatch_command({"cmd": "list"})
         self.assertTrue(result["ok"])
@@ -240,6 +307,41 @@ class TestRunOnce(unittest.IsolatedAsyncioTestCase):
         await mgr.run_once(unavailable_agents=unavailable)
         mgr._lifecycle.sync_watchers.assert_called_once_with(unavailable_agents=unavailable)
 
+
+
+class TestNotifyWatcherRoomNeedsLoadedState(unittest.IsolatedAsyncioTestCase):
+    """`notify_watcher_room` reads in-memory state only, so a record this
+    process never loaded gets no notice.
+
+    Pinned rather than fixed: `list` shows such a record as `failed`, so the
+    two disagree — but a disk-only record can name a room the watcher has since
+    moved away from, and posting an alert into that room is worse than posting
+    none. The policy belongs with the notification issue, not here. This test
+    exists so that changing it is a decision rather than an accident.
+    """
+
+    async def test_a_record_this_process_never_loaded_gets_no_notice(self):
+        mgr = _make_manager()
+        mgr._lifecycle.get_watcher_state = MagicMock(return_value=None)
+
+        sent = await mgr.notify_watcher_room("w1", "hello")
+
+        self.assertFalse(sent)
+        mgr._connector.send_text.assert_not_called()
+
+    async def test_a_loaded_record_does_get_one(self):
+        from gateway.core.state import WatcherState
+
+        mgr = _make_manager()
+        mgr._connector.send_text = AsyncMock()
+        mgr._lifecycle.get_watcher_state = MagicMock(
+            return_value=WatcherState(watcher_name="w1", session_id="s", room_id="r1")
+        )
+
+        sent = await mgr.notify_watcher_room("w1", "hello")
+
+        self.assertTrue(sent)
+        self.assertEqual(mgr._connector.send_text.call_args[0][0], "r1")
 
 if __name__ == "__main__":
     unittest.main()

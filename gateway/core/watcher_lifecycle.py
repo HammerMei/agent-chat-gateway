@@ -23,7 +23,13 @@ from .message_processor import MessageProcessor
 from .paths import room_path_key, watcher_prompt_key
 from .permission import PermissionRegistry
 from .session_maps import SessionMaps
-from .state import WatcherState, backend_identity
+from .state import (
+    StateFilter,
+    WatcherState,
+    backend_identity,
+    lifecycle_state,
+    state_filter_name,
+)
 from .state_store import StateStore
 
 logger = logging.getLogger("agent-chat-gateway.core.watcher_lifecycle")
@@ -297,30 +303,104 @@ class WatcherLifecycle:
             self._state_store.save(self._states)
             logger.info("Watcher '%s' reset", name)
 
-    def list_watchers(self) -> list[dict]:
-        """Return info for all configured watchers, including runtime status."""
+    def list_watchers(
+        self, state_filter: StateFilter = StateFilter.OPERABLE
+    ) -> list[dict]:
+        """Return info for persisted watcher records matching ``state_filter``.
+
+        **Enumerates records, not config and not live processors** (design §2.8).
+        Under rule-derived watchers there is no static set of watchers to read
+        out of ``config.yaml``, and deriving the rows from ``self._processors``
+        would make idle and paused rooms invisible to the very commands that can
+        still act on them.
+
+        Two consequences on the static path, both deliberate:
+
+        * A configured watcher with no record — its agent was unavailable, or
+          its first start raised before a record was written — does not appear.
+          There is nothing in such a row but its name; ``sync_watchers`` reports
+          the failure through its error list, which is where a start-time
+          failure belongs.  A watcher that started on an *earlier* boot does
+          still appear, because its record is on disk — as ``failed``, since it
+          is not resident.
+        * ``room_name`` and ``participants`` come from the record rather than
+          from config, so they describe the room the watcher is actually bound
+          to. (``room_kind`` is deliberately **not** in the row: nothing reads
+          it.)
+        """
         result = []
-        for wc in self._watcher_configs:
-            state = self._states.get(wc.name)
-            processor = self._processors.get(wc.name)
-            effective_session = state.session_id if state else ""
+        for name, state in sorted(self._state_store.merged_view(self._states).items()):
+            current = lifecycle_state(state, resident=self._is_resident(name))
+            if current not in state_filter:
+                continue
             result.append(
                 {
-                    "watcher_name": wc.name,
-                    "room_name": wc.room,
-                    "connector": wc.connector,
-                    "agent_name": wc.agent,
-                    "session_id": effective_session,
-                    "paused": state.paused if state else False,
-                    "active": processor is not None,
+                    "watcher_name": name,
+                    # Falls back to the room id so a nameless room is still
+                    # nameable in the table. Reachable: `pause` on a watcher
+                    # that has never started fabricates a record with neither
+                    # (both empty), and a rule-derived group DM has no platform
+                    # name either. NOT the DM case — both connectors return the
+                    # configured `@handle` as a DM room's name.
+                    "room_name": state.room_name or state.room_id,
+                    "room_id": state.room_id,
+                    "participants": list(state.participants),
+                    # The record's own connector/agent once the manager writes
+                    # them; on the static path they are empty, so fall back to
+                    # the entry this lifecycle belongs to and to config.
+                    "connector": state.connector or self._state_store.state_name,
+                    "agent_name": state.agent or self._agent_name_for(name),
+                    "session_id": state.session_id,
+                    "state": state_filter_name(current),
                     "context_injection_state": (
-                        self._injector.status_for(effective_session).state
-                        if effective_session
+                        self._injector.status_for(state.session_id).state
+                        if state.session_id
                         else "not_started"
                     ),
                 }
             )
         return result
+
+    def _is_resident(self, name: str) -> bool:
+        """Whether the lifecycle currently holds this watcher (design §2.5).
+
+        A registered processor, **or** a lifecycle transition in flight. The
+        second half is not a nicety: `pause` and `reset` both remove the
+        processor first and settle the record last, so between the two this
+        watcher has no processor, no `paused` flag and no `dropped_at` —
+        indistinguishable from what a failed start leaves behind. `reset` stays
+        that way for as long as a fresh session, a history fetch and a full
+        model turn take, which is bounded by the agent timeout and defaults to
+        minutes.
+
+        Reporting `failed` there would be the worst kind of wrong: `failed` is
+        documented as *the* state that means something is broken and sends the
+        operator to the startup log, so the recovery verb would accuse itself
+        while working. Counting a transition as resident errs the other way —
+        `active` for a few seconds while a watcher is being stopped — which is
+        transient, self-correcting, and does not send anyone anywhere.
+
+        The per-watcher lock is exactly the right signal because it is held for
+        precisely the span of a lifecycle transition: `sync_watchers`, `pause`,
+        `resume` and `reset` all take it around their whole start or stop, and
+        release it when the operation finishes — including when it *fails*, so a
+        genuinely failed start reports `failed` the moment it gives up.
+        """
+        if self._processors.get(name) is not None:
+            return True
+        lock = self._watcher_locks.get(name)
+        return lock is not None and lock.locked()
+
+    def _agent_name_for(self, watcher_name: str) -> str:
+        """Best-effort agent name for a record the manager has not stamped yet.
+
+        Layered on `get_watcher_config` rather than walking `_watcher_configs`
+        again: `_require_watcher_config` records that the two lookups over that
+        list were collapsed into one, and a third copy here would quietly make
+        that note false.
+        """
+        wc = self.get_watcher_config(watcher_name)
+        return wc.agent if wc else ""
 
     def get_watcher_state(self, name: str):
         """Return the WatcherState for a watcher, or None if not found."""
@@ -432,6 +512,10 @@ class WatcherLifecycle:
             session_id=session_id,
             room_id=room.id,
             room_type=room.type,
+            # The resolved room's own name, so that `list` — which reads records,
+            # not config (§2.8) — can name the room without going back to the
+            # config entry that no longer exists under rule-derived watchers.
+            room_name=room.name,
             # False whenever the session is new, not merely when the record is:
             # the flag describes what a *session* has received, and a replacement
             # session has received nothing. `reset_watcher` already pairs "clear the

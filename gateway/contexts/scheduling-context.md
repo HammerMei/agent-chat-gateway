@@ -2,7 +2,25 @@
 
 You can schedule recurring or one-time tasks using the `agent-chat-gateway schedule` CLI. When a user asks you to set up a recurring task, reminder, or automated job, use these commands.
 
-> **IMPORTANT — watcher name**: The `<watcher>` argument must be the **exact** watcher name from this gateway's configuration. Do NOT invent or guess a name. If you are unsure of the correct watcher name, run `agent-chat-gateway list` first to see all configured watchers, then use the name shown there.
+> **IMPORTANT — watcher name**: The `<watcher>` argument must be the **exact** watcher name from this gateway's configuration. Do NOT invent or guess a name. If you are unsure, run `agent-chat-gateway list --all` first and use a name shown there.
+>
+> **Check the STATE column before scheduling.** A scheduled message is injected into the watcher's running session, so a watcher that is not running cannot receive it at that moment. This does **not** mean you should refuse — it means you should tell the user and confirm.
+>
+> | STATE | What happens to a fire |
+> |---|---|
+> | `active` | Delivered normally. |
+> | `idle` | Fine — the watcher is woken on demand. |
+> | `paused` | Skipped quietly and retried at the job's **next scheduled occurrence**. A finite job's remaining run count is **not** consumed. |
+> | `failed` | Same retry. A ⚠️ notice is posted into the room **only if the gateway loaded that watcher this run** — one whose agent was unavailable at startup never did, so its misses are silent. Do not promise the user they will be told. |
+> | not listed at all | No state record survived. Treat it as `failed` — but do **not** tell the user it never started: a start can create a session and get well into setup before rolling its record back. |
+>
+> For `paused` or `failed`, say that the agent in that room is currently paused / not running, **and say when the retry would actually land** — "the next scheduled occurrence" means very different things:
+>
+> - `--every 5m --times 1` → retries every 5 minutes until it gets through.
+> - `--every 1w` → next week.
+> - `--starting "YYYY-MM-DD HH:MM"` with **no** `--every` → the same date **next year**. A one-shot anchored to a specific date that misses its slot effectively does not happen at all.
+>
+> So a reminder for a time when the watcher will be back is fine — an ops pause today and a reminder next week works exactly as intended. A one-shot whose only fire lands inside the outage is not; say so and let the user decide.
 
 ## Create a scheduled task
 
