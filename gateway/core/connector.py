@@ -471,6 +471,23 @@ class Connector(ABC):
         """
         return False
 
+    def trigger_history_bound(self, trigger: Any) -> str | None:
+        """The ISO timestamp of a router trigger frame, for bounding history handoff.
+
+        `register_router` passes the platform-native frame that prompted an offer;
+        the creation path needs one thing from it — an exclusive upper bound for
+        `fetch_room_history`, so the trigger itself is not fetched as history and
+        then delivered a second time as the live prompt (§2.7). Each connector
+        knows its own frame shape, which is why this lives here and not in the
+        routing layer.
+
+        Default: ``None`` (no bound) — connectors that never offer rooms to a
+        router need not override it, and an unparseable frame answers None rather
+        than raising, because the cost of no bound is one duplicated message
+        while the cost of raising is a failed creation.
+        """
+        return None
+
     async def fetch_room_history(
         self,
         room: Room,

@@ -39,6 +39,9 @@ def _make_manager():
     mgr._dispatcher.has_capacity = MagicMock()
     mgr._injector = MagicMock()
     mgr._state_store = MagicMock()
+    # No rules → no creation path; connect_only branches on this (§2.8).
+    mgr._watcher_manager = None
+    mgr._connector_name = "default"
     return mgr
 
 
@@ -307,6 +310,71 @@ class TestRunOnce(unittest.IsolatedAsyncioTestCase):
         await mgr.run_once(unavailable_agents=unavailable)
         mgr._lifecycle.sync_watchers.assert_called_once_with(unavailable_agents=unavailable)
 
+
+
+class TestTheRouterWiring(unittest.IsolatedAsyncioTestCase):
+    """Rules give the manager runtime effect (§2.8), and the registration order
+    is load-bearing: Rocket.Chat's start_inbound attempts subscribe-all only
+    when a router is already registered."""
+
+    def _real_manager(self, rules):
+        from gateway.core.session_manager import SessionManager
+        from tests.helpers import make_core_config
+
+        connector = MagicMock()
+        connector.register_handler = MagicMock()
+        connector.register_capacity_check = MagicMock()
+        connector.register_router = MagicMock()
+        connector.connect = AsyncMock()
+        connector.start_inbound = AsyncMock()
+        connector.trigger_history_bound = MagicMock(
+            return_value="2026-08-16T10:00:00+00:00")
+        return SessionManager(
+            connector, {"default": MagicMock()}, "default", make_core_config(),
+            state_name="rc", watcher_rules=rules,
+        ), connector
+
+    def _rule(self):
+        from gateway.core.room_pattern import RoomPattern
+        from gateway.core.watcher_rule import RoomMatcher, WatcherRule
+
+        return WatcherRule(
+            name="eng", connector="rc", agent="default",
+            rooms=RoomMatcher(include=(RoomPattern("eng-*"),)))
+
+    async def test_rules_register_a_router_before_connect(self):
+        mgr, connector = self._real_manager([self._rule()])
+        parent = MagicMock()
+        parent.attach_mock(connector.register_router, "register_router")
+        parent.attach_mock(connector.connect, "connect")
+
+        await mgr.connect_only()
+
+        names = [c[0] for c in parent.mock_calls]
+        self.assertEqual(names, ["register_router", "connect"])
+
+    async def test_no_rules_means_no_router_and_no_behaviour_change(self):
+        """A static-only deployment keeps its exact delivery behaviour —
+        registering a router flips Rocket.Chat to subscribe-all."""
+        mgr, connector = self._real_manager([])
+        await mgr.connect_only()
+        connector.register_router.assert_not_called()
+
+    async def test_the_router_asks_the_manager_with_the_triggers_bound(self):
+        from gateway.core.watcher_manager import RoomRef
+        from gateway.core.watcher_rule import RoomKind
+
+        mgr, connector = self._real_manager([self._rule()])
+        mgr._watcher_manager = MagicMock()
+        mgr._watcher_manager.get_or_create = AsyncMock()
+        room = RoomRef(id="r1", kind=RoomKind.CHANNEL, name="eng-backend")
+        trigger = {"_id": "m1"}
+
+        await mgr._route_unclaimed_room(room, trigger)
+
+        connector.trigger_history_bound.assert_called_once_with(trigger)
+        mgr._watcher_manager.get_or_create.assert_awaited_once_with(
+            "rc", room, history_before_ts="2026-08-16T10:00:00+00:00")
 
 
 class TestNotifyWatcherRoomNeedsLoadedState(unittest.IsolatedAsyncioTestCase):

@@ -321,6 +321,12 @@ class GatewayService:
                 watcher_configs=connector_watchers,
                 permission_registry=self._registry,
                 session_maps=self._maps,
+                # Rules give the manager runtime effect (§2.8). Filtered like the
+                # watcher configs: a rule binds to one connector by name, and the
+                # manager keys its matches on that same name.
+                watcher_rules=[
+                    r for r in config.watcher_rules if r.connector == cc.name
+                ],
             )
             self._entries.append(
                 ConnectorEntry(name=cc.name, connector=connector, session_manager=sm)

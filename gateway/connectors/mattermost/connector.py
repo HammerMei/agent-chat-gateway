@@ -822,6 +822,15 @@ class MattermostConnector(Connector):
             self._ws.unregister_channel(room_id)
             logger.info("Reaped channel state for %s", room_id)
 
+    def trigger_history_bound(self, trigger) -> str | None:
+        """The trigger's `post.create_at` (epoch ms) as ISO — the decoded event is
+        what `_offer_to_router` hands the router."""
+        if not isinstance(trigger, dict):
+            return None
+        post = trigger.get("post")
+        create_at = post.get("create_at", "") if isinstance(post, dict) else ""
+        return ts_ms_to_iso_local(str(create_at), self.timezone) if create_at else None
+
     def _room_ref_from_event(self, channel_id: str, decoded: dict) -> "RoomRef | None":
         """Build a `RoomRef` from the event, or None when the event cannot describe a room.
 

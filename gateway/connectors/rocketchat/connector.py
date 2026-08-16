@@ -848,6 +848,16 @@ class RocketChatConnector(Connector):
             # transient REST failure permanent for that room.
             self._rooms_being_routed.discard(room_id)
 
+    def trigger_history_bound(self, trigger) -> str | None:
+        """The trigger doc's `ts` as ISO — DDP carries it as `{"$date": ms}` or a
+        bare epoch-ms value; `ts_ms_to_iso_local` answers None on anything else."""
+        if not isinstance(trigger, dict):
+            return None
+        ts = trigger.get("ts", "")
+        if isinstance(ts, dict):
+            ts = ts.get("$date", "")
+        return ts_ms_to_iso_local(str(ts), self.timezone) if ts else None
+
     async def _room_ref_from_access(
         self, room_id: str, access: dict
     ) -> "RoomRef | None":

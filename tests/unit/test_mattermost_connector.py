@@ -1028,6 +1028,24 @@ class TestRoutingUntrackedChannels(unittest.IsolatedAsyncioTestCase):
             await self._drain(connector)
 
 
+class TestTriggerHistoryBound(unittest.TestCase):
+    """Mattermost's trigger is the decoded event; the bound is post.create_at."""
+
+    def test_create_at_becomes_iso(self):
+        connector = _make_connector(timezone="UTC")
+        bound = connector.trigger_history_bound(
+            {"post": {"id": "m1", "create_at": 1786874400000}})
+        self.assertEqual(bound, "2026-08-16T10:00:00+00:00")
+
+    def test_a_missing_or_garbled_frame_answers_none(self):
+        connector = _make_connector(timezone="UTC")
+        self.assertIsNone(connector.trigger_history_bound({"post": {}}))
+        self.assertIsNone(connector.trigger_history_bound({}))
+        self.assertIsNone(connector.trigger_history_bound(None))
+        self.assertIsNone(connector.trigger_history_bound(
+            {"post": {"create_at": "soon"}}))
+
+
 class TestReaping(unittest.IsolatedAsyncioTestCase):
     """Reaping is the room going away; unsubscribing is a watcher releasing it."""
 

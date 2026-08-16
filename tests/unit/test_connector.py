@@ -2152,6 +2152,38 @@ class TestTheMentionGateIsKindAware(unittest.TestCase):
         self.assertTrue(result.accepted)
 
 
+class TestTriggerHistoryBound(unittest.TestCase):
+    """The one thing the creation path needs from a trigger frame: an exclusive
+    upper bound for history handoff, so the trigger is not delivered twice."""
+
+    def _connector(self):
+        from gateway.connectors.rocketchat.config import RocketChatConfig
+        from gateway.connectors.rocketchat.connector import RocketChatConnector
+
+        return RocketChatConnector(RocketChatConfig(
+            server_url="https://x", username="bot", password="pw", name="rc",
+            owners=["glin"], timezone="UTC",
+        ))
+
+    def test_a_ddp_date_object_becomes_iso(self):
+        bound = self._connector().trigger_history_bound(
+            {"_id": "m1", "ts": {"$date": 1786874400000}})
+        self.assertEqual(bound, "2026-08-16T10:00:00+00:00")
+
+    def test_a_bare_epoch_ms_becomes_iso(self):
+        bound = self._connector().trigger_history_bound(
+            {"_id": "m1", "ts": 1786874400000})
+        self.assertEqual(bound, "2026-08-16T10:00:00+00:00")
+
+    def test_a_missing_or_garbled_ts_answers_none_not_a_raise(self):
+        """The cost of no bound is one duplicated message; the cost of raising
+        is a failed creation."""
+        connector = self._connector()
+        self.assertIsNone(connector.trigger_history_bound({"_id": "m1"}))
+        self.assertIsNone(connector.trigger_history_bound({"ts": "not-a-ts"}))
+        self.assertIsNone(connector.trigger_history_bound(None))
+
+
 class TestSystemMessagesAndTheAgentChain(unittest.TestCase):
     """The side effect of filtering at step 0, stated because nothing else would say it.
 

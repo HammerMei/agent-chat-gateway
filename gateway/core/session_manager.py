@@ -25,6 +25,7 @@ from .session_maps import SessionMaps
 from .state import StateFilter, parse_state_filter
 from .state_store import StateStore
 from .watcher_lifecycle import WatcherLifecycle
+from .watcher_manager import RoomRef, WatcherManager
 
 logger = logging.getLogger("agent-chat-gateway.core.session_manager")
 
@@ -52,8 +53,13 @@ class SessionManager:
         watcher_configs: list[WatcherConfig] | None = None,
         permission_registry: PermissionRegistry | None = None,
         session_maps: SessionMaps | None = None,
+        watcher_rules: list | None = None,
     ) -> None:
         self._connector = connector
+        # `state_name` is the connector's config name in production (service.py
+        # passes `cc.name`), which is also the name rules bind to — the manager
+        # and the router closure below both key on it.
+        self._connector_name = state_name
         maps = session_maps or SessionMaps()
 
         # Collaborators
@@ -71,6 +77,16 @@ class SessionManager:
             injector=self._injector,
             permission_registry=permission_registry,
             maps=maps,
+        )
+        # The creation path (§2.7/§2.8) exists only when rules do. Gated on the
+        # rules rather than always-on because registering a router changes what
+        # the connector *asks for* — Rocket.Chat switches to subscribe-all — and
+        # a static-only deployment must keep its exact delivery behaviour until
+        # its operator writes a rule.
+        self._watcher_manager = (
+            WatcherManager(state_name, connector, self._lifecycle, watcher_rules)
+            if watcher_rules
+            else None
         )
 
     # ── Main entry point ──────────────────────────────────────────────────────
@@ -122,6 +138,11 @@ class SessionManager:
         """
         self._connector.register_handler(self._dispatcher.dispatch)
         self._connector.register_capacity_check(self._dispatcher.capacity)
+        if self._watcher_manager is not None:
+            # Before start_inbound(), necessarily: Rocket.Chat's start_inbound
+            # attempts subscribe-all only when a router is already registered,
+            # so a router registered later would never receive an offer.
+            self._connector.register_router(self._route_unclaimed_room)
         await self._connector.connect()
 
     async def sync_only(self, unavailable_agents: set[str] | None = None) -> list[str]:
@@ -136,6 +157,21 @@ class SessionManager:
         errors = await self._lifecycle.sync_watchers(unavailable_agents=unavailable_agents)
         await self._connector.start_inbound()
         return errors
+
+    async def _route_unclaimed_room(self, room: RoomRef, trigger) -> None:
+        """The router the connectors call for a room no watcher tracks (§2.2).
+
+        The manager answers the whole question — sticky record, rule match,
+        create or drop — and the connector delivers the trigger afterwards if
+        the room became tracked. Nothing here inspects the trigger beyond
+        asking the connector what history bound it implies: the frame is
+        platform-shaped, and this layer deliberately is not.
+        """
+        await self._watcher_manager.get_or_create(
+            self._connector_name,
+            room,
+            history_before_ts=self._connector.trigger_history_bound(trigger),
+        )
 
     async def shutdown(self) -> None:
         """Stop all processors, save state, disconnect connector.
