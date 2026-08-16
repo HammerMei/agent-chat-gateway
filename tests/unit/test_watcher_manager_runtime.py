@@ -561,6 +561,92 @@ class TestEndToEndThroughTheRealLifecycle(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ws.rule_name)
         self.assertEqual(config_from_record(ws), materialize(rule, room))
 
+    async def test_a_recreation_replays_the_interval_its_room_owes(self):
+        """What makes an abort recoverable for a room with a record (§2.2).
+
+        The routing episode that parked, or the buffer that overflowed, left
+        its frames below the record's watermark — and nothing else would ever
+        return to them: the reconnect replay iterates *tracked* rooms and a
+        parked room is untracked, so the next live message's commit would seal
+        the interval by advancing the watermark past it.
+
+        Bounded by the record's own mark, and named explicitly so the room's
+        replay boundary is not spent by a window it did not set.
+        """
+        lifecycle, connector, _patch = self._real_lifecycle()
+        connector.replay_room_since = AsyncMock()
+        manager = WatcherManager("rc", connector, lifecycle, [_rule(agent="default")])
+
+        with _patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            await manager.get_or_create("rc", _room())
+            ws = lifecycle.get_watcher_state("rc-eng-backend")
+            ws.last_processed_ts = "1786874400000"   # what the room had reached
+            await lifecycle.stop_all()
+
+            await manager.get_or_create("rc", _room())
+
+        connector.replay_room_since.assert_awaited_once_with(
+            "r1", after_ts="1786874400000")
+
+    async def test_a_first_ever_creation_replays_nothing(self):
+        """There is no window behind it — the accepted residual, not a bug."""
+        lifecycle, connector, _patch = self._real_lifecycle()
+        connector.replay_room_since = AsyncMock()
+        manager = WatcherManager("rc", connector, lifecycle, [_rule(agent="default")])
+
+        with _patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            await manager.get_or_create("rc", _room())
+
+        connector.replay_room_since.assert_not_awaited()
+
+    async def test_a_failed_replay_does_not_undo_a_successful_recreation(self):
+        lifecycle, connector, _patch = self._real_lifecycle()
+        connector.replay_room_since = AsyncMock(side_effect=RuntimeError("rest down"))
+        manager = WatcherManager("rc", connector, lifecycle, [_rule(agent="default")])
+
+        with _patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            await manager.get_or_create("rc", _room())
+            lifecycle.get_watcher_state("rc-eng-backend").last_processed_ts = "1000"
+            await lifecycle.stop_all()
+
+            with self.assertLogs(
+                "agent-chat-gateway.core.watcher_manager", "WARNING"
+            ):
+                proc = await manager.get_or_create("rc", _room())
+
+        self.assertIsNotNone(proc, "the room is up either way")
+
+    async def test_a_resumed_session_bounds_its_handoff_at_the_records_watermark(self):
+        """A13. If the backend expired the session during the downtime — which
+        is precisely the long-downtime case a startup replay exists for — the
+        recreation mints a fresh one and the handoff fetches history. Unbounded,
+        that fetch pulls in the very interval the replay is about to deliver,
+        and the agent sees it twice: once inside a discarded history turn, once
+        as live prompts."""
+        lifecycle, connector, _patch = self._real_lifecycle()
+        connector.replay_room_since = AsyncMock()
+        manager = WatcherManager("rc", connector, lifecycle, [_rule(agent="default")])
+
+        with _patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            await manager.get_or_create("rc", _room())
+            ws = lifecycle.get_watcher_state("rc-eng-backend")
+            ws.last_processed_ts = "1786874400000"
+            # The backend forgot the session while the room was idle.
+            ws.session_id = ""
+            await lifecycle.stop_all()
+            connector.fetch_room_history.reset_mock()
+
+            await manager.get_or_create("rc", _room())
+
+        self.assertEqual(
+            connector.fetch_room_history.call_args.kwargs.get("before_ts"),
+            "1786874400000",
+        )
+
     async def test_a_recreation_advances_the_idle_clock_and_clears_dropped_at(self):
         lifecycle, connector, _patch = self._real_lifecycle()
         manager = WatcherManager("rc", connector, lifecycle, [_rule(agent="default")])

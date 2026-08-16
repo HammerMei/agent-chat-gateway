@@ -156,11 +156,33 @@ class SessionManager:
         stream starts regardless of them.
         """
         errors = await self._lifecycle.sync_watchers(unavailable_agents=unavailable_agents)
+        # Snapshotted before the stream opens, and that placement is the whole
+        # defence against the race below: after `start_inbound` a live message
+        # can recreate a room and advance its watermark past the entire
+        # down-window before the replay loop reaches that record. Reading the
+        # watermarks here freezes what "missed" means; the replay itself still
+        # runs after the stream, so a room's live traffic is never held up by
+        # a REST probe.
+        down_window = self._snapshot_watermarks()
         await self._connector.start_inbound()
-        await self._replay_persisted_records()
+        await self._replay_persisted_records(down_window)
         return errors
 
-    async def _replay_persisted_records(self) -> None:
+    def _snapshot_watermarks(self) -> dict[str, str]:
+        """Each rule-derived record's watermark as of boot, by watcher name.
+
+        Taken after `sync_watchers` — hydration is what puts the records in
+        memory — and before the inbound stream opens, so every value is the
+        boundary of the interval the daemon was down for, uncontaminated by
+        anything that arrives after.
+        """
+        return {
+            ws.watcher_name: ws.last_processed_ts
+            for ws in self._lifecycle.states().values()
+            if ws.rule_name and ws.last_processed_ts
+        }
+
+    async def _replay_persisted_records(self, down_window: dict[str, str]) -> None:
         """Recover messages that arrived while the daemon was down (§2.2).
 
         The abort guarantee — "watermark unchanged, so redelivery can retry" —
@@ -168,15 +190,27 @@ class SessionManager:
         startup nothing did: both connectors replay from their *reconnect*
         callback, which a process restart never fires. This walks the
         persisted rule-derived records instead, and for each one probes the
-        gap between its stored watermark and now. An empty gap leaves the room
-        idle — that is the lazy model working. A non-empty gap recreates the
-        watcher from its own record (sticky, §2.4 — rules are not consulted)
-        and replays the window through the connector's normal pipeline, where
-        the restored watermark and the id window dedup as usual.
+        gap between its boot-time watermark and now. An empty gap leaves the
+        room idle — that is the lazy model working. A non-empty gap recreates
+        the watcher from its own record (sticky, §2.4 — rules are not
+        consulted) and replays the window through the connector's normal
+        pipeline, where the restored watermark and the id window dedup as
+        usual.
+
+        ``down_window`` holds the watermarks as of *before the stream opened*
+        (`_snapshot_watermarks`), and every decision here reads it rather than
+        the record. A live message arriving between `start_inbound` and this
+        loop recreates its room and advances that record's watermark past the
+        whole down-window; reading the record then would report no gap and skip
+        the room, losing every message from the outage with no log line. The
+        snapshot also means a room that is *already resident* by the time the
+        loop reaches it is still replayed — being resident is not evidence that
+        anyone looked below the boundary.
 
         Best-effort per record: a room whose probe, recreation or replay fails
-        stays idle and is recovered by its next live message. Boot must not
-        die on one bad room.
+        stays idle, and its next live message triggers a recreation — which
+        replays from the record's watermark, so the interval is recovered
+        rather than merely the room. Boot must not die on one bad room.
 
         The accepted residual, restated: a room that never produced a record —
         or produced one with no watermark — has nothing to replay from, and a
@@ -186,11 +220,13 @@ class SessionManager:
         if self._watcher_manager is None:
             return
         for ws in list(self._lifecycle.states().values()):
-            if not ws.rule_name or ws.paused or not ws.config:
+            boundary = down_window.get(ws.watcher_name)
+            if not boundary:
+                # No record at boot, or no watermark to replay from — including
+                # every room created live since the stream opened, which has
+                # nothing behind it to recover.
                 continue
-            if not ws.last_processed_ts or not ws.room_id:
-                continue
-            if self._lifecycle.processor_named(ws.watcher_name) is not None:
+            if ws.paused or not ws.config or not ws.room_id:
                 continue
             room = Room(
                 id=ws.room_id,
@@ -200,9 +236,7 @@ class SessionManager:
                 type=ws.room_kind or ws.room_type or "channel",
             )
             try:
-                missed = await self._connector.probe_missed_since(
-                    room, ws.last_processed_ts
-                )
+                missed = await self._connector.probe_missed_since(room, boundary)
             except Exception as e:
                 logger.warning(
                     "Startup replay: could not probe room %s for watcher '%s': %s",
@@ -212,23 +246,28 @@ class SessionManager:
             if not missed:
                 continue
             try:
-                kind = RoomKind(ws.room_kind) if ws.room_kind else RoomKind.CHANNEL
-                created = await self._watcher_manager.get_or_create(
-                    self._connector_name,
-                    RoomRef(
-                        id=ws.room_id,
-                        kind=kind,
-                        name=ws.room_name,
-                        participants=tuple(ws.participants),
-                    ),
+                if self._lifecycle.processor_named(ws.watcher_name) is None:
+                    kind = RoomKind(ws.room_kind) if ws.room_kind else RoomKind.CHANNEL
+                    created = await self._watcher_manager.get_or_create(
+                        self._connector_name,
+                        RoomRef(
+                            id=ws.room_id,
+                            kind=kind,
+                            name=ws.room_name,
+                            participants=tuple(ws.participants),
+                        ),
+                    )
+                    if created is None:
+                        continue
+                await self._connector.replay_room_since(
+                    ws.room_id, after_ts=boundary
                 )
-                if created is None:
-                    continue
-                await self._connector.replay_room_since(ws.room_id)
             except Exception as e:
                 logger.warning(
                     "Startup replay failed for watcher '%s' (room %s) — the room "
-                    "stays idle and its next message recovers it: %s",
+                    "stays idle; its next message recreates it and replays from "
+                    "the record's watermark, so this interval is deferred rather "
+                    "than lost: %s",
                     ws.watcher_name, ws.room_id, e,
                 )
 

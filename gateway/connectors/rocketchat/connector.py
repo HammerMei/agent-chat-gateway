@@ -37,6 +37,7 @@ from ...core.connector import (
     Room,
     RoomCapacity,
 )
+from ...core.dispatch import RoomAlreadyRoutedError
 from ...core.pending_route import (
     STARTING_UP_NOTICE,
     PendingRoute,
@@ -406,23 +407,34 @@ class RocketChatConnector(Connector):
         for room_id in list(self._rooms):
             await self.replay_room_since(room_id)
 
-    async def replay_room_since(self, room_id: str) -> None:
-        """Replay one tracked room's outage window from its watermark.
+    async def replay_room_since(
+        self, room_id: str, after_ts: str | None = None
+    ) -> None:
+        """Replay one tracked room's outage window.
 
         The per-room half of the reconnect replay, and deliberately shared with
         the startup replay (§2.2): "cannot copy the reconnect path" forbids the
         *iteration source* — reconnect walks live subscriptions, startup walks
         persisted records — not the fetch-and-inject this method owns. The room
-        must already be tracked; startup recreates the watcher first, which is
-        also what restores the watermark this reads.
+        must already be tracked; startup recreates the watcher first.
 
         Everything is re-injected through the normal filter/normalize/dispatch
         pipeline with the replay flags set, so the id window and the watermark
         dedup the frames that also arrived live.
+
+        ``after_ts`` names the window explicitly. Without it the room's own
+        marks are read, which is the reconnect case. With it — the startup and
+        post-park cases — the caller is asking about a window it froze earlier,
+        and **the boundary is not discharged**: that mark belongs to the room's
+        own hand-back accounting, and a replay that read a different window has
+        no claim to spend it. Leaving it costs one deduped re-read at the next
+        reconnect; spending it wrongly costs a window nobody ever reads.
         """
         sub = self._rooms.get(room_id)
         if sub is None:
             return
+        # An explicitly named window is not this room's boundary to spend.
+        external_window = after_ts is not None
         # Snapshot the watermark NOW, before any await in this iteration.
         # The live DDP listen loop runs concurrently: awaiting get_room_history
         # for an earlier room yields the event loop and allows live messages for
@@ -447,7 +459,7 @@ class RocketChatConnector(Connector):
         # unknown, or the fetch failing) has not read the window, and dropping the mark
         # would close a gap nobody looked at. Those two failures are correlated with the
         # outage itself, so this is the likely path, not the exotic one.
-        watermark = sub.replay_boundary or sub.last_processed_ts
+        watermark = after_ts or sub.replay_boundary or sub.last_processed_ts
         if not watermark:
             logger.debug(
                 "Room '%s': no watermark yet — skipping replay", sub.room.name
@@ -544,6 +556,8 @@ class RocketChatConnector(Connector):
                     "page and may be permanently missed",
                     sub.room.name, self._REPLAY_HISTORY_COUNT,
                 )
+            elif external_window:
+                pass  # not this replay's mark to spend — see the docstring
             elif not sub.discharge_boundary(claims_at_entry):
                 # A read that found nothing is still a read — but only of the window
                 # this replay came in for. The membership check and the history fetch
@@ -846,6 +860,19 @@ class RocketChatConnector(Connector):
             # with its buffer not yet drained, and delivering this frame
             # directly would put it ahead of every frame that arrived before
             # it. While an episode is open, the buffer is the room's order.
+            #
+            # **What makes that true is loop atomicity, and it is fragile.**
+            # This check only covers frames that reach the *routing* path. Once
+            # the room is tracked, later frames go straight to the room's worker
+            # and never consult the buffer at all — so a frame could only jump
+            # the queue in the window between the room becoming tracked and the
+            # buffer draining. That window is currently empty because there is
+            # no suspension point between them: `subscribe_room`'s tracked-write
+            # is synchronous through to this method's `finally`. One inserted
+            # `await` in that span — an awaited online notification, an async
+            # save — silently reopens trigger loss, because the drained trigger
+            # would then arrive behind a newer frame and be filtered as already
+            # processed. `TestTheBufferDrainsBeforeAnythingCanOvertakeIt` pins it.
             verdict = pending.add(doc.get("_id", ""), (doc, access))
             if verdict == "duplicate":
                 # §2.2 outcome 6: the reservation is not disturbed, the copy goes.
@@ -905,7 +932,18 @@ class RocketChatConnector(Connector):
             # manager deliberately lets those propagate. A None-shaped outcome
             # (rule miss, pause, cap) does not raise and is final.
             async def offer() -> None:
-                await self._router(room, doc)
+                try:
+                    await self._router(room, doc)
+                except RoomAlreadyRoutedError:
+                    # Final, not retryable: another watcher already serves this
+                    # room, and three backoffs cannot change that — they would
+                    # only hold a routing worker for ~3.5s per message to a room
+                    # that will never be claimed.
+                    logger.warning(
+                        "Room %s is already served by another watcher — not "
+                        "creating a second one", room_id[:8],
+                    )
+                    return
 
             await route_attempts(
                 offer, retry_on=Exception,
@@ -1033,9 +1071,15 @@ class RocketChatConnector(Connector):
         persisted config rather than re-deriving the label, so a stale name cannot split a
         watcher's identity. Recorded in §2.3.
 
-        A failed lookup returns `None` — unknown — and caches nothing. It deliberately does
-        not fall back to 1:1: this answer decides whether the mention gate applies at all, so
-        a wrong one is not a slightly-off label but a watcher that replies to everyone.
+        Neither outcome caches, and the two are deliberately different shapes
+        (§2.2): a *failed* lookup raises `ClassificationUnavailable`, because the
+        classification was never made and the message must stay redeliverable,
+        while a lookup that succeeds and names nobody returns `None` — final,
+        since a retry cannot invent a counterpart.
+
+        Neither falls back to 1:1. This answer decides whether the mention gate
+        applies at all, so a wrong one is not a slightly-off label but a watcher
+        that replies to everyone in a group.
         """
         cached = self._dm_kinds.get(room_id)
         if cached is not None:

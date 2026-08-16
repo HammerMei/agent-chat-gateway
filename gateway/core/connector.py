@@ -498,15 +498,22 @@ class Connector(ABC):
         """
         return False
 
-    async def replay_room_since(self, room_id: str) -> None:
-        """Replay one tracked room's missed messages from its watermark.
+    async def replay_room_since(
+        self, room_id: str, after_ts: str | None = None
+    ) -> None:
+        """Replay one tracked room's missed messages.
 
-        The per-room half of the reconnect replay, exposed so the startup
-        replay can drive it record by record (§2.2, "abort is only retryable
-        if something replays"): reconnect iterates live subscriptions, startup
-        iterates persisted records, and this is the fetch-and-inject both
-        share. The room must already be tracked — recreation restores the
-        watermark this reads.
+        The per-room half of the reconnect replay, exposed so other recoveries
+        can drive it room by room (§2.2, "abort is only retryable if something
+        replays"): reconnect iterates live subscriptions, startup iterates
+        persisted records, and a recreation replays the interval its own room
+        parked. This is the fetch-and-inject all three share. The room must
+        already be tracked — recreation restores the watermark it reads.
+
+        ``after_ts`` names the window explicitly; without it the room's own
+        marks are used. A caller that names a window is asking about an
+        interval it froze earlier, so the room's replay boundary is left
+        undischarged — that mark belongs to the room's own accounting.
 
         Default: no-op. Connectors with no history API have nothing to replay,
         and a startup replay over their records must be harmless.

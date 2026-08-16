@@ -11,6 +11,7 @@ Run with:
 from __future__ import annotations
 
 import asyncio
+import textwrap
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -3369,6 +3370,39 @@ class TestTheRoutingTransaction(unittest.IsolatedAsyncioTestCase):
         delivered = [c.args[1]["_id"]
                      for c in connector._ws.deliver_to_room.call_args_list]
         self.assertEqual(delivered, ["m1"], "the trigger survived the first failure")
+
+    async def test_the_buffer_drains_before_anything_can_overtake_it(self):
+        """The invariant the ordering rests on, stated because it is invisible.
+
+        The pending-before-tracked check only covers the *routing* path; once
+        the room is tracked, later frames go straight to its worker. So the
+        buffer can only be overtaken in the window between the room becoming
+        tracked and the drain — and that window is empty only because nothing
+        suspends between them. This walks the source for an `await` in that
+        span, so an inserted one fails here rather than silently losing the
+        trigger to the already-processed filter.
+        """
+        import ast
+        import inspect
+
+        from gateway.connectors.rocketchat import connector as rc_connector
+
+        source = inspect.getsource(rc_connector.RocketChatConnector._on_unrouted_message)
+        tree = ast.parse(textwrap.dedent(source))
+        finally_bodies = [
+            node.finalbody for node in ast.walk(tree) if isinstance(node, ast.Try)
+            and node.finalbody
+        ]
+        self.assertTrue(finally_bodies, "the episode's drain lives in a finally")
+        for body in finally_bodies:
+            for node in body:
+                for inner in ast.walk(node):
+                    self.assertNotIsInstance(
+                        inner, ast.Await,
+                        "an await between the room becoming tracked and the "
+                        "buffer draining lets a later frame overtake the "
+                        "trigger, which the already-processed filter then drops",
+                    )
 
     async def test_a_parked_room_commits_nothing(self):
         """Outcomes 4-exhausted and 7 share one observable: nothing was

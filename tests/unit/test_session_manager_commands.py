@@ -360,22 +360,9 @@ class TestTheRouterWiring(unittest.IsolatedAsyncioTestCase):
         await mgr.connect_only()
         connector.register_router.assert_not_called()
 
-    async def test_startup_replay_runs_after_the_stream_opens(self):
-        """Probing history before start_inbound would leave a window where a
-        message arrives live for a room the replay is about to recreate —
-        after, the restored watermark resolves the race as ordinary dedup."""
-        mgr, connector = self._real_manager([self._rule()])
-        order = []
-        connector.start_inbound = AsyncMock(
-            side_effect=lambda: order.append("inbound"))
-        mgr._replay_persisted_records = AsyncMock(
-            side_effect=lambda: order.append("replay"))
-        mgr._lifecycle = MagicMock()
-        mgr._lifecycle.sync_watchers = AsyncMock(return_value=[])
-
-        await mgr.sync_only()
-
-        self.assertEqual(order, ["inbound", "replay"])
+    # The startup-replay ordering is pinned in test_startup_replay.py, which
+    # asserts all four points (sync -> snapshot -> inbound -> replay). Stating
+    # a weaker version of the same rule here would be a second copy of it.
 
     async def test_the_router_asks_the_manager_with_the_triggers_bound(self):
         from gateway.core.watcher_manager import RoomRef

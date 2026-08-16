@@ -89,14 +89,35 @@ async def route_attempts(
 
     False means the stage failed every attempt and the room **parks**: the
     episode ends, its buffer is dropped, and the room is offered again by its
-    next message. For a room with a persisted record the dropped interval is
-    recoverable — its watermark still sits below the aborted message, and
-    replay reads from the watermark. For a first-ever room it is not, which is
-    the accepted residual §2.2 records: making it recoverable would cost a
-    disk write per inbound message.
+    next message.
 
-    Only ``retry_on`` is retried. Anything else propagates — a bug should
-    surface as a bug, not spend three backoffs pretending to be weather.
+    What happens to the dropped interval depends on whether the room has a
+    persisted record, and the mechanism is worth naming because an earlier
+    version of this docstring claimed the recovery without one:
+
+    * **A room with a record** recovers it. Its watermark still sits below the
+      dropped frames, and the recreation that its next message triggers
+      replays from that watermark before delivering anything new
+      (`WatcherManager._recreate`). Nothing else would: the reconnect replay
+      iterates *tracked* rooms, and a parked room is untracked.
+    * **A first-ever room** does not. There is no watermark to replay from,
+      which is the accepted residual §2.2 records — making it recoverable
+      would cost a disk write per inbound message, including for every message
+      the rules are about to discard.
+
+    Only ``retry_on`` is retried; anything else propagates. How much that
+    promise is worth depends on what the caller passes, and the two stages
+    differ deliberately:
+
+    * **Classification** names ``ClassificationUnavailable``, so a bug in the
+      resolver surfaces as a bug rather than spending three backoffs
+      pretending to be weather.
+    * **The offer** names ``Exception``, because the manager deliberately lets
+      every failed start propagate (§2.2 outcome 4) and there is no typed
+      family covering "the backend was down". The cost is that a genuine bug
+      in creation is retried before it parks — visible in the log either way.
+      The *final* conditions that used to be caught by that breadth are
+      handled at the call site instead, which is where they are recognisable.
     """
     for attempt in range(len(delays) + 1):
         try:

@@ -19,6 +19,12 @@ from gateway.core.state import WatcherState
 from tests.helpers import make_lifecycle
 
 
+def _window(mgr):
+    """The down-window as `sync_only` would have frozen it — before anything
+    the tests then simulate arriving live."""
+    return mgr._snapshot_watermarks()
+
+
 def _dynamic_record(name="rc-eng-backend", room_id="r1", **overrides):
     fields = dict(
         watcher_name=name,
@@ -112,7 +118,7 @@ class TestStartupReplay(unittest.IsolatedAsyncioTestCase):
         report a gap for nearly every room at every boot."""
         mgr = self._manager([_dynamic_record()])
 
-        await mgr._replay_persisted_records()
+        await mgr._replay_persisted_records(_window(mgr))
 
         mgr._watcher_manager.get_or_create.assert_not_awaited()
         mgr._connector.replay_room_since.assert_not_awaited()
@@ -126,7 +132,7 @@ class TestStartupReplay(unittest.IsolatedAsyncioTestCase):
         mgr = self._manager([record])
         mgr._connector.probe_missed_since = AsyncMock(return_value=True)
 
-        await mgr._replay_persisted_records()
+        await mgr._replay_persisted_records(_window(mgr))
 
         # The probe was asked about the room typed by its *kind*, so a group DM
         # reaches the direct-room history endpoint rather than a channel one.
@@ -139,7 +145,8 @@ class TestStartupReplay(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(room.kind.value, "group_dm",
                          "the RoomRef is rebuilt from the record, not re-resolved")
         self.assertEqual(room.participants, ("alice", "bob"))
-        mgr._connector.replay_room_since.assert_awaited_once_with("r1")
+        mgr._connector.replay_room_since.assert_awaited_once_with(
+            "r1", after_ts="1786874400000")
 
     async def test_ineligible_records_are_left_alone(self):
         records = [
@@ -150,18 +157,43 @@ class TestStartupReplay(unittest.IsolatedAsyncioTestCase):
         mgr = self._manager(records)
         mgr._connector.probe_missed_since = AsyncMock(return_value=True)
 
-        await mgr._replay_persisted_records()
+        await mgr._replay_persisted_records(_window(mgr))
 
         mgr._connector.probe_missed_since.assert_not_awaited()
         mgr._watcher_manager.get_or_create.assert_not_awaited()
 
-    async def test_a_resident_room_is_not_probed(self):
-        mgr = self._manager([_dynamic_record()])
+    async def test_a_room_recreated_by_a_live_message_is_still_replayed(self):
+        """Inverted deliberately from "a resident room is not probed" — the
+        third such inversion in this step, and the same reason each time: the
+        old assertion pinned the defect.
+
+        `_replay_persisted_records` runs after `start_inbound`, so a live
+        message can recreate a room and advance its watermark past the whole
+        down-window before the loop reaches that record. Reading the record
+        then would report no gap and skip the room, losing every message from
+        the outage with no log line. The loop reads the frozen snapshot
+        instead, and being resident is not evidence anyone looked below the
+        boundary — so the room is replayed, from the boundary, and the id
+        window dedups whatever the live path already delivered."""
+        record = _dynamic_record()
+        mgr = self._manager([record])
+        window = _window(mgr)
+        mgr._connector.probe_missed_since = AsyncMock(return_value=True)
+        # What the live path did between start_inbound and this loop.
         mgr._lifecycle.processor_named = MagicMock(return_value="already-running")
+        record.last_processed_ts = "9999999999999"
 
-        await mgr._replay_persisted_records()
+        await mgr._replay_persisted_records(window)
 
-        mgr._connector.probe_missed_since.assert_not_awaited()
+        self.assertEqual(
+            mgr._connector.probe_missed_since.await_args.args[1], "1786874400000",
+            "the probe asks about the frozen down-window, not the advanced watermark",
+        )
+        # No second creation for a room that already has one, but the window is
+        # still replayed.
+        mgr._watcher_manager.get_or_create.assert_not_awaited()
+        mgr._connector.replay_room_since.assert_awaited_once_with(
+            "r1", after_ts="1786874400000")
 
     async def test_one_bad_room_does_not_kill_boot(self):
         """Best-effort per record: the probe failing, or the recreation
@@ -181,16 +213,59 @@ class TestStartupReplay(unittest.IsolatedAsyncioTestCase):
         mgr._watcher_manager.get_or_create = AsyncMock(
             side_effect=[RuntimeError("backend down"), "proc"])
 
-        await mgr._replay_persisted_records()
+        await mgr._replay_persisted_records(_window(mgr))
 
         # Both failures were survived and the good room still replayed.
-        mgr._connector.replay_room_since.assert_awaited_once_with("r-good")
+        mgr._connector.replay_room_since.assert_awaited_once_with(
+            "r-good", after_ts="1786874400000")
 
     async def test_without_a_manager_the_replay_is_a_no_op(self):
         mgr = self._manager([_dynamic_record()])
         mgr._watcher_manager = None
-        await mgr._replay_persisted_records()
+        await mgr._replay_persisted_records(_window(mgr))
         mgr._connector.probe_missed_since.assert_not_awaited()
+
+
+class TestTheDownWindowSnapshot(unittest.IsolatedAsyncioTestCase):
+    """The snapshot's *placement* is the defence: taken after hydration (which
+    is what puts the records in memory) and before the stream opens."""
+
+    def test_only_rule_derived_records_with_a_watermark_are_snapshotted(self):
+        from gateway.core.session_manager import SessionManager
+
+        mgr = SessionManager.__new__(SessionManager)
+        mgr._lifecycle = MagicMock()
+        mgr._lifecycle.states = MagicMock(return_value={
+            "keep": _dynamic_record(name="keep"),
+            "static": _dynamic_record(name="static", rule_name=""),
+            "fresh": _dynamic_record(name="fresh", last_processed_ts=""),
+        })
+
+        window = mgr._snapshot_watermarks()
+
+        self.assertEqual(window, {"keep": "1786874400000"})
+
+    async def test_the_snapshot_is_taken_before_the_stream_opens(self):
+        """After start_inbound a live message can advance a watermark past the
+        whole down-window, so a snapshot taken later describes nothing."""
+        from gateway.core.session_manager import SessionManager
+
+        mgr = SessionManager.__new__(SessionManager)
+        order = []
+        mgr._connector = MagicMock()
+        mgr._connector.start_inbound = AsyncMock(
+            side_effect=lambda: order.append("inbound"))
+        mgr._lifecycle = MagicMock()
+        mgr._lifecycle.sync_watchers = AsyncMock(
+            side_effect=lambda **kw: order.append("sync") or [])
+        mgr._snapshot_watermarks = MagicMock(
+            side_effect=lambda: order.append("snapshot") or {})
+        mgr._replay_persisted_records = AsyncMock(
+            side_effect=lambda w: order.append("replay"))
+
+        await mgr.sync_only()
+
+        self.assertEqual(order, ["sync", "snapshot", "inbound", "replay"])
 
 
 if __name__ == "__main__":

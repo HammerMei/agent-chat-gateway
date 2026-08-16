@@ -472,14 +472,45 @@ class WatcherManager:
         carried = carried_fields(record)
         carried["last_activity_at"] = _now_iso()
         carried["dropped_at"] = ""
+        # The window this recreation owes the room. Read before the start, which
+        # restores it into the connector and then advances it as the replayed
+        # and live messages commit.
+        boundary = record.last_processed_ts
         # A raise propagates: recreation that failed is an abort, not a decision,
         # and the caller owns the retry (§2.2). The per-room lock releases on the
         # way out, so the retry can re-enter.
         await self._lifecycle.start_watcher_in_room(
             wc, record, platform_room,
-            history_before_ts=history_before_ts, provenance=carried,
+            # The record's own watermark bounds the handoff when the backend has
+            # expired the session and a fresh one has to be minted: without it the
+            # unbounded fetch pulls in the very interval the replay below is about
+            # to deliver, and the agent sees it twice. The trigger's bound wins
+            # when there is one — it is the tighter of the two.
+            history_before_ts=history_before_ts or boundary,
+            provenance=carried,
         )
         self._lifecycle.save_state()
+
+        # Everything above the record's watermark, replayed through the normal
+        # pipeline. This is what makes an abort recoverable for a room that has
+        # a record (§2.2): the routing episode that parked, or the buffer that
+        # overflowed, left its frames below this boundary, and nothing else
+        # would ever return to them — the reconnect replay iterates *tracked*
+        # rooms and a parked room is untracked, and the next live message's
+        # commit would seal the interval by advancing the watermark past it.
+        #
+        # Best-effort: the room is up either way, and a replay that fails must
+        # not undo a successful recreation. Bounded by the record's own mark,
+        # so the room's replay boundary is not spent by a window it did not set.
+        if boundary:
+            try:
+                await self._connector.replay_room_since(record.room_id, after_ts=boundary)
+            except Exception as e:
+                logger.warning(
+                    "Watcher '%s' is up, but replaying room %s from %s failed — "
+                    "messages from before it may stay undelivered: %s",
+                    wc.name, record.room_id, boundary, e,
+                )
         return self._lifecycle.processor_named(wc.name)
 
     async def _create(

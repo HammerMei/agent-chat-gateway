@@ -43,6 +43,7 @@ from ...core.connector import (
     Room,
     RoomCapacity,
 )
+from ...core.dispatch import RoomAlreadyRoutedError
 from ...core.pending_route import (
     STARTING_UP_NOTICE,
     PendingRoute,
@@ -269,7 +270,9 @@ class MattermostConnector(Connector):
         for channel_id in list(self._channels):
             await self.replay_room_since(channel_id)
 
-    async def replay_room_since(self, room_id: str) -> None:
+    async def replay_room_since(
+        self, room_id: str, after_ts: str | None = None
+    ) -> None:
         """Replay one tracked channel's outage window from its watermark.
 
         The per-channel half of the reconnect replay, shared with the startup
@@ -283,6 +286,9 @@ class MattermostConnector(Connector):
         if state is None:
             return
         channel_id = room_id
+        # An explicitly named window (startup, post-park) is not this channel's
+        # boundary to spend — same rule, same reason, as Rocket.Chat's.
+        external_window = after_ts is not None
         # Snapshot the watermark NOW, before any await in this iteration —
         # same race rationale as RC: a concurrent live message must not be
         # allowed to advance the watermark mid-replay and cause the rest
@@ -295,7 +301,7 @@ class MattermostConnector(Connector):
         # catch. Replay is not serialized against live traffic here — it calls
         # `_on_posted_event` directly rather than through the per-channel worker.
         claims_at_entry = state.boundary_claims
-        watermark = state.replay_boundary or state.last_processed_ts
+        watermark = after_ts or state.replay_boundary or state.last_processed_ts
         if not watermark:
             logger.debug("Channel '%s': no watermark yet — skipping replay", state.room.name)
             return
@@ -358,7 +364,7 @@ class MattermostConnector(Connector):
             # window is spent once its batch has been *dispatched*, not once it was
             # fetched. Any hand-back during the batch — this replay's own or a live one
             # — left a newer claim, and the window stays open for the next recovery.
-            if not state.discharge_boundary(claims_at_entry):
+            if not external_window and not state.discharge_boundary(claims_at_entry):
                 logger.info(
                     "Channel '%s': the replay window was claimed again while this batch "
                     "was being dispatched — leaving it open", state.room.name,
@@ -1009,7 +1015,14 @@ class MattermostConnector(Connector):
                 # §2.2 outcome 5: audible in the room, once per episode.
                 logger.warning(
                     "Channel %s: pending buffer full — dropping a frame", channel_id)
-                await self._post_starting_up_notice(pending, channel_id)
+                # Spawned, not awaited: this runs on the channel worker, which
+                # holds the connector-wide permit for the whole handler call
+                # (§6.2), so a slow REST post here would stall delivery for
+                # every channel. The notice is owed, not urgent.
+                notice = asyncio.create_task(
+                    self._post_starting_up_notice(pending, channel_id))
+                self._routing_tasks.add(notice)
+                notice.add_done_callback(self._routing_tasks.discard)
             return
         if channel_id in self._channels:
             # Tracked now — the resolve above awaited, and a creation finished during
@@ -1041,7 +1054,15 @@ class MattermostConnector(Connector):
         """
         try:
             async def offer() -> None:
-                await self._router(room, decoded)
+                try:
+                    await self._router(room, decoded)
+                except RoomAlreadyRoutedError:
+                    # Final, not retryable — see Rocket.Chat's copy of this arm.
+                    logger.warning(
+                        "Channel %s is already served by another watcher — not "
+                        "creating a second one", channel_id,
+                    )
+                    return
 
             await route_attempts(
                 offer, retry_on=Exception,
