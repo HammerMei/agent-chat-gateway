@@ -81,6 +81,24 @@ class TestDispatchCommandList(unittest.IsolatedAsyncioTestCase):
             mgr._lifecycle.list_watchers.call_args[0][0], StateFilter.OPERABLE
         )
 
+    async def test_a_non_iterable_filter_is_a_bad_request_not_a_broken_daemon(self):
+        """`parse_state_filter` iterates what it is handed, so a hand-written
+        socket client sending `"states": 5` raises `TypeError`.
+
+        Escaping uncaught turns a malformed request into a per-connector
+        "failed to list watchers" warning, which reads as the daemon being
+        broken rather than the request being wrong. (Written because injecting
+        this fault changed nothing: the `TypeError` arm shipped without a test,
+        which is the shape a fix-and-test-in-one-edit always leaves.)
+        """
+        mgr = _make_manager()
+
+        result = await mgr.dispatch_command({"cmd": "list", "states": 5})
+
+        self.assertFalse(result["ok"])
+        self.assertIn("states", result["error"])
+        mgr._lifecycle.list_watchers.assert_not_called()
+
     async def test_an_unparseable_filter_is_an_error_not_a_silent_default(self):
         """A caller cannot tell from the rows that it was answered with a
         different question than the one it asked."""
