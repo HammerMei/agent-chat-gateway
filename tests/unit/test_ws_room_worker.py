@@ -598,3 +598,76 @@ class TestTheCreationPathJoinsTheRoomsQueue(unittest.IsolatedAsyncioTestCase):
             f"the drop was not reported: {logs.output}",
         )
         await c._ws.stop()
+
+
+class TestRoutingFramesDoNotOutliveARecovery(unittest.IsolatedAsyncioTestCase):
+    """A routing frame carries the account's standing *at read time*.
+
+    The routing queue and its workers survive a reconnect untouched, so without
+    a generation a frame read before an outage is acted on after one — and its
+    `access` still says `roomParticipant: true` for a channel the account may
+    have been removed from while the socket was down. Creating a watcher on that
+    is the one outcome routing must not produce.
+    """
+
+    def _client(self):
+        from gateway.connectors.rocketchat.websocket import RCWebSocketClient
+
+        return RCWebSocketClient(
+            server_url="http://localhost:3000", username="t", password="t"
+        )
+
+    async def test_a_frame_read_before_a_recovery_is_not_routed(self):
+        ws = self._client()
+        routed: list[str] = []
+
+        async def default_cb(doc, access=None):
+            routed.append(doc["_id"])
+
+        ws.register_default_callback(default_cb)
+        ws._queue_for_routing({"_id": "stale", "rid": "r1"}, {"roomParticipant": True})
+
+        # The recovery lands before the worker gets to it.
+        ws._recovery_generation += 1
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(routed, [], "a pre-recovery frame must not create a watcher")
+        await ws.stop()
+
+    async def test_a_frame_read_after_the_recovery_is_routed(self):
+        """The control: the generation must not simply block everything."""
+        ws = self._client()
+        routed: list[str] = []
+
+        async def default_cb(doc, access=None):
+            routed.append(doc["_id"])
+
+        ws.register_default_callback(default_cb)
+        ws._recovery_generation += 1
+        ws._queue_for_routing({"_id": "fresh", "rid": "r1"}, {"roomParticipant": True})
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(routed, ["fresh"])
+        await ws.stop()
+
+    async def test_frames_already_in_flight_when_the_socket_drops_are_dropped(self):
+        """Through the real bump site rather than a hand-incremented counter.
+
+        `_retire_recovery` is what a socket drop and a terminated stream both
+        go through, so this asserts the mechanism the production path uses, not
+        a counter a test moved itself.
+        """
+        ws = self._client()
+        routed: list[str] = []
+
+        async def default_cb(doc, access=None):
+            routed.append(doc["_id"])
+
+        ws.register_default_callback(default_cb)
+        ws._queue_for_routing({"_id": "pre", "rid": "r1"}, {"roomParticipant": True})
+
+        ws._retire_recovery()
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(routed, [])
+        await ws.stop()

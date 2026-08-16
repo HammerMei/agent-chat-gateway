@@ -1062,7 +1062,14 @@ class RCWebSocketClient:
             self._callback_tasks.add(task)
             task.add_done_callback(self._callback_tasks.discard)
         try:
-            self._routing_queue.put_nowait((doc, access))
+            # Stamped with the generation this frame was *read* under. The queue and
+            # its workers survive a reconnect untouched, so without it a frame read
+            # before an outage is acted on after one — and its `access` object, which
+            # is a snapshot of one delivery rather than a property of the room, still
+            # says `roomParticipant: true` for a channel the account may have been
+            # removed from while the socket was down. Creating a watcher on that is
+            # the one outcome routing must not produce.
+            self._routing_queue.put_nowait((doc, access, self._recovery_generation))
         except asyncio.QueueFull:
             # Dropped rather than blocking the listen loop. A lost routing frame costs the
             # first message of a room that has no watcher yet — the next one asks again —
@@ -1079,7 +1086,21 @@ class RCWebSocketClient:
         for rooms that do not.
         """
         while True:
-            doc, access = await self._routing_queue.get()
+            doc, access, generation = await self._routing_queue.get()
+            if generation != self._recovery_generation:
+                # A recovery happened between reading this frame and reaching it. Its
+                # `access` describes the account's standing at read time, and the very
+                # thing a recovery re-establishes is what that standing now is — so
+                # acting on it could create a watcher for a room the account left
+                # during the outage. Dropped rather than re-checked: the replay that
+                # follows a recovery re-offers the rooms that still qualify, so the
+                # frame's information is about to arrive again, correct this time.
+                logger.debug(
+                    "Dropping a routing frame read before a recovery "
+                    "(generation %d, now %d)",
+                    generation, self._recovery_generation,
+                )
+                continue
             # Not re-checked for None: nothing reaches this queue until
             # `register_default_callback` has run — `_queue_for_routing` returns early
             # without one — and nothing ever clears it, `stop()` included. A `continue`
