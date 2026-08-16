@@ -37,6 +37,11 @@ from ...core.connector import (
     Room,
     RoomCapacity,
 )
+from ...core.pending_route import (
+    STARTING_UP_NOTICE,
+    PendingRoute,
+    route_attempts,
+)
 from ...core.replay_window import ReplayWindow
 from ...core.replay_window import just_before as _just_before
 from ...core.sender_policy import sender_allowed
@@ -228,6 +233,17 @@ class RocketChatConnector(Connector):
 
     _TEXT_CHUNK_LIMIT = 40_000
 
+    # One routing episode's buffer — matches the transport's per-room queue
+    # depth, since a room that cannot hold this many live frames has no better
+    # claim to hold more while it is being created.
+    _PENDING_BUFFER_DEPTH = 50
+    # Bounded backoff for the two retryable resolution stages (§2.2): a
+    # classification the network ate, and a creation that raised. Three retries,
+    # ~3.5s worst case, holding one of the four routing workers — bounded on
+    # purpose, because an unbounded retry would turn one dead REST endpoint
+    # into a parked worker pool.
+    _ROUTE_RETRY_DELAYS: tuple[float, ...] = (0.5, 1.0, 2.0)
+
     def __init__(self, config: RocketChatConfig) -> None:
         self._config = config
         self._rest = RocketChatREST(config.server_url)
@@ -242,12 +258,15 @@ class RocketChatConnector(Connector):
         ] = {}  # room_id -> [watcher...]
         self._room_refcount: dict[str, int] = {}  # room_id -> subscriber count
         self._router = None
-        # Rooms currently being offered to the router. The routing workers are a pool, so
+        # Rooms with an open routing episode. The routing workers are a pool, so
         # several frames from one untracked room can be in flight at once — and offering a
         # room is slow (a DM needs `im.members` before it can even be classified), which
         # makes the overlap the normal case for a room that has just started talking rather
-        # than a rare one. Two offers for one room are two watchers and two sessions for it.
-        self._rooms_being_routed: set[str] = set()
+        # than a rare one. Two offers for one room are two watchers and two sessions for
+        # it, which is what the single open episode prevents; the frames that arrive
+        # during it wait in the episode's bounded buffer instead of being dropped (§2.7
+        # step 3) and are drained in arrival order when it ends.
+        self._pending_routes: dict[str, PendingRoute] = {}
         # What `start_inbound` decided, once — **not** whether the stream is live now, and
         # nothing may read it as that. The stream can die under a healthy socket, and a copy
         # of its liveness would go on saying otherwise while a watcher added in that window
@@ -796,6 +815,25 @@ class RocketChatConnector(Connector):
         room_id = doc.get("rid", "")
         if not room_id:
             return
+        pending = self._pending_routes.get(room_id)
+        if pending is not None:
+            # An episode for this room is open. Checked *before* the tracked
+            # check on purpose: the room may have become tracked an instant ago
+            # with its buffer not yet drained, and delivering this frame
+            # directly would put it ahead of every frame that arrived before
+            # it. While an episode is open, the buffer is the room's order.
+            verdict = pending.add(doc.get("_id", ""), (doc, access))
+            if verdict == "duplicate":
+                # §2.2 outcome 6: the reservation is not disturbed, the copy goes.
+                logger.debug(
+                    "Room %s: discarding a duplicate of a reserved message", room_id[:8])
+            elif verdict == "full":
+                # §2.2 outcome 5: the drop is audible in the room, once per
+                # episode — the sender watched this message arrive.
+                logger.warning(
+                    "Room %s: pending buffer full — dropping a frame", room_id[:8])
+                await self._post_starting_up_notice(pending, room_id)
+            return
         if room_id in self._rooms:
             # Tracked now — so deliver it rather than offer it again. The frame reached
             # this path because the room was untracked when it was routed here, and the
@@ -813,59 +851,76 @@ class RocketChatConnector(Connector):
             # older one claiming a boundary already past itself.
             self._ws.deliver_to_room(room_id, doc, access)
             return
-        if room_id in self._rooms_being_routed:
-            # An offer for this room is in flight and a second one would create a second
-            # watcher. This frame is dropped: the watcher does not exist yet, so there is
-            # nothing to deliver it to, and holding it would need a queue per room being
-            # created. The window is the duration of one creation, and the frames in it
-            # are the residue this coalescing costs — stated rather than implied, because
-            # the comment that used to be here called the loss "nothing".
-            logger.debug(
-                "Room %s is being created; dropping a frame that arrived during it",
-                room_id,
-            )
-            return
-        self._rooms_being_routed.add(room_id)
+
+        # First frame for this room: open the episode with the trigger buffered
+        # as its first frame, so success drains trigger-first in arrival order.
+        pending = PendingRoute(self._PENDING_BUFFER_DEPTH)
+        pending.add(doc.get("_id", ""), (doc, access))
+        self._pending_routes[room_id] = pending
         try:
-            try:
-                room = await self._room_ref_from_access(room_id, access)
-            except ClassificationUnavailable as e:
-                # Retryable in principle (§2.2 outcome 3) — the retry loop is the
-                # transaction increment's; until it lands the frame is dropped
-                # audibly and the room is re-offered by its next message.
-                logger.warning("Not routing room %s this time: %s", room_id, e)
-                return
+            # Stage 1 — classify. Only ClassificationUnavailable is retryable
+            # (§2.2 outcome 3: the routing decision was never made); None is a
+            # final decline and anything else is a bug that should surface.
+            resolved: dict = {}
+
+            async def classify() -> None:
+                resolved["room"] = await self._room_ref_from_access(room_id, access)
+
+            if not await route_attempts(
+                classify, retry_on=ClassificationUnavailable,
+                delays=self._ROUTE_RETRY_DELAYS, logger=logger,
+                label=f"Classifying room {room_id[:8]}",
+            ):
+                return  # parked; the finally drops the buffer
+            room = resolved["room"]
             if room is None:
-                return
-            try:
+                return  # final: no name to match, or no counterpart to classify by
+
+            # Stage 2 — offer. The router raising means a creation was started
+            # and not carried out (§2.2 outcome 4) — retryable, because the
+            # manager deliberately lets those propagate. A None-shaped outcome
+            # (rule miss, pause, cap) does not raise and is final.
+            async def offer() -> None:
                 await self._router(room, doc)
-            except Exception as e:
-                logger.error("Router failed for room %s: %s", room_id, e)
-                return
-            # The message that prompted the creation is delivered now, through the
-            # ordinary path. Offering a room is not delivering a message, and a brand-new
-            # room has no watermark for the replay to fetch it from later, so without this
-            # the message that caused the watcher to exist is the one message it never
-            # sees — and its sender waits for an answer that needs a second message to
-            # arrive.
-            #
-            # Onto the room's worker, so every gate that applies to a tracked room's
-            # message applies to this one — the mention gate, the sender policy, dedup,
-            # the capacity preflight — and so does its ordering. Creating a watcher and
-            # answering unprompted are separate decisions, and this keeps them separate.
-            #
-            # The worker demonstrably exists by now, which makes this the clearest of
-            # the bypasses: a newer frame entering it meanwhile could otherwise reach
-            # the handler concurrently with this one. (It can still be *ahead* of this
-            # one in the queue — serialising is not reordering — in which case this
-            # frame is filtered as already processed rather than dispatched twice.)
-            if room_id in self._rooms:
-                self._ws.deliver_to_room(room_id, doc, access)
+
+            await route_attempts(
+                offer, retry_on=Exception,
+                delays=self._ROUTE_RETRY_DELAYS, logger=logger,
+                label=f"Creating a watcher for room {room_id[:8]}",
+            )
         finally:
-            # Released whatever happened. A room that failed to be offered must be
-            # offerable again on its next message — holding the reservation would make one
-            # transient REST failure permanent for that room.
-            self._rooms_being_routed.discard(room_id)
+            # The episode ends here, whatever happened, and the buffer has one
+            # of two fates. Tracked: every frame — trigger first, then the ones
+            # that arrived during the episode — goes onto the room's worker, so
+            # every gate a tracked message passes applies to each of them, and
+            # so does the queue's ordering. Not tracked: the decision was "no
+            # watcher" or the room parked, and the frames go with it — stated
+            # audibly, because a brand-new room has no watermark for any replay
+            # to recover them from.
+            ended = self._pending_routes.pop(room_id, None)
+            frames = ended.drain() if ended is not None else []
+            if room_id in self._rooms:
+                for pending_doc, pending_access in frames:
+                    self._ws.deliver_to_room(room_id, pending_doc, pending_access)
+            elif frames:
+                logger.info(
+                    "Room %s: dropping %d buffered frame(s) — no watcher was created",
+                    room_id[:8], len(frames),
+                )
+
+    async def _post_starting_up_notice(self, pending: PendingRoute, room_id: str) -> None:
+        """Tell the room its messages are outrunning its setup — once per episode.
+
+        Best-effort: the notice is owed, but a REST failure posting it must not
+        take the routing worker down with it.
+        """
+        if pending.notice_posted:
+            return
+        pending.notice_posted = True
+        try:
+            await self.send_text(room_id, AgentResponse(text=STARTING_UP_NOTICE))
+        except Exception:
+            logger.debug("Could not post the starting-up notice", exc_info=True)
 
     def trigger_history_bound(self, trigger) -> str | None:
         """The trigger doc's `ts` as ISO — DDP carries it as `{"$date": ms}` or a

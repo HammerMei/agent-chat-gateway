@@ -61,7 +61,7 @@ def _mock_lifecycle():
 def _manager(lifecycle=None, rules=None, connector=None, **kwargs):
     lifecycle = lifecycle if lifecycle is not None else _mock_lifecycle()
     connector = connector if connector is not None else MagicMock(
-        send_to_room=AsyncMock())
+        send_text=AsyncMock())
     manager = WatcherManager(
         "rc", connector, lifecycle,
         rules if rules is not None else [_rule()], **kwargs,
@@ -335,15 +335,15 @@ class TestTheCreationCap(unittest.IsolatedAsyncioTestCase):
         result = await manager.get_or_create("rc", _room(id="rb", name="eng-b"))
 
         self.assertIsNone(result)
-        connector.send_to_room.assert_awaited_once()
-        self.assertEqual(connector.send_to_room.await_args.args[0], "rb")
+        connector.send_text.assert_awaited_once()
+        self.assertEqual(connector.send_text.await_args.args[0], "rb")
 
         release.set()
         await first
 
     async def test_a_failed_notice_does_not_raise_out_of_routing(self):
         manager, lifecycle, connector = _manager(creation_cap=0)
-        connector.send_to_room = AsyncMock(side_effect=RuntimeError("rest down"))
+        connector.send_text = AsyncMock(side_effect=RuntimeError("rest down"))
 
         result = await manager.get_or_create("rc", _room())
         self.assertIsNone(result)

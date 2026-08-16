@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING
 
 from .config import HistoryHandoffConfig, WatcherConfig
 from .connector import Room
+from .pending_route import STARTING_UP_NOTICE
 from .room_pattern import RoomPattern
 from .state import CONFIG_SCHEMA_VERSION, WatcherState
 from .watcher_rule import RoomKind, RuleMatch, WatcherRule
@@ -490,11 +491,12 @@ class WatcherManager:
                 "room %s", self._creation_cap, room.id,
             )
             try:
-                await self._connector.send_to_room(
-                    room.id,
-                    "⏳ Starting up — several rooms are being set up at once. "
-                    "Please try again in a moment.",
-                )
+                # send_text, not send_to_room: the latter resolves its argument
+                # as a room *name*, and all this layer holds is the opaque id.
+                from ..agents.response import AgentResponse
+
+                await self._connector.send_text(
+                    room.id, AgentResponse(text=STARTING_UP_NOTICE))
             except Exception:
                 logger.debug("Could not post the starting-up notice", exc_info=True)
             return None

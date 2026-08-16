@@ -74,7 +74,7 @@ def _make_connector():
     # Hand-built connector: `__init__` never runs, so anything the code reads has to be
     # set here. Delivery defaults to per-room, which is what these tests exercise.
     connector._router = None
-    connector._rooms_being_routed = set()
+    connector._pending_routes = {}
     connector._subscribe_all = False
     connector._dm_kinds = {}
     connector._rest = MagicMock()
@@ -2531,6 +2531,7 @@ class TestDirectRoomClassification(unittest.IsolatedAsyncioTestCase):
         is cached, the single-flight reservation is released — and the raise
         never escapes to the routing worker as an anonymous callback failure."""
         connector = self._connector()
+        connector._ROUTE_RETRY_DELAYS = ()
         connector._rest.dm_members = AsyncMock(side_effect=RuntimeError("api down"))
 
         with self.assertLogs(
@@ -2540,8 +2541,8 @@ class TestDirectRoomClassification(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(self.offered, [])
         self.assertEqual(connector._dm_kinds, {})
-        self.assertEqual(connector._rooms_being_routed, set())
-        self.assertTrue(any("Not routing room" in line for line in logs.output))
+        self.assertEqual(connector._pending_routes, {})
+        self.assertTrue(any("parking" in line for line in logs.output))
 
         # And the room recovers on its next message.
         connector._rest.dm_members = AsyncMock(return_value=["alice"])
@@ -3158,8 +3159,12 @@ class TestARoomIsOfferedOnceAtATime(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sorted(offered), ["new-room", "other-room"])
 
     async def test_a_room_that_failed_to_be_offered_can_be_offered_again(self):
-        """Holding the reservation would make one transient REST failure permanent."""
+        """Holding the reservation would make one transient REST failure permanent.
+
+        Delays zeroed so the park is immediate: what this pins is that a parked
+        episode releases its reservation, not how long the backoff waits."""
         connector = self._connector()
+        connector._ROUTE_RETRY_DELAYS = ()
         attempts = []
 
         async def _failing_router(room, trigger):
@@ -3173,7 +3178,159 @@ class TestARoomIsOfferedOnceAtATime(unittest.IsolatedAsyncioTestCase):
         await connector._on_unrouted_message(doc, access)
 
         self.assertEqual(len(attempts), 2)
-        self.assertEqual(connector._rooms_being_routed, set())
+        self.assertEqual(connector._pending_routes, {})
+
+
+class TestTheRoutingTransaction(unittest.IsolatedAsyncioTestCase):
+    """The reserve/resolve/commit-or-abort episode on the unrouted path (§2.2).
+
+    One episode per room, frames buffered while it is open, drained in arrival
+    order on success, dropped with the episode otherwise. Each of the design's
+    terminal outcomes that this path owns is pinned here; the tracked path's
+    accounting (watermark commit, hand-back) has its own tests and is released
+    behaviour this increment does not touch.
+    """
+
+    def _connector(self):
+        connector = _make_connector()
+        connector._config.filter_sender = False
+        connector._ROUTE_RETRY_DELAYS = (0,)
+        return connector
+
+    def _doc(self, msg_id="m1"):
+        return {"_id": msg_id, "msg": "hi", "u": {"username": "alice"},
+                "rid": "new-room", "ts": {"$date": 1}}
+
+    _ACCESS = {"roomParticipant": True, "roomType": "c", "roomName": "general"}
+
+    async def test_frames_arriving_during_creation_drain_in_arrival_order(self):
+        """Outcome 1, plus the ordering rule: the trigger first, then every
+        frame that arrived during the episode, all through the room's worker."""
+        connector = self._connector()
+        release = asyncio.Event()
+        entered = asyncio.Event()
+
+        async def creating_router(room, trigger):
+            entered.set()
+            await release.wait()
+            connector._rooms["new-room"] = MagicMock()  # what a creation does
+
+        connector.register_router(creating_router)
+
+        first = asyncio.create_task(
+            connector._on_unrouted_message(self._doc("m1"), self._ACCESS))
+        await entered.wait()
+        await connector._on_unrouted_message(self._doc("m2"), self._ACCESS)
+        await connector._on_unrouted_message(self._doc("m3"), self._ACCESS)
+        release.set()
+        await first
+
+        delivered = [c.args[1]["_id"]
+                     for c in connector._ws.deliver_to_room.call_args_list]
+        self.assertEqual(delivered, ["m1", "m2", "m3"])
+
+    async def test_a_duplicate_of_a_reserved_message_is_discarded(self):
+        """Outcome 6 — and the episode's seen-set is the only guard there is:
+        the new subscription's own dedup window starts empty."""
+        connector = self._connector()
+        release = asyncio.Event()
+        entered = asyncio.Event()
+
+        async def creating_router(room, trigger):
+            entered.set()
+            await release.wait()
+            connector._rooms["new-room"] = MagicMock()
+
+        connector.register_router(creating_router)
+
+        first = asyncio.create_task(
+            connector._on_unrouted_message(self._doc("m1"), self._ACCESS))
+        await entered.wait()
+        await connector._on_unrouted_message(self._doc("m2"), self._ACCESS)
+        await connector._on_unrouted_message(self._doc("m2"), self._ACCESS)  # dup
+        release.set()
+        await first
+
+        delivered = [c.args[1]["_id"]
+                     for c in connector._ws.deliver_to_room.call_args_list]
+        self.assertEqual(delivered, ["m1", "m2"], "the copy went, the original stayed")
+
+    async def test_a_full_buffer_is_audible_in_the_room_once(self):
+        """Outcome 5: silently committing would drop a message the user watched
+        arrive — and one episode owes one notice, however many frames overflow."""
+        connector = self._connector()
+        connector._PENDING_BUFFER_DEPTH = 1
+        connector.send_text = AsyncMock()
+        release = asyncio.Event()
+        entered = asyncio.Event()
+
+        async def slow_router(room, trigger):
+            entered.set()
+            await release.wait()
+
+        connector.register_router(slow_router)
+
+        first = asyncio.create_task(
+            connector._on_unrouted_message(self._doc("m1"), self._ACCESS))
+        await entered.wait()
+        await connector._on_unrouted_message(self._doc("m2"), self._ACCESS)  # full
+        await connector._on_unrouted_message(self._doc("m3"), self._ACCESS)  # full again
+        release.set()
+        await first
+
+        connector.send_text.assert_awaited_once()
+        self.assertEqual(connector.send_text.await_args.args[0], "new-room")
+
+    async def test_a_transient_classification_failure_recovers_in_place(self):
+        """Outcome 3, the retry half: the routing decision was never made, so
+        the same episode asks again — the trigger is not lost to one timeout."""
+        connector = self._connector()
+        offered = []
+        connector.register_router(
+            AsyncMock(side_effect=lambda room, trigger: offered.append(room)))
+        connector._rest.dm_members = AsyncMock(
+            side_effect=[RuntimeError("timeout"), ["alice"]])
+
+        await connector._on_unrouted_message(
+            self._doc("m1"), {"roomParticipant": True, "roomType": "d"})
+
+        self.assertEqual(len(offered), 1)
+        self.assertEqual(offered[0].kind, RoomKind.DM)
+
+    async def test_a_transient_creation_failure_recovers_in_place(self):
+        """Outcome 4, the retry half: the manager lets a failed start propagate
+        precisely so this loop can tell it from a final no."""
+        connector = self._connector()
+        calls = []
+
+        async def flaky_router(room, trigger):
+            calls.append(1)
+            if len(calls) < 2:
+                raise RuntimeError("backend hiccup")
+            connector._rooms["new-room"] = MagicMock()
+
+        connector.register_router(flaky_router)
+        await connector._on_unrouted_message(self._doc("m1"), self._ACCESS)
+
+        self.assertEqual(len(calls), 2)
+        delivered = [c.args[1]["_id"]
+                     for c in connector._ws.deliver_to_room.call_args_list]
+        self.assertEqual(delivered, ["m1"], "the trigger survived the first failure")
+
+    async def test_a_parked_room_commits_nothing(self):
+        """Outcomes 4-exhausted and 7 share one observable: nothing was
+        committed. No room state exists, no watermark was written, no frame was
+        delivered — so a later replay (for a room with a record) or the room's
+        next message (for a first-ever room) finds the field untouched."""
+        connector = self._connector()
+        connector._ROUTE_RETRY_DELAYS = ()
+        connector.register_router(AsyncMock(side_effect=RuntimeError("dead")))
+
+        await connector._on_unrouted_message(self._doc("m1"), self._ACCESS)
+
+        self.assertNotIn("new-room", connector._rooms)
+        connector._ws.deliver_to_room.assert_not_called()
+        self.assertEqual(connector._pending_routes, {})
 
 
 class TestAQueuedFrameDoesNotReofferATrackedRoom(unittest.IsolatedAsyncioTestCase):

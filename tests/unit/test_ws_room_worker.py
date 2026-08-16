@@ -533,7 +533,7 @@ class TestTheCreationPathJoinsTheRoomsQueue(unittest.IsolatedAsyncioTestCase):
         c._rooms = {
             "r1": _RoomSubscription(room=Room(id="r1", name="general", type="channel"))
         }
-        c._rooms_being_routed = set()
+        c._pending_routes = {}
         async def _noop_router(room, trigger):
             pass
 

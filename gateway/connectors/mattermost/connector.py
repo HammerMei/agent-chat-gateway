@@ -43,6 +43,11 @@ from ...core.connector import (
     Room,
     RoomCapacity,
 )
+from ...core.pending_route import (
+    STARTING_UP_NOTICE,
+    PendingRoute,
+    route_attempts,
+)
 from ...core.replay_window import ReplayWindow, just_before
 from ...core.tz_utils import local_iana_timezone as _server_local_timezone
 from ...core.watcher_manager import RoomRef
@@ -148,6 +153,14 @@ class MattermostConnector(Connector):
     # is 16383 — leave a safety margin below that.
     _TEXT_CHUNK_LIMIT = 16_000
 
+    # One routing episode's buffer — matches the transport's per-channel queue
+    # depth (websocket._CHANNEL_QUEUE_DEPTH), same reasoning as RC's.
+    _PENDING_BUFFER_DEPTH = 50
+    # Bounded backoff for a creation that raised (§2.2 outcome 4). MM episodes
+    # run on their own task, so the backoff holds no shared worker — the bound
+    # exists so a dead backend does not retry forever.
+    _ROUTE_RETRY_DELAYS: tuple[float, ...] = (0.5, 1.0, 2.0)
+
     def __init__(self, config: MattermostConfig) -> None:
         self._config = config
         self._rest = MattermostREST(
@@ -163,12 +176,14 @@ class MattermostConnector(Connector):
         self._capacity_check: CapacityCheck | None = None
         self._router = None
         self._channels: dict[str, _ChannelState] = {}  # channel_id -> state
-        # Channels whose router offer is in flight — the same single-flight rule as
-        # RC's `_rooms_being_routed`, and needed here for a sharper reason: the offer
+        # Channels with an open routing episode — the same single-episode rule as
+        # RC's `_pending_routes`, and needed here for a sharper reason: the offer
         # runs off the handler path (see `_offer_to_router`), so the per-channel
         # worker's serialization no longer covers the creation, and two back-to-back
-        # messages for one new channel could otherwise both trigger it.
-        self._rooms_being_routed: set[str] = set()
+        # messages for one new channel could otherwise both trigger it. Frames that
+        # arrive during the episode wait in its bounded buffer (§2.7 step 3) and
+        # drain in arrival order when it ends.
+        self._pending_routes: dict[str, PendingRoute] = {}
         # The off-handler routing tasks, tracked so disconnect() can cancel them
         # rather than leaving offers running against a closed transport.
         self._routing_tasks: set[asyncio.Task] = set()
@@ -946,6 +961,24 @@ class MattermostConnector(Connector):
             )
             return
 
+        pending = self._pending_routes.get(channel_id)
+        if pending is not None:
+            # An episode for this channel is open. Checked *before* the tracked
+            # check: the channel may have become tracked an instant ago with its
+            # buffer not yet drained, and delivering this frame directly would put
+            # it ahead of every frame that arrived before it.
+            verdict = pending.add(decoded["post"].get("id", ""), decoded)
+            if verdict == "duplicate":
+                # §2.2 outcome 6: the reservation is not disturbed, the copy goes.
+                logger.debug(
+                    "Channel %s: discarding a duplicate of a reserved message",
+                    channel_id)
+            elif verdict == "full":
+                # §2.2 outcome 5: audible in the room, once per episode.
+                logger.warning(
+                    "Channel %s: pending buffer full — dropping a frame", channel_id)
+                await self._post_starting_up_notice(pending, channel_id)
+            return
         if channel_id in self._channels:
             # Tracked now — the resolve above awaited, and a creation finished during
             # it. Deliver rather than offer: the per-channel callback that would have
@@ -953,46 +986,61 @@ class MattermostConnector(Connector):
             # is going to deliver it.
             self._ws.deliver_to_channel(decoded)
             return
-        if channel_id in self._rooms_being_routed:
-            # An offer for this channel is in flight and a second one would create a
-            # second watcher. This frame is dropped: the watcher does not exist yet, so
-            # there is nothing to deliver it to. The window is the duration of one
-            # creation, and the frames in it are the residue this coalescing costs —
-            # same rule, same honesty, as RC's `_on_unrouted_message`.
-            logger.debug(
-                "Channel %s is being created; dropping a frame that arrived during it",
-                channel_id,
-            )
-            return
-        self._rooms_being_routed.add(channel_id)
+        pending = PendingRoute(self._PENDING_BUFFER_DEPTH)
+        pending.add(decoded["post"].get("id", ""), decoded)
+        self._pending_routes[channel_id] = pending
         task = asyncio.create_task(self._route_channel(channel_id, room, decoded))
         self._routing_tasks.add(task)
         task.add_done_callback(self._routing_tasks.discard)
 
     async def _route_channel(self, channel_id: str, room: "RoomRef", decoded: dict) -> None:
-        """Run one router offer to completion, off the handler path.
+        """Run one routing episode to completion, off the handler path.
 
-        Owns the `_rooms_being_routed` reservation it was spawned under: released in
-        `finally`, whatever happened, so a channel whose offer failed is offerable
-        again on its next message — holding the reservation would make one transient
+        Owns the `_pending_routes` entry it was spawned under: popped in `finally`,
+        whatever happened, so a channel whose offer failed is offerable again on
+        its next message — holding the reservation would make one transient
         failure permanent for that channel.
+
+        The router raising means a creation was started and not carried out
+        (§2.2 outcome 4) — retryable with bounded backoff, because the manager
+        deliberately lets those propagate. A None-shaped outcome (rule miss,
+        pause, cap) does not raise and is final. Unlike RC there is no
+        classification stage: the kind arrived free on the event.
         """
         try:
-            try:
+            async def offer() -> None:
                 await self._router(room, decoded)
-            except Exception as e:
-                logger.error("Router failed for channel %s: %s", channel_id, e)
-                return
-            # The message that prompted the creation is delivered now, through the
-            # ordinary path — onto the channel's own queue, so every gate that applies
-            # to a tracked channel's message applies to this one, and so does its
-            # ordering. A brand-new channel has no watermark for a replay to fetch it
-            # from later, so without this the message that caused the watcher to exist
-            # is the one message it never sees.
-            if channel_id in self._channels:
-                self._ws.deliver_to_channel(decoded)
+
+            await route_attempts(
+                offer, retry_on=Exception,
+                delays=self._ROUTE_RETRY_DELAYS, logger=logger,
+                label=f"Creating a watcher for channel {channel_id}",
+            )
         finally:
-            self._rooms_being_routed.discard(channel_id)
+            # The episode ends, and the buffer has one of two fates — same rule,
+            # same honesty, as RC's `_on_unrouted_message`: drained trigger-first
+            # onto the channel's own queue when the channel became tracked, or
+            # dropped audibly with the episode when it did not.
+            ended = self._pending_routes.pop(channel_id, None)
+            frames = ended.drain() if ended is not None else []
+            if channel_id in self._channels:
+                for frame in frames:
+                    self._ws.deliver_to_channel(frame)
+            elif frames:
+                logger.info(
+                    "Channel %s: dropping %d buffered frame(s) — no watcher was created",
+                    channel_id, len(frames),
+                )
+
+    async def _post_starting_up_notice(self, pending: PendingRoute, channel_id: str) -> None:
+        """Tell the room its messages are outrunning its setup — once per episode."""
+        if pending.notice_posted:
+            return
+        pending.notice_posted = True
+        try:
+            await self.send_text(channel_id, AgentResponse(text=STARTING_UP_NOTICE))
+        except Exception:
+            logger.debug("Could not post the starting-up notice", exc_info=True)
 
     async def _on_posted_event(
         self,
