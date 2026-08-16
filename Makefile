@@ -17,6 +17,10 @@ setup: ## Run the interactive setup wizard (idempotent — skips if config exist
 test: ## Run test suite
 	uv run pytest tests/ -v --tb=short
 
+coverage: ## Run the test suite with branch coverage and print the gaps
+	uv run pytest tests/unit tests/integration -q --timeout=120 \
+		--cov=gateway --cov-branch --cov-report=term-missing:skip-covered
+
 lint: ## Run ruff check (if installed)
 	@if command -v ruff >/dev/null 2>&1; then \
 	    ruff check gateway/ tests/; \

@@ -70,6 +70,10 @@ markers = [
 
 [tool.coverage.run]
 source = ["gateway"]
+# Branch coverage, not just line coverage. A line-only number counts an `if`
+# whose false arm nothing exercises as fully covered, which is exactly the kind
+# of gap this project keeps finding one regression at a time.
+branch = true
 
 [tool.coverage.report]
 exclude_also = [
