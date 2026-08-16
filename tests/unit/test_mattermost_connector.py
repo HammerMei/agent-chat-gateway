@@ -752,9 +752,21 @@ class TestRoutingUntrackedChannels(unittest.IsolatedAsyncioTestCase):
         connector._ws.unregister_channel = MagicMock()
         connector.register_handler(AsyncMock(return_value=True))
         self.offered = []
+        self.triggers = []
         if register_router:
-            connector.register_router(AsyncMock(side_effect=self.offered.append))
+            connector.register_router(AsyncMock(side_effect=self._record_offer))
         return connector
+
+    def _record_offer(self, room, trigger):
+        # The router contract is `router(room, trigger)` — the trigger is the decoded
+        # event, kept so the creation path can bound history handoff by its timestamp.
+        self.offered.append(room)
+        self.triggers.append(trigger)
+
+    async def _drain(self, connector):
+        """Wait out the off-handler routing tasks the offer spawned."""
+        while connector._routing_tasks:
+            await asyncio.gather(*list(connector._routing_tasks))
 
     def _event(self, **overrides):
         event = {
@@ -771,13 +783,107 @@ class TestRoutingUntrackedChannels(unittest.IsolatedAsyncioTestCase):
 
     async def test_an_untracked_channel_is_offered_to_the_router(self):
         connector = await self._connector()
-        await connector._on_posted_event(self._event())
+        event = self._event()
+        await connector._on_posted_event(event)
+        await self._drain(connector)
 
         self.assertEqual(len(self.offered), 1)
         room = self.offered[0]
         self.assertEqual(room.id, "chan-new")
         self.assertEqual(room.kind, RoomKind.CHANNEL)
         self.assertEqual(room.name, "incident-42")
+        # The trigger rides along, so the creation path can bound history handoff
+        # by its timestamp — same contract as Rocket.Chat's router.
+        self.assertIs(self.triggers[0], event)
+
+    async def test_the_offer_does_not_hold_the_handler_path(self):
+        """The router runs off the handler (§2.7 step 3): the channel worker holds the
+        connector-wide permit for the whole handler call, so a creation awaited inside
+        it would stall delivery for every channel."""
+        connector = await self._connector()
+        release = asyncio.Event()
+
+        async def slow_router(room, trigger):
+            await release.wait()
+
+        connector.register_router(slow_router)
+
+        # Returns while the router is still blocked — the offer was spawned, not awaited.
+        await asyncio.wait_for(connector._on_posted_event(self._event()), timeout=1)
+        self.assertEqual(len(connector._routing_tasks), 1)
+
+        release.set()
+        await self._drain(connector)
+
+    async def test_a_second_frame_during_a_creation_is_dropped_not_reoffered(self):
+        """Single-flight per channel: an offer in flight means a second offer would
+        create a second watcher. The dropped frame is the stated residue of this
+        coalescing — same rule as RC's `_on_unrouted_message`."""
+        connector = await self._connector()
+        release = asyncio.Event()
+        calls = []
+
+        async def slow_router(room, trigger):
+            calls.append(room)
+            await release.wait()
+
+        connector.register_router(slow_router)
+
+        await connector._on_posted_event(self._event())
+        await connector._on_posted_event(
+            self._event(post={"channel_id": "chan-new", "id": "m2", "type": "",
+                              "user_id": "u1", "message": "second", "create_at": 2}))
+        release.set()
+        await self._drain(connector)
+
+        self.assertEqual(len(calls), 1)
+
+    async def test_the_trigger_is_handed_back_once_the_channel_is_tracked(self):
+        """A brand-new channel has no watermark for a replay to fetch from, so the
+        message that caused the watcher to exist would otherwise be the one message
+        it never sees. Handed back through the channel's own queue, so every gate a
+        tracked message passes applies to it too."""
+        connector = await self._connector()
+        connector._ws.deliver_to_channel = MagicMock()
+        event = self._event()
+
+        async def creating_router(room, trigger):
+            # What a real creation does that matters here: the channel becomes tracked.
+            connector._channels["chan-new"] = MagicMock()
+
+        connector.register_router(creating_router)
+        await connector._on_posted_event(event)
+        await self._drain(connector)
+
+        connector._ws.deliver_to_channel.assert_called_once_with(event)
+
+    async def test_no_hand_back_when_the_router_declines(self):
+        """A router that creates nothing (no rule matched) leaves the frame dropped —
+        delivering it would mean delivering to nobody."""
+        connector = await self._connector()
+        connector._ws.deliver_to_channel = MagicMock()
+
+        await connector._on_posted_event(self._event())
+        await self._drain(connector)
+
+        connector._ws.deliver_to_channel.assert_not_called()
+
+    async def test_a_failed_offer_leaves_the_channel_offerable_again(self):
+        """The single-flight reservation is released whatever happened — holding it
+        would make one transient failure permanent for that channel."""
+        connector = await self._connector()
+        connector.register_router(AsyncMock(side_effect=RuntimeError("boom")))
+
+        with self.assertLogs("agent-chat-gateway.connectors.mattermost", "ERROR"):
+            await connector._on_posted_event(self._event())
+            await self._drain(connector)
+        self.assertEqual(connector._rooms_being_routed, set())
+
+        # And the next message for the same channel is offered again.
+        connector.register_router(AsyncMock(side_effect=self._record_offer))
+        await connector._on_posted_event(self._event())
+        await self._drain(connector)
+        self.assertEqual(len(self.offered), 1)
 
     async def test_with_no_router_registered_nothing_changes(self):
         """What keeps this branch runnable while creation is still driven by static
@@ -793,6 +899,7 @@ class TestRoutingUntrackedChannels(unittest.IsolatedAsyncioTestCase):
         await connector._on_posted_event(
             self._event(channel_type="D", channel_name="u1__u2",
                         channel_display_name="alice", team_id=""))
+        await self._drain(connector)
 
         room = self.offered[0]
         self.assertEqual(room.kind, RoomKind.DM)
@@ -804,6 +911,7 @@ class TestRoutingUntrackedChannels(unittest.IsolatedAsyncioTestCase):
         await connector._on_posted_event(
             self._event(channel_type="G", channel_name="1b4c4b32",
                         channel_display_name="glin, probe-bot, alice", team_id=""))
+        await self._drain(connector)
 
         room = self.offered[0]
         self.assertEqual(room.kind, RoomKind.GROUP_DM)
@@ -824,6 +932,7 @@ class TestRoutingUntrackedChannels(unittest.IsolatedAsyncioTestCase):
         connector._rest.team_id = "team-1"
         await connector._on_posted_event(
             self._event(channel_type="D", channel_display_name="alice", team_id=""))
+        await self._drain(connector)
         self.assertEqual(len(self.offered), 1)
 
     async def test_a_replayed_event_is_not_offered_and_not_swallowed(self):
@@ -902,9 +1011,12 @@ class TestRoutingUntrackedChannels(unittest.IsolatedAsyncioTestCase):
         connector._ws.register_channel = MagicMock()
         connector.register_handler(AsyncMock(return_value=True))
         offered = []
-        connector.register_router(AsyncMock(side_effect=offered.append))
+        connector.register_router(
+            AsyncMock(side_effect=lambda room, trigger: offered.append(room)))
 
         await connector._on_posted_event(self._event())
+        while connector._routing_tasks:
+            await asyncio.gather(*list(connector._routing_tasks))
 
         self.assertEqual(len(offered), 1)
 
@@ -913,6 +1025,7 @@ class TestRoutingUntrackedChannels(unittest.IsolatedAsyncioTestCase):
         connector.register_router(AsyncMock(side_effect=RuntimeError("boom")))
         with self.assertLogs("agent-chat-gateway.connectors.mattermost", "ERROR"):
             await connector._on_posted_event(self._event())
+            await self._drain(connector)
 
 
 class TestReaping(unittest.IsolatedAsyncioTestCase):

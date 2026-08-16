@@ -21,6 +21,7 @@ docstring for the confirmed payload-shape details behind this design.
 
 from __future__ import annotations
 
+import asyncio
 import collections
 import logging
 import re
@@ -162,6 +163,15 @@ class MattermostConnector(Connector):
         self._capacity_check: CapacityCheck | None = None
         self._router = None
         self._channels: dict[str, _ChannelState] = {}  # channel_id -> state
+        # Channels whose router offer is in flight — the same single-flight rule as
+        # RC's `_rooms_being_routed`, and needed here for a sharper reason: the offer
+        # runs off the handler path (see `_offer_to_router`), so the per-channel
+        # worker's serialization no longer covers the creation, and two back-to-back
+        # messages for one new channel could otherwise both trigger it.
+        self._rooms_being_routed: set[str] = set()
+        # The off-handler routing tasks, tracked so disconnect() can cancel them
+        # rather than leaving offers running against a closed transport.
+        self._routing_tasks: set[asyncio.Task] = set()
         self._attachments_cache_base = (
             Path(config.attachments.cache_dir_global).expanduser() / config.name
         )
@@ -207,6 +217,13 @@ class MattermostConnector(Connector):
 
     async def disconnect(self) -> None:
         """Close the WebSocket and release HTTP client resources."""
+        # Routing offers run off the handler path, so stopping the transport does not
+        # stop them — cancelled here rather than left racing a closed client.
+        for task in list(self._routing_tasks):
+            task.cancel()
+        if self._routing_tasks:
+            await asyncio.gather(*self._routing_tasks, return_exceptions=True)
+        self._routing_tasks.clear()
         await self._ws.stop()
         await self._rest.close()
         logger.info("MattermostConnector disconnected")
@@ -774,7 +791,15 @@ class MattermostConnector(Connector):
 
         Replaces "unknown channel → discard" with "unknown channel → ask". The connector
         supplies a `RoomRef`; deciding whether a watcher should exist for it is the core's
-        business (a rule has to match, §2.2), and creating one is a later increment's.
+        business (a rule has to match, §2.2).
+
+        Called as `router(room, trigger)`, where `trigger` is the decoded event that
+        prompted the offer — the same contract as Rocket.Chat's, and for the same
+        non-hypothetical reason: a creation whose `history_handoff` fetches with no upper
+        bound picks up the trigger, which this connector then hands back as the live
+        prompt, and the agent sees the same message twice. The trigger is passed rather
+        than a timestamp because the creation path decides what it needs from it
+        (`fetch_room_history` takes a `before_ts`; excluding by id is also open to it).
 
         Optional on purpose: with no router registered the connector behaves exactly as
         before, which is what keeps this branch runnable while creation is still driven by
@@ -865,7 +890,15 @@ class MattermostConnector(Connector):
         return team_id == self._rest.team_id
 
     async def _offer_to_router(self, channel_id: str, decoded: dict) -> None:
-        """Hand an untracked channel to the router, if there is one and it is in scope."""
+        """Hand an untracked channel to the router, if there is one and it is in scope.
+
+        The router itself runs **off the handler path**. This method executes on the
+        channel's worker, which holds the connector-wide `_callback_sem` for the whole
+        call (§6.2) — so awaiting a creation here would stall delivery for *every*
+        channel, which is exactly the stall §2.7 step 3 moves creation off the handler
+        to avoid. The gates below are cheap (one cached REST call at most); everything
+        after them is spawned as a task and this method returns, releasing the permit.
+        """
         if self._router is None:
             return
         if not self._in_scope(decoded):
@@ -886,8 +919,8 @@ class MattermostConnector(Connector):
         #
         # The *mention* gate deliberately stays out of here. It is kind-dependent —
         # `require_mention` does not apply to a 1:1 DM but does to a group DM — so §2.7
-        # runs it after classification, and `impl/creation-path` owns that ordering along
-        # with the buffer that replays the triggering message.
+        # runs it after classification, on the tracked path the trigger is handed back
+        # through below.
         sender_id = decoded["post"].get("user_id", "")
         try:
             sender_username = await self._rest.resolve_username(sender_id)
@@ -904,10 +937,53 @@ class MattermostConnector(Connector):
             )
             return
 
+        if channel_id in self._channels:
+            # Tracked now — the resolve above awaited, and a creation finished during
+            # it. Deliver rather than offer: the per-channel callback that would have
+            # taken this frame was registered after it was routed here, so nobody else
+            # is going to deliver it.
+            self._ws.deliver_to_channel(decoded)
+            return
+        if channel_id in self._rooms_being_routed:
+            # An offer for this channel is in flight and a second one would create a
+            # second watcher. This frame is dropped: the watcher does not exist yet, so
+            # there is nothing to deliver it to. The window is the duration of one
+            # creation, and the frames in it are the residue this coalescing costs —
+            # same rule, same honesty, as RC's `_on_unrouted_message`.
+            logger.debug(
+                "Channel %s is being created; dropping a frame that arrived during it",
+                channel_id,
+            )
+            return
+        self._rooms_being_routed.add(channel_id)
+        task = asyncio.create_task(self._route_channel(channel_id, room, decoded))
+        self._routing_tasks.add(task)
+        task.add_done_callback(self._routing_tasks.discard)
+
+    async def _route_channel(self, channel_id: str, room: "RoomRef", decoded: dict) -> None:
+        """Run one router offer to completion, off the handler path.
+
+        Owns the `_rooms_being_routed` reservation it was spawned under: released in
+        `finally`, whatever happened, so a channel whose offer failed is offerable
+        again on its next message — holding the reservation would make one transient
+        failure permanent for that channel.
+        """
         try:
-            await self._router(room)
-        except Exception as e:
-            logger.error("Router failed for channel %s: %s", channel_id, e)
+            try:
+                await self._router(room, decoded)
+            except Exception as e:
+                logger.error("Router failed for channel %s: %s", channel_id, e)
+                return
+            # The message that prompted the creation is delivered now, through the
+            # ordinary path — onto the channel's own queue, so every gate that applies
+            # to a tracked channel's message applies to this one, and so does its
+            # ordering. A brand-new channel has no watermark for a replay to fetch it
+            # from later, so without this the message that caused the watcher to exist
+            # is the one message it never sees.
+            if channel_id in self._channels:
+                self._ws.deliver_to_channel(decoded)
+        finally:
+            self._rooms_being_routed.discard(channel_id)
 
     async def _on_posted_event(
         self,

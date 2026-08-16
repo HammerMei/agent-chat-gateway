@@ -203,6 +203,24 @@ class MattermostWebSocketClient:
 
     async def _dispatch(self, decoded: dict[str, Any]) -> None:
         """Route a decoded posted-event to the per-channel ordering queue."""
+        self.deliver_to_channel(decoded)
+
+    def deliver_to_channel(self, decoded: dict[str, Any]) -> None:
+        """Enqueue a decoded event onto its channel's ordering queue.
+
+        The public form of `_dispatch`, for the creation path (§2.7): the message
+        that triggered a creation is handed back through the channel's own queue
+        once the channel is tracked, so every gate that applies to a tracked
+        channel's message — the mention gate, dedup, the capacity preflight —
+        applies to it, and so does the queue's ordering. The Rocket.Chat
+        transport's `deliver_to_room` is the same contract; one copy of the
+        enqueue rule serves both callers here so the two cannot drift.
+
+        Synchronous on purpose: the enqueue never blocks (`put_nowait`), and a
+        full queue drops the event with a warning — the same audible overflow
+        answer live delivery gives, because a silent drop here would lose the
+        one message the new watcher exists to answer with nothing in the log.
+        """
         channel_id = decoded["post"]["channel_id"]
         queue = self._channel_queues.get(channel_id)
         if queue is None:
