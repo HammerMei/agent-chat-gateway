@@ -2099,6 +2099,59 @@ class TestSystemMessagesOnTheLivePath(unittest.TestCase):
         self.assertTrue(result.accepted)
 
 
+class TestTheMentionGateIsKindAware(unittest.TestCase):
+    """A group DM goes down the mention-required side (§2.7, §6.4).
+
+    `require_mention` skips 1:1 DMs only. Rocket.Chat reports both DM kinds as
+    type `d`, so nothing on the wire distinguishes them — the distinction comes
+    from classification (`_direct_room_identity`), and the creation path types
+    the room `group_dm` from the classified kind. The filter's `!= "dm"` test
+    then puts a group DM on the mention-required side, which is the §6.4
+    failure mode this class pins: a group DM misclassified as a plain DM makes
+    the agent answer every message from anyone in that group.
+    """
+
+    def _config(self):
+        from gateway.connectors.rocketchat.config import RocketChatConfig
+
+        return RocketChatConfig(
+            server_url="https://x", username="bot", password="pw", name="rc",
+            owners=["glin"],
+        )
+
+    def test_a_group_dm_requires_a_mention(self):
+        from gateway.connectors.rocketchat.normalize import filter_rc_message
+
+        result = filter_rc_message(
+            {"_id": "m1", "rid": "gdm1", "msg": "no mention here",
+             "u": {"username": "glin"}, "ts": {"$date": 1}},
+            self._config(), room_type="group_dm", last_processed_ts=None,
+        )
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "bot not mentioned")
+
+    def test_a_group_dm_message_mentioning_the_bot_passes(self):
+        from gateway.connectors.rocketchat.normalize import filter_rc_message
+
+        result = filter_rc_message(
+            {"_id": "m1", "rid": "gdm1", "msg": "@bot hello",
+             "u": {"username": "glin"}, "ts": {"$date": 1},
+             "mentions": [{"username": "bot"}]},
+            self._config(), room_type="group_dm", last_processed_ts=None,
+        )
+        self.assertTrue(result.accepted)
+
+    def test_a_one_to_one_dm_still_bypasses_the_gate(self):
+        from gateway.connectors.rocketchat.normalize import filter_rc_message
+
+        result = filter_rc_message(
+            {"_id": "m1", "rid": "dm1", "msg": "no mention here",
+             "u": {"username": "glin"}, "ts": {"$date": 1}},
+            self._config(), room_type="dm", last_processed_ts=None,
+        )
+        self.assertTrue(result.accepted)
+
+
 class TestSystemMessagesAndTheAgentChain(unittest.TestCase):
     """The side effect of filtering at step 0, stated because nothing else would say it.
 
