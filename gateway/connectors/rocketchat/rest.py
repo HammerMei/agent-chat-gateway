@@ -622,18 +622,18 @@ class RocketChatREST:
         no name and its participants are the only thing that identifies it to a human
         (§2.3).
 
-        Returns an empty list when the lookup fails. That is *no answer*, and the caller
-        treats it as one: it declines to classify the room rather than assuming either kind.
-        There is no safe default to pick. Reading a group as a 1:1 drops the mention gate and
-        the agent answers everyone in it; reading a 1:1 as a group makes it wait for a
-        mention its user has no reason to type, and it looks broken. Both are wrong, so the
-        room simply waits for its next message and the question is asked again.
+        **A failed request raises; only a readable-but-empty answer returns `[]`.**
+        The two used to be one return value, and the routing transaction (§2.2) is why
+        they cannot be: a network failure is *retryable* — the classification was never
+        made, so the message must stay redeliverable (abort) — while a server that
+        answers with no members is a *data condition* the retry cannot change (final).
+        Collapsing them made outcome 3 of the dedup transaction unreachable.
+
+        There is still no safe default kind to guess in either case. Reading a group as
+        a 1:1 drops the mention gate and the agent answers everyone in it; reading a
+        1:1 as a group makes it wait for a mention its user has no reason to type.
         """
-        try:
-            result = await self._request("GET", "im.members", params={"roomId": room_id})
-        except Exception as e:
-            logger.warning("Could not read members of direct room %s: %s", room_id, e)
-            return []
+        result = await self._request("GET", "im.members", params={"roomId": room_id})
         members = result.get("members") or []
         if not isinstance(members, list):
             return []

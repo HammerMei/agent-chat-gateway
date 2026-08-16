@@ -396,6 +396,17 @@ class WatcherManager:
 
         `history_before_ts` bounds a new session's history handoff strictly
         below the triggering message, so the trigger is not delivered twice.
+
+        **None is a final answer; an exception is a retryable one (§2.2).**
+        None means the decision was made and it was "no watcher" — a rule miss
+        and a paused record are completed decisions, and re-asking cannot
+        change them. A creation or recreation that *raises* is the opposite:
+        the decision was never carried out, the message must stay eligible for
+        redelivery, and the caller owns the retry. Collapsing the two shapes
+        into None made the transaction's abort outcome unreachable, which is
+        why this method deliberately does not catch what the start raises.
+        The cap refusal answers None too: it already produced a visible
+        "starting up" notice, and the next message re-asks.
         """
         if connector != self._connector_name:
             # A wiring error, not a routing outcome — each connector's router
@@ -448,16 +459,12 @@ class WatcherManager:
             name=room_description(room),
             type=room.kind.value,
         )
-        try:
-            await self._lifecycle.start_watcher_in_room(
-                wc, record, platform_room, history_before_ts=history_before_ts
-            )
-        except Exception as e:
-            logger.error(
-                "Recreating watcher '%s' for room %s failed: %s",
-                wc.name, record.room_id, e,
-            )
-            return None
+        # A raise propagates: recreation that failed is an abort, not a decision,
+        # and the caller owns the retry (§2.2). The per-room lock releases on the
+        # way out, so the retry can re-enter.
+        await self._lifecycle.start_watcher_in_room(
+            wc, record, platform_room, history_before_ts=history_before_ts
+        )
         record.last_activity_at = _now_iso()
         self._lifecycle.save_state()
         return self._lifecycle.processor_named(wc.name)
@@ -500,15 +507,13 @@ class WatcherManager:
         )
         self._creations_in_flight += 1
         try:
+            # A raise propagates (§2.2): a creation that failed is an abort, and
+            # catching it here would hand the caller the same None a rule miss
+            # produces — a final answer for a non-final condition. The cap slot
+            # and the per-room lock both release on the way out.
             await self._lifecycle.start_watcher_in_room(
                 wc, None, platform_room, history_before_ts=history_before_ts
             )
-        except Exception as e:
-            logger.error(
-                "Creating watcher '%s' for room %s failed: %s",
-                wc.name, room.id, e,
-            )
-            return None
         finally:
             self._creations_in_flight -= 1
 

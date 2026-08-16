@@ -121,18 +121,39 @@ class TestCreation(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(platform_room.id, "g1")
         self.assertEqual(platform_room.name, "alice, bob")
 
-    async def test_a_failed_creation_answers_none_and_is_retryable(self):
+    async def test_a_failed_creation_raises_rather_than_answering_none(self):
+        """Inverted deliberately from 'a failed creation answers None' — a
+        contract upgrade for the transaction (§2.2), not a reasoning reversal.
+        None is a final answer (rule miss, pause); a creation that raised never
+        carried out its decision, so the caller must be able to tell the two
+        apart to retry one and not the other."""
         manager, lifecycle, _ = _manager()
         lifecycle.start_watcher_in_room = AsyncMock(side_effect=RuntimeError("boom"))
 
-        result = await manager.get_or_create("rc", _room())
-        self.assertIsNone(result)
+        with self.assertRaises(RuntimeError):
+            await manager.get_or_create("rc", _room())
         lifecycle.save_state.assert_not_called()
 
-        # The next message tries again — the failure held no reservation.
+        # The raise held no reservation: the lock and the cap slot released, so
+        # the retry re-enters and succeeds.
         lifecycle.start_watcher_in_room = AsyncMock()
         await manager.get_or_create("rc", _room())
         lifecycle.start_watcher_in_room.assert_called_once()
+
+    async def test_a_failed_recreation_raises_too(self):
+        manager, lifecycle, _ = _manager()
+        record = WatcherState(
+            watcher_name="w", session_id="s1", room_id="r1",
+            config={"name": "w", "connector": "rc", "room": "eng-backend",
+                    "agent": "claude"})
+        lifecycle.record_for_room = MagicMock(return_value=record)
+        lifecycle.start_watcher_in_room = AsyncMock(side_effect=RuntimeError("boom"))
+
+        with self.assertRaises(RuntimeError):
+            await manager.get_or_create("rc", _room())
+        # No activity stamp and no save for a recreation that never happened.
+        self.assertEqual(record.last_activity_at, "")
+        lifecycle.save_state.assert_not_called()
 
     async def test_a_wrong_connector_is_refused(self):
         manager, lifecycle, _ = _manager()

@@ -56,6 +56,18 @@ from .websocket import RCWebSocketClient
 logger = logging.getLogger("agent-chat-gateway.connectors.rocketchat")
 
 
+class ClassificationUnavailable(Exception):
+    """A room's kind could not be determined *this time* — retryable (§2.2).
+
+    Raised instead of returning None because the routing transaction needs the
+    two apart: None from `_room_ref_from_access` is a **final** decline (a room
+    with no name, a direct room the server says has no counterpart — conditions
+    a retry cannot change), while this is an **abort** — the classification was
+    never made, so the routing decision was never made, and the message must
+    stay eligible for redelivery rather than being committed as decided.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Per-room runtime state (internal to the connector)
 # ---------------------------------------------------------------------------
@@ -815,7 +827,14 @@ class RocketChatConnector(Connector):
             return
         self._rooms_being_routed.add(room_id)
         try:
-            room = await self._room_ref_from_access(room_id, access)
+            try:
+                room = await self._room_ref_from_access(room_id, access)
+            except ClassificationUnavailable as e:
+                # Retryable in principle (§2.2 outcome 3) — the retry loop is the
+                # transaction increment's; until it lands the frame is dropped
+                # audibly and the room is re-offered by its next message.
+                logger.warning("Not routing room %s this time: %s", room_id, e)
+                return
             if room is None:
                 return
             try:
@@ -869,15 +888,19 @@ class RocketChatConnector(Connector):
         """
         room_type = room_type_for(access.get("roomType"))
         if room_type == "dm":
+            # May raise ClassificationUnavailable — deliberately not caught here:
+            # None from this method means *final* (a retry cannot change the
+            # answer), and a network failure is the opposite of that. The caller
+            # owns the retry (§2.2 outcome 3).
             identity = await self._direct_room_identity(room_id)
             if identity is None:
-                # An unknown classification is not a kind. Answering `dm` here would create
-                # a 1:1 watcher for what may be a group DM, and a room typed `dm` skips the
-                # mention gate entirely (§6.4) — so the agent would answer every message
-                # from everyone in that group. The room is not lost: the next message from
-                # it arrives on the same unrouted path and asks again.
+                # The server answered, and the answer names nobody. An unknown
+                # classification is not a kind: answering `dm` here would create
+                # a 1:1 watcher for what may be a group DM, and a room typed `dm`
+                # skips the mention gate entirely (§6.4) — so the agent would
+                # answer every message from everyone in that group.
                 logger.warning(
-                    "Direct room %s could not be classified — not routing it this time",
+                    "Direct room %s has no counterpart to classify by — not routing it",
                     room_id,
                 )
                 return None
@@ -922,9 +945,22 @@ class RocketChatConnector(Connector):
         if cached is not None:
             return cached
 
-        members = await self._rest.dm_members(room_id)
+        try:
+            members = await self._rest.dm_members(room_id)
+        except Exception as e:
+            # Retryable, and typed so the routing path can tell it from a final
+            # decline (§2.2 outcome 3): the classification was never made, so the
+            # routing decision was never made either, and the message must stay
+            # redeliverable. Not cached, for the same reason.
+            raise ClassificationUnavailable(
+                f"could not read members of direct room {room_id}: {e}"
+            ) from e
         if not members:
-            return None  # unknown, and unknown is not a kind
+            # Final, not retryable: the server answered and the answer names
+            # nobody. A retry cannot invent a counterpart, and there is still no
+            # safe kind to guess — so the room is declined, uncached, and the
+            # next message asks again with fresh data.
+            return None
 
         # `dm_members` has already excluded this account, by id rather than by the
         # spelling of its configured username — so everything here is a counterpart, and

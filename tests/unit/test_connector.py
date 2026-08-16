@@ -2511,18 +2511,42 @@ class TestDirectRoomClassification(unittest.IsolatedAsyncioTestCase):
 
         connector._rest.dm_members.assert_awaited_once()
 
-    async def test_a_failed_lookup_offers_nothing_and_caches_nothing(self):
-        """Unknown is not a kind.
+    async def test_a_memberless_answer_offers_nothing_and_caches_nothing(self):
+        """Unknown is not a kind — and this one is *final* (§2.2): the server
+        answered and named nobody, so a retry cannot change it.
 
-        Answering `dm` on a failed lookup would let a group DM be claimed by a `direct: true`
-        rule and skip the mention gate with it — the agent then answers everyone in the
-        group. Nothing is lost by declining: the room's next message asks again, which is
-        also why the failure must not be cached.
+        Answering `dm` would let a group DM be claimed by a `direct: true` rule and
+        skip the mention gate with it — the agent then answers everyone in the
+        group. The next message asks again with fresh data, which is also why the
+        decline is not cached.
         """
         connector = self._connector(members=())
         await self._deliver(connector)
         self.assertEqual(self.offered, [], "an unclassifiable room must not be offered")
         self.assertEqual(connector._dm_kinds, {})
+
+    async def test_a_lookup_failure_is_retryable_not_final(self):
+        """The other half of the split (§2.2 outcome 3): a network failure means
+        the classification was never made. The frame is dropped audibly, nothing
+        is cached, the single-flight reservation is released — and the raise
+        never escapes to the routing worker as an anonymous callback failure."""
+        connector = self._connector()
+        connector._rest.dm_members = AsyncMock(side_effect=RuntimeError("api down"))
+
+        with self.assertLogs(
+            "agent-chat-gateway.connectors.rocketchat", "WARNING"
+        ) as logs:
+            await self._deliver(connector)
+
+        self.assertEqual(self.offered, [])
+        self.assertEqual(connector._dm_kinds, {})
+        self.assertEqual(connector._rooms_being_routed, set())
+        self.assertTrue(any("Not routing room" in line for line in logs.output))
+
+        # And the room recovers on its next message.
+        connector._rest.dm_members = AsyncMock(return_value=["alice"])
+        await self._deliver(connector)
+        self.assertEqual(len(self.offered), 1)
 
     async def test_a_lookup_that_recovers_offers_the_room_it_declined(self):
         """The decline is for this message only — the retry is the whole reason it is safe."""

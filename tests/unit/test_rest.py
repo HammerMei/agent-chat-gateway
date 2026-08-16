@@ -1621,6 +1621,24 @@ class TestDmMembersExcludesThisAccountById(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(await rest.dm_members("r1"), ["alice", "carol"])
 
+    async def test_a_failed_request_raises_instead_of_answering_empty(self):
+        """A network failure and a memberless answer used to be one return
+        value, which made the routing transaction's abort outcome (§2.2)
+        unreachable: retryable and final must arrive as different shapes."""
+        rest = _make_rest()
+        rest.user_id = "BOT_ID"
+        rest._request = AsyncMock(side_effect=RuntimeError("api down"))
+
+        with self.assertRaises(RuntimeError):
+            await rest.dm_members("r1")
+
+    async def test_a_malformed_members_payload_is_still_an_empty_final_answer(self):
+        rest = _make_rest()
+        rest.user_id = "BOT_ID"
+        rest._request = AsyncMock(return_value={"success": True, "members": "what"})
+
+        self.assertEqual(await rest.dm_members("r1"), [])
+
 
 class TestHistoryBoundsAreSentInTheFormatTheServerParses(unittest.IsolatedAsyncioTestCase):
     """`oldest`/`latest` reach `new Date(...)` on the server, which rejects epoch digits.
