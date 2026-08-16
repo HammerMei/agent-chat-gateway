@@ -1949,39 +1949,74 @@ class TestASuccessorInstalledDuringTheReleaseIsNotClobbered(
         self.assertEqual(client._subscriptions["r1"], sub_id)
 
 
-class TestAReconnectForgetsTheDeadSocketsSubscriptions(unittest.IsolatedAsyncioTestCase):
-    """A subscription id cannot outlive the socket that issued it.
+class TestARecoveryReleasesBeforeItForgets(unittest.IsolatedAsyncioTestCase):
+    """The map is cleared so the resubscribe finds no `superseded` id — but *released*
+    first, because this recovery cannot tell which case it is in.
 
-    Left in the map, every room enters the supersede-and-release branch on every
-    reconnect — sending an `unsub` on the new socket for an id it never knew, and opening
-    the await window between release and install each time, for a release with nothing to
-    release.
+    An earlier version popped the map outright, justified by "a reconnect's ids died with
+    the socket, and a stream fallback has none". The second half was false: a
+    `subscribe_room` can land while a recovery runs, and a migration cancelled partway
+    leaves ids behind. Dropping those without an `unsub` left them live on the server and
+    untracked — unreachable even by `unsubscribe_room`.
     """
 
-    async def test_the_recovery_clears_ids_from_the_previous_socket(self):
+    def _client(self, subs: dict):
         from gateway.connectors.rocketchat.websocket import SubscriptionState
 
         client = _make_client()
-        cb = AsyncMock()
-        client._callbacks = {"r1": cb}
-        client._subscriptions = {"r1": "dead-sub"}
+        client._callbacks = {r: AsyncMock() for r in subs}
+        client._subscriptions = dict(subs)
         client._subscription_states = {
-            "r1": SubscriptionState(room_id="r1", callback=cb, sub_id="dead-sub")
+            r: SubscriptionState(room_id=r, callback=AsyncMock(), sub_id=sid)
+            for r, sid in subs.items()
         }
         client._subscribe_rooms_individually = AsyncMock()
+        return client
+
+    async def test_the_id_is_released_and_then_cleared(self):
+        client = self._client({"r1": "old-sub"})
         sent: list[dict] = []
-        client._send = lambda p: sent.append(p)
+
+        async def _send(payload):
+            sent.append(payload)
+
+        client._send = _send
 
         await client._recover("Reconnect", try_stream=False)
 
-        self.assertNotIn(
-            "r1", client._subscriptions,
-            "the id belonged to a socket that is gone",
-        )
-        self.assertIsNone(client._subscription_states["r1"].sub_id)
         self.assertEqual(
-            [f for f in sent if f.get("msg") == "unsub"], [],
-            "and no unsub is sent on the new socket for an id it never knew",
+            [f["id"] for f in sent if f.get("msg") == "unsub"], ["old-sub"],
+            "on a live socket this is the only thing that can ever release it; on a new "
+            "one the server ignores an id it never knew",
+        )
+        self.assertNotIn("r1", client._subscriptions)
+        self.assertIsNone(client._subscription_states["r1"].sub_id)
+
+    async def test_a_subscription_installed_during_the_release_survives(self):
+        """The leak this replaced: `subscribe_room` landing inside one of those awaits
+        installs an id this recovery never released."""
+        client = self._client({"r1": "old-1", "r2": "old-2"})
+
+        async def _send(payload):
+            if payload.get("id") == "old-1":
+                # A watcher is added for r3 while r1 is being released.
+                client._subscriptions["r3"] = "fresh-3"
+                client._callbacks["r3"] = AsyncMock()
+                client._subscription_states["r3"] = (
+                    client._subscription_states["r1"].__class__(
+                        room_id="r3", callback=AsyncMock(), sub_id="fresh-3"))
+
+        client._send = _send
+
+        await client._recover("Reconnect", try_stream=False)
+
+        self.assertEqual(
+            client._subscriptions.get("r3"), "fresh-3",
+            "nothing else names this subscription — dropping it strands it on the server",
+        )
+        self.assertEqual(
+            client._subscription_states["r3"].sub_id, "fresh-3",
+            "and the state must keep naming it too",
         )
 
 

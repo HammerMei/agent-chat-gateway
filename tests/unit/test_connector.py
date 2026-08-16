@@ -4391,3 +4391,98 @@ class TestEveryWayOfNotDeliveringGivesTheTurnBack(unittest.IsolatedAsyncioTestCa
             "the first message to actually be delivered after the overload must still "
             "have budget to be delivered with",
         )
+
+
+class TestACancelledDeliveryIsNotAVerdict(unittest.IsolatedAsyncioTestCase):
+    """A recovery cancelling the one it displaces is ordinary here, and cancellation says
+    nothing about the message.
+
+    The id is registered before the first await on purpose, so a live copy racing a replay
+    cannot both dispatch. Left registered after an interruption it does something else:
+    the *next* replay skips the message at the dedup check, counts the skip as handled,
+    and closes the outage window over a message nobody ever saw. `CancelledError` is a
+    `BaseException`, so the `except Exception` arms never covered it.
+    """
+
+    def _connector(self):
+        from gateway.connectors.rocketchat.agent_chain import TurnStore
+        from gateway.connectors.rocketchat.config import AgentChainConfig
+
+        connector = _make_connector()
+        connector._config = _make_config(
+            filter_sender=False,
+            agent_chain=AgentChainConfig(agent_usernames=["peer"], max_turns=3),
+        )
+        connector._config.require_mention = False
+        connector._turn_store = TurnStore()
+        connector._rooms["room-1"].room.type = "dm"
+        connector._rest.user_id = "BOT_ID"
+        connector._handler = AsyncMock(return_value=True)
+        return connector
+
+    def _doc(self):
+        return {"_id": "m1", "msg": "hi", "u": {"username": "peer", "_id": "U_PEER"},
+                "rid": "room-1", "ts": {"$date": 500}}
+
+    async def test_a_cancelled_normalize_leaves_the_message_replayable(self):
+        connector = self._connector()
+        sub = connector._rooms["room-1"]
+
+        with patch("gateway.connectors.rocketchat.connector.normalize_rc_message",
+                   side_effect=asyncio.CancelledError):
+            with self.assertRaises(asyncio.CancelledError):
+                await connector._on_raw_ddp_message("room-1", self._doc())
+
+        self.assertNotIn(
+            "m1", sub.seen_ids_set,
+            "a remembered id makes the next replay skip it and then close the window",
+        )
+
+    async def test_a_cancelled_handler_leaves_the_message_replayable(self):
+        connector = self._connector()
+        sub = connector._rooms["room-1"]
+        connector._handler = AsyncMock(side_effect=asyncio.CancelledError)
+
+        with self.assertRaises(asyncio.CancelledError):
+            await connector._on_raw_ddp_message("room-1", self._doc())
+
+        self.assertNotIn("m1", sub.seen_ids_set)
+
+    async def test_a_cancelled_delivery_gives_its_turn_back(self):
+        connector = self._connector()
+        connector._handler = AsyncMock(side_effect=asyncio.CancelledError)
+
+        with self.assertRaises(asyncio.CancelledError):
+            await connector._on_raw_ddp_message("room-1", self._doc())
+
+        self.assertEqual(
+            connector._turn_store.current_turns("room-1", None, "peer"), 0,
+            "the message was never delivered, so it took no turn",
+        )
+
+    async def test_the_next_replay_can_then_actually_deliver_it(self):
+        """End to end, because the loss is only visible one replay later: the point of
+        forgetting the id is that the retry reaches the handler."""
+        connector = self._connector()
+        with patch("gateway.connectors.rocketchat.connector.normalize_rc_message",
+                   side_effect=asyncio.CancelledError):
+            with self.assertRaises(asyncio.CancelledError):
+                await connector._on_raw_ddp_message("room-1", self._doc())
+
+        accepted = await connector._on_raw_ddp_message(
+            "room-1", self._doc(), is_replay=True, replay_after_ts="1")
+
+        self.assertTrue(accepted)
+        self.assertEqual(connector._handler.await_count, 1)
+
+    async def test_a_message_that_failed_normalization_is_still_not_retried(self):
+        """The near miss: the poison-pill rule is deliberate and must survive this change.
+        An ordinary exception is a verdict on the message; cancellation is not."""
+        connector = self._connector()
+        sub = connector._rooms["room-1"]
+
+        with patch("gateway.connectors.rocketchat.connector.normalize_rc_message",
+                   side_effect=RuntimeError("malformed")):
+            await connector._on_raw_ddp_message("room-1", self._doc())
+
+        self.assertIn("m1", sub.seen_ids_set)
