@@ -706,6 +706,24 @@ class RocketChatREST:
             return None
         return bool(result.get("subscription"))
 
+    async def get_subscription_room_ids(self) -> set[str]:
+        """Every room id this account holds a subscription record for.
+
+        `subscriptions.get` without `updatedSince` returns the full set in
+        `update` (verified in the handler: `getSubscriptions(userId)` with no
+        date returns an array, wrapped as `{update: result, remove: []}`).
+        Hidden rooms are included — a hidden room keeps its record and is
+        still membership, same rule as `is_room_member`. Raises on failure;
+        the caller owns the tri-state (a set that could not be read is
+        unknown, never empty).
+        """
+        result = await self._request("GET", "subscriptions.get")
+        return {
+            sub["rid"]
+            for sub in result.get("update", [])
+            if isinstance(sub, dict) and sub.get("rid")
+        }
+
     async def resolve_room(self, room_name: str) -> dict[str, Any]:
         """Resolve a room name to its info dict.
 

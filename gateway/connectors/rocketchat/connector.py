@@ -915,6 +915,19 @@ class RocketChatConnector(Connector):
         kind = RoomKind.GROUP if t == "p" else RoomKind.CHANNEL
         return RoomRef(id=rid, kind=kind, name=name)
 
+    async def membership_snapshot(self) -> set[str] | None:
+        """See `Connector.membership_snapshot`. Read from the subscription
+        records, same source of truth as `is_room_member` — hidden rooms are
+        included, because hidden is a display choice, not a departure."""
+        try:
+            return await self._rest.get_subscription_room_ids()
+        except Exception as e:
+            logger.warning(
+                "Could not read the subscription set — membership is unknown "
+                "this pass: %s", e,
+            )
+            return None
+
     async def _on_unrouted_message(self, doc: dict, access: dict | None = None) -> None:
         """A message for a room this connector has no watcher for (§2.2).
 

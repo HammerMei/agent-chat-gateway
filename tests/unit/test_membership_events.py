@@ -349,6 +349,107 @@ class TestTheMembershipHandlers(unittest.IsolatedAsyncioTestCase):
         static._connector.register_membership_hook.assert_not_called()
 
 
+class TestTheMembershipReconciliation(unittest.IsolatedAsyncioTestCase):
+    """The backstop (§2.7): dormant records — paused or idle — receive no
+    inbound and no timer reclamation, so a missed removal event leaves them
+    alive forever. A slow tick probes the platform and reclaims the ones
+    whose membership is unambiguously gone. Fail means keep."""
+
+    def _mgr(self, records, *, snapshot, cancelled=None):
+        mgr = _bare_manager_with_membership(
+            _cancel_jobs=cancelled.append if cancelled is not None else None)
+        mgr._lifecycle.states = MagicMock(
+            return_value={r.watcher_name: r for r in records})
+        mgr._connector.supports_unsolicited_inbound = True
+        mgr._connector.membership_snapshot = AsyncMock(return_value=snapshot)
+        reclaimed = []
+
+        async def reclaim(room_id, *, reason):
+            reclaimed.append((room_id, reason))
+            return f"w-{room_id}"
+
+        mgr._lifecycle.reclaim_room = AsyncMock(side_effect=reclaim)
+        mgr.reclaimed = reclaimed
+        return mgr
+
+    async def test_a_dormant_record_missing_from_the_snapshot_is_reclaimed(self):
+        idle = make_rule_derived_record(name="idle", room_id="gone",
+                                        dropped_at="2026-08-01T00:00:00+00:00")
+        paused = make_rule_derived_record(name="paused", room_id="also-gone",
+                                          paused=True)
+        kept = make_rule_derived_record(name="kept", room_id="still-here",
+                                        dropped_at="2026-08-01T00:00:00+00:00")
+        cancelled = []
+        mgr = self._mgr([idle, paused, kept], snapshot={"still-here"},
+                        cancelled=cancelled)
+
+        await mgr._reconcile_membership()
+
+        self.assertEqual(sorted(r for r, _ in mgr.reclaimed),
+                         ["also-gone", "gone"])
+        self.assertEqual(sorted(cancelled), ["w-also-gone", "w-gone"])
+        for _, reason in mgr.reclaimed:
+            self.assertIn("reconciliation", reason)
+
+    async def test_an_unanswered_snapshot_keeps_everything(self):
+        """None is 'could not answer', and an unanswered probe must never
+        reclaim: an empty set is a claim, None is the absence of one."""
+        idle = make_rule_derived_record(name="idle", room_id="gone",
+                                        dropped_at="2026-08-01T00:00:00+00:00")
+        mgr = self._mgr([idle], snapshot=None)
+
+        await mgr._reconcile_membership()
+
+        self.assertEqual(mgr.reclaimed, [])
+
+    async def test_active_and_static_records_are_not_probed(self):
+        active = make_rule_derived_record(name="active", room_id="a1")
+        static = make_rule_derived_record(name="static", room_id="s1",
+                                          dropped_at="2026-08-01T00:00:00+00:00",
+                                          config={})
+        mgr = self._mgr([active, static], snapshot=set())
+
+        await mgr._reconcile_membership()
+
+        self.assertEqual(mgr.reclaimed, [])
+        mgr._connector.membership_snapshot.assert_not_awaited()
+
+    async def test_a_connector_without_unsolicited_inbound_is_skipped(self):
+        idle = make_rule_derived_record(name="idle", room_id="gone",
+                                        dropped_at="2026-08-01T00:00:00+00:00")
+        mgr = self._mgr([idle], snapshot=set())
+        mgr._connector.supports_unsolicited_inbound = False
+
+        await mgr._reconcile_membership()
+
+        mgr._connector.membership_snapshot.assert_not_awaited()
+        self.assertEqual(mgr.reclaimed, [])
+
+    async def test_the_sweep_runs_it_on_its_own_slower_cadence(self):
+        from gateway.core.lifecycle_sweep import LifecycleSweep
+
+        reconcile = AsyncMock()
+        sweep = LifecycleSweep(MagicMock(), reconcile=reconcile,
+                               reconcile_every=3)
+
+        for _ in range(7):
+            await sweep._after_pass()
+
+        self.assertEqual(reconcile.await_count, 2, "passes 3 and 6")
+
+    async def test_a_failed_reconciliation_does_not_kill_the_cadence(self):
+        from gateway.core.lifecycle_sweep import LifecycleSweep
+
+        reconcile = AsyncMock(side_effect=RuntimeError("snapshot exploded"))
+        sweep = LifecycleSweep(MagicMock(), reconcile=reconcile,
+                               reconcile_every=1)
+
+        await sweep._after_pass()  # must not raise
+        await sweep._after_pass()
+
+        self.assertEqual(reconcile.await_count, 2)
+
+
 # ── The connector halves, twins side by side (§2.7) ─────────────────────────
 #
 # Cross-connector parity is this repo's recurring defect shape, so the RC and

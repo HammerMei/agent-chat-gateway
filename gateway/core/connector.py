@@ -307,6 +307,20 @@ class Connector(ABC):
         room, which is not something to tell the room's members about.
         """
 
+    async def membership_snapshot(self) -> set[str] | None:
+        """Room ids this account is currently a member of, or None for unknown.
+
+        The periodic membership reconciliation's probe (§2.7): a dormant
+        record whose room id is absent from an answered snapshot has
+        unambiguously lost its membership and is reclaimed. **None means the
+        question could not be answered** — unsupported on this connector, or
+        the lookup failed — and the caller must keep everything: an empty set
+        is a claim ("member of nothing"), and a connector that cannot answer
+        must never make it. The base returns None, so a connector without a
+        membership stream needs no carve-out here either.
+        """
+        return None
+
     def register_membership_hook(self, hook: "MembershipHook") -> None:
         """Register the callbacks for the bot's own membership events (§2.7).
 

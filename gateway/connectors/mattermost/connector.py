@@ -961,6 +961,20 @@ class MattermostConnector(Connector):
             return
         await self._membership_hook.added(room)
 
+    async def membership_snapshot(self) -> set[str] | None:
+        """See `Connector.membership_snapshot`. The full-membership listing is
+        the one probe that is unambiguous with the bot's own token (§6.2) —
+        the per-channel member lookup 403s for a non-member, which a
+        permissions problem also does."""
+        try:
+            return await self._rest.get_member_channel_ids()
+        except Exception as e:
+            logger.warning(
+                "Could not read the channel-membership set — membership is "
+                "unknown this pass: %s", e,
+            )
+            return None
+
     def reap_room(self, room_id: str) -> None:
         """Forget a channel's local state without touching watcher bookkeeping.
 

@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -49,6 +49,11 @@ logger = logging.getLogger("agent-chat-gateway.core.lifecycle_sweep")
 # TTLs are whole days, so hourly resolution is two orders of magnitude finer
 # than anything it measures.
 _SWEEP_INTERVAL_SECONDS = 3600.0
+
+# The membership reconciliation (§2.7) rides every Nth pass — a correctness
+# backstop for a missed removal event, not a primary path, so daily at the
+# hourly sweep. It costs one REST snapshot per pass it runs in.
+_RECONCILE_EVERY_PASSES = 24
 
 
 def _local_now() -> datetime:
@@ -72,6 +77,8 @@ class LifecycleSweep:
         now: Callable[[], datetime] | None = None,
         interval_seconds: float = _SWEEP_INTERVAL_SECONDS,
         pending_jobs: Callable[[str], bool] | None = None,
+        reconcile: Callable[[], Awaitable[None]] | None = None,
+        reconcile_every: int = _RECONCILE_EVERY_PASSES,
     ) -> None:
         self._lifecycle = lifecycle
         self._now = now or _local_now
@@ -81,6 +88,13 @@ class LifecycleSweep:
         # scheduler, not the lifecycle. None means no scheduler: nothing to
         # exempt.
         self._pending_jobs = pending_jobs
+        # The membership reconciliation (§2.7), injected because it needs the
+        # connector and the removal path, which live with the SessionManager.
+        # Rides this loop rather than owning one so it inherits the
+        # after-replay start ordering, on the slower cadence below.
+        self._reconcile = reconcile
+        self._reconcile_every = max(1, reconcile_every)
+        self._passes = 0
         self._task: asyncio.Task | None = None
 
     async def run_once(self) -> list[str]:
@@ -164,3 +178,21 @@ class LifecycleSweep:
                 # rooms forever.
                 logger.exception("Lifecycle sweep pass failed; next pass in %.0fs",
                                  self._interval)
+            await self._after_pass()
+
+    async def _after_pass(self) -> None:
+        """Advance the pass counter and run the reconciliation on its cadence.
+
+        Separated from `_loop` so tests can drive the divider without a
+        free-running loop — the same reason `run_once` exists.
+        """
+        self._passes += 1
+        if self._reconcile is None or self._passes % self._reconcile_every:
+            return
+        try:
+            await self._reconcile()
+        except Exception:
+            # Same rule as the sweep's own pass: the backstop must outlive
+            # one bad round.
+            logger.exception("Membership reconciliation failed; next round "
+                             "in %d pass(es)", self._reconcile_every)

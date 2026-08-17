@@ -103,7 +103,8 @@ class SessionManager:
         # deployment's lifecycle is config.yaml's, and its records carry no
         # frozen rule for the sweep to read anyway (§2.5).
         self._sweep = (
-            LifecycleSweep(self._lifecycle, pending_jobs=pending_jobs)
+            LifecycleSweep(self._lifecycle, pending_jobs=pending_jobs,
+                           reconcile=self._reconcile_membership)
             if self._watcher_manager is not None
             else None
         )
@@ -435,14 +436,23 @@ class SessionManager:
         """
         if self._watcher_manager is None or self._watcher_manager.disarmed:
             return
+        await self._reclaim_removed_room(
+            room_id,
+            reason="the platform reported the bot removed from the room",
+        )
+
+    async def _reclaim_removed_room(self, room_id: str, *, reason: str) -> None:
+        """The removal path's shared tail: reclaim the record, cancel its jobs.
+
+        Two discoverers, one end state (§2.7): the live membership event and
+        the periodic reconciliation both land here, so a removal discovered
+        late cannot reach a different outcome than one seen live.
+        """
         try:
-            name = await self._lifecycle.reclaim_room(
-                room_id,
-                reason="the platform reported the bot removed from the room",
-            )
+            name = await self._lifecycle.reclaim_room(room_id, reason=reason)
         except Exception:
             logger.exception(
-                "Membership-remove handling failed for room %s — the "
+                "Membership-removal reclaim failed for room %s — the "
                 "reconciliation re-discovers it", room_id,
             )
             return
@@ -454,6 +464,51 @@ class SessionManager:
                     "Could not cancel scheduled jobs for reclaimed watcher "
                     "'%s' — they will fail audibly when they fire", name,
                 )
+
+    async def _reconcile_membership(self) -> None:
+        """The periodic membership reconciliation (§2.7): the backstop for a
+        missed removal event, for exactly the records nothing else can reach.
+
+        "Discovered later as a REST failure" needs a future operation to touch
+        the room, and a **dormant** record — paused or idle — has no timer
+        reclamation and receives no inbound, so nothing ever touches it: a
+        missed remove leaves its session, prompt file, attachment directory
+        and jobs alive indefinitely, and `resume` keeps offering a room the
+        bot cannot access (R3 by another route). Active records are excluded
+        because the live paths do reach them; static records because their
+        owner is config.yaml.
+
+        Keyed on the connector declaring unsolicited inbound, not on a
+        platform: Rocket.Chat's reconnect replay covers message history, not
+        membership, so it has the same hole for a paused room. **Fail means
+        keep**: a snapshot that could not be read (None) reclaims nothing —
+        only an answered snapshot that unambiguously omits the room does.
+        """
+        if self._watcher_manager is None or self._watcher_manager.disarmed:
+            return
+        if not self._connector.supports_unsolicited_inbound:
+            return
+        dormant = [
+            r for r in self._lifecycle.states().values()
+            if (r.paused or r.dropped_at) and r.config and r.room_id
+        ]
+        if not dormant:
+            return
+        snapshot = await self._connector.membership_snapshot()
+        if snapshot is None:
+            logger.info(
+                "Membership snapshot unavailable — reconciliation kept all "
+                "%d dormant record(s) this round", len(dormant),
+            )
+            return
+        for record in dormant:
+            if record.room_id in snapshot:
+                continue
+            await self._reclaim_removed_room(
+                record.room_id,
+                reason="the membership reconciliation found the bot is no "
+                       "longer in the room (a removal event was missed)",
+            )
 
     async def shutdown(self) -> None:
         """Stop all processors, save state, disconnect connector.
