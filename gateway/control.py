@@ -17,7 +17,9 @@ import logging
 from typing import TYPE_CHECKING
 
 from . import runtime_lock
+from .core.connector import Room
 from .core.tz_utils import local_iana_timezone as _server_local_timezone
+from .core.watcher_manager import config_from_record
 from .runtime_lock import RUNTIME_DIR
 
 if TYPE_CHECKING:
@@ -303,13 +305,8 @@ class ControlServer:
         """
         if not watcher_name:
             return {"ok": False, "error": "Missing 'watcher_name'"}
-        for entry in self._entries:
-            if entry.session_manager.get_watcher_config(watcher_name) is not None:
-                return entry
-        # A rule-derived watcher has no config entry — its persisted record
-        # answers for it (§2.8). Checked second so the static path keeps
-        # winning while both exist; names cannot collide across the two, since
-        # rule-derived names embed the connector and a room label or digest.
+        # The persisted record is the only watcher identity left (§2.8) —
+        # the config lookup died with the static shape.
         for entry in self._entries:
             if entry.session_manager.get_watcher_state(watcher_name) is not None:
                 return entry
@@ -586,9 +583,12 @@ class ControlServer:
                 ),
             }
 
-        wc = entry.session_manager.get_watcher_config(watcher_name)
+        state = entry.session_manager.get_watcher_state(watcher_name)
+        if state is None or not state.room_id:
+            return {"ok": False, "error": f"No watcher record found for '{watcher_name}'"}
+        wc = config_from_record(state)
         if wc is None:
-            return {"ok": False, "error": f"Watcher config not found for '{watcher_name}'"}
+            return {"ok": False, "error": f"Watcher record for '{watcher_name}' carries no config"}
 
         # Validate and parse count.
         raw_count = request.get("count", 50)
@@ -660,7 +660,13 @@ class ControlServer:
                 pass  # mixed tz-aware/naive: skip comparison, connector will handle
 
         try:
-            room = await entry.connector.resolve_room(wc.room)
+            # By id, never by name (§2.8): the record's `room` is a
+            # description — a group DM's description resolves to nothing.
+            room = Room(
+                id=state.room_id,
+                name=state.room_name or watcher_name,
+                type=state.room_kind or state.room_type or "channel",
+            )
             # Converted here, at the one boundary where a human types a
             # timestamp: connector bounds are epoch milliseconds like every
             # other timestamp inside ACG (§5.2). Both values are already

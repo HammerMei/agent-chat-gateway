@@ -16,7 +16,7 @@ import secrets
 from datetime import UTC, datetime
 
 from ..agents import AgentBackend
-from .config import CoreConfig, WatcherConfig
+from .config import CoreConfig
 from .connector import (
     Connector,
     IncomingMessage,
@@ -48,7 +48,7 @@ class SessionManager:
     Usage::
 
         manager = SessionManager(connector, agents, "assistance", core_config,
-                                 watcher_configs=watchers)
+                                 watcher_rules=rules)
         await manager.run()   # blocks until cancelled
     """
 
@@ -59,7 +59,6 @@ class SessionManager:
         default_agent: str,
         config: CoreConfig,
         state_name: str = "default",
-        watcher_configs: list[WatcherConfig] | None = None,
         permission_registry: PermissionRegistry | None = None,
         session_maps: SessionMaps | None = None,
         watcher_rules: list | None = None,
@@ -82,7 +81,6 @@ class SessionManager:
             agents=agents,
             default_agent=default_agent,
             config=config,
-            watcher_configs=watcher_configs or [],
             state_store=self._state_store,
             dispatcher=self._dispatcher,
             injector=self._injector,
@@ -172,10 +170,15 @@ class SessionManager:
         """
         self._connector.register_handler(self._dispatcher.dispatch)
         self._connector.register_capacity_check(self._dispatcher.capacity)
-        if self._watcher_manager is not None:
-            # Before start_inbound(), necessarily: Rocket.Chat's start_inbound
-            # attempts subscribe-all only when a router is already registered,
-            # so a router registered later would never receive an offer.
+        if (self._watcher_manager is not None
+                and self._connector.supports_unsolicited_inbound()):
+            # The discovery hooks belong to discovering connectors only:
+            # Script and Voice have no stream to offer a room from — their
+            # rooms start eagerly (§2.6) — and neither implements
+            # register_router. Before start_inbound(), necessarily:
+            # Rocket.Chat's start_inbound attempts subscribe-all only when a
+            # router is already registered, so a router registered later
+            # would never receive an offer.
             self._connector.register_router(self._route_unclaimed_room)
             # Alongside the router, and gated the same way: membership events
             # exist to serve the rule-derived lifecycle, and a static-only
@@ -641,13 +644,10 @@ class SessionManager:
         """
         return self._lifecycle.get_processor(name)
 
-    def get_watcher_config(self, name: str):
-        """Return the WatcherConfig for a watcher name, or None if not found."""
-        return self._lifecycle.get_watcher_config(name)
-
     def get_all_watcher_names(self) -> list[str]:
-        """Return all configured watcher names for this connector."""
-        return [wc.name for wc in self._lifecycle._watcher_configs]
+        """Every persisted watcher name for this connector — records are the
+        only watcher identity left (§2.8)."""
+        return sorted(self._lifecycle.states().keys())
 
     async def pause_watcher(self, name: str) -> None:
         await self._lifecycle.pause_watcher(name)
@@ -737,7 +737,6 @@ class SessionManager:
 
         # Build a minimal Room from persisted state (room_id + room_type)
         state = self._lifecycle.get_watcher_state(watcher_name)
-        wc = self._lifecycle.get_watcher_config(watcher_name)
         if state is None:
             logger.warning(
                 "inject_message: no persisted state for watcher %r — "
@@ -747,7 +746,8 @@ class SessionManager:
                 watcher_name,
             )
         room_id = state.room_id if state else ""
-        room_name = wc.room if wc else watcher_name
+        room_name = (state.room_name if state and state.room_name
+                     else watcher_name)
         room_type = state.room_type if state else "channel"
 
         msg = IncomingMessage(

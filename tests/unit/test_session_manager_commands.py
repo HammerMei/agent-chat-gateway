@@ -466,7 +466,6 @@ def _make_manager_sm(connector, agent, watcher_configs=None):
         {"default": agent},
         "default",
         config,
-        watcher_configs=watcher_configs or [],
     )
 
 

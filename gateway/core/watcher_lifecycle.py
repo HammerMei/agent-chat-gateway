@@ -85,7 +85,6 @@ class WatcherLifecycle:
         agents: dict[str, AgentBackend],
         default_agent: str,
         config: CoreConfig,
-        watcher_configs: list[WatcherConfig],
         state_store: StateStore,
         dispatcher: MessageDispatcher,
         injector: InjectedContextBuilder,
@@ -96,7 +95,6 @@ class WatcherLifecycle:
         self._agents = agents
         self._default_agent = default_agent
         self._config = config
-        self._watcher_configs = watcher_configs
         self._state_store = state_store
         self._dispatcher = dispatcher
         self._injector = injector
@@ -108,7 +106,7 @@ class WatcherLifecycle:
         self._processors: dict[str, MessageProcessor] = {}
         self._states: dict[str, WatcherState] = {}
         # Per-watcher mutex: prevents concurrent pause/resume/reset commands for
-        # the same watcher from racing through _stop_processor / _start_watcher.
+        # the same watcher from racing through _stop_processor / the start.
         # The control socket can serve multiple simultaneous clients, so two
         # commands targeting the same watcher could otherwise interleave and
         # corrupt _processors / _states.
@@ -119,94 +117,43 @@ class WatcherLifecycle:
     async def sync_watchers(
         self, unavailable_agents: set[str] | None = None
     ) -> list[str]:
-        """Start processors for all active (non-paused) watchers defined in config.
+        """Hydrate the persisted records and settle agent availability at boot.
 
-        Args:
-            unavailable_agents: Optional set of agent names that are unavailable
-                (backend failed to start, or permission broker failed to start).
-                Any watcher whose resolved agent is in this set is skipped rather
-                than started without broker enforcement — starting without a broker
-                would silently bypass tool-call permission checks.
+        The static start loop that used to live here died at cutover: nothing
+        produces a static `WatcherConfig` any more, so every watcher's
+        recreation source is its persisted record (rule-derived, §2.4) or the
+        eager-start loop for connectors with no inbound stream (§2.6). What
+        remains is what boot still owes:
 
-        Returns:
-            List of human-readable error strings for any watchers that failed.
+        * **Agent availability.** Recorded only when the caller explicitly
+          provides it — None means "no information", not "all available",
+          or a second call would silently disarm the fail-closed
+          `_ensure_agent_available` guard in resume/reset.
+        * **Hydration.** Rule-derived records are loaded into memory so
+          `record_for_room` answers from boot — idle, until a message, the
+          replay or the eager loop recreates them.
+        * **The prune.** A record with no `rule_name` is the static model's,
+          and the static model has no owner left: config.yaml cannot name it
+          and no rule will recreate it. Pruned, with a log line each —
+          per the clean-break migration ruling, and warned about ahead of
+          time by `acg config validate`'s orphan check.
+
+        Returns the startup error list (now fed only by the eager-start loop,
+        which appends to it in `SessionManager.sync_only`).
         """
         errors: list[str] = []
         persisted = self._state_store.load()
-        blocked_agents = unavailable_agents or set()
-        # Only update _blocked_agents when the caller explicitly provides the
-        # set of unavailable agents.  Passing None (the default) means "no
-        # information about agent availability" — NOT "all agents are available".
-        # Unconditionally overwriting with an empty set when None is passed would
-        # silently disarm the fail-closed _ensure_agent_available guard in
-        # resume_watcher / reset_watcher, allowing watchers to start without
-        # their permission brokers if sync_watchers is ever called a second time
-        # without an availability check (e.g., a hot-reload path).
         if unavailable_agents is not None:
-            self._blocked_agents = set(blocked_agents)
+            self._blocked_agents = set(unavailable_agents)
 
-        for wc in self._watcher_configs:
-            state = persisted.get(wc.name)
-            if state and state.paused:
-                logger.info("Watcher '%s' is paused — skipping startup", wc.name)
-                self._states[wc.name] = state
-                continue
-
-            # Fail-closed: refuse to start a watcher whose agent's permission
-            # broker could not be initialized.  A watcher that starts without
-            # its broker would process messages with no tool-call enforcement.
-            agent_name = self._resolve_agent_name(wc.agent)
-            if agent_name in blocked_agents:
-                msg = (
-                    f"Watcher '{wc.name}' (room '{wc.room}'): skipped — "
-                    f"agent '{agent_name}' is unavailable "
-                    f"(backend or permission broker failed to start)"
-                )
-                logger.error(msg)
-                errors.append(msg)
-                continue
-
-            try:
-                # Hold the per-watcher lock for the entire _start_watcher call
-                # so that a concurrent pause/resume/reset command (arriving via
-                # the control socket after the socket is opened) cannot interleave
-                # with the subscribe window.  Without the lock, a pause_watcher()
-                # call arriving while _start_watcher is blocked at
-                # subscribe_room() would find the processor already in
-                # _processors, call stop() on it (sets state="stopped"), and then
-                # _start_watcher would resume to call processor.start() — leaving
-                # the processor in "stopped" state with a running consumer task,
-                # silently dropping every subsequent message.
-                # All other _start_watcher callers (resume_watcher, reset_watcher)
-                # already hold this lock, so this makes the invariant uniform.
-                async with self._get_watcher_lock(wc.name):
-                    await self._start_watcher(wc, state)
-            except Exception as e:
-                msg = f"Watcher '{wc.name}' (room '{wc.room}'): failed to start: {e}"
-                logger.error(msg)
-                errors.append(msg)
-
-        # Dropping a removed watcher's state is deliberate, so say so explicitly
-        # rather than relying on its absence from self._states.  StateStore.save
-        # now merges, precisely so that a watcher we *failed* to start — or
-        # skipped because its agent was unavailable — keeps its session id
-        # instead of being erased.  That protection would also resurrect a
-        # watcher the operator genuinely deleted from config, so removal has to
-        # be named.
-        #
-        # A rule-derived record is never an orphan of this loop (§2.4): its
-        # recreation source is the record itself, not a config entry, so
-        # "absent from config" is its normal state, not evidence of deletion.
-        # Pruning them here would delete cross-restart sticky binding, the
-        # paused-record drop, and the startup replay's iteration source in one
-        # line. They are hydrated into memory instead, so `record_for_room`
-        # answers for them from boot — idle, until a message or the replay
-        # recreates them.
-        config_names = {wc.name for wc in self._watcher_configs}
-        prune = {
-            name for name, ws in persisted.items()
-            if name not in config_names and not ws.rule_name
-        }
+        prune = {name for name, ws in persisted.items() if not ws.rule_name}
+        for name in sorted(prune):
+            logger.warning(
+                "Pruning static-era watcher record '%s' — the static shape "
+                "was removed and nothing recreates it; add a rule matching "
+                "its room to serve the room again (a fresh session starts on "
+                "its first message)", name,
+            )
         for name, ws in persisted.items():
             if ws.rule_name and name not in self._states:
                 self._states[name] = ws
@@ -241,26 +188,22 @@ class WatcherLifecycle:
     async def pause_watcher(self, name: str) -> None:
         """Pause a watcher: stop processing messages but preserve state.
 
-        Two kinds of name reach this (§2.8): a rule-derived record answers
-        for itself — it carries everything a pause writes — while a static
-        name still needs its config entry. A rule-derived name with **no**
-        record is rejected: pause acts on a record, and an unobserved room
-        has none — no id, no kind, nothing to key on (§4.4). The rejection
-        points at the rule's `except_for:`, which is where "never engage with
-        this room" belongs — declarative and effective before the first
-        message. Extending the static path's fabricate-a-blank-record branch
-        here instead would recreate #118's defect 1 on the new model.
+        Pause acts on a **record** (§4.4): a name with no record is rejected —
+        an unobserved room has no id, no kind, nothing to key on — and the
+        rejection points at the rule's `except_for:`, which is where "never
+        engage with this room" belongs: declarative and effective before the
+        first message. The old path fabricated a blank record for such a
+        name, which is #118's defect 1: the blank became the surviving copy
+        on save, and the real session id was unrecoverable.
         """
         record = self._states.get(name)
         if record is None or not record.config:
-            # The static path, byte-identical until the cutover deletes it.
-            if self.get_watcher_config(name) is None:
-                raise RuntimeError(
-                    f"No watcher named '{name}' — pause acts on a record, and "
-                    f"a room the gateway has never seen has none (§4.4). To "
-                    f"keep the bot out of a room durably, add the room to the "
-                    f"rule's 'rooms.except_for' list instead."
-                )
+            raise RuntimeError(
+                f"No watcher named '{name}' — pause acts on a record, and "
+                f"a room the gateway has never seen has none (§4.4). To "
+                f"keep the bot out of a room durably, add the room to the "
+                f"rule's 'rooms.except_for' list instead."
+            )
         async with self._get_watcher_lock(name):
             state = self._states.get(name)
             if state and state.paused:
@@ -280,13 +223,6 @@ class WatcherLifecycle:
                 )
             if state:
                 state.paused = True
-            else:
-                self._states[name] = WatcherState(
-                    watcher_name=name,
-                    session_id="",
-                    room_id="",
-                    paused=True,
-                )
             self._state_store.save(self._states)
             logger.info("Watcher '%s' paused", name)
 
@@ -623,8 +559,11 @@ class WatcherLifecycle:
         record = self._states.get(name)
         wc = config_from_record(record) if record is not None else None
         if wc is None:
-            # The static path, byte-identical until the cutover deletes it.
-            wc = self._require_watcher_config(name)
+            raise RuntimeError(
+                f"No watcher named '{name}' — resume acts on a persisted "
+                f"record, and this name has none. See 'list' for the "
+                f"records that exist."
+            )
         self._ensure_agent_available(wc)
         async with self._get_watcher_lock(name):
             state = self._states.get(name)
@@ -636,23 +575,23 @@ class WatcherLifecycle:
                     state.paused = False
                 self._state_store.save(self._states)
                 return
+            if state is None or not state.config:
+                # The record was reclaimed while we waited on the lock (an
+                # expire, or a membership removal). Same rule as everywhere:
+                # re-read under the lock, and a record that is gone cannot
+                # be resumed.
+                raise RuntimeError(
+                    f"Watcher '{name}' was reclaimed while the resume waited "
+                    f"— its record is gone. The room's next message creates "
+                    f"a fresh watcher."
+                )
             try:
-                if state is not None and state.config:
-                    await self._resume_record(wc, state)
-                else:
-                    await self._start_watcher(wc, state)
+                await self._resume_record(wc, state)
             except Exception as e:
                 logger.error("Failed to resume watcher '%s': %s", name, e)
                 raise
-            # Only clear paused flag AFTER successful start — if the start raises,
-            # the watcher is still stopped and the paused flag should remain True in memory
-            # so the next restart (or manual retry) correctly reflects the watcher's state.
-            # (The record path's start constructs a fresh WatcherState with
-            # paused=False already; `state` is the pre-start object, so this
-            # write is a no-op there and load-bearing only for the static path.)
-            state = self._states.get(name)
-            if state:
-                state.paused = False
+            # The start constructed a fresh WatcherState with paused=False —
+            # re-read and save what is actually in the map.
             self._state_store.save(self._states)
             logger.info("Watcher '%s' resumed", name)
 
@@ -688,20 +627,21 @@ class WatcherLifecycle:
     async def reset_watcher(self, name: str) -> None:
         """Reset a watcher: clear session and restart with fresh state.
 
-        On the record path a **paused record is refused, loudly** — §2.5:
-        "`reset` must not silently clear `paused`". A pause is the operator's
-        durable mute, and once config no longer names rooms it is the *only*
-        one, so a reset that quietly un-muted would erase an explicit
-        instruction as a side effect of session hygiene. The operator resumes
-        first, then resets. (The static path keeps its released
-        clears-the-flag behaviour until the cutover deletes it.)
+        A **paused record is refused, loudly** — §2.5: "`reset` must not
+        silently clear `paused`". A pause is the operator's only durable
+        mute now that config no longer names rooms, so a reset that quietly
+        un-muted would erase an explicit instruction as a side effect of
+        session hygiene. The operator resumes first, then resets.
         """
         record = self._states.get(name)
         wc = config_from_record(record) if record is not None else None
         if wc is None:
-            # The static path, byte-identical until the cutover deletes it.
-            wc = self._require_watcher_config(name)
-        elif record.paused:
+            raise RuntimeError(
+                f"No watcher named '{name}' — reset acts on a persisted "
+                f"record, and this name has none. See 'list' for the "
+                f"records that exist."
+            )
+        if record.paused:
             raise RuntimeError(
                 f"Watcher '{name}' is paused — reset does not clear a pause "
                 f"(§2.5). Resume it first, then reset."
@@ -721,37 +661,33 @@ class WatcherLifecycle:
                 )
 
             state = self._states.get(name)
+            if state is None or not state.config:
+                # Reclaimed while the reset waited on the lock — same re-read
+                # rule as resume's.
+                raise RuntimeError(
+                    f"Watcher '{name}' was reclaimed while the reset waited "
+                    f"— its record is gone. The room's next message creates "
+                    f"a fresh watcher."
+                )
             # Clear injection retry state BEFORE resetting context_injected so
             # the new startup attempt begins with a fresh failure counter.
             # Without this, a watcher that reached ``failed_degraded`` would
             # immediately re-enter that state after reset (the old failure_count
             # is still at ``_MAX_INJECT_ATTEMPTS``, so one more failure tips it
             # over again).
-            # The old note here explained why this sat outside the `if state:`
-            # guard: a config-pinned session id had to be reset even with no
-            # persisted state. Config pinning is gone, so the only id that can
-            # exist is the persisted one — and reset now always clears it, with no
-            # exemption.
-            old_session_id = state.session_id if state else ""
+            old_session_id = state.session_id
             if old_session_id:
                 self._injector.reset_session(old_session_id)
-            if state:
-                state.session_id = ""
-                state.context_injected = False
-                # The static path's released behaviour; the record path never
-                # reaches here paused (refused above, §2.5).
-                state.paused = False
+            state.session_id = ""
+            state.context_injected = False
 
             try:
-                if state is not None and state.config:
-                    # The record path: the cleared session id means the start
-                    # mints a fresh session; the carry keeps the frozen
-                    # snapshots, and the reset stamps the clock for the same
-                    # reason resume does — a fresh session immediately re-idled
-                    # by the next sweep pass is the §2.5 misimplementation.
-                    await self._resume_record(wc, state)
-                else:
-                    await self._start_watcher(wc, state)
+                # The cleared session id means the start mints a fresh
+                # session; the carry keeps the frozen snapshots, and the
+                # reset stamps the clock for the same reason resume does — a
+                # fresh session immediately re-idled by the next sweep pass
+                # is the §2.5 misimplementation.
+                await self._resume_record(wc, state)
             except Exception as e:
                 logger.error("Failed to restart watcher '%s' after reset: %s", name, e)
                 raise
@@ -804,7 +740,7 @@ class WatcherLifecycle:
                     # them; on the static path they are empty, so fall back to
                     # the entry this lifecycle belongs to and to config.
                     "connector": state.connector or self._state_store.state_name,
-                    "agent_name": state.agent or self._agent_name_for(name),
+                    "agent_name": state.agent,
                     "session_id": state.session_id,
                     "state": state_filter_name(current),
                     "context_injection_state": (
@@ -846,17 +782,6 @@ class WatcherLifecycle:
         lock = self._watcher_locks.get(name)
         return lock is not None and lock.locked()
 
-    def _agent_name_for(self, watcher_name: str) -> str:
-        """Best-effort agent name for a record the manager has not stamped yet.
-
-        Layered on `get_watcher_config` rather than walking `_watcher_configs`
-        again: `_require_watcher_config` records that the two lookups over that
-        list were collapsed into one, and a third copy here would quietly make
-        that note false.
-        """
-        wc = self.get_watcher_config(watcher_name)
-        return wc.agent if wc else ""
-
     def get_watcher_state(self, name: str):
         """Return the WatcherState for a watcher, or None if not found."""
         return self._states.get(name)
@@ -869,10 +794,6 @@ class WatcherLifecycle:
         the self-message filter that would drop messages sent by the bot user).
         """
         return self._processors.get(watcher_name)
-
-    def get_watcher_config(self, watcher_name: str) -> "WatcherConfig | None":
-        """Return the WatcherConfig for a watcher name, or None if not found."""
-        return next((wc for wc in self._watcher_configs if wc.name == watcher_name), None)
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
 
@@ -939,47 +860,6 @@ class WatcherLifecycle:
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
-    async def _start_watcher(
-        self,
-        wc: WatcherConfig,
-        state: WatcherState | None,
-        history_before_ts: str | None = None,
-    ) -> None:
-        """Start a single watcher: resolve room, ensure session, start processor.
-
-        Phases:
-          1. Resolve agent and room.
-          2. Provision session (reuse or create).
-          3. Build state and register session maps.
-          4. Build + ensure durable context delivery (identity header,
-             addressing rules, context files); best-effort one-time history
-             handoff send.
-          5. Prepare attachment workspace.
-          6. Create MessageProcessor (not yet started).
-          7. Subscribe to connector (with rollback on failure).
-          8. Register processor with dispatcher (deferred until subscribe succeeds).
-          9. Activate processor (start consumer loop + online notification).
-         10. Restore dedup watermark.
-
-        ``history_before_ts`` bounds the history handoff (step 3.5) to messages
-        strictly older than the given ISO timestamp. The creation path passes the
-        triggering message's timestamp here (§2.7): the trigger is buffered and
-        replayed into the new processor as the live prompt, so without the bound
-        the newest-history block would contain that same message and the agent
-        would receive it twice — once inside a history turn whose response is
-        discarded, and again live. Buffering alone does not fix that; only the
-        bound does. Static starts have no trigger and pass None (unbounded).
-        """
-        # 1. Resolve room. The static path's only resolver: `wc.room` here is an
-        # operator-written reference (a channel name, `@user`). The creation path must
-        # NOT come through this line — a materialized config's `room` is a description,
-        # not a lookup key (§2.4), and a group DM's description resolves to nothing. It
-        # enters at `start_watcher_in_room` with the room it already holds.
-        room = await self._connector.resolve_room(wc.room)
-        await self.start_watcher_in_room(
-            wc, state, room, history_before_ts=history_before_ts
-        )
-
     async def start_watcher_in_room(
         self,
         wc: WatcherConfig,
@@ -988,13 +868,14 @@ class WatcherLifecycle:
         history_before_ts: str | None = None,
         provenance: dict | None = None,
     ) -> None:
-        """Phases 1.5–10 of `_start_watcher`, taking the room as already resolved.
+        """The one start path: session, state, context, workspace, processor.
 
-        The seam the creation path enters through (§2.7): it arrives holding a
-        classified room — id, kind, description — so resolving by name would be
-        both redundant and wrong (a group DM has no resolvable name at all).
-        Static starts call `_start_watcher`, which resolves and delegates here;
-        everything below is byte-identical for both callers.
+        Every caller arrives holding a classified room — id, kind,
+        description — so nothing here resolves by name (a group DM has no
+        resolvable name at all). The callers are the manager's create and
+        recreate, and the lifecycle's own `_resume_record`; the static
+        `_start_watcher` that used to resolve a configured name into this
+        method died at cutover.
 
         ``provenance`` carries the §5.3 fields a start does not rebuild — the
         frozen rule and config snapshots, the room kind, the lifecycle clocks
@@ -1009,6 +890,14 @@ class WatcherLifecycle:
           could persist this record while it was still half-written, so a crash
           in that window left a rule-less record on disk to be pruned.
         """
+        # 0. Fail closed on an unavailable agent, on EVERY start. The guard
+        # used to live only in resume/reset, which left the creation paths —
+        # message-triggered, eager, wake — able to start a watcher whose
+        # permission broker never came up: processing messages with no
+        # tool-call enforcement, silently. A raise here is an abort, not a
+        # decision (§2.2): the message stays redeliverable, and the eager
+        # loop reports it as a startup error.
+        self._ensure_agent_available(wc)
         agent_name = self._resolve_agent_name(wc.agent)
         agent = self._agents[agent_name]
         agent_cfg = self._config.agent_config(agent_name)
@@ -1251,14 +1140,14 @@ class WatcherLifecycle:
                     )
             self._processors.pop(wc.name, None)
             # Keep ws in _states (do NOT pop) so that the context_injected flag
-            # and session_id are preserved for the next _start_watcher call.
+            # and session_id are preserved for the next start.
             cleaned = await self._cleanup_startup_session_best_effort(
                 agent, session_id, created_new_session, wc.name
             )
             if cleaned and created_new_session:
                 ws.session_id = ""
                 # The session that received context injection was destroyed, so
-                # the next _start_watcher will create a brand-new session that
+                # the next start will create a brand-new session that
                 # has never seen the context.  Reset the flag so injection is
                 # re-attempted for the new session — without this, the new
                 # session inherits context_injected=True from the old ws and
@@ -1465,8 +1354,19 @@ class WatcherLifecycle:
 
         # Step 2: Capture the live watermark while the connector still holds the
         # room entry it lives in — the unsubscribe below pops that entry.
+        # Best-effort (#118 defect 3): the same read is already best-effort in
+        # StateStore.save, and a raise here used to abandon the unsubscribe
+        # and the drain — leaving the room subscribed and the queue undrained —
+        # in order to preserve a watermark that then was not captured anyway.
         if state and state.room_id:
-            live_ts = self._connector.get_last_processed_ts(state.room_id)
+            try:
+                live_ts = self._connector.get_last_processed_ts(state.room_id)
+            except Exception as e:
+                live_ts = None
+                logger.warning(
+                    "Watcher '%s': could not read the live watermark during "
+                    "stop (proceeding; the persisted mark stands): %s", name, e,
+                )
             # `is not None`, so a connector that has *cleared* its watermark can say so.
             # `None` still means "no opinion — this room saw no activity in this run", and
             # must not erase what is on disk. An empty string is an opinion: a connector
@@ -1521,23 +1421,6 @@ class WatcherLifecycle:
             raise RuntimeError(
                 f"Watcher '{name}' stop completed with errors: {'; '.join(errors)}"
             )
-
-    def _require_watcher_config(self, name: str) -> WatcherConfig:
-        """`get_watcher_config`, for the callers that cannot proceed without one.
-
-        There used to be two functions over `self._watcher_configs` — this one raising
-        with a hint, `get_watcher_config` returning None — and that divergence, not the
-        duplication, was the defect: which behaviour a reader gets depended on which name
-        they happened to call, and the two could drift on what "found" means. There is one
-        lookup now; this only decides what to do when it comes back empty.
-        """
-        wc = self.get_watcher_config(name)
-        if wc is None:
-            raise RuntimeError(
-                f"Watcher '{name}' not found in config. "
-                f"Available: {[wc.name for wc in self._watcher_configs]}"
-            )
-        return wc
 
     def _ensure_agent_available(self, wc: WatcherConfig) -> None:
         """Fail closed if a watcher's resolved agent is currently unavailable."""

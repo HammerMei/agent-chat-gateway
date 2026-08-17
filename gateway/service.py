@@ -308,17 +308,12 @@ class GatewayService:
         self._entries: list[ConnectorEntry] = []
         for cc in config.connectors:
             connector = connector_factory(cc)
-            # Filter watcher configs belonging to this connector
-            connector_watchers = [
-                wc for wc in config.watchers if wc.connector == cc.name
-            ]
             sm = SessionManager(
                 connector=connector,
                 agents=agents,
                 default_agent=config.default_agent,
                 config=core_config,
                 state_name=cc.name,
-                watcher_configs=connector_watchers,
                 permission_registry=self._registry,
                 session_maps=self._maps,
                 # Rules give the manager runtime effect (§2.8). Filtered like the

@@ -53,7 +53,7 @@ class TestRuleDerivedRecordsSurviveBoot(unittest.IsolatedAsyncioTestCase):
         store = MagicMock()
         store.load = MagicMock(return_value={record.watcher_name: record})
         store.save = MagicMock()
-        lifecycle = make_lifecycle(state_store=store, watcher_configs=[])
+        lifecycle = make_lifecycle(state_store=store)
 
         await lifecycle.sync_watchers()
 
@@ -70,7 +70,7 @@ class TestRuleDerivedRecordsSurviveBoot(unittest.IsolatedAsyncioTestCase):
         store = MagicMock()
         store.load = MagicMock(return_value={record.watcher_name: record})
         store.save = MagicMock()
-        lifecycle = make_lifecycle(state_store=store, watcher_configs=[])
+        lifecycle = make_lifecycle(state_store=store)
 
         await lifecycle.sync_watchers()
 
@@ -82,7 +82,7 @@ class TestRuleDerivedRecordsSurviveBoot(unittest.IsolatedAsyncioTestCase):
         store = MagicMock()
         store.load = MagicMock(return_value={record.watcher_name: record})
         store.save = MagicMock()
-        lifecycle = make_lifecycle(state_store=store, watcher_configs=[])
+        lifecycle = make_lifecycle(state_store=store)
 
         await lifecycle.sync_watchers()
 

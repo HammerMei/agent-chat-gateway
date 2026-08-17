@@ -152,6 +152,36 @@ def make_watcher(room="script", name=None, connector="script", agent="default", 
     )
 
 
+async def start_watcher(lifecycle, wc, state=None, **kw):
+    """Start a watcher from a `WatcherConfig`, for tests of the start machinery.
+
+    The port of the deleted `_start_watcher`: resolve the configured room
+    reference through the connector, then enter the one start path
+    (`start_watcher_in_room`). Production has no name-resolving start left —
+    the manager's create/recreate and `_resume_record` all arrive holding a
+    room — but the start machinery's own behaviours (session provisioning,
+    identity comparison, history handoff, rollback) are start-path
+    properties, and these suites exercise them without needing the routing
+    stack above.
+    """
+    room = await lifecycle._connector.resolve_room(wc.room)
+    await lifecycle.start_watcher_in_room(wc, state, room, **kw)
+
+
+def make_rule(room="script", name=None, connector="default", agent="default", **kw):
+    """A `WatcherRule` naming one literal room — the post-cutover analogue of
+    `make_watcher` for suites that start watchers at boot: on an eager
+    connector (Script) the eager-start loop materializes it at `run_once`,
+    creating a watcher named `<connector>-<room>` (the derived label)."""
+    from gateway.core.room_pattern import RoomPattern
+    from gateway.core.watcher_rule import RoomMatcher, WatcherRule
+
+    return WatcherRule(
+        name=name or f"rule-{room}", connector=connector, agent=agent,
+        rooms=RoomMatcher(include=(RoomPattern(room),)), **kw,
+    )
+
+
 def make_rule_derived_record(
     name="w1",
     *,
@@ -198,7 +228,6 @@ def make_manager(
     connector=None,
     agent=None,
     *,
-    watcher_configs=None,
     timeout: int = 10,
     permission_registry=None,
     state_name: str = "default",
@@ -222,7 +251,6 @@ def make_manager(
         default_agent,
         config or make_core_config(timeout=timeout, default_agent=default_agent),
         state_name=state_name,
-        watcher_configs=watcher_configs or [],
         permission_registry=permission_registry,
         **kw,
     )
@@ -337,7 +365,6 @@ def make_lifecycle(**overrides):
         "agents": {},
         "default_agent": "default",
         "config": make_core_config(),
-        "watcher_configs": [],
         # `load()` must return a real empty mapping, not a MagicMock. A bare
         # mock's `.get(name)` is truthy, so `sync_watchers` reads every watcher
         # as paused, starts none of them, and returns no errors — a lifecycle

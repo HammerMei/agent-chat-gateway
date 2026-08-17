@@ -25,7 +25,7 @@ from gateway.core.state import (
     connector_name_of,
     save_state,
 )
-from tests.helpers import make_lifecycle
+from tests.helpers import make_lifecycle, start_watcher
 
 
 class TestOneSessionOneRoom(unittest.TestCase):
@@ -419,7 +419,7 @@ class TestARefusedBindingLeavesNothingBehind(unittest.IsolatedAsyncioTestCase):
         wc = WatcherConfig(name="w1", connector="rc", room="general", agent="a1")
 
         with self.assertRaises(SessionAlreadyBoundError):
-            await lc._start_watcher(wc, state=None)
+            await start_watcher(lc, wc, state=None)
         return lc, agent
 
     async def test_the_watcher_state_is_not_left_behind(self):
