@@ -488,42 +488,30 @@ class TestTheRealConnectorsReportTheirIdentity(unittest.TestCase):
 
 
 class TestWhoOwnsTheDmStream(unittest.TestCase):
-    """Both watcher shapes reach a DM, and only one of them runs today.
-
-    `direct:`/`group_direct:` are rule fields, and rules have no runtime effect until
-    the watcher manager lands. A **static** watcher naming `@someone` is the form that
-    actually works now — so counting only rules guarded the case that cannot yet happen
-    and missed the one that can.
-    """
+    """A rule's DM opt-ins are the only claim shape left: `direct` and
+    `group_direct` each claim a whole DM class — a DM has no room name for a
+    pattern to match. The per-room claim (`DmClaim.rooms`) survives as a type
+    for §2.7's reserved object form, so `overlaps` keeps understanding it,
+    but nothing produces one from config today."""
 
     def _rule(self, connector, direct=False, group_direct=False):
         from unittest.mock import MagicMock as M
 
         return M(connector=connector, rooms=M(direct=direct, group_direct=group_direct))
 
-    def _watcher(self, connector, room):
-        from unittest.mock import MagicMock as M
-
-        return M(connector=connector, room=room)
-
-    def test_a_static_at_room_claims_that_room_only(self):
-        claims = dm_claims([self._watcher("mm-eng", "@alice")], [])
-        self.assertEqual(claims["mm-eng"], DmClaim(rooms=frozenset({"@alice"})))
-        self.assertFalse(claims["mm-eng"].direct, "a named room is not every 1:1 DM")
-
-    def test_a_static_channel_claims_nothing(self):
-        self.assertEqual(dm_claims([self._watcher("mm-eng", "incidents")], []), {})
-
     def test_a_rule_opting_in_claims_that_class_only(self):
         """The two DM kinds are separate in `RoomMatcher.match()`, so a rule taking one
         must not be recorded as taking the other."""
-        one_to_one = dm_claims([], [self._rule("mm-eng", direct=True)])["mm-eng"]
+        one_to_one = dm_claims([self._rule("mm-eng", direct=True)])["mm-eng"]
         self.assertTrue(one_to_one.direct)
         self.assertFalse(one_to_one.group_direct)
 
-        group = dm_claims([], [self._rule("mm-eng", group_direct=True)])["mm-eng"]
+        group = dm_claims([self._rule("mm-eng", group_direct=True)])["mm-eng"]
         self.assertTrue(group.group_direct)
         self.assertFalse(group.direct)
+
+    def test_a_rule_with_no_dm_opt_in_claims_nothing(self):
+        self.assertEqual(dm_claims([self._rule("mm-eng")]), {})
 
     def test_the_two_dm_classes_do_not_collide(self):
         """A connector on 1:1 DMs and one on group DMs answer different conversations;
@@ -533,32 +521,25 @@ class TestWhoOwnsTheDmStream(unittest.TestCase):
         self.assertTrue(
             DmClaim(group_direct=True).overlaps(DmClaim(group_direct=True)))
 
-    def test_a_named_room_is_a_one_to_one_conversation(self):
-        """`@someone` addresses one person and resolves through the direct-channel
-        endpoint, so it overlaps a 1:1 claim and never a group-DM one."""
+    def test_two_whole_stream_claims_overlap(self):
+        """Two connectors both opting into 1:1 DMs would both answer every DM
+        on the account — exactly what the identity barrier must see."""
+        a = dm_claims([self._rule("mm-eng", direct=True)])["mm-eng"]
+        b = dm_claims([self._rule("mm-sales", direct=True)])["mm-sales"]
+        self.assertTrue(a.overlaps(b))
+
+    def test_a_reserved_per_room_claim_still_overlaps_the_stream(self):
+        """`DmClaim.rooms` is the reserved object form's shape (§2.7): nothing
+        produces it from config today, but `overlaps` must keep understanding
+        it so reviving per-DM include lists later extends this rather than
+        rewriting it."""
         named = DmClaim(rooms=frozenset({"@alice"}))
         self.assertTrue(named.overlaps(DmClaim(direct=True)))
         self.assertFalse(named.overlaps(DmClaim(group_direct=True)))
 
-    def test_room_names_are_compared_casefolded(self):
-        """One username spelled two ways is one channel, and a missed match here is the
-        costly direction: it lets two connectors answer the same DM."""
-        claims = dm_claims(
-            [self._watcher("a", "@Alice"), self._watcher("b", "@alice")], [])
-        self.assertTrue(claims["a"].overlaps(claims["b"]))
-
-    def test_both_shapes_combine_on_one_connector(self):
-        claims = dm_claims(
-            [self._watcher("mm-sales", "@bob"), self._watcher("mm-eng", "general")],
-            [self._rule("mm-eng", direct=True)],
-        )
-        self.assertTrue(claims["mm-eng"].direct)
-        self.assertEqual(claims["mm-sales"].rooms, frozenset({"@bob"}))
-
     def test_a_connector_claiming_nothing_never_overlaps(self):
         self.assertFalse(DmClaim().overlaps(DmClaim(direct=True)))
         self.assertFalse(DmClaim(direct=True).overlaps(DmClaim()))
-
 
 class TestStaticDmWatchersReachTheCheck(unittest.TestCase):
     """The wiring, not the helper: `GatewayService` must derive its DM owners this way.

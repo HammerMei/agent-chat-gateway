@@ -302,9 +302,7 @@ class GatewayService:
         # needs only this, and config is immutable after load. A DM has no team, so it
         # is the one thing the Mattermost different-teams exception cannot keep apart
         # (§4.5).
-        self._dm_claims: dict[str, DmClaim] = dm_claims(
-            config.watchers, config.watcher_rules
-        )
+        self._dm_claims: dict[str, DmClaim] = dm_claims(config.watcher_rules)
         self._entries: list[ConnectorEntry] = []
         for cc in config.connectors:
             connector = connector_factory(cc)

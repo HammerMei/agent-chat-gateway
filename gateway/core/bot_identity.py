@@ -24,8 +24,6 @@ from dataclasses import dataclass
 from ipaddress import ip_address
 from urllib.parse import urlsplit
 
-from .room_pattern import is_direct_room_name
-
 _DEFAULT_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443}
 
 
@@ -209,35 +207,28 @@ class ConnectorIdentity:
     dms: DmClaim = DmClaim()
 
 
-def dm_claims(watchers, watcher_rules) -> dict[str, DmClaim]:
+def dm_claims(watcher_rules) -> dict[str, DmClaim]:
     """What each connector claims of its account's direct messages.
 
-    Both watcher shapes reach a DM, and they claim different amounts — see `DmClaim`.
-    Only one of the two shapes runs today: rules have no runtime effect until the
-    watcher manager lands, while a static `@someone` watcher works now, so a check
-    reading only rules guards the form that cannot yet happen.
+    Post-cutover a rule's DM opt-ins are the only claim shape: `direct` and
+    `group_direct` each claim a whole DM class, because a DM has no room name
+    for a pattern to match. `DmClaim.rooms` — the per-room claim the static
+    `@someone` watchers used to make — stays as a *type* for §2.7's reserved
+    object form (`direct: {include: [...]}`), but nothing produces one today,
+    so two connectors that both opt into a class simply overlap.
 
-    Room names are compared casefolded. Two spellings of one username are one channel,
-    and here a missed match is the costly direction — it lets two connectors answer the
-    same DM — whereas over-matching only refuses a pair that was already suspicious.
-
-    Takes the two lists rather than a `GatewayConfig` because this module is in
+    Takes the list rather than a `GatewayConfig` because this module is in
     `gateway.core`, which the config layer imports and must not import back.
     """
     direct = {r.connector for r in watcher_rules if r.rooms.direct}
     group = {r.connector for r in watcher_rules if r.rooms.group_direct}
-    rooms: dict[str, set[str]] = {}
-    for w in watchers:
-        if is_direct_room_name(w.room):
-            rooms.setdefault(w.connector, set()).add(w.room.casefold())
 
     return {
         name: DmClaim(
             direct=name in direct,
             group_direct=name in group,
-            rooms=frozenset(rooms.get(name, ())),
         )
-        for name in direct | group | rooms.keys()
+        for name in direct | group
     }
 
 

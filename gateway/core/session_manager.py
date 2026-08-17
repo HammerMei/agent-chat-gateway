@@ -242,8 +242,16 @@ class SessionManager:
         resolution left (§2.8) — an eager rule genuinely starts from a name.
 
         Per-room failures append to the startup error list, as the static
-        loop's did; boot proceeds. Connectors with unsolicited inbound return
-        immediately — their rooms arrive, they are never walked.
+        loop's did; boot proceeds, and the daemon reports the list at startup.
+        **The catch below deliberately narrows `get_or_create`'s contract**
+        ("an exception is retryable — the caller owns the retry"): on an
+        eager connector no message can ever re-trigger the room, so the only
+        retries that exist are the next daemon restart and the operator's
+        `resume`. A room whose eager start fails therefore stays down, loudly,
+        until one of those — a weaker recovery than RC/MM's redelivery, and
+        the price of a transport with no inbound stream. Connectors with
+        unsolicited inbound return immediately — their rooms arrive, they are
+        never walked.
         """
         if self._watcher_manager is None:
             return

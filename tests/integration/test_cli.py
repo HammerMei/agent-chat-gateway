@@ -855,6 +855,19 @@ class TestCLIPauseResumeReset(_CLITestBase):
         self.assertEqual(code, 1)
         self.assertIn("watcher not found", stderr)
 
+    def test_expire_normal_path(self):
+        """Successful expire → print confirmation + exit 0 (§2.8)."""
+        self._start_daemon({"expire": {"ok": True}})
+        stdout, _, code = self._run(["expire", "rc-eng"])
+        self.assertEqual(code, 0)
+        self.assertIn("expired", stdout.lower())
+
+    def test_expire_failure_exits_1(self):
+        self._start_daemon({"expire": {"ok": False, "error": "no expirable record"}})
+        _, stderr, code = self._run(["expire", "ghost"])
+        self.assertEqual(code, 1)
+        self.assertIn("no expirable record", stderr)
+
     def test_resume_normal_path(self):
         """Successful resume → print confirmation + exit 0."""
         self._start_daemon({"resume": {"ok": True}})

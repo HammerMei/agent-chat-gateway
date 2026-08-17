@@ -248,7 +248,7 @@ def _check_declared_bot_accounts(config: GatewayConfig, result: ValidationResult
     are missed duplicates that the runtime check still catches — never a rejection of a
     configuration that would have worked.
     """
-    claims = dm_claims(config.watchers, config.watcher_rules)
+    claims = dm_claims(config.watcher_rules)
     declared: list[ConnectorIdentity] = []
     for connector in config.connectors:
         validator = _CONNECTOR_VALIDATORS.get(connector.type)
