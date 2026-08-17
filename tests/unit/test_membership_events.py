@@ -64,7 +64,11 @@ class TestARemovalReclaimsTheRecord(unittest.IsolatedAsyncioTestCase):
         connector.unsubscribe_room.assert_awaited_once_with("room-w1", watcher_id="w1")
         lifecycle._maps.remove_session.assert_called_with("sess-1")
         lifecycle._attachment_workspace.reclaim.assert_called_once()
-        lifecycle._state_store.save.assert_called()
+        # `save` MERGES the on-disk records, so the pop alone is not a
+        # deletion — without prune the write restores the record from disk
+        # and the next boot resurrects it (Codex round 3, P1).
+        lifecycle._state_store.save.assert_called_with(
+            lifecycle._states, prune={"w1"})
 
     async def test_a_resident_watcher_is_stopped_first_then_reclaimed(self):
         """Expiry bails on residency; a remove cannot — the bot can be kicked
@@ -122,6 +126,34 @@ class TestARemovalReclaimsTheRecord(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(lifecycle.get_watcher_state("w1"), "the record is kept")
         connector.unsubscribe_room.assert_not_awaited()
 
+    async def test_a_missing_frozen_agent_skips_cleanup_but_still_reclaims(self):
+        """Codex round 3: 'resolving' a removed frozen agent to the default
+        would run delete_session against the wrong backend and walk the
+        default agent's working directory. The agent-bound steps are skipped
+        (the leak is logged), the agent-independent ones still run, and the
+        record is still reclaimed — keeping it would make it immortal."""
+        record = make_rule_derived_record(agent="ghost")
+        lifecycle, connector = _harness([record])
+        default_backend = lifecycle._agents["default"]
+        default_backend.delete_session = AsyncMock()
+
+        with self.assertLogs(
+            "agent-chat-gateway.core.watcher_lifecycle", level="WARNING"
+        ) as captured:
+            name = await lifecycle.reclaim_room("room-w1", reason="removed")
+
+        self.assertEqual(name, "w1")
+        self.assertIsNone(lifecycle.get_watcher_state("w1"), "still reclaimed")
+        default_backend.delete_session.assert_not_awaited()
+        lifecycle._attachment_workspace.reclaim.assert_not_called()
+        # The agent-independent steps still run.
+        connector.unsubscribe_room.assert_awaited_once()
+        lifecycle._maps.remove_session.assert_called_with("sess-1")
+        lifecycle._state_store.save.assert_called_with(
+            lifecycle._states, prune={"w1"})
+        self.assertTrue(any("ghost" in line for line in captured.output),
+                        "the accepted leak names the missing agent")
+
     async def test_a_failed_stop_does_not_refuse_the_reclaim(self):
         """The room is gone whatever the teardown hit — a remove that refused
         to reclaim on a stop error would keep a session for a room that can
@@ -138,17 +170,22 @@ class TestARemovalReclaimsTheRecord(unittest.IsolatedAsyncioTestCase):
 
 
 class TestAnExpectedRecordPinsTheReclaim(unittest.IsolatedAsyncioTestCase):
-    """Codex review of #121, round 2: the reconciliation's evidence is a
-    stale snapshot. With `expected` set, reclaim_room aborts on ANY change —
-    a replaced record, or the same record woken back to active — instead of
-    following the replacement the way a live removal event may."""
+    """Codex review of #121, rounds 2–3: two pins, deliberately separate.
+
+    `expected` is an identity pin — a replaced record aborts instead of being
+    followed the way a live removal event's retry loop follows it. It does
+    NOT require dormancy, because the operator's `expire` acts on active
+    records too. `require_dormant` is the reconciliation's extra gate: its
+    evidence is a stale snapshot, so the same object woken back to life in
+    place is also not its to reclaim."""
 
     async def test_a_matching_dormant_record_is_reclaimed(self):
         record = make_rule_derived_record(dropped_at="2026-08-01T00:00:00+00:00")
         lifecycle, _ = _harness([record])
 
         name = await lifecycle.reclaim_room(
-            "room-w1", reason="reconciliation", expected=record)
+            "room-w1", reason="reconciliation",
+            expected=record, require_dormant=True)
 
         self.assertEqual(name, "w1")
         self.assertIsNone(lifecycle.get_watcher_state("w1"))
@@ -164,17 +201,32 @@ class TestAnExpectedRecordPinsTheReclaim(unittest.IsolatedAsyncioTestCase):
                              "the newer record is not the snapshot's to delete")
         connector.unsubscribe_room.assert_not_awaited()
 
-    async def test_a_record_woken_back_to_active_aborts_the_reclaim(self):
-        """Same object, no longer dormant: a wake between the snapshot and the
-        lock cleared dropped_at, and a stale snapshot has no authority over
-        what just happened. A live removal event (no `expected`) still would."""
+    async def test_a_record_woken_back_to_active_aborts_under_require_dormant(self):
+        """Same object, no longer dormant: an in-place resume cleared the
+        flags between the snapshot and the lock, and a stale snapshot has no
+        authority over what just happened. A live removal event (no pins)
+        still reclaims it."""
         record = make_rule_derived_record()  # active: no dropped_at, not paused
         lifecycle, connector = _harness([record])
 
         self.assertIsNone(await lifecycle.reclaim_room(
-            "room-w1", reason="reconciliation", expected=record))
+            "room-w1", reason="reconciliation",
+            expected=record, require_dormant=True))
         self.assertIsNotNone(lifecycle.get_watcher_state("w1"))
         connector.unsubscribe_room.assert_not_awaited()
+
+    async def test_the_identity_pin_alone_reclaims_an_active_record(self):
+        """The operator's `expire` shape (Codex round 3): `expected` without
+        `require_dormant` must reclaim a live, active record — the verb's
+        documented job — while still refusing a replacement."""
+        record = make_rule_derived_record()  # active
+        lifecycle, _ = _harness([record])
+
+        name = await lifecycle.reclaim_room(
+            "room-w1", reason="operator expire", expected=record)
+
+        self.assertEqual(name, "w1")
+        self.assertIsNone(lifecycle.get_watcher_state("w1"))
 
     async def test_a_paused_record_still_counts_as_dormant(self):
         """Paused is inside the reconciliation's authority — the snapshot said
@@ -183,7 +235,8 @@ class TestAnExpectedRecordPinsTheReclaim(unittest.IsolatedAsyncioTestCase):
         lifecycle, _ = _harness([record])
 
         name = await lifecycle.reclaim_room(
-            "room-w1", reason="reconciliation", expected=record)
+            "room-w1", reason="reconciliation",
+            expected=record, require_dormant=True)
 
         self.assertEqual(name, "w1")
         self.assertIsNone(lifecycle.get_watcher_state("w1"))
@@ -446,7 +499,7 @@ class TestTheMembershipReconciliation(unittest.IsolatedAsyncioTestCase):
         mgr._connector.membership_snapshot = AsyncMock(return_value=snapshot)
         reclaimed = []
 
-        async def reclaim(room_id, *, reason, expected=None):
+        async def reclaim(room_id, *, reason, expected=None, require_dormant=False):
             reclaimed.append((room_id, reason))
             return f"w-{room_id}"
 
@@ -478,6 +531,10 @@ class TestTheMembershipReconciliation(unittest.IsolatedAsyncioTestCase):
                 call.kwargs.get("expected"), by_room[call.args[0]],
                 "the reconciliation pins each reclaim to the exact record "
                 "its snapshot judged — a replacement aborts, never follows")
+            self.assertTrue(
+                call.kwargs.get("require_dormant"),
+                "the reconciliation also passes require_dormant — an "
+                "in-place resume is not its to reclaim (round 3)")
 
     async def test_a_room_that_woke_after_the_snapshot_is_left_alone(self):
         """Codex review of #121: the snapshot ages while the loop awaits

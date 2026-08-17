@@ -16,12 +16,16 @@ from gateway.core.watcher_rule import RoomMatcher, WatcherRule
 from tests.helpers import make_manager
 
 
-def _rule(name="ops", include=("ops-room",), connector="default"):
+def _rule(name="ops", include=("ops-room",), connector="default",
+          except_for=()):
     return WatcherRule(
         name=name,
         connector=connector,
         agent="default",
-        rooms=RoomMatcher(include=tuple(RoomPattern(p) for p in include)),
+        rooms=RoomMatcher(
+            include=tuple(RoomPattern(p) for p in include),
+            except_for=tuple(RoomPattern(p) for p in except_for),
+        ),
     )
 
 
@@ -73,6 +77,26 @@ class TestEagerStart(unittest.IsolatedAsyncioTestCase):
         woken = mgr._lifecycle.record_for_room("ops-room")
         self.assertEqual(woken.session_id, session_id, "the same session")
         self.assertEqual(woken.rule_name, "ops", "the frozen rule survived")
+
+    async def test_a_vetoed_literal_is_skipped_not_an_error(self):
+        """Codex round 3: an included literal the same rule's except_for also
+        matches is DECLINED — an intentional exclusion, not a startup
+        failure. Without the pre-veto the loop reported it as an error on
+        every boot."""
+        mgr = _eager_manager(rules=[
+            _rule(include=("ops-room", "ops-secret"),
+                  except_for=("ops-secret",)),
+        ])
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+
+            errors = await mgr.sync_only()
+
+        self.assertEqual(errors, [], "the vetoed literal is not a failure")
+        self.assertIsNotNone(mgr._lifecycle.record_for_room("ops-room"),
+                             "the non-vetoed sibling still starts")
+        self.assertIsNone(mgr._lifecycle.record_for_room("ops-secret"),
+                          "the vetoed room is never offered")
 
     async def test_a_paused_room_is_not_started_and_not_an_error(self):
         """§4.4 through the same door as everywhere else: get_or_create

@@ -384,8 +384,25 @@ class WatcherLifecycle:
                     "(proceeding): %s", name, e,
                 )
 
-        agent_name = self._resolve_agent_name(state.agent or None)
-        agent = self._agents.get(agent_name)
+        # A named-but-missing frozen agent is UNAVAILABLE, never substituted
+        # (Codex round 3): "resolving" it to the default would run the
+        # destructive steps below against the wrong backend — and step 5
+        # against the default agent's working directory — while the removed
+        # agent's actual session and files leak anyway. Skip the agent-bound
+        # steps, log the accepted leak, and still reclaim the record: keeping
+        # it because its agent vanished would make it immortal.
+        if state.agent and state.agent not in self._agents:
+            logger.warning(
+                "Watcher '%s': frozen agent '%s' no longer exists — skipping "
+                "backend session, prompt-file and attachment cleanup "
+                "(accepting the leak); the record is still reclaimed",
+                name, state.agent,
+            )
+            agent_name = None
+            agent = None
+        else:
+            agent_name = self._resolve_agent_name(state.agent or None)
+            agent = self._agents.get(agent_name)
         session_id = state.session_id
 
         # 2. The backend session. False means unsupported or unconfirmed —
@@ -420,8 +437,10 @@ class WatcherLifecycle:
                     name, e,
                 )
 
-        # 5. The attachment symlink and cache directory.
-        if state.room_id and state.connector:
+        # 5. The attachment symlink and cache directory. Skipped with the
+        # other agent-bound steps when the frozen agent is gone — the reclaim
+        # would otherwise walk the DEFAULT agent's working directory.
+        if agent_name is not None and state.room_id and state.connector:
             agent_cfg = self._config.agent_config(agent_name)
             try:
                 await asyncio.to_thread(
@@ -436,12 +455,18 @@ class WatcherLifecycle:
                     "workspace: %s", name, e,
                 )
 
-        # 6. The record, last.
+        # 6. The record, last. `save` MERGES the on-disk records (its
+        # docstring's whole point), so popping from the in-memory map is not
+        # enough — without `prune` the write restores the reclaimed record
+        # from disk and the next boot resurrects it, session pointer and all
+        # (Codex round 3, P1).
         self._states.pop(name, None)
-        self._state_store.save(self._states)
+        self._state_store.save(self._states, prune={name})
 
     async def reclaim_room(
-        self, room_id: str, *, reason: str, expected: "WatcherState | None" = None,
+        self, room_id: str, *, reason: str,
+        expected: "WatcherState | None" = None,
+        require_dormant: bool = False,
     ) -> str | None:
         """Forced reclamation of a room's record — not a timer's (§2.7, §4.4).
 
@@ -483,15 +508,21 @@ class WatcherLifecycle:
         periodic reconciliation — reaches the same end state. Returns the
         reclaimed watcher's name so the caller can cancel its jobs.
 
-        ``expected`` pins the reclamation to one snapshot of the room (Codex
-        review of #121, round 2): a LIVE removal event is authoritative for
-        the room whatever its record looks like by the time the lock is
-        acquired — the retry loop below deliberately follows the replacement —
-        but the reconciliation's evidence is a stale snapshot, and following
-        a replacement there deletes the very record a newer join or wake just
-        made. With ``expected`` set, any change — a different object, or the
-        same object no longer dormant — aborts with None instead of retrying,
-        and the next round decides against fresher evidence.
+        Two pins, deliberately separate (Codex review of #121, rounds 2–3):
+
+        * ``expected`` is an **identity pin**: with it set, a record that is
+          no longer the given object — every start installs a fresh
+          ``WatcherState``, so any wake or re-add replaces it — aborts with
+          None instead of following the replacement the way the retry loop
+          below does for a live removal event. The operator's ``expire``
+          passes this alone: it selected a record and must not delete that
+          record's successor, but it acts on active and dormant alike.
+        * ``require_dormant`` is the **reconciliation's extra gate**: its
+          evidence is a stale snapshot, so the same object woken back to
+          life in place (``resume`` on a still-resident processor clears
+          ``paused`` without replacing the object) is also not its to
+          reclaim. A live removal event passes neither — it is authoritative
+          for the room, not for one snapshot of it.
         """
         while True:
             record = self.record_for_room(room_id)
@@ -501,14 +532,16 @@ class WatcherLifecycle:
                 return None
             name = record.watcher_name
             async with self._get_watcher_lock(name):
-                if expected is not None and (
-                    self._states.get(name) is not record
-                    or not (record.paused or record.dropped_at)
-                ):
-                    # Re-checked UNDER the lock: a wake that held it while we
-                    # waited has made this record active (or replaced it), and
-                    # a stale snapshot has no authority over what just
-                    # happened.
+                if expected is not None and self._states.get(name) is not record:
+                    # Re-checked UNDER the lock: the record was replaced while
+                    # we waited, and the caller pinned this reclamation to the
+                    # object it selected — the replacement is not its to
+                    # delete.
+                    return None
+                if require_dormant and not (record.paused or record.dropped_at):
+                    # The same object, no longer dormant — an in-place resume
+                    # while we waited. A stale snapshot has no authority over
+                    # what just happened.
                     return None
                 if self._states.get(name) is not record:
                     # The record changed while we waited — an expiry reclaimed
@@ -704,6 +737,16 @@ class WatcherLifecycle:
                     f"Watcher '{name}' was reclaimed while the reset waited "
                     f"— its record is gone. The room's next message creates "
                     f"a fresh watcher."
+                )
+            if state.paused:
+                # Re-checked UNDER the lock (Codex round 3): the refusal above
+                # ran before this coroutine held it, and a pause landing in
+                # that gap would otherwise be silently cleared by the restart
+                # below — the restart writes a fresh record with paused=False,
+                # exactly the erase-by-side-effect §2.5 forbids.
+                raise RuntimeError(
+                    f"Watcher '{name}' is paused — reset does not clear a "
+                    f"pause (§2.5). Resume it first, then reset."
                 )
             # Clear injection retry state BEFORE resetting context_injected so
             # the new startup attempt begins with a fresh failure counter.

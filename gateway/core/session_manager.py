@@ -265,6 +265,18 @@ class SessionManager:
                     # belt-and-braces, not a policy.
                     continue
                 name = pattern.raw
+                if any(p.matches(name) for p in rule.rooms.except_for):
+                    # The rule's own veto (Codex round 3): an included literal
+                    # that except_for also matches is DECLINED by the same
+                    # rule, and get_or_create would correctly answer None —
+                    # which the branch below would then misreport as a
+                    # startup failure on every boot. An intentional exclusion
+                    # is a no-op, not an error.
+                    logger.info(
+                        "Rule '%s': room '%s' is excluded by the rule's own "
+                        "except_for — not started", rule.name, name,
+                    )
+                    continue
                 try:
                     room = await self._connector.resolve_room(name)
                     ref = RoomRef(
@@ -535,6 +547,7 @@ class SessionManager:
 
     async def _reclaim_removed_room(
         self, room_id: str, *, reason: str, expected=None,
+        require_dormant: bool = False,
     ) -> None:
         """The removal path's shared tail: reclaim the record, cancel its jobs.
 
@@ -544,7 +557,8 @@ class SessionManager:
         """
         try:
             name = await self._lifecycle.reclaim_room(
-                room_id, reason=reason, expected=expected)
+                room_id, reason=reason, expected=expected,
+                require_dormant=require_dormant)
         except Exception:
             logger.exception(
                 "Membership-removal reclaim failed for room %s — the "
@@ -620,8 +634,11 @@ class SessionManager:
                 reason="the membership reconciliation found the bot is no "
                        "longer in the room (a removal event was missed)",
                 # Pinned to this snapshot's record: the reclaim aborts under
-                # the lock if a wake or re-add got there first (round 2).
+                # the lock if a wake or re-add got there first (round 2) —
+                # including an in-place resume, which clears `paused` without
+                # replacing the object (round 3, hence require_dormant).
                 expected=record,
+                require_dormant=True,
             )
 
     async def shutdown(self) -> None:
@@ -703,7 +720,12 @@ class SessionManager:
                 f"rule-derived record, and this name has none."
             )
         reclaimed = await self._lifecycle.reclaim_room(
-            state.room_id, reason=f"operator 'expire' on watcher '{name}'"
+            state.room_id, reason=f"operator 'expire' on watcher '{name}'",
+            # The identity pin, without require_dormant (Codex round 3): the
+            # operator selected THIS record — following a replacement would
+            # delete a newly created watcher and contradict the error below —
+            # but expire acts on active and dormant records alike.
+            expected=state,
         )
         if reclaimed is None:
             raise RuntimeError(

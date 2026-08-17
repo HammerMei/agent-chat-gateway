@@ -570,11 +570,17 @@ operator asks. The hash remains the label; the header describes the room.
 **The header sources that description from the state record, not the frozen
 config.** The materialized config is a snapshot taken at creation (§2.4), so a
 group DM whose membership later changes would keep announcing its original
-members forever. `state.participants` is refreshed from inbound messages, so
-reading the header from there keeps the agent's stated sense of place true —
-which matters precisely because that header is also the "ask the agent which
-watcher this is" affordance. The frozen copy in the config stays as the drift
-baseline it exists to be; it is not what gets shown.
+members forever. `state.participants` is *intended* to be refreshed from
+inbound messages, so reading the header from there keeps the agent's stated
+sense of place true — which matters precisely because that header is also the
+"ask the agent which watcher this is" affordance. The frozen copy in the
+config stays as the drift baseline it exists to be; it is not what gets shown.
+
+> **Refresh deferred** (issue #124): the first implementation freezes
+> `state.participants` at creation too, because the message path carries no
+> participant set to refresh from — adding that carrier is its own change.
+> Until then the header and `list` show the creation-time members; nothing
+> keys on participants (above), so the staleness is display-only.
 
 One consequence worth stating: a Mattermost group DM's `channel_name` is itself
 a stable hash, so it *could* serve as the label. It is not used, because it is

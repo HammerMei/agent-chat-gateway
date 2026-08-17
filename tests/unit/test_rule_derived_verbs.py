@@ -126,6 +126,35 @@ class TestVerbsOnRuleDerivedRecords(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(lifecycle.get_watcher_state(NAME).paused,
                         "the pause survived the refused reset")
 
+    async def test_reset_refuses_a_pause_that_landed_while_it_waited(self):
+        """Codex round 3: the paused refusal runs before the lock, so a pause
+        landing between that check and the lock's acquisition would be
+        silently erased by the restart (which writes paused=False). The
+        re-check under the lock is what closes the gap."""
+        connector, lifecycle, _ = await self._harness()
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            MockProc.return_value.stop = AsyncMock()
+            await self._create(connector, lifecycle)
+
+            # The pause, landing inside reset's own critical section — the
+            # in-place write the pause verb makes, stamped after the pre-lock
+            # check has already passed.
+            real_stop = lifecycle._stop_processor
+
+            async def stop_then_pause(name):
+                await real_stop(name)
+                lifecycle.get_watcher_state(NAME).paused = True
+
+            lifecycle._stop_processor = stop_then_pause
+
+            with self.assertRaises(RuntimeError) as ctx:
+                await lifecycle.reset_watcher(NAME)
+
+        self.assertIn("paused", str(ctx.exception).lower())
+        self.assertTrue(lifecycle.get_watcher_state(NAME).paused,
+                        "the pause survived the refused reset")
+
     async def test_reset_mints_a_fresh_session_and_keeps_the_snapshots(self):
         connector, lifecycle, _ = await self._harness()
         with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
@@ -325,6 +354,11 @@ class TestTheExpireVerb(unittest.IsolatedAsyncioTestCase):
         args = mgr._lifecycle.reclaim_room.call_args
         self.assertEqual(args.args[0], "room-w1")
         self.assertIn("expire", args.kwargs["reason"])
+        # The identity pin, WITHOUT require_dormant (Codex round 3): expire
+        # must not delete the selected record's replacement, but it acts on
+        # active records too.
+        self.assertIs(args.kwargs.get("expected"), record)
+        self.assertFalse(args.kwargs.get("require_dormant", False))
         self.assertEqual(cancelled, ["w1"])
 
     async def test_expire_raises_where_the_event_handlers_swallow(self):
