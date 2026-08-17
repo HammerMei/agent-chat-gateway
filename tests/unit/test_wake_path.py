@@ -15,6 +15,7 @@ same episode → the *same session* resumes, the frozen record survives, and the
 connector's subscription bookkeeping has not grown.
 """
 
+import asyncio
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -445,6 +446,52 @@ class TestAFailedRecreationKeepsTheRecord(unittest.IsolatedAsyncioTestCase):
                          "not a fresh _create")
         self.assertEqual(woken.rule_name, "eng", "the frozen binding survived")
         self.assertIsNotNone(lifecycle.processor_named(name))
+
+
+class TestAWakeParkedOnTheLockRespectsShutdown(unittest.IsolatedAsyncioTestCase):
+    """TOCTOU sweep after Codex round 4: the disarm check ran only at
+    `get_or_create`'s entry. A wake that passed it and then parked on the
+    watcher lock could be released BY the shutdown itself (stopping the
+    sweep cancels the drop that held the lock) — and because the drop
+    mutates the record in place, the staleness fence cannot catch it. The
+    start then produced a processor `stop_all` never saw. The disarm is now
+    re-checked under both locks."""
+
+    _harness = TestTheWakeResumesTheSameSession._harness
+    _settle = TestTheWakeResumesTheSameSession._settle
+
+    async def test_the_late_wake_creates_nothing(self):
+        connector, lifecycle, dispatcher = await self._harness()
+        manager = self.manager
+        name = "rc-eng-backend"
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+
+            await connector._on_unrouted_message(_doc("m1", 1500), _ACCESS)
+            proc = lifecycle.processor_named(name)
+            lifecycle._processors.pop(name)
+            dispatcher.remove_processor(ROOM_ID, proc)
+
+            # The wake, parked on the watcher lock (what the sweep's drop
+            # holds mid-teardown).
+            lock = lifecycle._get_watcher_lock(name)
+            await lock.acquire()
+            await connector._on_raw_ddp_message(ROOM_ID, _doc("m2", 1600))
+            for _ in range(10):  # let the episode reach the lock
+                await asyncio.sleep(0)
+
+            # Shutdown begins while the wake waits; the lock then releases —
+            # in production, because the sweep task was cancelled.
+            manager._shutting_down = True
+            lock.release()
+            await self._settle(connector)
+
+        self.assertIsNone(
+            lifecycle.processor_named(name),
+            "a wake released by the shutdown must not start a processor "
+            "stop_all never saw",
+        )
 
 
 if __name__ == "__main__":

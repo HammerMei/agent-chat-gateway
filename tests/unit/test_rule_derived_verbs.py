@@ -126,6 +126,66 @@ class TestVerbsOnRuleDerivedRecords(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(lifecycle.get_watcher_state(NAME).paused,
                         "the pause survived the refused reset")
 
+    async def test_pause_refuses_a_record_reclaimed_while_it_waited(self):
+        """TOCTOU sweep after Codex round 4: pause was the odd verb out —
+        resume and reset both raise on a record reclaimed while they waited
+        on the lock, but pause fell through, answered ok and logged 'paused'
+        for a record that no longer existed. The room's next message would
+        then create a fresh, UNPAUSED watcher: a silent contradiction of the
+        operator's command."""
+        connector, lifecycle, _ = await self._harness()
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            MockProc.return_value.stop = AsyncMock()
+            await self._create(connector, lifecycle)
+
+            lock = lifecycle._get_watcher_lock(NAME)
+            await lock.acquire()
+            task = asyncio.create_task(lifecycle.pause_watcher(NAME))
+            for _ in range(5):  # past the pre-check, parked on the lock
+                await asyncio.sleep(0)
+            # The reclaim, landing while the pause waits.
+            lifecycle._states.pop(NAME)
+            lifecycle._processors.pop(NAME, None)
+            lock.release()
+
+            with self.assertRaises(RuntimeError) as ctx:
+                await task
+
+        self.assertIn("reclaimed", str(ctx.exception))
+
+    async def test_resume_and_reset_refuse_a_record_replaced_while_they_waited(self):
+        """TOCTOU sweep after Codex round 4: both verbs built `wc` from the
+        pre-lock record — acting on a REPLACEMENT would run the old record's
+        config against a watcher the operator did not select. Same identity
+        pin as the expire verb's `expected=`."""
+        connector, lifecycle, _ = await self._harness()
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            MockProc.return_value.stop = AsyncMock()
+            await self._create(connector, lifecycle)
+
+            for verb in (lifecycle.resume_watcher, lifecycle.reset_watcher):
+                original = lifecycle.get_watcher_state(NAME)
+                lock = lifecycle._get_watcher_lock(NAME)
+                await lock.acquire()
+                task = asyncio.create_task(verb(NAME))
+                for _ in range(5):
+                    await asyncio.sleep(0)
+                # The reclaim-and-recreate cycle, completed while the verb
+                # waited: a different object under the same name.
+                replacement = make_rule_derived_record(
+                    name=NAME, room_id=original.room_id)
+                lifecycle._states[NAME] = replacement
+                lifecycle._processors.pop(NAME, None)
+                lock.release()
+
+                with self.assertRaises(RuntimeError) as ctx:
+                    await task
+                self.assertIn("replaced", str(ctx.exception))
+                self.assertIs(lifecycle.get_watcher_state(NAME), replacement,
+                              "the replacement was left untouched")
+
     async def test_reset_refuses_a_pause_that_landed_while_it_waited(self):
         """Codex round 3: the paused refusal runs before the lock, so a pause
         landing between that check and the lock's acquisition would be

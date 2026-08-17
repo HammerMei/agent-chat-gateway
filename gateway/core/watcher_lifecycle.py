@@ -178,8 +178,9 @@ class WatcherLifecycle:
         recreation just made. Lock ordering is the manager's per-room lock
         outer, this lock inner; nothing takes them reversed.
 
-        **Never taken inside `start_watcher_in_room`** — `sync_watchers` already
-        holds it when it reaches that method, and the lock is not reentrant.
+        **Never taken inside `start_watcher_in_room`** — its callers (the
+        manager's `_recreate`, the verbs) already hold it when they reach that
+        method, and the lock is not reentrant.
         """
         return self._get_watcher_lock(name)
 
@@ -206,7 +207,21 @@ class WatcherLifecycle:
             )
         async with self._get_watcher_lock(name):
             state = self._states.get(name)
-            if state and state.paused:
+            if state is None or not state.config:
+                # Reclaimed while the pause waited on the lock — the same
+                # re-read rule resume and reset already apply (TOCTOU sweep
+                # after Codex round 4; pause was the odd verb out). Falling
+                # through instead answered ok and logged "paused" for a record
+                # that no longer exists, and the room's next message would
+                # create a fresh, UNPAUSED watcher — a silent contradiction of
+                # the operator's command.
+                raise RuntimeError(
+                    f"Watcher '{name}' was reclaimed while the pause waited "
+                    f"— its record is gone, so there is nothing to pause. To "
+                    f"keep the bot out of the room durably, add it to the "
+                    f"rule's 'rooms.except_for' list."
+                )
+            if state.paused:
                 logger.info("Watcher '%s' is already paused", name)
                 return
             try:
@@ -221,8 +236,7 @@ class WatcherLifecycle:
                     name,
                     e,
                 )
-            if state:
-                state.paused = True
+            state.paused = True
             self._state_store.save(self._states)
             logger.info("Watcher '%s' paused", name)
 
@@ -636,6 +650,17 @@ class WatcherLifecycle:
         self._ensure_agent_available(wc)
         async with self._get_watcher_lock(name):
             state = self._states.get(name)
+            if state is not None and state is not record:
+                # Replaced while the resume waited (TOCTOU sweep after Codex
+                # round 4): a reclaim-and-recreate cycle completed inside the
+                # lock wait, and `wc` above was built from the OLD record —
+                # resuming the replacement with it would run a config the
+                # persisted record no longer carries. Same identity-pin rule
+                # as the expire verb's `expected=`.
+                raise RuntimeError(
+                    f"Watcher '{name}' was replaced while the resume waited — "
+                    f"re-check 'list' and retry."
+                )
             if name in self._processors:
                 logger.info("Watcher '%s' is already running", name)
                 # Clear paused flag and persist — the watcher is already running
@@ -737,6 +762,15 @@ class WatcherLifecycle:
                     f"Watcher '{name}' was reclaimed while the reset waited "
                     f"— its record is gone. The room's next message creates "
                     f"a fresh watcher."
+                )
+            if state is not record:
+                # Replaced while the reset waited (TOCTOU sweep after Codex
+                # round 4): the reset would wipe the session of a watcher the
+                # operator did not select, and restart it with the OLD
+                # record's config. Same identity pin as resume's.
+                raise RuntimeError(
+                    f"Watcher '{name}' was replaced while the reset waited — "
+                    f"re-check 'list' and retry."
                 )
             if state.paused:
                 # Re-checked UNDER the lock (Codex round 3): the refusal above

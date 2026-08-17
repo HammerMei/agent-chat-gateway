@@ -510,6 +510,19 @@ class WatcherManager:
 
         lock = self._locks.setdefault(room.id, asyncio.Lock())
         async with lock:
+            if self._shutting_down:
+                # Re-checked UNDER the lock (TOCTOU sweep after Codex round
+                # 4): an episode that passed the check above and then parked
+                # on this lock — or on the watcher lock inside `_recreate` —
+                # can be released BY the shutdown itself (the sweep's stop
+                # cancels the drop that held it), and a start proceeding then
+                # is a processor `stop_all` never saw, an online notification
+                # posted mid-exit, and a save after the final save.
+                logger.info(
+                    "Not creating a watcher for room %s — the gateway began "
+                    "shutting down while this episode waited", room.id,
+                )
+                return None
             record = self._lifecycle.record_for_room(room.id)
             if record is not None:
                 resident = self._lifecycle.processor_named(record.watcher_name)
@@ -633,6 +646,17 @@ class WatcherManager:
         # against a settled record. Room lock outer, watcher lock inner —
         # nothing takes them reversed.
         async with self._lifecycle.watcher_lock(record.watcher_name):
+            if self._shutting_down:
+                # The inner half of the get_or_create re-check (TOCTOU sweep
+                # after Codex round 4): a wake parked on THIS lock while the
+                # sweep's drop held it is released by the shutdown cancelling
+                # the sweep — and the drop mutates the record in place, so the
+                # staleness check below cannot catch it.
+                logger.info(
+                    "Not recreating watcher for room %s — the gateway began "
+                    "shutting down while its wake waited", record.room_id,
+                )
+                return None
             if self._lifecycle.record_for_room(record.room_id) is not record:
                 # The record this wake was dispatched against is no longer the
                 # room's record — an expiry reclaimed it (or a later creation
