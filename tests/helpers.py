@@ -283,6 +283,7 @@ def make_bare_session_manager(**attrs):
     # override these two together, the way __init__ gates them together.
     mgr._watcher_manager = None
     mgr._sweep = None
+    mgr._cancel_jobs = None
     for name, value in attrs.items():
         setattr(mgr, name, value)
     return mgr

@@ -17,7 +17,14 @@ from datetime import UTC, datetime
 
 from ..agents import AgentBackend
 from .config import CoreConfig, WatcherConfig
-from .connector import Connector, IncomingMessage, Room, User, UserRole
+from .connector import (
+    Connector,
+    IncomingMessage,
+    MembershipHook,
+    Room,
+    User,
+    UserRole,
+)
 from .dispatch import MessageDispatcher
 from .injected_context_builder import InjectedContextBuilder
 from .lifecycle_sweep import LifecycleSweep
@@ -57,6 +64,7 @@ class SessionManager:
         session_maps: SessionMaps | None = None,
         watcher_rules: list | None = None,
         pending_jobs=None,
+        cancel_jobs=None,
     ) -> None:
         self._connector = connector
         # `state_name` is the connector's config name in production (service.py
@@ -99,6 +107,11 @@ class SessionManager:
             if self._watcher_manager is not None
             else None
         )
+        # Fired by the membership-remove handler for the reclaimed watcher's
+        # name: its pending jobs are cancelled with a stated reason rather
+        # than left pointing at nothing (§2.7). Injected like `pending_jobs`,
+        # because the job store lives above this layer.
+        self._cancel_jobs = cancel_jobs
 
     # ── Main entry point ──────────────────────────────────────────────────────
 
@@ -154,6 +167,15 @@ class SessionManager:
             # attempts subscribe-all only when a router is already registered,
             # so a router registered later would never receive an offer.
             self._connector.register_router(self._route_unclaimed_room)
+            # Alongside the router, and gated the same way: membership events
+            # exist to serve the rule-derived lifecycle, and a static-only
+            # deployment keeps its exact behaviour until its operator writes a
+            # rule. The base method is a no-op, so this is safe on a connector
+            # with no membership stream.
+            self._connector.register_membership_hook(MembershipHook(
+                added=self._on_membership_added,
+                removed=self._on_membership_removed,
+            ))
         await self._connector.connect()
 
     async def sync_only(self, unavailable_agents: set[str] | None = None) -> list[str]:
@@ -384,6 +406,54 @@ class SessionManager:
             room,
             history_before_ts=self._connector.trigger_history_bound(trigger),
         )
+
+    async def _on_membership_added(self, room: RoomRef) -> None:
+        """The bot was added to a room: register its record idle (§2.7).
+
+        Never raises toward the connector — an add the handler drops is
+        re-discovered by the room's first message, which is the safety net
+        membership registration supplements and never replaces.
+        """
+        if self._watcher_manager is None or self._watcher_manager.disarmed:
+            return
+        try:
+            await self._watcher_manager.register_on_join(room)
+        except Exception:
+            logger.exception(
+                "Membership-add handling failed for room %s — the room's "
+                "first message still creates its watcher", room.id,
+            )
+
+    async def _on_membership_removed(self, room_id: str) -> None:
+        """The bot was removed from a room: reclaim its record, cancel its jobs.
+
+        Never raises toward the connector — a remove the handler drops is
+        re-discovered by the periodic membership reconciliation, and
+        `reclaim_room` is idempotent so the late discovery reaches the same
+        end state. Gated on disarm like the add: a reclaim racing stop_all
+        would dismantle state the shutdown is flushing.
+        """
+        if self._watcher_manager is None or self._watcher_manager.disarmed:
+            return
+        try:
+            name = await self._lifecycle.reclaim_room(
+                room_id,
+                reason="the platform reported the bot removed from the room",
+            )
+        except Exception:
+            logger.exception(
+                "Membership-remove handling failed for room %s — the "
+                "reconciliation re-discovers it", room_id,
+            )
+            return
+        if name is not None and self._cancel_jobs is not None:
+            try:
+                self._cancel_jobs(name)
+            except Exception:
+                logger.exception(
+                    "Could not cancel scheduled jobs for reclaimed watcher "
+                    "'%s' — they will fail audibly when they fire", name,
+                )
 
     async def shutdown(self) -> None:
         """Stop all processors, save state, disconnect connector.

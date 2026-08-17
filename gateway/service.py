@@ -338,6 +338,11 @@ class GatewayService:
                 pending_jobs=(
                     lambda name, _cn=cc.name: self._has_pending_jobs(_cn, name)
                 ),
+                # The membership-remove handler's job cancellation (§2.7):
+                # same closure shape and same key as the oracle above.
+                cancel_jobs=(
+                    lambda name, _cn=cc.name: self._cancel_jobs_for(_cn, name)
+                ),
             )
             self._entries.append(
                 ConnectorEntry(name=cc.name, connector=connector, session_manager=sm)
@@ -380,6 +385,36 @@ class GatewayService:
                 "(keeping watcher '%s' one more pass): %s", watcher_name, e,
             )
             return True
+
+    def _cancel_jobs_for(self, connector_name: str, watcher_name: str) -> None:
+        """Cancel every scheduled job targeting a reclaimed watcher (§2.7).
+
+        Fired by the membership-remove handler after `reclaim_room` succeeds:
+        the room can never receive another message, so a job left in the store
+        would fire forever at nothing. Each cancellation is logged as an audit
+        line with the reason — a job disappearing from `schedule list` must be
+        explainable. Best-effort like the oracle: a store that cannot answer
+        leaves the jobs, and each fires audibly against the missing room
+        rather than being silently lost here.
+        """
+        try:
+            doomed = [
+                j for j in self._job_store.list_jobs(connector=connector_name)
+                if j.watcher == watcher_name
+            ]
+            for job in doomed:
+                self._job_store.remove(job.id)
+                logger.warning(
+                    "AUDIT: cancelled scheduled job %s (watcher '%s', "
+                    "connector '%s') — the bot was removed from the room, so "
+                    "the job could never deliver", job.id, watcher_name,
+                    connector_name,
+                )
+        except Exception as e:
+            logger.warning(
+                "Could not cancel scheduled jobs for reclaimed watcher '%s': %s",
+                watcher_name, e,
+            )
 
     async def _settle(
         self,

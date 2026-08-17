@@ -174,6 +174,21 @@ class RoomCapacity(Enum):
 CapacityCheck = Callable[[str], RoomCapacity]
 
 
+@dataclass(frozen=True)
+class MembershipHook:
+    """The callbacks a connector fires for the bot's own membership events (§2.7).
+
+    `added` takes the classified room (a `RoomRef` — annotated loosely because
+    `watcher_manager` imports this module); `removed` takes only the room id,
+    since a room the bot was removed from may no longer be resolvable. A pair
+    of named callables rather than two registration methods so a connector
+    cannot end up holding one half of the contract.
+    """
+
+    added: Callable[[Any], Awaitable[None]]
+    removed: Callable[[str], Awaitable[None]]
+
+
 # Connector *types* whose transport delivers unsolicited inbound — the load-time
 # twin of `Connector.supports_unsolicited_inbound()` below, which is the
 # declaration; this is what the config loader can actually read.
@@ -290,6 +305,20 @@ class Connector(ABC):
         The check returns a `RoomCapacity`, not a bool: `FULL` is backpressure and
         deserves the "server busy" reply, while `UNROUTED` means no watcher serves this
         room, which is not something to tell the room's members about.
+        """
+
+    def register_membership_hook(self, hook: "MembershipHook") -> None:
+        """Register the callbacks for the bot's own membership events (§2.7).
+
+        Implemented only where a membership stream exists (Rocket.Chat's
+        subscriptions-changed notification, Mattermost's user_added/user_removed
+        events). The base is a no-op, so a connector without one needs no
+        carve-out — the caller registers unconditionally alongside the router.
+
+        The hook's `added` receives the room the bot was added to, classified
+        exactly as a router offer would be; `removed` receives only the room id,
+        because a room the bot was removed from may no longer be resolvable at
+        all. Both fire for the *bot's own* membership only, never other users'.
         """
 
     # ── Outbound ─────────────────────────────────────────────────────────────

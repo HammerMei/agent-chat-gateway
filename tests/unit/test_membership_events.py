@@ -241,5 +241,112 @@ class TestAJoinRegistersAnIdleRecord(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(past_expire_ttl(record, joined + timedelta(days=16)))
 
 
+def _bare_manager_with_membership(**attrs):
+    from tests.helpers import make_bare_session_manager
+
+    mgr = make_bare_session_manager(**attrs)
+    if mgr._watcher_manager is None:
+        mgr._watcher_manager = MagicMock()
+        mgr._watcher_manager.disarmed = False
+        mgr._watcher_manager.register_on_join = AsyncMock(return_value="w1")
+    mgr._lifecycle.reclaim_room = AsyncMock(return_value="w1")
+    return mgr
+
+
+class TestTheMembershipHandlers(unittest.IsolatedAsyncioTestCase):
+    """The SessionManager half: events reach the manager and the lifecycle,
+    jobs are cancelled for a reclaimed name, and nothing ever raises toward
+    the connector — a dropped add is re-discovered by the room's first
+    message, a dropped remove by the reconciliation."""
+
+    async def test_an_add_registers_through_the_manager(self):
+        mgr = _bare_manager_with_membership()
+        room = _room()
+
+        await mgr._on_membership_added(room)
+
+        mgr._watcher_manager.register_on_join.assert_awaited_once_with(room)
+
+    async def test_a_remove_reclaims_and_cancels_the_jobs(self):
+        cancelled = []
+        mgr = _bare_manager_with_membership(_cancel_jobs=cancelled.append)
+
+        await mgr._on_membership_removed("room-w1")
+
+        mgr._lifecycle.reclaim_room.assert_awaited_once()
+        self.assertEqual(
+            mgr._lifecycle.reclaim_room.call_args.args[0], "room-w1")
+        self.assertEqual(cancelled, ["w1"])
+
+    async def test_a_no_op_reclaim_cancels_nothing(self):
+        """reclaim_room answering None means no record was reclaimed — a
+        static record, or no record at all — and the jobs of a watcher that
+        still exists must not be cancelled."""
+        cancelled = []
+        mgr = _bare_manager_with_membership(_cancel_jobs=cancelled.append)
+        mgr._lifecycle.reclaim_room = AsyncMock(return_value=None)
+
+        await mgr._on_membership_removed("room-w1")
+
+        self.assertEqual(cancelled, [])
+
+    async def test_a_disarmed_manager_ignores_both(self):
+        """Mid-shutdown, an add must not register after the final save and a
+        remove must not race stop_all — both are re-discovered later."""
+        mgr = _bare_manager_with_membership()
+        mgr._watcher_manager.disarmed = True
+
+        await mgr._on_membership_added(_room())
+        await mgr._on_membership_removed("room-w1")
+
+        mgr._watcher_manager.register_on_join.assert_not_awaited()
+        mgr._lifecycle.reclaim_room.assert_not_awaited()
+
+    async def test_no_manager_means_no_membership_handling(self):
+        """Static-only deployments keep their exact behaviour (§2.7)."""
+        mgr = _bare_manager_with_membership()
+        mgr._watcher_manager = None
+
+        await mgr._on_membership_added(_room())
+        await mgr._on_membership_removed("room-w1")
+
+        mgr._lifecycle.reclaim_room.assert_not_awaited()
+
+    async def test_handler_failures_never_reach_the_connector(self):
+        mgr = _bare_manager_with_membership()
+        mgr._watcher_manager.register_on_join = AsyncMock(
+            side_effect=RuntimeError("boom"))
+        mgr._lifecycle.reclaim_room = AsyncMock(
+            side_effect=RuntimeError("boom"))
+
+        await mgr._on_membership_added(_room())      # must not raise
+        await mgr._on_membership_removed("room-w1")  # must not raise
+
+    async def test_a_failed_job_cancel_does_not_undo_the_reclaim(self):
+        def explode(name):
+            raise RuntimeError("store is corrupt")
+
+        mgr = _bare_manager_with_membership(_cancel_jobs=explode)
+
+        await mgr._on_membership_removed("room-w1")  # must not raise
+
+        mgr._lifecycle.reclaim_room.assert_awaited_once()
+
+    async def test_connect_only_registers_the_hook_with_the_router(self):
+        """The hook is gated exactly like the router: rules exist, or neither
+        is registered and a static-only deployment keeps its behaviour."""
+        mgr = _bare_manager_with_membership()
+        await mgr.connect_only()
+        mgr._connector.register_membership_hook.assert_called_once()
+        hook = mgr._connector.register_membership_hook.call_args.args[0]
+        self.assertEqual(hook.added, mgr._on_membership_added)
+        self.assertEqual(hook.removed, mgr._on_membership_removed)
+
+        static = _bare_manager_with_membership()
+        static._watcher_manager = None
+        await static.connect_only()
+        static._connector.register_membership_hook.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

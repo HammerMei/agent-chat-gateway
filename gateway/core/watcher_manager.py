@@ -455,6 +455,15 @@ class WatcherManager:
         """
         self._shutting_down = True
 
+    @property
+    def disarmed(self) -> bool:
+        """Whether shutdown has begun. The membership handlers read this: an
+        event landing mid-teardown must neither register a record after the
+        final save nor reclaim one stop_all is dismantling — a skipped event
+        is re-discovered (the add by the room's first message, the remove by
+        the reconciliation), which is what idempotent handling is for."""
+        return self._shutting_down
+
     async def get_or_create(
         self,
         connector: str,
