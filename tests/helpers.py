@@ -152,6 +152,39 @@ def make_watcher(room="script", name=None, connector="script", agent="default", 
     )
 
 
+def make_rule_derived_record(
+    name="w1",
+    *,
+    room_id=None,
+    idle_days=15,
+    expire_days=15,
+    connector="rc",
+    agent="default",
+    session_id="sess-1",
+    **kw,
+):
+    """A `WatcherState` as the watcher manager persists it: frozen rule AND
+    materialized config, so `config_from_record` accepts it. Added when the
+    membership-events suite became the second place to need one (the idle-sweep
+    suite's local builder predates the config snapshot and pins TTL arithmetic,
+    which never reads it)."""
+    from gateway.core.state import WatcherState
+
+    defaults = {
+        "watcher_name": name,
+        "session_id": session_id,
+        "room_id": room_id or f"room-{name}",
+        "room_type": "channel",
+        "connector": connector,
+        "agent": agent,
+        "rule_name": "eng",
+        "rule": {"session_idle_days": idle_days, "session_expire_days": expire_days},
+        "config": {"name": name, "connector": connector, "room": "", "agent": agent},
+    }
+    defaults.update(kw)
+    return WatcherState(**defaults)
+
+
 def make_core_config(timeout: int = 10, agents=None, default_agent="default", **kw):
     """A `CoreConfig` with one agent, which is what most tests need."""
     return CoreConfig(

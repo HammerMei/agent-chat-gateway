@@ -465,6 +465,86 @@ class WatcherLifecycle:
         self._states.pop(name, None)
         self._state_store.save(self._states)
 
+    async def reclaim_room(self, room_id: str, *, reason: str) -> str | None:
+        """Membership removal (§2.7): the platform says the room is gone.
+
+        Reclaims the room's record through `_reclaim_record_locked` — the same
+        body expiry runs — under gates that are almost all *weaker* than
+        expiry's, because a removal is not an inference from inactivity:
+
+        * **A resident processor is stopped first.** Expiry bails on residency;
+          a remove can hit a live, active watcher (the bot kicked from a room
+          mid-conversation), and leaving its processor running against a popped
+          record is the defect, not the teardown. The full `_stop_processor`
+          is correct here — the room is gone, so there is no §2.2 connector
+          state worth preserving the way an idle drop preserves it.
+        * **Pause is overridden, audibly.** Pause protects a record from
+          inactivity-driven reclamation; removal is the platform stating the
+          room cannot receive another message, and honouring pause would keep
+          a session, prompt file and attachment directory alive forever for
+          it — and leave `resume` able to "revive" a room the bot has no
+          access to. The override is the one case an operator's explicit
+          setting is discarded, so it is logged as an audit event, never
+          silent.
+        * **No TTL, no job exemption.** The caller cancels this room's pending
+          jobs with a stated reason — an exemption would keep a record alive
+          for a job that can never deliver.
+
+        One gate is *stronger*: a record with no materialized config is the
+        static path's (config.yaml recreates it at every boot regardless of
+        records), and reclaiming it here would delete a watermark while
+        leaving the watcher's owner intent in place — skipped with a log,
+        matching `_recreate`'s ownership rule.
+
+        Idempotent: no record for the room answers None, so a removal
+        discovered twice — the live event and a later REST failure, or the
+        periodic reconciliation — reaches the same end state. Returns the
+        reclaimed watcher's name so the caller can cancel its jobs.
+        """
+        while True:
+            record = self.record_for_room(room_id)
+            if record is None:
+                return None
+            name = record.watcher_name
+            async with self._get_watcher_lock(name):
+                if self._states.get(name) is not record:
+                    # The record changed while we waited — an expiry reclaimed
+                    # it, or a wake replaced it. Re-read and re-decide; the
+                    # removal applies to the room, not to one snapshot of it.
+                    continue
+                if not record.config:
+                    logger.info(
+                        "Room %s's record ('%s') carries no materialized "
+                        "config — its owner is config.yaml, so a membership "
+                        "removal does not reclaim it (%s)",
+                        room_id, name, reason,
+                    )
+                    return None
+                if self._processors.get(name) is not None:
+                    try:
+                        await self._stop_processor(name)
+                    except Exception as e:
+                        logger.warning(
+                            "Watcher '%s': error stopping the processor for a "
+                            "membership removal (proceeding to reclaim): %s",
+                            name, e,
+                        )
+                if record.paused:
+                    logger.warning(
+                        "AUDIT: watcher '%s' (room %s) was paused, and its "
+                        "pause is being overridden by a membership removal — "
+                        "%s. The pause protected the record from inactivity; "
+                        "this is the platform stating the room is gone.",
+                        name, room_id, reason,
+                    )
+                await self._reclaim_record_locked(name, record)
+                logger.info(
+                    "Watcher '%s' reclaimed — %s; re-adding the bot to room "
+                    "%s starts fresh, with no continuity",
+                    name, reason, room_id,
+                )
+                return name
+
     async def resume_watcher(self, name: str) -> None:
         """Resume a paused watcher."""
         wc = self._require_watcher_config(name)
