@@ -199,10 +199,22 @@ class RocketChatREST:
 
         self.auth_token = data["data"]["authToken"]
         self.user_id = data["data"]["userId"]
-        self.bot_username = username
+        # The CANONICAL spelling the server knows, not what the operator
+        # typed (#112). Rocket.Chat's login is not spelling-exact — probed on
+        # 6.12, `probebot9207` and the account's email both log into
+        # `ProbeBot9207` — and every message frame carries the canonical
+        # form in `u.username`, so identity comparisons against the typed
+        # spelling silently fail under an ordinary configuration. The typed
+        # value is kept only for re-login.
+        self.bot_username = (
+            data["data"].get("me", {}).get("username") or username
+        )
         self._username = username
         self._password = password
-        logger.info("Logged in as %s (uid=%s)", username, self.user_id)
+        logger.info(
+            "Logged in as %s (canonical username=%s, uid=%s)",
+            username, self.bot_username, self.user_id,
+        )
 
     async def _get_server_major_version(self) -> int | None:
         """Fetch and cache the RC server's major version via ``GET /api/info``.

@@ -957,7 +957,7 @@ class RocketChatConnector(Connector):
             return
         sender = doc.get("u", {}).get("username", "")
         if doc.get("u", {}).get("_id") == self._rest.user_id or (
-            sender == self._config.username
+            sender == self.agent_username
         ):
             # By id first, and by name only as a fallback for frames that carry no id.
             # A login whose canonical username differs in casing, or which is an alias,
@@ -1624,8 +1624,15 @@ class RocketChatConnector(Connector):
 
     @property
     def agent_username(self) -> str:
-        """The bot's own RC username (from connector config)."""
-        return self._config.username
+        """The bot's own RC username — the CANONICAL spelling once logged in.
+
+        Never the configured one when the server has answered (#112): login
+        is not spelling-exact, message frames carry the canonical form, and
+        every identity comparison this property feeds (the mention gate, the
+        history handoff's own-turn labels, the own-message fallback) fails
+        silently under a lowercase or email login otherwise. Falls back to
+        the config before login, exactly like Mattermost's."""
+        return self._rest.bot_username or self._config.username
 
     @property
     def timezone(self) -> str:
@@ -1655,7 +1662,7 @@ class RocketChatConnector(Connector):
         if msg.room.type == "dm":
             return "to: me"
 
-        own = self._config.username
+        own = self.agent_username
         agent_names = set(self._config.agent_chain.agent_usernames)
         mentioned = set(msg.mentions)
 
@@ -1721,7 +1728,7 @@ class RocketChatConnector(Connector):
         raw_msgs = await self._rest.get_room_history(
             room.id, room.type, count, before_ts=before_ts, after_ts=after_ts
         )
-        bot_username = self._config.username
+        bot_username = self.agent_username
         owners = set(self._config.owners)
         guests = set(self._config.guests)
         peer_agents = set(self._config.agent_chain.agent_usernames)
@@ -1813,7 +1820,7 @@ class RocketChatConnector(Connector):
         activity = ["user-typing"] if is_typing else []
         await self._ws.call_method(
             "stream-notify-room",
-            [f"{room_id}/user-activity", self._config.username, activity],
+            [f"{room_id}/user-activity", self.agent_username, activity],
         )
 
     async def notify_online(self, room_id: str, text: str) -> None:
@@ -2036,6 +2043,7 @@ class RocketChatConnector(Connector):
             last_processed_ts=filter_ts,
             turn_store=self._turn_store,
             bot_user_id=self._rest.user_id or "",
+            bot_username=self.agent_username,
         )
         # Captured here, with no await between the filter's increment and this read, so
         # it names the count that increment belonged to. `_hand_back` compares it before

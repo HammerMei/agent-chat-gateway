@@ -502,6 +502,8 @@ class TestRocketChatMembershipEvents(unittest.IsolatedAsyncioTestCase):
         connector = RocketChatConnector.__new__(RocketChatConnector)
         connector.__init__(make_rc_config())
         connector._rest = MagicMock()
+        # Pre-login: agent_username falls back to the configured spelling.
+        connector._rest.bot_username = None
         connector._ws = MagicMock()
         return connector
 
@@ -824,6 +826,8 @@ class TestTheWiring(unittest.IsolatedAsyncioTestCase):
 
         connector = RocketChatConnector(make_rc_config())
         connector._rest = MagicMock()
+        # Pre-login: agent_username falls back to the configured spelling.
+        connector._rest.bot_username = None
         connector._ws = MagicMock()
         connector._ws.subscribe_all = AsyncMock(return_value=True)
         connector._ws.unsubscribe_rooms_keeping_callbacks = AsyncMock()

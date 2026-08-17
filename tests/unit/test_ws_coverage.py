@@ -555,6 +555,8 @@ class TestHandlerSendBusy(unittest.IsolatedAsyncioTestCase):
 
         connector = RocketChatConnector.__new__(RocketChatConnector)
         connector._rest = MagicMock()
+        # Pre-login: agent_username falls back to the configured spelling.
+        connector._rest.bot_username = None
         connector._rest.post_message = AsyncMock()
         return connector
 

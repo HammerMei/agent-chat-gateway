@@ -71,6 +71,8 @@ class TestBothConnectorsAgreeOnTheRepresentation(unittest.IsolatedAsyncioTestCas
             server_url="https://x", username="bot", password="pw", name="rc",
             owners=["glin"], timezone="UTC"))
         c._rest = MagicMock()
+        # Pre-login: agent_username falls back to the configured spelling.
+        c._rest.bot_username = None
         c._rest.get_room_history = AsyncMock(return_value=[])
         return c
 
@@ -82,6 +84,8 @@ class TestBothConnectorsAgreeOnTheRepresentation(unittest.IsolatedAsyncioTestCas
             server_url="https://x", username="bot", password="pw", name="mm",
             team="eng", owners=["glin"], timezone="UTC"))
         c._rest = MagicMock()
+        # Pre-login: agent_username falls back to the configured spelling.
+        c._rest.bot_username = None
         c._rest.get_room_history = AsyncMock(return_value=[])
         c._rest.bot_username = "bot"
         return c
@@ -131,6 +135,8 @@ class TestTheAgentFacingHalfStaysISO(unittest.IsolatedAsyncioTestCase):
             server_url="https://x", username="bot", password="pw", name="rc",
             owners=["glin"], timezone="UTC"))
         c._rest = MagicMock()
+        # Pre-login: agent_username falls back to the configured spelling.
+        c._rest.bot_username = None
         c._rest.get_room_history = AsyncMock(return_value=[
             {"_id": "m1", "msg": "hi", "u": {"username": "glin"},
              "ts": {"$date": int(_EPOCH)}},

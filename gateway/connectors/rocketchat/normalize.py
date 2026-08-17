@@ -77,6 +77,7 @@ def filter_rc_message(
     last_processed_ts: str | None,
     turn_store: "TurnStore | None" = None,
     bot_user_id: str = "",
+    bot_username: str = "",
 ) -> FilterResult:
     """Decide whether a raw RC DDP message document should be processed.
 
@@ -128,6 +129,9 @@ def filter_rc_message(
         )
 
     sender = doc.get("u", {}).get("username", "")
+    # The canonical spelling once the connector has logged in (#112); the
+    # configured one only before that, or in tests that pass no better.
+    own_username = bot_username or config.username
 
     # 1. Skip own messages — by id first, name only as a fallback for frames carrying no
     #    id. Rocket.Chat's login is not spelling-exact: probed against 6.12, an account
@@ -147,7 +151,7 @@ def filter_rc_message(
     #    `bot_user_id` for exactly this all along.
     if bot_user_id and doc.get("u", {}).get("_id") == bot_user_id:
         return FilterResult(accepted=False, reason="own message")
-    if sender == config.username:
+    if sender == own_username:
         return FilterResult(accepted=False, reason="own message")
 
     # Determine if sender is a known agent
@@ -163,7 +167,7 @@ def filter_rc_message(
     # 3. For channels/groups: require @mention (unless listen-all mode or agent sender)
     if config.require_mention and not is_agent and room_type != "dm":
         mentions = doc.get("mentions", [])
-        bot_mentioned = any(m.get("username") == config.username for m in mentions)
+        bot_mentioned = any(m.get("username") == own_username for m in mentions)
         room_wide_mentioned = any(
             is_room_wide_mention(m.get("username", "")) for m in mentions
         )
@@ -173,7 +177,7 @@ def filter_rc_message(
                 a.get("description", "") for a in doc.get("attachments", [])
             )
             searchable = (msg_text + " " + attach_descs).strip()
-            if not _mention_pattern(config.username).search(searchable):
+            if not _mention_pattern(own_username).search(searchable):
                 return FilterResult(
                     accepted=False, sender=sender, reason="bot not mentioned"
                 )
@@ -276,7 +280,7 @@ async def normalize_rc_message(
         display_name=doc.get("u", {}).get("name", sender_username),
     )
 
-    text = _extract_text(doc, room.type, config.username)
+    text = _extract_text(doc, room.type, rest.bot_username or config.username)
     attachments, warnings = await _download_attachments(doc, config, rest, cache_dir)
     thread_id: str | None = doc.get("tmid") or None
 

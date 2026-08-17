@@ -62,6 +62,8 @@ def _make_connector():
     connector._subscribe_all = False
     connector._dm_kinds = {}
     connector._rest = MagicMock()
+    # Pre-login: agent_username falls back to the configured spelling.
+    connector._rest.bot_username = None
     # Membership is the ordinary case, so replay tests are not all about the gate. A bare
     # MagicMock would answer with a truthy object that is still `is not True`, which reads
     # as "removed" and would make every replay test pass by replaying nothing.
@@ -295,6 +297,8 @@ class TestWatermarkAdvancement(unittest.IsolatedAsyncioTestCase):
         connector = RocketChatConnector.__new__(RocketChatConnector)
         connector._config = config
         connector._rest = MagicMock()
+        # Pre-login: agent_username falls back to the configured spelling.
+        connector._rest.bot_username = None
         connector._ws = MagicMock()
         connector._handler = None
         connector._capacity_check = None
@@ -395,6 +399,9 @@ def _make_rc_connector():
 
     connector = RocketChatConnector.__new__(RocketChatConnector)
     connector._config = _make_config()
+    # Pre-login: agent_username falls back to the configured spelling (#112).
+    connector._rest = MagicMock()
+    connector._rest.bot_username = None
     return connector
 
 
@@ -547,6 +554,9 @@ def _make_rc_connector_with_agents(agent_usernames: list[str]):
     cfg = _make_config()
     cfg.agent_chain = AgentChainConfig(agent_usernames=agent_usernames)
     connector._config = cfg
+    # Pre-login: agent_username falls back to the configured spelling (#112).
+    connector._rest = MagicMock()
+    connector._rest.bot_username = None
     return connector
 
 
@@ -1195,6 +1205,8 @@ class TestNotifyAgentEvent(unittest.IsolatedAsyncioTestCase):
         connector = RocketChatConnector.__new__(RocketChatConnector)
         connector._config = _make_config()
         connector._rest = MagicMock()
+        # Pre-login: agent_username falls back to the configured spelling.
+        connector._rest.bot_username = None
         connector._ws = MagicMock()
         connector._ws.call_method = AsyncMock()
         return connector
@@ -2185,6 +2197,61 @@ class TestSystemMessagesOnTheLivePath(unittest.TestCase):
         self.assertTrue(result.accepted)
 
 
+class TestTheMentionGateUsesTheCanonicalUsername(unittest.TestCase):
+    """#112: login is not spelling-exact, and mentions carry the CANONICAL
+    spelling. Under a lowercase or email login, a gate comparing against the
+    configured spelling never recognises being @-mentioned — the bot
+    connects, subscribes, and silently ignores everyone in every
+    require_mention room."""
+
+    def _config(self):
+        from gateway.connectors.rocketchat.config import RocketChatConfig
+
+        # The operator typed the lowercase form; the server knows ProbeBot9207.
+        return RocketChatConfig(
+            server_url="https://x", username="probebot9207", password="pw",
+            name="rc", owners=["glin"],
+        )
+
+    def _doc(self, mention):
+        return {"_id": "m1", "rid": "ch1", "msg": f"@{mention} hello",
+                "u": {"username": "glin"}, "ts": {"$date": 1},
+                "mentions": [{"username": mention}]}
+
+    def test_a_canonical_mention_is_recognised_when_passed_through(self):
+        from gateway.connectors.rocketchat.normalize import filter_rc_message
+
+        result = filter_rc_message(
+            self._doc("ProbeBot9207"), self._config(),
+            room_type="channel", last_processed_ts=None,
+            bot_username="ProbeBot9207",
+        )
+        self.assertTrue(result.accepted, result.reason)
+
+    def test_without_the_canonical_name_the_gate_goes_deaf(self):
+        """The failure #112 documents, pinned so the fallback's limits stay
+        visible: config-spelling comparison misses the canonical mention."""
+        from gateway.connectors.rocketchat.normalize import filter_rc_message
+
+        result = filter_rc_message(
+            self._doc("ProbeBot9207"), self._config(),
+            room_type="channel", last_processed_ts=None,
+        )
+        self.assertFalse(result.accepted)
+
+    def test_an_own_message_is_recognised_by_canonical_name(self):
+        from gateway.connectors.rocketchat.normalize import filter_rc_message
+
+        doc = {"_id": "m1", "rid": "ch1", "msg": "my own reply",
+               "u": {"username": "ProbeBot9207"}, "ts": {"$date": 1}}
+        result = filter_rc_message(
+            doc, self._config(), room_type="dm", last_processed_ts=None,
+            bot_username="ProbeBot9207",
+        )
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "own message")
+
+
 class TestTheMentionGateIsKindAware(unittest.TestCase):
     """A group DM goes down the mention-required side (§2.7, §6.4).
 
@@ -2254,6 +2321,8 @@ class TestProbeMissedSince(unittest.IsolatedAsyncioTestCase):
 
         connector = _make_connector()
         connector._rest = MagicMock()
+        # Pre-login: agent_username falls back to the configured spelling.
+        connector._rest.bot_username = None
         connector._rest.user_id = "BOT_ID"
         connector._rest.get_room_history_page = AsyncMock(return_value=HistoryPage(
             messages=docs,
@@ -2537,6 +2606,8 @@ class TestUnroutedMessages(unittest.IsolatedAsyncioTestCase):
         connector = _make_connector()
         connector._ws = MagicMock(register_default_callback=MagicMock())
         connector._rest = MagicMock()
+        # Pre-login: agent_username falls back to the configured spelling.
+        connector._rest.bot_username = None
         connector._rest.dm_member_count = AsyncMock(return_value=2)
         self.offered = []
         connector._config = _make_config(owners=["glin"])
@@ -2632,6 +2703,8 @@ class TestDirectRoomClassification(unittest.IsolatedAsyncioTestCase):
         connector = _make_connector()
         connector._ws = MagicMock(register_default_callback=MagicMock())
         connector._rest = MagicMock()
+        # Pre-login: agent_username falls back to the configured spelling.
+        connector._rest.bot_username = None
         connector._rest.dm_members = AsyncMock(return_value=list(members))
         self.offered = []
         connector._config = _make_config(owners=["glin"])

@@ -96,9 +96,36 @@ class TestLogin(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(rest.auth_token, "tok123")
         self.assertEqual(rest.user_id, "uid456")
+        # No `me` in the response → the typed spelling is all there is.
         self.assertEqual(rest.bot_username, "bot")
         self.assertEqual(rest._username, "bot")
         self.assertEqual(rest._password, "pass")
+
+    async def test_login_stores_the_canonical_username_not_the_typed_one(self):
+        """#112: login is not spelling-exact (probed on 6.12 — 'probebot9207'
+        and the account's email both log into 'ProbeBot9207'), and every
+        message frame carries the canonical form. Identity comparisons built
+        on the typed spelling silently fail — the bot never recognises its
+        own @mention — so the canonical one is what login must keep."""
+        rest = _make_rest()
+        ok_resp = _make_response(
+            200,
+            {
+                "status": "success",
+                "data": {
+                    "authToken": "tok123",
+                    "userId": "uid456",
+                    "me": {"username": "ProbeBot9207"},
+                },
+            },
+        )
+        rest._client.post = AsyncMock(return_value=ok_resp)
+
+        await rest.login("probebot9207", "pass")
+
+        self.assertEqual(rest.bot_username, "ProbeBot9207")
+        # The typed spelling survives for re-login only.
+        self.assertEqual(rest._username, "probebot9207")
 
     async def test_login_status_not_success_raises(self):
         rest = _make_rest()

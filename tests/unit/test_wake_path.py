@@ -60,6 +60,8 @@ class TestTheWakeResumesTheSameSession(unittest.IsolatedAsyncioTestCase):
         # The wire is the seam being doubled — everything above it is real.
         await connector._rest._client.aclose()
         connector._rest = MagicMock()
+        # Pre-login: agent_username falls back to the configured spelling.
+        connector._rest.bot_username = None
         connector._rest.user_id = "bot-id"
         connector._rest.is_room_member = AsyncMock(return_value=True)
         connector._ws = MagicMock()
