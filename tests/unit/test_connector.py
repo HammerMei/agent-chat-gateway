@@ -4346,8 +4346,9 @@ class TestAnIdleRoomWakesOnItsNextMessage(unittest.IsolatedAsyncioTestCase):
                 "u": {"username": "alice"}, "ts": {"$date": ts}}
 
     async def _settle(self, connector):
-        while connector._routing_tasks:
-            await asyncio.gather(*connector._routing_tasks)
+        from tests.helpers import settle_routing_tasks
+
+        await settle_routing_tasks(connector)
 
     async def test_the_wake_offers_the_room_and_redelivers_the_trigger(self):
         from gateway.core.watcher_manager import RoomRef
@@ -4443,8 +4444,9 @@ class TestADeclinedWakeDoesNotLoop(unittest.IsolatedAsyncioTestCase):
                 "u": {"username": "alice"}, "ts": {"$date": ts}}
 
     async def _settle(self, connector):
-        while connector._routing_tasks:
-            await asyncio.gather(*connector._routing_tasks)
+        from tests.helpers import settle_routing_tasks
+
+        await settle_routing_tasks(connector)
 
     async def test_declined_frames_are_dropped_and_remembered_not_redelivered(self):
         connector = self._connector()

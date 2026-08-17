@@ -103,10 +103,9 @@ class TestTheWakeResumesTheSameSession(unittest.IsolatedAsyncioTestCase):
         return connector, lifecycle, dispatcher
 
     async def _settle(self, connector):
-        import asyncio
+        from tests.helpers import settle_routing_tasks
 
-        while connector._routing_tasks:
-            await asyncio.gather(*connector._routing_tasks)
+        await settle_routing_tasks(connector)
 
     async def test_create_idle_wake_resumes_the_same_session(self):
         connector, lifecycle, dispatcher = await self._harness()

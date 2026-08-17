@@ -1733,8 +1733,9 @@ class TestAnIdleChannelWakesOnItsNextMessage(unittest.IsolatedAsyncioTestCase):
                 "mentions": []}
 
     async def _settle(self, connector):
-        while connector._routing_tasks:
-            await asyncio.gather(*connector._routing_tasks)
+        from tests.helpers import settle_routing_tasks
+
+        await settle_routing_tasks(connector)
 
     async def test_the_wake_offers_the_channel_and_redelivers_the_trigger(self):
         from gateway.core.watcher_manager import RoomRef
@@ -1801,8 +1802,9 @@ class TestADeclinedChannelWakeDoesNotLoop(unittest.IsolatedAsyncioTestCase):
                 "mentions": []}
 
     async def _settle(self, connector):
-        while connector._routing_tasks:
-            await asyncio.gather(*connector._routing_tasks)
+        from tests.helpers import settle_routing_tasks
+
+        await settle_routing_tasks(connector)
 
     async def test_declined_frames_are_dropped_and_remembered_not_redelivered(self):
         connector = await self._connector()

@@ -195,6 +195,23 @@ def make_manager(
     )
 
 
+async def settle_routing_tasks(connector):
+    """Wait until every spawned routing episode has finished AND been discarded.
+
+    Not a bare `while set: gather` — that livelocks: awaiting an already-done
+    task returns **without yielding**, and the `discard` runs in a done-callback
+    that needs loop time it then never gets. The whole test spins as one giant
+    callback (caught on Python 3.13, where the runner's debug mode reported a
+    single 120-second callback; 3.11 only ever dodged it by timing). The
+    `sleep(0)` is the yield that lets the callbacks drain the set.
+    """
+    import asyncio
+
+    while connector._routing_tasks:
+        await asyncio.gather(*connector._routing_tasks)
+        await asyncio.sleep(0)
+
+
 def make_bare_session_manager(**attrs):
     """A `SessionManager` built without `__init__`, every collaborator a double.
 
