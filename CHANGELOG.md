@@ -9,181 +9,155 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-- **A watcher that is supposed to be running and is not now has a name: `failed`**
-  (design §2.5). A start writes its record partway through — before the subscription
-  and the processor — so that a later failure does not lose the session id; the
-  consequence was a record that is not paused, not dropped and not running, which
-  `list` called `active`. It is **derived, not stored**: the record says what the
-  gateway wants, residency says what is, and `failed` is the two disagreeing, so the
-  next successful start clears it with nobody having to remember to. Such a watcher is
-  retried on **every daemon start** rather than being remembered as hopeless — the
-  operator keeps getting the signal until they fix it, and `pause` is how they say
-  "stop trying this one".
-- **`list` reports state records rather than config entries** (design §2.8), and takes
-  a state filter: `--active`, `--idle`, `--paused`, `--failed`, `--all`, defaulting to
-  everything except idle. Under rule-derived watchers there is no static set of
-  watchers in `config.yaml` to enumerate, and deriving the rows from live processors
-  would hide idle and paused rooms from the very commands that can still act on them.
-  Three visible consequences:
-  - Output is now an aligned table with **room id** and **participants** columns. The
-    participants column is how a group DM is identified, so it is part of the default
-    view rather than something to hide behind a flag.
-  - **A watcher appears exactly when a state record exists for it** — not when it
-    is configured, and not when it started. A start that fails before the record
-    is written, or one whose rollback removes it, leaves no row; a start that
-    fails after a record already existed shows as `failed`. So the same fault can
-    present either way depending on whether the watcher has ever run, and no row
-    means "nothing left to act on" rather than "the start never got far" — the
-    startup errors say what actually failed. Such a watcher can still be paused by
-    name, which is how one that fails on every boot is kept from being retried.
-  - `status` asks for every state explicitly, so its `Watchers:` count stays a total
-    rather than silently inheriting `list`'s narrower default.
-  - **`list` can show a record the operator verbs cannot act on.** A watcher whose
-    agent was unavailable at boot has a record on disk but none in memory, and
-    `pause`/`resume`/`reset` read only the in-memory map — so pausing one writes a
-    blank record over it and loses its session id. That is pre-existing behaviour
-    which this change makes *visible* rather than introduces; it is tracked in #118
-    and deliberately not fixed here, because doing so requires writes that a
-    read-only view has no business making.
-- **One room is served by one watcher, and one session belongs to one room**
-  (design §4.1). Both were previously unenforced, and both failed silently:
-  - The dispatch index kept a *list* of processors per room and fanned every message
-    out to all of them, so two watchers on one connector+room meant two agents
-    answering every message — neither seeing the other's reply, since each connector
-    filters its own account. The index is now a single slot: config load rejects the
-    pair by name, and a second claim at runtime raises. **Two watchers on one
-    connector and one room no longer start.** Two agents in one room remains
-    supported the way it is meant to be done — one bot account each, so one connector
-    each. If an existing config carries such a pair, note the recovery cost: the daemon
-    refuses to start until one entry is removed, and removing it also prunes that
-    watcher's persisted record — its session id, watermark and paused flag.
-  - `bind_session` overwrote an existing session→room binding without a word, which
-    points a session's identity header, transcript and permission routing at a second
-    room. It now fails closed, and startup refuses outright when a state file already
-    contains such a pair, naming both records.
-- **A room with no watcher is no longer reported as backpressure.** The capacity
-  preflight returned a bool, so "no processor" and "queue full" were indistinguishable
-  and both connectors posted "server busy" into a room that an idle gateway simply was
-  not serving. It now reports `AVAILABLE` / `FULL` / `UNROUTED`, and only `FULL`
-  produces the busy notice.
+### Changed — the watcher model itself
+- **BREAKING: `watchers:` entries are rules, and watchers are created per room
+  at runtime** (`docs/design/dynamic-watcher-design.md`). A rule declares which
+  rooms an agent serves — `rooms:` is a mapping with `include:` glob patterns,
+  `except_for:`, and the DM opt-ins `direct:` / `group_direct:` — and the
+  gateway creates each room's watcher on the room's first message (Rocket.Chat,
+  Mattermost) or eagerly at startup for connectors with no inbound stream
+  (voice, script, whose rules must name literal rooms). Rules match top-down;
+  the first rule that claims a room wins, and `acg config validate` warns about
+  rules an earlier rule shadows. Each created watcher is named
+  `<connector>-<room>`, which is what `list` shows and the operator verbs act
+  on. **The static shape — a `room:` key, or `rooms:` as a list — is a hard
+  load error** naming the migration guide; see
+  `docs/migration-dynamic-watchers.md`, and note the upgrade **resets every
+  existing watcher session**: static-era state records are pruned at the first
+  post-rewrite start (logged per record), and each room begins a fresh session
+  on its first message.
+- **Watchers now idle and expire** (design §2.5). A room quiet for
+  `session_idle_days` (default 15) has its runtime dropped — the session is
+  kept, the connector's room state survives, and the room's next message wakes
+  it into the *same* session. A further `session_expire_days` (default 15)
+  after the drop, everything is reclaimed: record, backend session, prompt
+  file, attachment workspace. The TTLs are per rule, both default to 15, and
+  there is **no ordering constraint between them** — they are sequential legs
+  measured from different origins (last activity; the drop). An hourly sweep
+  runs both legs, advancing a watcher at most one state per pass, so an outage
+  of any length cannot cascade `active → expired`; a pending scheduled job
+  exempts a room from expiry (never from idling); **pause exempts from both**.
+  Boot runs the same evaluation over was-active records, so a fleet reads
+  honestly after a restart instead of `failed`.
+- **Operator verbs act on records, and there is a new one**:
+  `acg expire <watcher>` reclaims a room's record, session and files now,
+  cancelling its scheduled jobs (it overrides pause, audibly — the audit line
+  names the room). `pause` on a room the gateway has never seen is rejected
+  with a pointer at `rooms.except_for` (the old path fabricated a blank record
+  that then *overwrote the real one on disk* — #118). `reset` refuses a paused
+  watcher instead of silently clearing the pause; `resume` restarts the idle
+  clock at the moment of resume, so a long-paused watcher is not re-idled by
+  the next sweep pass.
+- **`list` reports state records rather than config entries** (design §2.8),
+  with a state filter: `--active`, `--idle`, `--paused`, `--failed`, `--all`,
+  defaulting to everything except idle. Rows carry room id and participants; a
+  watcher that is supposed to be running and is not reads **`failed`** —
+  derived from record-vs-residency, never stored, so the next successful start
+  clears it. A failed record past its idle TTL converts to idle at the next
+  boot rather than being retried forever.
 
 ### Added
-- **Two connectors may no longer run as one bot account.** Each connector reports the
-  identity its platform assigned it — Rocket.Chat's login user id, Mattermost's
-  `users/me` id plus resolved team id — and startup refuses before any connector
-  subscribes if two of them are the same account on the same server. Sharing an account
-  means both receive the identical message stream, so every room matching rules on both
-  gets two agents answering it, which the per-connector watcher key cannot detect.
-  Two exceptions, per design §4.5: Mattermost connectors scoped to **different teams**
-  may share an account, and no two of them may claim **overlapping** direct messages (a
-  DM has no team, so it reaches every connection the account has open). A rule opting in
-  with `direct:`/`group_direct:` claims every DM; a static `@someone` watcher claims just
-  that conversation, so two connectors on `@alice` and `@bob` are a working setup.
-  A connector that cannot establish its own identity stops startup rather than starting
-  unchecked. Mattermost now opens its socket while connecting but starts reading it
-  only after watchers are restored, so messages arriving during startup are buffered
-  instead of discarded for a channel the connector does not know yet — a window that
-  already spanned each connector's watcher restore, and that the new barrier would
-  otherwise have widened. `acg config validate` reports the case config can see — two connectors
-  naming one server and one username — without needing a restart.
+- **Membership events** (design §2.7): both discovering connectors register a
+  room the moment the bot is added to it — as an idle record, nothing started,
+  so a bot invited to fifty rooms is listable immediately at zero session
+  cost — and reclaim the room's record, session and files the moment the bot
+  is removed, overriding pause (the platform saying the room is gone outranks
+  an inactivity guard) and cancelling the room's scheduled jobs. Rocket.Chat
+  listens on `subscriptions-changed`, Mattermost on `user_added`/
+  `user_removed`. A **periodic membership reconciliation** (daily) backstops a
+  missed removal event for paused and idle records, which nothing else ever
+  touches; an unanswerable membership probe keeps everything (fail = keep).
+- **`docs/migration-dynamic-watchers.md`** — the rewrite procedure, the field
+  notes (a DM entry cannot be named; `direct: true` replaces `room: "@user"`),
+  and the accepted losses, stated as such.
+- **Two connectors may no longer run as one bot account.** Each connector
+  reports the identity its platform assigned it, and startup refuses before
+  any connector subscribes if two of them are the same account on the same
+  server. Two exceptions, per design §4.5: Mattermost connectors scoped to
+  **different teams** may share an account, and no two of them may claim
+  **overlapping** direct messages — a rule opting in with `direct:`/
+  `group_direct:` claims that whole DM class, so two connectors both opting in
+  conflict. A connector that cannot establish its own identity stops startup.
+  Mattermost opens its socket while connecting but starts reading only after
+  watchers are restored, so startup messages are buffered rather than
+  discarded.
 - **A persisted session is only resumed against the backend that issued it.**
-  Watcher state records the resolved `backend_identity` (agent backend type plus
-  the **canonicalized** working directory — a deploy symlink repointed to a new
-  target is a different store, and a process launched there sees the physical
-  path) alongside the session id, and the two are compared before the
-  id is reused. Changing an agent's `type` or `working_directory` now starts a
-  fresh session, logged with the before/after identity, instead of replaying the
-  stored id into a different session store — where it finds nothing, or matches an
-  unrelated session that happens to carry the same id. The earlier conversation is
-  left intact in the backend it belongs to. A record with no stored identity is
-  treated the same way: an id that cannot be attributed to a store is not resumed.
-- **Config schema groundwork for on-the-fly watchers** (see
-  `docs/design/dynamic-watcher-design.md`) — purely additive, no runtime
-  behavior change yet:
-  - `session_idle_days` / `session_expire_days` — optional TTL settings for the
-    upcoming idle/expire watcher lifecycle, on a **watcher rule**, so two rules
-    sharing one agent can differ. Both default to `None` (feature off).
-    Validated at load time: positive integers, and `session_idle_days` must be
-    strictly less than `session_expire_days` when both are set. They briefly
-    lived on `AgentConfig` earlier in this same unreleased cycle; setting either
-    on an agent is now a load error naming the new home.
-  - `AgentBackend.typical_session_retention_days() -> int | None` — lets a
-    backend declare its own session-retention limit. `ClaudeBackend` returns
-    `30` (Claude Code's default `cleanupPeriodDays`); `OpenCodeBackend`
-    returns `None` (no automatic expiry).
-  - `WatcherConfig.exclude_rooms` — new field for the future `room: "*"` +
-    `exclude_room:` rule-matching mechanism. `room: "*"` itself is currently
-    rejected at config-load time with a clear "not implemented yet" error —
-    the rule-matching engine that would give it meaning hasn't landed yet.
+  Watcher state records the resolved `backend_identity` (agent backend type
+  plus the canonicalized working directory) alongside the session id, and the
+  two are compared before the id is reused. Changing an agent's `type` or
+  `working_directory` starts a fresh session, logged with the before/after
+  identity, instead of replaying the stored id into a different session store.
+- `AgentBackend.typical_session_retention_days() -> int | None` — a backend
+  declares its session-retention limit (`ClaudeBackend`: 30; `OpenCodeBackend`:
+  none).
 
 ### Changed
-- **Per-room files are named by a digest instead of the watcher name.**
-  (`docs/design/dynamic-watcher-design.md` §2.3.) v0.5.1 documented watcher names as
-  "persistent identifiers (state.json sessions, CLI pause/resume/reset, attachment/
-  system-prompt file paths)"; the last of those no longer holds.
-
-  The two artifacts key on different things, because they identify different things:
-
-  - the **attachment workspace** (`<working_directory>/.acg-attachments/…`) keys on
-    `(connector, room id)` — the cache it links to is per room and shared by definition.
-    A rename no longer orphans it, and a name collision can no longer point one room's
-    attachment path at another room's files;
-  - the **system-prompt file** (`<RUNTIME_DIR>/system-prompts/…`) keys on
-    `(connector, room id, watcher name)`, because its contents are built from the agent
-    and that watcher's own context files. Two watchers may bind different agents to one
-    room, and a room-only key would make the second silently overwrite the first.
-
-  So renaming a watcher still orphans its prompt file — unchanged from before, where that
-  file was named after the watcher outright. What the digest removes is the *collision*:
-  two rooms can no longer share one path. Once watchers are created per room, the name is
-  derived from the room and the prompt key becomes room-determined too.
-
-  *On upgrade:* one prompt file and one symlink per existing room are orphaned once. They
-  are internal artifacts and harmless to delete; automatic reclamation belongs to the
-  watcher-expiry work. Watcher names remain persistent identifiers for state records and
-  for `pause`/`resume`/`reset`.
+- **Per-room files are named by a digest instead of the watcher name**
+  (design §2.3): the attachment workspace keys on `(connector, room id)`, the
+  system-prompt file on `(connector, room id, watcher name)`. A rename no
+  longer orphans the workspace, and two rooms can no longer collide onto one
+  path. *On upgrade:* one prompt file and one symlink per existing room are
+  orphaned once; they are internal artifacts and harmless to delete — expiry
+  reclaims the new ones automatically.
+- **A room with no watcher is no longer reported as backpressure.** The
+  capacity preflight reports `AVAILABLE` / `FULL` / `UNROUTED`, and only
+  `FULL` produces the "server busy" notice.
+- **One room is served by one watcher, and one session belongs to one room**
+  (design §4.1). The dispatch index is a single slot — a second claim at
+  runtime raises — and `bind_session` fails closed instead of silently
+  re-pointing a session's identity header and permission routing at a second
+  room. Under rules the collision cannot arise from config: first-match
+  precedence decides, and validate warns about the shadowed rule. Two agents
+  in one room remains supported the intended way — one bot account each.
 
 ### Removed
-- **BREAKING: `watchers[].session_id` (sticky sessions).** Setting it is now a
-  config error naming the replacement, rather than being silently ignored — every
-  field on a watcher entry is read with `.get()`, so a quiet removal would have
-  left the config loading, the session no longer pinned, and nothing said about it.
-  This was documented in `v0.5.1`, so **a config carrying it fails at startup after
-  upgrading.**
-
-  *Why it is gone rather than moved:* a pinned id names a session the backend is
-  free to expire (Claude Code's default `cleanupPeriodDays` is 30), after which the
-  watcher silently starts empty; and with a watcher created per discovered room,
-  one id in config cannot say which room it belongs to.
-
-  *Migration:* delete the field. To carry context into a session, have the agent
-  summarise its session to a file and list that file in `context_inject_files` —
-  see `docs/user-guide.md`'s Use Case 3. Session *continuity* across daemon
-  restarts needs no configuration and is unaffected: the runtime-assigned session
-  id is persisted in the state file and resumed. The two cross-watcher
-  duplicate-`session_id` load errors are gone with the field.
+- **BREAKING: the static watcher shape** (`room:`, `rooms:` as a list, the
+  auto-derived `<connector>-<room>` naming of static entries, `exclude_room`,
+  and the `room: "*"` placeholder rejection). All replaced by rules, above.
+- **BREAKING: `watchers[].session_id` (sticky sessions).** Setting it is a
+  config error naming the replacement rather than being silently ignored. This
+  was documented in `v0.5.1`, so a config carrying it fails at startup after
+  upgrading. *Why gone rather than moved:* a pinned id names a session the
+  backend is free to expire, and with a watcher created per discovered room,
+  one id in config cannot say which room it belongs to. *Migration:* delete
+  the field; to carry context into a session, have the agent summarise it to a
+  file and list that file in `context_inject_files` (user guide, Use Case 3).
+  Runtime session continuity across restarts is unaffected.
 
 ### Fixed
-- **File attachment uploads restored on Rocket.Chat 8.0+.** RC 8.0 removed
-  the one-step `rooms.upload/{rid}` endpoint that `RocketChatREST.upload_file()`
-  relied on, silently breaking `send --attach` and agent-triggered uploads on
-  any RC 8.x server (closes #56). `RocketChatREST` now detects the server's
-  major version via the unauthenticated `GET /api/info` endpoint (cached after
-  first successful fetch) and dispatches to RC 8.0+'s two-step
-  `rooms.media` + `rooms.mediaConfirm` flow when appropriate, falling back to
-  the legacy one-step flow for pre-8.0 servers or when the version can't be
-  determined.
-- **OpenCode agents no longer lose their identity/addressing header after context
-  compaction.** #52/#58 fixed this for Claude via `--append-system-prompt-file`;
-  OpenCode's `ensure_durable_instructions()` was left as a one-time send into
-  conversation history (not compaction-resistant) pending this follow-up.
-  `OpenCodeBackend` now writes durable content to a per-watcher file and
-  forwards its content fresh on every `send()`/`stream()` call via OpenCode's
-  per-request `system` field on `POST /session/{id}/message` — a per-request
-  mechanism, not a sidecar-wide config, since a single OpenCode agent config
-  (and its sidecar) can be shared by multiple ACG watchers that each need
-  distinct identity content.
+- **The bot's Rocket.Chat identity is the account the server knows, not the
+  configured spelling** (#112). Login is not spelling-exact — a lowercase or
+  email login resolves to the account's canonical username, which is what
+  every message frame carries — so the mention gate, the history handoff's
+  own-turn labels, the own-message fallback, the `to:` field and the typing
+  payload all compared against the wrong string and failed silently. They now
+  use the canonical spelling captured at login.
+- **A delivery in flight across a watcher restart no longer commits to a
+  detached state object** (#115), on either connector: the watermark, dedup id
+  and hand-back boundary follow the *room*, so an accepted message is not
+  re-delivered by the next replay and a handed-back one stays recoverable.
+  Also from #115: Mattermost's `unregister_channel` releases the channel's
+  queue and worker instead of leaking them; the Rocket.Chat routing path
+  records a `roomParticipant: False` removal for a tracked room instead of
+  dropping the news; the sender allow-list has one implementation again; and a
+  stale return annotation is corrected.
+- **`pause`/`resume`/`reset` no longer corrupt a record that exists on disk
+  but was not loaded this run** (#118): the blank-record fabrication is gone
+  with the path that produced it, a raising watermark read no longer aborts a
+  teardown's unsubscribe and drain, and the stale-`room_id` cursor hazard is
+  unreachable under records bound to `(connector, room_id)`.
+- **Permission brokers are enforced on every start path.** The fail-closed
+  guard for an unavailable agent lived only in `resume`/`reset`, so a watcher
+  created on the message path (or eagerly at boot) could start without its
+  permission broker and process messages with no tool-call enforcement,
+  silently.
+- **File attachment uploads restored on Rocket.Chat 8.0+.** RC 8.0 removed the
+  one-step `rooms.upload/{rid}` endpoint (closes #56); the client now detects
+  the server's major version and dispatches to the two-step
+  `rooms.media` + `rooms.mediaConfirm` flow, falling back for pre-8.0 servers.
+- **OpenCode agents no longer lose their identity/addressing header after
+  context compaction.** Durable content is written per watcher and forwarded
+  fresh on every send via OpenCode's per-request `system` field.
 
 ## [0.5.1] - 2026-07-30
 
