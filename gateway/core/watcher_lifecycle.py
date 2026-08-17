@@ -545,6 +545,38 @@ class WatcherLifecycle:
                 )
                 return name
 
+    def register_idle_record(self, wc: WatcherConfig, room: Room,
+                             provenance: dict) -> None:
+        """Membership add (§2.7): persist a record in idle state, start nothing.
+
+        The sessionless sibling of `start_watcher_in_room`'s step 3: the same
+        construction — provenance applied at construction, unknown keys
+        refused — with every session-scoped field empty, because no session
+        exists. No maps binding (nothing to bind), no dispatcher claim, no
+        subscription: the room's first message takes the untracked path, and
+        the routing episode finds this record and wakes it through
+        `_recreate`, where `_provision_session` treats the empty session id
+        as "none yet" and mints one.
+
+        Caller (the manager's `register_on_join`) holds both the per-room and
+        the per-watcher lock, and has already established no record exists
+        for the room.
+        """
+        ws = WatcherState(
+            watcher_name=wc.name,
+            session_id="",
+            room_id=room.id,
+            room_type=room.type,
+            room_name=room.name,
+            context_injected=False,
+            paused=False,
+            last_processed_ts="",
+            backend_identity="",
+            **provenance,
+        )
+        self._states[wc.name] = ws
+        self._state_store.save(self._states)
+
     async def resume_watcher(self, name: str) -> None:
         """Resume a paused watcher."""
         wc = self._require_watcher_config(name)

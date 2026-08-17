@@ -9,8 +9,13 @@ discovered twice reaches the same end state.
 """
 
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
+from gateway.core.room_pattern import RoomPattern
+from gateway.core.state import StateFilter, lifecycle_state, past_expire_ttl
+from gateway.core.watcher_manager import RoomRef, WatcherManager, config_from_record
+from gateway.core.watcher_rule import RoomKind, RoomMatcher, WatcherRule
 from tests.helpers import (
     MockAgentBackend,
     make_core_config,
@@ -129,6 +134,111 @@ class TestARemovalReclaimsTheRecord(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(name, "w1")
         self.assertIsNone(lifecycle.get_watcher_state("w1"))
+
+
+def _rule(name="eng", include=("eng-*",), **kwargs):
+    return WatcherRule(
+        name=name,
+        connector="rc",
+        agent="default",
+        rooms=RoomMatcher(
+            include=tuple(RoomPattern(p) for p in include),
+            except_for=(),
+            direct=False,
+            group_direct=False,
+        ),
+        **kwargs,
+    )
+
+
+def _room(id="r1", kind=RoomKind.CHANNEL, name="eng-backend", participants=()):
+    return RoomRef(id=id, kind=kind, name=name, participants=participants)
+
+
+def _add_harness(rules=None):
+    """A real manager over a real lifecycle — the add path writes a record
+    and starts nothing, so the whole stack can be real except the stores."""
+    lifecycle, connector = _harness([])
+    manager = WatcherManager(
+        "rc", connector, lifecycle, rules if rules is not None else [_rule()])
+    return manager, lifecycle, connector
+
+
+class TestAJoinRegistersAnIdleRecord(unittest.IsolatedAsyncioTestCase):
+
+    async def test_the_record_is_idle_addressable_and_recreatable(self):
+        manager, lifecycle, connector = _add_harness()
+
+        name = await manager.register_on_join(_room())
+
+        self.assertEqual(name, "rc-eng-backend")
+        record = lifecycle.get_watcher_state(name)
+        self.assertIsNotNone(record, "the record is persisted")
+        # Idle, not active and not failed: dropped_at is the join stamp.
+        self.assertTrue(record.dropped_at)
+        self.assertEqual(
+            lifecycle_state(record, resident=False), StateFilter.IDLE)
+        # The rule was snapshotted at join (§2.4) and the config materialized —
+        # without the frozen config the first-message wake declines the record
+        # as static and the room is permanently deaf.
+        self.assertIsNotNone(config_from_record(record))
+        self.assertEqual(record.rule_name, "eng")
+        self.assertTrue(record.rule)
+        self.assertEqual(record.room_kind, "channel")
+        lifecycle._state_store.save.assert_called()
+
+    async def test_nothing_is_started(self):
+        manager, lifecycle, connector = _add_harness()
+
+        name = await manager.register_on_join(_room())
+
+        record = lifecycle.get_watcher_state(name)
+        self.assertEqual(record.session_id, "", "no session is provisioned")
+        self.assertNotIn(name, lifecycle._processors, "no processor runs")
+        connector.subscribe_room.assert_not_called()
+        lifecycle._dispatcher.add_processor.assert_not_called()
+
+    async def test_a_duplicate_add_never_restamps_the_clocks(self):
+        """A duplicate add event — or an add for a room whose record already
+        exists — must not reset dropped_at (pushing expiry out) or re-snapshot
+        the rule (breaking sticky binding)."""
+        manager, lifecycle, _ = _add_harness()
+
+        name = await manager.register_on_join(_room())
+        record = lifecycle.get_watcher_state(name)
+        stamped = record.dropped_at
+
+        self.assertIsNone(await manager.register_on_join(_room()))
+        self.assertIs(lifecycle.get_watcher_state(name), record)
+        self.assertEqual(record.dropped_at, stamped)
+
+    async def test_no_matching_rule_registers_nothing(self):
+        manager, lifecycle, _ = _add_harness(rules=[_rule(include=("ops-*",))])
+
+        self.assertIsNone(await manager.register_on_join(_room()))
+        self.assertIsNone(lifecycle.get_watcher_state("rc-eng-backend"))
+
+    async def test_a_disarmed_manager_registers_nothing(self):
+        manager, lifecycle, _ = _add_harness()
+        manager.disarm()
+
+        self.assertIsNone(await manager.register_on_join(_room()))
+        self.assertIsNone(lifecycle.get_watcher_state("rc-eng-backend"))
+
+    async def test_a_never_spoken_room_expires_from_the_join_stamp(self):
+        """Deliberate (§2.7): the registered record reuses the idle state
+        rather than inventing a fourth one, so it inherits idle's full
+        semantics — including expiry `session_expire_days` after the join."""
+        manager, lifecycle, _ = _add_harness()
+
+        name = await manager.register_on_join(_room())
+        record = lifecycle.get_watcher_state(name)
+
+        joined = datetime.fromisoformat(record.dropped_at)
+        if joined.tzinfo is None:
+            joined = joined.astimezone(timezone.utc)
+        self.assertFalse(past_expire_ttl(record, joined + timedelta(days=14)))
+        self.assertTrue(past_expire_ttl(record, joined + timedelta(days=16)))
 
 
 if __name__ == "__main__":

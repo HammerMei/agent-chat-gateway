@@ -311,6 +311,41 @@ def _digest(room_id: str) -> str:
     return hashlib.sha256(room_id.encode()).hexdigest()[:_GROUP_DM_LABEL_DIGITS]
 
 
+def creation_provenance(
+    wc: WatcherConfig,
+    rule: WatcherRule,
+    room: RoomRef,
+    *,
+    connector_name: str,
+    agent_name: str,
+    now: str,
+    dropped_at: str = "",
+) -> dict:
+    """The §5.3 fields only the moment of creation knows (§2.4).
+
+    One construction site for both creators — the message-path `_create` and
+    the membership-add `register_on_join` — because two hand-built dicts drift
+    the day a field is added, and the field they drift on is exactly the one a
+    recreation then silently fails to carry. `dropped_at` is the only
+    difference between the two: a message-path creation starts active (""),
+    a join registers idle (stamped with the join time), and the expiry timer
+    runs from that stamp.
+    """
+    return {
+        "room_kind": room.kind.value,
+        "participants": list(room.participants),
+        "connector": connector_name,
+        "agent": agent_name,
+        "created_at": now,
+        "last_activity_at": now,
+        "dropped_at": dropped_at,
+        "config": _jsonable(wc),
+        "rule_name": rule.name,
+        "rule": rule_snapshot(rule),
+        "config_schema_version": CONFIG_SCHEMA_VERSION,
+    }
+
+
 def config_from_record(record: WatcherState) -> WatcherConfig | None:
     """Rebuild the materialized config a record was persisted with (§2.4).
 
@@ -473,6 +508,70 @@ class WatcherManager:
                     return resident
                 return await self._recreate(record, room, history_before_ts)
             return await self._create(room, history_before_ts)
+
+    async def register_on_join(self, room: RoomRef) -> str | None:
+        """A membership-add registers the room's record in `idle` state (§2.7).
+
+        The rule is matched and snapshotted at join time, the config is
+        materialized, and **nothing is started** — no session, no history
+        handoff, no subscription. Starting would pay the eager cost this
+        design exists to avoid, for every room the bot is added to including
+        ones never used. The room becomes listable and addressable
+        immediately; its first message wakes it through the normal untracked
+        path, whose episode finds the record and takes `_recreate`.
+
+        A supplement, never a replacement: an add event that arrives during a
+        disconnect is simply gone (Mattermost's socket has no replay), so
+        message-triggered creation stays the safety net and this method's
+        absence changes nothing but visibility.
+
+        Under the same per-room lock as `get_or_create`, because an add event
+        and the room's first message can arrive near-simultaneously and that
+        lock is what makes "existence check + create" one critical section.
+        A room that already has a record is a no-op — a duplicate add must
+        not restamp clocks or re-snapshot the rule (§2.4, sticky binding).
+
+        The registered record inherits full idle semantics deliberately: a
+        room nobody ever speaks in expires `session_expire_days` after the
+        join, reusing the idle state rather than inventing a fourth one.
+        Returns the registered name, or None for every no-op.
+        """
+        if self._shutting_down:
+            return None
+        lock = self._locks.setdefault(room.id, asyncio.Lock())
+        async with lock:
+            if self._lifecycle.record_for_room(room.id) is not None:
+                return None
+            rule = first_matching_rule(self._rules, self._connector_name, room)
+            if rule is None:
+                logger.debug(
+                    "Membership add for room %s matches no rule — not registered",
+                    room.id,
+                )
+                return None
+            wc = materialize(rule, room)
+            now = now_iso()
+            provenance = creation_provenance(
+                wc, rule, room,
+                connector_name=self._connector_name,
+                agent_name=self._lifecycle.resolve_agent_name(wc.agent),
+                now=now,
+                # Registered idle: the record's expiry clock starts at the join.
+                dropped_at=now,
+            )
+            platform_room = Room(
+                id=room.id,
+                name=room_description(room),
+                type=room.kind.value,
+            )
+            async with self._lifecycle.watcher_lock(wc.name):
+                self._lifecycle.register_idle_record(wc, platform_room, provenance)
+            logger.info(
+                "Registered watcher '%s' idle for room %s from rule '%s' "
+                "(membership add) — its first message starts it",
+                wc.name, room.id, rule.name,
+            )
+            return wc.name
 
     async def _recreate(
         self,
@@ -652,20 +751,12 @@ class WatcherManager:
         # which a concurrent creation's save persists this record without its
         # rule, and a crash in that window leaves an orphan for the next boot to
         # prune.
-        now = now_iso()
-        provenance = {
-            "room_kind": room.kind.value,
-            "participants": list(room.participants),
-            "connector": self._connector_name,
-            "agent": self._lifecycle.resolve_agent_name(wc.agent),
-            "created_at": now,
-            "last_activity_at": now,
-            "dropped_at": "",
-            "config": _jsonable(wc),
-            "rule_name": rule.name,
-            "rule": rule_snapshot(rule),
-            "config_schema_version": CONFIG_SCHEMA_VERSION,
-        }
+        provenance = creation_provenance(
+            wc, rule, room,
+            connector_name=self._connector_name,
+            agent_name=self._lifecycle.resolve_agent_name(wc.agent),
+            now=now_iso(),
+        )
         self._creations_in_flight += 1
         try:
             # A raise propagates (§2.2): a creation that failed is an abort, and
