@@ -682,6 +682,27 @@ class TestRocketChatMembershipEvents(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(room.kind, RoomKind.GROUP_DM)
         self.assertEqual(room.participants, ("alice", "bob"))
 
+    async def test_an_add_outrun_by_its_own_removal_does_not_register(self):
+        """Codex round 4, RC twin: the direct-room add pays a member lookup,
+        and a removal landing in that await must not be outrun — the
+        generation captured before the classification is rechecked as the
+        last statement before the hook."""
+        connector = self._connector()
+        hook, added, _ = _hook()
+        connector.register_membership_hook(hook)
+
+        async def members_then_removal_lands(rid):
+            # The removal, mid-await: what the removed arm stamps.
+            connector._note_membership_loss("d1")
+            return ["alice", "bob"]
+
+        connector._rest.dm_members = AsyncMock(
+            side_effect=members_then_removal_lands)
+
+        await connector._on_membership_event("inserted", {"rid": "d1", "t": "d"})
+
+        added.assert_not_awaited()
+
     async def test_a_removed_subscription_reclaims_by_room_id(self):
         connector = self._connector()
         hook, added, removed = _hook()
@@ -779,6 +800,35 @@ class TestMattermostMembershipEvents(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(room.kind, RoomKind.CHANNEL)
         self.assertEqual(room.name, "eng-backend")
         removed.assert_not_awaited()
+
+    async def test_an_add_outrun_by_its_own_removal_does_not_register(self):
+        """Codex round 4: the add's REST classification awaits, and a removal
+        landing in that window must win — registering afterwards would create
+        an idle record for a room the bot has already left, operable until
+        the daily reconciliation. The generation captured at dispatch is what
+        the recheck before the hook compares."""
+        connector = self._connector()
+        hook, added, _ = _hook()
+        connector.register_membership_hook(hook)
+
+        async def classify_then_removal_lands(channel_id):
+            # The removal, mid-await: what the user_removed arm stamps.
+            connector._membership_gen[channel_id] = (
+                connector._membership_gen.get(channel_id, 0) + 1)
+            return {"id": "chan-1", "type": "O", "name": "eng-backend",
+                    "display_name": "Eng Backend", "team_id": "team-1"}
+
+        connector._rest.get_channel = AsyncMock(
+            side_effect=classify_then_removal_lands)
+
+        await connector._on_membership_event({
+            "event": "user_added",
+            "data": {"user_id": "bot-id-1", "team_id": "team-1"},
+            "broadcast": {"channel_id": "chan-1"},
+        })
+        await self._settle(connector)
+
+        added.assert_not_awaited()
 
     async def test_someone_elses_add_is_ignored(self):
         connector = self._connector()

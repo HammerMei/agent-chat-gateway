@@ -122,7 +122,10 @@ def _make_sm_mock(inject_result: bool = True, paused: bool = False, room_id: str
     sm = MagicMock()
     sm.inject_message = AsyncMock(return_value=inject_result)
     sm.notify_watcher_room = AsyncMock(return_value=True)
-    sm.get_watcher_config = MagicMock(return_value=MagicMock())
+    # `get_watcher_config` was removed with the static path (Codex round 4) —
+    # a bare MagicMock would keep answering for it and hide exactly the
+    # AttributeError the scheduler's fallback used to raise in production.
+    del sm.get_watcher_config
     watcher_state = MagicMock()
     watcher_state.paused = paused
     watcher_state.room_id = room_id
@@ -1398,7 +1401,7 @@ class TestInjectionResolvesOnceAndReportsFailure(unittest.IsolatedAsyncioTestCas
 
     async def test_no_owner_reports_a_lookup_miss(self):
         stranger = _make_sm_mock()
-        stranger.get_watcher_config = MagicMock(return_value=None)
+        stranger.get_watcher_state = MagicMock(return_value=None)
         scheduler = self._scheduler({"mm-eng": stranger})
 
         with self.assertLogs("agent-chat-gateway.core.scheduler", "WARNING") as logs:

@@ -1056,6 +1056,21 @@ class WatcherLifecycle:
             # failure mode this parameter exists to close.
             **(provenance or {}),
         )
+        # The record this start is replacing, kept for the rollbacks below
+        # (Codex round 4, P1): a RECREATION that fails mid-start must restore
+        # it, not pop — popping left the room recordless in memory, so the
+        # caller's retry took `_create` against the current rules and minted a
+        # fresh session, silently discarding the frozen binding and watermark
+        # the record on disk still carried. The rollbacks never save, so after
+        # a restore memory matches disk again.
+        prior = self._states.get(wc.name)
+
+        def _rollback_record() -> None:
+            if prior is not None:
+                self._states[wc.name] = prior
+            else:
+                self._states.pop(wc.name, None)
+
         self._states[wc.name] = ws
         try:
             self._maps.bind_session(session_id, room.id, self._connector)
@@ -1065,7 +1080,9 @@ class WatcherLifecycle:
             # it, and the next boot's uniqueness preflight refuses to start at all — a
             # transient conflict turned into a permanently unbootable state file. The
             # freshly created backend session goes too; nothing will ever use it.
-            self._states.pop(wc.name, None)
+            # (That rationale was about the NEW ws staying; the PRIOR record
+            # existed before this start and is safe to restore.)
+            _rollback_record()
             await self._cleanup_startup_session_best_effort(
                 agent, session_id, created_new_session, wc.name
             )
@@ -1145,7 +1162,7 @@ class WatcherLifecycle:
                 content=built_content,
             )
         except Exception:
-            self._states.pop(wc.name, None)
+            _rollback_record()
             self._maps.remove_session(session_id)
             await self._cleanup_startup_session_best_effort(
                 agent, session_id, created_new_session, wc.name
@@ -1172,7 +1189,7 @@ class WatcherLifecycle:
             # WatcherState (with context_injected=True) and a dangling session
             # binding that would cause context re-injection to be skipped on the
             # next attempt.
-            self._states.pop(wc.name, None)
+            _rollback_record()
             self._maps.remove_session(session_id)
             await self._cleanup_startup_session_best_effort(
                 agent, session_id, created_new_session, wc.name

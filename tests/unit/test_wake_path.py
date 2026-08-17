@@ -384,5 +384,68 @@ class TestAWakeLandingMidDropWaits(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class TestAFailedRecreationKeepsTheRecord(unittest.IsolatedAsyncioTestCase):
+    """Codex round 4 (P1): a recreation that fails mid-start used to POP the
+    record from `_states` in its rollback — the room was then recordless in
+    memory, so the retry took `_create` against the current rules and minted
+    a fresh session, silently discarding the frozen binding and watermark
+    still sitting on disk. The rollback must restore the prior record, so the
+    retry goes back through `_recreate`."""
+
+    _harness = TestTheWakeResumesTheSameSession._harness
+    _settle = TestTheWakeResumesTheSameSession._settle
+
+    async def test_the_prior_record_survives_and_the_retry_resumes(self):
+        connector, lifecycle, dispatcher = await self._harness()
+        name = "rc-eng-backend"
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+
+            # 1. Creation, then the idle drop's postcondition.
+            await connector._on_unrouted_message(_doc("m1", 1500), _ACCESS)
+            record = lifecycle.get_watcher_state(name)
+            session_id = record.session_id
+            proc = lifecycle.processor_named(name)
+            lifecycle._processors.pop(name)
+            dispatcher.remove_processor(ROOM_ID, proc)
+
+            # 2. The wake, with a failure inside the start (context injection
+            # — one of the three rollback paths that popped). Raises for as
+            # long as it is installed: the routing episode retries within the
+            # same wake, and this pin needs the FAILED outcome to observe.
+            real_ensure = lifecycle._injector.ensure
+
+            async def failing_ensure(*args, **kwargs):
+                raise RuntimeError("injection failure")
+
+            lifecycle._injector.ensure = failing_ensure
+
+            await connector._on_raw_ddp_message(ROOM_ID, _doc("m2", 1600))
+            await self._settle(connector)
+
+            # The rollback restored the PRIOR record — the exact object, not
+            # a copy and not an empty map.
+            self.assertIs(
+                lifecycle.get_watcher_state(name), record,
+                "the failed recreation must restore the record it replaced — "
+                "popping it converts the retry into a first-time _create",
+            )
+            self.assertIsNone(lifecycle.processor_named(name))
+
+            # 3. The failure clears; the next message must go through
+            # _recreate against the restored record.
+            lifecycle._injector.ensure = real_ensure
+            await connector._on_raw_ddp_message(ROOM_ID, _doc("m3", 1700))
+            await self._settle(connector)
+
+        woken = lifecycle.get_watcher_state(name)
+        self.assertEqual(woken.session_id, session_id,
+                         "the retry RESUMED the frozen session — _recreate, "
+                         "not a fresh _create")
+        self.assertEqual(woken.rule_name, "eng", "the frozen binding survived")
+        self.assertIsNotNone(lifecycle.processor_named(name))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -953,7 +953,13 @@ class MattermostConnector(Connector):
             )
             coro = self._membership_hook.removed(channel_id)
         else:
-            coro = self._handle_membership_add(channel_id)
+            # The generation, captured SYNCHRONOUSLY at dispatch (Codex round
+            # 4): the add's REST classification awaits, and a removal that
+            # lands in that window must not be outrun — the recheck before
+            # `hook.added` compares against this. A genuine re-add captures
+            # the already-bumped generation and still passes.
+            entry_gen = self._membership_gen.get(channel_id, 0)
+            coro = self._handle_membership_add(channel_id, entry_gen)
         # Guarded like RC's `_run_membership_callback`, and for the same
         # reason: a hook that raises inside a spawned task is otherwise an
         # unobserved task exception — a GC-time warning, not a log line.
@@ -970,7 +976,9 @@ class MattermostConnector(Connector):
                 "cover it", channel_id,
             )
 
-    async def _handle_membership_add(self, channel_id: str) -> None:
+    async def _handle_membership_add(
+        self, channel_id: str, entry_gen: int = 0,
+    ) -> None:
         """Classify a joined channel via REST and hand it to the hook.
 
         The event itself is sparse — `data` carries only `user_id` and
@@ -1001,6 +1009,18 @@ class MattermostConnector(Connector):
             return
         room = self._room_ref_from_event(channel_id, decoded)
         if room is None:
+            return
+        if self._membership_gen.get(channel_id, 0) != entry_gen:
+            # A removal landed while the classification awaited (Codex round
+            # 4): registering now would create an idle record for a room the
+            # bot has already left. The last recheck before the hook, so both
+            # interleavings are correct — a removal after this add's dispatch
+            # fails here, and a genuine re-add captured the bumped generation
+            # at dispatch and passes.
+            logger.info(
+                "Channel %s: membership was lost while the join was being "
+                "classified — not registering", channel_id,
+            )
             return
         await self._membership_hook.added(room)
 

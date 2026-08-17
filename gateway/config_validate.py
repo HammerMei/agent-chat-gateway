@@ -383,18 +383,39 @@ def _check_state_orphans(config: GatewayConfig, result: ValidationResult) -> Non
     # configured connectors would never open it — so an unreadable file belonging to a
     # since-renamed connector would pass validation and then be abandoned silently at
     # startup, which is the failure the refusal exists to prevent.
+    configured = {c.name for c in config.connectors}
     for path in state_files():
+        file_connector = connector_name_of(path)
         try:
-            load_state(connector_name_of(path))
+            states = load_state(file_connector)
         except StateFormatError as exc:
             msg = str(exc)
             result.errors.append(msg)
             result.findings.append(
                 Finding("error", "global", None, None, msg)
             )
+            continue
         except Exception:
             # Handled inside load_state by starting fresh; nothing to report.
-            pass
+            continue
+        if file_connector not in configured and states:
+            # A state file whose connector was renamed or removed (Codex round
+            # 4): its records are valid but no SessionManager will ever
+            # hydrate them — the loop below iterates configured connectors
+            # only, so without this the file's sessions are abandoned with no
+            # warning anywhere. Only files that actually carry records are
+            # reported; an empty leftover file is noise.
+            msg = (
+                f"State file '{path.name}' belongs to connector "
+                f"'{file_connector}', which is not in config.yaml — its "
+                f"{len(states)} record(s) will never be loaded and their "
+                "sessions stay abandoned. Restore the connector name to "
+                "reclaim them, or delete the file if they are unwanted."
+            )
+            result.warnings.append(msg)
+            result.findings.append(
+                Finding("warning", "global", None, None, msg)
+            )
 
     for connector in config.connectors:
         try:

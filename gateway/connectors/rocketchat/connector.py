@@ -909,8 +909,21 @@ class RocketChatConnector(Connector):
                 self._note_membership_loss(rid)
                 await self._membership_hook.removed(rid)
                 return
+            # The generation, captured before the classification awaits (Codex
+            # round 4): a removal landing in that window bumps it, and the
+            # recheck below is the last statement before the hook — so an add
+            # outrun by its own removal never registers a record for a room
+            # the bot has already left, while a genuine re-add captures the
+            # bumped generation here and still passes.
+            entry_gen = self._room_membership_gen.get(rid, 0)
             room = await self._room_ref_from_sub_doc(rid, doc)
             if room is not None:
+                if self._room_membership_gen.get(rid, 0) != entry_gen:
+                    logger.info(
+                        "Room %s: membership was lost while the join was "
+                        "being classified — not registering", rid,
+                    )
+                    return
                 await self._membership_hook.added(room)
         except Exception:
             logger.exception(

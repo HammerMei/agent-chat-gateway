@@ -265,6 +265,66 @@ class TestValidateConfigStateOrphans(_ValidateConfigTestBase):
         self.assertIn("stale", result.warnings[0])
         self.assertIn("static-era", result.warnings[0])
 
+    def test_a_state_file_of_a_removed_connector_is_reported(self):
+        """Codex round 4: a connector renamed or removed in config.yaml leaves
+        its state file behind, and no SessionManager will ever hydrate it —
+        without this warning its records (and their sessions) are abandoned
+        silently. Rule-derived records are exactly the ones this matters for:
+        they are 'never an orphan' by shape, so the connector-set comparison
+        is the only check that can catch them."""
+        cfg = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                rooms:
+                  include: [general]
+        """)
+        self.runtime_dir.mkdir()
+        (self.runtime_dir / "state.old-rc.json").write_text(json.dumps({
+            "version": STATE_FORMAT_VERSION,
+            "watchers": [
+                {"watcher_name": "w1", "session_id": "keep", "room_id": "r1",
+                 "rule_name": "w1"},
+            ]
+        }))
+        result = self._validate(cfg)
+        self.assertTrue(result.ok, "abandoned records are a warning, not an error")
+        self.assertEqual(len(result.warnings), 1)
+        self.assertIn("old-rc", result.warnings[0])
+        self.assertIn("not in config.yaml", result.warnings[0])
+
+    def test_an_empty_leftover_state_file_is_not_reported(self):
+        """The noise gate: a removed connector's file with no records has
+        nothing to abandon."""
+        cfg = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                rooms:
+                  include: [general]
+        """)
+        self.runtime_dir.mkdir()
+        (self.runtime_dir / "state.old-rc.json").write_text(json.dumps({
+            "version": STATE_FORMAT_VERSION, "watchers": []
+        }))
+        result = self._validate(cfg)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.warnings, [])
+
     def test_a_legacy_state_file_is_reported_as_an_error_not_skipped(self):
         """The branch that reads state used to be `except Exception: continue`.
 
