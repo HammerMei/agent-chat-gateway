@@ -575,6 +575,39 @@ class SessionManager:
     async def reset_watcher(self, name: str) -> None:
         await self._lifecycle.reset_watcher(name)
 
+    async def expire_watcher(self, name: str) -> None:
+        """The §2.8 `expire` verb: operator-initiated reclamation, now.
+
+        Runs the same forced-reclamation path a membership removal runs —
+        pause overridden with an audit line, scheduled jobs cancelled — but
+        raises where the event handlers swallow: an operator watching the
+        command must see the failure the connector must not. Only a
+        rule-derived record is expirable; a static watcher's owner is
+        config.yaml, and there is nothing durable to reclaim for it.
+        """
+        state = self._lifecycle.get_watcher_state(name)
+        if state is None or not state.config or not state.room_id:
+            raise RuntimeError(
+                f"No expirable record for watcher '{name}' — expire acts on a "
+                f"rule-derived record, and this name has none."
+            )
+        reclaimed = await self._lifecycle.reclaim_room(
+            state.room_id, reason=f"operator 'expire' on watcher '{name}'"
+        )
+        if reclaimed is None:
+            raise RuntimeError(
+                f"Watcher '{name}' was not reclaimed — its record changed "
+                f"while the expire ran. Re-check 'list' and retry."
+            )
+        if self._cancel_jobs is not None:
+            try:
+                self._cancel_jobs(reclaimed)
+            except Exception:
+                logger.exception(
+                    "Could not cancel scheduled jobs for expired watcher "
+                    "'%s' — they will fail audibly when they fire", reclaimed,
+                )
+
     async def inject_message(self, watcher_name: str, text: str) -> bool:
         """Inject a synthetic OWNER-role message directly into a watcher's queue.
 
@@ -735,6 +768,16 @@ class SessionManager:
                 return {"ok": False, "error": "Missing 'watcher_name' for 'reset' command"}
             try:
                 await self.reset_watcher(name)
+                return {"ok": True}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+
+        elif cmd == "expire":
+            name = request.get("watcher_name", "")
+            if not name:
+                return {"ok": False, "error": "Missing 'watcher_name' for 'expire' command"}
+            try:
+                await self.expire_watcher(name)
                 return {"ok": True}
             except Exception as e:
                 return {"ok": False, "error": str(e)}

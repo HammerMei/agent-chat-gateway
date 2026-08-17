@@ -40,6 +40,10 @@ def _make_entry(name: str, dispatch_result: dict | None = None,
         def _get_watcher_config(wname: str):
             return MagicMock() if wname in watcher_names else None
         entry.session_manager.get_watcher_config = MagicMock(side_effect=_get_watcher_config)
+        # A static-only entry: no rule-derived records. Without this the bare
+        # MagicMock answers truthy for every name, and the record fallback in
+        # _find_entry_for_watcher (§2.8) matches "unknown" watchers.
+        entry.session_manager.get_watcher_state = MagicMock(return_value=None)
     return entry
 
 

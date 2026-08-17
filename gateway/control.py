@@ -242,9 +242,9 @@ class ControlServer:
         if cmd and cmd.startswith("schedule-"):
             return self._handle_schedule(cmd, request)
 
-        # pause/resume/reset: auto-resolve connector from watcher name (watcher names are
-        # globally unique across all connectors, so no --connector is needed).
-        if cmd in ("pause", "resume", "reset") and not connector_name:
+        # pause/resume/reset/expire: auto-resolve connector from watcher name (watcher
+        # names are globally unique across all connectors, so no --connector is needed).
+        if cmd in ("pause", "resume", "reset", "expire") and not connector_name:
             watcher_name = request.get("watcher_name", "")
             entry = self._find_entry_for_watcher(watcher_name)
             if isinstance(entry, dict):
@@ -305,6 +305,13 @@ class ControlServer:
             return {"ok": False, "error": "Missing 'watcher_name'"}
         for entry in self._entries:
             if entry.session_manager.get_watcher_config(watcher_name) is not None:
+                return entry
+        # A rule-derived watcher has no config entry — its persisted record
+        # answers for it (§2.8). Checked second so the static path keeps
+        # winning while both exist; names cannot collide across the two, since
+        # rule-derived names embed the connector and a room label or digest.
+        for entry in self._entries:
+            if entry.session_manager.get_watcher_state(watcher_name) is not None:
                 return entry
         return {"ok": False, "error": f"Unknown watcher: {watcher_name!r}"}
 

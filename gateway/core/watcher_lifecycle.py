@@ -27,12 +27,18 @@ from .state import (
     StateFilter,
     WatcherState,
     backend_identity,
+    carried_fields,
     lifecycle_state,
+    now_iso,
     past_expire_ttl,
     past_idle_ttl,
     state_filter_name,
 )
 from .state_store import StateStore
+
+# No cycle: watcher_manager's runtime imports reach state/config/connector,
+# never back into this module (its lifecycle reference is TYPE_CHECKING only).
+from .watcher_manager import config_from_record
 
 logger = logging.getLogger("agent-chat-gateway.core.watcher_lifecycle")
 
@@ -233,8 +239,28 @@ class WatcherLifecycle:
     # ── Lifecycle controls ────────────────────────────────────────────────────
 
     async def pause_watcher(self, name: str) -> None:
-        """Pause a watcher: stop processing messages but preserve state."""
-        self._require_watcher_config(name)
+        """Pause a watcher: stop processing messages but preserve state.
+
+        Two kinds of name reach this (§2.8): a rule-derived record answers
+        for itself — it carries everything a pause writes — while a static
+        name still needs its config entry. A rule-derived name with **no**
+        record is rejected: pause acts on a record, and an unobserved room
+        has none — no id, no kind, nothing to key on (§4.4). The rejection
+        points at the rule's `except_for:`, which is where "never engage with
+        this room" belongs — declarative and effective before the first
+        message. Extending the static path's fabricate-a-blank-record branch
+        here instead would recreate #118's defect 1 on the new model.
+        """
+        record = self._states.get(name)
+        if record is None or not record.config:
+            # The static path, byte-identical until the cutover deletes it.
+            if self.get_watcher_config(name) is None:
+                raise RuntimeError(
+                    f"No watcher named '{name}' — pause acts on a record, and "
+                    f"a room the gateway has never seen has none (§4.4). To "
+                    f"keep the bot out of a room durably, add the room to the "
+                    f"rule's 'rooms.except_for' list instead."
+                )
         async with self._get_watcher_lock(name):
             state = self._states.get(name)
             if state and state.paused:
@@ -466,7 +492,12 @@ class WatcherLifecycle:
         self._state_store.save(self._states)
 
     async def reclaim_room(self, room_id: str, *, reason: str) -> str | None:
-        """Membership removal (§2.7): the platform says the room is gone.
+        """Forced reclamation of a room's record — not a timer's (§2.7, §4.4).
+
+        Three callers, one semantics: a live membership removal, the periodic
+        reconciliation discovering one that was missed, and the operator's
+        `expire` verb. Each is an authoritative statement, never an inference
+        from inactivity — which is why the gates below differ from expiry's.
 
         Reclaims the room's record through `_reclaim_record_locked` — the same
         body expiry runs — under gates that are almost all *weaker* than
@@ -532,9 +563,10 @@ class WatcherLifecycle:
                 if record.paused:
                     logger.warning(
                         "AUDIT: watcher '%s' (room %s) was paused, and its "
-                        "pause is being overridden by a membership removal — "
-                        "%s. The pause protected the record from inactivity; "
-                        "this is the platform stating the room is gone.",
+                        "pause is being overridden by a forced reclamation — "
+                        "%s. The pause protected the record from "
+                        "inactivity-driven timers; this reclamation is not "
+                        "one (§4.4).",
                         name, room_id, reason,
                     )
                 await self._reclaim_record_locked(name, record)
@@ -578,8 +610,21 @@ class WatcherLifecycle:
         self._state_store.save(self._states)
 
     async def resume_watcher(self, name: str) -> None:
-        """Resume a paused watcher."""
-        wc = self._require_watcher_config(name)
+        """Resume a paused watcher.
+
+        A rule-derived record resumes from itself (§2.8): its own materialized
+        config, a Room built from its own fields — a group DM has no name to
+        resolve, so the static path's name resolution is wrong for it — and
+        `carried_fields`, so the frozen snapshots survive the fresh
+        `WatcherState` the start constructs. A resume that passed bare
+        provenance would wipe `rule`/`config`/`created_at`, and the next boot
+        would prune the emptied record as an orphan (the A1 lesson, again).
+        """
+        record = self._states.get(name)
+        wc = config_from_record(record) if record is not None else None
+        if wc is None:
+            # The static path, byte-identical until the cutover deletes it.
+            wc = self._require_watcher_config(name)
         self._ensure_agent_available(wc)
         async with self._get_watcher_lock(name):
             state = self._states.get(name)
@@ -592,21 +637,75 @@ class WatcherLifecycle:
                 self._state_store.save(self._states)
                 return
             try:
-                await self._start_watcher(wc, state)
+                if state is not None and state.config:
+                    await self._resume_record(wc, state)
+                else:
+                    await self._start_watcher(wc, state)
             except Exception as e:
                 logger.error("Failed to resume watcher '%s': %s", name, e)
                 raise
-            # Only clear paused flag AFTER successful start — if _start_watcher() raises,
+            # Only clear paused flag AFTER successful start — if the start raises,
             # the watcher is still stopped and the paused flag should remain True in memory
             # so the next restart (or manual retry) correctly reflects the watcher's state.
+            # (The record path's start constructs a fresh WatcherState with
+            # paused=False already; `state` is the pre-start object, so this
+            # write is a no-op there and load-bearing only for the static path.)
+            state = self._states.get(name)
             if state:
                 state.paused = False
             self._state_store.save(self._states)
             logger.info("Watcher '%s' resumed", name)
 
+    async def _resume_record(self, wc: WatcherConfig, record: WatcherState) -> None:
+        """Start a rule-derived record's watcher again, for `resume_watcher`.
+
+        Caller holds the per-watcher lock. Mirrors `_recreate`'s carry —
+        `carried_fields`, `dropped_at` cleared — with two deliberate
+        differences:
+
+        * **`last_activity_at` is stamped at the moment of resume.** §2.5 rules
+          this explicitly ("resume returns a paused watcher to active and
+          restarts its clock"), and it is the one deliberate exception to
+          *a recreation carries the clock, never restamps* (`_recreate`, the
+          sixth inversion). The two write sites disagree on purpose: a boot or
+          wake recreation is residency, not activity, but a watcher paused
+          longer than its idle TTL must not be re-idled by the first sweep
+          pass after an operator explicitly asked for it back.
+        * **No replay.** Messages that arrived while paused were deliberately
+          dropped, not deferred (§4.4) — a resume that replayed the paused
+          interval would deliver exactly what the pause existed to mute.
+        """
+        carried = carried_fields(record)
+        carried["dropped_at"] = ""
+        carried["last_activity_at"] = now_iso()
+        room = Room(
+            id=record.room_id,
+            name=record.room_name or record.watcher_name,
+            type=record.room_kind or record.room_type,
+        )
+        await self.start_watcher_in_room(wc, record, room, provenance=carried)
+
     async def reset_watcher(self, name: str) -> None:
-        """Reset a watcher: clear session and restart with fresh state."""
-        wc = self._require_watcher_config(name)
+        """Reset a watcher: clear session and restart with fresh state.
+
+        On the record path a **paused record is refused, loudly** — §2.5:
+        "`reset` must not silently clear `paused`". A pause is the operator's
+        durable mute, and once config no longer names rooms it is the *only*
+        one, so a reset that quietly un-muted would erase an explicit
+        instruction as a side effect of session hygiene. The operator resumes
+        first, then resets. (The static path keeps its released
+        clears-the-flag behaviour until the cutover deletes it.)
+        """
+        record = self._states.get(name)
+        wc = config_from_record(record) if record is not None else None
+        if wc is None:
+            # The static path, byte-identical until the cutover deletes it.
+            wc = self._require_watcher_config(name)
+        elif record.paused:
+            raise RuntimeError(
+                f"Watcher '{name}' is paused — reset does not clear a pause "
+                f"(§2.5). Resume it first, then reset."
+            )
         self._ensure_agent_available(wc)
         async with self._get_watcher_lock(name):
             try:
@@ -639,10 +738,20 @@ class WatcherLifecycle:
             if state:
                 state.session_id = ""
                 state.context_injected = False
+                # The static path's released behaviour; the record path never
+                # reaches here paused (refused above, §2.5).
                 state.paused = False
 
             try:
-                await self._start_watcher(wc, state)
+                if state is not None and state.config:
+                    # The record path: the cleared session id means the start
+                    # mints a fresh session; the carry keeps the frozen
+                    # snapshots, and the reset stamps the clock for the same
+                    # reason resume does — a fresh session immediately re-idled
+                    # by the next sweep pass is the §2.5 misimplementation.
+                    await self._resume_record(wc, state)
+                else:
+                    await self._start_watcher(wc, state)
             except Exception as e:
                 logger.error("Failed to restart watcher '%s' after reset: %s", name, e)
                 raise
