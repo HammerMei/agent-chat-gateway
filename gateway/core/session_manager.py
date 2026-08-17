@@ -101,11 +101,16 @@ class SessionManager:
         )
         # The idle sweep exists only where rule-derived watchers do: a static
         # deployment's lifecycle is config.yaml's, and its records carry no
-        # frozen rule for the sweep to read anyway (§2.5).
+        # frozen rule for the sweep to read anyway (§2.5). And only where the
+        # transport can wake what the sweep drops: §2.6 rules eager connectors
+        # (Script, Voice) "never" idle-eligible — no message can ever arrive
+        # to wake an idled room there, so a timer that dropped one would be
+        # muting it permanently. One capability, one gate.
         self._sweep = (
             LifecycleSweep(self._lifecycle, pending_jobs=pending_jobs,
                            reconcile=self._reconcile_membership)
             if self._watcher_manager is not None
+            and connector.supports_unsolicited_inbound()
             else None
         )
         # Fired by the membership-remove handler for the reclaimed watcher's
@@ -113,6 +118,10 @@ class SessionManager:
         # than left pointing at nothing (§2.7). Injected like `pending_jobs`,
         # because the job store lives above this layer.
         self._cancel_jobs = cancel_jobs
+        # Kept for the eager-start loop (§2.6): a connector with no
+        # unsolicited inbound never has a room offered to it, so its rules'
+        # literal rooms are walked at boot instead.
+        self._watcher_rules = list(watcher_rules or [])
 
     # ── Main entry point ──────────────────────────────────────────────────────
 
@@ -189,6 +198,10 @@ class SessionManager:
         stream starts regardless of them.
         """
         errors = await self._lifecycle.sync_watchers(unavailable_agents=unavailable_agents)
+        # Eager creation for connectors with no unsolicited inbound (§2.6):
+        # nothing ever offers them a room, so their rules' literal rooms are
+        # started here, before the inbound surface opens.
+        await self._eager_start_rule_rooms(errors)
         # Snapshotted before the stream opens, and that placement is the whole
         # defence against the race below: after `start_inbound` a live message
         # can recreate a room and advance its watermark past the entire
@@ -213,6 +226,63 @@ class SessionManager:
             self._sweep.start()
         return errors
 
+    async def _eager_start_rule_rooms(self, errors: list[str]) -> None:
+        """Start every literal rule room on a connector that cannot discover (§2.6).
+
+        Script's messages arrive by direct injection and Voice's rooms as HTTP
+        path segments — no stream ever offers a room, so lazy creation can
+        never fire. Their rules name **literal** rooms (enforced at config
+        load, `_enforce_literal_rooms`), and each named room starts at boot
+        through `get_or_create`: sticky binding, the paused refusal and the
+        §5.3 record fields all apply exactly as they do on the message path.
+        `resolve_room(name)` here is the one legitimately name-based
+        resolution left (§2.8) — an eager rule genuinely starts from a name.
+
+        Per-room failures append to the startup error list, as the static
+        loop's did; boot proceeds. Connectors with unsolicited inbound return
+        immediately — their rooms arrive, they are never walked.
+        """
+        if self._watcher_manager is None:
+            return
+        if self._connector.supports_unsolicited_inbound():
+            return
+        kind_for = {k.value: k for k in RoomKind}
+        for rule in self._watcher_rules:
+            for pattern in rule.rooms.include:
+                if not pattern.is_literal:
+                    # Load enforcement makes this unreachable; skipping is
+                    # belt-and-braces, not a policy.
+                    continue
+                name = pattern.raw
+                try:
+                    room = await self._connector.resolve_room(name)
+                    ref = RoomRef(
+                        id=room.id,
+                        kind=kind_for.get(room.type, RoomKind.CHANNEL),
+                        name=room.name,
+                    )
+                    proc = await self._watcher_manager.get_or_create(
+                        self._connector_name, ref)
+                except Exception as e:
+                    msg = (f"Rule '{rule.name}' (room '{name}'): eager start "
+                           f"failed: {e}")
+                    logger.error(msg)
+                    errors.append(msg)
+                    continue
+                if proc is None:
+                    record = self._lifecycle.record_for_room(ref.id)
+                    if record is not None and record.paused:
+                        logger.info(
+                            "Rule '%s': room '%s' is paused — not started",
+                            rule.name, name,
+                        )
+                    else:
+                        msg = (f"Rule '{rule.name}' (room '{name}'): eager "
+                               f"start produced no watcher — check that the "
+                               f"room matches the rule's include patterns")
+                        logger.error(msg)
+                        errors.append(msg)
+
     async def _evaluate_lifecycle_at_boot(self) -> None:
         """Boot runs the same evaluation the sweep runs (§2.5), over the
         records that were *active* at shutdown.
@@ -236,6 +306,12 @@ class SessionManager:
         every such record is resident again or honestly idle.
         """
         if self._watcher_manager is None:
+            return
+        if not self._connector.supports_unsolicited_inbound():
+            # §2.6: eager connectors are never idle-eligible — a record this
+            # evaluation stamped idle could never be woken (no message can
+            # arrive), so it would be muted permanently. Their records were
+            # just restarted by the eager loop instead.
             return
         now = datetime.now().astimezone()
         stamped = 0
@@ -329,6 +405,11 @@ class SessionManager:
         someone speaks again.
         """
         if self._watcher_manager is None:
+            return
+        if not self._connector.supports_unsolicited_inbound():
+            # §2.6: an eager connector has no history surface to probe and no
+            # down-window to recover — its messages arrive by injection or
+            # HTTP request, which nothing buffers while the daemon is down.
             return
         for ws in list(self._lifecycle.states().values()):
             boundary = down_window.get(ws.watcher_name)
@@ -486,7 +567,9 @@ class SessionManager:
         """
         if self._watcher_manager is None or self._watcher_manager.disarmed:
             return
-        if not self._connector.supports_unsolicited_inbound:
+        # A method, not a property — the unparenthesised form is a bound
+        # method and always truthy, which silently killed this gate once.
+        if not self._connector.supports_unsolicited_inbound():
             return
         dormant = [
             r for r in self._lifecycle.states().values()

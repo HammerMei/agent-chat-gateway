@@ -384,7 +384,9 @@ class TestTheMembershipReconciliation(unittest.IsolatedAsyncioTestCase):
             _cancel_jobs=cancelled.append if cancelled is not None else None)
         mgr._lifecycle.states = MagicMock(
             return_value={r.watcher_name: r for r in records})
-        mgr._connector.supports_unsolicited_inbound = True
+        # A method, not a property (core/connector.py) — modelled as one, so
+        # the gate's call form is what the test exercises.
+        mgr._connector.supports_unsolicited_inbound = MagicMock(return_value=True)
         mgr._connector.membership_snapshot = AsyncMock(return_value=snapshot)
         reclaimed = []
 
@@ -442,7 +444,7 @@ class TestTheMembershipReconciliation(unittest.IsolatedAsyncioTestCase):
         idle = make_rule_derived_record(name="idle", room_id="gone",
                                         dropped_at="2026-08-01T00:00:00+00:00")
         mgr = self._mgr([idle], snapshot=set())
-        mgr._connector.supports_unsolicited_inbound = False
+        mgr._connector.supports_unsolicited_inbound = MagicMock(return_value=False)
 
         await mgr._reconcile_membership()
 
