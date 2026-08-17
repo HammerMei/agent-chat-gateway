@@ -217,6 +217,12 @@ agent-chat-gateway schedule pause acg-bb47e7f4
 
 Paused jobs do not fire until resumed. The `NEXT RUN` column shows `-`.
 
+A job — **paused or active** — also keeps its watcher's room from expiring:
+the watcher lifecycle reclaims a room only when nothing points at it, and a
+paused job still does (pausing means "not now", not "never"). The room can
+still go *idle* (cheap; the job's own firing wakes it), but its session and
+record survive until the job is deleted or completed.
+
 ### Resume a paused job
 
 ```bash
@@ -228,6 +234,12 @@ agent-chat-gateway schedule resume acg-bb47e7f4
 ```bash
 agent-chat-gateway schedule delete acg-bb47e7f4
 ```
+
+Deleting a job releases its room back to the normal expiry lifecycle. Note
+the reverse direction too: if the bot is **removed from a room** (or an
+operator runs `acg expire` on its watcher), the room's pending jobs are
+cancelled — removed from the store, with an audit log line each — because a
+job pointing at a room the bot cannot reach would fire at nothing forever.
 
 Deletion is permanent. Completed jobs can also be deleted to clean up the list.
 

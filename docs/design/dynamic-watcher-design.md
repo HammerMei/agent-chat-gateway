@@ -1566,6 +1566,12 @@ for nothing. Expiry is the destructive step, because it deletes the record
 the recreation reads from, leaving the job pointing at nothing. So expiry
 skips any room with a pending job.
 
+"Pending" includes **paused** jobs, not only active ones (owner, 2026-08-17):
+a pause is "not now", not "never" — deleting the record under a paused job
+would orphan it the moment an operator resumes it, and the operator's next
+move after resuming would be wondering why the job fires at nothing. Only a
+completed job stops holding its room.
+
 One interaction worth stating: a room idle for a long time will have had its
 session deleted by the agent backend regardless of what ACG persisted
 (§3, backend retention). The recreation path handles that through the typed
