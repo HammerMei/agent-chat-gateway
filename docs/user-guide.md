@@ -80,7 +80,8 @@ agents:
 watchers:
   - name: general
     connector: rc-home
-    room: general
+    rooms:
+      include: [general]
     agent: claude
 ```
 
@@ -166,21 +167,24 @@ agents:
 watchers:
   - name: general
     connector: rc-company
-    room: general
+    rooms:
+      include: [general]
     agent: claude
     context_inject_files:
       - contexts/team-assistant.md    # team-specific system prompt
 
   - name: dev
     connector: rc-company
-    room: dev
+    rooms:
+      include: [dev]
     agent: opencode
     context_inject_files:
       - contexts/engineering-context.md
 
   - name: support
     connector: rc-company
-    room: support
+    rooms:
+      include: [support]
     agent: claude
     context_inject_files:
       - contexts/support-runbook.md
@@ -228,13 +232,16 @@ agents:
 watchers:
   - name: my-assistant
     connector: rc-personal
-    room: "@alice"       # DM room — only you can see it
+    rooms:
+      direct: true       # 1:1 DMs — only people in `owners`/`guests` get through
     agent: claude
     online_notification: "✅ Agent ready"
 ```
 
 **Key settings for this use case:**
-- Use `room: "@username"` to watch a DM room instead of a channel — keeps it private
+- Use `rooms.direct: true` to serve DMs instead of a channel — a DM has no
+  room name for a pattern to match, and the connector's `owners` list gates
+  who can talk
 - Set `permissions.enabled: false` for personal use where approval friction isn't needed
 - Set yourself as the sole owner; omit `guests` entirely
 
@@ -295,7 +302,8 @@ wc -l /Users/me/project/HANDOFF.md && head -5 /Users/me/project/HANDOFF.md
 watchers:
   - name: my-project
     connector: rc-home
-    room: "@alice"
+    rooms:
+      direct: true
     agent: claude
     context_inject_files:
       - /Users/me/project/HANDOFF.md
@@ -484,38 +492,39 @@ agents:
 
 ### Watchers
 
-Each watcher binds one chat room/channel (on whichever connector it names) to an AI agent backend.
+A `watchers:` entry is a **rule**: it declares which rooms an agent serves,
+and the gateway creates each room's watcher on demand — on the room's first
+message for Rocket.Chat and Mattermost, or eagerly at startup for connectors
+with no inbound stream (voice, script — their rules must name literal rooms).
 
 ```yaml
 watchers:
-  - name: general-assistant
+  - name: general-assistant     # the RULE's name — required
     connector: rc-main
-    room: general
+    rooms:
+      include: [general]        # glob patterns work: [eng-*, general]
+      # except_for: [eng-private]  # subtracted from this rule's include
+      # direct: true               # also serve 1:1 DMs
+      # group_direct: true         # also serve multi-party DMs (mentions required)
     agent: claude
 ```
 
-Binding the same connector+agent to several rooms at once: use `rooms:`
-instead of `room:` — it expands into one watcher per room, with the name
-auto-derived as `<connector>-<room>` (a `@username` DM room becomes
-`<connector>-dm-<username>`) unless you set `name:` explicitly:
+Each created watcher is named `<connector>-<room>` — that derived name is
+what `list` shows and what `pause`/`resume`/`reset`/`expire` act on. Rules
+match top-down; the first rule that claims a room wins, and `acg config
+validate` warns when an earlier rule shadows a later one completely.
 
-```yaml
-watchers:
-  - connector: rc-main
-    agent: claude
-    rooms: [general, dev, "@alice"]
-    # -> rc-main-general, rc-main-dev, rc-main-dm-alice
-```
+A quiet room is dropped after `session_idle_days` (default 15 — the session
+is kept and the next message resumes it) and reclaimed entirely after a
+further `session_expire_days` (default 15). Pause a watcher to exempt it from
+both timers. Configs written for the old static shape (`room:`, or `rooms:`
+as a list) fail at load — see docs/migration-dynamic-watchers.md.
 
-`name:` may only be set when the entry has exactly one room (via `room:`, or a
-single-item `rooms:`) — it pins a specific watcher's identity, which is ambiguous
-across an expanded multi-room entry.
-
-> ⚠️ **One watcher per room, per connector.** Two watchers pointing at the same room
-> on the same connector are refused at config load: both would receive every message
-> and both would answer, and neither would see the other's reply — a connector filters
-> its own account's messages. To put two agents in one room, give each its own bot
-> account and its own connector, which is the supported multi-agent setup.
+> ⚠️ **One watcher per room, per connector.** Two rules cannot both serve a
+> room — first-match precedence gives it to the earlier rule, and validate
+> warns about the shadowed one. To put two agents in one room, give each its
+> own bot account and its own connector, which is the supported multi-agent
+> setup.
 
 > ⚠️ **Watcher names are persistent identifiers** — they key session state in
 > `state.<connector>.json` and they're what you type into
@@ -864,7 +873,8 @@ connectors:
 watchers:
   - name: general
     connector: rc-main
-    room: general
+    rooms:
+      include: [general]
     agent: claude
     context_inject_files:
       - contexts/rc-room-profiles.md     # Room member profiles — specific to this room
@@ -1055,7 +1065,8 @@ connectors:
 watchers:
   - name: general
     connector: rc-main
-    room: general
+    rooms:
+      include: [general]
     agent: claude
     context_inject_files:
       - contexts/rc-room-profiles.md     # Room member profiles — specific to this room
@@ -1317,12 +1328,14 @@ connectors:
 watchers:
   - name: company-general
     connector: rc-company
-    room: general
+    rooms:
+      include: [general]
     agent: claude
 
   - name: partner-collab
     connector: rc-partner
-    room: general
+    rooms:
+      include: [general]
     agent: claude
 ```
 
@@ -1352,12 +1365,14 @@ connectors:
 watchers:
   - name: rc-general
     connector: rc-main
-    room: general
+    rooms:
+      include: [general]
     agent: claude
 
   - name: mm-general
     connector: mm-main
-    room: town-square
+    rooms:
+      include: [town-square]
     agent: claude
 ```
 

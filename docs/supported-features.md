@@ -110,7 +110,9 @@ connectors:
 watchers:
   - name: siri-watcher
     connector: siri-voice
-    room: voice-room           # → POST /ask/voice-room
+    rooms:
+      include: [voice-room]    # literal (no stream to match patterns against)
+                               # → POST /ask/voice-room
     agent: my-agent
     context_inject_files:
       - gateway/contexts/voice-context.md
