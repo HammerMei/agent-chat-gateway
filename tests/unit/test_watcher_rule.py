@@ -313,15 +313,27 @@ class TestParserHardErrors(unittest.TestCase):
     def test_ttl_rejects_bool_which_is_an_int_subclass(self):
         self._err({**MINIMAL, "session_idle_days": True}, "positive integer")
 
-    def test_idle_must_be_strictly_less_than_expire(self):
-        self._err(
-            {**MINIMAL, "session_idle_days": 30, "session_expire_days": 30},
-            "strictly less than",
-        )
-        self._err(
-            {**MINIMAL, "session_idle_days": 31, "session_expire_days": 30},
-            "strictly less than",
-        )
+    def test_the_two_legs_need_no_ordering_between_them(self):
+        """Inverted deliberately: the old rule required idle < expire, on the
+        assumption that both were measured from the moment the room went quiet.
+        They are not (§2.5) — expiry is measured from the moment the watcher
+        becomes *idle*, so they are two independent legs of a sequence and the
+        default is 15/15, which the old rule would have rejected outright."""
+        for idle, expire in ((15, 15), (30, 30), (31, 30)):
+            with self.subTest(idle=idle, expire=expire):
+                rule = parse({**MINIMAL, "session_idle_days": idle,
+                              "session_expire_days": expire})
+                self.assertEqual(rule.session_idle_days, idle)
+                self.assertEqual(rule.session_expire_days, expire)
+
+    def test_a_non_positive_lifetime_is_still_refused(self):
+        """The ordering rule went; this one stays, and it is `_parse_rule_ttl`'s
+        — checked here so removing the ordering rule cannot be read as removing
+        every constraint on these fields."""
+        for field in ("session_idle_days", "session_expire_days"):
+            for bad in (0, -1):
+                with self.subTest(field=field, value=bad):
+                    self._err({**MINIMAL, field: bad}, "must be a positive integer")
 
     def test_entry_must_be_a_mapping(self):
         self._err(["not", "a", "mapping"], "must be a mapping")

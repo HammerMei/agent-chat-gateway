@@ -769,7 +769,12 @@ session at risk. Three reasons this is a decision and not a gap:
   precedes it is one it is reasonable to let go.
 * **It has an operator remedy that needs no code.** A deployment that expects
   long outages raises `session_expire_days`; the setting is per rule, so it can
-  be raised only where the sessions are worth keeping.
+  be raised only where the sessions are worth keeping. Note the prerequisite:
+  a watcher reads the **frozen** rule it was created against (below), so until
+  config reload exists the raised value applies to watchers created after the
+  change. That suits the case — an operator who knows their environment has
+  long outages sets it up front — but it is prophylactic, not a repair applied
+  after the fact.
 * **The automatic version is not cheap.** Crediting the outage back means
   persisting a heartbeat and subtracting the downtime when a TTL is evaluated —
   and a single global downtime figure does not compose across repeated
@@ -782,6 +787,31 @@ Support for the outage case can be added later if a deployment shows it is
 needed. Nothing here is a one-way door: every §5.3 field defaults, so an
 accumulator is additive, and a heartbeat is a new file rather than a schema
 change.
+
+#### The lifecycle timers read the frozen rule, always
+
+A watcher evaluates its TTLs against the rule snapshot frozen at creation
+(§2.4) — never against the current `config.yaml`. There is deliberately no
+exception for "operational" fields:
+
+**One rule with a carve-out is a rule applied inconsistently.** "Identity comes
+from the frozen copy, policy from the current one" reads well and is a
+maintenance trap: every reader then has to know which half it is holding, and
+the answer for a room whose rule has since been *deleted* is a third case
+again. A watcher that always reads its own snapshot needs none of that.
+
+**It also gives the frozen copy a consumer.** §2.4 stores the resolved rule so
+drift can be detected, and drift detection has had no caller: the snapshot has
+been groundwork waiting for one. Updating a live watcher's rule becomes an
+explicit step — diff the current rule against the frozen one and apply the
+difference — rather than a value that silently changes meaning on the next
+sweep. An operator can then see what a config change did, which the silent
+version cannot offer.
+
+So the config-reload capability owns rule updates, and this section owns only
+the reading: **the sweep reads what the record carries.** Until reload exists,
+a rule edit reaches existing watchers by the blunt route — expire the watcher,
+let the next message recreate it against the current rule.
 
 **One ordering constraint is not optional, whatever the arithmetic does:** the
 first expiry sweep must not run until the startup replay (§2.2) has finished.

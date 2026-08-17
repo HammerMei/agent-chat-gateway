@@ -1744,12 +1744,16 @@ def _parse_one_watcher_rule(
 
     idle_days = _parse_rule_ttl(wc, index, "session_idle_days")
     expire_days = _parse_rule_ttl(wc, index, "session_expire_days")
-    if idle_days is not None and expire_days is not None and idle_days >= expire_days:
-        raise ValueError(
-            f"Watcher rule at index {index} ('{rule_name}'): "
-            f"'session_idle_days' ({idle_days}) must be strictly less than "
-            f"'session_expire_days' ({expire_days})."
-        )
+    # No ordering constraint between them, and the absence is deliberate. The
+    # old rule — idle strictly less than expire — assumed both were measured
+    # from the same origin, the moment the room went quiet. They are not:
+    # expiry is measured from the moment the watcher becomes *idle* (§2.5), so
+    # they are two independent legs of a sequence and `15/15` is the default.
+    # Requiring an order here would reject that.
+    #
+    # Positivity is not re-checked here: `_parse_rule_ttl` already refuses a
+    # zero or negative value, and stating one rule in two places is how it ends
+    # up enforced in one.
 
     history_handoff = _parse_history_handoff(wc.get("history_handoff"), where)
 
