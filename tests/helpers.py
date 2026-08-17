@@ -120,6 +120,30 @@ class CleanupTrackingAgent(MockAgentBackend):
         return True
 
 
+def make_rc_config(
+    server_url: str = "http://chat.example.com",
+    username: str = "bot",
+    password: str = "pw",
+    name: str = "rc",
+    owners=None,
+    **overrides,
+):
+    """A minimal `RocketChatConfig` — lifted from `test_connector.py` when the
+    wake-path suite became its second consumer."""
+    from gateway.config import AttachmentConfig
+    from gateway.connectors.rocketchat.config import RocketChatConfig
+
+    return RocketChatConfig(
+        server_url=server_url,
+        username=username,
+        password=password,
+        name=name,
+        owners=owners or ["alice"],
+        attachments=AttachmentConfig(cache_dir_global="/tmp/rc-cache"),
+        **overrides,
+    )
+
+
 def make_watcher(room="script", name=None, connector="script", agent="default", **kw):
     """A `WatcherConfig` with the fields most tests do not care about filled in."""
     return WatcherConfig(

@@ -24,26 +24,9 @@ from gateway.core.watcher_rule import RoomKind
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
-def _make_config(
-    server_url: str = "http://chat.example.com",
-    username: str = "bot",
-    password: str = "pw",
-    name: str = "rc",
-    owners: list[str] | None = None,
-    **overrides,
-):
-    """Build a minimal RocketChatConfig for testing."""
-    from gateway.config import AttachmentConfig
-    from gateway.connectors.rocketchat.config import RocketChatConfig
-    return RocketChatConfig(
-        server_url=server_url,
-        username=username,
-        password=password,
-        name=name,
-        owners=owners or ["alice"],
-        attachments=AttachmentConfig(cache_dir_global="/tmp/rc-cache"),
-        **overrides,
-    )
+# Shared with the wake-path suite; the builder lives beside the other shared
+# fixtures so a config field added for one consumer reaches both.
+from tests.helpers import make_rc_config as _make_config  # noqa: E402
 
 
 
