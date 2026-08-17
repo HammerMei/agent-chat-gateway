@@ -56,6 +56,7 @@ def _make_connector():
     # Hand-built connector: `__init__` never runs, so anything the code reads has to be
     # set here. Delivery defaults to per-room, which is what these tests exercise.
     connector._router = None
+    connector._membership_hook = None
     connector._pending_routes = {}
     connector._routing_tasks = set()
     connector._subscribe_all = False

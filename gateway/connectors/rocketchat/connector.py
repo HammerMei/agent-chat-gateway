@@ -266,6 +266,7 @@ class RocketChatConnector(Connector):
         ] = {}  # room_id -> [watcher...]
         self._room_refcount: dict[str, int] = {}  # room_id -> subscriber count
         self._router = None
+        self._membership_hook = None
         # Rooms with an open routing episode. The routing workers are a pool, so
         # several frames from one untracked room can be in flight at once — and offering a
         # room is slow (a DM needs `im.members` before it can even be classified), which
@@ -359,6 +360,11 @@ class RocketChatConnector(Connector):
             "Rocket.Chat delivery: %s",
             "all rooms" if self._subscribe_all else "per room",
         )
+        if self._membership_hook is not None:
+            # Gated like the router that gates this method: no hook, no wire
+            # cost. A refusal is degraded rather than fatal — joins are
+            # discovered by first messages, removals by the reconciliation.
+            await self._ws.subscribe_membership_events()
 
     async def disconnect(self) -> None:
         """Close the WebSocket and release HTTP client resources.
@@ -831,6 +837,83 @@ class RocketChatConnector(Connector):
         """
         self._router = router
         self._ws.register_default_callback(self._on_unrouted_message)
+
+    def register_membership_hook(self, hook) -> None:
+        """Register the callbacks for the bot's own membership events (§2.7).
+
+        The wire subscription is opened in `start_inbound`, gated on this hook
+        existing — registration alone changes nothing, which is what keeps a
+        static deployment's behaviour byte-identical.
+        """
+        self._membership_hook = hook
+        self._ws.register_membership_callback(self._on_membership_event)
+
+    async def _on_membership_event(self, action: str, doc: dict) -> None:
+        """A subscriptions-changed event for this account (§2.7).
+
+        The stream is already scoped to the bot's own user id (the event name
+        is `<uid>/subscriptions-changed`), so unlike Mattermost there is no
+        own-id filter to apply — every event here is about the bot's own
+        membership. The doc is the server's subscription record (verified
+        against `notifyOnSubscriptionChanged`'s callers: both `inserted` and
+        `removed` carry the full document), so `rid`, `t` and `name` are on it.
+
+        Failures are logged and dropped, never raised: an add is a supplement
+        (the room's first message still creates its watcher), and a remove is
+        re-discovered by the reconciliation.
+        """
+        if self._membership_hook is None:
+            return
+        rid = doc.get("rid") or ""
+        if not rid:
+            return
+        try:
+            if action == "removed":
+                await self._membership_hook.removed(rid)
+                return
+            room = await self._room_ref_from_sub_doc(rid, doc)
+            if room is not None:
+                await self._membership_hook.added(room)
+        except Exception:
+            logger.exception(
+                "Membership event (%s) for room %s failed — the safety nets "
+                "cover it", action, rid,
+            )
+
+    async def _room_ref_from_sub_doc(
+        self, rid: str, doc: dict
+    ) -> "RoomRef | None":
+        """Classify a joined room from its subscription document.
+
+        The same shape as `_room_ref_from_access`, from the other source: the
+        subscription's `t` is the room type letter and `name` the room name,
+        and a direct room takes the member lookup because the letter `d`
+        covers both DM kinds and the difference decides whether the mention
+        gate applies (§6.4). `ClassificationUnavailable` propagates to the
+        caller's catch — an add that cannot classify is dropped, not guessed.
+        """
+        t = doc.get("t") or ""
+        if t == "d":
+            identity = await self._direct_room_identity(rid)
+            if identity is None:
+                logger.warning(
+                    "Joined direct room %s has no counterpart to classify by — "
+                    "not registered", rid,
+                )
+                return None
+            kind, participants = identity
+            return RoomRef(id=rid, kind=kind, participants=participants)
+        if t not in ("c", "p"):
+            logger.debug(
+                "Joined room %s has unsupported type %r — not registered", rid, t)
+            return None
+        name = doc.get("name") or ""
+        if not name:
+            logger.debug(
+                "Joined room %s has no name and is not direct — not registered", rid)
+            return None
+        kind = RoomKind.GROUP if t == "p" else RoomKind.CHANNEL
+        return RoomRef(id=rid, kind=kind, name=name)
 
     async def _on_unrouted_message(self, doc: dict, access: dict | None = None) -> None:
         """A message for a room this connector has no watcher for (§2.2).

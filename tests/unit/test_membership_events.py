@@ -8,6 +8,7 @@ points at is reclaimed, record popped last, idempotently — a removal
 discovered twice reaches the same end state.
 """
 
+import asyncio
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
@@ -346,6 +347,266 @@ class TestTheMembershipHandlers(unittest.IsolatedAsyncioTestCase):
         static._watcher_manager = None
         await static.connect_only()
         static._connector.register_membership_hook.assert_not_called()
+
+
+# ── The connector halves, twins side by side (§2.7) ─────────────────────────
+#
+# Cross-connector parity is this repo's recurring defect shape, so the RC and
+# MM suites below pin the same contract each: the bot's own add reaches
+# `hook.added` with a classified RoomRef, its own remove reaches
+# `hook.removed` with the room id, other users' events and failures reach
+# neither, and nothing ever raises toward the transport.
+
+
+def _hook():
+    from gateway.core.connector import MembershipHook
+
+    added = AsyncMock()
+    removed = AsyncMock()
+    return MembershipHook(added=added, removed=removed), added, removed
+
+
+class TestRocketChatMembershipEvents(unittest.IsolatedAsyncioTestCase):
+
+    def _connector(self):
+        from gateway.connectors.rocketchat.connector import RocketChatConnector
+        from tests.helpers import make_rc_config
+
+        connector = RocketChatConnector.__new__(RocketChatConnector)
+        connector.__init__(make_rc_config())
+        connector._rest = MagicMock()
+        connector._ws = MagicMock()
+        return connector
+
+    async def test_an_inserted_channel_subscription_registers_the_room(self):
+        connector = self._connector()
+        hook, added, removed = _hook()
+        connector.register_membership_hook(hook)
+
+        await connector._on_membership_event(
+            "inserted", {"rid": "r1", "t": "c", "name": "eng-backend"})
+
+        added.assert_awaited_once()
+        room = added.call_args.args[0]
+        self.assertEqual(room.id, "r1")
+        self.assertEqual(room.kind, RoomKind.CHANNEL)
+        self.assertEqual(room.name, "eng-backend")
+        removed.assert_not_awaited()
+
+    async def test_a_private_group_classifies_as_group(self):
+        connector = self._connector()
+        hook, added, _ = _hook()
+        connector.register_membership_hook(hook)
+
+        await connector._on_membership_event(
+            "inserted", {"rid": "r2", "t": "p", "name": "secret"})
+
+        self.assertEqual(added.call_args.args[0].kind, RoomKind.GROUP)
+
+    async def test_a_direct_room_takes_the_member_lookup(self):
+        """`t: "d"` covers both DM kinds, and the difference decides whether
+        the mention gate applies (§6.4) — so the add pays the same lookup the
+        routing path pays, and never guesses."""
+        connector = self._connector()
+        connector._rest.dm_members = AsyncMock(return_value=["alice", "bob"])
+        hook, added, _ = _hook()
+        connector.register_membership_hook(hook)
+
+        await connector._on_membership_event("inserted", {"rid": "d1", "t": "d"})
+
+        room = added.call_args.args[0]
+        self.assertEqual(room.kind, RoomKind.GROUP_DM)
+        self.assertEqual(room.participants, ("alice", "bob"))
+
+    async def test_a_removed_subscription_reclaims_by_room_id(self):
+        connector = self._connector()
+        hook, added, removed = _hook()
+        connector.register_membership_hook(hook)
+
+        await connector._on_membership_event(
+            "removed", {"rid": "r1", "t": "c", "name": "eng-backend"})
+
+        removed.assert_awaited_once_with("r1")
+        added.assert_not_awaited()
+
+    async def test_a_failed_classification_is_dropped_not_raised(self):
+        """The safety net (§2.7): an add that cannot classify stays
+        unregistered, and the room's first message creates its watcher."""
+        connector = self._connector()
+        connector._rest.dm_members = AsyncMock(side_effect=RuntimeError("down"))
+        hook, added, _ = _hook()
+        connector.register_membership_hook(hook)
+
+        await connector._on_membership_event("inserted", {"rid": "d1", "t": "d"})
+
+        added.assert_not_awaited()
+
+    async def test_no_hook_means_no_action(self):
+        connector = self._connector()
+        await connector._on_membership_event(
+            "inserted", {"rid": "r1", "t": "c", "name": "x"})  # must not raise
+
+    async def test_the_receive_loop_discards_updated_before_any_task(self):
+        """`updated` fires on every unread-count change in every room — it
+        must die on the receive loop, not as a spawned task."""
+        from gateway.connectors.rocketchat.websocket import RCWebSocketClient
+
+        ws = RCWebSocketClient("http://x", "bot", "pw")
+        calls = []
+
+        async def cb(action, doc):
+            calls.append(action)
+
+        ws.register_membership_callback(cb)
+
+        def frame(action, doc=None, event="uid1/subscriptions-changed"):
+            return {"msg": "changed", "collection": "stream-notify-user",
+                    "fields": {"eventName": event,
+                               "args": [action, doc if doc is not None
+                                        else {"rid": "r1"}]}}
+
+        ws._handle_notify_user(frame("updated"))
+        ws._handle_notify_user(frame("inserted", event="uid1/rooms-changed"))
+        ws._handle_notify_user({"msg": "changed",
+                                "collection": "stream-notify-user",
+                                "fields": {"eventName": "uid1/subscriptions-changed",
+                                           "args": ["inserted"]}})
+        self.assertEqual(ws._callback_tasks, set(),
+                         "nothing spawned for filtered frames")
+
+        ws._handle_notify_user(frame("inserted"))
+        ws._handle_notify_user(frame("removed"))
+        await asyncio.gather(*ws._callback_tasks)
+        self.assertEqual(calls, ["inserted", "removed"])
+
+
+class TestMattermostMembershipEvents(unittest.IsolatedAsyncioTestCase):
+
+    def _connector(self):
+        from tests.unit.test_mattermost_connector import _make_connector
+
+        connector = _make_connector()
+        connector._rest.team_id = "team-1"
+        connector._rest.get_channel = AsyncMock(return_value={
+            "id": "chan-1", "type": "O", "name": "eng-backend",
+            "display_name": "Eng Backend", "team_id": "team-1",
+        })
+        return connector
+
+    async def _settle(self, connector):
+        if connector._routing_tasks:
+            await asyncio.gather(*connector._routing_tasks)
+
+    async def test_the_bots_own_add_registers_the_room(self):
+        connector = self._connector()
+        hook, added, removed = _hook()
+        connector.register_membership_hook(hook)
+
+        await connector._on_membership_event({
+            "event": "user_added",
+            "data": {"user_id": "bot-id-1", "team_id": "team-1"},
+            "broadcast": {"channel_id": "chan-1"},
+        })
+        await self._settle(connector)
+
+        added.assert_awaited_once()
+        room = added.call_args.args[0]
+        self.assertEqual(room.id, "chan-1")
+        self.assertEqual(room.kind, RoomKind.CHANNEL)
+        self.assertEqual(room.name, "eng-backend")
+        removed.assert_not_awaited()
+
+    async def test_someone_elses_add_is_ignored(self):
+        connector = self._connector()
+        hook, added, _ = _hook()
+        connector.register_membership_hook(hook)
+
+        await connector._on_membership_event({
+            "event": "user_added",
+            "data": {"user_id": "someone-else", "team_id": "team-1"},
+            "broadcast": {"channel_id": "chan-1"},
+        })
+        await self._settle(connector)
+
+        added.assert_not_awaited()
+        connector._rest.get_channel.assert_not_awaited()
+
+    async def test_the_bots_own_remove_arrives_user_scoped(self):
+        """The variant the bot actually receives for itself (verified against
+        `channel.go`): the removed user no longer belongs to the channel, so
+        the server sends a user-scoped event with the channel in `data` and
+        the user in `broadcast` — the mirror image of every other variant."""
+        connector = self._connector()
+        hook, added, removed = _hook()
+        connector.register_membership_hook(hook)
+
+        await connector._on_membership_event({
+            "event": "user_removed",
+            "data": {"channel_id": "chan-1", "remover_id": "admin"},
+            "broadcast": {"user_id": "bot-id-1"},
+        })
+        await self._settle(connector)
+
+        removed.assert_awaited_once_with("chan-1")
+        added.assert_not_awaited()
+
+    async def test_someone_elses_remove_is_ignored(self):
+        """The channel-scoped variant, which the bot sees for OTHER people's
+        removals from channels it is still in."""
+        connector = self._connector()
+        hook, _, removed = _hook()
+        connector.register_membership_hook(hook)
+
+        await connector._on_membership_event({
+            "event": "user_removed",
+            "data": {"user_id": "someone-else", "remover_id": "admin"},
+            "broadcast": {"channel_id": "chan-1"},
+        })
+        await self._settle(connector)
+
+        removed.assert_not_awaited()
+
+    async def test_another_teams_channel_is_not_registered(self):
+        connector = self._connector()
+        connector._rest.get_channel = AsyncMock(return_value={
+            "id": "chan-9", "type": "O", "name": "other",
+            "display_name": "Other", "team_id": "team-9",
+        })
+        hook, added, _ = _hook()
+        connector.register_membership_hook(hook)
+
+        await connector._on_membership_event({
+            "event": "user_added",
+            "data": {"user_id": "bot-id-1", "team_id": "team-9"},
+            "broadcast": {"channel_id": "chan-9"},
+        })
+        await self._settle(connector)
+
+        added.assert_not_awaited()
+
+    async def test_a_failed_classification_is_dropped_not_raised(self):
+        connector = self._connector()
+        connector._rest.get_channel = AsyncMock(side_effect=RuntimeError("down"))
+        hook, added, _ = _hook()
+        connector.register_membership_hook(hook)
+
+        await connector._on_membership_event({
+            "event": "user_added",
+            "data": {"user_id": "bot-id-1", "team_id": "team-1"},
+            "broadcast": {"channel_id": "chan-1"},
+        })
+        await self._settle(connector)
+
+        added.assert_not_awaited()
+
+    async def test_no_hook_means_no_action(self):
+        connector = self._connector()
+        await connector._on_membership_event({
+            "event": "user_added",
+            "data": {"user_id": "bot-id-1"},
+            "broadcast": {"channel_id": "chan-1"},
+        })  # must not raise, must not spawn
+        self.assertEqual(connector._routing_tasks, set())
 
 
 if __name__ == "__main__":

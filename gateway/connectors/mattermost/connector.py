@@ -177,6 +177,7 @@ class MattermostConnector(Connector):
         self._handler: MessageHandler | None = None
         self._capacity_check: CapacityCheck | None = None
         self._router = None
+        self._membership_hook = None
         self._channels: dict[str, _ChannelState] = {}  # channel_id -> state
         # Channels with an open routing episode — the same single-episode rule as
         # RC's `_pending_routes`, and needed here for a sharper reason: the offer
@@ -209,6 +210,7 @@ class MattermostConnector(Connector):
         await self._rest.resolve_team(self._config.team)
 
         self._ws.register_handler(self._on_posted_event)
+        self._ws.register_membership_handler(self._on_membership_event)
         self._ws.set_reconnect_callback(self._on_ws_reconnect)
         # The socket opens here; the listen loop starts in `start_inbound()`, after the
         # watchers exist. Events arriving in between are buffered by the client rather
@@ -871,6 +873,93 @@ class MattermostConnector(Connector):
         static config.
         """
         self._router = router
+
+    def register_membership_hook(self, hook) -> None:
+        """Register the callbacks for the bot's own membership events (§2.7).
+
+        Registration alone changes nothing on the wire — the websocket already
+        receives `user_added`/`user_removed`; with no hook they stay ignored,
+        which is what keeps a static deployment's behaviour byte-identical.
+        """
+        self._membership_hook = hook
+
+    async def _on_membership_event(self, evt: dict) -> None:
+        """Filter a raw membership event to the bot's own, and act off-path.
+
+        The two events carry their ids in asymmetric places (verified against
+        the server's `NewWebSocketEvent` calls in `channel.go`):
+
+        * `user_added` — `data.user_id` is the added user; the channel is in
+          `broadcast.channel_id` on both the channel-scoped and user-scoped
+          variants.
+        * `user_removed` broadcast to the channel — `data.user_id` is the
+          removed user, channel in `broadcast.channel_id`. The removed user
+          no longer belongs to the channel, so the bot sees this only for
+          *other* people's removals.
+        * `user_removed` broadcast to the removed user — the one the bot gets
+          for itself: the user is `broadcast.user_id`, the channel is
+          `data.channel_id`, and `data.user_id` is absent.
+
+        Reading user-then-broadcast for the id and broadcast-then-data for the
+        channel covers all three without knowing which arrived. Everything
+        past the own-id filter runs on its own task (`_routing_tasks`, so
+        disconnect cancels it): the add needs a REST call, and this method
+        runs on the listen loop, where an await stalls every channel.
+        """
+        if self._membership_hook is None:
+            return
+        own_id = self._rest.bot_user_id
+        if not own_id:
+            return
+        data = evt.get("data") or {}
+        broadcast = evt.get("broadcast") or {}
+        user_id = data.get("user_id") or broadcast.get("user_id") or ""
+        if user_id != own_id:
+            return
+        channel_id = broadcast.get("channel_id") or data.get("channel_id") or ""
+        if not channel_id:
+            return
+        if evt.get("event") == "user_removed":
+            coro = self._membership_hook.removed(channel_id)
+        else:
+            coro = self._handle_membership_add(channel_id)
+        task = asyncio.create_task(coro)
+        self._routing_tasks.add(task)
+        task.add_done_callback(self._routing_tasks.discard)
+
+    async def _handle_membership_add(self, channel_id: str) -> None:
+        """Classify a joined channel via REST and hand it to the hook.
+
+        The event itself is sparse — `data` carries only `user_id` and
+        `team_id` — so unlike a post there is no metadata to classify from,
+        and one REST call per join is the price of the registration. Failure
+        is logged and dropped: an add is a supplement (§2.7), and the room's
+        first message still creates its watcher.
+        """
+        try:
+            chan = await self._rest.get_channel(channel_id)
+        except Exception as e:
+            logger.warning(
+                "Could not classify joined channel %s — it stays unregistered "
+                "until its first message: %s", channel_id, e,
+            )
+            return
+        decoded = {
+            "channel_type": chan.get("type"),
+            "channel_name": chan.get("name"),
+            "channel_display_name": chan.get("display_name"),
+            "team_id": chan.get("team_id"),
+        }
+        if not self._in_scope(decoded):
+            logger.debug(
+                "Joined channel %s belongs to another team — not registered",
+                channel_id,
+            )
+            return
+        room = self._room_ref_from_event(channel_id, decoded)
+        if room is None:
+            return
+        await self._membership_hook.added(room)
 
     def reap_room(self, room_id: str) -> None:
         """Forget a channel's local state without touching watcher bookkeeping.

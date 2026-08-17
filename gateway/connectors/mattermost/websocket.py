@@ -61,6 +61,7 @@ class MattermostWebSocketClient:
 
         self._ws: websockets.ClientConnection | None = None
         self._handler: PostedEventHandler | None = None
+        self._membership_handler: PostedEventHandler | None = None
         self._seq = 1
         self._reconnect_delay = 1.0
         self._max_reconnect_delay = 60.0
@@ -83,6 +84,18 @@ class MattermostWebSocketClient:
     def register_handler(self, handler: PostedEventHandler) -> None:
         """Register the single callback invoked for every decoded `posted` event."""
         self._handler = handler
+
+    def register_membership_handler(self, handler: PostedEventHandler) -> None:
+        """Register the callback for raw `user_added`/`user_removed` events (§2.7).
+
+        The transport hands the *whole* event over, undecoded: the two events
+        carry their ids in asymmetric places (a removal broadcast to the
+        removed user has the channel in `data` and the user in `broadcast`;
+        every other variant is the mirror image), and which user matters —
+        the bot's own id — is the connector's knowledge, not this layer's.
+        The handler must return fast; anything slow belongs on its own task.
+        """
+        self._membership_handler = handler
 
     def register_channel(self, channel_id: str) -> None:
         """Record that the dispatcher cares about this channel (no wire call)."""
@@ -273,6 +286,19 @@ class MattermostWebSocketClient:
                             logger.exception("Failed to decode posted event: %r", evt)
                             continue
                         await self._dispatch(decoded)
+                    elif evt.get("event") in ("user_added", "user_removed"):
+                        # Membership events (§2.7). Deliberately not routed
+                        # through the per-channel ordering queues: the handler
+                        # filters to the bot's own membership and spawns its
+                        # slow half, and ordering against posts is provided by
+                        # the core's locks, not the transport. A handler error
+                        # must not kill delivery for every channel.
+                        if self._membership_handler is not None:
+                            try:
+                                await self._membership_handler(evt)
+                            except Exception:
+                                logger.exception(
+                                    "Unhandled error in membership handler: %r", evt)
                     # Other events (hello, status_change, typing, seq_reply
                     # acks, etc.) are intentionally not acted on here.
             except asyncio.CancelledError:

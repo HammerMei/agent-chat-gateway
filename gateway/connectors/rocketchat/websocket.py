@@ -100,6 +100,18 @@ class RCWebSocketClient:
         # message in every readable channel.
         self._routing_queue: asyncio.Queue = asyncio.Queue(maxsize=self._ROOM_QUEUE_DEPTH)
         self._routing_workers: list[asyncio.Task] = []
+        # The id the DDP login response assigned this account — captured because the
+        # membership stream's event name is built from it (`<uid>/subscriptions-changed`),
+        # and nothing else on this layer knows it.
+        self._user_id: str | None = None
+        # The membership-events subscription (§2.7): id, intent, and callback. The same
+        # key-space split as the stream above — a notify-user subscription is not a room —
+        # but deliberately without the pending/revoked hand-off machinery: recording a
+        # dead id here costs missed membership events, which the first-message safety net
+        # and the periodic reconciliation both cover, not silent room-wide delivery loss.
+        self._membership_sub_id: str | None = None
+        self._wants_membership = False
+        self._membership_callback: Callable | None = None
 
     async def connect(self) -> None:
         """Connect, perform DDP handshake, and login.
@@ -141,6 +153,10 @@ class RCWebSocketClient:
             )
             login_resp = await self._recv_until_result(login_id)
             if login_resp.get("msg") == "result" and not login_resp.get("error"):
+                # The id this login actually resolved to — the membership
+                # stream's event name is `<uid>/subscriptions-changed`, and the
+                # configured username is a spelling, not an id (#112).
+                self._user_id = (login_resp.get("result") or {}).get("id")
                 logger.info("WebSocket login successful for %s", self.username)
             else:
                 raise RuntimeError(f"WebSocket login failed: {login_resp}")
@@ -198,6 +214,9 @@ class RCWebSocketClient:
         self._wants_stream = False
         self._pending_stream_sub_id = None
         self._revoked_stream_sub_id = None
+        # The membership stream follows the same rule: a stop clears intent.
+        self._membership_sub_id = None
+        self._wants_membership = False
         # Cancel room workers explicitly and collect them for the drain gather.
         # Room workers add themselves to _callback_tasks but also register a
         # done-callback that discards them from that set when they complete.
@@ -445,6 +464,76 @@ class RCWebSocketClient:
 
         self._stream_sub_id = sub_id
         logger.info("Subscribed to __my_messages__ — delivery is no longer per room")
+        return True
+
+    def register_membership_callback(self, callback: Callable) -> None:
+        """Register the async callback for subscriptions-changed events (§2.7).
+
+        Called as `callback(action, subscription_doc)` with action `inserted`
+        or `removed` — `updated` fires on every unread-count change and is
+        filtered in the receive loop, before any task is spawned for it.
+        """
+        self._membership_callback = callback
+
+    async def subscribe_membership_events(self, timeout: float = 10.0) -> bool:
+        """Subscribe to this account's subscriptions-changed notify stream.
+
+        Same intent-before-attempt and generation discipline as
+        `subscribe_all`, without its pending/revoked hand-off machinery — a
+        confirmation raced by a `nosub` here costs missed membership events,
+        which the first-message safety net and the reconciliation both cover
+        (§2.7); it cannot cost room delivery. Returns False on refusal or
+        timeout, and the caller treats that as degraded, not fatal.
+        """
+        if not self._user_id:
+            logger.warning(
+                "No user id from the DDP login — membership events cannot be "
+                "subscribed")
+            return False
+        self._wants_membership = True
+        generation = self._recovery_generation
+
+        sub_id = self._new_id()
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._pending_subs[sub_id] = future
+        try:
+            await self._send(
+                {
+                    "msg": "sub",
+                    "id": sub_id,
+                    "name": "stream-notify-user",
+                    "params": [f"{self._user_id}/subscriptions-changed", False],
+                }
+            )
+            await asyncio.wait_for(future, timeout=timeout)
+        except Exception as e:
+            # A timeout is not a refusal — cancel so an accepted-late
+            # subscription is not left delivering to a client that recorded
+            # nothing (same rule as subscribe_all).
+            try:
+                await self._send({"msg": "unsub", "id": sub_id})
+            except Exception:
+                pass
+            logger.warning(
+                "Membership-events subscription refused or timed out (%s) — "
+                "joins and removals will be discovered by messages and the "
+                "reconciliation instead", e,
+            )
+            return False
+        finally:
+            self._pending_subs.pop(sub_id, None)
+
+        if generation != self._recovery_generation:
+            # Overtaken by a newer recovery or a stop — the replacement owns
+            # the field now (or the client is stopped and must record nothing).
+            try:
+                await self._send({"msg": "unsub", "id": sub_id})
+            except Exception:
+                pass
+            return False
+
+        self._membership_sub_id = sub_id
+        logger.info("Subscribed to subscriptions-changed — membership events are live")
         return True
 
     def _still_owns(self, room_id: str, sub_id: str, state) -> bool:
@@ -808,6 +897,11 @@ class RCWebSocketClient:
                     and msg.get("collection") == "stream-room-messages"
                 ):
                     await self._handle_room_message(msg)
+                elif (
+                    msg_type == "changed"
+                    and msg.get("collection") == "stream-notify-user"
+                ):
+                    self._handle_notify_user(msg)
                 elif msg_type == "result":
                     mid = msg.get("id")
                     if mid in self._pending_results:
@@ -847,6 +941,16 @@ class RCWebSocketClient:
                         logger.warning(
                             "The __my_messages__ stream was terminated between its "
                             "confirmation and being recorded (%s)", nosub_error,
+                        )
+                    elif nosub_id and nosub_id == self._membership_sub_id:
+                        # Degraded, not fatal: joins and removals fall back to
+                        # the first-message path and the reconciliation until
+                        # the next recovery re-subscribes (§2.7).
+                        self._membership_sub_id = None
+                        logger.warning(
+                            "The subscriptions-changed stream was terminated "
+                            "by the server (%s) — membership events are "
+                            "degraded until the next reconnect", nosub_error,
                         )
                     else:
                         logger.warning(
@@ -897,6 +1001,38 @@ class RCWebSocketClient:
     # whether a room should exist rather than answering anyone — but more than one, since a
     # single consumer serializes every room behind the slowest classification lookup.
     _ROUTING_WORKERS = 4
+
+    def _handle_notify_user(self, msg: dict) -> None:
+        """Dispatch a subscriptions-changed event to the membership callback (§2.7).
+
+        Cheap filters first, on the receive loop: `updated` fires on every
+        unread-count change in every room this account is in, so it is
+        discarded before any task exists for it. The callback itself runs on
+        its own task in `_callback_tasks` (drained by `stop`), because it ends
+        in record writes and possibly REST — nothing the receive loop waits on.
+        """
+        if self._membership_callback is None:
+            return
+        fields = msg.get("fields") or {}
+        event_name = fields.get("eventName") or ""
+        if not event_name.endswith("/subscriptions-changed"):
+            return
+        args = fields.get("args") or []
+        if len(args) < 2 or not isinstance(args[1], dict):
+            return
+        action, doc = args[0], args[1]
+        if action not in ("inserted", "removed"):
+            return
+        task = asyncio.create_task(self._run_membership_callback(action, doc))
+        self._callback_tasks.add(task)
+        task.add_done_callback(self._callback_tasks.discard)
+
+    async def _run_membership_callback(self, action: str, doc: dict) -> None:
+        try:
+            await self._membership_callback(action, doc)
+        except Exception:
+            logger.exception(
+                "Unhandled error in membership callback (action=%s)", action)
 
     async def _handle_room_message(self, msg: dict) -> None:
         """Extract room message and dispatch to per-room worker queue.
@@ -1428,6 +1564,14 @@ class RCWebSocketClient:
                 await self._subscribe_rooms_individually(
                     list(self._callbacks.items()), context=reason
                 )
+
+            if self._wants_membership:
+                # Intent survives failure, exactly like the stream's: the id
+                # is per-attempt, and a restore that fails degrades to the
+                # first-message and reconciliation paths rather than being
+                # retried here.
+                self._membership_sub_id = None
+                await self.subscribe_membership_events()
 
             await self._fire_reconnect_callback()
         finally:
