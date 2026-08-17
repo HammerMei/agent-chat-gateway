@@ -311,6 +311,14 @@ class TestAWakeLandingMidDropWaits(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(woken.session_id, session_id)
         self.assertIsNotNone(lifecycle.processor_named(name))
         self.assertIs(dispatcher.capacity(ROOM_ID), RoomCapacity.AVAILABLE)
+        # The tell that actually bites: without the lock, the recreation runs
+        # mid-drain and the teardown's LAST step then removes the session
+        # binding the recreation just made — a woken watcher whose responses
+        # have no room to go to, silently. The binding must have survived.
+        self.assertEqual(
+            lifecycle._maps.get_room(session_id), ROOM_ID,
+            "the teardown removed the session binding the wake just made",
+        )
 
 
 if __name__ == "__main__":
