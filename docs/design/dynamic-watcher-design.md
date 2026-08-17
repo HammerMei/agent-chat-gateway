@@ -919,6 +919,23 @@ gives the per-room park a deliberately short memory: a resolve that keeps
 failing backs off and parks **in process only** (§2.7), and a restart clears the
 park and tries again.
 
+**One qualification, ruled during the idle-tick increment's review: a failed
+record whose room has also been quiet past its idle TTL converts to `idle` at
+boot instead of being retried.** The boot evaluation cannot tell was-active
+from failed — the rollback table above is why no field distinguishes them —
+and it judges both by the same clock. The conversion is deliberate rather than
+an accident of that blindness: reviving a room nobody has spoken in for
+`session_idle_days` just to have it sit resident is the resume cost the boot
+evaluation exists to avoid paying, and the record's next message or scheduled
+injection retries the start through the wake anyway. What it costs is
+visibility — `idle` is outside the default `list` view, so a broken watcher
+whose room went quiet stops being reported after the first restart past its
+TTL. Accepted because the staleness bounds the harm: the failure is at least
+`session_idle_days` old, nobody has been affected by it in all that time, and
+the wake retries it the moment somebody would be. Retry-on-every-start remains
+the rule for every failed record *inside* its idle TTL — the case where
+someone is plausibly waiting.
+
 ##### `failed` is in the default `list` view
 
 `StateFilter.OPERABLE` is `active | paused | failed`. Of the states an operator
