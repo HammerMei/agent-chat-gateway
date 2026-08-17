@@ -923,9 +923,21 @@ class MattermostConnector(Connector):
             coro = self._membership_hook.removed(channel_id)
         else:
             coro = self._handle_membership_add(channel_id)
-        task = asyncio.create_task(coro)
+        # Guarded like RC's `_run_membership_callback`, and for the same
+        # reason: a hook that raises inside a spawned task is otherwise an
+        # unobserved task exception — a GC-time warning, not a log line.
+        task = asyncio.create_task(self._run_membership(coro, channel_id))
         self._routing_tasks.add(task)
         task.add_done_callback(self._routing_tasks.discard)
+
+    async def _run_membership(self, coro, channel_id: str) -> None:
+        try:
+            await coro
+        except Exception:
+            logger.exception(
+                "Membership handling failed for channel %s — the safety nets "
+                "cover it", channel_id,
+            )
 
     async def _handle_membership_add(self, channel_id: str) -> None:
         """Classify a joined channel via REST and hand it to the hook.

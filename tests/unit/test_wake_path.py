@@ -91,6 +91,9 @@ class TestTheWakeResumesTheSameSession(unittest.IsolatedAsyncioTestCase):
         lifecycle._attachment_workspace = MagicMock(
             setup=MagicMock(return_value="/tmp/fake"))
         manager = WatcherManager("rc", connector, lifecycle, [_rule()])
+        # Exposed for the suites that reuse this harness (the membership
+        # money test enters through `register_on_join`, not the router).
+        self.manager = manager
 
         # The same wiring `SessionManager` performs, in the same shape.
         async def router(room, trigger):

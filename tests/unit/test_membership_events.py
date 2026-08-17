@@ -710,5 +710,128 @@ class TestMattermostMembershipEvents(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(connector._routing_tasks, set())
 
 
+class TestAJoinRegisteredRoomWakesOnFirstMessage(unittest.IsolatedAsyncioTestCase):
+    """The seam money test (§2.7): register_on_join → the room's first message
+    arrives untracked → the real routing episode finds the record →
+    `_recreate` accepts a record with no session and no watermark → a session
+    is minted, `dropped_at` clears, and the frozen snapshots survive.
+
+    The decision layers are pinned above; this is the A1 lesson — a mocked
+    seam validates the halves while the seam's output corrupts state — so the
+    connector, manager, lifecycle and dispatcher are all real here, the same
+    harness as the wake suite's."""
+
+    from tests.unit.test_wake_path import (
+        TestTheWakeResumesTheSameSession as _WakeSuite,
+    )
+
+    _harness = _WakeSuite._harness
+    _settle = _WakeSuite._settle
+
+    async def test_join_register_then_first_message_wakes(self):
+        from unittest.mock import patch
+
+        from tests.unit.test_wake_path import _ACCESS, _doc
+
+        connector, lifecycle, dispatcher = await self._harness()
+
+        # 1. The join: an idle, sessionless record — nothing started.
+        name = await self.manager.register_on_join(
+            _room(id="wake-1", name="eng-backend"))
+        self.assertEqual(name, "rc-eng-backend")
+        record = lifecycle.get_watcher_state(name)
+        self.assertEqual(record.session_id, "")
+        self.assertEqual(record.last_processed_ts, "")
+        self.assertTrue(record.dropped_at)
+        created_at = record.created_at
+        self.assertNotIn("wake-1", connector._rooms,
+                         "a join registers, it does not subscribe")
+
+        # 2. The first message: untracked room → the real routing episode.
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            await connector._on_unrouted_message(_doc("m1", 1500), _ACCESS)
+            await self._settle(connector)
+
+        woken = lifecycle.get_watcher_state(name)
+        self.assertTrue(woken.session_id, "a session was minted on the wake")
+        self.assertEqual(woken.dropped_at, "", "the wake cleared the idle stamp")
+        self.assertEqual(woken.rule_name, "eng",
+                         "the join-frozen rule survived the wake")
+        self.assertTrue(dict(woken.config),
+                        "the join-frozen config survived the wake")
+        self.assertEqual(woken.created_at, created_at,
+                         "creation time is the join's, not the wake's")
+        self.assertIsNotNone(lifecycle.processor_named(name))
+        self.assertEqual(self.delivered, ["m1"], "the trigger was delivered")
+        # No watermark at the join, so the recreation owes no replay — and the
+        # empty boundary must not trip an after_ts="" fetch.
+        connector.replay_room_since.assert_not_awaited()
+
+    async def test_a_join_registered_record_is_untouched_by_boot(self):
+        """Across a restart the record persists with no watermark and a
+        `dropped_at`: the watermark snapshot excludes it (nothing to replay
+        from), and the boot evaluation skips it (it is idle, not was-active) —
+        verified here so neither loop ever probes with an empty bound."""
+        record = make_rule_derived_record(
+            name="joined", room_id="r-j", session_id="",
+            dropped_at="2026-08-16T00:00:00+00:00", last_processed_ts="")
+        mgr = _bare_manager_with_membership()
+        mgr._lifecycle.states = MagicMock(return_value={"joined": record})
+        mgr._watcher_manager.get_or_create = AsyncMock()
+
+        self.assertEqual(mgr._snapshot_watermarks(), {},
+                         "no watermark, nothing to replay from")
+        await mgr._evaluate_lifecycle_at_boot()
+        mgr._watcher_manager.get_or_create.assert_not_awaited()
+        self.assertEqual(record.dropped_at, "2026-08-16T00:00:00+00:00",
+                         "boot restamps nothing on an idle record")
+
+
+class TestTheWiring(unittest.IsolatedAsyncioTestCase):
+    """The one layer everything above mocks past: registration reaches the
+    transport, and the wire subscription is gated on the hook."""
+
+    def _rc(self):
+        from gateway.connectors.rocketchat.connector import RocketChatConnector
+        from tests.helpers import make_rc_config
+
+        connector = RocketChatConnector(make_rc_config())
+        connector._rest = MagicMock()
+        connector._ws = MagicMock()
+        connector._ws.subscribe_all = AsyncMock(return_value=True)
+        connector._ws.unsubscribe_rooms_keeping_callbacks = AsyncMock()
+        connector._ws.subscribe_membership_events = AsyncMock(return_value=True)
+        connector._router = lambda room, trigger: None
+        return connector
+
+    async def test_rc_subscribes_membership_events_iff_the_hook_exists(self):
+        connector = self._rc()
+        await connector.start_inbound()
+        connector._ws.subscribe_membership_events.assert_not_awaited()
+
+        hook, _, _ = _hook()
+        connector.register_membership_hook(hook)
+        await connector.start_inbound()
+        connector._ws.subscribe_membership_events.assert_awaited_once()
+        connector._ws.register_membership_callback.assert_called_once_with(
+            connector._on_membership_event)
+
+    async def test_mm_connect_registers_the_membership_handler(self):
+        from tests.unit.test_mattermost_connector import _make_connector
+
+        connector = _make_connector()
+        connector._rest.authenticate = AsyncMock()
+        connector._rest.get_me = AsyncMock()
+        connector._rest.resolve_team = AsyncMock()
+        connector._ws = MagicMock()
+        connector._ws.connect = AsyncMock()
+
+        await connector.connect()
+
+        connector._ws.register_membership_handler.assert_called_once_with(
+            connector._on_membership_event)
+
+
 if __name__ == "__main__":
     unittest.main()
