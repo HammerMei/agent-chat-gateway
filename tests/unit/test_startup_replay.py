@@ -94,14 +94,11 @@ class TestStartupReplay(unittest.IsolatedAsyncioTestCase):
     """The replay itself, against a mocked lifecycle and connector."""
 
     def _manager(self, records):
-        from gateway.core.session_manager import SessionManager
+        from tests.helpers import make_bare_session_manager
 
-        mgr = SessionManager.__new__(SessionManager)
-        mgr._connector = MagicMock()
+        mgr = make_bare_session_manager(_connector_name="rc")
         mgr._connector.probe_missed_since = AsyncMock(return_value=False)
         mgr._connector.replay_room_since = AsyncMock()
-        mgr._connector_name = "rc"
-        mgr._lifecycle = MagicMock()
         mgr._lifecycle.states = MagicMock(
             return_value={r.watcher_name: r for r in records})
         mgr._lifecycle.processor_named = MagicMock(return_value=None)
@@ -236,10 +233,9 @@ class TestTheDownWindowSnapshot(unittest.IsolatedAsyncioTestCase):
     is what puts the records in memory) and before the stream opens."""
 
     def test_only_rule_derived_records_with_a_watermark_are_snapshotted(self):
-        from gateway.core.session_manager import SessionManager
+        from tests.helpers import make_bare_session_manager
 
-        mgr = SessionManager.__new__(SessionManager)
-        mgr._lifecycle = MagicMock()
+        mgr = make_bare_session_manager()
         mgr._lifecycle.states = MagicMock(return_value={
             "keep": _dynamic_record(name="keep"),
             "static": _dynamic_record(name="static", rule_name=""),
@@ -253,14 +249,12 @@ class TestTheDownWindowSnapshot(unittest.IsolatedAsyncioTestCase):
     async def test_the_snapshot_is_taken_before_the_stream_opens(self):
         """After start_inbound a live message can advance a watermark past the
         whole down-window, so a snapshot taken later describes nothing."""
-        from gateway.core.session_manager import SessionManager
+        from tests.helpers import make_bare_session_manager
 
-        mgr = SessionManager.__new__(SessionManager)
+        mgr = make_bare_session_manager()
         order = []
-        mgr._connector = MagicMock()
         mgr._connector.start_inbound = AsyncMock(
             side_effect=lambda: order.append("inbound"))
-        mgr._lifecycle = MagicMock()
         mgr._lifecycle.sync_watchers = AsyncMock(
             side_effect=lambda **kw: order.append("sync") or [])
         mgr._snapshot_watermarks = MagicMock(

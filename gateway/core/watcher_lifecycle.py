@@ -28,6 +28,7 @@ from .state import (
     WatcherState,
     backend_identity,
     lifecycle_state,
+    past_idle_ttl,
     state_filter_name,
 )
 from .state_store import StateStore
@@ -212,6 +213,22 @@ class WatcherLifecycle:
             self._watcher_locks[name] = asyncio.Lock()
         return self._watcher_locks[name]
 
+    def watcher_lock(self, name: str) -> asyncio.Lock:
+        """The per-watcher mutex, for callers *outside* the lifecycle (§2.5).
+
+        The manager's create/recreate takes this around the start it drives, so
+        a wake cannot interleave with a pause's or an idle drop's teardown of
+        the same watcher: without it, a message landing mid-drain recreates the
+        watcher against the state object the teardown is still dismantling, and
+        the teardown's last step then removes the session binding the
+        recreation just made. Lock ordering is the manager's per-room lock
+        outer, this lock inner; nothing takes them reversed.
+
+        **Never taken inside `start_watcher_in_room`** — `sync_watchers` already
+        holds it when it reaches that method, and the lock is not reentrant.
+        """
+        return self._get_watcher_lock(name)
+
     # ── Lifecycle controls ────────────────────────────────────────────────────
 
     async def pause_watcher(self, name: str) -> None:
@@ -245,6 +262,80 @@ class WatcherLifecycle:
                 )
             self._state_store.save(self._states)
             logger.info("Watcher '%s' paused", name)
+
+    async def drop_idle(self, name: str, *, now) -> bool:
+        """The idle drop (§2.5): release the runtime, keep everything a wake needs.
+
+        Deliberately **narrower than `_stop_processor`**, and not a flag on it:
+        that method unsubscribes, and the idle savings exist precisely because
+        an idle room stays subscribed — the connector's room entry, watermark
+        and seen-id window are what make recreation cheap and dedup seamless
+        (§2.2). Idle teardown and pause teardown are different operations that
+        happen to share steps.
+
+        What it does, in `_stop_processor`'s numbering: 1 (release the
+        dispatcher slot), 2 (capture the live watermark into the record), 4
+        (drain and stop the processor), 5 (clean the session maps — the wake's
+        recreation re-binds, exactly as the restart-shaped recreation already
+        does). Never 3. Then `dropped_at` is stamped from the sweep's own
+        clock, so one pass reads one instant, and the record is saved.
+
+        Every decision is re-checked under the per-watcher lock: between the
+        sweep's look and this acquisition, an enqueue can advance the activity
+        clock, an operator can pause, a turn can start. Answers False — and
+        changes nothing — unless the drop actually happened. `now` is the
+        sweep's injected clock (aware datetime).
+        """
+        async with self._get_watcher_lock(name):
+            state = self._states.get(name)
+            if state is None or state.paused or state.dropped_at:
+                return False
+            processor = self._processors.get(name)
+            if processor is None:
+                # Not resident: failed, or mid-transition. Boot owns failed
+                # records (§2.5, retry-at-every-start); a timer must not.
+                return False
+            if processor.has_work_in_flight:
+                return False
+            if (
+                self._permission_registry is not None
+                and state.session_id
+                and self._permission_registry.pending_for_session(state.session_id)
+            ):
+                # An approval an operator is still reading — an idle drop must
+                # not cancel it (§2.5).
+                return False
+            if not past_idle_ttl(state, now):
+                return False
+
+            self._processors.pop(name, None)
+            if state.room_id:
+                self._dispatcher.remove_processor(state.room_id, processor)
+                # Capture the live watermark while the connector still holds the
+                # room entry — same reason as `_stop_processor` step 2, same
+                # `is not None` rule: None means "no opinion", an empty string
+                # is one.
+                live_ts = self._connector.get_last_processed_ts(state.room_id)
+                if live_ts is not None:
+                    state.last_processed_ts = live_ts
+            try:
+                await processor.stop()
+            except Exception as e:
+                logger.warning(
+                    "Watcher '%s': processor stop failed during idle drop "
+                    "(proceeding — the slot and record are already settled): %s",
+                    name, e,
+                )
+            if state.session_id:
+                self._maps.remove_session(state.session_id)
+            state.dropped_at = now.isoformat(timespec="seconds")
+            self._state_store.save(self._states)
+            logger.info(
+                "Watcher '%s' idled after %s day(s) without activity — session "
+                "kept, room still subscribed; its next message wakes it",
+                name, (state.rule or {}).get("session_idle_days"),
+            )
+            return True
 
     async def resume_watcher(self, name: str) -> None:
         """Resume a paused watcher."""

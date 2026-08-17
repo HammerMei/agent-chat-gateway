@@ -128,6 +128,8 @@ class MessageProcessor:
         #   draining → enqueue() rejects, consumer finishes queued messages then exits
         #   stopped  → everything halted
         self._state: str = "running"  # "running" | "draining" | "stopped"
+        # True while the consumer loop is inside a turn — see has_work_in_flight.
+        self._turn_in_flight: bool = False
         # Event set when the consumer finishes draining (or is forced to stop).
         self._drained = asyncio.Event()
         # Cooldown for queue-full notifications to prevent spam storms.
@@ -246,6 +248,18 @@ class MessageProcessor:
         """True if the processor is running and has queue capacity."""
         return self._state == "running" and not self._queue.full()
 
+    @property
+    def has_work_in_flight(self) -> bool:
+        """A turn is running or messages are queued — accepted work not yet done.
+
+        The idle sweep's busy gate (§2.5): a room must not be dropped
+        mid-conversation, and `last_activity_at` alone cannot say so — it is
+        stamped at *acceptance*, so a turn still running reads as old activity.
+        The pending-permission half of that gate lives with the sweep, which
+        holds the registry; this property answers only for the processor.
+        """
+        return self._turn_in_flight or not self._queue.empty()
+
     # ── Inbound ───────────────────────────────────────────────────────────────
 
     async def enqueue(self, msg: IncomingMessage) -> bool:
@@ -353,6 +367,7 @@ class MessageProcessor:
                         break
                     batch.append(extra)
 
+                self._turn_in_flight = True
                 try:
                     if len(batch) == 1:
                         await self._process(batch[0])
@@ -362,6 +377,8 @@ class MessageProcessor:
                     raise
                 except Exception:
                     logger.exception("Unhandled error in processor loop")
+                finally:
+                    self._turn_in_flight = False
                 # After each turn, check if we should exit (drain mode + empty).
                 if self._state == "draining" and self._queue.empty():
                     break

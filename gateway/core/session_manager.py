@@ -20,6 +20,7 @@ from .config import CoreConfig, WatcherConfig
 from .connector import Connector, IncomingMessage, Room, User, UserRole
 from .dispatch import MessageDispatcher
 from .injected_context_builder import InjectedContextBuilder
+from .lifecycle_sweep import LifecycleSweep
 from .permission import PermissionRegistry
 from .session_maps import SessionMaps
 from .state import StateFilter, parse_state_filter
@@ -87,6 +88,14 @@ class SessionManager:
         self._watcher_manager = (
             WatcherManager(state_name, connector, self._lifecycle, watcher_rules)
             if watcher_rules
+            else None
+        )
+        # The idle sweep exists only where rule-derived watchers do: a static
+        # deployment's lifecycle is config.yaml's, and its records carry no
+        # frozen rule for the sweep to read anyway (§2.5).
+        self._sweep = (
+            LifecycleSweep(self._lifecycle)
+            if self._watcher_manager is not None
             else None
         )
 
@@ -166,6 +175,13 @@ class SessionManager:
         down_window = self._snapshot_watermarks()
         await self._connector.start_inbound()
         await self._replay_persisted_records(down_window)
+        if self._sweep is not None:
+            # After the replay completes, structurally — §2.5 makes this
+            # ordering non-optional once the expiry leg exists (expiry deletes
+            # the record recreation reads from, and the replay's whole job is
+            # reviving rooms with messages waiting), and the idle leg honors it
+            # from day one so step 5 does not have to move this line.
+            self._sweep.start()
         return errors
 
     def _snapshot_watermarks(self) -> dict[str, str]:
@@ -306,6 +322,10 @@ class SessionManager:
         and cause duplicate message delivery on the next restart.
         """
         logger.info("SessionManager shutting down")
+        if self._sweep is not None:
+            # Before stop_all, so a pass cannot overlap the shutdown's own
+            # teardown of the processors it is judging.
+            await self._sweep.stop()
         await self._lifecycle.stop_all()
         self._lifecycle.save_state()
         await self._connector.disconnect()

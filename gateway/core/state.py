@@ -245,6 +245,38 @@ def now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+def past_idle_ttl(record: "WatcherState", now) -> bool:
+    """Whether this record's idle TTL has elapsed — the idle leg's arithmetic (§2.5).
+
+    One function, two callers by design: the sweep asks it on a timer, and boot
+    asks the same question once at start — a boot rule and a running rule would
+    drift on exactly the restart-only path nothing exercises.
+
+    Reads the **frozen** rule, never current config (§2.5): the sweep reads what
+    the record carries, and rule updates belong to a future config-reload that
+    diffs current against frozen. Answers False — never destructive — when the
+    record carries no rule snapshot (a static-model record, whose lifecycle is
+    `config.yaml`'s), no TTL, no activity clock, or a clock it cannot parse.
+
+    `now` is an aware datetime, injected by the caller: tests cannot sleep
+    fifteen days, and the sweep stamps `dropped_at` from the same value so one
+    pass reads one instant.
+    """
+    from datetime import datetime, timedelta
+
+    days = (record.rule or {}).get("session_idle_days")
+    if not isinstance(days, int) or days <= 0 or not record.last_activity_at:
+        return False
+    try:
+        last = datetime.fromisoformat(record.last_activity_at)
+    except ValueError:
+        return False
+    if last.tzinfo is None:
+        # A naive stamp is a legacy record; local time is what wrote it.
+        last = last.astimezone()
+    return (now - last) >= timedelta(days=days)
+
+
 def carried_fields(state: "WatcherState | None") -> dict:
     """The fields a recreation must carry out of the record it is recreating.
 

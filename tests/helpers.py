@@ -195,6 +195,49 @@ def make_manager(
     )
 
 
+def make_bare_session_manager(**attrs):
+    """A `SessionManager` built without `__init__`, every collaborator a double.
+
+    For method-level tests that pin one SessionManager method against mocks —
+    the real constructor builds real collaborators, which is a different kind
+    of test (`make_manager`). Sets every attribute `__init__` sets, because a
+    hand-built subset describes an object no code path produces, and the first
+    method to read an unset field fails several layers from the cause — the
+    `WatcherLifecycle.__new__` lesson, re-learned on SessionManager when
+    `_sweep` arrived and seven tests across two files broke at once.
+
+    A drift test (`test_session_manager_commands`) compares this against a
+    real instance, so the next `__init__` field fails there, once, with a
+    message that says what to do.
+    """
+    from unittest.mock import AsyncMock
+
+    from gateway.core.session_manager import SessionManager
+
+    mgr = SessionManager.__new__(SessionManager)
+    mgr._connector = MagicMock()
+    mgr._connector.connect = AsyncMock()
+    mgr._connector.start_inbound = AsyncMock()
+    mgr._connector.disconnect = AsyncMock()
+    mgr._connector_name = "default"
+    mgr._dispatcher = MagicMock()
+    mgr._injector = MagicMock()
+    mgr._state_store = MagicMock()
+    mgr._lifecycle = MagicMock()
+    mgr._lifecycle.sync_watchers = AsyncMock(return_value=[])
+    mgr._lifecycle.stop_all = AsyncMock()
+    mgr._lifecycle.pause_watcher = AsyncMock()
+    mgr._lifecycle.resume_watcher = AsyncMock()
+    mgr._lifecycle.reset_watcher = AsyncMock()
+    # No rules → no creation path and no sweep; tests that exercise either
+    # override these two together, the way __init__ gates them together.
+    mgr._watcher_manager = None
+    mgr._sweep = None
+    for name, value in attrs.items():
+        setattr(mgr, name, value)
+    return mgr
+
+
 def make_processor(agent=None, **overrides):
     """A real `MessageProcessor` with a double for every collaborator.
 

@@ -166,5 +166,152 @@ class TestTheWakeResumesTheSameSession(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(connector._watcher_contexts[ROOM_ID]), 1)
 
 
+class TestTheSweepIdlesAndTheNextMessageWakes(unittest.IsolatedAsyncioTestCase):
+    """The money test (§2.5): the full idle lifecycle through the real stack.
+
+    Create through the real routing episode → advance the injected clock →
+    the sweep drops the room (`dropped_at` set, processor gone, **connector
+    room state intact** — that assertion pins §2.2) → the next message wakes
+    it → the *same session* resumes, replaying from the watermark the drop
+    captured. No layer is doubled between the sweep, the lifecycle, the
+    manager and the connector; only the wire, the processor and the agent are.
+    """
+
+    # Reuse the wake harness wholesale — same seams, same reasons.
+    _harness = TestTheWakeResumesTheSameSession._harness
+    _settle = TestTheWakeResumesTheSameSession._settle
+
+    async def test_create_sweep_idle_wake(self):
+        from datetime import datetime, timedelta
+
+        from gateway.core.lifecycle_sweep import LifecycleSweep
+
+        connector, lifecycle, dispatcher = await self._harness()
+        clock = {"now": datetime.now().astimezone()}
+        sweep = LifecycleSweep(lifecycle, now=lambda: clock["now"])
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            MockProc.return_value.stop = AsyncMock()
+            MockProc.return_value.has_work_in_flight = False
+
+            # 1. Creation, through the real routing episode.
+            await connector._on_unrouted_message(_doc("m1", 1500), _ACCESS)
+            name = "rc-eng-backend"
+            created = lifecycle.get_watcher_state(name)
+            self.assertIsNotNone(created)
+            session_id = created.session_id
+            # What the room reached before going quiet — the connector's live
+            # state the drop must capture and the wake must replay from.
+            sub = connector._rooms[ROOM_ID]
+            sub.last_processed_ts = "1500"
+            sub.remember("m1")
+
+            # 2. Sixteen days pass (rule defaults: 15/15). The sweep drops it.
+            clock["now"] += timedelta(days=16)
+            self.assertEqual(await sweep.run_once(), [name])
+
+            self.assertTrue(created.dropped_at, "the idle clock was stamped")
+            self.assertEqual(created.last_processed_ts, "1500",
+                             "the drop captured the live watermark")
+            self.assertIsNone(lifecycle.processor_named(name))
+            self.assertIs(dispatcher.capacity(ROOM_ID), RoomCapacity.UNROUTED)
+            # §2.2, pinned: the drop does NOT unsubscribe — the room entry,
+            # its watermark and its dedup window all survive.
+            self.assertIs(connector._rooms.get(ROOM_ID), sub)
+            self.assertIn("m1", sub.seen_ids_set)
+            self.assertEqual(connector._room_refcount[ROOM_ID], 1)
+
+            # 3. The next message wakes it through the tracked path.
+            handled = await connector._on_raw_ddp_message(ROOM_ID, _doc("m2", 1600))
+            await self._settle(connector)
+            self.assertTrue(handled)
+
+        woken = lifecycle.get_watcher_state(name)
+        self.assertEqual(woken.session_id, session_id, "the same session resumed")
+        self.assertEqual(woken.dropped_at, "", "no longer idle")
+        self.assertIsNotNone(lifecycle.processor_named(name))
+        self.assertIs(dispatcher.capacity(ROOM_ID), RoomCapacity.AVAILABLE)
+        # The wake replayed the interval the room owes, from the very
+        # watermark the drop captured.
+        connector.replay_room_since.assert_awaited_once()
+        self.assertEqual(
+            connector.replay_room_since.await_args.kwargs.get("after_ts"), "1500")
+        # And however many idle/wake cycles, the bookkeeping does not grow.
+        self.assertEqual(connector._room_refcount[ROOM_ID], 1)
+        self.assertEqual(len(connector._watcher_contexts[ROOM_ID]), 1)
+
+
+class TestAWakeLandingMidDropWaits(unittest.IsolatedAsyncioTestCase):
+    """The teardown/wake race the per-watcher lock closes.
+
+    An idle drop removes the dispatcher slot first and drains last, so a
+    message landing mid-drain finds the room UNROUTED and opens a wake — a
+    recreation racing the very teardown that made it possible. Without the
+    manager taking the lifecycle's per-watcher lock, the recreation runs
+    against the state object the teardown is still dismantling, and the
+    teardown's last steps remove the session binding the recreation just made
+    and stamp `dropped_at` over the recreation's reset. The observable tell is
+    exactly that stamp: a woken room that still reads idle.
+    """
+
+    _harness = TestTheWakeResumesTheSameSession._harness
+    _settle = TestTheWakeResumesTheSameSession._settle
+
+    async def test_the_wake_waits_for_the_teardown_to_settle(self):
+        import asyncio
+        from datetime import datetime, timedelta
+
+        from gateway.core.lifecycle_sweep import LifecycleSweep
+
+        connector, lifecycle, dispatcher = await self._harness()
+        clock = {"now": datetime.now().astimezone()}
+        sweep = LifecycleSweep(lifecycle, now=lambda: clock["now"])
+        release = asyncio.Event()
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            MockProc.return_value.has_work_in_flight = False
+
+            async def _slow_stop():
+                await release.wait()
+
+            MockProc.return_value.stop = AsyncMock(side_effect=_slow_stop)
+
+            await connector._on_unrouted_message(_doc("m1", 1500), _ACCESS)
+            name = "rc-eng-backend"
+            session_id = lifecycle.get_watcher_state(name).session_id
+
+            clock["now"] += timedelta(days=16)
+            drop = asyncio.create_task(sweep.run_once())
+            # Let the drop release the dispatcher slot and park in the drain,
+            # holding the per-watcher lock.
+            for _ in range(10):
+                await asyncio.sleep(0)
+            self.assertIsNone(lifecycle.processor_named(name),
+                              "the drop is mid-teardown")
+
+            # The wake lands exactly there.
+            wake = asyncio.create_task(
+                connector._on_raw_ddp_message(ROOM_ID, _doc("m2", 1600)))
+            for _ in range(10):
+                await asyncio.sleep(0)
+
+            release.set()
+            self.assertEqual(await drop, [name])
+            self.assertTrue(await wake)
+            await self._settle(connector)
+
+        woken = lifecycle.get_watcher_state(name)
+        self.assertEqual(
+            woken.dropped_at, "",
+            "the recreation ran after the teardown settled — a dropped_at "
+            "surviving here means the teardown stamped over the wake's reset",
+        )
+        self.assertEqual(woken.session_id, session_id)
+        self.assertIsNotNone(lifecycle.processor_named(name))
+        self.assertIs(dispatcher.capacity(ROOM_ID), RoomCapacity.AVAILABLE)
+
+
 if __name__ == "__main__":
     unittest.main()

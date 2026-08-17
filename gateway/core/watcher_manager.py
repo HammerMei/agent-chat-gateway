@@ -464,38 +464,61 @@ class WatcherManager:
             name=room_description(room),
             type=record.room_kind or room.kind.value,
         )
-        # Everything a start does not rebuild, carried out of the record being
-        # recreated — derived from the field classification in `state.py`, not
-        # listed here, so a new §5.3 field survives recreation without this line
-        # changing. The clocks move with it: the room is resident again, so it
-        # is no longer dropped, and this is activity.
-        carried = carried_fields(record)
-        carried["last_activity_at"] = now_iso()
-        carried["dropped_at"] = ""
-        # The window this recreation owes the room. Read before the start, which
-        # restores it into the connector and then advances it as the replayed
-        # and live messages commit.
-        boundary = record.last_processed_ts
         # A raise propagates: recreation that failed is an abort, not a decision,
         # and the caller owns the retry (§2.2). The per-room lock releases on the
         # way out, so the retry can re-enter.
-        await self._lifecycle.start_watcher_in_room(
-            wc, record, platform_room,
-            # The record's own watermark bounds the handoff when the backend has
-            # expired the session and a fresh one has to be minted: without it the
-            # unbounded fetch pulls in the very interval the replay below is about
-            # to deliver, and the agent sees it twice.
-            #
-            # The **lower** of the two bounds wins, and that is not the same as
-            # "the trigger's, if there is one". `before_ts` is an exclusive upper
-            # bound, so a *lower* value fetches less; the trigger is by
-            # construction a message above the watermark, so preferring it would
-            # pick the looser bound and re-admit the whole interval — the exact
-            # double delivery this argument exists to prevent, on the common path.
-            history_before_ts=_earlier(history_before_ts, boundary),
-            provenance=carried,
-        )
-        self._lifecycle.save_state()
+        #
+        # Under the lifecycle's per-watcher lock (§2.5): a pause and an idle drop
+        # both remove the processor first and settle the record last, holding
+        # this lock for the span — and the wake this method is means a message
+        # can arrive exactly mid-drain. Without the lock the recreation runs
+        # against the state object the teardown is still dismantling, and the
+        # teardown's last step removes the session binding just made. Waiting
+        # is correct in both cases: after a pause the record reads paused and
+        # the check below declines; after an idle drop the recreation proceeds
+        # against a settled record. Room lock outer, watcher lock inner —
+        # nothing takes them reversed.
+        async with self._lifecycle.watcher_lock(record.watcher_name):
+            if record.paused:
+                # Re-read under the lock: the pause that held it just settled.
+                logger.debug(
+                    "Room %s was paused while its wake waited — not recreating",
+                    record.room_id,
+                )
+                return None
+            # Everything a start does not rebuild, carried out of the record being
+            # recreated — derived from the field classification in `state.py`, not
+            # listed here, so a new §5.3 field survives recreation without this line
+            # changing. The clocks move with it: the room is resident again, so it
+            # is no longer dropped, and this is activity. Read under the lock, and
+            # that is load-bearing for the watermark below: a teardown this wake
+            # waited on captures the live watermark into the record as one of its
+            # steps, and a boundary read before the lock would replay from the
+            # stale mark.
+            carried = carried_fields(record)
+            carried["last_activity_at"] = now_iso()
+            carried["dropped_at"] = ""
+            # The window this recreation owes the room. Read before the start, which
+            # restores it into the connector and then advances it as the replayed
+            # and live messages commit.
+            boundary = record.last_processed_ts
+            await self._lifecycle.start_watcher_in_room(
+                wc, record, platform_room,
+                # The record's own watermark bounds the handoff when the backend has
+                # expired the session and a fresh one has to be minted: without it the
+                # unbounded fetch pulls in the very interval the replay below is about
+                # to deliver, and the agent sees it twice.
+                #
+                # The **lower** of the two bounds wins, and that is not the same as
+                # "the trigger's, if there is one". `before_ts` is an exclusive upper
+                # bound, so a *lower* value fetches less; the trigger is by
+                # construction a message above the watermark, so preferring it would
+                # pick the looser bound and re-admit the whole interval — the exact
+                # double delivery this argument exists to prevent, on the common path.
+                history_before_ts=_earlier(history_before_ts, boundary),
+                provenance=carried,
+            )
+            self._lifecycle.save_state()
 
         # Everything above the record's watermark, replayed through the normal
         # pipeline. This is what makes an abort recoverable for a room that has
@@ -582,14 +605,18 @@ class WatcherManager:
             # catching it here would hand the caller the same None a rule miss
             # produces — a final answer for a non-final condition. The cap slot
             # and the per-room lock both release on the way out.
-            await self._lifecycle.start_watcher_in_room(
-                wc, None, platform_room,
-                history_before_ts=history_before_ts, provenance=provenance,
-            )
+            #
+            # The lifecycle's per-watcher lock, for the same reason `_recreate`
+            # takes it: the start and the save are one lifecycle transition, and
+            # an operator verb for this name must see it whole or not at all.
+            async with self._lifecycle.watcher_lock(wc.name):
+                await self._lifecycle.start_watcher_in_room(
+                    wc, None, platform_room,
+                    history_before_ts=history_before_ts, provenance=provenance,
+                )
+                self._lifecycle.save_state()
         finally:
             self._creations_in_flight -= 1
-
-        self._lifecycle.save_state()
         logger.info(
             "Created watcher '%s' for room %s from rule '%s'",
             wc.name, room.id, rule.name,

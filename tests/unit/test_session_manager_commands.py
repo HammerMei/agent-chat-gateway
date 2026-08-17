@@ -15,33 +15,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 def _make_manager():
     """Build a minimal SessionManager with all collaborators mocked."""
-    from gateway.core.session_manager import SessionManager
+    from tests.helpers import make_bare_session_manager
 
-    mgr = SessionManager.__new__(SessionManager)
-    mgr._connector = MagicMock()
-    mgr._connector.register_handler = MagicMock()
-    mgr._connector.register_capacity_check = MagicMock()
-    mgr._connector.connect = AsyncMock()
-    # Startup's second phase ends by opening the inbound stream, once the watchers
-    # that give arriving events a destination exist.
-    mgr._connector.start_inbound = AsyncMock()
-    mgr._connector.disconnect = AsyncMock()
-    mgr._lifecycle = MagicMock()
+    mgr = make_bare_session_manager()
     mgr._lifecycle.list_watchers = MagicMock(return_value=[])
-    mgr._lifecycle.pause_watcher = AsyncMock()
-    mgr._lifecycle.resume_watcher = AsyncMock()
-    mgr._lifecycle.reset_watcher = AsyncMock()
-    mgr._lifecycle.stop_all = AsyncMock()
     mgr._lifecycle.save_state = MagicMock()
-    mgr._lifecycle.sync_watchers = AsyncMock(return_value=[])
-    mgr._dispatcher = MagicMock()
-    mgr._dispatcher.dispatch = MagicMock()
-    mgr._dispatcher.has_capacity = MagicMock()
-    mgr._injector = MagicMock()
-    mgr._state_store = MagicMock()
-    # No rules → no creation path; connect_only branches on this (§2.8).
-    mgr._watcher_manager = None
-    mgr._connector_name = "default"
     return mgr
 
 
@@ -493,3 +471,20 @@ class TestDispatchCommandPublic(_IsolatedTestCase2):
         self.assertIn("Unknown command", result["error"])
 
         await manager.shutdown()
+
+
+class TestTheBareSessionManagerMatchesARealOne(unittest.IsolatedAsyncioTestCase):
+    """`make_bare_session_manager` builds via `__new__`, so every field is set
+    by hand — the same drift the connector fixture test pins, on the object
+    that broke seven tests across two files when `_sweep` arrived."""
+
+    async def test_no_field_from_init_is_missing(self):
+        from tests.helpers import make_bare_session_manager, make_manager
+
+        real = make_manager()
+        missing = set(vars(real)) - set(vars(make_bare_session_manager()))
+        self.assertEqual(
+            missing, set(),
+            "fields on a real SessionManager that make_bare_session_manager "
+            "never sets — add them there, with the value __init__ gives them",
+        )

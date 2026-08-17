@@ -645,16 +645,12 @@ class TestInboundStartsAfterWatchersExist(unittest.IsolatedAsyncioTestCase):
     async def test_sync_only_starts_the_stream_after_restoring_watchers(self):
         from unittest.mock import AsyncMock, MagicMock, call
 
-        from gateway.core.session_manager import SessionManager
+        from tests.helpers import make_bare_session_manager
 
-        sm = SessionManager.__new__(SessionManager)
+        sm = make_bare_session_manager()
         order = MagicMock()
-        sm._connector = MagicMock()
         sm._connector.start_inbound = AsyncMock(side_effect=lambda: order("inbound"))
-        sm._lifecycle = MagicMock()
         sm._lifecycle.sync_watchers = AsyncMock(side_effect=lambda **kw: order("sync") or [])
-        # No rules -> no creation path; sync_only's startup replay branches on this.
-        sm._watcher_manager = None
 
         await sm.sync_only()
 
@@ -663,16 +659,12 @@ class TestInboundStartsAfterWatchersExist(unittest.IsolatedAsyncioTestCase):
     async def test_the_stream_starts_even_when_a_watcher_failed(self):
         """Per-watcher failures are reported, not a reason to leave the connector deaf
         for the rooms that did start."""
-        from unittest.mock import AsyncMock, MagicMock
+        from unittest.mock import AsyncMock
 
-        from gateway.core.session_manager import SessionManager
+        from tests.helpers import make_bare_session_manager
 
-        sm = SessionManager.__new__(SessionManager)
-        sm._connector = MagicMock()
-        sm._connector.start_inbound = AsyncMock()
-        sm._lifecycle = MagicMock()
+        sm = make_bare_session_manager()
         sm._lifecycle.sync_watchers = AsyncMock(return_value=["w1 failed"])
-        sm._watcher_manager = None
 
         errors = await sm.sync_only()
 
