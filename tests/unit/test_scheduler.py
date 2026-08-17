@@ -1156,6 +1156,97 @@ class TestParseStarting(unittest.TestCase):
         self.assertEqual(fr.day, 15)
 
 
+class TestInjectMessageWakesAnIdleRoom(unittest.IsolatedAsyncioTestCase):
+    """The wake, from the inside (§2.5).
+
+    The sweep exempts job-bearing rooms from expiry on the sentence "idling
+    one is harmless — the job wakes it", and `inject_message` bypasses the
+    connector entirely, so nothing on the message path can wake it for the
+    job. The injection must therefore recreate through the same
+    `get_or_create` a message would — and a pause must still win (§4.4),
+    which it does because a paused record answers None there.
+    """
+
+    def _record(self, **kw):
+        from gateway.core.state import WatcherState
+
+        defaults = dict(
+            watcher_name="rc-eng", session_id="sess-1", room_id="room-1",
+            room_type="channel", room_kind="channel", room_name="eng-backend",
+            participants=["alice"], rule_name="eng",
+        )
+        defaults.update(kw)
+        return WatcherState(**defaults)
+
+    async def test_an_idle_watchers_injection_recreates_it(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from gateway.core.watcher_manager import RoomRef
+        from gateway.core.watcher_rule import RoomKind
+        from tests.helpers import make_bare_session_manager
+
+        woken_processor = MagicMock()
+        woken_processor.enqueue = AsyncMock(return_value=True)
+
+        sm = make_bare_session_manager(_connector_name="rc")
+        sm._lifecycle.get_processor = MagicMock(return_value=None)  # idle
+        sm._lifecycle.get_watcher_state = MagicMock(return_value=self._record())
+        sm._lifecycle.get_watcher_config = MagicMock(return_value=None)
+        sm._watcher_manager = MagicMock()
+        sm._watcher_manager.get_or_create = AsyncMock(return_value=woken_processor)
+
+        result = await sm.inject_message("rc-eng", "check stock prices")
+
+        self.assertTrue(result)
+        woken_processor.enqueue.assert_awaited_once()
+        call = sm._watcher_manager.get_or_create.await_args
+        self.assertEqual(call.args[0], "rc")
+        room = call.args[1]
+        self.assertIsInstance(room, RoomRef)
+        self.assertEqual(room.id, "room-1")
+        self.assertIs(room.kind, RoomKind.CHANNEL)
+        self.assertEqual(room.participants, ("alice",))
+
+    async def test_a_declined_wake_is_a_visible_failure(self):
+        """Paused, or no frozen config: get_or_create answers None, and the
+        injection reports False with the same warning as before — a schedule
+        must not override a pause (§4.4)."""
+        import logging
+        from unittest.mock import AsyncMock, MagicMock
+
+        from tests.helpers import make_bare_session_manager
+
+        sm = make_bare_session_manager(_connector_name="rc")
+        sm._lifecycle.get_processor = MagicMock(return_value=None)
+        sm._lifecycle.get_watcher_state = MagicMock(
+            return_value=self._record(paused=True))
+        sm._watcher_manager = MagicMock()
+        sm._watcher_manager.get_or_create = AsyncMock(return_value=None)
+
+        with self.assertLogs("agent-chat-gateway.core.session_manager",
+                             level=logging.WARNING):
+            result = await sm.inject_message("rc-eng", "hello")
+
+        self.assertFalse(result)
+
+    async def test_a_static_deployment_keeps_the_old_answer(self):
+        """No watcher manager → no creation path; the injection fails exactly
+        as it always has rather than reaching for a router that is not there."""
+        import logging
+        from unittest.mock import MagicMock
+
+        from tests.helpers import make_bare_session_manager
+
+        sm = make_bare_session_manager()
+        sm._lifecycle.get_processor = MagicMock(return_value=None)
+
+        with self.assertLogs("agent-chat-gateway.core.session_manager",
+                             level=logging.WARNING):
+            result = await sm.inject_message("static-w", "hello")
+
+        self.assertFalse(result)
+
+
 class TestInjectMessageStateNone(unittest.IsolatedAsyncioTestCase):
     """T3: inject_message logs a warning when persisted state is None (room_id unknown)."""
 

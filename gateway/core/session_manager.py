@@ -383,6 +383,30 @@ class SessionManager:
         (e.g. watcher not running, queue full, or watcher not found).
         """
         processor = self._lifecycle.get_processor(watcher_name)
+        if processor is None and self._watcher_manager is not None:
+            # The wake, from the inside (§2.5): an idle room's record is real
+            # and its session is kept, so a scheduled job due in it recreates
+            # the watcher through the same get_or_create a message would —
+            # the sweep's expiry exemption for job-bearing rooms rests on
+            # exactly this ("idling one is harmless — the job wakes it"), and
+            # without it that sentence was an assumption with no backing.
+            # Paused answers None, so pause still outranks a schedule (§4.4).
+            record = self._lifecycle.get_watcher_state(watcher_name)
+            if record is not None and record.room_id:
+                kind = (
+                    RoomKind(record.room_kind)
+                    if record.room_kind
+                    else RoomKind.CHANNEL
+                )
+                processor = await self._watcher_manager.get_or_create(
+                    self._connector_name,
+                    RoomRef(
+                        id=record.room_id,
+                        kind=kind,
+                        name=record.room_name,
+                        participants=tuple(record.participants),
+                    ),
+                )
         if processor is None:
             logger.warning(
                 "inject_message: no active processor for watcher %r — "
