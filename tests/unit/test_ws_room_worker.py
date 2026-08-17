@@ -534,6 +534,10 @@ class TestTheCreationPathJoinsTheRoomsQueue(unittest.IsolatedAsyncioTestCase):
             "r1": _RoomSubscription(room=Room(id="r1", name="general", type="channel"))
         }
         c._pending_routes = {}
+        # The routing path asks whether a tracked room is *served* (§2.5, the wake);
+        # None reads as "no dispatcher wired: tracked is served", which is this
+        # fixture's situation.
+        c._capacity_check = None
         async def _noop_router(room, trigger):
             pass
 

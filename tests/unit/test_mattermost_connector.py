@@ -1689,6 +1689,157 @@ class TestEveryWayOfNotDeliveringGivesTheTurnBack(unittest.IsolatedAsyncioTestCa
         self.assertEqual(self._turns(c), 1)
 
 
+class TestAnIdleChannelWakesOnItsNextMessage(unittest.IsolatedAsyncioTestCase):
+    """The wake (§2.5), Mattermost's twin of Rocket.Chat's.
+
+    The idle drop keeps the channel's local state (§2.2), so its next message takes
+    the tracked path — where the UNROUTED arm used to drop it with a warning. The arm
+    now offers the channel back through the same episode funnel an untracked one goes
+    through. Mattermost's one wrinkle: the tracked path registers the post's id
+    *before* its first await, so the wake must forget it or the episode's redelivery
+    dies at the dedup check.
+    """
+
+    def setUp(self):
+        self.delivered: list[str] = []
+        self.offered: list = []
+        self.served = False
+
+    async def _connector(self):
+        connector = _make_connector(filter_sender=False)
+        connector._config.require_mention = False
+        room = Room(id="chan1", name="general", type="channel")
+        connector._ws.register_channel = MagicMock()
+        await connector.subscribe_room(room, watcher_id="w1")
+        connector._rest.resolve_username = AsyncMock(return_value="alice")
+        connector.register_capacity_check(
+            lambda *a, **kw:
+                RoomCapacity.AVAILABLE if self.served else RoomCapacity.UNROUTED)
+        connector.register_handler(AsyncMock(return_value=True))
+        connector._ws.deliver_to_channel = MagicMock(
+            side_effect=lambda decoded: self.delivered.append(decoded["post"]["id"]))
+
+        async def _router(room_ref, trigger):
+            self.offered.append(room_ref)
+            self.served = True
+
+        connector.register_router(_router)
+        return connector
+
+    def _event(self, post_id="p1", create_at=500):
+        return {"post": {"id": post_id, "channel_id": "chan1", "user_id": "u1",
+                         "message": "hi", "root_id": "", "type": "",
+                         "create_at": create_at},
+                "mentions": []}
+
+    async def _settle(self, connector):
+        while connector._routing_tasks:
+            await asyncio.gather(*connector._routing_tasks)
+
+    async def test_the_wake_offers_the_channel_and_redelivers_the_trigger(self):
+        from gateway.core.watcher_manager import RoomRef
+
+        connector = await self._connector()
+        state = connector._channels["chan1"]
+
+        await connector._on_posted_event(self._event())
+        await self._settle(connector)
+
+        self.assertEqual(len(self.offered), 1, "the channel was offered exactly once")
+        self.assertIsInstance(self.offered[0], RoomRef)
+        self.assertEqual(self.offered[0].id, "chan1")
+        self.assertEqual(self.delivered, ["p1"])
+        # The optimistic registration was undone, or this redelivery would have
+        # died at the dedup check; and the watermark never moved.
+        self.assertNotIn("p1", state.seen_ids_set)
+        self.assertFalse(state.last_processed_ts)
+
+    async def test_a_replayed_post_wakes_too(self):
+        """The outage wake. A replayed event carries no channel metadata — the
+        untracked path's `_room_ref_from_event` answers None for every one of them —
+        so the wake must resolve the room from the tracked state instead."""
+        connector = await self._connector()
+
+        await connector._on_posted_event(
+            self._event(), is_replay=True, replay_after_ts="100")
+        await self._settle(connector)
+
+        self.assertEqual(len(self.offered), 1)
+        self.assertEqual(self.delivered, ["p1"])
+
+
+class TestADeclinedChannelWakeDoesNotLoop(unittest.IsolatedAsyncioTestCase):
+    """The drain decides deliver-vs-drop on *served*, not on *tracked* — see
+    Rocket.Chat's twin for the loop this closes."""
+
+    def setUp(self):
+        self.delivered: list[str] = []
+        self.offers = 0
+
+    async def _connector(self):
+        connector = _make_connector(filter_sender=False)
+        connector._config.require_mention = False
+        room = Room(id="chan1", name="general", type="channel")
+        connector._ws.register_channel = MagicMock()
+        await connector.subscribe_room(room, watcher_id="w1")
+        connector._rest.resolve_username = AsyncMock(return_value="alice")
+        connector.register_capacity_check(lambda *a, **kw: RoomCapacity.UNROUTED)
+        connector.register_handler(AsyncMock(return_value=True))
+        connector._ws.deliver_to_channel = MagicMock(
+            side_effect=lambda decoded: self.delivered.append(decoded["post"]["id"]))
+
+        async def _declining_router(room_ref, trigger):
+            self.offers += 1
+
+        connector.register_router(_declining_router)
+        return connector
+
+    def _event(self, post_id="p1", create_at=500):
+        return {"post": {"id": post_id, "channel_id": "chan1", "user_id": "u1",
+                         "message": "hi", "root_id": "", "type": "",
+                         "create_at": create_at},
+                "mentions": []}
+
+    async def _settle(self, connector):
+        while connector._routing_tasks:
+            await asyncio.gather(*connector._routing_tasks)
+
+    async def test_declined_frames_are_dropped_and_remembered_not_redelivered(self):
+        connector = await self._connector()
+        state = connector._channels["chan1"]
+
+        await connector._on_posted_event(self._event())
+        await self._settle(connector)
+
+        self.assertEqual(self.offers, 1)
+        self.assertEqual(self.delivered, [],
+                         "a declined wake's frames must not go back on the tracked path")
+        self.assertIn("p1", state.seen_ids_set,
+                      "re-remembered, so reconnect replays do not re-offer it forever")
+        self.assertFalse(state.last_processed_ts, "the watermark is left where it is")
+
+    async def test_a_redelivered_duplicate_does_not_reopen_an_episode(self):
+        connector = await self._connector()
+
+        await connector._on_posted_event(self._event())
+        await self._settle(connector)
+        await connector._on_posted_event(self._event())
+        await self._settle(connector)
+
+        self.assertEqual(self.offers, 1, "the remembered id stops the re-offer")
+
+    async def test_a_new_message_retries_the_wake_once(self):
+        connector = await self._connector()
+
+        await connector._on_posted_event(self._event("p1", 500))
+        await self._settle(connector)
+        await connector._on_posted_event(self._event("p2", 600))
+        await self._settle(connector)
+
+        self.assertEqual(self.offers, 2,
+                         "each new message re-asks once — bounded, not a loop")
+
+
 class TestAPageOfSystemPostsIsNotAnEmptyWindow(unittest.IsolatedAsyncioTestCase):
     """`per_page` is applied before ACG filters system posts out.
 

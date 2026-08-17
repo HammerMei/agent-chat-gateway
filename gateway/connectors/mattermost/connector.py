@@ -1010,10 +1010,67 @@ class MattermostConnector(Connector):
             )
             return
 
+        self._route_or_buffer(channel_id, room, decoded)
+
+    def _channel_is_served(self, channel_id: str) -> bool:
+        """A processor answers for this channel now. Tracked is necessary, not sufficient.
+
+        The idle drop keeps a channel's local state (§2.2), so `channel_id in
+        self._channels` goes on answering True for a channel whose next message has
+        nowhere to go. Every deliver-or-route decision keys on this predicate rather
+        than on tracked-ness, and the drain's branch is the load-bearing one:
+        delivering an unserved channel's frame puts it back on the tracked path, whose
+        UNROUTED arm routes it back here — a hot loop with no retry delay anywhere in
+        it, entered by every message to a channel whose offer was declined.
+        """
+        if channel_id not in self._channels:
+            return False
+        if self._capacity_check is None:
+            # No dispatcher wired: nothing can answer UNROUTED, so tracked is served.
+            return True
+        return self._capacity_check(channel_id) is not RoomCapacity.UNROUTED
+
+    def _room_ref_from_state(self, state: "_ChannelState") -> "RoomRef":
+        """A RoomRef for a channel this connector already tracks — the wake's classification.
+
+        No event metadata needed, which is what lets a *replayed* post wake a channel:
+        the reconnect path synthesizes its events from REST history with no channel
+        metadata at all, so `_room_ref_from_event` answers None for every one of them.
+        The tracked state holds what the original classification decided. For a channel
+        with a record none of this is load-bearing anyway — `_recreate` reads the kind
+        and participants from the record itself (§2.4); the fallback matters only on
+        the recordless edge, where `_create` rule-matches this ref.
+        """
+        kind = _ROOM_KINDS.get(state.room.type)
+        if kind is None:
+            try:
+                kind = RoomKind(state.room.type)
+            except ValueError:
+                kind = RoomKind.CHANNEL
+        return RoomRef(
+            id=state.room.id,
+            kind=kind,
+            # A direct room's tracked name is its *description* (the counterpart, the
+            # member list — §2.3); `RoomRef.name` is the platform's own name, empty
+            # for both DM kinds by contract.
+            name="" if kind.is_direct else (state.room.name or ""),
+            participants=(),
+        )
+
+    def _route_or_buffer(self, channel_id: str, room: "RoomRef", decoded: dict) -> None:
+        """One entrance to the routing episode — untracked offers and wakes alike.
+
+        `_offer_to_router` arrives from the untracked path with a gate-checked,
+        event-classified room; the tracked handler's UNROUTED arm arrives with the room
+        resolved from the tracked state — the wake (§2.5). Both share the pending
+        buffer, the single open episode and `_route_channel`'s drain, because a second
+        creation entrance is how a wake would skip exactly the guarantees the episode
+        exists to make.
+        """
         pending = self._pending_routes.get(channel_id)
         if pending is not None:
-            # An episode for this channel is open. Checked *before* the tracked
-            # check: the channel may have become tracked an instant ago with its
+            # An episode for this channel is open. Checked *before* the served
+            # check: the channel may have become served an instant ago with its
             # buffer not yet drained, and delivering this frame directly would put
             # it ahead of every frame that arrived before it.
             verdict = pending.add(decoded["post"].get("id", ""), decoded)
@@ -1035,11 +1092,13 @@ class MattermostConnector(Connector):
                 self._routing_tasks.add(notice)
                 notice.add_done_callback(self._routing_tasks.discard)
             return
-        if channel_id in self._channels:
-            # Tracked now — the resolve above awaited, and a creation finished during
-            # it. Deliver rather than offer: the per-channel callback that would have
+        if self._channel_is_served(channel_id):
+            # Served now — a creation finished while this frame was on its way here.
+            # Deliver rather than offer: the per-channel callback that would have
             # taken this frame was registered after it was routed here, so nobody else
-            # is going to deliver it.
+            # is going to deliver it. Served, not tracked: an idle channel is tracked
+            # and its frame still has nowhere to go — delivering it would bounce it
+            # off the tracked path's UNROUTED arm straight back here.
             self._ws.deliver_to_channel(decoded)
             return
         pending = PendingRoute(self._PENDING_BUFFER_DEPTH)
@@ -1088,7 +1147,31 @@ class MattermostConnector(Connector):
             ended = self._pending_routes.pop(channel_id, None)
             frames = ended.drain() if ended is not None else []
             state = self._channels.get(channel_id)
-            if state is not None:
+            if state is not None and not self._channel_is_served(channel_id):
+                # Tracked and still unserved: the offer declined — no rule claims the
+                # channel, its record is paused, or a static-model record owns it.
+                # Served, not tracked, decides delivery here: these frames' only
+                # tracked-path outcome is the UNROUTED arm, which routes them straight
+                # back into a new episode — a hot loop with no delay in it, entered by
+                # every message to a declined channel.
+                #
+                # Re-remembered (the wake arm forgot them so a served redelivery could
+                # pass the dedup check): the decline is a configuration state and can
+                # persist indefinitely, so an id left unknown would have every
+                # reconnect re-fetch and re-offer a batch that can never be spent. The
+                # watermark is left where it is, so a user who resends is served
+                # normally once a watcher exists (§2.7).
+                for frame in frames:
+                    fid = frame["post"].get("id", "")
+                    if fid:
+                        self._remember_seen(state, fid)
+                if frames:
+                    logger.warning(
+                        "Channel %s: dropping %d buffered frame(s) — no watcher took "
+                        "the channel. A declined offer: no rule claims it, or its "
+                        "record is paused.", channel_id, len(frames),
+                    )
+            elif state is not None:
                 # Same rule, same mechanism, same reason as Rocket.Chat's: the
                 # watermark is a scalar, so a live message accepted during this
                 # episode has already advanced it past these frames and the
@@ -1257,14 +1340,36 @@ class MattermostConnector(Connector):
 
         capacity = self._capacity_check(channel_id) if self._capacity_check else None
         if capacity is RoomCapacity.UNROUTED:
-            # Not backpressure — see the Rocket.Chat connector's twin of this branch.
-            # No watcher serves this channel, so "server busy" would be a wrong answer
-            # from an idle gateway (§2.7).
-            logger.warning(
-                "Message for channel '%s' has no watcher — dropping without a reply.",
-                state.room.name,
+            # No processor serves this *tracked* channel. The idle drop keeps the
+            # channel's local state on purpose (§2.2), so an idle channel's next
+            # message arrives here, and this arm is the wake (§2.5): the channel is
+            # offered back through the same episode funnel an untracked one goes
+            # through — see the Rocket.Chat connector's twin of this branch.
+            #
+            # The id was registered optimistically above, before the first await —
+            # undone here, with the window kept open below the post, or the episode's
+            # redelivery dies at the dedup check. The declined episode's drain is what
+            # re-remembers it, so a channel nothing claims still converges. The turn
+            # is released because the redelivery runs the filter — and its charge —
+            # again.
+            if self._router is None:
+                # No router registered — a static-only deployment. The old arm's
+                # behaviour, verbatim: drop audibly, id left registered so reconnect
+                # replays do not re-offer it, watermark untouched.
+                logger.warning(
+                    "Message for channel '%s' has no watcher — dropping without a "
+                    "reply.", state.room.name,
+                )
+                self._release_turn_for(post, result, turn_generation, "no watcher")
+                return
+            logger.info(
+                "Message for channel '%s' has no processor — offering the channel "
+                "back to the router (wake).", state.room.name,
             )
-            self._release_turn_for(post, result, turn_generation, "no watcher")
+            self._keep_replayable(state, msg_id, str(post.get("create_at", "")))
+            self._release_turn_for(post, result, turn_generation, "waking the channel")
+            self._route_or_buffer(
+                channel_id, self._room_ref_from_state(state), decoded)
             return
         if capacity is RoomCapacity.FULL:
             logger.warning(

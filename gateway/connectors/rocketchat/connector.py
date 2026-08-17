@@ -1161,7 +1161,10 @@ class RocketChatConnector(Connector):
         return RoomRef(
             id=sub.room.id,
             kind=kind,
-            name=sub.room.name or "",
+            # A direct room's tracked name is its *description* (the counterpart, the
+            # member list — §2.3), and `RoomRef.name` is the platform's own name,
+            # empty for both DM kinds by contract.
+            name="" if kind.is_direct else (sub.room.name or ""),
             participants=participants,
         )
 
@@ -1934,6 +1937,19 @@ class RocketChatConnector(Connector):
             # worker, and the episode ends by delivering into that worker's queue.
             # Tasks run in creation order, and the episode reserves `_pending_routes`
             # before its first await, so a burst of frames buffers behind its first.
+            if self._router is None:
+                # No router registered — a static-only deployment. The old arm's
+                # behaviour, verbatim: drop audibly, remember the id so reconnect
+                # replays do not re-fetch a batch nothing can spend, watermark
+                # untouched so a resend is served once a watcher exists.
+                logger.warning(
+                    "Message for room '%s' has no watcher — dropping without a "
+                    "reply. A watcher that failed to start, or a room subscribed "
+                    "with none configured.", sub.room.name,
+                )
+                sub.remember(msg_id)
+                self._release_unused_turn(doc, result, turn_generation, "no watcher")
+                return True
             logger.info(
                 "Message for room '%s' has no processor — offering the room back "
                 "to the router (wake).", sub.room.name,
