@@ -348,17 +348,10 @@ class WatcherLifecycle:
         session maps, the system-prompt file, the attachment symlink and
         cache, and finally the record itself. "Expiry reclaims everything, or
         it leaves bookkeeping behind"; each best-effort step logs once and
-        accepts its leak rather than refusing to expire.
-
-        **The unsubscribe runs first, inside the lock, and the record is
-        popped last** — both halves are load-bearing. Unsubscribing first
-        funnels every mid-expiry frame onto the *untracked* path, whose
-        episode reads the record under this same lock and hits `_recreate`'s
-        staleness re-check once we finish; popping first instead would hand a
-        mid-await frame to `_create` while this teardown still owns the room's
-        connector state. Popping last is crash-honesty: a crash anywhere
-        before it leaves an idle record that simply expires again next pass,
-        while everything already reclaimed was best-effort to begin with.
+        accepts its leak rather than refusing to expire. The reclamation
+        itself — and the unsubscribe-first / record-popped-last ordering that
+        makes it safe — lives in `_reclaim_record_locked`, shared with
+        membership removal; only the gates are expiry's own.
 
         Every decision re-checks under the per-watcher lock, like `drop_idle`:
         between the sweep's look and this acquisition a wake can make the
@@ -373,80 +366,104 @@ class WatcherLifecycle:
             if not past_expire_ttl(state, now):
                 return False
 
-            # 1. The connector's room state. From here the room's frames take
-            # the untracked path; under subscribe-all this is local bookkeeping
-            # only, and calling it again after a partial failure is a no-op.
-            if state.room_id:
-                try:
-                    await self._connector.unsubscribe_room(
-                        state.room_id, watcher_id=name)
-                except Exception as e:
-                    logger.warning(
-                        "Watcher '%s': unsubscribe failed during expiry "
-                        "(proceeding): %s", name, e,
-                    )
-
-            agent_name = self._resolve_agent_name(state.agent or None)
-            agent = self._agents.get(agent_name)
-            session_id = state.session_id
-
-            # 2. The backend session. False means unsupported or unconfirmed —
-            # logged and accepted, per §2.5.
-            if session_id and agent is not None:
-                try:
-                    if not await agent.delete_session(session_id):
-                        logger.info(
-                            "Watcher '%s': backend did not confirm deletion of "
-                            "session %s — accepting the leak", name, session_id,
-                        )
-                except Exception as e:
-                    logger.warning(
-                        "Watcher '%s': backend session delete failed — "
-                        "accepting the leak: %s", name, e,
-                    )
-
-            # 3. Injector retry state and session maps. Both idempotent; the
-            # maps entry was already removed by the idle drop.
-            if session_id:
-                self._injector.reset_session(session_id)
-                self._maps.remove_session(session_id)
-
-            # 4. The system-prompt file — the backend that wrote it removes it.
-            if agent is not None and state.room_id and state.connector:
-                try:
-                    await agent.reclaim_durable_instructions(
-                        watcher_prompt_key(state.connector, state.room_id, name))
-                except Exception as e:
-                    logger.warning(
-                        "Watcher '%s': could not reclaim the prompt file: %s",
-                        name, e,
-                    )
-
-            # 5. The attachment symlink and cache directory.
-            if state.room_id and state.connector:
-                agent_cfg = self._config.agent_config(agent_name)
-                try:
-                    await asyncio.to_thread(
-                        self._attachment_workspace.reclaim,
-                        room_path_key(state.connector, state.room_id),
-                        state.room_id,
-                        agent_cfg.working_directory,
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "Watcher '%s': could not reclaim the attachment "
-                        "workspace: %s", name, e,
-                    )
-
-            # 6. The record, last.
-            self._states.pop(name, None)
-            self._state_store.save(self._states)
+            await self._reclaim_record_locked(name, state)
             logger.info(
                 "Watcher '%s' expired after %s day(s) idle — session and "
                 "record reclaimed; the room's next message creates a fresh "
                 "watcher", name, (state.rule or {}).get("session_expire_days"),
             )
             return True
+
+    async def _reclaim_record_locked(self, name: str, state: WatcherState) -> None:
+        """Reclaim everything a record points at, record popped last (§2.5).
+
+        The shared destructive body: expiry calls it after its gates
+        (TTL, residency, pause, the job exemption), membership removal after
+        its own (stop a resident processor, cancel jobs, audit the pause
+        override). The gates stay with the callers on purpose — they are what
+        differ; the reclamation order is what must not.
+
+        Caller MUST hold the per-watcher lock, and logs its own outcome —
+        this body logs only its per-step leaks.
+
+        **The unsubscribe runs first, and the record is popped last** — both
+        halves are load-bearing. Unsubscribing first funnels every mid-reclaim
+        frame onto the *untracked* path, whose episode reads the record under
+        the caller's lock and hits `_recreate`'s staleness re-check once we
+        finish; popping first instead would hand a mid-await frame to
+        `_create` while this teardown still owns the room's connector state.
+        Popping last is crash-honesty: a crash anywhere before it leaves a
+        record that is simply reclaimed again next time, while everything
+        already reclaimed was best-effort to begin with.
+        """
+        # 1. The connector's room state. From here the room's frames take
+        # the untracked path; under subscribe-all this is local bookkeeping
+        # only, and calling it again after a partial failure is a no-op.
+        if state.room_id:
+            try:
+                await self._connector.unsubscribe_room(
+                    state.room_id, watcher_id=name)
+            except Exception as e:
+                logger.warning(
+                    "Watcher '%s': unsubscribe failed during reclamation "
+                    "(proceeding): %s", name, e,
+                )
+
+        agent_name = self._resolve_agent_name(state.agent or None)
+        agent = self._agents.get(agent_name)
+        session_id = state.session_id
+
+        # 2. The backend session. False means unsupported or unconfirmed —
+        # logged and accepted, per §2.5.
+        if session_id and agent is not None:
+            try:
+                if not await agent.delete_session(session_id):
+                    logger.info(
+                        "Watcher '%s': backend did not confirm deletion of "
+                        "session %s — accepting the leak", name, session_id,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Watcher '%s': backend session delete failed — "
+                    "accepting the leak: %s", name, e,
+                )
+
+        # 3. Injector retry state and session maps. Both idempotent; the
+        # maps entry was already removed by the idle drop.
+        if session_id:
+            self._injector.reset_session(session_id)
+            self._maps.remove_session(session_id)
+
+        # 4. The system-prompt file — the backend that wrote it removes it.
+        if agent is not None and state.room_id and state.connector:
+            try:
+                await agent.reclaim_durable_instructions(
+                    watcher_prompt_key(state.connector, state.room_id, name))
+            except Exception as e:
+                logger.warning(
+                    "Watcher '%s': could not reclaim the prompt file: %s",
+                    name, e,
+                )
+
+        # 5. The attachment symlink and cache directory.
+        if state.room_id and state.connector:
+            agent_cfg = self._config.agent_config(agent_name)
+            try:
+                await asyncio.to_thread(
+                    self._attachment_workspace.reclaim,
+                    room_path_key(state.connector, state.room_id),
+                    state.room_id,
+                    agent_cfg.working_directory,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Watcher '%s': could not reclaim the attachment "
+                    "workspace: %s", name, e,
+                )
+
+        # 6. The record, last.
+        self._states.pop(name, None)
+        self._state_store.save(self._states)
 
     async def resume_watcher(self, name: str) -> None:
         """Resume a paused watcher."""
