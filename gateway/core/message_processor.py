@@ -32,7 +32,7 @@ from .injected_context_builder import InjectedContextBuilder
 from .paths import watcher_prompt_key
 from .prompt_builder import build_catchup_prompt, build_prompt
 from .session_maps import SessionMaps
-from .state import WatcherState
+from .state import WatcherState, now_iso
 
 if TYPE_CHECKING:
     from .permission import PermissionRegistry
@@ -270,6 +270,17 @@ class MessageProcessor:
             return False
         try:
             self._queue.put_nowait(msg)
+            # The idle clock (§2.5), advanced on *accepted* work only — a refused
+            # message is not activity, and counting it would keep a room the
+            # gateway is dropping messages for alive forever. One write site for
+            # everything that reaches a session: inbound and scheduled injection
+            # both funnel through this method, so the two cannot drift. In memory
+            # only, persisted at the existing save points — a per-message disk
+            # write is the cost §2.2 explicitly rejects — and a crash that loses
+            # the advance idles the room *early*, which is the safe direction:
+            # its next message wakes it and the same session resumes.
+            if self._watcher_state is not None:
+                self._watcher_state.last_activity_at = now_iso()
             return True
         except asyncio.QueueFull:
             logger.warning(

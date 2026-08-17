@@ -27,7 +27,6 @@ import hashlib
 import json
 import logging
 from dataclasses import dataclass, fields, is_dataclass, replace
-from datetime import datetime
 from typing import TYPE_CHECKING
 
 from .adapter_utils import ts_gt as _ts_gt
@@ -35,7 +34,7 @@ from .config import HistoryHandoffConfig, WatcherConfig
 from .connector import Room
 from .pending_route import STARTING_UP_NOTICE
 from .room_pattern import RoomPattern
-from .state import CONFIG_SCHEMA_VERSION, WatcherState, carried_fields
+from .state import CONFIG_SCHEMA_VERSION, WatcherState, carried_fields, now_iso
 from .watcher_rule import RoomKind, RuleMatch, WatcherRule
 
 if TYPE_CHECKING:
@@ -471,7 +470,7 @@ class WatcherManager:
         # changing. The clocks move with it: the room is resident again, so it
         # is no longer dropped, and this is activity.
         carried = carried_fields(record)
-        carried["last_activity_at"] = _now_iso()
+        carried["last_activity_at"] = now_iso()
         carried["dropped_at"] = ""
         # The window this recreation owes the room. Read before the start, which
         # restores it into the connector and then advances it as the replayed
@@ -563,7 +562,7 @@ class WatcherManager:
         # which a concurrent creation's save persists this record without its
         # rule, and a crash in that window leaves an orphan for the next boot to
         # prune.
-        now = _now_iso()
+        now = now_iso()
         provenance = {
             "room_kind": room.kind.value,
             "participants": list(room.participants),
@@ -613,7 +612,3 @@ def _earlier(a: str | None, b: str | None) -> str | None:
     return a if _ts_gt(b, a) else b
 
 
-def _now_iso() -> str:
-    """Local-time ISO seconds — the same shape every other timestamp in the
-    state file carries."""
-    return datetime.now().astimezone().isoformat(timespec="seconds")

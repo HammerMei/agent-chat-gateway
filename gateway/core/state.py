@@ -235,6 +235,16 @@ LIFECYCLE_CLOCK_FIELDS = frozenset({
 })
 
 
+def now_iso() -> str:
+    """Local-time ISO seconds — the shape every timestamp in the state file
+    carries (§5.2). One function, because every writer of a lifecycle clock
+    must agree on the representation, and two private copies is how one of
+    them drifts."""
+    from datetime import datetime
+
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
 def carried_fields(state: "WatcherState | None") -> dict:
     """The fields a recreation must carry out of the record it is recreating.
 

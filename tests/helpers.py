@@ -16,12 +16,13 @@ where it is wrong rather than three layers away.
 from __future__ import annotations
 
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from gateway.agents import AgentBackend
 from gateway.agents.response import AgentResponse
 from gateway.config import AgentConfig, WatcherConfig
 from gateway.core.config import CoreConfig
+from gateway.core.connector import Room
 from gateway.core.session_manager import SessionManager
 
 # Patch load_state/save_state globally so tests never touch live state files.
@@ -192,6 +193,35 @@ def make_manager(
         permission_registry=permission_registry,
         **kw,
     )
+
+
+def make_processor(agent=None, **overrides):
+    """A real `MessageProcessor` with a double for every collaborator.
+
+    Runs the real constructor and takes keyword overrides for whatever the
+    test substitutes — the same shape as `make_lifecycle`, added when the
+    idle-clock suite became the third file to need one.
+    """
+    from gateway.core.message_processor import MessageProcessor
+
+    connector = MagicMock()
+    connector.send_text = AsyncMock()
+    connector.format_prompt_prefix = MagicMock(return_value="")
+    connector.notify_typing = AsyncMock()
+    connector.notify_online = AsyncMock()
+    connector.notify_offline = AsyncMock()
+    defaults = {
+        "session_id": "ses_001",
+        "room": Room(id="room_1", name="test-room"),
+        "working_directory": "/tmp",
+        "watcher_id": "test-watcher",
+        "connector": connector,
+        "agent": agent or MockAgentBackend(),
+        "config": make_core_config(),
+        "agent_name": "default",
+    }
+    defaults.update(overrides)
+    return MessageProcessor(**defaults)
 
 
 def make_lifecycle(**overrides):
