@@ -302,32 +302,26 @@ class GatewayConfig:
         # separate because they identify different things: a WatcherConfig name is a
         # single room's runtime handle, a rule name is the rule's identity in
         # persisted state and in shadowing warnings.
-        seen_watcher_names: set[str] = set()
         seen_rule_names: set[str] = set()
         for i, wc_raw in enumerate(watchers_raw):
-            if entry_is_watcher_rule(wc_raw):
-                watcher_rules.append(
-                    _parse_one_watcher_rule(
-                        wc_raw, i,
-                        connectors=connectors,
-                        connector_names=connector_names,
-                        agents=agents,
-                        default_agent=default_agent,
-                        config_dir=config_dir,
-                        templates=watcher_templates,
-                        seen_rule_names=seen_rule_names,
-                    )
-                )
-                continue
-            watchers.extend(
-                _parse_one_watcher_entry(
-                    wc_raw, i, watcher_templates, connector_names, connectors, agents,
-                    default_agent, config_dir, seen_watcher_names,
+            if not entry_is_watcher_rule(wc_raw):
+                # The static watcher shape was removed at cutover (§5.4):
+                # every removed field is a hard load error, never silently
+                # ignored — a config that used to mean something must not
+                # load meaning nothing.
+                raise ValueError(_static_shape_error(wc_raw, i))
+            watcher_rules.append(
+                _parse_one_watcher_rule(
+                    wc_raw, i,
+                    connectors=connectors,
+                    connector_names=connector_names,
+                    agents=agents,
+                    default_agent=default_agent,
+                    config_dir=config_dir,
+                    templates=watcher_templates,
+                    seen_rule_names=seen_rule_names,
                 )
             )
-
-        for conflict in find_room_collisions(watchers):
-            raise ValueError(conflict)
 
         # The cross-watcher duplicate-session_id pass that used to sit here is gone
         # with the field: `session_id:` is refused per entry above, so no watcher can
@@ -1187,7 +1181,7 @@ def _validated_watcher_agent(
     return watcher_agent
 
 
-def _parse_one_watcher_entry(
+def _parse_one_watcher_entry(  # LEGACY: configtool-only — see note below
     wc_raw: object,
     index: int,
     watcher_templates: dict[str, dict],
@@ -1200,13 +1194,13 @@ def _parse_one_watcher_entry(
 ) -> list[WatcherConfig]:
     """Parses ONE raw `watchers:` entry into its expanded list of
     WatcherConfigs (more than one only when `rooms:` names several rooms).
-    Callers (from_file()/collect_config()) must ensure `connectors` is
-    non-empty before calling this — `resolved_connector` falls back to
-    `connectors[0].name` when an entry doesn't set its own `connector:`,
-    exactly as from_file() always guaranteed by construction (an earlier
-    raise would have stopped everything before reaching here); collect_config()
-    checks this explicitly since it can legitimately end up with zero
-    successfully-parsed connectors."""
+
+    **No loader calls this any more.** The static shape is a hard load error
+    at cutover (§5.4, `_static_shape_error`); the one remaining caller is the
+    config TUI (`gateway/configtool/model.py`), whose rewrite is
+    `impl/config-tooling`'s PR — this function's deletion goes with it, not
+    with the runtime cutover, because deleting an import another module
+    holds breaks the build without migrating the module."""
     if not isinstance(wc_raw, Mapping):
         raise ValueError(
             f"Watcher entry at index {index} must be a mapping "
@@ -1427,6 +1421,32 @@ def entry_is_watcher_rule(entry: object) -> bool:
     parser an entry belongs to.
     """
     return isinstance(entry, Mapping) and isinstance(entry.get("rooms"), Mapping)
+
+
+def _static_shape_error(entry: object, index: int) -> str:
+    """The message a removed-shape `watchers:` entry fails to load with (§5.4).
+
+    The static shape — `room:`, or `rooms:` as a list — was replaced by
+    watcher rules at cutover, and the contract is that a removed field is a
+    **hard load error naming its replacement**, never a silently ignored key:
+    a config that used to mean something must not load meaning nothing, which
+    is exactly how the parser's `.get()` style would otherwise fail (the
+    `_MOVED_TO_RULE_KEYS` precedent).
+    """
+    if not isinstance(entry, Mapping):
+        return (
+            f"Watcher entry at index {index} must be a mapping "
+            f"(got {type(entry).__name__})."
+        )
+    label = entry.get("name") or entry.get("room") or f"index {index}"
+    return (
+        f"Watcher entry '{label}': the static watcher shape (a 'room:' key, or "
+        f"'rooms:' as a list) has been removed — watchers are now created from "
+        f"rules, where 'rooms:' is a mapping ('rooms: {{include: [...]}}'). "
+        f"Rewrite this entry as a rule; see docs/migration-dynamic-watchers.md "
+        f"— it is not a 1:1 rename (each room gets its own watcher and a fresh "
+        f"session, and a paused room must be re-expressed as 'rooms.except_for')."
+    )
 
 
 def _parse_pattern_list(
@@ -1660,7 +1680,8 @@ def _parse_one_watcher_rule(
             f"Watcher rule at index {index}: 'session_id' is no longer "
             "supported. To carry context into a new session, have the agent "
             "summarise the session to a file and read it back — a handoff "
-            "survives the backend expiring a session, which pinning never did."
+            "survives the backend expiring a session, which pinning never "
+            "did. See docs/user-guide.md."
         )
 
     # entry_is_watcher_rule() guarantees this for entries routed here by the
@@ -2327,9 +2348,8 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
             issues,
         )
 
-    # Mirrors from_file()'s routing, per entry and by shape — one `seen_*` set each
+    # Mirrors from_file()'s routing, per entry and by shape — one `seen_*` set
     # per load, for the whole loop rather than per entry.
-    seen_watcher_names: set[str] = set()
     seen_rule_names: set[str] = set()
     for i, wc_raw in enumerate(watchers_raw):
         # See the identical connector-loop comment above: only ever use
@@ -2337,29 +2357,26 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
         name_hint = wc_raw.get("name") if isinstance(wc_raw, Mapping) else None
         if not isinstance(name_hint, str) or not name_hint:
             name_hint = None
-        # Every failure inside either parser is a ValueError and never a TypeError
+        # Every failure inside the parser is a ValueError and never a TypeError
         # precisely so this `except` can attribute it to one entry and keep going;
         # a TypeError escaping here would abort the whole validation pass and report
         # one global error instead of one bad entry among many good ones.
         try:
-            if entry_is_watcher_rule(wc_raw):
-                watcher_rules.append(
-                    _parse_one_watcher_rule(
-                        wc_raw, i,
-                        connectors=connectors,
-                        connector_names=connector_names,
-                        agents=agents,
-                        default_agent=default_agent,
-                        config_dir=config_dir,
-                        templates=watcher_templates,
-                        seen_rule_names=seen_rule_names,
-                    )
-                )
-                continue
-            watchers.extend(
-                _parse_one_watcher_entry(
-                    wc_raw, i, watcher_templates, connector_names, connectors, agents,
-                    default_agent, config_dir, seen_watcher_names,
+            if not entry_is_watcher_rule(wc_raw):
+                # The static shape is a hard error at cutover (§5.4), reported
+                # per entry here so a half-migrated config lists every
+                # remaining static entry in one pass.
+                raise ValueError(_static_shape_error(wc_raw, i))
+            watcher_rules.append(
+                _parse_one_watcher_rule(
+                    wc_raw, i,
+                    connectors=connectors,
+                    connector_names=connector_names,
+                    agents=agents,
+                    default_agent=default_agent,
+                    config_dir=config_dir,
+                    templates=watcher_templates,
+                    seen_rule_names=seen_rule_names,
                 )
             )
         except ValueError as exc:

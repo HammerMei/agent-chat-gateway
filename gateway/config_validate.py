@@ -162,7 +162,9 @@ def validate_config(config_path: str, lint: bool = False) -> ValidationResult:
     if config is None:
         return result
 
-    result.watcher_count = len(config.watchers)
+    # Rules are the only watcher shape after cutover; `config.watchers` is
+    # always empty (the static list died with its parser).
+    result.watcher_count = len(config.watcher_rules)
 
     try:
         with open(config_path) as f:
@@ -367,12 +369,15 @@ def _check_session_uniqueness(result: ValidationResult) -> None:
 
 
 def _check_state_orphans(config: GatewayConfig, result: ValidationResult) -> None:
-    """Warn when a connector's persisted state.<connector>.json references a
-    watcher name no longer present in the (expanded) config."""
-    configured_by_connector: dict[str, set[str]] = {}
-    for w in config.watchers:
-        configured_by_connector.setdefault(w.connector, set()).add(w.name)
+    """Warn when a connector's persisted state carries records the next boot
+    will prune.
 
+    After cutover the orphan test is the record's own shape, not a config
+    lookup: a rule-derived record (`rule_name` set) is never an orphan — its
+    recreation source is the record itself (§2.4), and "absent from config"
+    is its normal state — while a static-era record has no config entry left
+    to own it and is pruned at the next start, per the clean-break migration
+    ruling."""
     # Checked over the files on disk, not over config.connectors: a connector renamed
     # or removed in config.yaml leaves its state file behind, and only iterating
     # configured connectors would never open it — so an unreadable file belonging to a
@@ -403,20 +408,21 @@ def _check_state_orphans(config: GatewayConfig, result: ValidationResult) -> Non
             # unexpected — skip this connector's orphan check rather than failing the
             # whole validation over it.
             continue
-        configured = configured_by_connector.get(connector.name, set())
         for st in states:
-            if st.watcher_name not in configured:
-                msg = (
-                    f"Connector '{connector.name}': state.json has watcher "
-                    f"'{st.watcher_name}' with no matching entry in this config — "
-                    "its session/pause state will be dropped on next start. "
-                    "Restore the old watcher name (e.g. an explicit 'name:') "
-                    "if you want to keep it."
-                )
-                result.warnings.append(msg)
-                result.findings.append(
-                    Finding("warning", "connector", connector.name, None, msg)
-                )
+            if st.rule_name:
+                continue
+            msg = (
+                f"Connector '{connector.name}': state.json has static-era "
+                f"watcher '{st.watcher_name}' — the static shape was removed, "
+                "so its session/pause state will be pruned on the next start. "
+                "To keep the room, add a rule that matches it (a fresh session "
+                "starts on its first message); see "
+                "docs/migration-dynamic-watchers.md."
+            )
+            result.warnings.append(msg)
+            result.findings.append(
+                Finding("warning", "connector", connector.name, None, msg)
+            )
 
 
 def _lint_config(raw: dict, result: ValidationResult) -> None:

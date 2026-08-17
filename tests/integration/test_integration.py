@@ -1303,10 +1303,12 @@ class TestDuplicateSessionIdValidation(unittest.TestCase):
                 working_directory: /tmp
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
                 session_id: shared-session-id
               - name: w2
-                room: lobby
+                rooms:
+                  include: [lobby]
                 session_id: shared-session-id
         """)
 
@@ -1341,10 +1343,12 @@ class TestDuplicateSessionIdValidation(unittest.TestCase):
                 working_directory: /tmp
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
                 session_id: session-aaa
               - name: w2
-                room: lobby
+                rooms:
+                  include: [lobby]
                 session_id: session-bbb
         """)
 
@@ -1377,9 +1381,11 @@ class TestDuplicateSessionIdValidation(unittest.TestCase):
                 working_directory: /tmp
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
               - name: w2
-                room: lobby
+                rooms:
+                  include: [lobby]
         """)
 
         with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
@@ -1387,7 +1393,7 @@ class TestDuplicateSessionIdValidation(unittest.TestCase):
             tmp_path = f.name
 
         config = GatewayConfig.from_file(tmp_path)
-        self.assertEqual(len(config.watchers), 2)
+        self.assertEqual(len(config.watcher_rules), 2)
 
 
 class TestAttachmentCachePath(unittest.IsolatedAsyncioTestCase):

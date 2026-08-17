@@ -58,12 +58,6 @@ def write_config(watchers_block: str, extra: str = "") -> str:
         return f.name
 
 
-STATIC_ONLY = """\
-- room: general
-- {room: eng, connector: mm-second, agent: ops}
-- {rooms: [a, b], connector: mm-second}
-"""
-
 ONE_RULE = """\
 - name: eng-rooms
   connector: mm-second
@@ -72,73 +66,12 @@ ONE_RULE = """\
 """
 
 
-class TestTheStaticPathIsUnchanged(unittest.TestCase):
-    """The groundwork adds a path; it must not alter the one in production."""
-
-    def test_a_static_only_config_loads_exactly_as_before(self):
-        cfg = GatewayConfig.from_file(write_config(STATIC_ONLY))
-        self.assertEqual(
-            [(w.name, w.connector, w.room, w.agent) for w in cfg.watchers],
-            [
-                ("rc-first-general", "rc-first", "general", "default"),
-                ("mm-second-eng", "mm-second", "eng", "ops"),
-                ("mm-second-a", "mm-second", "a", "default"),
-                ("mm-second-b", "mm-second", "b", "default"),
-            ],
-        )
-        self.assertEqual(cfg.watcher_rules, [])
-
-    def test_the_wildcard_room_rejection_still_stands(self):
-        """`room: "*"` stays a hard error: the static path has no rule matching, and
-        there is no room literally named "*". The rule shape is how you ask for
-        pattern matching now."""
-        with self.assertRaises(ValueError) as cm:
-            GatewayConfig.from_file(write_config('- room: "*"\n'))
-        self.assertIn("not implemented yet", str(cm.exception))
-
-    def test_collect_config_agrees_with_from_file_on_a_static_config(self):
-        cfg, issues = collect_config(write_config(STATIC_ONLY))
-        self.assertEqual(issues, [])
-        self.assertEqual(len(cfg.watchers), 4)
-        self.assertEqual(cfg.watcher_rules, [])
-
-
-class TestBothShapesInOneBlock(unittest.TestCase):
+class TestRuleEntries(unittest.TestCase):
     def test_a_rule_entry_reaches_the_rule_parser(self):
         cfg = GatewayConfig.from_file(write_config(ONE_RULE))
         self.assertEqual(cfg.watchers, [])
         self.assertEqual([r.name for r in cfg.watcher_rules], ["eng-rooms"])
         self.assertEqual(cfg.watcher_rules[0].connector, "mm-second")
-
-    def test_the_two_shapes_coexist_and_keep_document_order(self):
-        cfg = GatewayConfig.from_file(write_config("""\
-            - {room: first, connector: rc-first}
-            - name: rule-a
-              connector: mm-second
-              rooms: {include: ["a-*"]}
-            - {room: second, connector: rc-first}
-            - name: rule-b
-              connector: mm-second
-              rooms: {include: ["b-*"]}
-            """))
-        self.assertEqual([w.room for w in cfg.watchers], ["first", "second"])
-        # Order matters for rules and nothing else: first-match precedence is
-        # positional, so the list must never be keyed or sorted by name.
-        self.assertEqual([r.name for r in cfg.watcher_rules], ["rule-a", "rule-b"])
-
-    def test_a_rule_and_a_static_watcher_may_share_a_name(self):
-        """Not a decision this PR makes — the two name sets are separate because they
-        identify different things, and whether they must be globally unique is a
-        materialization question for the uniqueness/manager work. Pinned so the
-        current behaviour is visible if that changes."""
-        cfg = GatewayConfig.from_file(write_config("""\
-            - {name: shared, room: general, connector: rc-first}
-            - name: shared
-              connector: mm-second
-              rooms: {include: ["x-*"]}
-            """))
-        self.assertEqual([w.name for w in cfg.watchers], ["shared"])
-        self.assertEqual([r.name for r in cfg.watcher_rules], ["shared"])
 
     def test_duplicate_rule_names_are_rejected(self):
         with self.assertRaises(ValueError) as cm:
@@ -176,7 +109,8 @@ class TestRuleErrorsAreAttributedAndSurvivable(unittest.TestCase):
 
     def test_collect_config_attributes_the_rule_and_keeps_going(self):
         cfg, issues = collect_config(write_config("""\
-            - {room: fine, connector: rc-first}
+            - name: fine
+              rooms: {include: ["ok-*"]}
             - name: broken
               rooms: {include: ["a-*"], nonsense: true}
             - name: also-fine
@@ -186,8 +120,7 @@ class TestRuleErrorsAreAttributedAndSurvivable(unittest.TestCase):
         self.assertEqual(issues[0].entity_kind, "watcher")
         self.assertEqual(issues[0].entity_name, "broken")
         # The entries either side of the broken one still parsed.
-        self.assertEqual([w.room for w in cfg.watchers], ["fine"])
-        self.assertEqual([r.name for r in cfg.watcher_rules], ["also-fine"])
+        self.assertEqual([r.name for r in cfg.watcher_rules], ["fine", "also-fine"])
 
     def test_an_unnamed_broken_rule_is_attributed_by_index(self):
         _, issues = collect_config(write_config("""\
@@ -306,7 +239,11 @@ class TestTheConfigToolSkipsRulesKnowingly(unittest.TestCase):
     on the parser would leave a legal entry with no row and no explanation anywhere.
     """
 
-    def test_only_the_static_entry_expands_and_nothing_is_reported(self):
+    def test_a_leftover_static_entry_still_expands_in_the_tool(self):
+        """The TUI's own loader keeps reading the static shape until
+        `impl/config-tooling` rewrites it — the runtime loader refuses the
+        same entry (see TestStaticShapeIsAHardError), and that inconsistency
+        is the integration branch's accepted state, not this test's subject."""
         path = write_config("""\
             - {room: general, connector: rc-first}
             - name: eng-rooms
@@ -316,9 +253,6 @@ class TestTheConfigToolSkipsRulesKnowingly(unittest.TestCase):
         cfg = EditableConfig.load(path)
         expanded = cfg.expanded_watchers()
         self.assertEqual([e.watcher.room for e in expanded], ["general"])
-        result = validate_config(path)
-        self.assertTrue(result.ok, result.errors)
-        self.assertEqual(result.warnings, [])
 
     def test_a_rules_only_config_yields_no_rows_rather_than_failing(self):
         cfg = EditableConfig.load(write_config(ONE_RULE))

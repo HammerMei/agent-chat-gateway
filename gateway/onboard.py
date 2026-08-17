@@ -127,13 +127,23 @@ def generate_config_yaml(
     if working_directory:
         agent["working_directory"] = working_directory
 
-    # Group every wizard-collected room into a single watcher entry via
-    # `rooms:` — the gateway expands it into one watcher per room and derives
-    # each watcher's name from connector+room automatically at load time.
+    # One watcher rule covering every wizard-collected room (§2.6): named
+    # rooms go into `rooms.include`, and any `@username` entry becomes the
+    # 1:1-DM opt-in — DMs have no room name for a pattern to match, so
+    # `direct: true` is how a rule claims them. The gateway creates each
+    # room's watcher on its first message.
+    named_rooms = [w["room"] for w in watchers if not w["room"].startswith("@")]
+    wants_dms = any(w["room"].startswith("@") for w in watchers)
+    rooms_block: dict = {}
+    if named_rooms:
+        rooms_block["include"] = named_rooms
+    if wants_dms:
+        rooms_block["direct"] = True
     watcher_entry = {
+        "name": "my-rooms",
         "connector": "rc-home",
         "agent": "my-agent",
-        "rooms": [w["room"] for w in watchers],
+        "rooms": rooms_block,
     }
 
     config = {

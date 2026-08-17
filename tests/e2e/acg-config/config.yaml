@@ -103,26 +103,31 @@ watcher_templates:
     context_inject_files: []
 
 watchers:
-  # DM: test_user ↔ acg_bot → OpenCode
+  # DM: test_user ↔ acg_bot → OpenCode (DMs are claimed by the direct flag,
+  # not by name — a DM has no room name for a pattern to match)
   - name: e2e-dm
     inherits: e2e-default
-    room: "@test_user"
+    rooms:
+      direct: true
     agent: e2e-opencode
 
   # Team channel → Claude Code
   - name: e2e-claude-channel
     inherits: e2e-default
-    room: "acg-e2e-claude"
+    rooms:
+      include: [acg-e2e-claude]
     agent: e2e-claude
 
   # Permission test channel → Claude Code (empty allowlist)
   - name: e2e-permission
     inherits: e2e-default
-    room: "acg-e2e-permission"
+    rooms:
+      include: [acg-e2e-permission]
     agent: e2e-claude-permission
 
   # Permission test channel → OpenCode (empty allowlist)
   - name: e2e-opencode-permission
     inherits: e2e-default
-    room: "acg-e2e-opencode-permission"
+    rooms:
+      include: [acg-e2e-opencode-permission]
     agent: e2e-opencode-permission

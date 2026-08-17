@@ -568,7 +568,7 @@ class TestStaticDmWatchersReachTheCheck(unittest.TestCase):
     With static watchers being the only form that runs, this is the path that matters.
     """
 
-    def _config(self, root, second_room):
+    def _config(self, root, second_rooms_block):
         import textwrap
 
         path = root / "config.yaml"
@@ -595,14 +595,16 @@ class TestStaticDmWatchersReachTheCheck(unittest.TestCase):
             watchers:
               - name: w1
                 connector: mm-eng
-                room: "@alice"
+                rooms:
+                  direct: true
               - name: w2
                 connector: mm-sales
-                room: "{second_room}"
+                rooms:
+{second_rooms_block}
         """))
         return path
 
-    def _service_dm_owners(self, second_room):
+    def _service_dm_owners(self, second_rooms_block):
         import tempfile
         from pathlib import Path as P
         from unittest.mock import patch
@@ -613,23 +615,30 @@ class TestStaticDmWatchersReachTheCheck(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as d:
             root = P(d)
-            cfg = GatewayConfig.from_file(str(self._config(root, second_room)))
+            cfg = GatewayConfig.from_file(str(self._config(root, second_rooms_block)))
             with patch.object(state_mod, "RUNTIME_DIR", root / "runtime"):
                 service = GatewayService(cfg)
             return service._dm_claims
 
-    def test_static_dm_watchers_become_per_room_claims(self):
-        claims = self._service_dm_owners("@bob")
-        self.assertEqual(claims["mm-eng"].rooms, frozenset({"@alice"}))
-        self.assertEqual(claims["mm-sales"].rooms, frozenset({"@bob"}))
-        self.assertFalse(
+    def test_rule_dm_opt_ins_become_stream_claims(self):
+        """A rule's `direct: true` claims the whole 1:1 stream — the per-room
+        claim died with the static shape, because DMs have no name for a rule
+        pattern to match. Two connectors both opting in therefore overlap,
+        which is exactly what the identity barrier must see."""
+        claims = self._service_dm_owners("                  direct: true")
+        self.assertTrue(claims["mm-eng"].direct)
+        self.assertTrue(claims["mm-sales"].direct)
+        self.assertTrue(
             claims["mm-eng"].overlaps(claims["mm-sales"]),
-            "disjoint DMs on two connectors are a working configuration",
+            "two whole-stream claims on one account overlap",
         )
 
-    def test_a_channel_watcher_claims_nothing(self):
+    def test_a_channel_rule_claims_nothing(self):
         """Otherwise the test above would pass against a map that always holds both."""
-        self.assertNotIn("mm-sales", self._service_dm_owners("incidents"))
+        self.assertNotIn(
+            "mm-sales",
+            self._service_dm_owners("                  include: [incidents]"),
+        )
 
 
 class TestInboundStartsAfterWatchersExist(unittest.IsolatedAsyncioTestCase):

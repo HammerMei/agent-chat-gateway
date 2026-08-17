@@ -59,7 +59,7 @@ class TestShippedConfigsValidate(unittest.TestCase):
     """The schema is the cheapest gate that catches a removed key in shipped input.
 
     It is not enforced at load — only tests run it — which is exactly why the shipped
-    inputs need a test that does. `$defs/staticWatcher` sets
+    inputs need a test that does. `$defs/watcherRule` sets
     `additionalProperties: false`, so a field removed from the schema makes any config
     still carrying it fail here.
     """
@@ -121,7 +121,7 @@ class TestGeneratedConfigsCarryNoRemovedKeys(unittest.TestCase):
     def test_the_generator_emits_only_declared_watcher_keys(self):
         with open(SCHEMA_PATH) as f:
             schema = json.load(f)
-        allowed = set(schema["$defs"]["staticWatcher"]["properties"])
+        allowed = set(schema["$defs"]["watcherRule"]["properties"])
 
         for script in GENERATOR_SCRIPTS:
             blocks = self._embedded_python(script)

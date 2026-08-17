@@ -246,7 +246,8 @@ class TestValidateReportsWhatBlocksTheBoot(unittest.TestCase):
             watchers:
               - name: w1
                 connector: rc
-                room: general
+                rooms:
+                  include: [general]
         """))
         return validate_config(str(path))
 
@@ -318,10 +319,12 @@ class TestConfigRefusesARoomTwice(unittest.TestCase):
             watchers:
               - name: w1
                 connector: rc
-                room: general
+                rooms:
+                  include: [general]
               - name: w2
                 connector: {second_connector}
-                room: {second_room}
+                rooms:
+                  include: [{second_room}]
         """)
 
     def _load(self, text):
@@ -333,13 +336,19 @@ class TestConfigRefusesARoomTwice(unittest.TestCase):
             path.write_text(text.replace("{root}", str(root)))
             return GatewayConfig.from_file(str(path))
 
-    def test_two_watchers_on_one_connector_and_room_are_refused(self):
-        with self.assertRaises(ValueError) as cm:
-            self._load(self._config())
-        msg = str(cm.exception)
-        self.assertIn("w1", msg)
-        self.assertIn("w2", msg)
-        self.assertIn("general", msg)
+    def test_two_rules_on_one_connector_and_room_shadow_not_refuse(self):
+        """The load-time hard refusal died with the static shape: under
+        first-match precedence the second rule is simply dead for that room,
+        which is a shadowing WARNING (§2.1) — the room cannot be double-served,
+        so there is nothing to refuse."""
+        from gateway.config import find_shadowed_rules
+
+        cfg = self._load(self._config())
+        findings = find_shadowed_rules(cfg.watcher_rules)
+        self.assertEqual(
+            [(f.rule.name, f.shadowed_by.name) for f in findings],
+            [("w2", "w1")],
+        )
 
     def test_the_same_room_on_another_connector_is_fine(self):
         """The supported multi-agent shape: each agent has its own bot account, so its
@@ -351,8 +360,8 @@ class TestConfigRefusesARoomTwice(unittest.TestCase):
         self._load(self._config(second_room="random"))
 
     def test_config_validate_reports_it_too(self):
-        """Same rule, called from the fault-tolerant path, so `acg config validate`
-        reports the pair rather than only the daemon refusing to boot."""
+        """Same finding through `acg config validate`: a warning naming the
+        shadowed rule, never an error — the room cannot be double-served."""
         from gateway.config_validate import validate_config
 
         with tempfile.TemporaryDirectory() as d:
@@ -361,9 +370,10 @@ class TestConfigRefusesARoomTwice(unittest.TestCase):
             path.write_text(self._config().replace("{root}", str(root)))
             result = validate_config(str(path))
 
+        self.assertEqual(result.errors, [])
         self.assertTrue(
-            any("both watch room" in e for e in result.errors),
-            f"expected a room-collision error, got {result.errors}",
+            any("can never fire" in w for w in result.warnings),
+            f"expected a shadowing warning, got {result.warnings}",
         )
 
 
