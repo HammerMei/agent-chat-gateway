@@ -241,6 +241,30 @@ class TestAJoinRegistersAnIdleRecord(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(past_expire_ttl(record, joined + timedelta(days=14)))
         self.assertTrue(past_expire_ttl(record, joined + timedelta(days=16)))
 
+    async def test_the_sweep_reclaims_a_never_woken_registration(self):
+        """The reclaim itself, not just the arithmetic: a join-registered
+        record is sessionless and was never subscribed, so the expiry leg
+        walks the reclaim body with an empty session, no maps entry and no
+        live room state — every step best-effort, which is exactly why
+        nothing else ever executes this combination."""
+        from gateway.core.lifecycle_sweep import LifecycleSweep
+
+        manager, lifecycle, connector = _add_harness()
+
+        name = await manager.register_on_join(_room())
+        record = lifecycle.get_watcher_state(name)
+        joined = datetime.fromisoformat(record.dropped_at)
+
+        sweep = LifecycleSweep(lifecycle, now=lambda: joined + timedelta(days=16))
+        transitioned = await sweep.run_once()
+
+        self.assertEqual(transitioned, [name])
+        self.assertIsNone(lifecycle.get_watcher_state(name), "the record is gone")
+        # The room was registered, never subscribed — the unsubscribe is the
+        # reclaim body's first step and must be a harmless no-op here.
+        connector.unsubscribe_room.assert_awaited_once()
+        lifecycle._state_store.save.assert_called()
+
 
 def _bare_manager_with_membership(**attrs):
     from tests.helpers import make_bare_session_manager
