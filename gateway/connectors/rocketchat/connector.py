@@ -1996,9 +1996,13 @@ class RocketChatConnector(Connector):
             # all-accepted, and `discharge_boundary` spends the outage window
             # on a frame that is only sitting in an episode buffer — so if the
             # episode then parks, nothing points below the watermark any more
-            # and the frame is unrecoverable. The claim makes the discharge
-            # refuse; whichever of the served drain or the next recovery runs
-            # discharges it properly, and a claim never narrows an open window.
+            # and the frame is unrecoverable. The claim makes that discharge
+            # refuse. Only a replay ever discharges: the served drain *claims*
+            # too (the opposite operation), so on a happy wake this boundary
+            # lingers until the next reconnect replay reads its own window and
+            # spends it — dedup absorbs the refetch, the same lifecycle every
+            # successful episode's drain claim already has. A claim never
+            # narrows an open window.
             ts = extract_ts(doc)
             if ts:
                 sub.claim_boundary(sub.last_processed_ts, _just_before(ts))
