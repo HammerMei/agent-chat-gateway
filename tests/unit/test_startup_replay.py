@@ -165,19 +165,21 @@ class TestStartupReplay(unittest.IsolatedAsyncioTestCase):
         mgr._connector.probe_missed_since.assert_not_awaited()
         mgr._watcher_manager.get_or_create.assert_not_awaited()
 
-    async def test_a_room_recreated_by_a_live_message_is_still_replayed(self):
-        """Inverted deliberately from "a resident room is not probed" — the
-        third such inversion in this step, and the same reason each time: the
-        old assertion pinned the defect.
+    async def test_a_room_a_live_message_already_recreated_is_left_alone(self):
+        """Inverted again — the fourth deliberate inversion in this step, and
+        the first one a *model* overturned rather than a review finding.
 
-        `_replay_persisted_records` runs after `start_inbound`, so a live
-        message can recreate a room and advance its watermark past the whole
-        down-window before the loop reaches that record. Reading the record
-        then would report no gap and skip the room, losing every message from
-        the outage with no log line. The loop reads the frozen snapshot
-        instead, and being resident is not evidence anyone looked below the
-        boundary — so the room is replayed, from the boundary, and the id
-        window dedups whatever the live path already delivered."""
+        Writing down replay ownership (§2.2) settled it: a recreation owns the
+        replay for the room it recreates, and this loop owns no interval at
+        all. A resident room with a record must have come through a recreation
+        — its record rules out `_create`, and a rule-derived record is absent
+        from `watchers:` so the static path never starts one — so its window is
+        already replayed, and replaying here would be a second pass over it.
+
+        The probe still reads the frozen snapshot rather than the record: a
+        live message may have advanced the watermark past the whole
+        down-window, and reading it would report no gap at all.
+        """
         record = _dynamic_record()
         mgr = self._manager([record])
         window = _window(mgr)
@@ -192,11 +194,8 @@ class TestStartupReplay(unittest.IsolatedAsyncioTestCase):
             mgr._connector.probe_missed_since.await_args.args[1], "1786874400000",
             "the probe asks about the frozen down-window, not the advanced watermark",
         )
-        # No second creation for a room that already has one, but the window is
-        # still replayed.
         mgr._watcher_manager.get_or_create.assert_not_awaited()
-        mgr._connector.replay_room_since.assert_awaited_once_with(
-            "r1", after_ts="1786874400000")
+        mgr._connector.replay_room_since.assert_not_awaited()
 
     async def test_one_bad_room_does_not_kill_boot(self):
         """Best-effort per record: the probe failing, or the recreation

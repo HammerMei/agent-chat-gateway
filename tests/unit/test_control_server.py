@@ -614,17 +614,23 @@ class TestHandleFetchHistory(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["ok"])
         self.assertIn("after_ts", result["error"])
 
-    async def test_after_ts_passed_to_connector(self):
-        """after_ts must be forwarded to fetch_room_history."""
+    async def test_after_ts_is_converted_at_this_boundary(self):
+        """The operator types ISO; the connector is handed epoch-ms (§5.2).
+
+        This is the one place a human writes a timestamp, so it is the one
+        place that converts — connector bounds are epoch-ms like every other
+        timestamp inside ACG, and leaving the ISO to travel further is how a
+        value that looked right met an interface that wanted the other form.
+        """
         entry = _make_history_entry("my-watcher")
         server = _make_server(entry)
-        ts = "2026-05-10T19:25:00+08:00"
         await server.dispatch_command({
-            "cmd": "fetch-history", "watcher": "my-watcher", "after_ts": ts
+            "cmd": "fetch-history", "watcher": "my-watcher",
+            "after_ts": "2026-05-10T19:25:00+08:00",
         })
         entry.connector.fetch_room_history.assert_called_once()
         _, kwargs = entry.connector.fetch_room_history.call_args
-        self.assertEqual(kwargs.get("after_ts"), ts)
+        self.assertEqual(kwargs.get("after_ts"), "1778412300000")
 
     async def test_combined_after_and_before_passed_to_connector(self):
         """Both after_ts and before_ts must be forwarded when a time window is specified."""
@@ -641,8 +647,9 @@ class TestHandleFetchHistory(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["ok"])
         entry.connector.fetch_room_history.assert_called_once()
         _, kwargs = entry.connector.fetch_room_history.call_args
-        self.assertEqual(kwargs.get("after_ts"), after)
-        self.assertEqual(kwargs.get("before_ts"), before)
+        # Both converted at this boundary; the window is preserved.
+        self.assertEqual(kwargs.get("after_ts"), "1778371200000")
+        self.assertEqual(kwargs.get("before_ts"), "1778414400000")
 
     async def test_inverted_range_returns_error(self):
         """after_ts >= before_ts must return a clear error, not silently return empty results."""

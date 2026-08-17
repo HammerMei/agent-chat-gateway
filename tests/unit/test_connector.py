@@ -2220,15 +2220,19 @@ class TestTriggerHistoryBound(unittest.TestCase):
             owners=["glin"], timezone="UTC",
         ))
 
-    def test_a_ddp_date_object_becomes_iso(self):
+    def test_a_ddp_date_object_reads_as_epoch_ms(self):
+        """Epoch milliseconds, not ISO (§5.2): the consumer compares this
+        against a room's watermark and forwards it as a history bound, and both
+        of those are epoch-ms. Converting to ISO here put an unparseable value
+        into a numeric comparison, which then fell back to string ordering."""
         bound = self._connector().trigger_history_bound(
             {"_id": "m1", "ts": {"$date": 1786874400000}})
-        self.assertEqual(bound, "2026-08-16T10:00:00+00:00")
+        self.assertEqual(bound, "1786874400000")
 
-    def test_a_bare_epoch_ms_becomes_iso(self):
+    def test_a_bare_epoch_ms_reads_through(self):
         bound = self._connector().trigger_history_bound(
             {"_id": "m1", "ts": 1786874400000})
-        self.assertEqual(bound, "2026-08-16T10:00:00+00:00")
+        self.assertEqual(bound, "1786874400000")
 
     def test_a_missing_or_garbled_ts_answers_none_not_a_raise(self):
         """The cost of no bound is one duplicated message; the cost of raising
@@ -3454,6 +3458,42 @@ class TestTheRoutingTransaction(unittest.IsolatedAsyncioTestCase):
             _ts_gt("1", sub.replay_boundary or "1"),
             "the claimed mark sits strictly below the buffered frame",
         )
+
+    async def test_the_claim_holds_for_a_brand_new_room_with_no_watermark(self):
+        """The common episode, and the one the first version of the test above
+        did not cover: it seeded a watermark, so both claim candidates were
+        non-empty.
+
+        A first-ever room offers `("", just_before(trigger))`. If the empty
+        string won and were stored, the read site — `after_ts or
+        replay_boundary or last_processed_ts` — would treat it as falsy and
+        skip the room entirely, leaving the claim inert exactly where it
+        matters most. `claim_boundary` filters falsy candidates rather than
+        sorting them oldest, which is what makes this work; pinned here because
+        the docstring's "an unparseable candidate sorts as the oldest" reads
+        like it would not.
+        """
+        connector = self._connector()
+
+        async def creating_router(room, trigger):
+            from gateway.connectors.rocketchat.connector import _RoomSubscription
+
+            # A brand-new room: no watermark yet, by definition.
+            connector._rooms["new-room"] = _RoomSubscription(
+                room=Room(id="new-room", name="general"))
+
+        connector.register_router(creating_router)
+        await connector._on_unrouted_message(self._doc("m1"), self._ACCESS)
+
+        sub = connector._rooms["new-room"]
+        self.assertTrue(
+            sub.replay_boundary,
+            "an empty watermark must not become the claimed mark — a falsy "
+            "boundary is skipped by every reader, so the claim would be inert",
+        )
+        # And a recovery reading its own window actually uses it.
+        self.assertEqual(
+            sub.replay_boundary or sub.last_processed_ts, sub.replay_boundary)
 
     async def test_a_parked_room_commits_nothing(self):
         """Outcomes 4-exhausted and 7 share one observable: nothing was

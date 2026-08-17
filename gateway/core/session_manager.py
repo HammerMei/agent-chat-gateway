@@ -246,31 +246,33 @@ class SessionManager:
             if not missed:
                 continue
             try:
-                if self._lifecycle.processor_named(ws.watcher_name) is None:
-                    kind = RoomKind(ws.room_kind) if ws.room_kind else RoomKind.CHANNEL
-                    # The recreation replays the record's own window itself, so
-                    # this branch does not replay again. Two passes over one
-                    # interval is not free: replay hands the filter the same
-                    # boundary both times, so the watermark the first pass
-                    # advanced does not suppress the second, and only the id
-                    # window stands between them — a window exactly as large as
-                    # one replay batch, so a full one re-delivers.
-                    await self._watcher_manager.get_or_create(
-                        self._connector_name,
-                        RoomRef(
-                            id=ws.room_id,
-                            kind=kind,
-                            name=ws.room_name,
-                            participants=tuple(ws.participants),
-                        ),
-                    )
-                else:
-                    # Resident already — a live message recreated it while this
-                    # loop was working, so no recreation will replay for it and
-                    # this is the only call that covers its down-window.
-                    await self._connector.replay_room_since(
-                        ws.room_id, after_ts=boundary
-                    )
+                if self._lifecycle.processor_named(ws.watcher_name) is not None:
+                    # Already resident, so a recreation already ran for it — and
+                    # a recreation owns its room's replay (§2.2, "replay
+                    # ownership"). Nothing to do: replaying here would be a
+                    # second pass over the interval the recreation just covered,
+                    # and a second pass is not free, because replay hands the
+                    # filter its own boundary rather than the live watermark —
+                    # so the ts filter suppresses nothing and only the bounded
+                    # id window separates the two.
+                    #
+                    # That a resident room with a record must have come through
+                    # a recreation is not an assumption: its record rules out
+                    # `_create`, and a rule-derived record is absent from
+                    # `watchers:`, so the static path never starts one either.
+                    continue
+                kind = RoomKind(ws.room_kind) if ws.room_kind else RoomKind.CHANNEL
+                # Triggering the recreation is this loop's whole job. It owns no
+                # interval of its own; the recreation replays what the room owes.
+                await self._watcher_manager.get_or_create(
+                    self._connector_name,
+                    RoomRef(
+                        id=ws.room_id,
+                        kind=kind,
+                        name=ws.room_name,
+                        participants=tuple(ws.participants),
+                    ),
+                )
             except Exception as e:
                 logger.warning(
                     "Startup replay failed for watcher '%s' (room %s) — the room "

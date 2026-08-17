@@ -24,6 +24,7 @@ from pathlib import Path
 from ...agents.response import AgentEvent, AgentResponse
 from ...core.adapter_utils import ts_gt as _ts_gt
 from ...core.adapter_utils import ts_ms_to_iso_local, weekday_abbrev
+from ...core.adapter_utils import ts_to_float as _ts_to_float
 from ...core.bot_identity import (
     BotIdentity,
     ConnectorIdentityError,
@@ -658,17 +659,23 @@ class RocketChatConnector(Connector):
             # hands the message back and forgets its id so a later replay can bring it
             # back. Spending the boundary on a batch that contains one of those removes
             # the only mark that could — the live watermark has moved past it by then.
-            if all_accepted and not external_window:
-                if not sub.discharge_boundary(claims_at_entry):
-                    logger.info(
-                        "Room '%s': the outage window was claimed again while this "
-                        "batch was being dispatched — leaving it open",
-                        sub.room.name,
-                    )
-            else:
+            #
+            # Two independent questions, and folding them into one condition
+            # made the `else` speak for both: an externally-named window took
+            # the hand-back arm and logged that a queue was full, on the most
+            # ordinary path there is. Whose window this was decides whether the
+            # mark may be spent; whether the batch was accepted decides whether
+            # it *should* be.
+            if not all_accepted:
                 logger.warning(
                     "Room '%s': part of the replayed batch was handed back (queue "
                     "full) — keeping the outage window open for the next recovery",
+                    sub.room.name,
+                )
+            elif not external_window and not sub.discharge_boundary(claims_at_entry):
+                logger.info(
+                    "Room '%s': the outage window was claimed again while this "
+                    "batch was being dispatched — leaving it open",
                     sub.room.name,
                 )
 
@@ -1030,14 +1037,17 @@ class RocketChatConnector(Connector):
         return False
 
     def trigger_history_bound(self, trigger) -> str | None:
-        """The trigger doc's `ts` as ISO — DDP carries it as `{"$date": ms}` or a
-        bare epoch-ms value; `ts_ms_to_iso_local` answers None on anything else."""
+        """The trigger doc's `ts` as epoch milliseconds (§5.2).
+
+        DDP carries it as `{"$date": ms}` or a bare numeric — both already the
+        internal representation, so this extracts rather than converts. It used
+        to convert to ISO, which then met an epoch-ms watermark in a numeric
+        comparison that could not parse it.
+        """
         if not isinstance(trigger, dict):
             return None
-        ts = trigger.get("ts", "")
-        if isinstance(ts, dict):
-            ts = ts.get("$date", "")
-        return ts_ms_to_iso_local(str(ts), self.timezone) if ts else None
+        ts = extract_ts(trigger)
+        return ts if ts and _ts_to_float(ts) is not None else None
 
     async def _room_ref_from_access(
         self, room_id: str, access: dict

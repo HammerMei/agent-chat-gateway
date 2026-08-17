@@ -493,6 +493,9 @@ class Connector(ABC):
           bound, so the very message that set the watermark comes back — and it
           is a user message, so the own-message rule does not remove it.
 
+        ``after_ts`` is epoch milliseconds, like every timestamp inside ACG
+        (§5.2).
+
         Default: ``False`` — a connector with no history API has nothing to
         probe, and a startup replay over its records must be harmless.
         """
@@ -521,7 +524,11 @@ class Connector(ABC):
         return None
 
     def trigger_history_bound(self, trigger: Any) -> str | None:
-        """The ISO timestamp of a router trigger frame, for bounding history handoff.
+        """A router trigger frame's timestamp, for bounding history handoff.
+
+        Epoch milliseconds as a string, like every timestamp inside ACG (§5.2):
+        its consumer compares it against a room's watermark and forwards it as
+        a `fetch_room_history` bound, and both of those are epoch-ms.
 
         `register_router` passes the platform-native frame that prompted an offer;
         the creation path needs one thing from it — an exclusive upper bound for
@@ -565,14 +572,18 @@ class Connector(ABC):
         Args:
             room     : Resolved ``Room`` object (provides ``id`` and ``type``).
             count    : Maximum number of messages to retrieve.
-            before_ts: ISO 8601 exclusive upper-bound timestamp.  When provided,
-                       only messages older than this timestamp are returned.
-                       Maps to the platform ``latest`` parameter.
-            after_ts : ISO 8601 inclusive lower-bound timestamp.  When provided,
-                       only messages newer than or equal to this timestamp are
-                       returned.  Maps to the platform ``oldest`` parameter.
-                       Connectors that do not support this parameter may silently
-                       ignore it.
+            before_ts: Exclusive upper bound, **epoch milliseconds as a string**
+                       — the internal representation for every timestamp
+                       crossing an ACG interface (§5.2). Only messages older
+                       than it are returned. Maps to the platform's own
+                       upper-bound parameter, which each connector converts to
+                       if its API wants something else.
+            after_ts : Inclusive lower bound, epoch milliseconds as a string.
+                       Connectors that do not support it may silently ignore it.
+
+        Note the asymmetry, which is deliberate: the *bounds* are epoch-ms
+        because ACG compares them, while the ``ts`` field of each returned dict
+        is ISO because an agent reads it.
         """
         return []
 

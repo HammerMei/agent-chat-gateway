@@ -26,6 +26,20 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("agent-chat-gateway.control")
 
+
+def _to_epoch_ms(dt) -> str | None:
+    """An operator's ISO timestamp as the internal representation (§5.2).
+
+    A naive datetime is read as local time, which is what an operator who
+    omitted the offset meant — the alternative, UTC, would silently shift the
+    window by the local offset.
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.astimezone()
+    return str(int(dt.timestamp() * 1000))
+
 CONTROL_SOCK = RUNTIME_DIR / "control.sock"
 
 
@@ -640,8 +654,16 @@ class ControlServer:
 
         try:
             room = await entry.connector.resolve_room(wc.room)
+            # Converted here, at the one boundary where a human types a
+            # timestamp: connector bounds are epoch milliseconds like every
+            # other timestamp inside ACG (§5.2). Both values are already
+            # parsed above, so this reuses the datetimes rather than the
+            # strings.
             msgs = await entry.connector.fetch_room_history(
-                room, count, before_ts=before_ts, after_ts=after_ts
+                room,
+                count,
+                before_ts=_to_epoch_ms(before_dt),
+                after_ts=_to_epoch_ms(after_dt),
             )
         except Exception as e:
             logger.error("fetch_room_history failed for watcher '%s': %s", watcher_name, e)

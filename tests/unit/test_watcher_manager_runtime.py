@@ -647,6 +647,41 @@ class TestEndToEndThroughTheRealLifecycle(unittest.IsolatedAsyncioTestCase):
             "1786874400000",
         )
 
+    async def test_the_tighter_of_the_two_handoff_bounds_wins(self):
+        """The case that distinguishes `_earlier` from `or`, and which the test
+        above cannot see because it passes no trigger bound at all.
+
+        A trigger is by construction a message *above* the watermark, and
+        `before_ts` is an exclusive upper bound — so the trigger's bound fetches
+        **more** history, not less. Preferring it, as `or` does whenever a
+        trigger exists (i.e. on every message-path recreation), re-admits the
+        whole interval the replay is about to deliver: the double delivery the
+        bound exists to prevent.
+        """
+        lifecycle, connector, _patch = self._real_lifecycle()
+        connector.replay_room_since = AsyncMock()
+        manager = WatcherManager("rc", connector, lifecycle, [_rule(agent="default")])
+
+        with _patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            await manager.get_or_create("rc", _room())
+            ws = lifecycle.get_watcher_state("rc-eng-backend")
+            ws.last_processed_ts = "1786874400000"   # the room's own boundary
+            ws.session_id = ""                        # backend forgot the session
+            await lifecycle.stop_all()
+            connector.fetch_room_history.reset_mock()
+
+            # A trigger, above the watermark, as every real one is.
+            await manager.get_or_create(
+                "rc", _room(), history_before_ts="1786888888888")
+
+        self.assertEqual(
+            connector.fetch_room_history.call_args.kwargs.get("before_ts"),
+            "1786874400000",
+            "the record's watermark is the tighter bound and must win over the "
+            "trigger's, which sits above it",
+        )
+
     async def test_a_recreation_advances_the_idle_clock_and_clears_dropped_at(self):
         lifecycle, connector, _patch = self._real_lifecycle()
         manager = WatcherManager("rc", connector, lifecycle, [_rule(agent="default")])

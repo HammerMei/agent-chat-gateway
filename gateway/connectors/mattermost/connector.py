@@ -66,7 +66,7 @@ from .normalize import (
 from .outbound import send_media as _send_media
 from .outbound import send_text as _send_text
 from .policy import apply_thread_policy
-from .rest import MattermostREST, RoomNotFoundError, iso_to_epoch_ms_str
+from .rest import MattermostREST, RoomNotFoundError
 from .websocket import MattermostWebSocketClient
 
 logger = logging.getLogger("agent-chat-gateway.connectors.mattermost")
@@ -767,17 +767,20 @@ class MattermostConnector(Connector):
         included with role="agent"/username="me"; peer agents are included
         with role="agent" and their real (sanitized) username.
 
-        Note: before_ts/after_ts are ISO 8601 strings per the Connector ABC
-        contract — converted here to the epoch-ms strings
-        MattermostREST.get_room_history expects natively (see that method's
-        docstring), and applied as a best-effort client-side filter, not
-        exact server-side pagination.
+        `before_ts`/`after_ts` are epoch milliseconds, the internal
+        representation (§5.2), which is what `MattermostREST.get_room_history`
+        wants natively — so they pass straight through. They used to be
+        converted from ISO here, and the converter *raised* on an epoch-ms
+        value: the same bound that worked on Rocket.Chat, whose normalizer
+        tolerates both, silently cost every Mattermost recreation its history
+        handoff. Applied as a best-effort client-side filter, not exact
+        server-side pagination.
         """
         raw_msgs = await self._rest.get_room_history(
             room.id,
             count,
-            before_ts=iso_to_epoch_ms_str(before_ts) if before_ts else None,
-            after_ts=iso_to_epoch_ms_str(after_ts) if after_ts else None,
+            before_ts=before_ts or None,
+            after_ts=after_ts or None,
         )
         bot_username = self.agent_username
         owners = set(self._config.owners)
@@ -878,13 +881,14 @@ class MattermostConnector(Connector):
         return False
 
     def trigger_history_bound(self, trigger) -> str | None:
-        """The trigger's `post.create_at` (epoch ms) as ISO — the decoded event is
-        what `_offer_to_router` hands the router."""
+        """The trigger's `post.create_at` — already epoch milliseconds, which is
+        the internal representation (§5.2), so this reads it rather than
+        converting it."""
         if not isinstance(trigger, dict):
             return None
         post = trigger.get("post")
         create_at = post.get("create_at", "") if isinstance(post, dict) else ""
-        return ts_ms_to_iso_local(str(create_at), self.timezone) if create_at else None
+        return str(create_at) if create_at else None
 
     def _room_ref_from_event(self, channel_id: str, decoded: dict) -> "RoomRef | None":
         """Build a `RoomRef` from the event, or None when the event cannot describe a room.

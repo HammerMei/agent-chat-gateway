@@ -321,6 +321,48 @@ guarantee is not read as stronger than it is.
 This supersedes the "defer bookkeeping until accepted" phrasing in §2.7, which
 described only the success path.
 
+##### Replay ownership: one interval, one owner
+
+Three mechanisms replay a room's history, and they were built one increment at
+a time without ever being stated together. Three consecutive review rounds then
+landed in the seams between them — each round moved a boundary, and the next
+found a defect at its new position. This is that statement.
+
+**Every replay is defined by the interval it owes, and every interval has
+exactly one owner.**
+
+| Owner | Interval | Names the window? | May discharge the boundary? |
+|---|---|---|---|
+| `_on_ws_reconnect` | the outage the socket just ended | no — reads the room's own marks | **yes**, it read the window those marks describe |
+| `WatcherManager._recreate` | everything below the record's watermark, for the room it is recreating | yes (`after_ts=record.last_processed_ts`) | no |
+| the drain of a routing episode | nothing — it *claims*, never replays | — | no |
+
+Two consequences that are not obvious and were each got wrong once:
+
+* **A caller that names a window may not discharge the room's boundary.** The
+  boundary is set by the room's own hand-back accounting — "a message below
+  here was refused and must come back" — and a replay that read a *different*
+  window has no claim on it. Discharging it anyway loses the refused message
+  permanently, because the live watermark has moved past it by then. The rule
+  applies at **every** discharge site, of which there are two per connector
+  (the empty page and the dispatched batch); guarding one and not the other
+  reads as correct in a single file.
+
+* **The startup replay owns no interval at all.** It exists to *notice* that a
+  room has a gap and to trigger the recreation that covers it — the recreation
+  is what replays. A room in the startup scan that is already resident got that
+  way through `_recreate` (its record rules out `_create`, and a rule-derived
+  record is not in `watchers:` so the static path never starts it), so its
+  interval has already been replayed and a second pass is pure duplication:
+  replay hands the filter its own boundary rather than the live watermark, so
+  the ts filter suppresses nothing and only the bounded id window separates the
+  two passes.
+
+The claim the drain makes is the one piece that is deliberately *not* a replay:
+the frames are handed to the room's worker immediately, and the claim only
+covers the case where the scalar watermark has already moved past them (above).
+It is discharged by whichever reconnect next reads its own window.
+
 An unmatched message is dropped deliberately. The connector knows nothing
 about watcher lifecycle, which is both the correct separation and the reason
 idle becomes cheap: **no unsubscribe means the connector's per-room state —
@@ -1688,6 +1730,50 @@ Independently shippable, and each is a separate change. The first two are
    shape, so a sync test written now would encode the wrong target.
 
 ### 5.2 Connector interface
+
+#### Timestamps: one representation inside, ISO only where a human reads it
+
+Two representations are in play and nothing said which went where, so a value
+that looked right crossed an interface that wanted the other one. The rule:
+
+> **Every timestamp crossing an ACG interface is epoch milliseconds as a
+> string.** ISO-8601 appears in exactly two places, both of them edges: what
+> the control socket accepts from an operator, and what `fetch_room_history`
+> returns *inside its message dicts*, which an agent reads.
+
+This is not a new convention — it is the one the system already followed almost
+everywhere. `get_last_processed_ts`, `update_last_processed_ts`,
+`probe_missed_since`, `replay_room_since`, both connectors' message-timestamp
+extraction, `WatcherState.last_processed_ts`, `claim_boundary`, `just_before`
+and the replay filter are all epoch-ms today. Writing it down closes the two
+that were not.
+
+**Why epoch-ms and not ISO**, given ISO is the friendlier form: the comparison
+helpers are numeric. `ts_to_float` cannot parse ISO at all, so `ts_gt` falls
+through to a *string* comparison — and `ts_gt(iso, epoch)` is therefore `True`
+for every pair a deployment can currently produce, regardless of which instant
+is actually later, because `"2026…" > "1786…"`. That accident expires when
+epoch-ms crosses `"2000000000000"` in 2033. `just_before(iso)` is worse: it
+returns its argument unchanged, so a bound meant to be exclusive silently is
+not. A representation that the ordering primitives cannot order is not a
+candidate for the internal one.
+
+**Consequences at the two edges:**
+
+* The control socket keeps accepting ISO from operators — it is the only
+  human-typed timestamp in the system — and converts once, at that boundary,
+  before calling any connector method.
+* `fetch_room_history`'s `before_ts`/`after_ts` are epoch-ms like everything
+  else. Its *return* dicts keep ISO in their `ts` field: that value is read by
+  an agent, not compared by ACG.
+
+**The failure this closes**, recorded because it was silent: connectors were
+free to differ on tolerance. Rocket.Chat's bound normalizer accepted both forms
+and Mattermost's raised on the wrong one, so the same epoch-ms value worked on
+one connector and, on the other, raised into a blanket `except` that logged
+"starting without history" — every recreation that minted a fresh session lost
+its handoff, on the exact path the bound exists to serve. One documented
+contract, two behaviours, no test that could see it.
 
 ```python
 class Connector(ABC):

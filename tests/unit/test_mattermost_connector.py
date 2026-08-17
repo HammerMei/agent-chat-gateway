@@ -678,15 +678,24 @@ class TestOnWsReconnect(unittest.IsolatedAsyncioTestCase):
 
 
 class TestFetchRoomHistoryTimestampWiring(unittest.IsolatedAsyncioTestCase):
-    async def test_iso_before_after_converted_to_epoch_ms_for_rest_call(self):
+    async def test_epoch_ms_bounds_reach_rest_unchanged(self):
+        """Inverted from "ISO converted to epoch-ms" (§5.2).
+
+        The bounds are epoch milliseconds, like every timestamp inside ACG, and
+        that is what this REST client wants natively — so nothing converts. The
+        old conversion *raised* on an epoch-ms value, and the caller's blanket
+        `except` turned that into "starting without history": the same bound
+        that worked on Rocket.Chat, whose normalizer tolerates both forms,
+        silently cost every Mattermost recreation its handoff.
+        """
         connector = _make_connector()
         connector._rest.get_room_history = AsyncMock(return_value=[])
 
         await connector.fetch_room_history(
             Room(id="chan1", name="general", type="channel"),
             count=10,
-            before_ts="2026-01-01T00:00:00+00:00",
-            after_ts="2025-12-31T00:00:00+00:00",
+            before_ts="1767225600000",
+            after_ts="1767139200000",
         )
 
         connector._rest.get_room_history.assert_called_once_with(
@@ -1141,19 +1150,23 @@ class TestProbeMissedSince(unittest.IsolatedAsyncioTestCase):
 class TestTriggerHistoryBound(unittest.TestCase):
     """Mattermost's trigger is the decoded event; the bound is post.create_at."""
 
-    def test_create_at_becomes_iso(self):
+    def test_create_at_reads_through_as_epoch_ms(self):
+        """`create_at` is already the internal representation (§5.2), so this
+        reads it rather than converting it."""
         connector = _make_connector(timezone="UTC")
         bound = connector.trigger_history_bound(
             {"post": {"id": "m1", "create_at": 1786874400000}})
-        self.assertEqual(bound, "2026-08-16T10:00:00+00:00")
+        self.assertEqual(bound, "1786874400000")
 
     def test_a_missing_or_garbled_frame_answers_none(self):
         connector = _make_connector(timezone="UTC")
         self.assertIsNone(connector.trigger_history_bound({"post": {}}))
         self.assertIsNone(connector.trigger_history_bound({}))
         self.assertIsNone(connector.trigger_history_bound(None))
-        self.assertIsNone(connector.trigger_history_bound(
-            {"post": {"create_at": "soon"}}))
+        # A non-numeric create_at is not something this connector can produce;
+        # it is passed through as the string it is rather than guessed at.
+        self.assertEqual(
+            connector.trigger_history_bound({"post": {"create_at": "soon"}}), "soon")
 
 
 class TestReaping(unittest.IsolatedAsyncioTestCase):
