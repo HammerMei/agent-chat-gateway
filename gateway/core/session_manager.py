@@ -533,7 +533,9 @@ class SessionManager:
             reason="the platform reported the bot removed from the room",
         )
 
-    async def _reclaim_removed_room(self, room_id: str, *, reason: str) -> None:
+    async def _reclaim_removed_room(
+        self, room_id: str, *, reason: str, expected=None,
+    ) -> None:
         """The removal path's shared tail: reclaim the record, cancel its jobs.
 
         Two discoverers, one end state (§2.7): the live membership event and
@@ -541,7 +543,8 @@ class SessionManager:
         late cannot reach a different outcome than one seen live.
         """
         try:
-            name = await self._lifecycle.reclaim_room(room_id, reason=reason)
+            name = await self._lifecycle.reclaim_room(
+                room_id, reason=reason, expected=expected)
         except Exception:
             logger.exception(
                 "Membership-removal reclaim failed for room %s — the "
@@ -616,6 +619,9 @@ class SessionManager:
                 record.room_id,
                 reason="the membership reconciliation found the bot is no "
                        "longer in the room (a removal event was missed)",
+                # Pinned to this snapshot's record: the reclaim aborts under
+                # the lock if a wake or re-add got there first (round 2).
+                expected=record,
             )
 
     async def shutdown(self) -> None:

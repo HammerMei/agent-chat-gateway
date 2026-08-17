@@ -267,6 +267,16 @@ class RocketChatConnector(Connector):
         self._room_refcount: dict[str, int] = {}  # room_id -> subscriber count
         self._router = None
         self._membership_hook = None
+        # Room-level membership-loss generation (Codex review of #121, round
+        # 2). `membership_epoch` lives on the subscription OBJECT and dies
+        # with it, so a delivery holding subscription A could not see a loss
+        # that marked its replacement B before re-add installed C — three
+        # transitions inside one flight, and the commit fence would have
+        # redirected a pre-removal watermark into the new membership. This
+        # counter belongs to the ROOM: every membership-loss site bumps it,
+        # a delivery captures it at entry, and the fence refuses to redirect
+        # across a bump, whichever object the loss happened to mark.
+        self._room_membership_gen: dict[str, int] = {}
         # Rooms with an open routing episode. The routing workers are a pool, so
         # several frames from one untracked room can be in flight at once — and offering a
         # room is slow (a DM needs `im.members` before it can even be classified), which
@@ -528,6 +538,7 @@ class RocketChatConnector(Connector):
             # for a room seen for the first time: no window, and ts-dedup off until
             # live traffic establishes one (`normalize.py`, step 4).
             sub.left_the_room()
+            self._note_membership_loss(room_id)
             logger.warning(
                 "Room '%s': this account is no longer a member — skipping replay and "
                 "closing the outage window; a later re-add starts from that point, "
@@ -895,6 +906,7 @@ class RocketChatConnector(Connector):
                 sub = self._rooms.get(rid)
                 if sub is not None:
                     sub.left_the_room()
+                self._note_membership_loss(rid)
                 await self._membership_hook.removed(rid)
                 return
             room = await self._room_ref_from_sub_doc(rid, doc)
@@ -940,6 +952,12 @@ class RocketChatConnector(Connector):
             return None
         kind = RoomKind.GROUP if t == "p" else RoomKind.CHANNEL
         return RoomRef(id=rid, kind=kind, name=name)
+
+    def _note_membership_loss(self, room_id: str) -> None:
+        """Record a membership loss at ROOM level — see `_room_membership_gen`."""
+        self._room_membership_gen[room_id] = (
+            self._room_membership_gen.get(room_id, 0) + 1
+        )
 
     async def membership_snapshot(self) -> set[str] | None:
         """See `Connector.membership_snapshot`. Read from the subscription
@@ -1003,9 +1021,12 @@ class RocketChatConnector(Connector):
             # stale watermark. Absence stays a plain return: "nobody said"
             # is not "not a participant".
             if access is not None and access.get("roomParticipant") is False:
-                sub = self._rooms.get(doc.get("rid", ""))
+                rid = doc.get("rid", "")
+                sub = self._rooms.get(rid)
                 if sub is not None:
                     sub.left_the_room()
+                if rid:
+                    self._note_membership_loss(rid)
             return
         if not sender_allowed(self._config, sender):
             return
@@ -2018,6 +2039,12 @@ class RocketChatConnector(Connector):
         # other side of it. The commit at the end is the write that matters: it is what a
         # later re-add would replay from.
         entry_epoch = sub.membership_epoch
+        # The ROOM-level loss generation, captured beside the object's epoch:
+        # the epoch cannot survive the object, and a benign restart replacing
+        # the object mid-flight would otherwise hide a loss that marked the
+        # replacement (round 2). The commit fence compares this, not the
+        # replacement's own epoch.
+        entry_mgen = self._room_membership_gen.get(room_id, 0)
 
         # --- _id dedup (live + replay race guard) ---
         # A message can arrive on both the live DDP stream and the reconnect
@@ -2053,6 +2080,7 @@ class RocketChatConnector(Connector):
             # was not a member, none of which is in the 200-id window because none of it
             # was ever delivered.
             sub.left_the_room()
+            self._note_membership_loss(room_id)
             return True
 
         msg_id = doc.get("_id", "")
@@ -2374,7 +2402,8 @@ class RocketChatConnector(Connector):
                         "Room %s: not reopening the outage window for a message that was in "
                         "flight when this account was removed", room_id,
                     )
-            elif live is not None and sub.membership_epoch == entry_epoch:
+            elif (live is not None
+                  and self._room_membership_gen.get(room_id, 0) == entry_mgen):
                 logger.warning(
                     "Room %s: a hand-back outlived its subscription (watcher "
                     "restarted mid-delivery) — claiming the outage window on the "
@@ -2382,9 +2411,11 @@ class RocketChatConnector(Connector):
                 )
                 live.claim_boundary(live.last_processed_ts, _just_before(result.msg_ts))
             elif live is not None:
-                # The old object learned of a membership loss while this
-                # delivery ran: the live object belongs to a NEW membership,
-                # and a pre-removal frame has no claim on its window.
+                # A membership loss happened somewhere in this delivery's
+                # flight — whichever object it marked (the room generation
+                # survives replacements, round 2): the live object belongs to
+                # a NEW membership, and a pre-removal frame has no claim on
+                # its window.
                 logger.warning(
                     "Room %s: not claiming a window for a hand-back that "
                     "crossed a membership removal", room_id,
@@ -2427,7 +2458,8 @@ class RocketChatConnector(Connector):
                 )
                 return True
             target = sub
-        elif live is not None and sub.membership_epoch == entry_epoch:
+        elif (live is not None
+              and self._room_membership_gen.get(room_id, 0) == entry_mgen):
             logger.warning(
                 "Room %s: a delivery outlived its subscription (watcher restarted "
                 "mid-delivery) — committing its watermark and dedup id to the live "
@@ -2436,8 +2468,9 @@ class RocketChatConnector(Connector):
             live.remember(msg_id)
             target = live
         elif live is not None:
-            # A membership loss happened while this delivery ran (the removal
-            # hook marked the old object): the live state is a re-add's fresh
+            # A membership loss happened somewhere in this delivery's flight —
+            # whichever object it marked, because the room generation survives
+            # replacements (round 2): the live state is a re-add's fresh
             # membership, and committing a pre-removal watermark into it would
             # point the next replay below the removal — delivering the whole
             # non-member interval, which the epoch machinery exists to prevent.

@@ -137,6 +137,58 @@ class TestARemovalReclaimsTheRecord(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(lifecycle.get_watcher_state("w1"))
 
 
+class TestAnExpectedRecordPinsTheReclaim(unittest.IsolatedAsyncioTestCase):
+    """Codex review of #121, round 2: the reconciliation's evidence is a
+    stale snapshot. With `expected` set, reclaim_room aborts on ANY change —
+    a replaced record, or the same record woken back to active — instead of
+    following the replacement the way a live removal event may."""
+
+    async def test_a_matching_dormant_record_is_reclaimed(self):
+        record = make_rule_derived_record(dropped_at="2026-08-01T00:00:00+00:00")
+        lifecycle, _ = _harness([record])
+
+        name = await lifecycle.reclaim_room(
+            "room-w1", reason="reconciliation", expected=record)
+
+        self.assertEqual(name, "w1")
+        self.assertIsNone(lifecycle.get_watcher_state("w1"))
+
+    async def test_a_replaced_record_aborts_the_reclaim(self):
+        stale = make_rule_derived_record(dropped_at="2026-08-01T00:00:00+00:00")
+        current = make_rule_derived_record(dropped_at="2026-08-01T00:00:00+00:00")
+        lifecycle, connector = _harness([current])
+
+        self.assertIsNone(await lifecycle.reclaim_room(
+            "room-w1", reason="reconciliation", expected=stale))
+        self.assertIsNotNone(lifecycle.get_watcher_state("w1"),
+                             "the newer record is not the snapshot's to delete")
+        connector.unsubscribe_room.assert_not_awaited()
+
+    async def test_a_record_woken_back_to_active_aborts_the_reclaim(self):
+        """Same object, no longer dormant: a wake between the snapshot and the
+        lock cleared dropped_at, and a stale snapshot has no authority over
+        what just happened. A live removal event (no `expected`) still would."""
+        record = make_rule_derived_record()  # active: no dropped_at, not paused
+        lifecycle, connector = _harness([record])
+
+        self.assertIsNone(await lifecycle.reclaim_room(
+            "room-w1", reason="reconciliation", expected=record))
+        self.assertIsNotNone(lifecycle.get_watcher_state("w1"))
+        connector.unsubscribe_room.assert_not_awaited()
+
+    async def test_a_paused_record_still_counts_as_dormant(self):
+        """Paused is inside the reconciliation's authority — the snapshot said
+        the room is gone, and §2.7 has removal override pause."""
+        record = make_rule_derived_record(paused=True)
+        lifecycle, _ = _harness([record])
+
+        name = await lifecycle.reclaim_room(
+            "room-w1", reason="reconciliation", expected=record)
+
+        self.assertEqual(name, "w1")
+        self.assertIsNone(lifecycle.get_watcher_state("w1"))
+
+
 def _rule(name="eng", include=("eng-*",), **kwargs):
     return WatcherRule(
         name=name,
@@ -394,7 +446,7 @@ class TestTheMembershipReconciliation(unittest.IsolatedAsyncioTestCase):
         mgr._connector.membership_snapshot = AsyncMock(return_value=snapshot)
         reclaimed = []
 
-        async def reclaim(room_id, *, reason):
+        async def reclaim(room_id, *, reason, expected=None):
             reclaimed.append((room_id, reason))
             return f"w-{room_id}"
 
@@ -420,6 +472,12 @@ class TestTheMembershipReconciliation(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sorted(cancelled), ["w-also-gone", "w-gone"])
         for _, reason in mgr.reclaimed:
             self.assertIn("reconciliation", reason)
+        by_room = {idle.room_id: idle, paused.room_id: paused}
+        for call in mgr._lifecycle.reclaim_room.call_args_list:
+            self.assertIs(
+                call.kwargs.get("expected"), by_room[call.args[0]],
+                "the reconciliation pins each reclaim to the exact record "
+                "its snapshot judged — a replacement aborts, never follows")
 
     async def test_a_room_that_woke_after_the_snapshot_is_left_alone(self):
         """Codex review of #121: the snapshot ages while the loop awaits

@@ -184,6 +184,13 @@ class MattermostConnector(Connector):
         self._capacity_check: CapacityCheck | None = None
         self._router = None
         self._membership_hook = None
+        # Room-level membership-loss generation — RC's twin (round 2 of the
+        # #121 review): the membership_lost bit on _ChannelState dies with
+        # the object, so a loss that marked a mid-flight replacement was
+        # invisible to a delivery holding the original. Every loss bumps
+        # this; a delivery captures it at entry; the commit fence refuses to
+        # redirect across a bump.
+        self._membership_gen: dict[str, int] = {}
         self._channels: dict[str, _ChannelState] = {}  # channel_id -> state
         # Channels with an open routing episode — the same single-episode rule as
         # RC's `_pending_routes`, and needed here for a sharper reason: the offer
@@ -941,6 +948,9 @@ class MattermostConnector(Connector):
             state = self._channels.get(channel_id)
             if state is not None:
                 state.membership_lost = True
+            self._membership_gen[channel_id] = (
+                self._membership_gen.get(channel_id, 0) + 1
+            )
             coro = self._membership_hook.removed(channel_id)
         else:
             coro = self._handle_membership_add(channel_id)
@@ -1458,6 +1468,7 @@ class MattermostConnector(Connector):
             return  # Own message — also skipped before spending a resolve_username call.
 
         state = self._channels.get(channel_id)
+        entry_mgen = self._membership_gen.get(channel_id, 0)
         if not state:
             await self._offer_to_router(channel_id, decoded)
             return
@@ -1632,7 +1643,8 @@ class MattermostConnector(Connector):
         # handed-back one is never recovered. The commit follows the channel.
         live = self._channels.get(channel_id)
         if live is not state and live is not None:
-            if state.membership_lost:
+            if (state.membership_lost
+                    or self._membership_gen.get(channel_id, 0) != entry_mgen):
                 # A membership loss happened while this delivery ran: the live
                 # state belongs to a re-add's fresh membership, and a
                 # pre-removal post has no claim on its watermark or window —

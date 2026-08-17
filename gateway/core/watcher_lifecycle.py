@@ -440,7 +440,9 @@ class WatcherLifecycle:
         self._states.pop(name, None)
         self._state_store.save(self._states)
 
-    async def reclaim_room(self, room_id: str, *, reason: str) -> str | None:
+    async def reclaim_room(
+        self, room_id: str, *, reason: str, expected: "WatcherState | None" = None,
+    ) -> str | None:
         """Forced reclamation of a room's record — not a timer's (§2.7, §4.4).
 
         Three callers, one semantics: a live membership removal, the periodic
@@ -480,13 +482,34 @@ class WatcherLifecycle:
         discovered twice — the live event and a later REST failure, or the
         periodic reconciliation — reaches the same end state. Returns the
         reclaimed watcher's name so the caller can cancel its jobs.
+
+        ``expected`` pins the reclamation to one snapshot of the room (Codex
+        review of #121, round 2): a LIVE removal event is authoritative for
+        the room whatever its record looks like by the time the lock is
+        acquired — the retry loop below deliberately follows the replacement —
+        but the reconciliation's evidence is a stale snapshot, and following
+        a replacement there deletes the very record a newer join or wake just
+        made. With ``expected`` set, any change — a different object, or the
+        same object no longer dormant — aborts with None instead of retrying,
+        and the next round decides against fresher evidence.
         """
         while True:
             record = self.record_for_room(room_id)
             if record is None:
                 return None
+            if expected is not None and record is not expected:
+                return None
             name = record.watcher_name
             async with self._get_watcher_lock(name):
+                if expected is not None and (
+                    self._states.get(name) is not record
+                    or not (record.paused or record.dropped_at)
+                ):
+                    # Re-checked UNDER the lock: a wake that held it while we
+                    # waited has made this record active (or replaced it), and
+                    # a stale snapshot has no authority over what just
+                    # happened.
+                    return None
                 if self._states.get(name) is not record:
                     # The record changed while we waited — an expiry reclaimed
                     # it, or a wake replaced it. Re-read and re-decide; the

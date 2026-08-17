@@ -598,6 +598,7 @@ class TestRCRefcount(unittest.IsolatedAsyncioTestCase):
         connector._capacity_check = None
         connector._rooms = {}
         connector._watcher_contexts = {}
+        connector._room_membership_gen = {}
         connector._room_refcount = {}
         connector._attachments_cache_base = Path("/tmp/acg-test-attachments/rc-test")
         connector._turn_store = None
@@ -681,6 +682,7 @@ class TestMultiWatcherDispatch(unittest.IsolatedAsyncioTestCase):
         connector._capacity_check = None
         connector._rooms = {}
         connector._watcher_contexts = {}
+        connector._room_membership_gen = {}
         connector._room_refcount = {}
         connector._attachments_cache_base = Path("/tmp/acg-test-attachments/rc-test")
         connector._turn_store = None
@@ -1440,6 +1442,7 @@ class TestAttachmentCachePath(unittest.IsolatedAsyncioTestCase):
         connector._capacity_check = None
         connector._rooms = {}
         connector._watcher_contexts = {}
+        connector._room_membership_gen = {}
         connector._room_refcount = {}
         connector._attachments_cache_base = Path("/tmp/acg-test/rc-home")
         connector._turn_store = None

@@ -133,9 +133,13 @@ class TestADeliveryCrossingAMembershipRemoval(unittest.IsolatedAsyncioTestCase):
         )
 
         async def handler(msg):
-            # The removal hook marks the CURRENT object, then the re-add
-            # installs a fresh one — all while this delivery runs.
+            # The removal hook marks the current object AND bumps the room's
+            # loss generation (both happen on the production removal path);
+            # then the re-add installs a fresh object — all while this
+            # delivery runs. The fence must compare the ROOM generation, not
+            # the replaced object's epoch (Codex round 2).
             old_sub.left_the_room()
+            connector._note_membership_loss("room-1")
             connector._rooms["room-1"] = fresh
             return True
 
@@ -146,6 +150,44 @@ class TestADeliveryCrossingAMembershipRemoval(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fresh.last_processed_ts, "",
                          "no pre-removal watermark in the new membership")
         self.assertNotIn("m1", fresh.seen_ids_set)
+
+    async def test_rc_refuses_the_commit_when_a_restart_hides_the_removal(self):
+        """Codex round 2: A→B→removal→C. A benign restart replaces the entry
+        object BEFORE the removal, so the loss marks the replacement (B) and
+        the re-add installs a third object (C) that carries no mark at all.
+        An object-level fence sees a clean live object; the ROOM-level
+        generation is what survives the shuffle."""
+        from gateway.connectors.rocketchat.connector import _RoomSubscription
+        from gateway.core.connector import Room
+
+        connector, sub_a = self._make_connector_and_sub()
+
+        def _fresh(ts=""):
+            return _RoomSubscription(
+                room=Room(id="room-1", name="general", type="channel"),
+                last_processed_ts=ts,
+            )
+
+        sub_b, sub_c = _fresh("150"), _fresh()
+
+        async def handler(msg):
+            # 1. Benign watcher restart mid-delivery: A → B, no loss.
+            connector._rooms["room-1"] = sub_b
+            # 2. The removal lands on B — the mark dies with B.
+            sub_b.left_the_room()
+            connector._note_membership_loss("room-1")
+            # 3. Re-add installs C, unmarked.
+            connector._rooms["room-1"] = sub_c
+            return True
+
+        connector._handler = handler
+
+        await connector._on_raw_ddp_message("room-1", self._doc("m1", "200"))
+
+        self.assertEqual(sub_c.last_processed_ts, "",
+                         "no pre-removal watermark crossed into the third "
+                         "object's membership")
+        self.assertNotIn("m1", sub_c.seen_ids_set)
 
     async def test_mm_refuses_the_commit_across_a_removal(self):
         from unittest.mock import AsyncMock
@@ -182,6 +224,54 @@ class TestADeliveryCrossingAMembershipRemoval(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(fresh.last_processed_ts)
         self.assertNotIn("p1", fresh.seen_ids_set)
 
+    async def test_mm_refuses_the_commit_when_a_restart_hides_the_removal(self):
+        """Codex round 2, MM half: A→B→removal→C — the membership_lost bit
+        lives on the state object and dies with it, so the channel-level
+        generation is the fence that survives."""
+        from unittest.mock import AsyncMock
+
+        from gateway.connectors.mattermost.connector import _ChannelState
+        from gateway.core.connector import Room
+        from tests.unit.test_mattermost_connector import _make_connector
+
+        connector = _make_connector()
+        connector._config.require_mention = False
+        connector._config.filter_sender = False
+        connector._rest.resolve_username = AsyncMock(return_value="alice")
+
+        def _state(ts=None):
+            s = _ChannelState(room=Room(id="chan-1", name="general", type="channel"))
+            s.last_processed_ts = ts
+            return s
+
+        state_a, state_b, state_c = _state("100"), _state("150"), _state()
+        connector._channels["chan-1"] = state_a
+
+        async def handler(msg):
+            # 1. Benign restart mid-delivery: A → B, no loss.
+            connector._channels["chan-1"] = state_b
+            # 2. The removal stamps B and bumps the channel generation —
+            #    exactly what the removal hook does.
+            state_b.membership_lost = True
+            connector._membership_gen["chan-1"] = (
+                connector._membership_gen.get("chan-1", 0) + 1)
+            # 3. Re-add installs C, unmarked.
+            connector._channels["chan-1"] = state_c
+            return True
+
+        connector._handler = handler
+
+        await connector._on_posted_event({
+            "post": {"id": "p1", "channel_id": "chan-1", "user_id": "u-alice",
+                     "message": "hello", "create_at": 200},
+            "sender_name": "@alice", "channel_type": "O",
+            "channel_name": "general", "channel_display_name": "General",
+            "team_id": "", "mentions": [],
+        })
+
+        self.assertIsNone(state_c.last_processed_ts)
+        self.assertNotIn("p1", state_c.seen_ids_set)
+
     async def test_the_mm_removal_hook_stamps_the_current_state(self):
         from unittest.mock import AsyncMock
 
@@ -205,6 +295,9 @@ class TestADeliveryCrossingAMembershipRemoval(unittest.IsolatedAsyncioTestCase):
             await _a.gather(*connector._routing_tasks)
 
         self.assertTrue(state.membership_lost)
+        self.assertEqual(connector._membership_gen.get("chan-1"), 1,
+                         "the removal also bumps the channel-level "
+                         "generation — the mark that outlives the object")
 
 
 class TestAFailedWakeReplayKeepsTheWindow(unittest.IsolatedAsyncioTestCase):

@@ -57,6 +57,7 @@ def _make_connector():
     # set here. Delivery defaults to per-room, which is what these tests exercise.
     connector._router = None
     connector._membership_hook = None
+    connector._room_membership_gen = {}
     connector._pending_routes = {}
     connector._routing_tasks = set()
     connector._subscribe_all = False
@@ -307,6 +308,7 @@ class TestWatermarkAdvancement(unittest.IsolatedAsyncioTestCase):
         connector._room_refcount = {}
         connector._attachments_cache_base = Path("/tmp/acg-test-attachments/test")
         connector._turn_store = None  # no agent chain configured
+        connector._room_membership_gen = {}
 
         room = Room(id="room-1", name="general", type="channel")
         sub = _RoomSubscription(room=room, last_processed_ts="100")
