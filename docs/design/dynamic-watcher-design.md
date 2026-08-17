@@ -1365,6 +1365,19 @@ The room becomes listable and addressable immediately; the first message
 wakes it through the normal path. This reuses the existing idle state rather
 than inventing a fourth one.
 
+Reusing idle means inheriting its expiry: the registered record's
+`dropped_at` is the join instant — being born idle, that *is* the moment it
+became idle — so a room nobody ever speaks in is reclaimed
+`session_expire_days` after the join. Accepted deliberately (owner,
+2026-08-17), and the usual pattern makes it the uncommon case anyway: a bot
+is normally added to a room *in order to* be spoken to, and the first message
+makes the watcher active. A registration that expires never-spoken had no
+session to lose — the record is the only thing reclaimed, and a later first
+message recreates it at full fidelity through the same path it would have
+taken anyway. Once woken, the join time never participates in any calculation
+again; a later quiet spell restamps `dropped_at` and expiry measures from the
+new stamp.
+
 Three properties this must have:
 
 - **It is a supplement, never a replacement.** Mattermost's websocket has no
