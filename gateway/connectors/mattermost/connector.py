@@ -105,6 +105,12 @@ class _ChannelState(ReplayWindow):
     # its queues are full.
     replay_boundary: str | None = None
     boundary_claims: int = 0
+    # Set by the membership-removal hook while this object is still the
+    # channel's current state. RC carries a membership_epoch for the same
+    # job; Mattermost has no epoch machinery, and the commit-redirection
+    # fence needs exactly one bit: did a membership loss happen while a
+    # delivery holding this object was in flight.
+    membership_lost: bool = False
     seen_ids: collections.deque = field(default_factory=lambda: collections.deque())
     seen_ids_set: set = field(default_factory=set)
     watcher_ids: set = field(default_factory=set)
@@ -321,6 +327,13 @@ class MattermostConnector(Connector):
             )
             raw_msgs = page.messages
         except Exception as e:
+            # An EXTERNAL window that was not read is claimed (Codex review of
+            # #121, RC's twin has the same rule): the caller's mark lives in
+            # the record, this channel state is fresh, and the triggering
+            # post's commit would otherwise seal the unread interval away
+            # permanently. Whoever fails to replay owns keeping it reachable.
+            if external_window:
+                state.claim_boundary(after_ts)
             logger.warning("Channel '%s': failed to fetch history for replay: %s", state.room.name, e)
             return
 
@@ -920,6 +933,14 @@ class MattermostConnector(Connector):
         if not channel_id:
             return
         if evt.get("event") == "user_removed":
+            # Mark the channel's CURRENT state before anything reclaims it —
+            # synchronously, before the task below is even created — so a
+            # delivery in flight that holds this object can tell a membership
+            # replacement from a benign watcher restart (see the commit
+            # fence in `_on_posted_event`).
+            state = self._channels.get(channel_id)
+            if state is not None:
+                state.membership_lost = True
             coro = self._membership_hook.removed(channel_id)
         else:
             coro = self._handle_membership_add(channel_id)
@@ -1611,6 +1632,20 @@ class MattermostConnector(Connector):
         # handed-back one is never recovered. The commit follows the channel.
         live = self._channels.get(channel_id)
         if live is not state and live is not None:
+            if state.membership_lost:
+                # A membership loss happened while this delivery ran: the live
+                # state belongs to a re-add's fresh membership, and a
+                # pre-removal post has no claim on its watermark or window —
+                # committing one would point the next replay below the
+                # removal, delivering the whole non-member interval.
+                logger.warning(
+                    "Channel %s: discarding the marks of a delivery that "
+                    "crossed a membership removal", channel_id,
+                )
+                if not accepted:
+                    self._release_turn_for(post, result, turn_generation,
+                                           "handler queue full")
+                return
             logger.warning(
                 "Channel %s: a delivery outlived its state (watcher restarted "
                 "mid-delivery) — committing to the live one", channel_id,

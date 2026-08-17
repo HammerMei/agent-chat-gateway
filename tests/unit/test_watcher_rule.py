@@ -171,10 +171,14 @@ class TestParserHappyPath(unittest.TestCase):
         r = parse({**MINIMAL, "session_idle_days": 7, "session_expire_days": 30})
         self.assertEqual((r.session_idle_days, r.session_expire_days), (7, 30))
 
-    def test_ttls_default_to_none_meaning_no_lifecycle(self):
+    def test_omitted_ttls_take_the_dataclass_defaults(self):
+        """Inverted (Codex review of #121): this used to pin None — 'no
+        lifecycle' — which was the defect, not the contract. §2.5's ruling is
+        15/15 by default, and the parser passing its None explicitly was
+        exactly how the defaults got silently overridden."""
         r = parse(MINIMAL)
-        self.assertIsNone(r.session_idle_days)
-        self.assertIsNone(r.session_expire_days)
+        self.assertEqual(r.session_idle_days, 15)
+        self.assertEqual(r.session_expire_days, 15)
 
     def test_notifications_and_history_handoff(self):
         r = parse({**MINIMAL, "online_notification": "hi", "history_handoff": {"fetch_count": 5}})
@@ -771,3 +775,50 @@ class TestSharedHelpersAttributeToTheRuleParser(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestOmittedTtlsGetTheDefaults(unittest.TestCase):
+    """Codex review of #121, P1 — and real: the parser passed its None
+    explicitly, overriding the dataclass defaults, so every config that did
+    not spell the TTLs out had the whole idle/expiry lifecycle silently off.
+    Pinned at the loader seam, because tests that construct WatcherRule
+    directly get the defaults and can never see this."""
+
+    def _load(self, watcher_block):
+        import tempfile
+        import textwrap
+
+        from gateway.config import GatewayConfig
+
+        cfg = (
+            "connectors:\n"
+            "  - name: rc\n"
+            "    type: rocketchat\n"
+            "    server: {url: https://x.com, username: b, password: s}\n"
+            "agents:\n"
+            "  default: {type: claude, working_directory: /tmp}\n"
+            "watchers:\n"
+            + textwrap.indent(textwrap.dedent(watcher_block), "  ")
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(cfg)
+        return GatewayConfig.from_file(f.name).watcher_rules[0]
+
+    def test_omitted_ttls_are_15_15(self):
+        rule = self._load("- name: w1\n  rooms: {include: [general]}\n")
+        self.assertEqual(rule.session_idle_days, 15)
+        self.assertEqual(rule.session_expire_days, 15)
+        # And the frozen snapshot — what the runtime actually judges against —
+        # carries the defaults too.
+        from gateway.core.watcher_manager import rule_snapshot
+
+        snap = rule_snapshot(rule)
+        self.assertEqual(snap["session_idle_days"], 15)
+        self.assertEqual(snap["session_expire_days"], 15)
+
+    def test_explicit_ttls_still_win(self):
+        rule = self._load(
+            "- name: w1\n  rooms: {include: [general]}\n"
+            "  session_idle_days: 3\n  session_expire_days: 40\n")
+        self.assertEqual(rule.session_idle_days, 3)
+        self.assertEqual(rule.session_expire_days, 40)

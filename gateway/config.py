@@ -1787,13 +1787,24 @@ def _parse_one_watcher_rule(
     # later valid rule with the same name was rejected as a duplicate of something
     # that does not exist. Harmless under from_file()'s fail-fast loading, wrong
     # under collect_config(), which keeps going after a failed entry.
+    # Omitted TTLs must fall through to the dataclass defaults (15/15, the
+    # §2.5 ruling). Passing the parser's None explicitly OVERRODE them — every
+    # config that did not spell the TTLs out had the whole idle/expiry
+    # lifecycle silently off, and no test caught it because tests construct
+    # WatcherRule directly, where the defaults apply. One source of truth:
+    # the default lives on the dataclass, and this call simply does not
+    # mention a field the operator did not mention.
+    ttl_kwargs = {}
+    if idle_days is not None:
+        ttl_kwargs["session_idle_days"] = idle_days
+    if expire_days is not None:
+        ttl_kwargs["session_expire_days"] = expire_days
     rule = WatcherRule(
         name=rule_name,
         connector=resolved_connector,
         agent=watcher_agent,
         rooms=matcher,
-        session_idle_days=idle_days,
-        session_expire_days=expire_days,
+        **ttl_kwargs,
         # _resolve_paths validates the container and every element itself, so
         # there is one implementation of this check rather than a rule-shaped copy
         # beside a static-shaped one.

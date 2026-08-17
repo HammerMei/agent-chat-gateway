@@ -233,6 +233,76 @@ class TestStopSurvivesACursorReadFailure(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("w1", lifecycle._processors)
 
 
+class TestAMissingFrozenAgentFailsClosed(unittest.IsolatedAsyncioTestCase):
+    """Codex review of #121: `_resolve_agent_name` substitutes the default for
+    an unknown name — right for an empty field, wrong for a named one. A
+    record frozen against a since-deleted agent must read `failed`, not
+    silently restart under a different backend, working directory and tool
+    policy."""
+
+    async def test_a_named_but_missing_agent_refuses_the_start(self):
+        from unittest.mock import MagicMock
+
+        from gateway.core.connector import Room
+        from tests.helpers import (
+            MockAgentBackend,
+            make_core_config,
+            make_lifecycle,
+            make_watcher,
+        )
+
+        lifecycle = make_lifecycle(
+            agents={"default": MockAgentBackend()},
+            config=make_core_config(),
+            dispatcher=MagicMock(holder=MagicMock(return_value=None)),
+        )
+        wc = make_watcher("room-1", name="w1", agent="deleted-agent")
+
+        with self.assertRaises(RuntimeError) as ctx:
+            await lifecycle.start_watcher_in_room(
+                wc, None, Room(id="r1", name="room-1", type="channel"))
+
+        self.assertIn("deleted-agent", str(ctx.exception))
+        self.assertIn("no longer exists", str(ctx.exception))
+        self.assertIsNone(lifecycle.get_watcher_state("w1"),
+                          "nothing was written for a refused start")
+
+    async def test_an_empty_agent_field_still_takes_the_default(self):
+        from unittest.mock import MagicMock, patch
+
+        from gateway.core.connector import Room
+        from tests.helpers import (
+            MockAgentBackend,
+            make_core_config,
+            make_lifecycle,
+            make_watcher,
+        )
+
+        connector = MagicMock()
+        connector.subscribe_room = AsyncMock()
+        connector.get_last_processed_ts = MagicMock(return_value=None)
+        connector.attachment_cache_dir = MagicMock(return_value=None)
+        connector.fetch_room_history = AsyncMock(return_value=[])
+        lifecycle = make_lifecycle(
+            connector=connector,
+            agents={"default": MockAgentBackend()},
+            config=make_core_config(),
+            dispatcher=MagicMock(holder=MagicMock(return_value=None)),
+            injector=MagicMock(build=AsyncMock(return_value=""),
+                               ensure=AsyncMock(return_value=None)),
+        )
+        lifecycle._attachment_workspace = MagicMock(
+            setup=MagicMock(return_value="/tmp/fake"))
+        wc = make_watcher("room-1", name="w1", agent="")
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            await lifecycle.start_watcher_in_room(
+                wc, None, Room(id="r1", name="room-1", type="channel"))
+
+        self.assertIsNotNone(lifecycle.get_watcher_state("w1"))
+
+
 class TestTheExpireVerb(unittest.IsolatedAsyncioTestCase):
 
     def _mgr(self, record, *, reclaimed="w1", cancelled=None):

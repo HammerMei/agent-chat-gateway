@@ -300,7 +300,7 @@ class WatcherLifecycle:
             )
             return True
 
-    async def expire_idle(self, name: str, *, now) -> bool:
+    async def expire_idle(self, name: str, *, now, pending_jobs=None) -> bool:
         """The expiry (§2.5): reclaim everything an idle record points at.
 
         The destructive leg — after this the room has no record, no watermark
@@ -326,6 +326,19 @@ class WatcherLifecycle:
             if self._processors.get(name) is not None:
                 return False
             if not past_expire_ttl(state, now):
+                return False
+            if pending_jobs is not None and pending_jobs(name):
+                # Re-checked UNDER the lock (Codex review of #121): the
+                # sweep's own check ran before this coroutine was scheduled,
+                # and a schedule-create landing in that gap would have its
+                # job orphaned by the reclamation below. The residual window
+                # — a create between this line and the pop — is accepted:
+                # closing it would couple the job store's writes to the
+                # watcher lock, and the job store lives a layer up.
+                logger.info(
+                    "Watcher '%s' gained a pending job while its expiry "
+                    "waited — not expiring", name,
+                )
                 return False
 
             await self._reclaim_record_locked(name, state)
@@ -897,6 +910,22 @@ class WatcherLifecycle:
         # tool-call enforcement, silently. A raise here is an abort, not a
         # decision (§2.2): the message stays redeliverable, and the eager
         # loop reports it as a startup error.
+        #
+        # And fail closed on a frozen agent that no longer EXISTS (Codex
+        # review of #121): `_resolve_agent_name` substitutes the default for
+        # an unknown name, which is right for an empty field and wrong for a
+        # named one — a record frozen against a since-deleted agent would
+        # silently restart under a different backend, working directory and
+        # tool policy, when sticky binding (§2.4) says the record is
+        # authoritative. The watcher reads `failed` instead, which is honest:
+        # the operator deleted the agent this room runs on.
+        if wc.agent and wc.agent not in self._agents:
+            raise RuntimeError(
+                f"Watcher '{wc.name}' is bound to agent '{wc.agent}', which "
+                f"no longer exists in config — refusing to substitute "
+                f"'{self._default_agent}'. Restore the agent, or expire the "
+                f"watcher to re-create it under the current rules."
+            )
         self._ensure_agent_available(wc)
         agent_name = self._resolve_agent_name(wc.agent)
         agent = self._agents[agent_name]

@@ -129,7 +129,9 @@ class LifecycleSweep:
                         "scheduled job — not expiring", record.watcher_name,
                     )
                     continue
-                if await self._lifecycle.expire_idle(record.watcher_name, now=now):
+                if await self._lifecycle.expire_idle(
+                        record.watcher_name, now=now,
+                        pending_jobs=self._pending_jobs):
                     transitioned.append(record.watcher_name)
                 continue
             # The idle leg.

@@ -384,6 +384,10 @@ class TestTheMembershipReconciliation(unittest.IsolatedAsyncioTestCase):
             _cancel_jobs=cancelled.append if cancelled is not None else None)
         mgr._lifecycle.states = MagicMock(
             return_value={r.watcher_name: r for r in records})
+        # The pre-reclaim re-read (stale-snapshot guard) resolves by room —
+        # modelled against the same records, so "unchanged" answers itself.
+        by_room = {r.room_id: r for r in records}
+        mgr._lifecycle.record_for_room = MagicMock(side_effect=by_room.get)
         # A method, not a property (core/connector.py) — modelled as one, so
         # the gate's call form is what the test exercises.
         mgr._connector.supports_unsolicited_inbound = MagicMock(return_value=True)
@@ -416,6 +420,22 @@ class TestTheMembershipReconciliation(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sorted(cancelled), ["w-also-gone", "w-gone"])
         for _, reason in mgr.reclaimed:
             self.assertIn("reconciliation", reason)
+
+    async def test_a_room_that_woke_after_the_snapshot_is_left_alone(self):
+        """Codex review of #121: the snapshot ages while the loop awaits
+        earlier reclamations — a record that became active again (or was
+        replaced by a re-add) is not this snapshot's to reclaim."""
+        woken = make_rule_derived_record(name="woken", room_id="gone",
+                                         dropped_at="2026-08-01T00:00:00+00:00")
+        mgr = self._mgr([woken], snapshot=set())
+
+        # The wake, mid-loop: dormancy re-read happens per record, and this
+        # record is no longer dormant by the time the loop reaches it.
+        woken.dropped_at = ""
+
+        await mgr._reconcile_membership()
+
+        self.assertEqual(mgr.reclaimed, [])
 
     async def test_an_unanswered_snapshot_keeps_everything(self):
         """None is 'could not answer', and an unanswered probe must never

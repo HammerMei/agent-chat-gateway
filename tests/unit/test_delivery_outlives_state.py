@@ -105,6 +105,159 @@ class TestADeliveryOutlivesItsSubscription(unittest.IsolatedAsyncioTestCase):
                          "nothing was committed to the detached object")
 
 
+class TestADeliveryCrossingAMembershipRemoval(unittest.IsolatedAsyncioTestCase):
+    """Codex review of #121: the redirect fence must tell a benign watcher
+    restart from a membership replacement. A pre-removal frame committing
+    into a re-added room's fresh state would point the next replay below the
+    removal — delivering the whole non-member interval."""
+
+    _make_connector_and_sub = _WatermarkSuite._make_connector_and_sub
+
+    def _doc(self, mid="m1", ts="200"):
+        return {
+            "_id": mid,
+            "u": {"username": "alice", "_id": "uid-alice"},
+            "msg": "@bot hello",
+            "ts": {"$date": ts},
+            "mentions": [{"username": "bot"}],
+        }
+
+    async def test_rc_refuses_the_commit_across_a_removal(self):
+        from gateway.connectors.rocketchat.connector import _RoomSubscription
+        from gateway.core.connector import Room
+
+        connector, old_sub = self._make_connector_and_sub()
+        fresh = _RoomSubscription(
+            room=Room(id="room-1", name="general", type="channel"),
+            last_processed_ts="",
+        )
+
+        async def handler(msg):
+            # The removal hook marks the CURRENT object, then the re-add
+            # installs a fresh one — all while this delivery runs.
+            old_sub.left_the_room()
+            connector._rooms["room-1"] = fresh
+            return True
+
+        connector._handler = handler
+
+        await connector._on_raw_ddp_message("room-1", self._doc("m1", "200"))
+
+        self.assertEqual(fresh.last_processed_ts, "",
+                         "no pre-removal watermark in the new membership")
+        self.assertNotIn("m1", fresh.seen_ids_set)
+
+    async def test_mm_refuses_the_commit_across_a_removal(self):
+        from unittest.mock import AsyncMock
+
+        from gateway.connectors.mattermost.connector import _ChannelState
+        from gateway.core.connector import Room
+        from tests.unit.test_mattermost_connector import _make_connector
+
+        connector = _make_connector()
+        connector._config.require_mention = False
+        connector._config.filter_sender = False
+        connector._rest.resolve_username = AsyncMock(return_value="alice")
+
+        old = _ChannelState(room=Room(id="chan-1", name="general", type="channel"))
+        old.last_processed_ts = "100"
+        connector._channels["chan-1"] = old
+        fresh = _ChannelState(room=Room(id="chan-1", name="general", type="channel"))
+
+        async def handler(msg):
+            old.membership_lost = True  # what the removal hook stamps
+            connector._channels["chan-1"] = fresh
+            return True
+
+        connector._handler = handler
+
+        await connector._on_posted_event({
+            "post": {"id": "p1", "channel_id": "chan-1", "user_id": "u-alice",
+                     "message": "hello", "create_at": 200},
+            "sender_name": "@alice", "channel_type": "O",
+            "channel_name": "general", "channel_display_name": "General",
+            "team_id": "", "mentions": [],
+        })
+
+        self.assertIsNone(fresh.last_processed_ts)
+        self.assertNotIn("p1", fresh.seen_ids_set)
+
+    async def test_the_mm_removal_hook_stamps_the_current_state(self):
+        from unittest.mock import AsyncMock
+
+        from gateway.connectors.mattermost.connector import _ChannelState
+        from gateway.core.connector import MembershipHook, Room
+        from tests.unit.test_mattermost_connector import _make_connector
+
+        connector = _make_connector()
+        state = _ChannelState(room=Room(id="chan-1", name="g", type="channel"))
+        connector._channels["chan-1"] = state
+        connector.register_membership_hook(
+            MembershipHook(added=AsyncMock(), removed=AsyncMock()))
+
+        await connector._on_membership_event({
+            "event": "user_removed",
+            "data": {"channel_id": "chan-1", "remover_id": "admin"},
+            "broadcast": {"user_id": "bot-id-1"},
+        })
+        if connector._routing_tasks:
+            import asyncio as _a
+            await _a.gather(*connector._routing_tasks)
+
+        self.assertTrue(state.membership_lost)
+
+
+class TestAFailedWakeReplayKeepsTheWindow(unittest.IsolatedAsyncioTestCase):
+    """Codex review of #121: a wake replay reads an EXTERNAL window (the
+    record's mark) against a fresh subscription — a failure that simply
+    returned left nothing pointing at the interval, and the triggering
+    message's commit sealed it away permanently. Whoever fails to replay owns
+    keeping the window reachable."""
+
+    _make_connector_and_sub = _WatermarkSuite._make_connector_and_sub
+
+    async def test_rc_claims_the_external_window_on_fetch_failure(self):
+        from unittest.mock import AsyncMock
+
+        connector, sub = self._make_connector_and_sub()
+        connector._rest.is_room_member = AsyncMock(return_value=True)
+        connector._rest.get_room_history_page = AsyncMock(
+            side_effect=RuntimeError("REST hiccup"))
+
+        await connector.replay_room_since("room-1", after_ts="50")
+
+        self.assertEqual(sub.replay_boundary, "50",
+                         "the unread window is claimed for the next reconnect")
+
+    async def test_rc_claims_the_external_window_on_membership_unknown(self):
+        from unittest.mock import AsyncMock
+
+        connector, sub = self._make_connector_and_sub()
+        connector._rest.is_room_member = AsyncMock(return_value=None)
+
+        await connector.replay_room_since("room-1", after_ts="50")
+
+        self.assertEqual(sub.replay_boundary, "50")
+
+    async def test_mm_claims_the_external_window_on_fetch_failure(self):
+        from unittest.mock import AsyncMock
+
+        from gateway.connectors.mattermost.connector import _ChannelState
+        from gateway.core.connector import Room
+        from tests.unit.test_mattermost_connector import _make_connector
+
+        connector = _make_connector()
+        state = _ChannelState(room=Room(id="chan-1", name="g", type="channel"))
+        state.last_processed_ts = "100"
+        connector._channels["chan-1"] = state
+        connector._rest.get_room_history_page = AsyncMock(
+            side_effect=RuntimeError("REST hiccup"))
+
+        await connector.replay_room_since("chan-1", after_ts="50")
+
+        self.assertEqual(state.replay_boundary, "50")
+
+
 class TestMMDeliveryOutlivesItsState(unittest.IsolatedAsyncioTestCase):
     """Mattermost's twin of the same fence."""
 

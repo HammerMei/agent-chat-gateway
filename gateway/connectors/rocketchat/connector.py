@@ -539,6 +539,15 @@ class RocketChatConnector(Connector):
             # Unknown is not removal. The lookup failing is correlated with the outage
             # itself, so this is the likely path, and the window stays open for the
             # next attempt to read.
+            #
+            # For an EXTERNAL window (the wake, the startup replay) "stays open"
+            # is not automatic (Codex review of #121): the caller's mark lives in
+            # the record, this subscription is fresh, and the triggering message
+            # commits a newer watermark moments after this return — past the
+            # whole unread interval, permanently. Whoever fails to replay owns
+            # keeping the window reachable, so the failure claims it here.
+            if external_window:
+                sub.claim_boundary(after_ts)
             logger.warning(
                 "Room '%s': membership could not be established — skipping replay; "
                 "live delivery is unaffected and the next reconnect will ask again",
@@ -555,6 +564,12 @@ class RocketChatConnector(Connector):
             )
             raw_msgs = page.messages
         except Exception as e:
+            # Same rule as the membership-unknown arm above: an external
+            # window that was not read is claimed, so the next reconnect
+            # recovers what the triggering message's commit would otherwise
+            # seal away.
+            if external_window:
+                sub.claim_boundary(after_ts)
             logger.warning(
                 "Room '%s': failed to fetch history for replay: %s",
                 sub.room.name, e,
@@ -869,6 +884,17 @@ class RocketChatConnector(Connector):
             return
         try:
             if action == "removed":
+                # Mark the room's CURRENT state before the core reclaims it
+                # (Codex review of #121): a delivery in flight holds this
+                # object, and the commit-redirection fence reads its epoch to
+                # tell a benign watcher restart (redirect to the live state)
+                # from a membership replacement (a pre-removal frame must not
+                # commit into the re-added room's fresh state — that watermark
+                # would point the next replay below the removal, delivering
+                # the whole non-member interval).
+                sub = self._rooms.get(rid)
+                if sub is not None:
+                    sub.left_the_room()
                 await self._membership_hook.removed(rid)
                 return
             room = await self._room_ref_from_sub_doc(rid, doc)
@@ -2348,13 +2374,21 @@ class RocketChatConnector(Connector):
                         "Room %s: not reopening the outage window for a message that was in "
                         "flight when this account was removed", room_id,
                     )
-            elif live is not None:
+            elif live is not None and sub.membership_epoch == entry_epoch:
                 logger.warning(
                     "Room %s: a hand-back outlived its subscription (watcher "
                     "restarted mid-delivery) — claiming the outage window on the "
                     "live one instead", room_id,
                 )
                 live.claim_boundary(live.last_processed_ts, _just_before(result.msg_ts))
+            elif live is not None:
+                # The old object learned of a membership loss while this
+                # delivery ran: the live object belongs to a NEW membership,
+                # and a pre-removal frame has no claim on its window.
+                logger.warning(
+                    "Room %s: not claiming a window for a hand-back that "
+                    "crossed a membership removal", room_id,
+                )
             # The one outcome that leaves this message pending: its id was just forgotten
             # precisely so a later replay can bring it back, and a boundary spent on a
             # batch containing it would remove the only thing that could.
@@ -2393,7 +2427,7 @@ class RocketChatConnector(Connector):
                 )
                 return True
             target = sub
-        elif live is not None:
+        elif live is not None and sub.membership_epoch == entry_epoch:
             logger.warning(
                 "Room %s: a delivery outlived its subscription (watcher restarted "
                 "mid-delivery) — committing its watermark and dedup id to the live "
@@ -2401,6 +2435,17 @@ class RocketChatConnector(Connector):
             )
             live.remember(msg_id)
             target = live
+        elif live is not None:
+            # A membership loss happened while this delivery ran (the removal
+            # hook marked the old object): the live state is a re-add's fresh
+            # membership, and committing a pre-removal watermark into it would
+            # point the next replay below the removal — delivering the whole
+            # non-member interval, which the epoch machinery exists to prevent.
+            logger.warning(
+                "Room %s: discarding the watermark of a delivery that crossed "
+                "a membership removal", room_id,
+            )
+            return True
         else:
             # The room is gone entirely; there is nothing to commit into.
             logger.warning(

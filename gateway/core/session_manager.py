@@ -598,6 +598,20 @@ class SessionManager:
         for record in dormant:
             if record.room_id in snapshot:
                 continue
+            # Re-read before acting (Codex review of #121): the snapshot ages
+            # while this loop awaits earlier reclamations, and both halves of
+            # staleness are real — a wake can make the record active again
+            # (dropped_at cleared), and a re-add can replace it with a fresh
+            # record entirely. A record that is no longer THIS dormant record
+            # is not this snapshot's to reclaim; the next daily round decides
+            # it against a snapshot taken after whatever just happened.
+            current = self._lifecycle.record_for_room(record.room_id)
+            if current is not record or not (current.paused or current.dropped_at):
+                logger.info(
+                    "Reconciliation: room %s changed since the snapshot was "
+                    "taken — leaving it for the next round", record.room_id,
+                )
+                continue
             await self._reclaim_removed_room(
                 record.room_id,
                 reason="the membership reconciliation found the bot is no "
