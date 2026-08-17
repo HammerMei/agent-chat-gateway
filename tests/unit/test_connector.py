@@ -77,6 +77,7 @@ def _make_connector():
     # set here. Delivery defaults to per-room, which is what these tests exercise.
     connector._router = None
     connector._pending_routes = {}
+    connector._routing_tasks = set()
     connector._subscribe_all = False
     connector._dm_kinds = {}
     connector._rest = MagicMock()
@@ -4320,6 +4321,188 @@ class TestTheMessageThatCreatedTheWatcherIsDelivered(unittest.IsolatedAsyncioTes
         await connector._on_unrouted_message(doc, access)
 
         self.assertEqual(self.delivered, [])
+
+
+class TestAnIdleRoomWakesOnItsNextMessage(unittest.IsolatedAsyncioTestCase):
+    """The wake (§2.5): a tracked room with no processor is offered back to the router.
+
+    The idle drop keeps the room subscribed (§2.2), so its next message takes the
+    *tracked* path — where the UNROUTED arm used to drop it with a warning. Nothing on
+    that path called the router, so an idle room was permanently deaf. The arm now
+    routes the frame into the same episode funnel an untracked room goes through: same
+    pending buffer, same single open episode, same drain.
+    """
+
+    def setUp(self):
+        self.delivered: list[tuple[str, str]] = []
+        self.offered: list = []
+        self.served = False
+
+    def _connector(self):
+        connector = _make_connector()
+        connector._config.require_mention = False
+        connector._config.filter_sender = False
+        connector._handler = AsyncMock(return_value=True)
+        # Tracked-but-unserved is the wake's precondition, and `_capacity_check` is
+        # what says so — the fixture's None reads as "no dispatcher wired: served".
+        connector._capacity_check = lambda rid: (
+            RoomCapacity.AVAILABLE if self.served else RoomCapacity.UNROUTED)
+        connector._ws.deliver_to_room = MagicMock(
+            side_effect=lambda rid, doc, access=None, **kw:
+                self.delivered.append((rid, doc["_id"]))
+        )
+
+        async def _router(room, trigger):
+            # What a successful recreation does that this layer can see: the room
+            # gains a processor.
+            self.offered.append(room)
+            self.served = True
+
+        connector.register_router(_router)
+        return connector
+
+    def _doc(self, mid="m1", ts=500):
+        return {"_id": mid, "rid": "room-1", "msg": "hi",
+                "u": {"username": "alice"}, "ts": {"$date": ts}}
+
+    async def _settle(self, connector):
+        while connector._routing_tasks:
+            await asyncio.gather(*connector._routing_tasks)
+
+    async def test_the_wake_offers_the_room_and_redelivers_the_trigger(self):
+        from gateway.core.watcher_manager import RoomRef
+
+        connector = self._connector()
+        sub = connector._rooms["room-1"]
+
+        handled = await connector._on_raw_ddp_message("room-1", self._doc())
+        await self._settle(connector)
+
+        self.assertTrue(handled)
+        self.assertEqual(len(self.offered), 1, "the room was offered exactly once")
+        self.assertIsInstance(self.offered[0], RoomRef)
+        self.assertEqual(self.offered[0].id, "room-1")
+        # The trigger came back through the room's own worker, in order.
+        self.assertEqual(self.delivered, [("room-1", "m1")])
+        # Not remembered and the watermark unmoved: the redelivery must pass the
+        # dedup check, and a resend must be served normally either way.
+        self.assertNotIn("m1", sub.seen_ids_set)
+        self.assertFalse(sub.last_processed_ts)
+
+    async def test_a_replayed_frame_wakes_too(self):
+        """The outage wake: a reconnect replay reconstructs docs from REST history and
+        carries no access object — the funnel's untracked gates would drop it, so the
+        wake must enter below them, with the room resolved from the tracked state."""
+        connector = self._connector()
+
+        await connector._on_raw_ddp_message(
+            "room-1", self._doc(), is_replay=True, replay_after_ts="100")
+        await self._settle(connector)
+
+        self.assertEqual(len(self.offered), 1)
+        self.assertEqual(self.delivered, [("room-1", "m1")])
+
+    async def test_frames_during_the_wake_buffer_behind_its_episode(self):
+        """The single open episode covers the wake exactly as it covers a creation:
+        a burst into a waking room is one offer, and the drain keeps arrival order."""
+        connector = self._connector()
+        release = asyncio.Event()
+        offered = self.offered
+
+        async def _slow_router(room, trigger):
+            offered.append(room)
+            await release.wait()
+            self.served = True
+
+        connector.register_router(_slow_router)
+
+        await connector._on_raw_ddp_message("room-1", self._doc("m1", 500))
+        await asyncio.sleep(0)  # the episode reserves _pending_routes before its await
+        await connector._on_raw_ddp_message("room-1", self._doc("m2", 600))
+        await asyncio.sleep(0)
+        release.set()
+        await self._settle(connector)
+
+        self.assertEqual(len(offered), 1, "one episode, not one per frame")
+        self.assertEqual(self.delivered, [("room-1", "m1"), ("room-1", "m2")])
+
+
+class TestADeclinedWakeDoesNotLoop(unittest.IsolatedAsyncioTestCase):
+    """The drain decides deliver-vs-drop on *served*, not on *tracked*.
+
+    A wake's room is tracked by definition, so a drain that keys on tracked-ness
+    redelivers a declined wake's frames — onto the tracked path, whose UNROUTED arm
+    routes them straight back into a new episode. No retry delay exists anywhere in
+    that cycle, and every message to a paused or rule-less room enters it.
+    """
+
+    def setUp(self):
+        self.delivered: list[str] = []
+        self.offers = 0
+
+    def _connector(self):
+        connector = _make_connector()
+        connector._config.require_mention = False
+        connector._config.filter_sender = False
+        connector._handler = AsyncMock(return_value=True)
+        connector._capacity_check = lambda rid: RoomCapacity.UNROUTED
+        connector._ws.deliver_to_room = MagicMock(
+            side_effect=lambda rid, doc, access=None, **kw:
+                self.delivered.append(doc["_id"])
+        )
+
+        async def _declining_router(room, trigger):
+            # A rule miss, a paused record, the cap: a completed decision, None-shaped.
+            self.offers += 1
+
+        connector.register_router(_declining_router)
+        return connector
+
+    def _doc(self, mid="m1", ts=500):
+        return {"_id": mid, "rid": "room-1", "msg": "hi",
+                "u": {"username": "alice"}, "ts": {"$date": ts}}
+
+    async def _settle(self, connector):
+        while connector._routing_tasks:
+            await asyncio.gather(*connector._routing_tasks)
+
+    async def test_declined_frames_are_dropped_and_remembered_not_redelivered(self):
+        connector = self._connector()
+        sub = connector._rooms["room-1"]
+
+        await connector._on_raw_ddp_message("room-1", self._doc())
+        await self._settle(connector)
+
+        self.assertEqual(self.offers, 1)
+        self.assertEqual(self.delivered, [],
+                         "a declined wake's frames must not go back on the tracked path")
+        # Remembered, exactly as the old arm remembered a frame it dropped: the
+        # decline can persist indefinitely, and an unknown id would have every
+        # reconnect re-fetch and re-offer a batch that can never be spent.
+        self.assertIn("m1", sub.seen_ids_set)
+        self.assertFalse(sub.last_processed_ts, "the watermark is left where it is")
+
+    async def test_a_redelivered_duplicate_does_not_reopen_an_episode(self):
+        connector = self._connector()
+
+        await connector._on_raw_ddp_message("room-1", self._doc())
+        await self._settle(connector)
+        # The same frame again — a reconnect replay bringing the batch back.
+        await connector._on_raw_ddp_message("room-1", self._doc())
+        await self._settle(connector)
+
+        self.assertEqual(self.offers, 1, "the remembered id stops the re-offer")
+
+    async def test_a_new_message_retries_the_wake_once(self):
+        connector = self._connector()
+
+        await connector._on_raw_ddp_message("room-1", self._doc("m1", 500))
+        await self._settle(connector)
+        await connector._on_raw_ddp_message("room-1", self._doc("m2", 600))
+        await self._settle(connector)
+
+        self.assertEqual(self.offers, 2,
+                         "each new message re-asks once — bounded, not a loop")
 
 
 class TestTheFirstMessageIntoARoomKeepsARetryCursor(unittest.IsolatedAsyncioTestCase):

@@ -274,6 +274,13 @@ class RocketChatConnector(Connector):
         # during it wait in the episode's bounded buffer instead of being dropped (§2.7
         # step 3) and are drained in arrival order when it ends.
         self._pending_routes: dict[str, PendingRoute] = {}
+        # Episodes opened from the *tracked* path (§2.5, the wake): the untracked path
+        # runs its episode inline on a routing worker, but the tracked handler runs on
+        # the room's own worker, and awaiting a creation there would stall the very
+        # queue the drain is about to deliver into. Strong references, because a task
+        # nothing holds is collected mid-flight; discarded on completion, cancelled and
+        # gathered on disconnect — the same shape Mattermost's `_routing_tasks` has.
+        self._routing_tasks: set[asyncio.Task] = set()
         # What `start_inbound` decided, once — **not** whether the stream is live now, and
         # nothing may read it as that. The stream can die under a healthy socket, and a copy
         # of its liveness would go on saying otherwise while a watcher added in that window
@@ -354,6 +361,11 @@ class RocketChatConnector(Connector):
 
     async def disconnect(self) -> None:
         """Close the WebSocket and release HTTP client resources."""
+        for task in list(self._routing_tasks):
+            task.cancel()
+        if self._routing_tasks:
+            await asyncio.gather(*self._routing_tasks, return_exceptions=True)
+        self._routing_tasks.clear()
         await self._ws.stop()
         await self._rest.close()
         logger.info("RocketChatConnector disconnected")
@@ -860,6 +872,44 @@ class RocketChatConnector(Connector):
         room_id = doc.get("rid", "")
         if not room_id:
             return
+        await self._route_room(room_id, doc, access)
+
+    def _room_is_served(self, room_id: str) -> bool:
+        """A processor answers for this room now. Tracked is necessary, not sufficient.
+
+        The idle drop keeps a room subscribed (§2.2), so `room_id in self._rooms` goes
+        on answering True for a room whose next message has nowhere to go. Every
+        deliver-or-route decision keys on this predicate rather than on tracked-ness,
+        and the drain's branch is the load-bearing one: delivering an unserved room's
+        frame puts it back on the tracked path, whose UNROUTED arm routes it back here
+        — a hot loop with no retry delay anywhere in it, entered by every message to a
+        room whose offer was declined.
+        """
+        if room_id not in self._rooms:
+            return False
+        if self._capacity_check is None:
+            # No dispatcher wired: nothing can answer UNROUTED, so tracked is served.
+            return True
+        return self._capacity_check(room_id) is not RoomCapacity.UNROUTED
+
+    async def _route_room(
+        self,
+        room_id: str,
+        doc: dict,
+        access: dict | None,
+        *,
+        resolved_room: "RoomRef | None" = None,
+    ) -> None:
+        """One routing episode for one room — the single entrance to creation (§2.7).
+
+        Two callers, one funnel. `_on_unrouted_message` arrives from the routing
+        workers with an untracked room and classifies it here; the tracked handler's
+        UNROUTED arm arrives with `resolved_room` already in hand — the wake (§2.5),
+        where the room was classified when it was first routed — and skips straight
+        to the offer. Both share the pending buffer, the single open episode and the
+        drain, because a second creation entrance is how a wake would skip exactly
+        the guarantees the episode exists to make.
+        """
         pending = self._pending_routes.get(room_id)
         if pending is not None:
             # An episode for this room is open. Checked *before* the tracked
@@ -899,13 +949,15 @@ class RocketChatConnector(Connector):
                     "Room %s: pending buffer full — dropping a frame", room_id[:8])
                 await self._post_starting_up_notice(pending, room_id)
             return
-        if room_id in self._rooms:
-            # Tracked now — so deliver it rather than offer it again. The frame reached
-            # this path because the room was untracked when it was routed here, and the
+        if self._room_is_served(room_id):
+            # Served now — so deliver it rather than offer it again. The frame reached
+            # this path because the room was unserved when it was routed here, and the
             # watcher was created while it waited: the per-room callback that would have
             # taken it was registered after the routing decision was made, so nobody else
             # is going to deliver it. Returning here is how the message that arrived
-            # during a creation used to be lost.
+            # during a creation used to be lost. Served, not tracked: an idle room is
+            # tracked and its frame still has nowhere to go — delivering it would bounce
+            # it off the tracked path's UNROUTED arm straight back here.
             #
             # **Onto the room's worker, not around it.** This runs on one of several
             # routing workers, so dispatching here directly puts concurrent deliveries
@@ -923,21 +975,25 @@ class RocketChatConnector(Connector):
         pending.add(doc.get("_id", ""), (doc, access))
         self._pending_routes[room_id] = pending
         try:
-            # Stage 1 — classify. Only ClassificationUnavailable is retryable
-            # (§2.2 outcome 3: the routing decision was never made); None is a
-            # final decline and anything else is a bug that should surface.
-            resolved: dict = {}
+            # Stage 1 — classify, unless the caller already holds the answer (the
+            # wake, whose room was classified when it was first routed). Only
+            # ClassificationUnavailable is retryable (§2.2 outcome 3: the routing
+            # decision was never made); None is a final decline and anything else
+            # is a bug that should surface.
+            room = resolved_room
+            if room is None:
+                resolved: dict = {}
 
-            async def classify() -> None:
-                resolved["room"] = await self._room_ref_from_access(room_id, access)
+                async def classify() -> None:
+                    resolved["room"] = await self._room_ref_from_access(room_id, access)
 
-            if not await route_attempts(
-                classify, retry_on=ClassificationUnavailable,
-                delays=self._ROUTE_RETRY_DELAYS, logger=logger,
-                label=f"Classifying room {room_id[:8]}",
-            ):
-                return  # parked; the finally drops the buffer
-            room = resolved["room"]
+                if not await route_attempts(
+                    classify, retry_on=ClassificationUnavailable,
+                    delays=self._ROUTE_RETRY_DELAYS, logger=logger,
+                    label=f"Classifying room {room_id[:8]}",
+                ):
+                    return  # parked; the finally drops the buffer
+                room = resolved["room"]
             if room is None:
                 return  # final: no name to match, or no counterpart to classify by
 
@@ -976,7 +1032,28 @@ class RocketChatConnector(Connector):
             ended = self._pending_routes.pop(room_id, None)
             frames = ended.drain() if ended is not None else []
             sub = self._rooms.get(room_id)
-            if sub is not None:
+            if sub is not None and not self._room_is_served(room_id):
+                # Tracked and still unserved: the offer declined — no rule claims the
+                # room, its record is paused, or a static-model record owns it. Served,
+                # not tracked, decides delivery here for the same reason it does above:
+                # these frames' only tracked-path outcome is the UNROUTED arm, which
+                # routes them straight back into a new episode — a hot loop with no
+                # delay in it, entered by every message to a declined room.
+                #
+                # Remembered, exactly as the arm remembers a frame it drops today: the
+                # decline is a configuration state and can persist indefinitely, so an
+                # id left unknown would have every reconnect re-fetch and re-offer a
+                # batch that can never be spent. The watermark is left where it is, so
+                # a user who resends is served normally once a watcher exists (§2.7).
+                for pending_doc, _ in frames:
+                    sub.remember(pending_doc.get("_id", ""))
+                if frames:
+                    logger.warning(
+                        "Room %s: dropping %d buffered frame(s) — no watcher took the "
+                        "room. A declined offer: no rule claims it, or its record is "
+                        "paused.", room_id[:8], len(frames),
+                    )
+            elif sub is not None:
                 # **Claim the window before handing the frames over.** The
                 # watermark is a scalar high-water mark, so a live message
                 # accepted while this episode was resolving has already
@@ -1058,6 +1135,35 @@ class RocketChatConnector(Connector):
             return None
         ts = extract_ts(trigger)
         return ts if ts and _ts_to_float(ts) is not None else None
+
+    def _room_ref_from_sub(self, sub: "_RoomSubscription") -> "RoomRef":
+        """A RoomRef for a room this connector already tracks — the wake's classification.
+
+        No REST call and no access object: the room was classified when it was first
+        routed, and what that classification decided is in the tracked state — the
+        room's type (a `RoomKind` value for every room the dynamic path subscribed) and,
+        for a direct room, the permanently-cached kind and participants (§6.4). For a
+        room with a record none of this is load-bearing anyway: `_recreate` reads the
+        kind and participants from the record itself (§2.4). The fallback matters only
+        on the recordless edge, where `_create` rule-matches this ref — and a room the
+        dynamic path never touched carries a platform type no `RoomKind` names, which
+        the channel fallback covers.
+        """
+        kind = RoomKind.CHANNEL
+        try:
+            kind = RoomKind(sub.room.type)
+        except ValueError:
+            pass
+        participants: tuple[str, ...] = ()
+        cached = self._dm_kinds.get(sub.room.id)
+        if cached is not None:
+            kind, participants = cached
+        return RoomRef(
+            id=sub.room.id,
+            kind=kind,
+            name=sub.room.name or "",
+            participants=participants,
+        )
 
     async def _room_ref_from_access(
         self, room_id: str, access: dict
@@ -1807,32 +1913,40 @@ class RocketChatConnector(Connector):
         # optimization, not a hard guarantee.
         capacity = self._capacity_check(room_id) if self._capacity_check else None
         if capacity is RoomCapacity.UNROUTED:
-            # Not backpressure: no watcher serves this room, so there is nothing to be
-            # busy with and nothing to tell its members. Telling them the gateway is
-            # busy would be a wrong answer from an idle gateway (§2.7).
+            # No processor serves this *tracked* room. The idle drop keeps a room
+            # subscribed on purpose (§2.2) — the watermark and seen-id window are what
+            # make recreation cheap — so an idle room's next message arrives here, on
+            # the tracked path, and this arm is the wake (§2.5): the room is offered
+            # back through the same episode funnel an untracked room goes through, so
+            # the pending buffer, the single open episode and the recreation's replay
+            # all apply. A direct recreate-on-UNROUTED shortcut would skip exactly
+            # those, and they are the defects the routing transaction closed.
             #
-            # The id is recorded, and that is a *decision* rather than an inheritance
-            # from the branch below, which no longer records during replay.
+            # NOT remembered, deliberately — the inverse of what this arm did when it
+            # only dropped. The episode ends by delivering this frame back through
+            # this handler, and a remembered id would be rejected at the dedup check
+            # above; the declined episode's drain is what remembers it instead, so a
+            # room nothing claims still converges. The watermark is left where it is
+            # either way.
             #
-            # The difference is whether the rejection is transient. A full queue drains,
-            # so a replayed message rejected for capacity is owed another attempt, and
-            # recording it would lose it silently. UNROUTED is not like that: it means no
-            # watcher serves this room, which is a configuration state and can persist
-            # indefinitely. Keeping the window open for it would have every recovery
-            # re-fetch a batch that can never be spent — a boundary that is never
-            # consumed is its own defect, and a worse one than a message that no watcher
-            # was ever going to see.
-            #
-            # The watermark is left where it is, so a user who resends is served normally
-            # once a watcher exists.
-            logger.warning(
-                "Message for room '%s' has no watcher — dropping without a reply. "
-                "A watcher that failed to start, or a room subscribed with none "
-                "configured.",
-                sub.room.name,
+            # The turn is released because the redelivery runs the filter — and its
+            # charge — again. Spawned, not awaited: this runs on the room's own
+            # worker, and the episode ends by delivering into that worker's queue.
+            # Tasks run in creation order, and the episode reserves `_pending_routes`
+            # before its first await, so a burst of frames buffers behind its first.
+            logger.info(
+                "Message for room '%s' has no processor — offering the room back "
+                "to the router (wake).", sub.room.name,
             )
-            sub.remember(msg_id)
-            self._release_unused_turn(doc, result, turn_generation, "no watcher")
+            self._release_unused_turn(doc, result, turn_generation, "waking the room")
+            task = asyncio.create_task(
+                self._route_room(
+                    room_id, doc, access,
+                    resolved_room=self._room_ref_from_sub(sub),
+                )
+            )
+            self._routing_tasks.add(task)
+            task.add_done_callback(self._routing_tasks.discard)
             return True
         if capacity is RoomCapacity.FULL:
             logger.warning(
