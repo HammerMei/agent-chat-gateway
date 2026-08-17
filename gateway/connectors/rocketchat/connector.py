@@ -912,8 +912,8 @@ class RocketChatConnector(Connector):
         """
         pending = self._pending_routes.get(room_id)
         if pending is not None:
-            # An episode for this room is open. Checked *before* the tracked
-            # check on purpose: the room may have become tracked an instant ago
+            # An episode for this room is open. Checked *before* the served
+            # check on purpose: the room may have become served an instant ago
             # with its buffer not yet drained, and delivering this frame
             # directly would put it ahead of every frame that arrived before
             # it. While an episode is open, the buffer is the room's order.

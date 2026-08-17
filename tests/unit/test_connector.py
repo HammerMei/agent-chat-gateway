@@ -22,12 +22,9 @@ from gateway.core.connector import Room, RoomCapacity
 from gateway.core.watcher_rule import RoomKind
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-
-
 # Shared with the wake-path suite; the builder lives beside the other shared
 # fixtures so a config field added for one consumer reaches both.
 from tests.helpers import make_rc_config as _make_config  # noqa: E402
-
 
 
 def _page(msgs, limit=200):
