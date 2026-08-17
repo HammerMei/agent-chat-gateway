@@ -333,8 +333,10 @@ class MattermostConnector(Connector):
                     "Channel '%s': no missed messages since %s",
                     state.room.name, watermark)
                 # A read that found nothing is still a read — of the window this replay
-                # came in for, not one claimed during the fetch above.
-                state.discharge_boundary(claims_at_entry)
+                # came in for, not one claimed during the fetch above. An externally
+                # named window is not this channel's mark to spend either way.
+                if not external_window:
+                    state.discharge_boundary(claims_at_entry)
             return
 
         if page.was_full:
@@ -1076,7 +1078,21 @@ class MattermostConnector(Connector):
             # dropped audibly with the episode when it did not.
             ended = self._pending_routes.pop(channel_id, None)
             frames = ended.drain() if ended is not None else []
-            if channel_id in self._channels:
+            state = self._channels.get(channel_id)
+            if state is not None:
+                # Same rule, same mechanism, same reason as Rocket.Chat's: the
+                # watermark is a scalar, so a live message accepted during this
+                # episode has already advanced it past these frames and the
+                # filter would reject them as already processed. The claim is a
+                # promise that a recovery comes back for them (§2.2), which is
+                # what makes a filtered delivery a deferral and not a loss.
+                oldest = min(
+                    (str(f["post"].get("create_at", "")) for f in frames
+                     if f["post"].get("create_at")),
+                    default="",
+                )
+                if oldest:
+                    state.claim_boundary(state.last_processed_ts, just_before(oldest))
                 for frame in frames:
                     self._ws.deliver_to_channel(frame)
             elif frames:

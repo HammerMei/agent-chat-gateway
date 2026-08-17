@@ -145,8 +145,11 @@ class TestStartupReplay(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(room.kind.value, "group_dm",
                          "the RoomRef is rebuilt from the record, not re-resolved")
         self.assertEqual(room.participants, ("alice", "bob"))
-        mgr._connector.replay_room_since.assert_awaited_once_with(
-            "r1", after_ts="1786874400000")
+        # The recreation replays the record's own window itself, so this loop
+        # does not replay again — two passes over one interval are not free:
+        # replay hands the filter the same boundary both times, so only the id
+        # window stands between them.
+        mgr._connector.replay_room_since.assert_not_awaited()
 
     async def test_ineligible_records_are_left_alone(self):
         records = [
@@ -215,9 +218,12 @@ class TestStartupReplay(unittest.IsolatedAsyncioTestCase):
 
         await mgr._replay_persisted_records(_window(mgr))
 
-        # Both failures were survived and the good room still replayed.
-        mgr._connector.replay_room_since.assert_awaited_once_with(
-            "r-good", after_ts="1786874400000")
+        # Both failures were survived and the good room was still recovered —
+        # by its recreation, which owns the replay.
+        self.assertEqual(
+            [c.args[1].id for c in mgr._watcher_manager.get_or_create.await_args_list],
+            ["r-worse", "r-good"],
+        )
 
     async def test_without_a_manager_the_replay_is_a_no_op(self):
         mgr = self._manager([_dynamic_record()])

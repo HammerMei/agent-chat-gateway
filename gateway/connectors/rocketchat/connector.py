@@ -658,7 +658,7 @@ class RocketChatConnector(Connector):
             # hands the message back and forgets its id so a later replay can bring it
             # back. Spending the boundary on a batch that contains one of those removes
             # the only mark that could — the live watermark has moved past it by then.
-            if all_accepted:
+            if all_accepted and not external_window:
                 if not sub.discharge_boundary(claims_at_entry):
                     logger.info(
                         "Room '%s': the outage window was claimed again while this "
@@ -861,18 +861,25 @@ class RocketChatConnector(Connector):
             # directly would put it ahead of every frame that arrived before
             # it. While an episode is open, the buffer is the room's order.
             #
-            # **What makes that true is loop atomicity, and it is fragile.**
-            # This check only covers frames that reach the *routing* path. Once
-            # the room is tracked, later frames go straight to the room's worker
-            # and never consult the buffer at all — so a frame could only jump
-            # the queue in the window between the room becoming tracked and the
-            # buffer draining. That window is currently empty because there is
-            # no suspension point between them: `subscribe_room`'s tracked-write
-            # is synchronous through to this method's `finally`. One inserted
-            # `await` in that span — an awaited online notification, an async
-            # save — silently reopens trigger loss, because the drained trigger
-            # would then arrive behind a newer frame and be filtered as already
-            # processed. `TestTheBufferDrainsBeforeAnythingCanOvertakeIt` pins it.
+            # **This check only covers the routing path, and that is a real
+            # limit rather than a formality.** Once the room is tracked, later
+            # frames go straight to its worker and never consult the buffer —
+            # so a frame can overtake the trigger in the window between the
+            # tracked-write (inside the router call, `start_watcher_in_room`
+            # step 7) and the drain below.
+            #
+            # That window is **not** empty — a recreation replays the interval
+            # its room owes before returning — so a live frame can land in it
+            # and advance the watermark past the buffered trigger. The
+            # watermark is a scalar, so that commit implicitly claims
+            # everything below it and the trigger is then filtered as already
+            # processed (§2.2, "commits within a room must be ordered").
+            #
+            # **Which is why the drain claims the window before handing the
+            # frames over** — see the `finally` below. A filtered frame is then
+            # a deferral rather than a loss: the claim is a promise that a
+            # recovery comes back for it, the same promise the queue-full
+            # hand-back makes with the same mechanism.
             verdict = pending.add(doc.get("_id", ""), (doc, access))
             if verdict == "duplicate":
                 # §2.2 outcome 6: the reservation is not disturbed, the copy goes.
@@ -961,7 +968,28 @@ class RocketChatConnector(Connector):
             # to recover them from.
             ended = self._pending_routes.pop(room_id, None)
             frames = ended.drain() if ended is not None else []
-            if room_id in self._rooms:
+            sub = self._rooms.get(room_id)
+            if sub is not None:
+                # **Claim the window before handing the frames over.** The
+                # watermark is a scalar high-water mark, so a live message
+                # accepted while this episode was resolving has already
+                # advanced it past these buffered frames — one timestamp
+                # cannot say "committed the later one but not the earlier"
+                # (§2.2, "commits within a room must be ordered"). The filter
+                # would then reject each of them as already processed, and
+                # nothing would point below the mark any more.
+                #
+                # This is the same promise the queue-full hand-back makes with
+                # the same mechanism: a message below here was not read, so a
+                # recovery must come back for it. Delivery below is still
+                # attempted first — the claim is what makes the case where it
+                # is filtered a *deferral* rather than a loss.
+                oldest = min(
+                    (extract_ts(d) for d, _ in frames if extract_ts(d)),
+                    default="",
+                )
+                if oldest:
+                    sub.claim_boundary(sub.last_processed_ts, _just_before(oldest))
                 for pending_doc, pending_access in frames:
                     self._ws.deliver_to_room(room_id, pending_doc, pending_access)
             elif frames:

@@ -248,7 +248,14 @@ class SessionManager:
             try:
                 if self._lifecycle.processor_named(ws.watcher_name) is None:
                     kind = RoomKind(ws.room_kind) if ws.room_kind else RoomKind.CHANNEL
-                    created = await self._watcher_manager.get_or_create(
+                    # The recreation replays the record's own window itself, so
+                    # this branch does not replay again. Two passes over one
+                    # interval is not free: replay hands the filter the same
+                    # boundary both times, so the watermark the first pass
+                    # advanced does not suppress the second, and only the id
+                    # window stands between them — a window exactly as large as
+                    # one replay batch, so a full one re-delivers.
+                    await self._watcher_manager.get_or_create(
                         self._connector_name,
                         RoomRef(
                             id=ws.room_id,
@@ -257,11 +264,13 @@ class SessionManager:
                             participants=tuple(ws.participants),
                         ),
                     )
-                    if created is None:
-                        continue
-                await self._connector.replay_room_since(
-                    ws.room_id, after_ts=boundary
-                )
+                else:
+                    # Resident already — a live message recreated it while this
+                    # loop was working, so no recreation will replay for it and
+                    # this is the only call that covers its down-window.
+                    await self._connector.replay_room_since(
+                        ws.room_id, after_ts=boundary
+                    )
             except Exception as e:
                 logger.warning(
                     "Startup replay failed for watcher '%s' (room %s) — the room "

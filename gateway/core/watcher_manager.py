@@ -30,6 +30,7 @@ from dataclasses import dataclass, fields, is_dataclass, replace
 from datetime import datetime
 from typing import TYPE_CHECKING
 
+from .adapter_utils import ts_gt as _ts_gt
 from .config import HistoryHandoffConfig, WatcherConfig
 from .connector import Room
 from .pending_route import STARTING_UP_NOTICE
@@ -484,9 +485,15 @@ class WatcherManager:
             # The record's own watermark bounds the handoff when the backend has
             # expired the session and a fresh one has to be minted: without it the
             # unbounded fetch pulls in the very interval the replay below is about
-            # to deliver, and the agent sees it twice. The trigger's bound wins
-            # when there is one — it is the tighter of the two.
-            history_before_ts=history_before_ts or boundary,
+            # to deliver, and the agent sees it twice.
+            #
+            # The **lower** of the two bounds wins, and that is not the same as
+            # "the trigger's, if there is one". `before_ts` is an exclusive upper
+            # bound, so a *lower* value fetches less; the trigger is by
+            # construction a message above the watermark, so preferring it would
+            # pick the looser bound and re-admit the whole interval — the exact
+            # double delivery this argument exists to prevent, on the common path.
+            history_before_ts=_earlier(history_before_ts, boundary),
             provenance=carried,
         )
         self._lifecycle.save_state()
@@ -589,6 +596,21 @@ class WatcherManager:
             wc.name, room.id, rule.name,
         )
         return self._lifecycle.processor_named(wc.name)
+
+
+def _earlier(a: str | None, b: str | None) -> str | None:
+    """The tighter of two exclusive upper bounds, or whichever one exists.
+
+    A function rather than an inline comparison because the direction is easy
+    to get backwards and was: an upper bound is tighter when it is *lower*, and
+    the first version reached for the trigger's bound as "the tighter of the
+    two" when the trigger is by construction above the watermark.
+    """
+    if not a:
+        return b or None
+    if not b:
+        return a
+    return a if _ts_gt(b, a) else b
 
 
 def _now_iso() -> str:

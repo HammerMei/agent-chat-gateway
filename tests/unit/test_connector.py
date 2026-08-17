@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from gateway.connectors.rocketchat.connector import _just_before
+from gateway.core.adapter_utils import ts_gt as _ts_gt
 from gateway.core.connector import Room, RoomCapacity
 from gateway.core.watcher_rule import RoomKind
 
@@ -3371,38 +3372,88 @@ class TestTheRoutingTransaction(unittest.IsolatedAsyncioTestCase):
                      for c in connector._ws.deliver_to_room.call_args_list]
         self.assertEqual(delivered, ["m1"], "the trigger survived the first failure")
 
-    async def test_the_buffer_drains_before_anything_can_overtake_it(self):
-        """The invariant the ordering rests on, stated because it is invisible.
+    async def test_the_recreations_replay_is_the_only_await_in_the_drain_window(self):
+        """The exposure, pinned to exactly one call so a second cannot be added
+        without a decision.
 
-        The pending-before-tracked check only covers the *routing* path; once
-        the room is tracked, later frames go straight to its worker. So the
-        buffer can only be overtaken in the window between the room becoming
-        tracked and the drain — and that window is empty only because nothing
-        suspends between them. This walks the source for an `await` in that
-        span, so an inserted one fails here rather than silently losing the
-        trigger to the already-processed filter.
+        The pending-before-tracked check covers the *routing* path only; once
+        the room is tracked, frames go straight to its worker. So a frame can
+        overtake the buffered trigger between the tracked-write (inside the
+        router call) and the drain — and that span is not empty: a recreation
+        replays the interval its room owes before returning. If that replay
+        delivers nothing and a live frame lands meanwhile, the trigger is
+        filtered as already processed and lost.
+
+        One await is the accepted exposure and it is documented at the drain;
+        this walks the span so the *next* one fails here rather than silently.
         """
         import ast
         import inspect
 
-        from gateway.connectors.rocketchat import connector as rc_connector
+        from gateway.core import watcher_manager
 
-        source = inspect.getsource(rc_connector.RocketChatConnector._on_unrouted_message)
+        source = inspect.getsource(watcher_manager.WatcherManager._recreate)
         tree = ast.parse(textwrap.dedent(source))
-        finally_bodies = [
-            node.finalbody for node in ast.walk(tree) if isinstance(node, ast.Try)
-            and node.finalbody
-        ]
-        self.assertTrue(finally_bodies, "the episode's drain lives in a finally")
-        for body in finally_bodies:
-            for node in body:
-                for inner in ast.walk(node):
-                    self.assertNotIsInstance(
-                        inner, ast.Await,
-                        "an await between the room becoming tracked and the "
-                        "buffer draining lets a later frame overtake the "
-                        "trigger, which the already-processed filter then drops",
-                    )
+        awaited = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Await):
+                call = node.value
+                name = (call.func.attr if isinstance(call, ast.Call)
+                        and isinstance(call.func, ast.Attribute) else "?")
+                awaited.append(name)
+
+        self.assertEqual(
+            sorted(awaited), ["replay_room_since", "start_watcher_in_room"],
+            "an await added to the recreation path widens the window in which "
+            "a live frame can overtake the buffered trigger — the drain's own "
+            "comment names this as the accepted, singular exposure",
+        )
+
+    async def test_a_drained_frame_the_watermark_outran_is_deferred_not_lost(self):
+        """The scalar-watermark case §2.2 names, at the episode boundary.
+
+        Nothing marks the buffered trigger as processed. What happens is that a
+        live message accepted while the episode was resolving commits *its own*
+        timestamp — and one timestamp cannot say "committed the later one but
+        not the earlier", so the filter then rejects everything below it,
+        including the trigger.
+
+        The episode claims the window before handing its frames over, which is
+        the same promise the queue-full hand-back makes with the same
+        mechanism: a message below this mark was not read, so a recovery must
+        come back for it.
+        """
+        connector = self._connector()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def creating_router(room, trigger):
+            entered.set()
+            await release.wait()
+            from gateway.connectors.rocketchat.connector import _RoomSubscription
+
+            sub = _RoomSubscription(room=Room(id="new-room", name="general"))
+            # What a live message accepted during the episode leaves behind.
+            sub.last_processed_ts = "9999"
+            connector._rooms["new-room"] = sub
+
+        connector.register_router(creating_router)
+        first = asyncio.create_task(
+            connector._on_unrouted_message(self._doc("m1"), self._ACCESS))
+        await entered.wait()
+        release.set()
+        await first
+
+        sub = connector._rooms["new-room"]
+        self.assertTrue(
+            sub.replay_boundary,
+            "the window below the drained frames is claimed, so a recovery "
+            "returns for anything the advanced watermark filtered out",
+        )
+        self.assertTrue(
+            _ts_gt("1", sub.replay_boundary or "1"),
+            "the claimed mark sits strictly below the buffered frame",
+        )
 
     async def test_a_parked_room_commits_nothing(self):
         """Outcomes 4-exhausted and 7 share one observable: nothing was

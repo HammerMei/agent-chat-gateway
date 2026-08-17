@@ -349,10 +349,18 @@ Three distinct keys, deliberately:
 | Filesystem paths (system prompt, attachment workspace) | `hash(connector, room_id)` — never the raw id |
 | Display and CLI | `<connector>-<room_label>` — cosmetic, never load-bearing |
 
-The `room_name` on the state record is the platform's own name, refreshed from
-inbound messages. **Boot and recreation resolve by `room_id`, never by the
-persisted name** — a name freed by a rename can be reused by a different
-room, and resolving by name would bind an existing session to the wrong one.
+The `room_name` on the state record is a **human-readable description of the
+room**, refreshed from inbound messages: the platform's own name for a named
+room, and for the DM kinds the room's description — the counterpart for a 1:1,
+the participant list for a group DM (§2.4). Direct rooms have no platform name
+to carry, and leaving the field empty for them made `list` show a blank column
+for exactly the rooms an operator cannot otherwise tell apart, so the
+description fills it instead. It is a display value and nothing keys on it.
+
+**Boot and recreation resolve by `room_id`, never by the persisted name** — a
+name freed by a rename can be reused by a different room, and resolving by name
+would bind an existing session to the wrong one. This is what makes the field
+safe to hold a description rather than a platform identifier.
 
 Labels need no disambiguating flag: connector names are validated unique at
 config load, so `<connector>-<label>` is unique by construction — **provided a
@@ -1756,7 +1764,7 @@ Records are keyed on `(connector, room_id)`. Added to each record:
 
 | Field | Purpose |
 |---|---|
-| `room_name` | the platform's own name, refreshed from inbound messages; empty for DMs |
+| `room_name` | a human-readable description of the room, refreshed from inbound messages: the platform's name for a named room, the counterpart or participant list for the DM kinds (§2.3). Display only — nothing keys on it |
 | `room_kind` | `channel` / `group` / `dm` / `group_dm` — decides the label form and whether `require_mention` applies (§2.7) |
 | `participants` | DM counterparts, for the `list` column; refreshed, never part of a key |
 | `connector`, `agent` | so a rule edit cannot silently re-point a dormant session |

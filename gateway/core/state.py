@@ -144,8 +144,13 @@ class WatcherState:
     # Written by the watcher manager; empty on records the static path creates,
     # which is why every one of them defaults rather than being required.
 
-    # The platform's own name for the room, refreshed from inbound messages.
-    # Empty for DMs, which have no name to carry.
+    # A human-readable description of the room, refreshed from inbound messages
+    # (§2.3): the platform's own name for a named room, and for the DM kinds the
+    # room's description — the counterpart for a 1:1, the participant list for a
+    # group DM. Direct rooms have no platform name, and an empty field left the
+    # `list` column blank for exactly the rooms an operator cannot otherwise tell
+    # apart. Display only: resolution goes by `room_id`, which is what makes this
+    # safe to hold a description rather than an identifier.
     room_name: str = ""
     # channel / group / dm / group_dm — decides the label form and whether
     # require_mention applies (§2.7). Distinct from `room_type` above, which is the
