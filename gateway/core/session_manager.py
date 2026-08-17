@@ -56,6 +56,7 @@ class SessionManager:
         permission_registry: PermissionRegistry | None = None,
         session_maps: SessionMaps | None = None,
         watcher_rules: list | None = None,
+        pending_jobs=None,
     ) -> None:
         self._connector = connector
         # `state_name` is the connector's config name in production (service.py
@@ -94,7 +95,7 @@ class SessionManager:
         # deployment's lifecycle is config.yaml's, and its records carry no
         # frozen rule for the sweep to read anyway (§2.5).
         self._sweep = (
-            LifecycleSweep(self._lifecycle)
+            LifecycleSweep(self._lifecycle, pending_jobs=pending_jobs)
             if self._watcher_manager is not None
             else None
         )

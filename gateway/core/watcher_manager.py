@@ -46,6 +46,17 @@ logger = logging.getLogger("agent-chat-gateway.core.watcher_manager")
 
 WatcherKey = tuple[str, str]  # (connector, room_id)
 
+
+class StaleRecordError(RuntimeError):
+    """A recreation's record was reclaimed or replaced while it waited (§2.5).
+
+    Raised, not answered with None: None is a final decline and the routing
+    episode would remember the trigger as one — but the room may now be
+    recordless, where a fresh `_create` is the correct outcome and the frame
+    is its trigger. An exception is a retryable abort (§2.2), so the episode's
+    retry re-enters `get_or_create` and dispatches against current state.
+    """
+
 # How many hex characters of the room-id digest a group DM's label carries. Eight is the
 # design's figure (§2.3): short enough to type from a `list` row, and collisions are
 # cosmetic — two identical-looking rows and nothing worse, since the label is never a key.
@@ -375,8 +386,14 @@ class WatcherManager:
         # are released before creation's awaits finish on RC's routing workers,
         # and this lock is what actually covers "existence check + creation" as
         # one critical section. Entries are never removed — the map grows with
-        # distinct rooms offered, which is bounded by rooms the account can see;
-        # expiry's reclamation sweep is the owner of shrinking it.
+        # distinct rooms offered, which is bounded by rooms the account can see.
+        # The expiry increment considered shrinking it and ruled it unsafe: an
+        # asyncio.Lock briefly reads unlocked during the release-to-waiter
+        # handoff, so a delete in that window lets a fresh setdefault mint a
+        # second lock and two creations run the "single"-flight section at
+        # once. A safe shrink needs refcounting; bounded growth does not earn
+        # it. (The lifecycle's `_watcher_locks` map holds by the same
+        # reasoning.)
         self._locks: dict[str, asyncio.Lock] = {}
         # A soft cap, checked-then-incremented under the per-room lock. Two
         # rooms' creations can race the check and both proceed; the cap bounds
@@ -508,6 +525,19 @@ class WatcherManager:
         # against a settled record. Room lock outer, watcher lock inner —
         # nothing takes them reversed.
         async with self._lifecycle.watcher_lock(record.watcher_name):
+            if self._lifecycle.record_for_room(record.room_id) is not record:
+                # The record this wake was dispatched against is no longer the
+                # room's record — an expiry reclaimed it (or a later creation
+                # replaced it) while we waited on the lock. One rule, no cases:
+                # raise, and the caller's retry re-enters `get_or_create`,
+                # which re-reads and dispatches correctly whatever the room's
+                # state is now — `_create` for a reclaimed room, the resident
+                # processor for a replaced one. Proceeding here instead would
+                # resurrect a record the expiry just deleted, session and all.
+                raise StaleRecordError(
+                    f"room {record.room_id}'s record changed while its "
+                    f"recreation waited — retry re-reads"
+                )
             if record.paused:
                 # Re-read under the lock: the pause that held it just settled.
                 logger.debug(

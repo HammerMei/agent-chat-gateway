@@ -262,19 +262,36 @@ def past_idle_ttl(record: "WatcherState", now) -> bool:
     fifteen days, and the sweep stamps `dropped_at` from the same value so one
     pass reads one instant.
     """
+    return _past_ttl(record, "session_idle_days", record.last_activity_at, now)
+
+
+def past_expire_ttl(record: "WatcherState", now) -> bool:
+    """Whether this record's expiry TTL has elapsed — the destructive leg (§2.5).
+
+    Measured from `dropped_at` — the moment the watcher became idle — and never
+    from its last activity. That origin is the whole outage story: a watcher
+    active at shutdown gets a fresh `dropped_at` from the first sweep after the
+    restart, so the outage is not counted and `active → expired` cannot happen
+    through a downtime of any length. Same frozen-rule, never-destructive-on-
+    bad-data contract as `past_idle_ttl`; same injected clock.
+    """
+    return _past_ttl(record, "session_expire_days", record.dropped_at, now)
+
+
+def _past_ttl(record: "WatcherState", field_name: str, origin: str, now) -> bool:
     from datetime import datetime, timedelta
 
-    days = (record.rule or {}).get("session_idle_days")
-    if not isinstance(days, int) or days <= 0 or not record.last_activity_at:
+    days = (record.rule or {}).get(field_name)
+    if not isinstance(days, int) or days <= 0 or not origin:
         return False
     try:
-        last = datetime.fromisoformat(record.last_activity_at)
+        start = datetime.fromisoformat(origin)
     except ValueError:
         return False
-    if last.tzinfo is None:
+    if start.tzinfo is None:
         # A naive stamp is a legacy record; local time is what wrote it.
-        last = last.astimezone()
-    return (now - last) >= timedelta(days=days)
+        start = start.astimezone()
+    return (now - start) >= timedelta(days=days)
 
 
 def carried_fields(state: "WatcherState | None") -> dict:

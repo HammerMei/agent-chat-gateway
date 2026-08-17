@@ -327,6 +327,17 @@ class GatewayService:
                 watcher_rules=[
                     r for r in config.watcher_rules if r.connector == cc.name
                 ],
+                # The expiry exemption's oracle (§2.5): a room with a pending
+                # scheduled job must not have its record deleted — the job's
+                # injection can wake an idle room, never a reclaimed one. The
+                # closure binds this connector's name (jobs are unique per
+                # connector, not globally) and reads the store lazily — it is
+                # loaded later in startup, and the sweep's first pass is an
+                # hour away. Fails EXEMPT: if the store cannot answer, keeping
+                # a record one more pass beats deleting one a job points at.
+                pending_jobs=(
+                    lambda name, _cn=cc.name: self._has_pending_jobs(_cn, name)
+                ),
             )
             self._entries.append(
                 ConnectorEntry(name=cc.name, connector=connector, session_manager=sm)
@@ -345,6 +356,30 @@ class GatewayService:
             self._entries,
             job_store=self._job_store,
         )
+
+    def _has_pending_jobs(self, connector_name: str, watcher_name: str) -> bool:
+        """Whether any non-completed scheduled job targets this watcher.
+
+        The expiry exemption's oracle (§2.5). ACTIVE **and PAUSED** jobs both
+        exempt: deleting a record under a paused job orphans it the moment an
+        operator resumes it. Jobs key by watcher name and connector — names
+        are unique only per connector, so both halves matter.
+
+        Fails EXEMPT: a store that cannot answer (not yet loaded, corrupt
+        file) keeps the record one more pass, which costs a state-file entry;
+        answering False would delete a record a job points at, permanently.
+        """
+        try:
+            return any(
+                j.watcher == watcher_name
+                for j in self._job_store.list_jobs(connector=connector_name)
+            )
+        except Exception as e:
+            logger.warning(
+                "Could not read the job store for the expiry exemption "
+                "(keeping watcher '%s' one more pass): %s", watcher_name, e,
+            )
+            return True
 
     async def _settle(
         self,

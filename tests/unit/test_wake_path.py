@@ -65,6 +65,7 @@ class TestTheWakeResumesTheSameSession(unittest.IsolatedAsyncioTestCase):
         connector._ws = MagicMock()
         connector._ws.stream_active = False
         connector._ws.subscribe_room = AsyncMock()
+        connector._ws.unsubscribe_room = AsyncMock()
         self.delivered: list[str] = []
         connector._ws.deliver_to_room = MagicMock(
             side_effect=lambda rid, doc, access=None, **kw:
@@ -239,6 +240,64 @@ class TestTheSweepIdlesAndTheNextMessageWakes(unittest.IsolatedAsyncioTestCase):
         # And however many idle/wake cycles, the bookkeeping does not grow.
         self.assertEqual(connector._room_refcount[ROOM_ID], 1)
         self.assertEqual(len(connector._watcher_contexts[ROOM_ID]), 1)
+
+
+class TestTheFullLifecycleEndsInAFreshWatcher(unittest.IsolatedAsyncioTestCase):
+    """The whole §2.5 arc through the real stack: create → idle → expire →
+    the room's next message creates a *fresh* watcher.
+
+    Expiry is the destructive step — after it there is no record, no
+    watermark and no session, and the room's connector state is reclaimed
+    too, so the next message arrives *untracked* and takes the creation path
+    against the current rules with a brand-new session. That last assertion
+    is the point of the whole leg: expiry is how a rule edit eventually
+    reaches a room (§2.5, "the blunt route").
+    """
+
+    _harness = TestTheWakeResumesTheSameSession._harness
+    _settle = TestTheWakeResumesTheSameSession._settle
+
+    async def test_create_idle_expire_fresh_create(self):
+        from datetime import datetime, timedelta
+
+        from gateway.core.lifecycle_sweep import LifecycleSweep
+
+        connector, lifecycle, dispatcher = await self._harness()
+        clock = {"now": datetime.now().astimezone()}
+        sweep = LifecycleSweep(lifecycle, now=lambda: clock["now"])
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            MockProc.return_value.stop = AsyncMock()
+            MockProc.return_value.has_work_in_flight = False
+
+            # 1. Create, 2. idle — the arc the money test already pins.
+            await connector._on_unrouted_message(_doc("m1", 1500), _ACCESS)
+            name = "rc-eng-backend"
+            first_session = lifecycle.get_watcher_state(name).session_id
+            clock["now"] += timedelta(days=16)
+            self.assertEqual(await sweep.run_once(), [name])
+
+            # 3. A full expire-TTL after the drop: reclaimed.
+            clock["now"] += timedelta(days=15)
+            self.assertEqual(await sweep.run_once(), [name])
+
+            self.assertIsNone(lifecycle.get_watcher_state(name),
+                              "the record is gone")
+            self.assertNotIn(ROOM_ID, connector._rooms,
+                             "expiry reclaims the connector's room state too")
+            self.assertNotIn(ROOM_ID, connector._room_refcount)
+
+            # 4. The next message arrives UNTRACKED and creates fresh.
+            await connector._on_unrouted_message(_doc("m3", 9999), _ACCESS)
+
+        fresh = lifecycle.get_watcher_state(name)
+        self.assertIsNotNone(fresh, "the room's next message created a watcher")
+        self.assertNotEqual(fresh.session_id, first_session,
+                            "a fresh session — expiry deleted the old one")
+        self.assertEqual(fresh.dropped_at, "")
+        self.assertIs(dispatcher.capacity(ROOM_ID), RoomCapacity.AVAILABLE)
+        self.assertEqual(self.delivered[-1], "m3", "the trigger was delivered")
 
 
 class TestAWakeLandingMidDropWaits(unittest.IsolatedAsyncioTestCase):

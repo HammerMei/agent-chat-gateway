@@ -28,8 +28,8 @@ def _iso(dt: datetime) -> str:
     return dt.isoformat(timespec="seconds")
 
 
-def _record(name="w1", *, idle_days=15, age_days=16.0, paused=False,
-            dropped_at="", rule=True, session_id="sess-1"):
+def _record(name="w1", *, idle_days=15, expire_days=15, age_days=16.0,
+            paused=False, dropped_at="", rule=True, session_id="sess-1"):
     return WatcherState(
         watcher_name=name,
         session_id=session_id,
@@ -38,8 +38,11 @@ def _record(name="w1", *, idle_days=15, age_days=16.0, paused=False,
         paused=paused,
         dropped_at=dropped_at,
         last_activity_at=_iso(NOW - timedelta(days=age_days)),
-        rule={"session_idle_days": idle_days} if rule else {},
+        rule=({"session_idle_days": idle_days,
+               "session_expire_days": expire_days} if rule else {}),
         rule_name="eng" if rule else "",
+        connector="rc" if rule else "",
+        agent="default" if rule else "",
     )
 
 
@@ -50,19 +53,26 @@ def _resident_processor(*, busy=False):
     return processor
 
 
-def _harness(records, *, processors=None, registry=None):
+def _harness(records, *, processors=None, registry=None, pending_jobs=None):
     """A real lifecycle holding real records, its collaborators doubled."""
+    from tests.helpers import MockAgentBackend, make_core_config
+
     connector = MagicMock()
     # `is not None` is the capture rule; a bare MagicMock return would be
     # written into the record as the watermark.
     connector.get_last_processed_ts = MagicMock(return_value=None)
+    connector.unsubscribe_room = AsyncMock()
     lifecycle = make_lifecycle(connector=connector,
+                               agents={"default": MockAgentBackend()},
+                               config=make_core_config(),
                                permission_registry=registry)
+    lifecycle._attachment_workspace = MagicMock()
     for r in records:
         lifecycle._states[r.watcher_name] = r
     for name, proc in (processors or {}).items():
         lifecycle._processors[name] = proc
-    sweep = LifecycleSweep(lifecycle, now=lambda: NOW)
+    sweep = LifecycleSweep(lifecycle, now=lambda: NOW,
+                           pending_jobs=pending_jobs)
     return sweep, lifecycle, connector
 
 
@@ -127,17 +137,17 @@ class TestWhatTheTimerMustNeverTouch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await sweep.run_once(), [])
         self.assertEqual(record.dropped_at, "")
 
-    async def test_an_already_idle_record_is_not_taken_further(self):
-        """One transition per sweep: this pass may not take a record it (or a
-        previous pass) already idled anywhere else. The expiry leg is step 5's,
-        and when it lands, this is the rule that keeps active → expired
-        impossible through an outage."""
-        record = _record(dropped_at=_iso(NOW - timedelta(days=20)),
+    async def test_an_already_idle_record_is_not_re_idled(self):
+        """An idle record takes the expiry leg or nothing — never the idle leg
+        again. Restamping `dropped_at` would push expiry out forever, one
+        sweep interval at a time. (That an idle record past its *expiry* TTL
+        is reclaimed is the expiry suite's; this record is inside it.)"""
+        record = _record(dropped_at=_iso(NOW - timedelta(days=2)),
                          age_days=400.0)
         sweep, lifecycle, _ = _harness([record])
 
         self.assertEqual(await sweep.run_once(), [])
-        self.assertEqual(record.dropped_at, _iso(NOW - timedelta(days=20)),
+        self.assertEqual(record.dropped_at, _iso(NOW - timedelta(days=2)),
                          "the existing dropped_at is not restamped")
 
     async def test_a_static_record_is_config_yamls_not_the_timers(self):
@@ -183,6 +193,131 @@ class TestTheBusyGate(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(await sweep.run_once(), [])
         self.assertEqual(record.dropped_at, "")
+
+
+class TestTheSweepExpiresAStaleIdleRecord(unittest.IsolatedAsyncioTestCase):
+    """The expiry leg (§2.5): the destructive one, so its gates are the doc's
+    word for word — measured from `dropped_at`, frozen rule, reclaims
+    everything, and a pending scheduled job holds it."""
+
+    def _idle_record(self, *, dropped_days_ago=16.0, **kw):
+        return _record(
+            dropped_at=_iso(NOW - timedelta(days=dropped_days_ago)),
+            age_days=dropped_days_ago + 20, **kw)
+
+    async def test_past_expire_ttl_reclaims_everything(self):
+        record = self._idle_record()
+        sweep, lifecycle, connector = _harness([record])
+
+        transitioned = await sweep.run_once()
+
+        self.assertEqual(transitioned, ["w1"])
+        self.assertIsNone(lifecycle.get_watcher_state("w1"), "the record is gone")
+        lifecycle._state_store.save.assert_called()
+        # The connector's room state is reclaimed — the room's next message
+        # takes the untracked path and creates a FRESH watcher.
+        connector.unsubscribe_room.assert_awaited_once_with(
+            "room-w1", watcher_id="w1")
+        # Session maps and the attachment workspace went with it.
+        lifecycle._maps.remove_session.assert_called_with("sess-1")
+        lifecycle._attachment_workspace.reclaim.assert_called_once()
+
+    async def test_within_expire_ttl_is_untouched(self):
+        record = self._idle_record(dropped_days_ago=14.0)
+        sweep, lifecycle, connector = _harness([record])
+
+        self.assertEqual(await sweep.run_once(), [])
+        self.assertIsNotNone(lifecycle.get_watcher_state("w1"))
+        connector.unsubscribe_room.assert_not_awaited()
+
+    async def test_the_expiry_origin_is_dropped_at_not_activity(self):
+        """A record idle for two days whose *activity* is forty days old must
+        not expire: the expiry clock starts at the drop, which is what makes
+        an outage survivable (§2.5)."""
+        record = _record(dropped_at=_iso(NOW - timedelta(days=2)),
+                         age_days=40.0)
+        sweep, lifecycle, _ = _harness([record])
+
+        self.assertEqual(await sweep.run_once(), [])
+        self.assertIsNotNone(lifecycle.get_watcher_state("w1"))
+
+    async def test_paused_is_never_expired(self):
+        record = self._idle_record(dropped_days_ago=400.0, paused=True)
+        sweep, lifecycle, _ = _harness([record])
+
+        self.assertEqual(await sweep.run_once(), [])
+        self.assertIsNotNone(lifecycle.get_watcher_state("w1"))
+
+    async def test_a_pending_job_exempts_from_expiry_but_not_idling(self):
+        """§2.5: idling a job-bearing room is harmless — the job's injection
+        wakes it — but expiry deletes the record the recreation reads from,
+        leaving the job pointing at nothing."""
+        stale_idle = self._idle_record(name="jobbed")
+        active_but_old = _record(name="quiet", age_days=16.0)
+        sweep, lifecycle, _ = _harness(
+            [stale_idle, active_but_old],
+            processors={"quiet": _resident_processor()},
+            pending_jobs=lambda name: True,
+        )
+
+        transitioned = await sweep.run_once()
+
+        self.assertIsNotNone(lifecycle.get_watcher_state("jobbed"),
+                             "expiry is held by the job")
+        self.assertEqual(transitioned, ["quiet"],
+                         "idling is not held by the job")
+        self.assertTrue(lifecycle.get_watcher_state("quiet").dropped_at)
+
+    async def test_a_woken_record_is_not_expired(self):
+        """Between the sweep's look and the lock, a wake can make the record
+        resident again — and a resident record is not idle, whatever its
+        stale dropped_at momentarily says."""
+        record = self._idle_record()
+        sweep, lifecycle, connector = _harness(
+            [record], processors={"w1": _resident_processor()})
+
+        self.assertEqual(await sweep.run_once(), [])
+        self.assertIsNotNone(lifecycle.get_watcher_state("w1"))
+
+    async def test_one_transition_per_pass_across_the_whole_life(self):
+        """The cascade §2.5 forbids, walked pass by pass: a watcher active at
+        shutdown and forty days stale takes idle at the first sweep, holds at
+        the second (its dropped_at is that pass's own stamp), and expires only
+        a full expire-TTL later."""
+        record = _record(age_days=40.0)
+        proc = _resident_processor()
+        sweep, lifecycle, _ = _harness([record], processors={"w1": proc})
+
+        # Pass 1: idled, not expired.
+        self.assertEqual(await sweep.run_once(), ["w1"])
+        self.assertEqual(record.dropped_at, _iso(NOW))
+        self.assertIsNotNone(lifecycle.get_watcher_state("w1"))
+
+        # Pass 2, same day: nothing — the expiry clock started at pass 1.
+        self.assertEqual(await sweep.run_once(), [])
+        self.assertIsNotNone(lifecycle.get_watcher_state("w1"))
+
+        # A full expire-TTL later: reclaimed.
+        sweep._now = lambda: NOW + timedelta(days=15)
+        self.assertEqual(await sweep.run_once(), ["w1"])
+        self.assertIsNone(lifecycle.get_watcher_state("w1"))
+
+
+class TestPastExpireTtl(unittest.TestCase):
+    def test_no_dropped_at_answers_false(self):
+        from gateway.core.state import past_expire_ttl
+
+        self.assertFalse(past_expire_ttl(_record(age_days=400.0), NOW))
+
+    def test_reads_the_frozen_expire_days(self):
+        from gateway.core.state import past_expire_ttl
+
+        short = _record(expire_days=15,
+                        dropped_at=_iso(NOW - timedelta(days=16)))
+        long = _record(expire_days=30,
+                       dropped_at=_iso(NOW - timedelta(days=16)))
+        self.assertTrue(past_expire_ttl(short, NOW))
+        self.assertFalse(past_expire_ttl(long, NOW))
 
 
 class TestPastIdleTtl(unittest.TestCase):

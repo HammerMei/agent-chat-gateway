@@ -177,6 +177,27 @@ class TestCreation(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.last_activity_at, "")
         lifecycle.save_state.assert_not_called()
 
+    async def test_a_recreation_against_a_reclaimed_record_raises_for_retry(self):
+        """The expire-vs-wake race (§2.5): the record this wake dispatched
+        against was reclaimed while it waited on the watcher lock. Raised, not
+        None — None would remember the trigger as a decline, and the correct
+        outcome for a reclaimed room is a retry that re-enters get_or_create
+        and lands in _create, with this frame as the fresh watcher's trigger."""
+        from gateway.core.watcher_manager import StaleRecordError
+
+        manager, lifecycle, _ = _manager()
+        record = WatcherState(
+            watcher_name="w", session_id="s1", room_id="r1",
+            config={"name": "w", "connector": "rc", "room": "eng-backend",
+                    "agent": "claude"})
+        # The dispatch read finds the record; the re-check under the lock
+        # finds it reclaimed.
+        lifecycle.record_for_room = MagicMock(side_effect=[record, None])
+
+        with self.assertRaises(StaleRecordError):
+            await manager.get_or_create("rc", _room())
+        lifecycle.start_watcher_in_room.assert_not_called()
+
     async def test_a_disarmed_manager_declines_every_offer(self):
         """Shutdown disarms the manager before anything stops (§2.5): the wake
         arms stay reachable until the connector disconnects, and a creation
