@@ -930,6 +930,67 @@ class TestSubscribeRoomRollback(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("new-room", connector._room_refcount)
 
 
+class TestHostileRoomIdsAreContained(unittest.TestCase):
+    """The attachment cache path is fenced (§2.3): the id comes from the
+    server, and expiry `rmtree`s the directory it names, so no id may name a
+    path outside the cache base. Dot components survive a character-class
+    sanitize — dots are legal filename characters — which is why the fence is
+    `resolve_under`, not the regex."""
+
+    def test_dot_components_and_empties_are_refused_outright(self):
+        connector = _make_connector()
+        for rid in ("..", ".", ""):
+            with self.subTest(rid=rid):
+                self.assertIsNone(connector.attachment_cache_dir(rid))
+
+    def test_no_id_resolves_outside_the_cache_base(self):
+        connector = _make_connector()
+        base = Path("/tmp/test-cache").resolve()
+        for rid in ("a/../b", "../../etc", "x\\..\\y", "GENERAL123", "室內"):
+            with self.subTest(rid=rid):
+                p = connector.attachment_cache_dir(rid)
+                if p is None:
+                    continue  # refused is also contained
+                resolved = Path(p).resolve()
+                self.assertTrue(
+                    resolved.is_relative_to(base) and resolved != base,
+                    f"{rid!r} escaped to {resolved}",
+                )
+
+    def test_a_real_id_resolves_where_it_always_did(self):
+        connector = _make_connector()
+        self.assertEqual(
+            connector.attachment_cache_dir("GENERAL123abcDEF0"),
+            str(Path("/tmp/test-cache") / "GENERAL123abcDEF0"),
+        )
+
+    def test_reclaim_of_a_hostile_id_deletes_nothing(self):
+        """The destructive consumer, end to end: expiry's reclaim given an id
+        spelling '..' must not delete the directory above the cache base."""
+        import tempfile
+
+        from gateway.core.attachment_workspace import AttachmentWorkspace
+        from gateway.core.paths import room_path_key
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / "cache" / "rc"
+            base.mkdir(parents=True)
+            sentinel = Path(td) / "cache" / "sentinel.txt"
+            sentinel.write_text("must survive")
+            working = Path(td) / "wd"
+            working.mkdir()
+
+            connector = _make_connector()
+            connector._attachments_cache_base = base
+            workspace = AttachmentWorkspace(connector)
+
+            workspace.reclaim(room_path_key("rc", ".."), "..", str(working))
+
+            self.assertTrue(sentinel.exists(),
+                            "reclaim escaped the cache base and deleted its parent")
+            self.assertTrue(base.exists())
+
+
 class TestSubscribeRoomIsIdempotentPerWatcher(unittest.IsolatedAsyncioTestCase):
     """The same watcher re-subscribing to a room it already holds must not leak.
 

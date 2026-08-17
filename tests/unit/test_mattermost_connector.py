@@ -1689,6 +1689,33 @@ class TestEveryWayOfNotDeliveringGivesTheTurnBack(unittest.IsolatedAsyncioTestCa
         self.assertEqual(self._turns(c), 1)
 
 
+class TestHostileChannelIdsAreContained(unittest.TestCase):
+    """Rocket.Chat's twin — same fence, same reason (§2.3): the character
+    sanitize alone lets `..` through, and expiry `rmtree`s this path."""
+
+    def test_dot_components_and_empties_are_refused_outright(self):
+        connector = _make_connector()
+        for cid in ("..", ".", ""):
+            with self.subTest(cid=cid):
+                self.assertIsNone(connector.attachment_cache_dir(cid))
+
+    def test_no_id_resolves_outside_the_cache_base(self):
+        from pathlib import Path
+
+        connector = _make_connector()
+        base = connector._attachments_cache_base.resolve()
+        for cid in ("a/../b", "../../etc", "x\\..\\y", "chan123"):
+            with self.subTest(cid=cid):
+                p = connector.attachment_cache_dir(cid)
+                if p is None:
+                    continue  # refused is also contained
+                resolved = Path(p).resolve()
+                self.assertTrue(
+                    resolved.is_relative_to(base) and resolved != base,
+                    f"{cid!r} escaped to {resolved}",
+                )
+
+
 class TestAnIdleChannelWakesOnItsNextMessage(unittest.IsolatedAsyncioTestCase):
     """The wake (§2.5), Mattermost's twin of Rocket.Chat's.
 
