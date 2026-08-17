@@ -1061,6 +1061,12 @@ class MattermostConnector(Connector):
             # member list — §2.3); `RoomRef.name` is the platform's own name, empty
             # for both DM kinds by contract.
             name="" if kind.is_direct else (state.room.name or ""),
+            # Empty where Rocket.Chat's twin reads its permanent DM cache: Mattermost
+            # gets participants from event metadata, and the tracked state keeps
+            # none. Rule matching keys on the kind, and a room with a record never
+            # consults this ref's participants — the only consequence lives on the
+            # recordless-DM wake edge, where `_create` labels the watcher by digest
+            # rather than counterpart. Display-only, accepted.
             participants=(),
         )
 
@@ -1129,6 +1135,12 @@ class MattermostConnector(Connector):
         pause, cap) does not raise and is final. Unlike RC there is no
         classification stage: the kind arrived free on the event.
         """
+        # Whether the routing decision was *completed* — see Rocket.Chat's twin:
+        # a decline is an answer and its frames are remembered; a park or a
+        # cancellation is the absence of one, and remembering those ids would
+        # have the park's promised recovery — the next wake's replay from the
+        # record watermark — die at the dedup check, silently.
+        declined = False
         try:
             async def offer() -> None:
                 try:
@@ -1141,7 +1153,7 @@ class MattermostConnector(Connector):
                     )
                     return
 
-            await route_attempts(
+            declined = await route_attempts(
                 offer, retry_on=Exception,
                 delays=self._ROUTE_RETRY_DELAYS, logger=logger,
                 label=f"Creating a watcher for channel {channel_id}",
@@ -1155,28 +1167,42 @@ class MattermostConnector(Connector):
             frames = ended.drain() if ended is not None else []
             state = self._channels.get(channel_id)
             if state is not None and not self._channel_is_served(channel_id):
-                # Tracked and still unserved: the offer declined — no rule claims the
-                # channel, its record is paused, or a static-model record owns it.
-                # Served, not tracked, decides delivery here: these frames' only
-                # tracked-path outcome is the UNROUTED arm, which routes them straight
-                # back into a new episode — a hot loop with no delay in it, entered by
-                # every message to a declined channel.
-                #
-                # Re-remembered (the wake arm forgot them so a served redelivery could
-                # pass the dedup check): the decline is a configuration state and can
-                # persist indefinitely, so an id left unknown would have every
-                # reconnect re-fetch and re-offer a batch that can never be spent. The
-                # watermark is left where it is, so a user who resends is served
-                # normally once a watcher exists (§2.7).
-                for frame in frames:
-                    fid = frame["post"].get("id", "")
-                    if fid:
-                        self._remember_seen(state, fid)
-                if frames:
+                # Tracked and still unserved. Served, not tracked, decides delivery
+                # here: these frames' only tracked-path outcome is the UNROUTED arm,
+                # which routes them straight back into a new episode — a hot loop
+                # with no delay in it, entered by every message to a declined
+                # channel. What happens to the ids depends on WHICH way the offer
+                # ended — see Rocket.Chat's twin of this branch.
+                if declined:
+                    # A completed decline: re-remembered (the wake arm forgot them
+                    # so a served redelivery could pass the dedup check). The
+                    # decline is a configuration state and can persist
+                    # indefinitely, so an id left unknown would have every
+                    # reconnect re-fetch and re-offer a batch that can never be
+                    # spent. The watermark is left where it is, so a user who
+                    # resends is served normally once a watcher exists (§2.7).
+                    for frame in frames:
+                        fid = frame["post"].get("id", "")
+                        if fid:
+                            self._remember_seen(state, fid)
+                    if frames:
+                        logger.warning(
+                            "Channel %s: dropping %d buffered frame(s) — no watcher "
+                            "took the channel. A declined offer: no rule claims it, "
+                            "or its record is paused.", channel_id, len(frames),
+                        )
+                elif frames:
+                    # Parked or cancelled: the decision was never made, and this
+                    # channel HAS a record — the park's promised recovery is the
+                    # next wake's replay from that record's watermark (§2.2), and
+                    # a remembered id would have it die at the dedup check. The
+                    # wake arm already forgot the trigger and claimed a boundary
+                    # below it (`_keep_replayable`), so the ids stay unknown and
+                    # the window stays open.
                     logger.warning(
-                        "Channel %s: dropping %d buffered frame(s) — no watcher took "
-                        "the channel. A declined offer: no rule claims it, or its "
-                        "record is paused.", channel_id, len(frames),
+                        "Channel %s: %d buffered frame(s) not delivered — the offer "
+                        "parked or was cancelled. Their ids stay unknown so the "
+                        "next wake's replay recovers them.", channel_id, len(frames),
                     )
             elif state is not None:
                 # Same rule, same mechanism, same reason as Rocket.Chat's: the
@@ -1493,12 +1519,13 @@ class MattermostConnector(Connector):
     def _release_turn_for(self, post: dict, result, generation: int, reason: str) -> None:
         """Give back the turn a post took, for a post that was not delivered.
 
-        One place, because Mattermost has **six** ways to decline a post after the filter
-        has already charged it — no watcher for the channel, the preflight for a replay,
-        the preflight for live traffic, normalization raising, the handler raising, and the
-        handler queue — and they were added one at a time. The count is in the comment
-        because it was wrong here once: it said three, which was true when three of the six
-        released and nobody had counted the rest.
+        One place, because Mattermost has **seven** ways to decline a post after the
+        filter has already charged it — the wake (the post is re-charged when the
+        episode redelivers it), the no-router drop, the preflight for a replay, the
+        preflight for live traffic, normalization raising, the handler raising, and
+        the handler queue — and they were added one at a time. The count is in the
+        comment because it was wrong here twice: it said three when three of six
+        released, and six after the wake made it seven.
         """
         if not result.agent_chain_token or self._turn_store is None:
             return

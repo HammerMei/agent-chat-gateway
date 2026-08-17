@@ -1842,6 +1842,76 @@ class TestADeclinedChannelWakeDoesNotLoop(unittest.IsolatedAsyncioTestCase):
                          "each new message re-asks once — bounded, not a loop")
 
 
+class TestAParkedChannelWakeStaysRecoverable(unittest.IsolatedAsyncioTestCase):
+    """A park is not a decline — see Rocket.Chat's twin. The wake arm forgot
+    the optimistically-registered id (`_keep_replayable`), and a park must
+    leave it forgotten: the next wake's replay from the record watermark is
+    the recovery, and a re-remembered id has it die at the dedup check."""
+
+    def setUp(self):
+        self.delivered: list[str] = []
+        self.offers = 0
+
+    async def _connector(self):
+        connector = _make_connector(filter_sender=False)
+        connector._config.require_mention = False
+        connector._ROUTE_RETRY_DELAYS = ()  # park after one attempt
+        room = Room(id="chan1", name="general", type="channel")
+        connector._ws.register_channel = MagicMock()
+        await connector.subscribe_room(room, watcher_id="w1")
+        connector._rest.resolve_username = AsyncMock(return_value="alice")
+        connector.register_capacity_check(lambda *a, **kw: RoomCapacity.UNROUTED)
+        connector.register_handler(AsyncMock(return_value=True))
+        connector._ws.deliver_to_channel = MagicMock(
+            side_effect=lambda decoded: self.delivered.append(decoded["post"]["id"]))
+
+        async def _parking_router(room_ref, trigger):
+            self.offers += 1
+            raise RuntimeError("backend down")
+
+        connector.register_router(_parking_router)
+        return connector
+
+    def _event(self, post_id="p1", create_at=500):
+        return {"post": {"id": post_id, "channel_id": "chan1", "user_id": "u1",
+                         "message": "hi", "root_id": "", "type": "",
+                         "create_at": create_at},
+                "mentions": []}
+
+    async def _settle(self, connector):
+        from tests.helpers import settle_routing_tasks
+
+        await settle_routing_tasks(connector)
+
+    async def test_parked_frames_are_not_re_remembered(self):
+        connector = await self._connector()
+        state = connector._channels["chan1"]
+
+        await connector._on_posted_event(self._event())
+        await self._settle(connector)
+
+        self.assertEqual(self.offers, 1)
+        self.assertEqual(self.delivered, [])
+        self.assertNotIn(
+            "p1", state.seen_ids_set,
+            "a re-remembered id would have the recovery replay die at dedup",
+        )
+        self.assertTrue(state.replay_boundary,
+                        "the wake arm's claim holds the window open")
+
+    async def test_the_same_post_can_reopen_an_episode_after_a_park(self):
+        connector = await self._connector()
+
+        await connector._on_posted_event(self._event())
+        await self._settle(connector)
+        await connector._on_posted_event(
+            self._event(), is_replay=True, replay_after_ts="400")
+        await self._settle(connector)
+
+        self.assertEqual(self.offers, 2,
+                         "the parked frame is re-offerable, not suppressed")
+
+
 class TestAPageOfSystemPostsIsNotAnEmptyWindow(unittest.IsolatedAsyncioTestCase):
     """`per_page` is applied before ACG filters system posts out.
 

@@ -4487,6 +4487,97 @@ class TestADeclinedWakeDoesNotLoop(unittest.IsolatedAsyncioTestCase):
                          "each new message re-asks once — bounded, not a loop")
 
 
+class TestAParkedWakeStaysRecoverable(unittest.IsolatedAsyncioTestCase):
+    """A park is not a decline, and confusing them loses the message for good.
+
+    A parked room's promised recovery is the next wake's replay from the
+    record's watermark (`route_attempts`' own contract) — a remembered id has
+    that replay die at the dedup check, silently and permanently. So the
+    drain's remember applies to completed declines only; a park's ids stay
+    unknown, and the wake arm's boundary claim keeps the window open so a
+    replay batch cannot spend it on frames that only reached the buffer.
+    """
+
+    def setUp(self):
+        self.delivered: list[str] = []
+        self.offers = 0
+
+    def _connector(self):
+        connector = _make_connector()
+        connector._config.require_mention = False
+        connector._config.filter_sender = False
+        connector._handler = AsyncMock(return_value=True)
+        connector._capacity_check = lambda rid: RoomCapacity.UNROUTED
+        connector._ROUTE_RETRY_DELAYS = ()  # park after one attempt, not ~3.5s
+        connector._ws.deliver_to_room = MagicMock(
+            side_effect=lambda rid, doc, access=None, **kw:
+                self.delivered.append(doc["_id"])
+        )
+
+        async def _parking_router(room, trigger):
+            # A creation started and not carried out (§2.2 outcome 4): the
+            # backend is down, every attempt raises, the room parks.
+            self.offers += 1
+            raise RuntimeError("backend down")
+
+        connector.register_router(_parking_router)
+        return connector
+
+    def _doc(self, mid="m1", ts=500):
+        return {"_id": mid, "rid": "room-1", "msg": "hi",
+                "u": {"username": "alice"}, "ts": {"$date": ts}}
+
+    async def _settle(self, connector):
+        from tests.helpers import settle_routing_tasks
+
+        await settle_routing_tasks(connector)
+
+    async def test_parked_frames_are_not_remembered(self):
+        connector = self._connector()
+        sub = connector._rooms["room-1"]
+
+        await connector._on_raw_ddp_message("room-1", self._doc())
+        await self._settle(connector)
+
+        self.assertEqual(self.offers, 1)
+        self.assertEqual(self.delivered, [])
+        self.assertNotIn(
+            "m1", sub.seen_ids_set,
+            "a remembered id would have the recovery replay die at dedup",
+        )
+
+    async def test_the_wake_arm_claims_a_boundary_below_the_frame(self):
+        """The Mattermost twin does this via _keep_replayable; without it a
+        *replayed* frame that parks leaves the batch reporting itself
+        all-accepted, and the discharge spends the outage window on a frame
+        that only reached the episode buffer."""
+        connector = self._connector()
+        sub = connector._rooms["room-1"]
+        sub.last_processed_ts = "400"
+
+        await connector._on_raw_ddp_message("room-1", self._doc("m1", 500))
+        await self._settle(connector)
+
+        self.assertTrue(sub.replay_boundary,
+                        "the window is held open below the parked frame")
+        self.assertTrue(_ts_gt("500", sub.replay_boundary),
+                        "the claim points below the frame it preserves")
+
+    async def test_the_same_message_can_reopen_an_episode_after_a_park(self):
+        """The recovery path in miniature: the replay redelivers the same id,
+        and a park must not have suppressed it."""
+        connector = self._connector()
+
+        await connector._on_raw_ddp_message("room-1", self._doc())
+        await self._settle(connector)
+        await connector._on_raw_ddp_message(
+            "room-1", self._doc(), is_replay=True, replay_after_ts="400")
+        await self._settle(connector)
+
+        self.assertEqual(self.offers, 2,
+                         "the parked frame is re-offerable, not suppressed")
+
+
 class TestTheFirstMessageIntoARoomKeepsARetryCursor(unittest.IsolatedAsyncioTestCase):
     """`boundary or watermark` is nothing when a room has neither.
 

@@ -981,6 +981,14 @@ class RocketChatConnector(Connector):
         pending = PendingRoute(self._PENDING_BUFFER_DEPTH)
         pending.add(doc.get("_id", ""), (doc, access))
         self._pending_routes[room_id] = pending
+        # Whether the routing decision was *completed* — a decline is an answer
+        # ("no watcher": rule miss, pause, cap), a park or a cancellation is the
+        # absence of one, and the drain below must treat them oppositely: a
+        # declined frame is remembered so it cannot re-offer forever, a parked
+        # frame's id must stay unknown or the recovery the park is promised —
+        # the next wake's replay from the record watermark — dies at the dedup
+        # check, silently.
+        declined = False
         try:
             # Stage 1 — classify, unless the caller already holds the answer (the
             # wake, whose room was classified when it was first routed). Only
@@ -1002,7 +1010,8 @@ class RocketChatConnector(Connector):
                     return  # parked; the finally drops the buffer
                 room = resolved["room"]
             if room is None:
-                return  # final: no name to match, or no counterpart to classify by
+                declined = True  # final: no name to match, or no counterpart
+                return
 
             # Stage 2 — offer. The router raising means a creation was started
             # and not carried out (§2.2 outcome 4) — retryable, because the
@@ -1022,7 +1031,11 @@ class RocketChatConnector(Connector):
                     )
                     return
 
-            await route_attempts(
+            # True when the offer ran to completion (its answer may still be
+            # "no watcher" — that is the decline); False when every attempt
+            # raised and the room parked. A cancellation propagates past this
+            # line, leaving `declined` False, which is the same honest answer.
+            declined = await route_attempts(
                 offer, retry_on=Exception,
                 delays=self._ROUTE_RETRY_DELAYS, logger=logger,
                 label=f"Creating a watcher for room {room_id[:8]}",
@@ -1040,25 +1053,41 @@ class RocketChatConnector(Connector):
             frames = ended.drain() if ended is not None else []
             sub = self._rooms.get(room_id)
             if sub is not None and not self._room_is_served(room_id):
-                # Tracked and still unserved: the offer declined — no rule claims the
-                # room, its record is paused, or a static-model record owns it. Served,
-                # not tracked, decides delivery here for the same reason it does above:
-                # these frames' only tracked-path outcome is the UNROUTED arm, which
-                # routes them straight back into a new episode — a hot loop with no
-                # delay in it, entered by every message to a declined room.
+                # Tracked and still unserved. Served, not tracked, decides delivery
+                # here for the same reason it does above: these frames' only
+                # tracked-path outcome is the UNROUTED arm, which routes them
+                # straight back into a new episode — a hot loop with no delay in
+                # it, entered by every message to a declined room.
                 #
-                # Remembered, exactly as the arm remembers a frame it drops today: the
-                # decline is a configuration state and can persist indefinitely, so an
-                # id left unknown would have every reconnect re-fetch and re-offer a
-                # batch that can never be spent. The watermark is left where it is, so
-                # a user who resends is served normally once a watcher exists (§2.7).
-                for pending_doc, _ in frames:
-                    sub.remember(pending_doc.get("_id", ""))
-                if frames:
+                # What happens to the ids depends on WHICH way the offer ended,
+                # because the two promises point in opposite directions:
+                if declined:
+                    # A completed decline — no rule claims the room, its record is
+                    # paused. A configuration state that can persist indefinitely,
+                    # so an id left unknown would have every reconnect re-fetch and
+                    # re-offer a batch that can never be spent. Remembered, exactly
+                    # as the old arm remembered the frames it dropped. The watermark
+                    # is left where it is, so a user who resends is served normally
+                    # once a watcher exists (§2.7).
+                    for pending_doc, _ in frames:
+                        sub.remember(pending_doc.get("_id", ""))
+                    if frames:
+                        logger.warning(
+                            "Room %s: dropping %d buffered frame(s) — no watcher took "
+                            "the room. A declined offer: no rule claims it, or its "
+                            "record is paused.", room_id[:8], len(frames),
+                        )
+                elif frames:
+                    # Parked (every attempt raised) or cancelled: the decision was
+                    # never made, and this room HAS a record — the park's promised
+                    # recovery is the next wake's replay from that record's
+                    # watermark (§2.2). A remembered id would have that replay die
+                    # at the dedup check, silently and permanently; unknown ids are
+                    # exactly what lets it bring these frames back.
                     logger.warning(
-                        "Room %s: dropping %d buffered frame(s) — no watcher took the "
-                        "room. A declined offer: no rule claims it, or its record is "
-                        "paused.", room_id[:8], len(frames),
+                        "Room %s: %d buffered frame(s) not delivered — the offer "
+                        "parked or was cancelled. Their ids stay unknown so the "
+                        "next wake's replay recovers them.", room_id[:8], len(frames),
                     )
             elif sub is not None:
                 # **Claim the window before handing the frames over.** The
@@ -1961,6 +1990,18 @@ class RocketChatConnector(Connector):
                 "Message for room '%s' has no processor — offering the room back "
                 "to the router (wake).", sub.room.name,
             )
+            # Claim a boundary below this frame, exactly as Mattermost's
+            # `_keep_replayable` does on its wake arm. Without it a *replayed*
+            # frame that lands here returns True, the batch reports itself
+            # all-accepted, and `discharge_boundary` spends the outage window
+            # on a frame that is only sitting in an episode buffer — so if the
+            # episode then parks, nothing points below the watermark any more
+            # and the frame is unrecoverable. The claim makes the discharge
+            # refuse; whichever of the served drain or the next recovery runs
+            # discharges it properly, and a claim never narrows an open window.
+            ts = extract_ts(doc)
+            if ts:
+                sub.claim_boundary(sub.last_processed_ts, _just_before(ts))
             self._release_unused_turn(doc, result, turn_generation, "waking the room")
             task = asyncio.create_task(
                 self._route_room(
