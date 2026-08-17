@@ -949,6 +949,47 @@ class TestSubscribeRoomRollback(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("new-room", connector._room_refcount)
 
 
+class TestSubscribeRoomIsIdempotentPerWatcher(unittest.IsolatedAsyncioTestCase):
+    """The same watcher re-subscribing to a room it already holds must not leak.
+
+    A wake after an idle drop runs the same start path a fresh creation does
+    (§2.5), and the idle drop deliberately keeps the room tracked (§2.2) — so
+    `subscribe_room` is re-entered for a (room, watcher) pair that is already
+    registered. Appending a second context and bumping the refcount there leaks
+    one of each per idle/wake cycle, and the leaked refcount means the room's
+    real unsubscribe never reaches zero.
+    """
+
+    async def test_same_watcher_resubscribe_does_not_grow_state(self):
+        connector = _make_connector()
+        room = connector._rooms["room-1"].room
+
+        # The fixture already holds watcher "w1" with refcount 1 — a wake.
+        await connector.subscribe_room(room, watcher_id="w1")
+
+        self.assertEqual(connector._room_refcount["room-1"], 1)
+        contexts = connector._watcher_contexts["room-1"]
+        self.assertEqual([c.watcher_id for c in contexts], ["w1"])
+
+        # And after several cycles, still one of each.
+        await connector.subscribe_room(room, watcher_id="w1")
+        await connector.subscribe_room(room, watcher_id="w1")
+        self.assertEqual(connector._room_refcount["room-1"], 1)
+        self.assertEqual(
+            [c.watcher_id for c in connector._watcher_contexts["room-1"]], ["w1"])
+
+    async def test_a_different_watcher_still_refcounts(self):
+        connector = _make_connector()
+        room = connector._rooms["room-1"].room
+
+        await connector.subscribe_room(room, watcher_id="w2")
+
+        self.assertEqual(connector._room_refcount["room-1"], 2)
+        self.assertEqual(
+            [c.watcher_id for c in connector._watcher_contexts["room-1"]],
+            ["w1", "w2"])
+
+
 # ── Tests: _on_raw_ddp_message edge paths (T3) ───────────────────────────────
 
 

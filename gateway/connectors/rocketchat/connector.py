@@ -1183,8 +1183,26 @@ class RocketChatConnector(Connector):
         )
 
         if room.id in self._rooms:
+            contexts = self._watcher_contexts.setdefault(room.id, [])
+            for i, existing in enumerate(contexts):
+                if existing.watcher_id == ctx.watcher_id:
+                    # The same watcher re-subscribing to a room it already holds — a
+                    # wake after an idle drop, which keeps the room tracked (§2.2) and
+                    # then runs the same start path a fresh creation does. Idempotent,
+                    # like the dispatcher's claim ("replaces its own; refuses
+                    # another's"): appending a second context and bumping the refcount
+                    # here would leak one of each per idle/wake cycle, and the leaked
+                    # refcount means the room's real unsubscribe never reaches zero.
+                    contexts[i] = ctx
+                    logger.debug(
+                        "Room '%s' (id=%s) already subscribed by watcher '%s' — "
+                        "replaced its context, refcount stays %d",
+                        room.name, room.id, ctx.watcher_id,
+                        self._room_refcount[room.id],
+                    )
+                    return
             self._room_refcount[room.id] += 1
-            self._watcher_contexts.setdefault(room.id, []).append(ctx)
+            contexts.append(ctx)
             logger.debug(
                 "Room '%s' (id=%s) already subscribed — added watcher '%s', refcount=%d",
                 room.name,
