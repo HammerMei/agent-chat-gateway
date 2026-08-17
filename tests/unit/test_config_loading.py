@@ -2341,6 +2341,10 @@ class TestStaticShapeIsAHardError(unittest.TestCase):
         self.assertIn("docs/migration-dynamic-watchers.md", msg)
         self.assertIn("not a 1:1 rename", msg,
                       "the sharp edges are stated, not discovered")
+        # This error is the upgrade's guaranteed touchpoint: anyone with
+        # static records had static config, so they read this BEFORE the
+        # first post-rewrite boot prunes those records (owner, 2026-08-17).
+        self.assertIn("RESETS every existing watcher session", msg)
 
     def test_a_rooms_list_is_the_same_hard_error(self):
         msg = self._msg("- rooms: [general, dev]\n")

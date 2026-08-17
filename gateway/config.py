@@ -1443,9 +1443,11 @@ def _static_shape_error(entry: object, index: int) -> str:
         f"Watcher entry '{label}': the static watcher shape (a 'room:' key, or "
         f"'rooms:' as a list) has been removed — watchers are now created from "
         f"rules, where 'rooms:' is a mapping ('rooms: {{include: [...]}}'). "
-        f"Rewrite this entry as a rule; see docs/migration-dynamic-watchers.md "
-        f"— it is not a 1:1 rename (each room gets its own watcher and a fresh "
-        f"session, and a paused room must be re-expressed as 'rooms.except_for')."
+        f"Rewrite this entry as a rule, and note the upgrade RESETS every "
+        f"existing watcher session: the old records are reclaimed at the next "
+        f"start, each room begins a fresh session on its first message, and a "
+        f"paused room must be re-expressed as 'rooms.except_for'. It is not a "
+        f"1:1 rename — see docs/migration-dynamic-watchers.md before rewriting."
     )
 
 
