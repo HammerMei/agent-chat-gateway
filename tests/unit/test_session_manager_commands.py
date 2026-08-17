@@ -235,18 +235,24 @@ class TestShutdownOrdering(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(call_order[:2], ["stop_all", "save_state"])
 
-    async def test_the_manager_is_disarmed_before_anything_stops(self):
+    async def test_the_manager_is_drained_before_anything_stops(self):
         """The wake arms stay reachable until the connector disconnects, so a
         shutdown that stops things before disarming leaves a window where an
         idle room's message recreates a watcher nothing below will stop —
         absent from stop_all's snapshot, its save rewriting the state file
-        after the final save (§2.5)."""
+        after the final save (§2.5). Since Codex round 5 the first step is
+        `drain()` — disarm PLUS waiting out in-flight starts, because an
+        episode already inside start_watcher_in_room installs its processor
+        after stop_all's snapshot."""
         mgr = _make_manager()
         call_order: list[str] = []
 
         mgr._watcher_manager = MagicMock()
-        mgr._watcher_manager.disarm = MagicMock(
-            side_effect=lambda: call_order.append("disarm"))
+
+        async def _drain():
+            call_order.append("drain")
+
+        mgr._watcher_manager.drain = _drain
         sweep = MagicMock()
 
         async def _sweep_stop():
@@ -262,7 +268,7 @@ class TestShutdownOrdering(unittest.IsolatedAsyncioTestCase):
 
         await mgr.shutdown()
 
-        self.assertEqual(call_order[:3], ["disarm", "sweep_stop", "stop_all"])
+        self.assertEqual(call_order[:3], ["drain", "sweep_stop", "stop_all"])
 
     async def test_disconnect_called_after_save_state(self):
         mgr = _make_manager()
@@ -360,12 +366,16 @@ class TestTheRouterWiring(unittest.IsolatedAsyncioTestCase):
         names = [c[0] for c in parent.mock_calls]
         self.assertEqual(names, ["register_router", "connect"])
 
-    async def test_no_rules_means_no_router_and_no_behaviour_change(self):
-        """A static-only deployment keeps its exact delivery behaviour —
-        registering a router flips Rocket.Chat to subscribe-all."""
+    async def test_no_rules_still_registers_the_router(self):
+        """INVERTED with Codex round 5's fix (the old pin protected
+        static-only deployments, which no longer load): the manager and the
+        router now exist unconditionally — removing a connector's last rule
+        must not strand its hydrated rule-derived records with no router, no
+        recreation and no replay. RC running subscribe-all with zero rules
+        (every offer declined) is the named, accepted consequence."""
         mgr, connector = self._real_manager([])
         await mgr.connect_only()
-        connector.register_router.assert_not_called()
+        connector.register_router.assert_called_once()
 
     # The startup-replay ordering is pinned in test_startup_replay.py, which
     # asserts all four points (sync -> snapshot -> inbound -> replay). Stating

@@ -494,5 +494,116 @@ class TestAWakeParkedOnTheLockRespectsShutdown(unittest.IsolatedAsyncioTestCase)
         )
 
 
+class TestDrainWaitsOutInflightStarts(unittest.IsolatedAsyncioTestCase):
+    """Codex round 5 (P1): the disarm flag only stops NEW episodes — one
+    already inside `start_watcher_in_room` (awaiting session creation)
+    installs its processor after `stop_all` snapshots `_processors` and is
+    never stopped, its save rewriting state after the final save. `drain()`
+    disarms and then waits the in-flight episode out, so the snapshot taken
+    after it returns includes the processor."""
+
+    _harness = TestTheWakeResumesTheSameSession._harness
+    _settle = TestTheWakeResumesTheSameSession._settle
+
+    async def test_drain_waits_and_the_processor_is_visible_after(self):
+        connector, lifecycle, dispatcher = await self._harness()
+        manager = self.manager
+        gate = asyncio.Event()
+        agent = lifecycle._agents["default"]
+        real_create = agent.create_session
+
+        async def gated_create(*args, **kwargs):
+            await gate.wait()
+            return await real_create(*args, **kwargs)
+
+        agent.create_session = gated_create
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            MockProc.return_value.stop = AsyncMock()
+
+            # The episode, in flight: parked inside start_watcher_in_room on
+            # the gated session creation. As a task, because the unrouted
+            # path awaits creation inline.
+            episode = asyncio.create_task(
+                connector._on_unrouted_message(_doc("m1", 1500), _ACCESS))
+            for _ in range(10):
+                await asyncio.sleep(0)
+
+            drain_task = asyncio.create_task(manager.drain())
+            for _ in range(10):
+                await asyncio.sleep(0)
+            self.assertFalse(drain_task.done(),
+                             "drain must wait for the in-flight start")
+
+            gate.set()
+            await drain_task
+            await episode
+            await self._settle(connector)
+
+        self.assertIsNotNone(
+            lifecycle.processor_named("rc-eng-backend"),
+            "the episode finished BEFORE drain returned — its processor is "
+            "inside the snapshot stop_all takes next",
+        )
+        self.assertTrue(manager.disarmed, "drain disarms first")
+
+
+class TestARuleLessManagerStillWakesRecords(unittest.IsolatedAsyncioTestCase):
+    """Codex round 5 (P1): the manager used to exist only when rules did — a
+    pre-cutover gate protecting static-only deployments, which no longer
+    load. Its post-cutover victim: removing a connector's LAST rule left its
+    hydrated rule-derived records with no router, no boot recreation and no
+    replay — every existing session unreachable, despite §2.4 keeping the
+    records until expiry. The manager now always exists; with an empty rule
+    list it recreates persisted records and declines genuinely new rooms."""
+
+    _harness = TestTheWakeResumesTheSameSession._harness
+    _settle = TestTheWakeResumesTheSameSession._settle
+
+    async def test_the_session_manager_constructs_it_unconditionally(self):
+        from tests.helpers import make_manager
+
+        mgr = make_manager(watcher_rules=[])
+        self.assertIsNotNone(mgr._watcher_manager,
+                             "no rules is not no manager — persisted records "
+                             "still need recreation, replay and the sweep")
+
+    async def test_a_persisted_record_wakes_under_an_empty_rule_list(self):
+        connector, lifecycle, dispatcher = await self._harness()
+        name = "rc-eng-backend"
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+
+            # Created while the rule existed.
+            await connector._on_unrouted_message(_doc("m1", 1500), _ACCESS)
+            record = lifecycle.get_watcher_state(name)
+            session_id = record.session_id
+            proc = lifecycle.processor_named(name)
+            lifecycle._processors.pop(name)
+            dispatcher.remove_processor(ROOM_ID, proc)
+
+            # The operator removes the last rule and restarts, in miniature:
+            # a manager with NO current rules over the same lifecycle.
+            ruleless = WatcherManager("rc", connector, lifecycle, [])
+
+            async def router(room, trigger):
+                await ruleless.get_or_create(
+                    "rc", room,
+                    history_before_ts=connector.trigger_history_bound(trigger))
+
+            connector.register_router(router)
+
+            await connector._on_raw_ddp_message(ROOM_ID, _doc("m2", 1600))
+            await self._settle(connector)
+
+        woken = lifecycle.get_watcher_state(name)
+        self.assertEqual(woken.session_id, session_id,
+                         "sticky binding: the record is the recreation "
+                         "source — current rules are never consulted")
+        self.assertIsNotNone(lifecycle.processor_named(name))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -87,28 +87,29 @@ class SessionManager:
             permission_registry=permission_registry,
             maps=maps,
         )
-        # The creation path (§2.7/§2.8) exists only when rules do. Gated on the
-        # rules rather than always-on because registering a router changes what
-        # the connector *asks for* — Rocket.Chat switches to subscribe-all — and
-        # a static-only deployment must keep its exact delivery behaviour until
-        # its operator writes a rule.
-        self._watcher_manager = (
-            WatcherManager(state_name, connector, self._lifecycle, watcher_rules)
-            if watcher_rules
-            else None
-        )
-        # The idle sweep exists only where rule-derived watchers do: a static
-        # deployment's lifecycle is config.yaml's, and its records carry no
-        # frozen rule for the sweep to read anyway (§2.5). And only where the
-        # transport can wake what the sweep drops: §2.6 rules eager connectors
-        # (Script, Voice) "never" idle-eligible — no message can ever arrive
-        # to wake an idled room there, so a timer that dropped one would be
-        # muting it permanently. One capability, one gate.
+        # The manager is constructed UNCONDITIONALLY, empty rule list and all
+        # (Codex round 5, P1). It was once gated on rules existing — a
+        # pre-cutover rule protecting static-only deployments' delivery
+        # behaviour — but that deployment shape no longer loads, and the gate
+        # had acquired a new victim: a connector whose operator removed its
+        # last rule still hydrates its self-sufficient rule-derived records
+        # (§2.4 keeps them until expiry), and without a manager those records
+        # got no router, no boot recreation, no replay and no sweep — every
+        # existing session unreachable, silently. With an empty rule list the
+        # manager recreates persisted records and merely declines genuinely
+        # new rooms. Consequence, named: the router is now always registered,
+        # so Rocket.Chat runs subscribe-all even with zero rules — every
+        # offer declined, which is the uniform §2.8 behaviour post-cutover.
+        self._watcher_manager = WatcherManager(
+            state_name, connector, self._lifecycle, watcher_rules)
+        # The idle sweep exists only where the transport can wake what it
+        # drops: §2.6 rules eager connectors (Script, Voice) "never"
+        # idle-eligible — no message can ever arrive to wake an idled room
+        # there, so a timer that dropped one would be muting it permanently.
         self._sweep = (
             LifecycleSweep(self._lifecycle, pending_jobs=pending_jobs,
                            reconcile=self._reconcile_membership)
-            if self._watcher_manager is not None
-            and connector.supports_unsolicited_inbound()
+            if connector.supports_unsolicited_inbound()
             else None
         )
         # Fired by the membership-remove handler for the reclaimed watcher's
@@ -655,8 +656,12 @@ class SessionManager:
             # the connector disconnects, and an idle room's message landing
             # mid-teardown would otherwise recreate a watcher nothing below
             # will stop — absent from stop_all's snapshot, its save rewriting
-            # the state file after the final save (§2.5).
-            self._watcher_manager.disarm()
+            # the state file after the final save (§2.5). `drain` disarms AND
+            # waits out episodes already in flight (Codex round 5): one
+            # already inside `start_watcher_in_room` installs its processor
+            # after stop_all's snapshot, so it must finish — or bail at a
+            # disarm re-check — before the snapshot is taken.
+            await self._watcher_manager.drain()
         if self._sweep is not None:
             # Before stop_all, so a pass cannot overlap the shutdown's own
             # teardown of the processors it is judging.

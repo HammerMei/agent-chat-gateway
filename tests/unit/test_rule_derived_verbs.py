@@ -173,11 +173,14 @@ class TestVerbsOnRuleDerivedRecords(unittest.IsolatedAsyncioTestCase):
                 for _ in range(5):
                     await asyncio.sleep(0)
                 # The reclaim-and-recreate cycle, completed while the verb
-                # waited: a different object under the same name.
+                # waited: a different object under the same name, WITH its
+                # own resident processor.
                 replacement = make_rule_derived_record(
                     name=NAME, room_id=original.room_id)
                 lifecycle._states[NAME] = replacement
-                lifecycle._processors.pop(NAME, None)
+                replacement_proc = MagicMock()
+                replacement_proc.stop = AsyncMock()
+                lifecycle._processors[NAME] = replacement_proc
                 lock.release()
 
                 with self.assertRaises(RuntimeError) as ctx:
@@ -185,6 +188,13 @@ class TestVerbsOnRuleDerivedRecords(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("replaced", str(ctx.exception))
                 self.assertIs(lifecycle.get_watcher_state(NAME), replacement,
                               "the replacement was left untouched")
+                # Round 5: the gates run BEFORE the destructive stop — a
+                # rejected reset must not leave the replacement non-resident.
+                replacement_proc.stop.assert_not_awaited()
+                self.assertIs(lifecycle._processors.get(NAME), replacement_proc,
+                              "the replacement's processor survived the "
+                              "rejected verb")
+                lifecycle._processors.pop(NAME, None)
 
     async def test_reset_refuses_a_pause_that_landed_while_it_waited(self):
         """Codex round 3: the paused refusal runs before the lock, so a pause
@@ -197,19 +207,20 @@ class TestVerbsOnRuleDerivedRecords(unittest.IsolatedAsyncioTestCase):
             MockProc.return_value.stop = AsyncMock()
             await self._create(connector, lifecycle)
 
-            # The pause, landing inside reset's own critical section — the
-            # in-place write the pause verb makes, stamped after the pre-lock
-            # check has already passed.
-            real_stop = lifecycle._stop_processor
-
-            async def stop_then_pause(name):
-                await real_stop(name)
-                lifecycle.get_watcher_state(NAME).paused = True
-
-            lifecycle._stop_processor = stop_then_pause
+            # The pause, landing between reset's pre-lock check and its lock
+            # acquisition — the in-place write the pause verb makes. (It
+            # cannot land INSIDE the critical section: pause needs this same
+            # lock, which is why gates-before-stop is complete — round 5.)
+            lock = lifecycle._get_watcher_lock(NAME)
+            await lock.acquire()
+            task = asyncio.create_task(lifecycle.reset_watcher(NAME))
+            for _ in range(5):  # past the pre-check, parked on the lock
+                await asyncio.sleep(0)
+            lifecycle.get_watcher_state(NAME).paused = True
+            lock.release()
 
             with self.assertRaises(RuntimeError) as ctx:
-                await lifecycle.reset_watcher(NAME)
+                await task
 
         self.assertIn("paused", str(ctx.exception).lower())
         self.assertTrue(lifecycle.get_watcher_state(NAME).paused,

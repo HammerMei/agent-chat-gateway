@@ -445,6 +445,27 @@ class WatcherManager:
         # drops and remembers the frames, and the watermark stays put for the
         # next boot's replay to recover them.
         self._shutting_down = False
+        # In-flight creation/recreation/registration episodes (Codex round 5,
+        # P1): the disarm flag stops NEW episodes, but one already inside
+        # `start_watcher_in_room` — awaiting session creation, history, or
+        # context setup — installs its processor after `stop_all` snapshots
+        # `_processors`, and is then never stopped. `drain()` waits these out.
+        # The event starts SET: zero in-flight means nothing to wait for.
+        self._inflight = 0
+        self._drained = asyncio.Event()
+        self._drained.set()
+
+    def _enter_episode(self) -> None:
+        """MUST be called in the same synchronous segment as the entry disarm
+        check — an await between the check and this increment would let an
+        episode go invisible to `drain()`."""
+        self._inflight += 1
+        self._drained.clear()
+
+    def _exit_episode(self) -> None:
+        self._inflight -= 1
+        if self._inflight == 0:
+            self._drained.set()
 
     def disarm(self) -> None:
         """Refuse every offer from now on — called by shutdown, before any stop.
@@ -454,6 +475,18 @@ class WatcherManager:
         teardown will never stop (§2.5).
         """
         self._shutting_down = True
+
+    async def drain(self) -> None:
+        """Disarm, then wait for every in-flight episode to finish (Codex
+        round 5). Composes with the under-lock disarm re-checks (round 4):
+        an episode parked on a lock wakes, sees the flag, and exits via its
+        `finally` instead of completing a full start — so this wait is short
+        for parked episodes and bounded by creation latency (10–40s) for one
+        already inside `start_watcher_in_room`. That wait is the decision:
+        the alternative is a processor `stop_all` never saw. A hung backend
+        is the daemon-level grace window's problem, not this method's."""
+        self.disarm()
+        await self._drained.wait()
 
     @property
     def disarmed(self) -> bool:
@@ -508,28 +541,34 @@ class WatcherManager:
             )
             return None
 
-        lock = self._locks.setdefault(room.id, asyncio.Lock())
-        async with lock:
-            if self._shutting_down:
-                # Re-checked UNDER the lock (TOCTOU sweep after Codex round
-                # 4): an episode that passed the check above and then parked
-                # on this lock — or on the watcher lock inside `_recreate` —
-                # can be released BY the shutdown itself (the sweep's stop
-                # cancels the drop that held it), and a start proceeding then
-                # is a processor `stop_all` never saw, an online notification
-                # posted mid-exit, and a save after the final save.
-                logger.info(
-                    "Not creating a watcher for room %s — the gateway began "
-                    "shutting down while this episode waited", room.id,
-                )
-                return None
-            record = self._lifecycle.record_for_room(room.id)
-            if record is not None:
-                resident = self._lifecycle.processor_named(record.watcher_name)
-                if resident is not None:
-                    return resident
-                return await self._recreate(record, room, history_before_ts)
-            return await self._create(room, history_before_ts)
+        # Same synchronous segment as the disarm check above — an await
+        # before this increment would let the episode go invisible to drain().
+        self._enter_episode()
+        try:
+            lock = self._locks.setdefault(room.id, asyncio.Lock())
+            async with lock:
+                if self._shutting_down:
+                    # Re-checked UNDER the lock (TOCTOU sweep after Codex round
+                    # 4): an episode that passed the check above and then parked
+                    # on this lock — or on the watcher lock inside `_recreate` —
+                    # can be released BY the shutdown itself (the sweep's stop
+                    # cancels the drop that held it), and a start proceeding then
+                    # is a processor `stop_all` never saw, an online notification
+                    # posted mid-exit, and a save after the final save.
+                    logger.info(
+                        "Not creating a watcher for room %s — the gateway began "
+                        "shutting down while this episode waited", room.id,
+                    )
+                    return None
+                record = self._lifecycle.record_for_room(room.id)
+                if record is not None:
+                    resident = self._lifecycle.processor_named(record.watcher_name)
+                    if resident is not None:
+                        return resident
+                    return await self._recreate(record, room, history_before_ts)
+                return await self._create(room, history_before_ts)
+        finally:
+            self._exit_episode()
 
     async def register_on_join(self, room: RoomRef) -> str | None:
         """A membership-add registers the room's record in `idle` state (§2.7).
@@ -560,40 +599,49 @@ class WatcherManager:
         """
         if self._shutting_down:
             return None
-        lock = self._locks.setdefault(room.id, asyncio.Lock())
-        async with lock:
-            if self._lifecycle.record_for_room(room.id) is not None:
-                return None
-            rule = first_matching_rule(self._rules, self._connector_name, room)
-            if rule is None:
-                logger.debug(
-                    "Membership add for room %s matches no rule — not registered",
-                    room.id,
+        # Same synchronous segment as the check above (see get_or_create):
+        # a registration writes a record and saves, so it is an in-flight
+        # transition drain() must see.
+        self._enter_episode()
+        try:
+            lock = self._locks.setdefault(room.id, asyncio.Lock())
+            async with lock:
+                if self._shutting_down:
+                    return None
+                if self._lifecycle.record_for_room(room.id) is not None:
+                    return None
+                rule = first_matching_rule(self._rules, self._connector_name, room)
+                if rule is None:
+                    logger.debug(
+                        "Membership add for room %s matches no rule — not registered",
+                        room.id,
+                    )
+                    return None
+                wc = materialize(rule, room)
+                now = now_iso()
+                provenance = creation_provenance(
+                    wc, rule, room,
+                    connector_name=self._connector_name,
+                    agent_name=self._lifecycle.resolve_agent_name(wc.agent),
+                    now=now,
+                    # Registered idle: the record's expiry clock starts at the join.
+                    dropped_at=now,
                 )
-                return None
-            wc = materialize(rule, room)
-            now = now_iso()
-            provenance = creation_provenance(
-                wc, rule, room,
-                connector_name=self._connector_name,
-                agent_name=self._lifecycle.resolve_agent_name(wc.agent),
-                now=now,
-                # Registered idle: the record's expiry clock starts at the join.
-                dropped_at=now,
-            )
-            platform_room = Room(
-                id=room.id,
-                name=room_description(room),
-                type=room.kind.value,
-            )
-            async with self._lifecycle.watcher_lock(wc.name):
-                self._lifecycle.register_idle_record(wc, platform_room, provenance)
-            logger.info(
-                "Registered watcher '%s' idle for room %s from rule '%s' "
-                "(membership add) — its first message starts it",
-                wc.name, room.id, rule.name,
-            )
-            return wc.name
+                platform_room = Room(
+                    id=room.id,
+                    name=room_description(room),
+                    type=room.kind.value,
+                )
+                async with self._lifecycle.watcher_lock(wc.name):
+                    self._lifecycle.register_idle_record(wc, platform_room, provenance)
+                logger.info(
+                    "Registered watcher '%s' idle for room %s from rule '%s' "
+                    "(membership add) — its first message starts it",
+                    wc.name, room.id, rule.name,
+                )
+                return wc.name
+        finally:
+            self._exit_episode()
 
     async def _recreate(
         self,

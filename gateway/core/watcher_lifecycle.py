@@ -742,18 +742,13 @@ class WatcherLifecycle:
             )
         self._ensure_agent_available(wc)
         async with self._get_watcher_lock(name):
-            try:
-                await self._stop_processor(name)
-            except Exception as e:
-                # Best-effort teardown: log the error but continue with the restart.
-                # A failure here (e.g. network error while sending DDP unsub) should
-                # not prevent the user from recovering the watcher via reset.
-                logger.warning(
-                    "Watcher '%s': error during stop phase of reset (proceeding with restart): %s",
-                    name,
-                    e,
-                )
-
+            # EVERY gate runs before the destructive stop (Codex round 5):
+            # with the checks after it, a reset correctly rejected for a
+            # record replaced mid-wait had already stopped the REPLACEMENT's
+            # processor — leaving the watcher the operator did not select
+            # non-resident. The re-reads stay complete because every other
+            # writer of these fields needs this same lock: nothing can change
+            # them between the gates and the stop below.
             state = self._states.get(name)
             if state is None or not state.config:
                 # Reclaimed while the reset waited on the lock — same re-read
@@ -781,6 +776,17 @@ class WatcherLifecycle:
                 raise RuntimeError(
                     f"Watcher '{name}' is paused — reset does not clear a "
                     f"pause (§2.5). Resume it first, then reset."
+                )
+            try:
+                await self._stop_processor(name)
+            except Exception as e:
+                # Best-effort teardown: log the error but continue with the restart.
+                # A failure here (e.g. network error while sending DDP unsub) should
+                # not prevent the user from recovering the watcher via reset.
+                logger.warning(
+                    "Watcher '%s': error during stop phase of reset (proceeding with restart): %s",
+                    name,
+                    e,
                 )
             # Clear injection retry state BEFORE resetting context_injected so
             # the new startup attempt begins with a fresh failure counter.
