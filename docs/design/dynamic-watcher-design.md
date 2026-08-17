@@ -445,6 +445,14 @@ assert it is still under the intended root), and **define symlink handling
 before deletion** during expiry, so reclaiming an attachment workspace cannot
 follow a link out of the tree.
 
+The containment requirement has a second implementation site the expiry
+increment added: **the attachment cache directory itself** —
+`attachment_cache_dir` on both connectors joins a *server-supplied* room id
+under the cache base, and expiry deletes the directory it names. A
+character-class sanitize alone is not the fence, because dots are legal
+filename characters and `..` passes it; `resolve_under` is, and an id it
+refuses means no attachment caching for that room rather than an escape.
+
 The reason this is worth doing rather than tolerating is that *three separate
 things* all want to change the display name, and only this decoupling makes
 all three harmless at once: a channel rename, a group DM's membership
