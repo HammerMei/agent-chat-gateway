@@ -269,3 +269,143 @@ class TestTheDownWindowSnapshot(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBootRunsTheSweepsEvaluation(unittest.IsolatedAsyncioTestCase):
+    """Boot runs the same evaluation the sweep runs (§2.5) — `past_idle_ttl`,
+    one function, two callers — over the records that were active at shutdown.
+
+    Inside its TTL: recreated through `get_or_create` (replay, sticky binding
+    and the paused refusal apply for free). Past it: marked idle with a
+    *fresh* `dropped_at` — never backdated, which is what keeps
+    `active → expired` impossible through an outage of any length. Either
+    way, nothing is left in the no-processor-no-dropped_at limbo that `list`
+    reports as `failed` after every restart.
+    """
+
+    def _manager(self, records):
+        from datetime import datetime, timedelta
+        from unittest.mock import AsyncMock, MagicMock
+
+        from tests.helpers import make_bare_session_manager
+
+        mgr = make_bare_session_manager(_connector_name="rc")
+        mgr._lifecycle.states = MagicMock(
+            return_value={r.watcher_name: r for r in records})
+        mgr._lifecycle.save_state = MagicMock()
+        mgr._watcher_manager = MagicMock()
+        mgr._watcher_manager.get_or_create = AsyncMock(return_value="proc")
+        self._old = (datetime.now().astimezone()
+                     - timedelta(days=16)).isoformat(timespec="seconds")
+        self._recent = (datetime.now().astimezone()
+                        - timedelta(days=1)).isoformat(timespec="seconds")
+        return mgr
+
+    async def test_a_was_active_record_inside_its_ttl_is_recreated(self):
+        mgr = self._manager([])
+        record = _dynamic_record(
+            rule={"name": "eng", "session_idle_days": 15})
+        mgr._lifecycle.states = MagicMock(
+            return_value={record.watcher_name: record})
+        record.last_activity_at = self._recent
+
+        await mgr._evaluate_lifecycle_at_boot()
+
+        mgr._watcher_manager.get_or_create.assert_awaited_once()
+        room = mgr._watcher_manager.get_or_create.await_args.args[1]
+        self.assertEqual(room.id, "r1")
+        self.assertEqual(record.dropped_at, "")
+
+    async def test_a_was_active_record_past_its_ttl_is_marked_idle_fresh(self):
+        """Marked idle rather than resumed — and the stamp is *this* boot's
+        moment, so the outage is not counted against expiry."""
+        from datetime import datetime, timedelta
+
+        mgr = self._manager([])
+        record = _dynamic_record(
+            rule={"name": "eng", "session_idle_days": 15})
+        mgr._lifecycle.states = MagicMock(
+            return_value={record.watcher_name: record})
+        record.last_activity_at = self._old
+
+        await mgr._evaluate_lifecycle_at_boot()
+
+        mgr._watcher_manager.get_or_create.assert_not_awaited()
+        self.assertTrue(record.dropped_at, "stamped idle")
+        stamped = datetime.fromisoformat(record.dropped_at)
+        self.assertLess(
+            datetime.now().astimezone() - stamped, timedelta(minutes=1),
+            "fresh — the expiry clock starts now, not in the outage",
+        )
+        mgr._lifecycle.save_state.assert_called_once()
+
+    async def test_what_boot_must_not_touch(self):
+        """Paused (§4.4), already idle (its own leg), static (config.yaml's),
+        and roomless records are all left exactly as found."""
+        mgr = self._manager([])
+        paused = _dynamic_record(name="p", room_id="r-p")
+        paused.paused = True
+        paused.last_activity_at = self._old
+        idle = _dynamic_record(name="i", room_id="r-i")
+        idle.dropped_at = "2026-07-01T00:00:00-07:00"
+        idle.last_activity_at = self._old
+        static = _dynamic_record(name="s", room_id="r-s", rule_name="", rule={})
+        static.last_activity_at = self._old
+        roomless = _dynamic_record(name="r", room_id="")
+        roomless.last_activity_at = self._old
+        mgr._lifecycle.states = MagicMock(return_value={
+            "p": paused, "i": idle, "s": static, "r": roomless})
+
+        await mgr._evaluate_lifecycle_at_boot()
+
+        mgr._watcher_manager.get_or_create.assert_not_awaited()
+        self.assertEqual(paused.dropped_at, "")
+        self.assertEqual(idle.dropped_at, "2026-07-01T00:00:00-07:00")
+        self.assertEqual(static.dropped_at, "")
+        self.assertEqual(roomless.dropped_at, "")
+
+    async def test_a_failed_recreation_leaves_the_record_failed_and_continues(self):
+        from unittest.mock import AsyncMock
+
+        mgr = self._manager([])
+        first = _dynamic_record(
+            name="a", room_id="r-a", rule={"name": "eng", "session_idle_days": 15})
+        second = _dynamic_record(
+            name="b", room_id="r-b", rule={"name": "eng", "session_idle_days": 15})
+        first.last_activity_at = self._recent
+        second.last_activity_at = self._recent
+        mgr._lifecycle.states = MagicMock(return_value={"a": first, "b": second})
+        mgr._watcher_manager.get_or_create = AsyncMock(
+            side_effect=[RuntimeError("backend down"), "proc"])
+
+        await mgr._evaluate_lifecycle_at_boot()
+
+        self.assertEqual(mgr._watcher_manager.get_or_create.await_count, 2,
+                         "one abort does not stop the pass")
+        self.assertEqual(first.dropped_at, "", "an abort leaves it failed, honestly")
+
+    async def test_the_evaluation_runs_after_inbound_and_before_the_replay(self):
+        """A record the evaluation recreates owns its own replay, so the loop
+        must find it resident; a record it idles must still be probed, because
+        messages waiting in a room outrank its idleness."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from tests.helpers import make_bare_session_manager
+
+        mgr = make_bare_session_manager()
+        order = []
+        mgr._connector.start_inbound = AsyncMock(
+            side_effect=lambda: order.append("inbound"))
+        mgr._lifecycle.sync_watchers = AsyncMock(
+            side_effect=lambda **kw: order.append("sync") or [])
+        mgr._snapshot_watermarks = MagicMock(
+            side_effect=lambda: order.append("snapshot") or {})
+        mgr._evaluate_lifecycle_at_boot = AsyncMock(
+            side_effect=lambda: order.append("evaluate"))
+        mgr._replay_persisted_records = AsyncMock(
+            side_effect=lambda w: order.append("replay"))
+
+        await mgr.sync_only()
+
+        self.assertEqual(
+            order, ["sync", "snapshot", "inbound", "evaluate", "replay"])

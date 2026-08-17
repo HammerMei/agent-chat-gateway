@@ -23,7 +23,7 @@ from .injected_context_builder import InjectedContextBuilder
 from .lifecycle_sweep import LifecycleSweep
 from .permission import PermissionRegistry
 from .session_maps import SessionMaps
-from .state import StateFilter, parse_state_filter
+from .state import StateFilter, parse_state_filter, past_idle_ttl
 from .state_store import StateStore
 from .watcher_lifecycle import WatcherLifecycle
 from .watcher_manager import RoomRef, WatcherManager
@@ -174,6 +174,11 @@ class SessionManager:
         # a REST probe.
         down_window = self._snapshot_watermarks()
         await self._connector.start_inbound()
+        # Before the replay, deliberately: a record this evaluation recreates
+        # owns its own replay (§2.2, replay ownership), so the loop below finds
+        # it resident and skips it — and a record it marks idle is still probed
+        # below, because messages waiting in a room outrank its idleness.
+        await self._evaluate_lifecycle_at_boot()
         await self._replay_persisted_records(down_window)
         if self._sweep is not None:
             # After the replay completes, structurally — §2.5 makes this
@@ -183,6 +188,72 @@ class SessionManager:
             # from day one so step 5 does not have to move this line.
             self._sweep.start()
         return errors
+
+    async def _evaluate_lifecycle_at_boot(self) -> None:
+        """Boot runs the same evaluation the sweep runs (§2.5), over the
+        records that were *active* at shutdown.
+
+        One function, two callers: the TTL arithmetic is `past_idle_ttl`, the
+        same call the sweep makes — a boot rule and a running rule would drift
+        on exactly the restart-only path nothing exercises.
+
+        A was-active record (rule-derived, not paused, no `dropped_at`) is
+        either **recreated** through `get_or_create` — so replay, sticky
+        binding and the paused refusal all apply for free — or, when it is
+        already past its idle TTL, **marked idle with a fresh `dropped_at`**
+        rather than paying a resume for a room the first sweep would drop
+        minutes later. Fresh, never backdated: expiry measures from this
+        moment, which is what keeps `active → expired` impossible through an
+        outage of any length (§2.5).
+
+        This is also what keeps `list` honest after a restart: a was-active
+        record has no `dropped_at` and no processor, which reads as `failed` —
+        the default view reporting a healthy fleet as broken. After this pass
+        every such record is resident again or honestly idle.
+        """
+        if self._watcher_manager is None:
+            return
+        now = datetime.now().astimezone()
+        stamped = 0
+        for record in list(self._lifecycle.states().values()):
+            if (
+                not record.rule_name
+                or record.paused
+                or record.dropped_at
+                or not record.room_id
+            ):
+                continue
+            if past_idle_ttl(record, now):
+                record.dropped_at = now.isoformat(timespec="seconds")
+                stamped += 1
+                logger.info(
+                    "Watcher '%s' was idle past its TTL across the restart — "
+                    "marked idle; its next message wakes it",
+                    record.watcher_name,
+                )
+                continue
+            kind = RoomKind(record.room_kind) if record.room_kind else RoomKind.CHANNEL
+            try:
+                await self._watcher_manager.get_or_create(
+                    self._connector_name,
+                    RoomRef(
+                        id=record.room_id,
+                        kind=kind,
+                        name=record.room_name,
+                        participants=tuple(record.participants),
+                    ),
+                )
+            except Exception as e:
+                # An abort, not a decision (§2.2): the record keeps reading
+                # `failed`, which is the honest state, and the next boot — or
+                # the room's next message — retries.
+                logger.warning(
+                    "Boot recreation failed for watcher '%s' (room %s) — it "
+                    "stays failed until its next message or the next start: %s",
+                    record.watcher_name, record.room_id, e,
+                )
+        if stamped:
+            self._lifecycle.save_state()
 
     def _snapshot_watermarks(self) -> dict[str, str]:
         """Each rule-derived record's watermark as of boot, by watcher name.
