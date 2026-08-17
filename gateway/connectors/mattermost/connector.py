@@ -1603,9 +1603,27 @@ class MattermostConnector(Connector):
             self._release_turn_for(post, result, turn_generation, "handler raised")
             return
 
+        # The commit target may no longer be `state` (#115, RC's sibling has the
+        # same fence): a watcher stop→start while the handler ran popped it from
+        # `self._channels` and installed a fresh `_ChannelState`, so a watermark,
+        # dedup id or hand-back boundary written to `state` vanishes with it —
+        # the next reconnect replay re-delivers an accepted post, and a
+        # handed-back one is never recovered. The commit follows the channel.
+        live = self._channels.get(channel_id)
+        if live is not state and live is not None:
+            logger.warning(
+                "Channel %s: a delivery outlived its state (watcher restarted "
+                "mid-delivery) — committing to the live one", channel_id,
+            )
+
         if not accepted:
             logger.warning("Message from %s was dropped (queue full)", result.sender)
-            self._keep_replayable(state, msg_id, result.msg_ts)
+            if live is state:
+                self._keep_replayable(state, msg_id, result.msg_ts)
+            elif live is not None:
+                self._keep_replayable(live, msg_id, result.msg_ts)
+            # else: the channel is gone; there is nowhere for a replay to
+            # recover into.
             # Forgetting the id is not enough: the filter already spent a turn of this
             # sender's agent-chain budget, before anything knew whether the post could be
             # delivered. Every retry spends another, and once the budget is gone the
@@ -1615,6 +1633,16 @@ class MattermostConnector(Connector):
             # hand-back path, which this branch is.
             self._release_turn_for(post, result, turn_generation, "handler queue full")
             return
+
+        if live is not state:
+            if live is None:
+                logger.warning(
+                    "Channel %s: discarding the watermark of a post whose channel "
+                    "was reclaimed mid-delivery", channel_id,
+                )
+                return
+            self._remember_seen(live, msg_id)
+            state = live
 
         # Never backwards, for the reason Rocket.Chat's sibling site gives: replay calls
         # `_on_posted_event` directly rather than through the per-channel worker, so a

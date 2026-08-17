@@ -969,6 +969,17 @@ class RocketChatConnector(Connector):
             # The same rule as `dm_members`: who someone is, not how their name is spelled.
             return
         if not access or not access.get("roomParticipant"):
+            # An explicit `roomParticipant: False` for a room this connector
+            # still tracks is the news the account was removed (#115): the
+            # tracked path records it (`left_the_room()` clears the watermark
+            # and bumps the epoch), and this path used to drop it — so a
+            # later re-add replayed the whole non-member interval from the
+            # stale watermark. Absence stays a plain return: "nobody said"
+            # is not "not a participant".
+            if access is not None and access.get("roomParticipant") is False:
+                sub = self._rooms.get(doc.get("rid", ""))
+                if sub is not None:
+                    sub.left_the_room()
             return
         if not sender_allowed(self._config, sender):
             return
@@ -2321,13 +2332,29 @@ class RocketChatConnector(Connector):
             #
             # Nothing is owed by not claiming: this message belongs to a membership the
             # account no longer has, so leaving it unreachable is the outcome, not a loss.
-            if sub.membership_epoch == entry_epoch:
-                sub.claim_boundary(sub.last_processed_ts, _just_before(result.msg_ts))
-            else:
+            #
+            # And not to a DETACHED object (#115): a watcher stop→start while this
+            # delivery was in flight popped `sub` and installed a fresh one, so a
+            # boundary written to `sub` is a note left in an object nothing reads
+            # again — the hand-back is never recovered. The claim goes to the room's
+            # LIVE subscription when one exists; when none does, the room is gone
+            # and there is nowhere for a replay to recover into anyway.
+            live = self._rooms.get(room_id)
+            if live is sub:
+                if sub.membership_epoch == entry_epoch:
+                    sub.claim_boundary(sub.last_processed_ts, _just_before(result.msg_ts))
+                else:
+                    logger.warning(
+                        "Room %s: not reopening the outage window for a message that was in "
+                        "flight when this account was removed", room_id,
+                    )
+            elif live is not None:
                 logger.warning(
-                    "Room %s: not reopening the outage window for a message that was in "
-                    "flight when this account was removed", room_id,
+                    "Room %s: a hand-back outlived its subscription (watcher "
+                    "restarted mid-delivery) — claiming the outage window on the "
+                    "live one instead", room_id,
                 )
+                live.claim_boundary(live.last_processed_ts, _just_before(result.msg_ts))
             # The one outcome that leaves this message pending: its id was just forgotten
             # precisely so a later replay can bring it back, and a boundary spent on a
             # batch containing it would remove the only thing that could.
@@ -2346,15 +2373,39 @@ class RocketChatConnector(Connector):
         # This is a much smaller race than waiting for the entire handler
         # duration, so the previous "advance before handler" behaviour did not
         # meaningfully reduce reconnect duplication in practice.
-        if sub.membership_epoch != entry_epoch:
-            # The account left this room while this message was in flight. Committing now
-            # would restore the very watermark the removal cleared, and a later re-add
-            # would replay from before the removal — delivering the interval the account
-            # was not a member for. The message itself is already handled; only the mark
-            # it would leave behind is refused.
+        # The commit target may no longer be `sub` (#115): a watcher stop→start
+        # while the handler ran popped it and installed a fresh subscription, so
+        # a watermark and dedup id written to `sub` vanish with it — the next
+        # reconnect replay re-delivers this very message to the new processor.
+        # The commit follows the room, not the object.
+        live = self._rooms.get(room_id)
+        if live is sub:
+            if sub.membership_epoch != entry_epoch:
+                # The account left this room while this message was in flight.
+                # Committing now would restore the very watermark the removal
+                # cleared, and a later re-add would replay from before the
+                # removal — delivering the interval the account was not a
+                # member for. The message itself is already handled; only the
+                # mark it would leave behind is refused.
+                logger.warning(
+                    "Room %s: discarding the watermark of a message that was in flight when "
+                    "this account left", room_id,
+                )
+                return True
+            target = sub
+        elif live is not None:
             logger.warning(
-                "Room %s: discarding the watermark of a message that was in flight when "
-                "this account left", room_id,
+                "Room %s: a delivery outlived its subscription (watcher restarted "
+                "mid-delivery) — committing its watermark and dedup id to the live "
+                "one", room_id,
+            )
+            live.remember(msg_id)
+            target = live
+        else:
+            # The room is gone entirely; there is nothing to commit into.
+            logger.warning(
+                "Room %s: discarding the watermark of a message whose room was "
+                "reclaimed mid-delivery", room_id,
             )
             return True
 
@@ -2363,10 +2414,11 @@ class RocketChatConnector(Connector):
         # and an unconditional assignment then rewinds the cursor. In memory the seen-id
         # window hides that; across a save and a restart it does not, and history after
         # the regressed cursor is dispatched a second time.
-        if _ts_gt(result.msg_ts, sub.last_processed_ts or ""):
-            sub.last_processed_ts = result.msg_ts
+        if _ts_gt(result.msg_ts, target.last_processed_ts or ""):
+            target.last_processed_ts = result.msg_ts
         # msg_id was already added to seen_ids_set by the optimistic registration
-        # block above (before the first await).  No second add needed here.
+        # block above (before the first await; re-added to the live subscription
+        # above when the original was replaced mid-delivery).
         return True
 
     async def _handler_send_busy(self, room_id: str, doc: dict) -> None:

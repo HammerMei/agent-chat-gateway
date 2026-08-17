@@ -1317,6 +1317,10 @@ class TestInjectMessageTimestampFormat(unittest.IsolatedAsyncioTestCase):
         # connector's header formatter — this is the code path a scheduled
         # job's message actually goes through.
         connector = RocketChatConnector.__new__(RocketChatConnector)
+        # Pre-login: agent_username falls back to the configured spelling (#112).
+        from unittest.mock import MagicMock as _M
+        connector._rest = _M()
+        connector._rest.bot_username = None
         connector._config = RocketChatConfig(
             server_url="http://chat.example.com",
             username="bot",

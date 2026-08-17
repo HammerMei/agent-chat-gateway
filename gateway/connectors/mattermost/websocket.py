@@ -102,8 +102,21 @@ class MattermostWebSocketClient:
         self._registered_channels.add(channel_id)
 
     def unregister_channel(self, channel_id: str) -> None:
-        """Stop caring about this channel locally (no wire call)."""
+        """Release the channel's local delivery machinery (no wire call).
+
+        The RC twin pops the queue and cancels the worker; this method used
+        to discard only the bookkeeping set — which is write-only in
+        production code — so every unsubscribe/reap over a long-lived process
+        leaked an asyncio.Task parked on `queue.get()` plus its queue,
+        forever (#115). Cancel-and-forget rather than awaited, because
+        `reap_room` is synchronous: a cancelled worker finishes on the loop,
+        and `_dispatch` lazily recreates the pair if the channel returns.
+        """
         self._registered_channels.discard(channel_id)
+        self._channel_queues.pop(channel_id, None)
+        worker = self._channel_workers.pop(channel_id, None)
+        if worker is not None and not worker.done():
+            worker.cancel()
 
     def set_reconnect_callback(self, cb: Callable[[], Any]) -> None:
         self._on_reconnect_cb = cb

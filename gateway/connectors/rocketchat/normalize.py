@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 
 from ...core.adapter_utils import ts_to_float as _ts_to_float
 from ...core.connector import Attachment, IncomingMessage, Room, User, UserRole
+from ...core.sender_policy import sender_allowed
 from .mentions import is_room_wide_mention
 
 if TYPE_CHECKING:
@@ -157,12 +158,13 @@ def filter_rc_message(
     # Determine if sender is a known agent
     is_agent = sender in config.agent_chain.agent_usernames
 
-    # 2. Sender filter
-    if config.filter_sender:
-        # allow-list mode: only owners+guests+agents are accepted
-        if sender not in config.allow_senders and not is_agent:
-            return FilterResult(accepted=False, sender=sender, reason="sender not in allow-list")
-    # else: open mode — everyone passes; role resolved later in normalize
+    # 2. Sender filter — the shared rule, not an inline copy (#115): this was
+    # the fourth site of "may this sender start a turn", and the module's own
+    # docstring argues a second copy is one too many. The `is_agent` bypass
+    # this copy carried is inside `sender_allowed` already.
+    if not sender_allowed(config, sender):
+        return FilterResult(accepted=False, sender=sender, reason="sender not in allow-list")
+    # open mode passes everyone; role resolved later in normalize
 
     # 3. For channels/groups: require @mention (unless listen-all mode or agent sender)
     if config.require_mention and not is_agent and room_type != "dm":

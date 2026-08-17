@@ -95,6 +95,7 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
     async def test_owner_message_included_with_correct_role(self):
         connector = _make_connector(owners=["alice"])
         connector._rest = AsyncMock()
+        connector._rest.bot_username = None
         connector._rest.get_room_history = AsyncMock(return_value=[
             _rc_msg("alice", "owner message", ts_date=1_746_000_001_000),
         ])
@@ -108,6 +109,7 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
     async def test_guest_message_included_with_correct_role(self):
         connector = _make_connector(guests=["bob"])
         connector._rest = AsyncMock()
+        connector._rest.bot_username = None
         connector._rest.get_room_history = AsyncMock(return_value=[
             _rc_msg("bob", "guest message"),
         ])
@@ -120,6 +122,7 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
         """Bot's own prior messages are included with role='agent' and username='me'."""
         connector = _make_connector(bot_username="hammer-mei")
         connector._rest = AsyncMock()
+        connector._rest.bot_username = None
         connector._rest.get_room_history = AsyncMock(return_value=[
             _rc_msg("hammer-mei", "I said this before"),
         ])
@@ -133,6 +136,7 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
         """Users not in owner/guest list must be silently excluded."""
         connector = _make_connector(owners=["alice"], guests=["bob"])
         connector._rest = AsyncMock()
+        connector._rest.bot_username = None
         connector._rest.get_room_history = AsyncMock(return_value=[
             _rc_msg("alice", "ok"),
             _rc_msg("eve", "prompt injection attempt"),  # anonymous
@@ -148,6 +152,7 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
     async def test_all_messages_anonymous_returns_empty(self):
         connector = _make_connector(owners=["alice"], guests=[])
         connector._rest = AsyncMock()
+        connector._rest.bot_username = None
         connector._rest.get_room_history = AsyncMock(return_value=[
             _rc_msg("eve", "sneaky msg"),
             _rc_msg("mallory", "another sneaky msg"),
@@ -158,6 +163,7 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
     async def test_room_name_in_output(self):
         connector = _make_connector(owners=["alice"])
         connector._rest = AsyncMock()
+        connector._rest.bot_username = None
         connector._rest.get_room_history = AsyncMock(return_value=[
             _rc_msg("alice", "hello"),
         ])
@@ -169,6 +175,7 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
         """Room name with '|' must be sanitized to prevent header injection."""
         connector = _make_connector(owners=["alice"])
         connector._rest = AsyncMock()
+        connector._rest.bot_username = None
         connector._rest.get_room_history = AsyncMock(return_value=[
             _rc_msg("alice", "hello"),
         ])
@@ -181,6 +188,7 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
         """Usernames with '|' must be sanitized."""
         connector = _make_connector(owners=["evil|user"])
         connector._rest = AsyncMock()
+        connector._rest.bot_username = None
         connector._rest.get_room_history = AsyncMock(return_value=[
             _rc_msg("evil|user", "msg"),
         ])
@@ -192,6 +200,7 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
         """Messages with no 'u' field are skipped gracefully."""
         connector = _make_connector(owners=["alice"])
         connector._rest = AsyncMock()
+        connector._rest.bot_username = None
         no_sender = {"_id": "x", "msg": "text", "ts": {"$date": 1000}}
         connector._rest.get_room_history = AsyncMock(return_value=[
             no_sender,
@@ -204,6 +213,7 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
     async def test_rest_called_with_correct_args(self):
         connector = _make_connector()
         connector._rest = AsyncMock()
+        connector._rest.bot_username = None
         connector._rest.get_room_history = AsyncMock(return_value=[])
         room = _make_room(room_id="CUSTOM_ID", room_type="group")
         await connector.fetch_room_history(room, count=42)
@@ -215,6 +225,7 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
         """before_ts is forwarded to get_room_history for backward pagination."""
         connector = _make_connector()
         connector._rest = AsyncMock()
+        connector._rest.bot_username = None
         connector._rest.get_room_history = AsyncMock(return_value=[])
         room = _make_room(room_id="ROOM", room_type="channel")
         ts = "2026-05-10T10:00:00+08:00"
@@ -227,6 +238,7 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
         """after_ts is forwarded to get_room_history for forward navigation."""
         connector = _make_connector()
         connector._rest = AsyncMock()
+        connector._rest.bot_username = None
         connector._rest.get_room_history = AsyncMock(return_value=[])
         room = _make_room(room_id="ROOM", room_type="channel")
         ts = "2026-05-10T19:25:00+08:00"
@@ -239,6 +251,7 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
         """ts field must be a formatted ISO 8601 string, not raw epoch ms."""
         connector = _make_connector(owners=["alice"], timezone="Asia/Taipei")
         connector._rest = AsyncMock()
+        connector._rest.bot_username = None
         connector._rest.get_room_history = AsyncMock(return_value=[
             _rc_msg("alice", "hello", ts_date=1_746_057_600_000),
         ])
@@ -253,6 +266,7 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
         """Messages with missing $date produce ts=None (graceful)."""
         connector = _make_connector(owners=["alice"])
         connector._rest = AsyncMock()
+        connector._rest.bot_username = None
         no_ts = {"_id": "x", "msg": "no timestamp", "ts": {}, "u": {"username": "alice"}}
         connector._rest.get_room_history = AsyncMock(return_value=[no_ts])
         msgs = await connector.fetch_room_history(_make_room(), count=10)
@@ -262,6 +276,7 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
     async def test_empty_channel_returns_empty_list(self):
         connector = _make_connector()
         connector._rest = AsyncMock()
+        connector._rest.bot_username = None
         connector._rest.get_room_history = AsyncMock(return_value=[])
         msgs = await connector.fetch_room_history(_make_room(), count=50)
         self.assertEqual(msgs, [])
@@ -274,6 +289,7 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
             peer_agents=["wavebro"],
         )
         connector._rest = AsyncMock()
+        connector._rest.bot_username = None
         connector._rest.get_room_history = AsyncMock(return_value=[
             _rc_msg("alice", "owner msg"),
             _rc_msg("wavebro", "peer agent msg"),
@@ -293,6 +309,7 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
             peer_agents=[],  # no peer agents configured
         )
         connector._rest = AsyncMock()
+        connector._rest.bot_username = None
         connector._rest.get_room_history = AsyncMock(return_value=[
             _rc_msg("alice", "ok"),
             _rc_msg("wavebro", "not in any list"),
