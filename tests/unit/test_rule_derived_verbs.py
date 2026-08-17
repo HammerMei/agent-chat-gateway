@@ -191,6 +191,48 @@ def _wake_room():
     return RoomRef(id=ROOM_ID, kind=RoomKind.CHANNEL, name="eng-backend")
 
 
+class TestStopSurvivesACursorReadFailure(unittest.IsolatedAsyncioTestCase):
+    """#118 defect 3: `_stop_processor`'s watermark capture used to run with
+    no try — a raising cursor read abandoned the unsubscribe and the drain,
+    leaving the room subscribed and the queue undrained, to preserve a
+    watermark it then did not capture anyway."""
+
+    async def test_pause_completes_when_the_cursor_read_raises(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from tests.helpers import (
+            MockAgentBackend,
+            make_core_config,
+            make_lifecycle,
+            make_rule_derived_record,
+        )
+
+        connector = MagicMock()
+        connector.get_last_processed_ts = MagicMock(
+            side_effect=RuntimeError("socket died"))
+        connector.unsubscribe_room = AsyncMock()
+        lifecycle = make_lifecycle(
+            connector=connector,
+            agents={"default": MockAgentBackend()},
+            config=make_core_config(),
+        )
+        record = make_rule_derived_record(name="w1",
+                                          last_processed_ts="persisted-mark")
+        lifecycle._states["w1"] = record
+        proc = MagicMock()
+        proc.stop = AsyncMock()
+        lifecycle._processors["w1"] = proc
+
+        await lifecycle.pause_watcher("w1")  # must not raise
+
+        self.assertTrue(record.paused)
+        self.assertEqual(record.last_processed_ts, "persisted-mark",
+                         "the persisted mark stands when the live read fails")
+        connector.unsubscribe_room.assert_awaited_once()
+        proc.stop.assert_awaited_once()
+        self.assertNotIn("w1", lifecycle._processors)
+
+
 class TestTheExpireVerb(unittest.IsolatedAsyncioTestCase):
 
     def _mgr(self, record, *, reclaimed="w1", cancelled=None):
