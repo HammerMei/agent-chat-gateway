@@ -867,11 +867,16 @@ class MattermostConnector(Connector):
     async def probe_missed_since(self, room: Room, after_ts: str) -> bool:
         """See `Connector.probe_missed_since`. Raw posts, so `user_id` is still
         on them — `fetch_room_history` maps the bot's own posts to `"me"`."""
-        raw = await self._rest.get_room_history(
+        page = await self._rest.get_room_history_page(
             room.id, count=self._REPLAY_HISTORY_COUNT, after_ts=after_ts
         )
+        if page.was_full:
+            # Same trap, same reason as Rocket.Chat's: `count` is applied before
+            # system posts are filtered out, so an empty filtered list can mean
+            # "nothing here" or "a full page of joins hiding everything older".
+            return True
         own_id = self._rest.bot_user_id
-        for post in raw:
+        for post in page.messages:
             if own_id and post.get("user_id") == own_id:
                 continue
             # Strictly after: `after_ts` is inclusive, so the message that set

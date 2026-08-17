@@ -1124,9 +1124,15 @@ class TestProbeMissedSince(unittest.IsolatedAsyncioTestCase):
     history includes by design, while the watermark only advances on accepted
     inbound) and the inclusive boundary message."""
 
-    def _connector(self, posts):
+    def _connector(self, posts, *, was_full=False):
+        from gateway.core.connector import HistoryPage
+
         connector = _make_connector()
-        connector._rest.get_room_history = AsyncMock(return_value=posts)
+        connector._rest.get_room_history_page = AsyncMock(return_value=HistoryPage(
+            messages=posts,
+            raw_count=connector._REPLAY_HISTORY_COUNT if was_full else len(posts),
+            limit=connector._REPLAY_HISTORY_COUNT,
+        ))
         return connector
 
     _ROOM = Room(id="c1", name="eng", type="channel")
@@ -1144,6 +1150,11 @@ class TestProbeMissedSince(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_real_user_post_above_the_watermark_is_a_gap(self):
         connector = self._connector([self._post(1000), self._post(2000)])
+        self.assertTrue(await connector.probe_missed_since(self._ROOM, "1000"))
+
+    async def test_a_page_filled_by_system_posts_is_a_gap(self):
+        """Same trap as Rocket.Chat's: the count is applied before the filter."""
+        connector = self._connector([], was_full=True)
         self.assertTrue(await connector.probe_missed_since(self._ROOM, "1000"))
 
 

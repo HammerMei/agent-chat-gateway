@@ -2165,11 +2165,17 @@ class TestProbeMissedSince(unittest.IsolatedAsyncioTestCase):
     watcher on every start — the eager cost the lazy model exists to avoid.
     """
 
-    def _connector(self, docs):
+    def _connector(self, docs, *, was_full=False):
+        from gateway.core.connector import HistoryPage
+
         connector = _make_connector()
         connector._rest = MagicMock()
         connector._rest.user_id = "BOT_ID"
-        connector._rest.get_room_history = AsyncMock(return_value=docs)
+        connector._rest.get_room_history_page = AsyncMock(return_value=HistoryPage(
+            messages=docs,
+            raw_count=connector._REPLAY_HISTORY_COUNT if was_full else len(docs),
+            limit=connector._REPLAY_HISTORY_COUNT,
+        ))
         return connector
 
     def _doc(self, ms, user_id="U1"):
@@ -2205,6 +2211,20 @@ class TestProbeMissedSince(unittest.IsolatedAsyncioTestCase):
     async def test_an_empty_room_is_not_a_gap(self):
         connector = self._connector([])
         self.assertFalse(await connector.probe_missed_since(self._ROOM, "1000"))
+
+    async def test_a_page_filled_by_system_events_is_a_gap_not_an_empty_window(self):
+        """`count` is the server's, the filter is ACG's, and it runs after — so
+        a window whose newest entries are all joins and topic changes arrives
+        as an empty list with every user message in it still waiting behind
+        that page. Only `raw_count` tells that apart from a genuinely empty
+        window, and the reconnect replay already reads it for this reason.
+
+        Answering "gap" when the two cannot be told apart costs one recreation;
+        answering "no gap" costs someone the reply they are waiting for — and
+        costs it silently, which is the half that decides this.
+        """
+        connector = self._connector([], was_full=True)
+        self.assertTrue(await connector.probe_missed_since(self._ROOM, "1000"))
 
 
 class TestTriggerHistoryBound(unittest.TestCase):

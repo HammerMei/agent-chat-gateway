@@ -1023,11 +1023,21 @@ class RocketChatConnector(Connector):
         """See `Connector.probe_missed_since`. Raw docs, so the sender id is
         still on them — `fetch_room_history` has already reduced the bot's own
         posts to `username: "me"` by the time it returns."""
-        raw = await self._rest.get_room_history(
+        page = await self._rest.get_room_history_page(
             room.id, room.type, self._REPLAY_HISTORY_COUNT, after_ts=after_ts
         )
+        if page.was_full:
+            # The page, and the *filter*: `count` is applied by the server and
+            # system events are dropped afterwards, so a window whose newest
+            # entries are all joins and topic changes filters down to nothing
+            # while every user message in it waits behind that page. An empty
+            # filtered list therefore has two meanings, and only `raw_count`
+            # tells them apart — the reconnect replay reads it for the same
+            # reason. Answering "gap" when they cannot be told apart costs one
+            # recreation; answering "no gap" costs someone their reply.
+            return True
         own_id = self._rest.user_id
-        for doc in raw:
+        for doc in page.messages:
             if own_id and doc.get("u", {}).get("_id") == own_id:
                 continue
             # Strictly after: `after_ts` is inclusive, so the boundary message —

@@ -70,8 +70,8 @@ watchers:
     rooms:
       include: ["eng-*", "incident-*"]
       except_for: ["eng-archive"]
-    session_idle_days: 7
-    session_expire_days: 30
+    session_idle_days: 15        # default 15 — see §2.5
+    session_expire_days: 15      # default 15, measured from the idle moment
     # plus every existing watcher parameter: context_inject_files,
     # history_handoff, notifications, inherits, …
 ```
@@ -733,61 +733,69 @@ A watcher can therefore exist as a record before it has ever run — which is
 what makes a newly-joined room listable and pausable before its first
 message.
 
-#### The TTLs are wall-clock, and a long outage therefore ages every watcher
+#### Defaults, and what a long outage does to them
 
-The two timers measure elapsed time and know nothing about whether ACG was
-running. A daemon that is down for a week returns to find every record a week
-older, and nothing distinguishes "this room went quiet" from "nobody was
-listening". Decided deliberately (owner, 2026-08-16) rather than compensated
-for, and the reasoning is worth keeping because the alternative was costed:
+`session_idle_days: 15` and `session_expire_days: 15` — a month from last
+activity to reclamation. Chosen to sit in the range agent backends retain
+sessions for anyway, so the expectation an operator already has is the one this
+meets.
 
-**Two rules make wall-clock TTLs survivable, and they cover different halves.**
+Both timers are wall-clock and know nothing about whether ACG was running, so a
+daemon that is down for a week returns to find every record a week older. What
+keeps that survivable is **where each timer starts**, and the two halves of the
+fleet are protected differently.
 
-* **A sweep advances a watcher by at most one state.** A watcher that was
-  active when the daemon stopped becomes `idle` on the first sweep after it
-  starts — and `dropped_at` is set to *that moment*, so the expiry timer begins
-  then rather than counting the outage. The naive implementation, deriving the
-  final state from the timestamps and acting on it, would take such a watcher
-  from `active` straight to `expired` in one pass and delete a session whose
-  room was busy right up to the shutdown. Cascading is the defect; one step per
-  sweep is the fix, and it costs nothing.
+**Expiry is measured from the moment a watcher becomes idle — not from its last
+activity.** `dropped_at` is written when the sweep drops the watcher, so for a
+watcher that was *active* when the daemon stopped, the expiry clock begins at
+the first sweep after it starts and the outage is not counted at all.
+`active → expired` therefore cannot happen through an outage of any length.
 
-* **Generous defaults cover the half the first rule cannot.** A watcher that
-  was *already* idle when the daemon stopped carries a `dropped_at` from before
-  the outage, and `idle → expired` is itself a single transition, so no
-  step-limit protects it. What protects it is the size of the window:
-  `session_idle_days: 15` and `session_expire_days: 15` mean a month from last
-  activity to reclamation, so an outage has to run for more than two weeks
-  before an idle record is at risk. A session nobody has touched in a month,
-  through an outage that long, is one it is reasonable to let go — and the
-  figure is deliberately in the range agent backends retain sessions for
-  anyway, so the expectation an operator already has is the one this meets.
+This requires one rule of the implementation, because the naive version breaks
+it: **a sweep advances a watcher by at most one state.** Deriving the final
+state from the timestamps and acting on it would take a watcher that was busy
+right up to the shutdown from `active` straight to `expired` in a single pass,
+deleting the session the `dropped_at` reset exists to protect. One step per
+sweep costs nothing and is what makes the guarantee above true.
 
-**What is *not* done, and could be added later without a migration:** crediting
-the outage back, by persisting a heartbeat and subtracting the downtime when a
-TTL is evaluated. It was costed and declined for now. A single global downtime
-figure does not compose across repeated restarts — it remembers only the last
-one — so a correct version needs either a per-record accumulator or a mutation
-of `last_activity_at` at boot, and the second makes the record claim activity
-at a moment there was none. Every §5.3 field defaults, so adding an accumulator
-later is additive; the heartbeat is a new file rather than a schema change.
-Nothing here is a one-way door.
+**A watcher that was already idle when the daemon stopped is not protected by
+that**, and this is accepted rather than solved. Its `dropped_at` predates the
+outage, and `idle → expired` is itself a single transition, so nothing but the
+size of the window helps: an outage longer than `session_expire_days` puts its
+session at risk. Three reasons this is a decision and not a gap:
+
+* **The case is uncommon.** With the defaults it takes more than two weeks of
+  continuous downtime, and a session nobody has touched in the month that
+  precedes it is one it is reasonable to let go.
+* **It has an operator remedy that needs no code.** A deployment that expects
+  long outages raises `session_expire_days`; the setting is per rule, so it can
+  be raised only where the sessions are worth keeping.
+* **The automatic version is not cheap.** Crediting the outage back means
+  persisting a heartbeat and subtracting the downtime when a TTL is evaluated —
+  and a single global downtime figure does not compose across repeated
+  restarts, since it remembers only the last one. A correct version needs
+  either a per-record accumulator or a boot-time mutation of
+  `last_activity_at`, and the second makes the record claim activity at a
+  moment there was none.
+
+Support for the outage case can be added later if a deployment shows it is
+needed. Nothing here is a one-way door: every §5.3 field defaults, so an
+accumulator is additive, and a heartbeat is a new file rather than a schema
+change.
 
 **One ordering constraint is not optional, whatever the arithmetic does:** the
 first expiry sweep must not run until the startup replay (§2.2) has finished.
-Expiry is the destructive step — it deletes the record that recreation reads
-from — and the replay's whole job is reviving rooms that have messages waiting.
-A sweep that runs first reclaims exactly the rooms the replay was about to
-wake, irreversibly.
+Expiry is the destructive step — it deletes the record recreation reads from —
+and the replay's whole job is reviving rooms that have messages waiting. A
+sweep that runs first reclaims exactly the rooms the replay was about to wake,
+irreversibly.
 
-**A related question the lifecycle increment has to answer:** a record that was
-`active` at shutdown has no `dropped_at`, so on the next start it is neither
-resident nor dropped, and `lifecycle_state` reads that as **`failed`** — which
-is in the default `list` view. Every watcher therefore reads as failed between
-a start and the first sweep. Either the sweep runs early enough that no
-operator sees it, or the boot path marks previously-active records idle
-directly; what it must not do is leave `list` reporting a healthy fleet as
-broken after every restart.
+**A related question the lifecycle increment has to answer**, and it is not
+settled by "boot recreates active records only" below: a record that was
+`active` at shutdown has no `dropped_at`, so between the start and whatever
+processes it, it is neither resident nor dropped — and `lifecycle_state` reads
+that as **`failed`**, which is in the default `list` view. What it must not do
+is leave `list` reporting a healthy fleet as broken after every restart.
 
 #### `failed`: a record that wants to be resident and is not
 
