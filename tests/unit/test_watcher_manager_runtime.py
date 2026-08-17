@@ -177,6 +177,21 @@ class TestCreation(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.last_activity_at, "")
         lifecycle.save_state.assert_not_called()
 
+    async def test_a_disarmed_manager_declines_every_offer(self):
+        """Shutdown disarms the manager before anything stops (§2.5): the wake
+        arms stay reachable until the connector disconnects, and a creation
+        mid-teardown outlives every stop that already ran. None-shaped — a
+        final decline, so the drain drops and remembers, and the watermark
+        stays put for the next boot."""
+        manager, lifecycle, _ = _manager()
+
+        manager.disarm()
+        result = await manager.get_or_create("rc", _room())
+
+        self.assertIsNone(result)
+        lifecycle.start_watcher_in_room.assert_not_called()
+        lifecycle.record_for_room.assert_not_called()
+
     async def test_a_wrong_connector_is_refused(self):
         manager, lifecycle, _ = _manager()
         result = await manager.get_or_create("mm", _room())
@@ -682,7 +697,16 @@ class TestEndToEndThroughTheRealLifecycle(unittest.IsolatedAsyncioTestCase):
             "trigger's, which sits above it",
         )
 
-    async def test_a_recreation_advances_the_idle_clock_and_clears_dropped_at(self):
+    async def test_a_recreation_carries_the_idle_clock_and_clears_dropped_at(self):
+        """Deliberately inverted (the sixth in this branch): this test used to
+        assert recreation *advances* `last_activity_at`, and internal review
+        showed that to be §2.5's condemned boot-time mutation — the boot
+        evaluation recreates every was-active record at every start, so the
+        stamp meant a deployment restarted more often than its idle TTL never
+        idled anything, silently. A recreation is residency, not activity;
+        when it *is* activity (a wake), the triggering message's enqueue
+        stamps the clock moments later at its one advancing write site.
+        """
         lifecycle, connector, _patch = self._real_lifecycle()
         manager = WatcherManager("rc", connector, lifecycle, [_rule(agent="default")])
 
@@ -697,7 +721,10 @@ class TestEndToEndThroughTheRealLifecycle(unittest.IsolatedAsyncioTestCase):
             await manager.get_or_create("rc", _room())
 
         ws = lifecycle.get_watcher_state("rc-eng-backend")
-        self.assertNotEqual(ws.last_activity_at, "2020-01-01T00:00:00+00:00")
+        self.assertEqual(
+            ws.last_activity_at, "2020-01-01T00:00:00+00:00",
+            "a restart is not activity — the idle clock survives recreation",
+        )
         self.assertEqual(ws.dropped_at, "", "a resident room is not dropped")
 
     async def test_a_second_message_reuses_the_watcher_it_created(self):

@@ -235,6 +235,35 @@ class TestShutdownOrdering(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(call_order[:2], ["stop_all", "save_state"])
 
+    async def test_the_manager_is_disarmed_before_anything_stops(self):
+        """The wake arms stay reachable until the connector disconnects, so a
+        shutdown that stops things before disarming leaves a window where an
+        idle room's message recreates a watcher nothing below will stop —
+        absent from stop_all's snapshot, its save rewriting the state file
+        after the final save (§2.5)."""
+        mgr = _make_manager()
+        call_order: list[str] = []
+
+        mgr._watcher_manager = MagicMock()
+        mgr._watcher_manager.disarm = MagicMock(
+            side_effect=lambda: call_order.append("disarm"))
+        sweep = MagicMock()
+
+        async def _sweep_stop():
+            call_order.append("sweep_stop")
+
+        sweep.stop = _sweep_stop
+        mgr._sweep = sweep
+
+        async def _stop_all():
+            call_order.append("stop_all")
+
+        mgr._lifecycle.stop_all = _stop_all
+
+        await mgr.shutdown()
+
+        self.assertEqual(call_order[:3], ["disarm", "sweep_stop", "stop_all"])
+
     async def test_disconnect_called_after_save_state(self):
         mgr = _make_manager()
 

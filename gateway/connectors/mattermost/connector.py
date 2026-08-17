@@ -232,15 +232,22 @@ class MattermostConnector(Connector):
         await self._ws.start()
 
     async def disconnect(self) -> None:
-        """Close the WebSocket and release HTTP client resources."""
-        # Routing offers run off the handler path, so stopping the transport does not
-        # stop them — cancelled here rather than left racing a closed client.
+        """Close the WebSocket and release HTTP client resources.
+
+        The transport stops **first** — the channel workers are what spawn
+        routing and wake episodes (§2.5), so cancelling `_routing_tasks`
+        before they stop lets a worker spawn a newcomer during the gather:
+        never cancelled, and `clear()` then drops its only strong reference
+        while it runs against a dead transport. Stop the spawner, then
+        harvest; the offers themselves run off the handler path, which is why
+        they still need the explicit cancel afterwards.
+        """
+        await self._ws.stop()
         for task in list(self._routing_tasks):
             task.cancel()
         if self._routing_tasks:
             await asyncio.gather(*self._routing_tasks, return_exceptions=True)
         self._routing_tasks.clear()
-        await self._ws.stop()
         await self._rest.close()
         logger.info("MattermostConnector disconnected")
 

@@ -286,13 +286,15 @@ class MessageProcessor:
             self._queue.put_nowait(msg)
             # The idle clock (§2.5), advanced on *accepted* work only — a refused
             # message is not activity, and counting it would keep a room the
-            # gateway is dropping messages for alive forever. One write site for
-            # everything that reaches a session: inbound and scheduled injection
-            # both funnel through this method, so the two cannot drift. In memory
-            # only, persisted at the existing save points — a per-message disk
-            # write is the cost §2.2 explicitly rejects — and a crash that loses
-            # the advance idles the room *early*, which is the safe direction:
-            # its next message wakes it and the same session resumes.
+            # gateway is dropping messages for alive forever. The clock's one
+            # ADVANCING write site: inbound and scheduled injection both funnel
+            # through this method, so the two cannot drift. (Creation initializes
+            # the field — a birth stamp, not an advance — and recreation carries
+            # it untouched: a restart is not activity.) In memory only, persisted
+            # at the existing save points — a per-message disk write is the cost
+            # §2.2 explicitly rejects — and a crash that loses the advance idles
+            # the room *early*, which is the safe direction: its next message
+            # wakes it and the same session resumes.
             if self._watcher_state is not None:
                 self._watcher_state.last_activity_at = now_iso()
             return True

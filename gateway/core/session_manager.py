@@ -393,6 +393,13 @@ class SessionManager:
         and cause duplicate message delivery on the next restart.
         """
         logger.info("SessionManager shutting down")
+        if self._watcher_manager is not None:
+            # First, before anything stops: the wake arms stay reachable until
+            # the connector disconnects, and an idle room's message landing
+            # mid-teardown would otherwise recreate a watcher nothing below
+            # will stop — absent from stop_all's snapshot, its save rewriting
+            # the state file after the final save (§2.5).
+            self._watcher_manager.disarm()
         if self._sweep is not None:
             # Before stop_all, so a pass cannot overlap the shutdown's own
             # teardown of the processors it is judging.

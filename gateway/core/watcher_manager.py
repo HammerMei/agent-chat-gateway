@@ -383,6 +383,25 @@ class WatcherManager:
         # pile-ups, it does not ration exactly (§2.7 step 7).
         self._creation_cap = creation_cap
         self._creations_in_flight = 0
+        # Set by SessionManager.shutdown before the teardown begins. The wake
+        # arms stay physically reachable until the connector disconnects — an
+        # idle room is subscribed with no processor for that whole span, so its
+        # messages read UNROUTED and would recreate a watcher *during* the
+        # teardown: never drained, absent from stop_all's snapshot, and its
+        # save_state rewrites the state file after the final save. Once set,
+        # every offer answers None — a final decline, so the declined drain
+        # drops and remembers the frames, and the watermark stays put for the
+        # next boot's replay to recover them.
+        self._shutting_down = False
+
+    def disarm(self) -> None:
+        """Refuse every offer from now on — called by shutdown, before any stop.
+
+        The wake arms stay reachable until the connector disconnects, so
+        without this a message landing mid-teardown recreates a watcher the
+        teardown will never stop (§2.5).
+        """
+        self._shutting_down = True
 
     async def get_or_create(
         self,
@@ -415,6 +434,16 @@ class WatcherManager:
             logger.error(
                 "get_or_create for connector %r reached the manager for %r",
                 connector, self._connector_name,
+            )
+            return None
+        if self._shutting_down:
+            # Disarmed (see __init__): a creation mid-teardown outlives every
+            # stop that already ran. Final, not retryable — the daemon is
+            # exiting, and the message stays below the watermark for the next
+            # boot to replay.
+            logger.info(
+                "Not creating a watcher for room %s — the gateway is shutting down",
+                room.id,
             )
             return None
 
@@ -489,14 +518,22 @@ class WatcherManager:
             # Everything a start does not rebuild, carried out of the record being
             # recreated — derived from the field classification in `state.py`, not
             # listed here, so a new §5.3 field survives recreation without this line
-            # changing. The clocks move with it: the room is resident again, so it
-            # is no longer dropped, and this is activity. Read under the lock, and
-            # that is load-bearing for the watermark below: a teardown this wake
-            # waited on captures the live watermark into the record as one of its
-            # steps, and a boundary read before the lock would replay from the
-            # stale mark.
+            # changing. Read under the lock, and that is load-bearing for the
+            # watermark below: a teardown this wake waited on captures the live
+            # watermark into the record as one of its steps, and a boundary read
+            # before the lock would replay from the stale mark.
+            #
+            # `last_activity_at` is carried, NOT re-stamped. A recreation is
+            # residency, not activity: the boot evaluation routes every
+            # was-active record through here at every start, and a stamp at
+            # this line is exactly the "boot-time mutation of last_activity_at"
+            # §2.5 condemns — it made the record claim activity at a moment
+            # there was none, so a deployment restarted more often than its
+            # idle TTL never idled anything, silently. When a recreation *is*
+            # activity — a wake, a replay with messages waiting — the message
+            # that caused it is enqueued moments later, and `enqueue` is the
+            # clock's one advancing write site.
             carried = carried_fields(record)
-            carried["last_activity_at"] = now_iso()
             carried["dropped_at"] = ""
             # The window this recreation owes the room. Read before the start, which
             # restores it into the connector and then advances it as the replayed

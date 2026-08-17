@@ -342,12 +342,14 @@ def lifecycle_state(record: "WatcherState", *, resident: bool) -> StateFilter:
       would hide the only one of the two that someone has to act on.
     * **idle** is a record the manager dropped. It is checked *before*
       residency because an idle record is supposed to have no processor;
-      reversing the two would report every idle watcher as failed. **Nothing
-      writes ``dropped_at`` yet** — the watcher manager will, when it releases a
-      watcher and clears it on recreation (§2.5) — so this branch is unreachable
-      in production today and ``--idle`` legitimately returns nothing. The
-      reader lands before the writer on purpose: it is what makes idling
-      observable as soon as the lifecycle increment produces it.
+      reversing the two would report every idle watcher as failed. Two writers
+      stamp ``dropped_at`` (§2.5): the sweep's ``drop_idle`` when it releases a
+      quiet room, and the boot evaluation for a was-active record already past
+      its idle TTL. Recreation clears it. The boot writer means a record whose
+      start failed *and* whose room then stayed quiet past the TTL converts to
+      idle rather than being retried at the next boot — deliberate: reviving a
+      15-days-quiet room to sit idle is the resume cost §2.5 declines to pay,
+      and its next message or scheduled injection retries the start anyway.
     * **failed** is the record and reality disagreeing: it wants to be resident
       and is not, which is what a start that got far enough to write a record
       and then raised leaves behind. Derived rather than stored, so the next

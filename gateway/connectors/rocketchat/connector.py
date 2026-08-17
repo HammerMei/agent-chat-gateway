@@ -360,13 +360,20 @@ class RocketChatConnector(Connector):
         )
 
     async def disconnect(self) -> None:
-        """Close the WebSocket and release HTTP client resources."""
+        """Close the WebSocket and release HTTP client resources.
+
+        The transport stops **first**: the room workers are what spawn wake
+        episodes (§2.5), so cancelling `_routing_tasks` before they stop lets
+        a worker spawn a newcomer during the gather — never cancelled, and
+        `clear()` then drops its only strong reference while it runs against a
+        dead transport. Stop the spawner, then harvest.
+        """
+        await self._ws.stop()
         for task in list(self._routing_tasks):
             task.cancel()
         if self._routing_tasks:
             await asyncio.gather(*self._routing_tasks, return_exceptions=True)
         self._routing_tasks.clear()
-        await self._ws.stop()
         await self._rest.close()
         logger.info("RocketChatConnector disconnected")
 
