@@ -44,6 +44,7 @@ from ...core.connector import (
     RoomCapacity,
 )
 from ...core.dispatch import RoomAlreadyRoutedError
+from ...core.paths import resolve_under
 from ...core.pending_route import (
     STARTING_UP_NOTICE,
     PendingRoute,
@@ -585,8 +586,16 @@ class MattermostConnector(Connector):
     # ── Attachment cache ────────────────────────────────────────────────────────
 
     def _cache_dir_for(self, channel_id: str) -> Path:
+        """The channel's cache directory, contained under the cache base.
+
+        The character-class sanitize alone lets `..` through — dots are legal
+        filename characters — and expiry `rmtree`s this directory, so
+        `resolve_under` is the actual fence. See Rocket.Chat's
+        `attachment_cache_dir` twin; a refused component raises to the caller
+        below, which answers None (no caching for this channel).
+        """
         safe_channel_id = re.sub(r"[^\w.\-]", "_", channel_id)
-        return self._attachments_cache_base / safe_channel_id
+        return resolve_under(self._attachments_cache_base, safe_channel_id)
 
     @property
     def text_chunk_limit(self) -> int | None:
@@ -746,7 +755,14 @@ class MattermostConnector(Connector):
 
     def attachment_cache_dir(self, room_id: str) -> str | None:
         """Return the global cache directory for a channel's attachments."""
-        return str(self._cache_dir_for(room_id))
+        try:
+            return str(self._cache_dir_for(room_id))
+        except ValueError:
+            logger.warning(
+                "Refusing an attachment cache path for channel id %r — it does "
+                "not name a directory under the cache base", room_id,
+            )
+            return None
 
     # ── History ──────────────────────────────────────────────────────────────
 

@@ -39,6 +39,7 @@ from ...core.connector import (
     RoomCapacity,
 )
 from ...core.dispatch import RoomAlreadyRoutedError
+from ...core.paths import resolve_under
 from ...core.pending_route import (
     STARTING_UP_NOTICE,
     PendingRoute,
@@ -1459,8 +1460,28 @@ class RocketChatConnector(Connector):
     # ── Attachment cache ────────────────────────────────────────────────────────
 
     def attachment_cache_dir(self, room_id: str) -> str | None:
-        """Return the global cache directory for a room's attachments."""
-        return str(self._attachments_cache_base / room_id)
+        """Return the global cache directory for a room's attachments.
+
+        Contained via `resolve_under`, not raw joining: the id arrives from
+        the server and is a path component here, and expiry `rmtree`s this
+        directory — so an id spelling `..` (which survives a character-class
+        sanitize, because dots are legal) must not be able to name a path
+        outside the cache base. Sanitized first for the characters a filename
+        cannot carry, exactly as Mattermost's `_cache_dir_for` does; a
+        component `resolve_under` still refuses answers None, which the
+        pipeline already reads as "no attachment caching for this room" — the
+        fail-closed direction. Rocket.Chat ids are alphanumeric in practice,
+        so real rooms resolve to the same directory they always did.
+        """
+        safe_room_id = re.sub(r"[^\w.\-]", "_", room_id)
+        try:
+            return str(resolve_under(self._attachments_cache_base, safe_room_id))
+        except ValueError:
+            logger.warning(
+                "Refusing an attachment cache path for room id %r — it does "
+                "not name a directory under the cache base", room_id,
+            )
+            return None
 
     @property
     def text_chunk_limit(self) -> int | None:
