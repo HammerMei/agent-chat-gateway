@@ -187,6 +187,55 @@ class TestVerbsOnRuleDerivedRecords(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(agent.created_sessions), sessions_before,
                          "the refusal minted no session")
 
+    async def test_resume_joins_the_shutdown_drain_barrier(self):
+        """Codex round 9: the manager's drain covers message-triggered
+        starts, but resume/reset call start_watcher_in_room directly off
+        control handlers the ControlServer's stop does not await — a verb
+        already inside session creation could install a processor after
+        stop_all's snapshot. drain_verbs waits it out; a verb arriving after
+        the drain refuses."""
+        connector, lifecycle, _ = await self._harness()
+        gate = asyncio.Event()
+        agent = lifecycle._agents["default"]
+        real_create = agent.create_session
+
+        async def gated_create(*args, **kwargs):
+            await gate.wait()
+            return await real_create(*args, **kwargs)
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            MockProc.return_value.stop = AsyncMock()
+            await self._create(connector, lifecycle)
+            await lifecycle.pause_watcher(NAME)
+            # Force the resume to mint a session so it parks on the gate.
+            lifecycle.get_watcher_state(NAME).session_id = ""
+            agent.create_session = gated_create
+
+            verb = asyncio.create_task(lifecycle.resume_watcher(NAME))
+            for _ in range(10):
+                await asyncio.sleep(0)
+
+            drain = asyncio.create_task(lifecycle.drain_verbs())
+            for _ in range(10):
+                await asyncio.sleep(0)
+            self.assertFalse(drain.done(),
+                             "the drain must wait for the in-flight resume")
+
+            gate.set()
+            await drain
+            await verb
+
+            self.assertIsNotNone(
+                lifecycle.processor_named(NAME),
+                "the verb finished BEFORE the drain returned — its processor "
+                "is inside the snapshot stop_all takes next")
+
+            # And after the drain, new verbs refuse.
+            with self.assertRaises(RuntimeError) as ctx:
+                await lifecycle.reset_watcher(NAME)
+            self.assertIn("shutting down", str(ctx.exception))
+
     async def test_pause_refuses_a_record_reclaimed_while_it_waited(self):
         """TOCTOU sweep after Codex round 4: pause was the odd verb out —
         resume and reset both raise on a record reclaimed while they waited

@@ -1492,6 +1492,18 @@ class MattermostConnector(Connector):
         if not state:
             await self._offer_to_router(channel_id, decoded)
             return
+        if state.membership_lost:
+            # The removal hook stamped this state, but the reclamation runs in
+            # its own task and can wait on the watcher lock — a post handled
+            # in that window used to be normalized and DELIVERED to the agent
+            # of a room the bot had already been removed from, with the flag
+            # consulted only later at the commit fence (Codex round 9). The
+            # bot cannot answer in a room it left; drop at entry.
+            logger.debug(
+                "Channel %s: membership lost, reclamation pending — "
+                "dropping post", channel_id,
+            )
+            return
 
         msg_id = post.get("id", "")
         if msg_id and msg_id in state.seen_ids_set:

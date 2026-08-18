@@ -30,7 +30,12 @@ from .injected_context_builder import InjectedContextBuilder
 from .lifecycle_sweep import LifecycleSweep
 from .permission import PermissionRegistry
 from .session_maps import SessionMaps
-from .state import StateFilter, parse_state_filter, past_idle_ttl
+from .state import (
+    StateFilter,
+    parse_state_filter,
+    past_idle_ttl,
+    room_kind_or_channel,
+)
 from .state_store import StateStore
 from .watcher_lifecycle import WatcherLifecycle
 from .watcher_manager import RoomRef, WatcherManager
@@ -39,25 +44,9 @@ from .watcher_rule import RoomKind
 logger = logging.getLogger("agent-chat-gateway.core.session_manager")
 
 
-def _room_kind_or_channel(record) -> RoomKind:
-    """The record's room kind, degraded rather than raised (Codex round 8).
-
-    `load_state` promises a corrupted record degrades instead of taking the
-    service down; a raising `RoomKind(...)` conversion re-introduced the
-    crash one field later. Unknown values fall back to CHANNEL with a
-    warning — the mention gate applies there, which is the safe default.
-    """
-    if not record.room_kind:
-        return RoomKind.CHANNEL
-    try:
-        return RoomKind(record.room_kind)
-    except ValueError:
-        logger.warning(
-            "Watcher '%s': persisted room_kind %r is not a known kind — "
-            "treating the room as a channel",
-            record.watcher_name, record.room_kind,
-        )
-        return RoomKind.CHANNEL
+# The shared degrade-don't-raise conversion lives in state.py since Codex
+# round 9 found a THIRD raising site — one helper, every consumer.
+_room_kind_or_channel = room_kind_or_channel
 
 
 class SessionManager:
@@ -554,7 +543,10 @@ class SessionManager:
                     # `_create`, and a rule-derived record is absent from
                     # `watchers:`, so the static path never starts one either.
                     continue
-                kind = RoomKind(ws.room_kind) if ws.room_kind else RoomKind.CHANNEL
+                # Tolerant like the boot and injection paths (Codex round 9 —
+                # the third raising site): a garbled kind must not strand the
+                # outage messages behind an idle record no live traffic wakes.
+                kind = room_kind_or_channel(ws)
                 # Triggering the recreation is this loop's whole job. It owns no
                 # interval of its own; the recreation replays what the room owes.
                 await self._watcher_manager.get_or_create(
@@ -739,6 +731,11 @@ class SessionManager:
             # after stop_all's snapshot, so it must finish — or bail at a
             # disarm re-check — before the snapshot is taken.
             await self._watcher_manager.drain()
+        # The verbs' half of the same barrier (Codex round 9): resume and
+        # reset start watchers off control-socket handlers the ControlServer
+        # does not await, so they need their own drain — new transitions
+        # refuse, in-flight ones finish before stop_all's snapshot.
+        await self._lifecycle.drain_verbs()
         if self._sweep is not None:
             # Before stop_all, so a pass cannot overlap the shutdown's own
             # teardown of the processors it is judging.

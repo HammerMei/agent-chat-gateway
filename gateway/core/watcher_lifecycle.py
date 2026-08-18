@@ -111,6 +111,40 @@ class WatcherLifecycle:
         # commands targeting the same watcher could otherwise interleave and
         # corrupt _processors / _states.
         self._watcher_locks: dict[str, asyncio.Lock] = {}
+        # The shutdown barrier for OPERATOR-started transitions (Codex round
+        # 9): the manager's drain covers creation/recreation/registration
+        # episodes, but resume and reset call start_watcher_in_room directly
+        # off control-socket handlers the ControlServer's stop does not
+        # await — a verb already inside session creation could install a
+        # processor after stop_all's snapshot and save after the final save,
+        # the same hole round 5 closed for message-triggered starts. Same
+        # discipline: increment in the same synchronous segment as the entry
+        # disarm check; drain waits the in-flight verbs out.
+        self._disarmed = False
+        self._verb_inflight = 0
+        self._verbs_drained = asyncio.Event()
+        self._verbs_drained.set()
+
+    def _enter_verb(self, verb: str, name: str) -> None:
+        """MUST run in the same synchronous segment as the disarm check."""
+        if self._disarmed:
+            raise RuntimeError(
+                f"Cannot {verb} watcher '{name}' — the gateway is shutting "
+                f"down."
+            )
+        self._verb_inflight += 1
+        self._verbs_drained.clear()
+
+    def _exit_verb(self) -> None:
+        self._verb_inflight -= 1
+        if self._verb_inflight == 0:
+            self._verbs_drained.set()
+
+    async def drain_verbs(self) -> None:
+        """Refuse new resume/reset transitions, wait out those in flight.
+        Called by shutdown after the manager's own drain, before stop_all."""
+        self._disarmed = True
+        await self._verbs_drained.wait()
 
     # ── Sync ──────────────────────────────────────────────────────────────────
 
@@ -688,6 +722,15 @@ class WatcherLifecycle:
                 f"records that exist."
             )
         self._ensure_agent_available(wc)
+        # The shutdown barrier (Codex round 9): checked and entered in one
+        # synchronous segment, exited via finally — see drain_verbs.
+        self._enter_verb("resume", name)
+        try:
+            await self._resume_locked(name, wc, record)
+        finally:
+            self._exit_verb()
+
+    async def _resume_locked(self, name, wc, record) -> None:
         async with self._get_watcher_lock(name):
             state = self._states.get(name)
             if state is not None and state is not record:
@@ -781,6 +824,14 @@ class WatcherLifecycle:
                 f"(§2.5). Resume it first, then reset."
             )
         self._ensure_agent_available(wc)
+        # The shutdown barrier (Codex round 9) — same shape as resume's.
+        self._enter_verb("reset", name)
+        try:
+            await self._reset_locked(name, wc, record)
+        finally:
+            self._exit_verb()
+
+    async def _reset_locked(self, name, wc, record) -> None:
         async with self._get_watcher_lock(name):
             # EVERY gate runs before the destructive stop (Codex round 5):
             # with the checks after it, a reset correctly rejected for a

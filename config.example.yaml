@@ -285,7 +285,7 @@ watchers:
   #
   # name (required):
   #   The RULE's identity — rules are not auto-named. Each created watcher gets
-  #   its own derived name like "<connector>-<room>", which is what the CLI
+  #   its own derived name like "<connector>:<room>", which is what the CLI
   #   verbs above act on ("list" shows them).
   #
   # rooms (required) — a mapping, with up to four keys:
@@ -328,7 +328,7 @@ watchers:
     agent: my-agent                 # must match an agent name above
     description: "General channel + the admin's DMs"
     rooms:
-      include: [general]            # -> creates watcher "rc-home-general" on first message
+      include: [general]            # -> creates watcher "rc-home:general" on first message
       # direct: true                # uncomment to also serve 1:1 DMs
 
 # ── Templates (optional — most useful with 2+ connectors/agents) ─────────────

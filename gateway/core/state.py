@@ -282,7 +282,12 @@ def _past_ttl(record: "WatcherState", field_name: str, origin: str, now) -> bool
     from datetime import datetime, timedelta
 
     days = (record.rule or {}).get(field_name)
-    if not isinstance(days, int) or days <= 0 or not origin:
+    # bool is an int subtype, so `True` read as a ONE-DAY TTL — and the
+    # expiry leg is destructive, which is exactly what this helper's
+    # never-destructive-on-bad-data contract forbids (Codex round 9). The
+    # config parser already rejects booleans; a hand-edited or corrupted
+    # record must degrade the same way.
+    if isinstance(days, bool) or not isinstance(days, int) or days <= 0 or not origin:
         return False
     try:
         start = datetime.fromisoformat(origin)
@@ -292,6 +297,31 @@ def _past_ttl(record: "WatcherState", field_name: str, origin: str, now) -> bool
         # A naive stamp is a legacy record; local time is what wrote it.
         start = start.astimezone()
     return (now - start) >= timedelta(days=days)
+
+
+def room_kind_or_channel(record: "WatcherState"):
+    """The record's room kind, degraded rather than raised (Codex round 9 —
+    the THIRD raising conversion site made this the shared helper).
+
+    `load_state` promises a corrupted record degrades instead of taking the
+    service down; a raising `RoomKind(...)` conversion re-introduces the
+    crash one field later, wherever it runs. Unknown values fall back to
+    CHANNEL with a warning — the mention gate applies there, which is the
+    safe default.
+    """
+    from gateway.core.watcher_rule import RoomKind
+
+    if not record.room_kind:
+        return RoomKind.CHANNEL
+    try:
+        return RoomKind(record.room_kind)
+    except ValueError:
+        logger.warning(
+            "Watcher '%s': persisted room_kind %r is not a known kind — "
+            "treating the room as a channel",
+            record.watcher_name, record.room_kind,
+        )
+        return RoomKind.CHANNEL
 
 
 def carried_fields(state: "WatcherState | None") -> dict:

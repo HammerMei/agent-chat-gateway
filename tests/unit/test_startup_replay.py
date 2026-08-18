@@ -334,7 +334,7 @@ class TestBootRunsTheSweepsEvaluation(unittest.IsolatedAsyncioTestCase):
             bad.watcher_name: bad, good.watcher_name: good})
 
         with self.assertLogs(
-            "agent-chat-gateway.core.session_manager", level="WARNING"
+            "agent-chat-gateway.state", level="WARNING"
         ) as captured:
             await mgr._evaluate_lifecycle_at_boot()
 

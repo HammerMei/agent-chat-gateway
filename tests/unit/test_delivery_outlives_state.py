@@ -272,6 +272,43 @@ class TestADeliveryCrossingAMembershipRemoval(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(state_c.last_processed_ts)
         self.assertNotIn("p1", state_c.seen_ids_set)
 
+    async def test_mm_drops_a_post_at_entry_once_membership_is_lost(self):
+        """Codex round 9: the reclamation runs in its own task and can wait
+        on the watcher lock — a post handled in that window was normalized
+        and DELIVERED to the agent of a room the bot had been removed from,
+        with the flag consulted only at the commit fence. Dropped at entry
+        now: the bot cannot answer in a room it left."""
+        from unittest.mock import AsyncMock
+
+        from gateway.connectors.mattermost.connector import _ChannelState
+        from gateway.core.connector import Room
+        from tests.unit.test_mattermost_connector import _make_connector
+
+        connector = _make_connector()
+        connector._config.require_mention = False
+        connector._config.filter_sender = False
+        resolve = AsyncMock(return_value="alice")
+        connector._rest.resolve_username = resolve
+        handler = AsyncMock(return_value=True)
+        connector._handler = handler
+
+        state = _ChannelState(room=Room(id="chan-1", name="general", type="channel"))
+        state.membership_lost = True
+        connector._channels["chan-1"] = state
+
+        await connector._on_posted_event({
+            "post": {"id": "p1", "channel_id": "chan-1", "user_id": "u-alice",
+                     "message": "hello", "create_at": 200},
+            "sender_name": "@alice", "channel_type": "O",
+            "channel_name": "general", "channel_display_name": "General",
+            "team_id": "", "mentions": [],
+        })
+
+        handler.assert_not_awaited()
+        resolve.assert_not_awaited()
+        self.assertNotIn("p1", state.seen_ids_set,
+                         "nothing was committed for the dropped post")
+
     async def test_the_mm_removal_hook_stamps_the_current_state(self):
         from unittest.mock import AsyncMock
 

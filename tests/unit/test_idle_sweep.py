@@ -150,6 +150,21 @@ class TestWhatTheTimerMustNeverTouch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.dropped_at, _iso(NOW - timedelta(days=2)),
                          "the existing dropped_at is not restamped")
 
+    async def test_a_boolean_ttl_is_bad_data_not_a_one_day_clock(self):
+        """Codex round 9: bool is an int subtype, so a corrupted
+        `session_expire_days: true` used to read as a ONE-DAY TTL and the
+        destructive expiry leg ran on it — the exact never-destructive-on-
+        bad-data contract the helper states. Bad data disables the clock."""
+        from gateway.core.state import past_expire_ttl, past_idle_ttl
+
+        record = _record(dropped_at=_iso(NOW - timedelta(days=400)),
+                         age_days=400.0)
+        record.rule["session_expire_days"] = True
+        record.rule["session_idle_days"] = True
+
+        self.assertFalse(past_expire_ttl(record, NOW))
+        self.assertFalse(past_idle_ttl(record, NOW))
+
     async def test_a_static_record_is_config_yamls_not_the_timers(self):
         record = _record(rule=False, age_days=400.0)
         sweep, lifecycle, _ = _harness(
