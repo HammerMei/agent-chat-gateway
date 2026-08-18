@@ -320,6 +320,30 @@ class TestAJoinRegistersAnIdleRecord(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.room_kind, "channel")
         lifecycle._state_store.save.assert_called()
 
+    async def test_a_join_for_a_recreated_room_does_not_clobber_the_old_record(self):
+        """Codex round 7: the same-name/different-room refusal at the SECOND
+        install site. `register_on_join` establishes no record exists for the
+        ROOM — but a room deleted and recreated under the same platform name
+        derives the same watcher NAME, and installing the join's record
+        silently replaced the old room's record, pause and session included."""
+        manager, lifecycle, connector = _add_harness()
+        old = make_rule_derived_record(
+            name="rc-eng-backend", room_id="old-room-id", paused=True)
+        lifecycle._states["rc-eng-backend"] = old
+
+        with self.assertRaises(RuntimeError) as ctx:
+            await manager.register_on_join(
+                _room(id="recreated-room-id", name="eng-backend"))
+
+        # The raise is contained one layer up: the SessionManager's membership
+        # handler logs and swallows (pinned by
+        # test_handler_failures_never_reach_the_connector), and the room's
+        # first message reports the same exit loudly via the start guard.
+        self.assertIn("expire rc-eng-backend", str(ctx.exception))
+        self.assertIs(lifecycle.get_watcher_state("rc-eng-backend"), old,
+                      "the old room's record — an operator's pause included "
+                      "— was left untouched")
+
     async def test_nothing_is_started(self):
         manager, lifecycle, connector = _add_harness()
 

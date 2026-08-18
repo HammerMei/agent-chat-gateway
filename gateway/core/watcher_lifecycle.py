@@ -636,6 +636,23 @@ class WatcherLifecycle:
         the per-watcher lock, and has already established no record exists
         for the room.
         """
+        # The same-name/different-room refusal, at the SECOND install site
+        # (Codex round 7): the caller established no record exists for this
+        # ROOM, but a room deleted and recreated under the same platform name
+        # derives the same watcher NAME — and installing here would silently
+        # replace the old room's record exactly the way start's step 0.5 now
+        # refuses to. The raise is contained by the membership path's
+        # safety-net logging; the room's first message then hits the start
+        # guard and reports the same exit loudly.
+        existing = self._states.get(wc.name)
+        if existing is not None and existing.room_id and existing.room_id != room.id:
+            raise RuntimeError(
+                f"Watcher name '{wc.name}' already belongs to room "
+                f"'{existing.room_id}', but this membership add is for room "
+                f"'{room.id}' — a room recreated under the same name derives "
+                f"the same watcher name. Release the old record with "
+                f"'expire {wc.name}' (or wait out its TTL)."
+            )
         ws = WatcherState(
             watcher_name=wc.name,
             session_id="",
