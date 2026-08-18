@@ -720,7 +720,7 @@ class TestValidateConfigLint(_ValidateConfigTestBase):
                 connector: rc
                 rooms:
                   include: [general]
-                online_notification: null
+                context_inject_files: []
         """)
         result = self._validate(cfg, lint=True)  # must not raise
         watcher_findings = [f for f in result.findings if f.entity_kind == "watcher"]

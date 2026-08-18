@@ -196,15 +196,11 @@ class TestMaterialization(unittest.TestCase):
         rule = _rule(
             include=["eng-*"],
             context_inject_files=["/srv/notes.md"],
-            online_notification="up",
-            offline_notification="down",
             history_handoff=HistoryHandoffConfig(enabled=True, fetch_count=25),
         )
         wc = materialize(rule, RoomRef(id="r1", kind=RoomKind.CHANNEL, name="eng-x"))
 
         self.assertEqual(wc.context_inject_files, ["/srv/notes.md"])
-        self.assertEqual(wc.online_notification, "up")
-        self.assertEqual(wc.offline_notification, "down")
         self.assertTrue(wc.history_handoff.enabled)
         self.assertEqual(wc.history_handoff.fetch_count, 25)
 

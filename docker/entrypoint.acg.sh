@@ -188,8 +188,6 @@ config = {
         "rooms":              watcher_rooms,
         "agent":              "default-agent",
         "context_inject_files": [],
-        "online_notification":  "✅ _Agent online_",
-        "offline_notification": "❌ _Agent offline_",
     }],
 }
 

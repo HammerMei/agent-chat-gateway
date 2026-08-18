@@ -59,6 +59,7 @@ def _mm_connector(messages, *, was_full=False):
 
     c = MattermostConnector.__new__(MattermostConnector)
     c._channels = {}
+    c._membership_gen = {}
     c._rest = MagicMock()
     c._rest.get_room_history_page = AsyncMock(
         return_value=HistoryPage(messages=messages, raw_count=len(messages),

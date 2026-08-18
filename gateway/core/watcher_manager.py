@@ -190,8 +190,6 @@ def materialize(rule: WatcherRule, room: RoomRef) -> WatcherConfig:
         room=room_description(room),
         agent=rule.agent,
         context_inject_files=list(rule.context_inject_files),
-        online_notification=rule.online_notification,
-        offline_notification=rule.offline_notification,
         history_handoff=replace(rule.history_handoff),
     )
 
@@ -427,8 +425,6 @@ def config_from_record(record: WatcherState) -> WatcherConfig | None:
                else _str("agent")),
         context_inject_files=[p for p in files if isinstance(p, str)]
         if isinstance(files, list) else [],
-        online_notification=_str("online_notification") or None,
-        offline_notification=_str("offline_notification") or None,
         history_handoff=HistoryHandoffConfig(**hh_kwargs),
     )
 

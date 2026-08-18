@@ -43,6 +43,10 @@ def _record(name="w1", *, idle_days=15, expire_days=15, age_days=16.0,
         rule_name="eng" if rule else "",
         connector="rc" if rule else "",
         agent="default" if rule else "",
+        # Faithful to a real start (round 19): a record with a session
+        # carries the identity it was minted against — empty now reads
+        # "unverifiable" at reclaim and skips the agent-bound cleanup.
+        backend_identity="claude:" if session_id else "",
     )
 
 

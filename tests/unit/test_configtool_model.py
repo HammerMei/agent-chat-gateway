@@ -899,7 +899,7 @@ class TestWatcherCrudPrimitives(_EditableConfigTestBase):
               - connector: rc
                 agent: default
                 room: general
-                online_notification: "hi"
+                context_inject_files: [notes.md]
         """)
         cfg = EditableConfig.load(path)
         added = cfg.add_watcher_rooms("rc", "default", ["dev"], {})
@@ -1130,15 +1130,12 @@ class TestWatcherSharedFields(unittest.TestCase):
             "connector": "rc", "agent": "d", "room": "general", "name": "x",
             "description": "desc", "inherits": "tpl",
             "context_inject_files": ["a.md"],
-            "online_notification": "up", "offline_notification": "down",
             "history_handoff": {"enabled": True},
         })
 
         self.assertEqual(got, {
             "inherits": "tpl",
             "context_inject_files": ["a.md"],
-            "online_notification": "up",
-            "offline_notification": "down",
             "history_handoff": {"enabled": True},
             "description": "desc",
         })

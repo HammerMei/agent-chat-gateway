@@ -808,28 +808,6 @@ class Connector(ABC):
 
     # ── Optional status notifications ─────────────────────────────────────────
 
-    async def notify_online(self, room_id: str, text: str) -> None:
-        """Post a status message when the agent comes online in a room.
-
-        Args:
-            room_id: Opaque platform room ID.
-            text   : Message text to post (watcher-configured, may include emoji/markdown).
-
-        Default: no-op.  Override for platforms that support status messages.
-        """
-        pass
-
-    async def notify_offline(self, room_id: str, text: str) -> None:
-        """Post a status message when the agent goes offline in a room.
-
-        Args:
-            room_id: Opaque platform room ID.
-            text   : Message text to post (watcher-configured, may include emoji/markdown).
-
-        Default: no-op.  Override for platforms that support status messages.
-        """
-        pass
-
     async def notify_agent_event(
         self,
         room_id: str,

@@ -181,6 +181,29 @@ class TestARemovalReclaimsTheRecord(unittest.IsolatedAsyncioTestCase):
             any("claude:/the/old/workdir" in line for line in captured.output),
             "the accepted leak names both identities")
 
+    async def test_a_session_with_no_identity_is_unverifiable_at_reclaim(self):
+        """Codex round 19: 'cannot check' must not read as 'checked out' — a
+        record with a session but an empty backend_identity would have
+        delete_session run against whatever backend the agent name resolves
+        to NOW, the same cross-store destruction the mismatch branch refuses.
+        Skip agent-bound cleanup; still reclaim."""
+        record = make_rule_derived_record(backend_identity="")
+        lifecycle, connector = _harness([record])
+        default_backend = lifecycle._agents["default"]
+        default_backend.delete_session = AsyncMock()
+
+        with self.assertLogs(
+            "agent-chat-gateway.core.watcher_lifecycle", level="WARNING"
+        ) as captured:
+            name = await lifecycle.reclaim_room("room-w1", reason="removed")
+
+        self.assertEqual(name, "w1")
+        self.assertIsNone(lifecycle.get_watcher_state("w1"), "still reclaimed")
+        default_backend.delete_session.assert_not_awaited()
+        lifecycle._attachment_workspace.reclaim.assert_not_called()
+        self.assertTrue(any("no backend identity" in line
+                            for line in captured.output))
+
     async def test_a_failed_prune_restores_the_record(self):
         """Codex round 18: popped-with-disk-copy-intact is the worst state —
         the reconciliation cannot rediscover the room from memory, and any

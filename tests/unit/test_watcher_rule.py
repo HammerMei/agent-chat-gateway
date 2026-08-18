@@ -180,11 +180,21 @@ class TestParserHappyPath(unittest.TestCase):
         self.assertEqual(r.session_idle_days, 15)
         self.assertEqual(r.session_expire_days, 15)
 
-    def test_notifications_and_history_handoff(self):
-        r = parse({**MINIMAL, "online_notification": "hi", "history_handoff": {"fetch_count": 5}})
-        self.assertEqual(r.online_notification, "hi")
-        self.assertIsNone(r.offline_notification)
+    def test_history_handoff_is_read(self):
+        r = parse({**MINIMAL, "history_handoff": {"fetch_count": 5}})
         self.assertEqual(r.history_handoff.fetch_count, 5)
+
+    def test_the_retired_notification_fields_are_refused(self):
+        """Removed 2026-08-02 by owner decision (platform presence is the
+        signal; idle/wake cycles made per-transition announcements noise),
+        executed with the runtime cutover. A config still carrying them must
+        fail loudly, per the same breaking-change precedent as the static
+        shape."""
+        for field in ("online_notification", "offline_notification"):
+            with self.subTest(field=field):
+                with self.assertRaises(ValueError) as cm:
+                    parse({**MINIMAL, field: "hi"})
+                self.assertIn("unknown key", str(cm.exception))
 
     def test_inherits_supplies_shared_fields(self):
         templates = {"base": {"agent": "claude-ops", "session_idle_days": 3}}
@@ -416,8 +426,7 @@ class TestUnknownRuleKeysAreRejected(unittest.TestCase):
             "name": "eng", "connector": "mm-home", "agent": "claude-eng",
             "description": "x", "rooms": {"include": ["eng-*"]},
             "session_idle_days": 7, "session_expire_days": 30,
-            "context_inject_files": [], "online_notification": "hi",
-            "offline_notification": "bye", "history_handoff": {"enabled": False},
+            "context_inject_files": [], "history_handoff": {"enabled": False},
         }
         self.assertEqual(parse(entry).name, "eng")
 
@@ -488,8 +497,6 @@ class TestEveryRuleFieldIsTypeChecked(unittest.TestCase):
         "session_idle_days": "seven",
         "session_expire_days": [30],
         "context_inject_files": "notes.md",
-        "online_notification": True,
-        "offline_notification": 3,
         "history_handoff": True,
     }
     # `description` is annotation only and never read; `inherits` is resolved
@@ -758,13 +765,6 @@ class TestSharedHelpersAttributeToTheRuleParser(unittest.TestCase):
 
     def test_history_handoff_error_names_the_rule_and_index(self):
         msg = self._msg({**MINIMAL, "history_handoff": {"enable": False}})
-        self.assertTrue(
-            msg.startswith("Watcher rule at index 3:"),
-            f"expected a rule-parser prefix, got: {msg}",
-        )
-
-    def test_notification_error_names_the_rule_and_index(self):
-        msg = self._msg({**MINIMAL, "online_notification": True})
         self.assertTrue(
             msg.startswith("Watcher rule at index 3:"),
             f"expected a rule-parser prefix, got: {msg}",

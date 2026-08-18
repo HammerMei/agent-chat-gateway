@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/HammerMei/agent-chat-gateway/main/gateway/schema/config.schema.json",
   "title": "agent-chat-gateway config.yaml",
-  "description": "Hand-written schema for editor autocomplete / typo-checking of config.yaml. It intentionally does NOT re-validate every connector-type-specific field (server/allowed_users/attachments/agent_chain vary by connector 'type') — that stays the job of `acg config validate`. See docs/migration-0.3.md for the format this schema describes (v0.3+: connector_templates/agent_templates/watcher_templates + per-entry 'inherits:', tool_presets, watcher rooms:).",
+  "description": "Hand-written schema for editor autocomplete / typo-checking of config.yaml. It intentionally does NOT re-validate every connector-type-specific field (server/allowed_users/attachments/agent_chain vary by connector 'type') \u2014 that stays the job of `acg config validate`. See docs/migration-0.3.md for the format this schema describes (v0.3+: connector_templates/agent_templates/watcher_templates + per-entry 'inherits:', tool_presets, watcher rooms:).",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -22,7 +22,7 @@
     },
     "agent_templates": {
       "type": "object",
-      "description": "Named, reusable field blocks for agents. Reference one by name via an agent's 'inherits:' field (the agent's own fields win on conflict; flat one-tier merge — no nested templates).",
+      "description": "Named, reusable field blocks for agents. Reference one by name via an agent's 'inherits:' field (the agent's own fields win on conflict; flat one-tier merge \u2014 no nested templates).",
       "additionalProperties": {
         "type": "object",
         "properties": {
@@ -40,7 +40,7 @@
     },
     "connector_templates": {
       "type": "object",
-      "description": "Named, reusable field blocks for connectors. Reference one by name via a connector's 'inherits:' field. Must not set 'name' — that identifies a specific connector. No nested templates.",
+      "description": "Named, reusable field blocks for connectors. Reference one by name via a connector's 'inherits:' field. Must not set 'name' \u2014 that identifies a specific connector. No nested templates.",
       "additionalProperties": {
         "type": "object",
         "properties": {
@@ -67,7 +67,7 @@
     },
     "watcher_templates": {
       "type": "object",
-      "description": "Named, reusable field blocks for watchers. Reference one by name via a watcher's 'inherits:' field. Must not set 'name', 'room', or 'rooms' — those identify a specific watcher — nor 'session_id', which is removed entirely (sessions are no longer pinned from config; use a handoff file via context_inject_files). No nested templates.",
+      "description": "Named, reusable field blocks for watchers. Reference one by name via a watcher's 'inherits:' field. Must not set 'name', 'room', or 'rooms' \u2014 those identify a specific watcher \u2014 nor 'session_id', which is removed entirely (sessions are no longer pinned from config; use a handoff file via context_inject_files). No nested templates.",
       "additionalProperties": {
         "type": "object",
         "properties": {
@@ -211,7 +211,7 @@
     },
     "connector": {
       "type": "object",
-      "description": "additionalProperties is intentionally left open — server/allowed_users/attachments/agent_chain and other fields vary by connector 'type' (rocketchat/mattermost/voice/script) and are validated by each connector's own config parser, not by this schema.",
+      "description": "additionalProperties is intentionally left open \u2014 server/allowed_users/attachments/agent_chain and other fields vary by connector 'type' (rocketchat/mattermost/voice/script) and are validated by each connector's own config parser, not by this schema.",
       "required": [
         "name",
         "type"
@@ -263,11 +263,11 @@
             "claude",
             "opencode"
           ],
-          "description": "Required (directly or via an inherits: agent_templates entry) — no fallback."
+          "description": "Required (directly or via an inherits: agent_templates entry) \u2014 no fallback."
         },
         "command": {
           "type": "string",
-          "description": "Defaults based on 'type' when omitted ('claude' for type: claude, 'opencode' for type: opencode) — not a single fixed fallback."
+          "description": "Defaults based on 'type' when omitted ('claude' for type: claude, 'opencode' for type: opencode) \u2014 not a single fixed fallback."
         },
         "new_session_args": {
           "type": "array",
@@ -314,11 +314,11 @@
       }
     },
     "watcher": {
-      "description": "A 'watchers:' entry — a watcher RULE (docs/design/dynamic-watcher-design.md §2.1). The static shape ('room:', or 'rooms:' as an array) was removed at cutover; the loader refuses it with a pointer at docs/migration-dynamic-watchers.md, and this schema matches that refusal rather than dual-accepting a shape nothing runs.",
+      "description": "A 'watchers:' entry \u2014 a watcher RULE (docs/design/dynamic-watcher-design.md \u00a72.1). The static shape ('room:', or 'rooms:' as an array) was removed at cutover; the loader refuses it with a pointer at docs/migration-dynamic-watchers.md, and this schema matches that refusal rather than dual-accepting a shape nothing runs.",
       "$ref": "#/$defs/watcherRule"
     },
     "dmOptIn": {
-      "description": "Opt in to a DM class. Only true/false is accepted by the loader today. The object form is reserved for per-DM include/except_for (§2.7) and is accepted here so that adding it later extends this union instead of changing the schema's shape — a config written against the newer loader still validates against this schema.",
+      "description": "Opt in to a DM class. Only true/false is accepted by the loader today. The object form is reserved for per-DM include/except_for (\u00a72.7) and is accepted here so that adding it later extends this union instead of changing the schema's shape \u2014 a config written against the newer loader still validates against this schema.",
       "anyOf": [
         {
           "type": "boolean"
@@ -362,7 +362,7 @@
         "name": {
           "type": "string",
           "minLength": 1,
-          "description": "The rule's identity — required and unique. Unlike the static shape there is no single room to derive a name from, and this is what shadowing warnings and persisted rule_name refer to."
+          "description": "The rule's identity \u2014 required and unique. Unlike the static shape there is no single room to derive a name from, and this is what shadowing warnings and persisted rule_name refer to."
         },
         "connector": {
           "type": "string"
@@ -387,7 +387,7 @@
               "items": {
                 "type": "string"
               },
-              "description": "Evaluated after include, within this rule. An excluded room does NOT fall through to a later rule — this rule claimed it and then declined it."
+              "description": "Evaluated after include, within this rule. An excluded room does NOT fall through to a later rule \u2014 this rule claimed it and then declined it."
             },
             "direct": {
               "$ref": "#/$defs/dmOptIn"
@@ -418,18 +418,6 @@
           "items": {
             "type": "string"
           }
-        },
-        "online_notification": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "offline_notification": {
-          "type": [
-            "string",
-            "null"
-          ]
         },
         "history_handoff": {
           "$ref": "#/$defs/historyHandoff"

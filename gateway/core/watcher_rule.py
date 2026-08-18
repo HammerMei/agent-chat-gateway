@@ -156,8 +156,6 @@ class WatcherRule:
     # measure different intervals from different origins.
     session_expire_days: int = 15
     context_inject_files: list[str] = field(default_factory=list)
-    online_notification: str | None = None
-    offline_notification: str | None = None
     history_handoff: HistoryHandoffConfig = field(default_factory=HistoryHandoffConfig)
 
     def match(self, name: str, kind: RoomKind) -> RuleMatch:

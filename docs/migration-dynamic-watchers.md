@@ -112,3 +112,11 @@ When you migrate servers, do one of:
 
 Session content does not survive a server move either way; export anything
 that matters first (checklist step 3).
+
+## `online_notification` / `offline_notification` are removed
+
+The fields are gone from rules and templates — a config still carrying them
+fails at load with an unknown-key error. The platform's own presence
+indicators are the replacement (they were always the better signal), and the
+idle/expire lifecycle means a watcher now starts and stops many times over
+its life; announcing each transition was noise, not status.

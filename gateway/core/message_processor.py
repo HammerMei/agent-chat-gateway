@@ -6,7 +6,6 @@ Responsibilities after decomposition:
   - Queue orchestration (enqueue / consumer loop)
   - Lifecycle (start / stop / _stopping gate)
   - Session-map updates (role, permission thread)
-  - Online/offline notifications
   - Anonymous user rejection
 
 Delegated to extracted collaborators:
@@ -76,8 +75,6 @@ class MessageProcessor:
         watcher_state: WatcherState | None = None,
         watcher_config: WatcherConfig | None = None,
         connector_name: str = "",
-        online_notification: str | None = "✅ _Agent online_",
-        offline_notification: str | None = "❌ _Agent offline_",
         attachment_local_base: str | None = None,
         append_system_prompt_file: str | None = None,
     ) -> None:
@@ -97,8 +94,6 @@ class MessageProcessor:
         self._watcher_state = watcher_state
         self._watcher_config = watcher_config
         self._connector_name = connector_name
-        self._online_notification = online_notification
-        self._offline_notification = offline_notification
         self._attachment_local_base = attachment_local_base
         # Path to re-supply on every turn via AgentBackend.send()/.stream()'s
         # append_system_prompt_file kwarg (e.g. Claude's
@@ -118,7 +113,6 @@ class MessageProcessor:
             maxsize=self._config.max_queue_depth or 0
         )
         self._task: asyncio.Task | None = None
-        self._notify_task: asyncio.Task | None = None
         # Track short-lived fire-and-forget tasks (e.g. queue-full notifications)
         # so they can be awaited/cancelled during stop() and don't float free.
         self._background_tasks: set[asyncio.Task] = set()
@@ -139,11 +133,10 @@ class MessageProcessor:
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def start(self) -> None:
-        """Start the consumer task and post an online notification."""
+        """Start the consumer task."""
         self._task = asyncio.create_task(
             self._run(), name=f"processor-{self._watcher_id[:8]}"
         )
-        self._notify_task = asyncio.create_task(self._notify_online())
         logger.info(
             "MessageProcessor started: watcher=%s room=%s session=%s agent=%s cwd=%s",
             self._watcher_id[:8],
@@ -162,12 +155,10 @@ class MessageProcessor:
           3. Wait for the consumer to finish processing all already-queued messages
              (up to ``drain_timeout`` seconds).  If the timeout expires, the consumer
              task is force-cancelled — queued messages may be lost in this case.
-          4. Post offline notification — only after drain so users never see
-             "offline" followed by residual replies from queued work.
-          5. Cancel and await any in-flight background tasks.
-          6. Transition to ``stopped``.
+          4. Cancel and await any in-flight background tasks.
+          5. Transition to ``stopped``.
 
-        Draining matters for user-visible ordering (point 4) and for not losing
+        Draining matters for not losing
         queued work — but note it does **not** affect the persisted watermark.
         Both connectors advance their watermark when a message is *accepted into
         the queue*, not when it is handled, so draining never moves it.
@@ -186,13 +177,6 @@ class MessageProcessor:
         # Phase 1: stop accepting new messages.
         self._state = "draining"
 
-        if self._notify_task:
-            self._notify_task.cancel()
-            try:
-                await self._notify_task
-            except asyncio.CancelledError:
-                pass
-            self._notify_task = None
 
         # Phase 2: wake the consumer (if blocked on empty queue) and wait for drain.
         if self._task:
@@ -218,10 +202,6 @@ class MessageProcessor:
             except asyncio.CancelledError:
                 pass
             self._task = None
-
-        # Post offline notification only after drain — users never see "offline"
-        # followed by residual replies from still-draining queued work.
-        await self._notify_offline()
 
         # Phase 3: clean up background tasks.
         for task in list(self._background_tasks):
@@ -675,25 +655,3 @@ class MessageProcessor:
         )
         if to_repeat is not None:
             self._append_system_prompt_file = to_repeat
-
-    # ── Notifications ─────────────────────────────────────────────────────────
-
-    async def _notify_online(self) -> None:
-        if self._online_notification is None:
-            return
-        try:
-            await self._connector.notify_online(
-                self._room.id, self._online_notification
-            )
-        except Exception as e:
-            logger.warning("Failed to post online notification: %s", e)
-
-    async def _notify_offline(self) -> None:
-        if self._offline_notification is None:
-            return
-        try:
-            await self._connector.notify_offline(
-                self._room.id, self._offline_notification
-            )
-        except Exception as e:
-            logger.warning("Failed to post offline notification: %s", e)

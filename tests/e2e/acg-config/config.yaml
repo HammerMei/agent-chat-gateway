@@ -89,7 +89,7 @@ agents:
     session_prefix: e2e-oc-perm
 
 # All watchers share the same connector and an empty context_inject_files list.
-# online/offline_notification are omitted entirely — they default to null (quiet),
+# (online/offline notifications were removed with the dynamic-watcher cutover)
 # so there is nothing to state. session_id no longer exists at all: sessions are
 # auto-created and persisted, never pinned from config.
 # Explicit 'name:' is kept on every entry (rather than relying on rooms:

@@ -387,10 +387,19 @@ class MattermostConnector(Connector):
                 state.room.name, len(raw_msgs), watermark,
             )
 
+        # The membership era, captured at replay entry (Codex round 19): a
+        # live remove-then-re-add can REPLACE the channel state mid-batch,
+        # and an exists-check alone would let the rest of a batch fetched
+        # for the OLD era dispatch into the newly joined room. The
+        # generation is the authoritative removal signal the fences already
+        # use — RC's replay carries the same check via its epoch.
+        entry_gen = self._membership_gen.get(channel_id, 0)
         for idx, post in enumerate(raw_msgs):
-            if channel_id not in self._channels:
+            if (channel_id not in self._channels
+                    or self._membership_gen.get(channel_id, 0) != entry_gen):
                 logger.debug(
-                    "Channel '%s' was unsubscribed during replay — skipping %d remaining message(s)",
+                    "Channel '%s' was unsubscribed or its membership changed "
+                    "during replay — skipping %d remaining message(s)",
                     state.room.name, len(raw_msgs) - idx,
                 )
                 break
@@ -752,18 +761,6 @@ class MattermostConnector(Connector):
                 await self._ws.send_typing(room_id)
             except Exception as e:
                 logger.debug("Failed to send typing indicator: %s", e)
-
-    async def notify_online(self, room_id: str, text: str) -> None:
-        try:
-            await self._rest.post_message(room_id, text)
-        except Exception as e:
-            logger.warning("Failed to post online notification: %s", e)
-
-    async def notify_offline(self, room_id: str, text: str) -> None:
-        try:
-            await self._rest.post_message(room_id, text)
-        except Exception as e:
-            logger.warning("Failed to post offline notification: %s", e)
 
     def on_agent_chain_drop(self, room_id: str, thread_id: str | None, sender: str) -> None:
         """Reset the sender's turn counter after an agent-chain termination drop."""

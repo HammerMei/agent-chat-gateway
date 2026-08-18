@@ -198,7 +198,7 @@ def make_rule_derived_record(
     membership-events suite became the second place to need one (the idle-sweep
     suite's local builder predates the config snapshot and pins TTL arithmetic,
     which never reads it)."""
-    from gateway.core.state import WatcherState
+    from gateway.core.state import WatcherState, backend_identity
 
     defaults = {
         "watcher_name": name,
@@ -210,6 +210,12 @@ def make_rule_derived_record(
         "rule_name": "eng",
         "rule": {"session_idle_days": idle_days, "session_expire_days": expire_days},
         "config": {"name": name, "connector": connector, "room": "", "agent": agent},
+        # Faithful to what a real start writes (round 19): a record WITH a
+        # session always carries the backend identity it was minted against —
+        # an empty one now reads "unverifiable" at reclaim and skips the
+        # agent-bound cleanup, which is the corruption case, not the default.
+        "backend_identity": backend_identity(
+            AgentConfig().type, AgentConfig().working_directory),
     }
     defaults.update(kw)
     return WatcherState(**defaults)
@@ -332,8 +338,6 @@ def make_processor(agent=None, **overrides):
     connector.send_text = AsyncMock()
     connector.format_prompt_prefix = MagicMock(return_value="")
     connector.notify_typing = AsyncMock()
-    connector.notify_online = AsyncMock()
-    connector.notify_offline = AsyncMock()
     defaults = {
         "session_id": "ses_001",
         "room": Room(id="room_1", name="test-room"),

@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **BREAKING: `online_notification` / `offline_notification` are removed**
+  from watcher rules and templates (decided 2026-08-02 with the dynamic-watcher
+  design; executed with the runtime cutover). A config still carrying them
+  fails at load with an unknown-key error. IM platforms carry their own
+  presence signal, and under the idle/expire lifecycle a watcher starts and
+  stops many times over its life — announcing each transition was noise. The
+  connector `notify_online`/`notify_offline` API is removed with it.
+
 ### Changed — the watcher model itself
 - **BREAKING: `watchers:` entries are rules, and watchers are created per room
   at runtime** (`docs/design/dynamic-watcher-design.md`). A rule declares which

@@ -1029,24 +1029,6 @@ def _validated_optional_name(raw: object, where: str, field_name: str) -> str | 
     return raw
 
 
-def _validated_notification(raw: object, where: str, field_name: str) -> str | None:
-    """Check a notification field against its declared `str | None` contract.
-
-    Copied through unchecked, a YAML boolean or number reaches the platform REST
-    client's message field much later, where the send fails and is only logged as a
-    warning — so the operator's status message silently never appears. An actionable
-    load error is the whole point of checking it here. Unlike a name, an empty
-    string is a legitimate "nothing to announce".
-    """
-    if raw is None:
-        return None
-    if not isinstance(raw, str):
-        raise ValueError(
-            f"{where}: '{field_name}' must be a string or null "
-            f"(got {type(raw).__name__})."
-        )
-    return raw
-
 
 _HH_FIELD_TYPES: dict[str, type] = {
     "enabled": bool,
@@ -1354,13 +1336,6 @@ def _parse_one_watcher_entry(  # LEGACY: configtool-only — see note below
     # mapping left a third — see _parse_history_handoff() for all three.
     history_handoff = _parse_history_handoff(wc.get("history_handoff"), where)
 
-    online_notification = _validated_notification(
-        wc.get("online_notification"), where, "online_notification"
-    )
-    offline_notification = _validated_notification(
-        wc.get("offline_notification"), where, "offline_notification"
-    )
-
     # Names are staged here, NOT written into `seen_watcher_names` directly,
     # until this whole entry finishes successfully (committed just before
     # returning below). PR review finding: with the old
@@ -1410,8 +1385,6 @@ def _parse_one_watcher_entry(  # LEGACY: configtool-only — see note below
                 room=room,
                 agent=watcher_agent,
                 context_inject_files=ctx_files,
-                online_notification=online_notification,
-                offline_notification=offline_notification,
                 history_handoff=history_handoff,
             )
         )
@@ -1633,8 +1606,6 @@ WATCHER_RULE_KEYS: frozenset[str] = frozenset({
     "session_idle_days",
     "session_expire_days",
     "context_inject_files",
-    "online_notification",
-    "offline_notification",
     "history_handoff",
 })
 
@@ -1830,12 +1801,6 @@ def _parse_one_watcher_rule(
             wc.get("context_inject_files", []),
             config_dir,
             f"Watcher rule at index {index}: 'context_inject_files'",
-        ),
-        online_notification=_validated_notification(
-            wc.get("online_notification"), where, "online_notification"
-        ),
-        offline_notification=_validated_notification(
-            wc.get("offline_notification"), where, "offline_notification"
         ),
         history_handoff=history_handoff,
     )

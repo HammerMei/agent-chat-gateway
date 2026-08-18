@@ -104,8 +104,6 @@ watchers:
       direct: true
     agent: opencode_agent
     context_inject_files: []
-    online_notification: "✅ _Agent online_"
-    offline_notification: "❌ _Agent offline_"
 
   # Channel rule — Claude agent. The watcher is created on the room's first
   # message and shows up in `agent-chat-gateway list` as "rocketchat:general".
@@ -115,5 +113,3 @@ watchers:
       include: [general]       # channel name(s); globs like "eng-*" work too
     agent: claude_agent
     context_inject_files: []
-    online_notification: "✅ _Agent online_"
-    offline_notification: "❌ _Agent offline_"

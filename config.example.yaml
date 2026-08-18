@@ -307,9 +307,6 @@ watchers:
   #   injected after connector-level and agent-level files into every watcher
   #   this rule creates.
   #
-  # online_notification / offline_notification: status message posted when a
-  #   watcher starts or stops. Default: null (no message).
-  #
   # description: optional free-text note (ignored at runtime).
 
   # ── Voice rule (pairs with the siri-voice connector above) ──────────────
@@ -378,13 +375,13 @@ watchers:
 # A `watcher_templates:` entry cannot set name/room/rooms (those identify a specific
 # watcher; session_id stays in that list so a template setting the removed field is
 # reported against the template rather than against every entry inheriting it), but
-# can set shared fields like `agent:` or
-# notifications — opted into the same way, via `inherits:` on each watcher:
+# can set shared fields like `agent:` or per-rule session TTLs — opted into
+# the same way, via `inherits:` on each watcher:
 #
 # watcher_templates:
 #   standard:
-#     online_notification: "✅ _Agent online_"   # restore the pre-0.2 default globally
-#     offline_notification: "❌ _Agent offline_"
+#     agent: my-agent
+#     session_expire_days: 30
 #
 # watchers:
 #   - {name: bot-a, connector: rc-bot-a, agent: bot-a-agent, rooms: {include: [nest, hammer], direct: true}, inherits: standard}

@@ -499,8 +499,23 @@ class WatcherLifecycle:
             # the same reason — the old id means nothing (or someone else's
             # session) in the new store, and the prompt/attachment walk would
             # run in the new working directory where the old files are not.
-            # Empty recorded identity proceeds: such a record carries no
-            # session for step 2 to mis-delete.
+            # An empty identity WITH a session is unverifiable (Codex round
+            # 19): the loader accepts such a record, and "cannot check" must
+            # not read as "checked out" — the delete would run against
+            # whatever backend the agent name resolves to NOW, the same
+            # cross-store destruction the mismatch branch refuses. An empty
+            # identity with NO session still proceeds: step 2 has nothing to
+            # mis-delete and the remaining cleanup is path-keyed.
+            if (agent_name is not None and state.session_id
+                    and not state.backend_identity):
+                logger.warning(
+                    "Watcher '%s': session %s carries no backend identity to "
+                    "verify against — skipping backend session, prompt-file "
+                    "and attachment cleanup (accepting the leak); the record "
+                    "is still reclaimed", name, state.session_id,
+                )
+                agent_name = None
+                agent = None
             if agent_name is not None and state.backend_identity:
                 agent_cfg = self._config.agent_config(agent_name)
                 current = backend_identity(
@@ -1439,8 +1454,6 @@ class WatcherLifecycle:
             watcher_state=ws,
             watcher_config=wc,
             connector_name=wc.connector,
-            online_notification=wc.online_notification,
-            offline_notification=wc.offline_notification,
             attachment_local_base=attachment_local_base,
             append_system_prompt_file=to_repeat,
         )

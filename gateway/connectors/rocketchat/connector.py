@@ -1930,18 +1930,6 @@ class RocketChatConnector(Connector):
             [f"{room_id}/user-activity", self.agent_username, activity],
         )
 
-    async def notify_online(self, room_id: str, text: str) -> None:
-        try:
-            await self._rest.post_message(room_id, text)
-        except Exception as e:
-            logger.warning("Failed to post online notification: %s", e)
-
-    async def notify_offline(self, room_id: str, text: str) -> None:
-        try:
-            await self._rest.post_message(room_id, text)
-        except Exception as e:
-            logger.warning("Failed to post offline notification: %s", e)
-
     def on_agent_chain_drop(self, room_id: str, thread_id: str | None, sender: str) -> None:
         """Called when an agent chain LLM response was dropped (termination token detected).
 

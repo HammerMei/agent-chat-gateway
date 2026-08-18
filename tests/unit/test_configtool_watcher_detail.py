@@ -3,7 +3,7 @@ Config TUI Phase 3 (watcher CRUD, docs/design/config-tool.md).
 
 Pins the merge-on-add / split-on-edit design: editing a GROUP-SHARED field
 (connector/agent/inherits) edits a `rooms:` group in place; editing a
-PER-ROOM field (room itself, name, session_id, online/offline_notification,
+PER-ROOM field (room itself, name, session_id, context_inject_files,
 context_inject_files, history_handoff.*) auto-splits that one room out into
 its own entry (reusing the exact same merge-or-create primitive new-watcher
 creation and "Clone for rooms" use). See gateway/configtool/model.py's
@@ -126,7 +126,7 @@ class TestWatcherEditSharedField:
         group too (2 watchers sharing 'rc', editing one to 'rc2' moved
         BOTH — never the intent when the user is looking at one specific
         room). connector/agent are stored as a single value on the shared
-        raw entry, exactly like online_notification etc. (already
+        raw entry, exactly like context_inject_files etc. (already
         correctly per-room) — reassigning one room's connector must split
         it out, not drag its siblings along."""
         config_path = _write_config(tmp_path, _config_with_a_group(work_dir))
@@ -287,7 +287,7 @@ class TestWatcherEditPerRoomField:
         "the TUI's watcher editing writes the static shape, which the loader "
         "refuses since the runtime cutover — the save gate correctly blocks "
         "it; impl/config-tooling rewrites the TUI for rules and unskips this"))
-    async def test_editing_online_notification_splits_the_room_out(
+    async def test_editing_a_per_room_field_splits_the_room_out(
         self, tmp_path, work_dir
     ):
         config_path = _write_config(tmp_path, _config_with_a_group(work_dir))
@@ -297,7 +297,7 @@ class TestWatcherEditPerRoomField:
             await _open_watcher_row(pilot, app, row=0, key="e")  # 'dev' or 'general', row 0
 
             edited_room = app.screen.room
-            app.screen.query_one("#field-online_notification", Input).value = "hi"
+            app.screen.query_one("#field-context_inject_files", Input).value = "notes.md"
             await pilot.pause()
             await pilot.press("ctrl+s")
             await pilot.pause()
@@ -305,11 +305,11 @@ class TestWatcherEditPerRoomField:
             assert isinstance(app.screen, OverviewScreen)
             raw = yaml.safe_load(Path(config_path).read_text())
             entries = {e.get("room"): e for e in raw["watchers"] if "room" in e}
-            assert entries[edited_room]["online_notification"] == "hi"
+            assert entries[edited_room]["context_inject_files"] == ["notes.md"]
             # The OTHER room stays in the (now-shrunk, normalized) group,
             # completely untouched.
             remaining_room = "general" if edited_room == "dev" else "dev"
-            assert "online_notification" not in entries[remaining_room]
+            assert "context_inject_files" not in entries[remaining_room]
 
     @pytest.mark.skip(reason=(
         "the TUI's watcher editing writes the static shape, which the loader "
@@ -326,7 +326,7 @@ class TestWatcherEditPerRoomField:
         async with app.run_test() as pilot:
             await pilot.pause()
             await _open_watcher_row(pilot, app, row=0, key="e")
-            app.screen.query_one("#field-online_notification", Input).value = "hi"
+            app.screen.query_one("#field-context_inject_files", Input).value = "notes.md"
             await pilot.pause()
             await pilot.press("ctrl+s")
             await pilot.pause()
@@ -345,14 +345,14 @@ class TestWatcherEditPerRoomField:
         async with app.run_test() as pilot:
             await pilot.pause()
             await _open_watcher_row(pilot, app, row=0, key="e")
-            app.screen.query_one("#field-online_notification", Input).value = "hi"
+            app.screen.query_one("#field-context_inject_files", Input).value = "notes.md"
             await pilot.pause()
             await pilot.press("ctrl+s")
             await pilot.pause()
 
             raw = yaml.safe_load(Path(config_path).read_text())
             assert raw["watchers"] == [
-                {"connector": "rc", "agent": "default", "room": "general", "online_notification": "hi"}
+                {"connector": "rc", "agent": "default", "room": "general", "context_inject_files": ["notes.md"]}
             ]
 
     @pytest.mark.skip(reason=(
@@ -391,7 +391,7 @@ class TestWatcherEditPerRoomField:
             await _open_watcher_row(pilot, app, row=0, key="e")
 
             edited_room = app.screen.room
-            app.screen.query_one("#field-online_notification", Input).value = "hi"
+            app.screen.query_one("#field-context_inject_files", Input).value = "notes.md"
             await pilot.pause()
             await pilot.press("ctrl+s")
             await pilot.pause()
@@ -399,7 +399,7 @@ class TestWatcherEditPerRoomField:
             assert isinstance(app.screen, OverviewScreen)
             raw = yaml.safe_load(Path(config_path).read_text())
             entries = {e.get("room"): e for e in raw["watchers"] if "room" in e}
-            assert entries[edited_room]["online_notification"] == "hi"
+            assert entries[edited_room]["context_inject_files"] == ["notes.md"]
             # The split-off room must keep the description it inherited
             # from the group it was split out of.
             assert entries[edited_room]["description"] == "shared note"
@@ -518,7 +518,7 @@ class TestWatcherRoomRename:
               - connector: rc
                 agent: default
                 room: dev
-                online_notification: "x"
+                context_inject_files: [x.md]
             """,
         )
         app = ConfigToolApp(config_path)
@@ -839,7 +839,7 @@ class TestWatcherCloneForRooms:
               - connector: rc
                 agent: default
                 room: dev
-                online_notification: "different settings, never mergeable"
+                context_inject_files: [different-settings-never-mergeable.md]
             """,
         )
         app = ConfigToolApp(config_path)
@@ -906,7 +906,7 @@ class TestWatcherCloneForRooms:
               - connector: rc
                 agent: default
                 room: dev
-                online_notification: "different settings, never mergeable"
+                context_inject_files: [different-settings-never-mergeable.md]
             """,
         )
         app = ConfigToolApp(config_path)

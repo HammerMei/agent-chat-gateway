@@ -235,7 +235,6 @@ watchers:
     rooms:
       direct: true       # 1:1 DMs — only people in `owners`/`guests` get through
     agent: claude
-    online_notification: "✅ Agent ready"
 ```
 
 **Key settings for this use case:**
@@ -552,8 +551,6 @@ as a list) fail at load — see docs/migration-dynamic-watchers.md.
 | `session_idle_days` | int | No | Days without a message before the room's runtime is dropped (session kept); default 15 |
 | `session_expire_days` | int | No | Days idle before the record and session are reclaimed entirely; default 15 |
 | `context_inject_files` | list | No | Rule-specific context files (frozen into each created watcher) |
-| `online_notification` | string | No | Message posted when a watcher starts; default `null` (no message) |
-| `offline_notification` | string | No | Message posted when a watcher stops; default `null` (no message) |
 
 The old static fields (`room:`, list-shaped `rooms:`) are refused at load —
 see `docs/migration-dynamic-watchers.md`.

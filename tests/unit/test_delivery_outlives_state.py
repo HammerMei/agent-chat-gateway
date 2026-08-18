@@ -380,6 +380,54 @@ class TestParticipantFalseFiresTheRemovalHook(unittest.IsolatedAsyncioTestCase):
                         else True)
 
 
+class TestMMReplayAbortsOnAMembershipEraChange(unittest.IsolatedAsyncioTestCase):
+    """Codex round 19 (P1): a live remove-then-re-add REPLACES the channel
+    state mid-batch, and the exists-check alone let the rest of a batch
+    fetched for the OLD era dispatch into the newly joined room. The
+    generation captured at replay entry aborts the batch on any change."""
+
+    async def test_the_batch_stops_at_the_era_boundary(self):
+        from unittest.mock import AsyncMock
+
+        from gateway.connectors.mattermost.connector import _ChannelState
+        from gateway.core.connector import Room
+        from tests.unit.test_mattermost_connector import _make_connector
+
+        connector = _make_connector()
+        connector._config.require_mention = False
+        connector._config.filter_sender = False
+        connector._rest.resolve_username = AsyncMock(return_value="alice")
+
+        state = _ChannelState(room=Room(id="chan-1", name="general", type="channel"))
+        connector._channels["chan-1"] = state
+        posts = [
+            {"id": f"p{i}", "channel_id": "chan-1", "user_id": "u-alice",
+             "message": f"m{i}", "create_at": 100 + i, "type": ""}
+            for i in range(3)
+        ]
+        connector._rest.get_room_history = AsyncMock(return_value=posts)
+
+        delivered = []
+
+        async def handler(msg):
+            delivered.append(msg.id)
+            if len(delivered) == 1:
+                # The removal + re-add, mid-batch: gen bumps, fresh state.
+                connector._membership_gen["chan-1"] = (
+                    connector._membership_gen.get("chan-1", 0) + 1)
+                connector._channels["chan-1"] = _ChannelState(
+                    room=Room(id="chan-1", name="general", type="channel"))
+            return True
+
+        connector._handler = handler
+
+        await connector.replay_room_since("chan-1", after_ts="50")
+
+        self.assertEqual(delivered, ["p0"],
+                         "the batch stopped at the era boundary — the old "
+                         "era's remaining posts never reached the new room")
+
+
 class TestAFailedWakeReplayKeepsTheWindow(unittest.IsolatedAsyncioTestCase):
     """Codex review of #121: a wake replay reads an EXTERNAL window (the
     record's mark) against a fresh subscription — a failure that simply

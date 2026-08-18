@@ -69,8 +69,6 @@ def _make_lifecycle_r14(watcher_names=None):
         wc.room = f"#{name}"
         wc.connector = "rc"
         wc.agent = None
-        wc.online_notification = None
-        wc.offline_notification = None
         watcher_configs.append(wc)
 
     connector = MagicMock()

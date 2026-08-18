@@ -299,8 +299,7 @@ class TestStickyBinding(unittest.IsolatedAsyncioTestCase):
             config=config if config is not None
             else {"name": "rc:eng-backend", "connector": "rc",
                   "room": "eng-backend", "agent": "claude",
-                  "context_inject_files": [], "online_notification": None,
-                  "offline_notification": None,
+                  "context_inject_files": [],
                   "history_handoff": {"enabled": True, "fetch_count": 50,
                                       "verbatim_tail": 15, "max_fetch_count": 200}},
         )

@@ -861,7 +861,7 @@ class TestTimestampAndCacheDir(unittest.TestCase):
         self.assertIn("room-xyz", result)
 
 
-# ── Tests: notify_typing / notify_online / notify_offline (T3) ────────────────
+# ── Tests: notify_typing (T3) ─────────────────────────────────────────────────
 
 
 class TestNotifications(unittest.IsolatedAsyncioTestCase):
@@ -891,28 +891,6 @@ class TestNotifications(unittest.IsolatedAsyncioTestCase):
         args = connector._ws.call_method.call_args[0]
         self.assertEqual(args[1][2], [])  # empty activity list
 
-    async def test_notify_online_posts_message(self):
-        connector = _make_connector()
-        connector._rest.post_message = AsyncMock()
-        await connector.notify_online("room-1", "✅ online")
-        connector._rest.post_message.assert_awaited_once_with("room-1", "✅ online")
-
-    async def test_notify_online_swallows_exception(self):
-        """notify_online must not raise when post_message fails."""
-        connector = _make_connector()
-        connector._rest.post_message = AsyncMock(side_effect=RuntimeError("network error"))
-        await connector.notify_online("room-1", "✅ online")  # must not raise
-
-    async def test_notify_offline_posts_message(self):
-        connector = _make_connector()
-        connector._rest.post_message = AsyncMock()
-        await connector.notify_offline("room-1", "❌ offline")
-        connector._rest.post_message.assert_awaited_once_with("room-1", "❌ offline")
-
-    async def test_notify_offline_swallows_exception(self):
-        connector = _make_connector()
-        connector._rest.post_message = AsyncMock(side_effect=OSError("timeout"))
-        await connector.notify_offline("room-1", "❌ offline")  # must not raise
 
 
 # ── Tests: subscribe_room rollback on DDP failure (T3) ───────────────────────

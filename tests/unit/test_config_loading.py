@@ -1908,7 +1908,7 @@ class TestWatcherTemplates(unittest.TestCase):
                 working_directory: /tmp
             watcher_templates:
               standard:
-                online_notification: "hi"
+                session_expire_days: 30
             watchers:
               - name: w1
                 connector: rc
@@ -1919,7 +1919,7 @@ class TestWatcherTemplates(unittest.TestCase):
         """)
         config = GatewayConfig.from_file(path)
         self.assertEqual(len(config.watcher_rules), 1)
-        self.assertEqual(config.watcher_rules[0].online_notification, "hi")
+        self.assertEqual(config.watcher_rules[0].session_expire_days, 30)
 
 
 class TestRemovedDefaultsKeysRejected(unittest.TestCase):
@@ -2158,9 +2158,11 @@ class TestToolPresets(unittest.TestCase):
 # ── Tests: quiet notification defaults ────────────────────────────────────────
 
 
-class TestQuietNotificationDefaults(unittest.TestCase):
-    """Migration-0.2 behavior change: online/offline notifications default to
-    quiet (None) instead of posting '_Agent online_'/'_Agent offline_'."""
+class TestNotificationFieldsAreRemoved(unittest.TestCase):
+    """Owner decision (2026-08-02, executed with the runtime cutover): the
+    notification fields are gone — platform presence is the signal, and under
+    the idle/expire lifecycle a watcher starts and stops many times over its
+    life. A config still carrying them fails loudly, template or rule."""
 
     def _write_config(self, watcher_extra: str = "") -> str:
         cfg = textwrap.dedent(f"""\
@@ -2182,48 +2184,30 @@ class TestQuietNotificationDefaults(unittest.TestCase):
             f.write(cfg)
             return f.name
 
-    def test_notifications_default_to_none(self):
-        path = self._write_config()
-        config = GatewayConfig.from_file(path)
-        self.assertIsNone(config.watcher_rules[0].online_notification)
-        self.assertIsNone(config.watcher_rules[0].offline_notification)
+    def test_a_rule_carrying_the_field_is_refused(self):
+        path = self._write_config("online_notification: 'hi'")
+        with self.assertRaises(ValueError) as cm:
+            GatewayConfig.from_file(path)
+        self.assertIn("unknown key", str(cm.exception))
 
-    def test_watcher_template_can_restore_old_behavior_globally(self):
+    def test_a_template_carrying_the_field_is_refused_via_the_inheritor(self):
         path = self._write_config()
-        # Inject a watcher_templates: entry restoring the pre-0.2 notification
-        # text, and opt the one watcher into it via inherits:.
         with open(path) as f:
             body = f.read()
         body = body.replace(
             "connectors:",
             "watcher_templates:\n"
             "  standard:\n"
-            "    online_notification: '✅ _Agent online_'\n"
-            "    offline_notification: '❌ _Agent offline_'\n"
+            "    offline_notification: 'bye'\n"
             "connectors:",
             1,
         )
-        body = body.replace(
-            "- name: w1",
-            "- name: w1\n    inherits: standard",
-            1,
-        )
+        body = body.replace("- name: w1", "- name: w1\n    inherits: standard", 1)
         with open(path, "w") as f:
             f.write(body)
-        config = GatewayConfig.from_file(path)
-        self.assertEqual(config.watcher_rules[0].online_notification, "✅ _Agent online_")
-        self.assertEqual(config.watcher_rules[0].offline_notification, "❌ _Agent offline_")
-
-    def test_explicit_notification_overrides_default(self):
-        path = self._write_config(
-            "online_notification: 'hi there'\noffline_notification: 'bye'"
-        )
-        config = GatewayConfig.from_file(path)
-        self.assertEqual(config.watcher_rules[0].online_notification, "hi there")
-        self.assertEqual(config.watcher_rules[0].offline_notification, "bye")
-
-
-# ── Tests: description: field (informational only, ignored at runtime) ──────
+        with self.assertRaises(ValueError) as cm:
+            GatewayConfig.from_file(path)
+        self.assertIn("unknown key", str(cm.exception))
 
 
 class TestDescriptionField(unittest.TestCase):

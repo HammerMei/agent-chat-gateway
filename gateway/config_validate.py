@@ -82,8 +82,6 @@ _AGENT_LINT_DEFAULTS: list[tuple[str, object]] = [
 ]
 _WATCHER_LINT_DEFAULTS: list[tuple[str, object]] = [
     ("context_inject_files", []),
-    ("online_notification", None),
-    ("offline_notification", None),
 ]
 _CONNECTOR_LINT_DEFAULTS: list[tuple[str, object]] = [
     ("reply_in_thread", False),
