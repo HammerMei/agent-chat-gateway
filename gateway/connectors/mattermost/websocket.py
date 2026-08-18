@@ -337,10 +337,27 @@ class MattermostWebSocketClient:
                 self._reconnect_delay = 1.0
                 logger.info("Reconnected to %s", self.ws_url)
                 if self._on_reconnect_cb is not None:
+                    # OFF the receive loop (Codex round 22): this coroutine
+                    # runs ON the listen task, and awaiting the reconnect
+                    # replay here stopped event consumption for its whole
+                    # duration — including `user_removed`, the ONLY feeder of
+                    # the membership generation the replay's own era fence
+                    # reads. A removal landing mid-replay was therefore
+                    # unreadable until the replay finished, and the stale
+                    # batch delivered despite it. As a task, the loop keeps
+                    # consuming and the fence's signal stays live; the replay
+                    # was never serialized against live traffic anyway (it
+                    # calls _on_posted_event directly, not via the workers).
+                    def _log_replay_failure(task: asyncio.Task) -> None:
+                        if not task.cancelled() and task.exception():
+                            logger.error("Error in on_reconnect callback: %r",
+                                         task.exception())
+
                     try:
                         result = self._on_reconnect_cb()
                         if asyncio.iscoroutine(result):
-                            await result
+                            task = asyncio.create_task(result)
+                            task.add_done_callback(_log_replay_failure)
                     except Exception:
                         logger.exception("Error in on_reconnect callback")
                 return

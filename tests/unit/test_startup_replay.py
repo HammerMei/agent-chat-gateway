@@ -77,6 +77,26 @@ class TestRuleDerivedRecordsSurviveBoot(unittest.IsolatedAsyncioTestCase):
         prune = store.save.call_args.kwargs.get("prune")
         self.assertIn(record.watcher_name, prune)
 
+    async def test_a_damaged_rule_name_alone_does_not_cost_the_session(self):
+        """Codex round 22: the prune test is BOTH fields, not one — the
+        static path never wrote a materialized config, so a record whose
+        rule_name alone was hand-damaged still carries everything sticky
+        recreation needs. Pruning it destroyed a session over one corrupted
+        attribution field."""
+        record = _dynamic_record(rule_name="")  # config intact
+        store = MagicMock()
+        store.load = MagicMock(return_value={record.watcher_name: record})
+        store.save = MagicMock()
+        lifecycle = make_lifecycle(state_store=store)
+
+        await lifecycle.sync_watchers()
+
+        prune = store.save.call_args.kwargs.get("prune")
+        self.assertNotIn(record.watcher_name, prune or set(),
+                         "a materialized config alone keeps the record")
+        self.assertIs(lifecycle.record_for_room("r1"), record,
+                      "and it hydrates — the message path can recreate it")
+
     async def test_a_hydrated_paused_record_still_answers_paused(self):
         record = _dynamic_record(paused=True)
         store = MagicMock()

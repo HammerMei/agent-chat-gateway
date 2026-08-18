@@ -197,6 +197,46 @@ class TestDispatch(unittest.IsolatedAsyncioTestCase):
 # ── send_typing ───────────────────────────────────────────────────────────────
 
 
+class TestReconnectReplayRunsOffTheReceiveLoop(unittest.IsolatedAsyncioTestCase):
+    """Codex round 22 (P1): the reconnect callback ran ON the listen task,
+    so awaiting the replay there stopped event consumption for its whole
+    duration — including user_removed, the only feeder of the membership
+    generation the replay's own era fence reads. A removal landing
+    mid-replay was unreadable until the replay finished, defeating the
+    fence. The callback's coroutine is a task now; the loop keeps reading."""
+
+    async def test_the_callback_coroutine_does_not_block_the_reconnect(self):
+        from unittest.mock import MagicMock, patch
+
+        from gateway.connectors.mattermost.websocket import (
+            MattermostWebSocketClient,
+        )
+
+        ws = MattermostWebSocketClient("http://localhost:8065", lambda: "t")
+        gate = asyncio.Event()
+        entered = asyncio.Event()
+
+        async def slow_replay():
+            entered.set()
+            await gate.wait()
+
+        ws.set_reconnect_callback(slow_replay)
+        ws._running = True
+
+        with patch("gateway.connectors.mattermost.websocket.websockets.connect",
+                   new=AsyncMock(return_value=MagicMock())), \
+             patch.object(ws, "_authenticate", new=AsyncMock()):
+            ws._reconnect_delay = 0.01
+            await asyncio.wait_for(ws._reconnect(), timeout=5)
+
+        # _reconnect returned while the replay is still parked — the listen
+        # loop (its caller) is free to consume events.
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        self.assertFalse(gate.is_set())
+        gate.set()
+        await asyncio.sleep(0)
+
+
 class TestSendTyping(unittest.IsolatedAsyncioTestCase):
     async def test_sends_user_typing_action(self):
         ws = _make_ws()

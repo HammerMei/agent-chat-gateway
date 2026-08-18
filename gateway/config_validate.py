@@ -429,7 +429,11 @@ def _check_state_orphans(config: GatewayConfig, result: ValidationResult) -> Non
             # whole validation over it.
             continue
         for st in states:
-            if st.rule_name:
+            if st.rule_name or st.config:
+                # Same both-fields prune test as sync_watchers (Codex round
+                # 22): a materialized config alone is enough for sticky
+                # recreation, so such a record is NOT pruned and must not be
+                # warned about as static-era.
                 # The record-vs-agent divergences (matrix sweep after Codex
                 # round 6): the runtime is fail-closed and loud about both,
                 # but only AFTER the restart — this command's job is to say

@@ -181,11 +181,16 @@ class WatcherLifecycle:
         * **Hydration.** Rule-derived records are loaded into memory so
           `record_for_room` answers from boot — idle, until a message, the
           replay or the eager loop recreates them.
-        * **The prune.** A record with no `rule_name` is the static model's,
-          and the static model has no owner left: config.yaml cannot name it
-          and no rule will recreate it. Pruned, with a log line each —
-          per the clean-break migration ruling, and warned about ahead of
-          time by `acg config validate`'s orphan check.
+        * **The prune.** A record with NEITHER a `rule_name` NOR a
+          materialized `config` is the static model's, and the static model
+          has no owner left: config.yaml cannot name it and no rule will
+          recreate it. Pruned, with a log line each — per the clean-break
+          migration ruling, and warned about ahead of time by
+          `acg config validate`'s orphan check. Both fields, not one (Codex
+          round 22): the static path never wrote a materialized config, so a
+          record whose `rule_name` alone was hand-damaged still carries
+          everything sticky recreation needs — one corrupted attribution
+          field must not cost a session.
 
         Returns the startup error list (now fed only by the eager-start loop,
         which appends to it in `SessionManager.sync_only`).
@@ -195,7 +200,8 @@ class WatcherLifecycle:
         if unavailable_agents is not None:
             self._blocked_agents = set(unavailable_agents)
 
-        prune = {name for name, ws in persisted.items() if not ws.rule_name}
+        prune = {name for name, ws in persisted.items()
+                 if not ws.rule_name and not ws.config}
         for name in sorted(prune):
             logger.warning(
                 "Pruning static-era watcher record '%s' — the static shape "
@@ -204,7 +210,7 @@ class WatcherLifecycle:
                 "its first message)", name,
             )
         for name, ws in persisted.items():
-            if ws.rule_name and name not in self._states:
+            if (ws.rule_name or ws.config) and name not in self._states:
                 self._states[name] = ws
 
         self._state_store.save(self._states, prune=prune)
