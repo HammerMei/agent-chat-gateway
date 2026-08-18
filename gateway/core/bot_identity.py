@@ -273,10 +273,21 @@ def fold_record_dm_claims(claim: DmClaim, records) -> DmClaim:
         # two connectors sharing an account both answer that DM.
         if not (record.rule_name or record.config) or not record.room_id:
             continue
-        if record.room_kind == "dm":
+        # A damaged room_kind falls back to room_type (Codex round 26):
+        # the record is preserved and can still answer its DM — a live wake
+        # supplies the kind — so an unknown kind must not read as no claim.
+        # The fallback is conservative: a bare "dm" room_type with no finer
+        # kind claims BOTH classes rather than neither.
+        kind = record.room_kind or ""
+        if kind not in ("dm", "group_dm") and getattr(
+                record, "room_type", "") == "dm":
+            rooms.add(record.room_id)
+            group_rooms.add(record.room_id)
+            watchers.add(record.watcher_name)
+        elif kind == "dm":
             rooms.add(record.room_id)
             watchers.add(record.watcher_name)
-        elif record.room_kind == "group_dm":
+        elif kind == "group_dm":
             group_rooms.add(record.room_id)
             watchers.add(record.watcher_name)
     return DmClaim(

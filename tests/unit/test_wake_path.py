@@ -218,8 +218,15 @@ class TestTheSweepIdlesAndTheNextMessageWakes(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await sweep.run_once(), [name])
 
             self.assertTrue(created.dropped_at, "the idle clock was stamped")
-            self.assertEqual(created.last_processed_ts, "1500",
-                             "the drop captured the live watermark")
+            # The drop captures the oldest OWED mark (round 26): the creation
+            # drain claimed just-below-m1 (delivery is attempted, a filtered
+            # frame is a deferral not a loss), and that claim is open until a
+            # replay discharges it — so the durable record carries 1499, and
+            # the wake re-reads one page the dedup window absorbs. Older is
+            # the safe direction; 1500 here would spend a window nothing read.
+            self.assertEqual(created.last_processed_ts, "1499",
+                             "the drop captured the owed mark, not merely "
+                             "the processed one")
             self.assertIsNone(lifecycle.processor_named(name))
             self.assertIs(dispatcher.capacity(ROOM_ID), RoomCapacity.UNROUTED)
             # §2.2, pinned: the drop does NOT unsubscribe — the room entry,
@@ -239,10 +246,10 @@ class TestTheSweepIdlesAndTheNextMessageWakes(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(lifecycle.processor_named(name))
         self.assertIs(dispatcher.capacity(ROOM_ID), RoomCapacity.AVAILABLE)
         # The wake replayed the interval the room owes, from the very
-        # watermark the drop captured.
+        # watermark the drop captured — the OWED mark (round 26).
         connector.replay_room_since.assert_awaited_once()
         self.assertEqual(
-            connector.replay_room_since.await_args.kwargs.get("after_ts"), "1500")
+            connector.replay_room_since.await_args.kwargs.get("after_ts"), "1499")
         # And however many idle/wake cycles, the bookkeeping does not grow.
         self.assertEqual(connector._room_refcount[ROOM_ID], 1)
         self.assertEqual(len(connector._watcher_contexts[ROOM_ID]), 1)

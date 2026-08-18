@@ -597,6 +597,23 @@ class TestPersistedRecordsAreClaims(unittest.TestCase):
         self.assertEqual(claim.rooms, frozenset())
         self.assertEqual(claim.group_rooms, frozenset())
 
+    def test_a_damaged_room_kind_still_claims_via_room_type(self):
+        """Codex round 26: a preserved record whose room_kind was corrupted
+        can still answer its DM (the live wake supplies the kind), so an
+        unknown kind must not read as no claim — the surviving room_type
+        claims BOTH DM classes, conservatively."""
+        from unittest.mock import MagicMock as M
+
+        from gateway.core.bot_identity import fold_record_dm_claims
+
+        damaged = M(rule_name="eng", config={"name": "w1"}, room_id="d1",
+                    room_kind="", room_type="dm", watcher_name="w1")
+        claim = fold_record_dm_claims(DmClaim(), [damaged])
+        self.assertIn("d1", claim.rooms)
+        self.assertIn("d1", claim.group_rooms)
+        self.assertTrue(claim.overlaps(DmClaim(direct=True)))
+        self.assertTrue(claim.overlaps(DmClaim(group_direct=True)))
+
     def test_a_config_only_dm_record_still_claims(self):
         """Codex round 24, the both-fields eligibility's last consumer: a DM
         record whose rule_name alone was damaged is preserved and recreated,

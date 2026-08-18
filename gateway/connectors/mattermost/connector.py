@@ -628,7 +628,23 @@ class MattermostConnector(Connector):
 
     def get_last_processed_ts(self, room_id: str) -> str | None:
         state = self._channels.get(room_id)
-        return state.last_processed_ts if state else None
+        if state is None:
+            return None
+        # The oldest OWED mark, not merely the newest processed one (Codex
+        # round 26): a claimed replay boundary is a window someone still owes
+        # a read of, and shutdown's watermark capture persists this getter's
+        # answer — returning only last_processed_ts let a cancelled replay's
+        # claimed-but-undischarged tail vanish from the durable record, and
+        # the next boot started above it. Older is the safe direction: a low
+        # watermark costs a re-fetch dedup absorbs; a high one loses messages.
+        if state.boundary_claims and state.replay_boundary:
+            from gateway.core.replay_window import ts_to_float
+
+            lp = ts_to_float(state.last_processed_ts or "")
+            rb = ts_to_float(state.replay_boundary)
+            if lp is None or (rb is not None and rb < lp):
+                return state.replay_boundary
+        return state.last_processed_ts
 
     # ── Attachment cache ────────────────────────────────────────────────────────
 

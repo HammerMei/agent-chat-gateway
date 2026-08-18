@@ -1681,9 +1681,22 @@ class RocketChatConnector(Connector):
             self._rooms[room_id].last_processed_ts = ts
 
     def get_last_processed_ts(self, room_id: str) -> str | None:
-        """Return the last processed message timestamp for a room."""
+        """The oldest OWED mark for the room — the claimed replay boundary
+        when one is open and older, else the processed watermark (Codex
+        round 26, the MM twin): shutdown persists this getter's answer, and
+        a claimed-but-undischarged window must survive into the durable
+        record or the next boot starts above the unprocessed tail."""
         sub = self._rooms.get(room_id)
-        return sub.last_processed_ts if sub else None
+        if sub is None:
+            return None
+        if sub.boundary_claims and sub.replay_boundary:
+            from gateway.core.replay_window import ts_to_float
+
+            lp = ts_to_float(sub.last_processed_ts or "")
+            rb = ts_to_float(sub.replay_boundary)
+            if lp is None or (rb is not None and rb < lp):
+                return sub.replay_boundary
+        return sub.last_processed_ts
 
     # ── Attachment cache ────────────────────────────────────────────────────────
 

@@ -460,7 +460,12 @@ class TestOnPostedEvent(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(received[0].text, "hi")
         self.assertEqual(connector.get_last_processed_ts("chan1"), "12345")
 
-    async def test_dropped_message_does_not_advance_watermark(self):
+    async def test_dropped_message_leaves_an_owed_mark_not_an_advance(self):
+        """A queue-full hand-back must not ADVANCE the watermark past the
+        refused message — and since round 26 the getter answers the oldest
+        OWED mark, so the hand-back's claimed window (just below the refused
+        post) is what a shutdown would persist: the next boot replays it
+        instead of losing it."""
         connector = await self._connector_with_channel(owners=["alice"])
         connector._rest.resolve_username = AsyncMock(return_value="alice")
         handler = AsyncMock(return_value=False)  # queue full
@@ -471,7 +476,12 @@ class TestOnPostedEvent(unittest.IsolatedAsyncioTestCase):
             "mentions": ["bot-id-1"],
         })
 
-        self.assertIsNone(connector.get_last_processed_ts("chan1"))
+        self.assertEqual(connector.get_last_processed_ts("chan1"), "12344",
+                         "the owed window, never a mark at-or-above the "
+                         "refused message")
+        state = connector._channels["chan1"]
+        self.assertIsNone(state.last_processed_ts,
+                          "the PROCESSED mark itself did not advance")
 
     async def test_duplicate_message_id_skipped(self):
         connector = await self._connector_with_channel(owners=["alice"])

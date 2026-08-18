@@ -462,6 +462,13 @@ class TestMMReplayAbortsOnAMembershipEraChange(unittest.IsolatedAsyncioTestCase)
         self.assertEqual(state.replay_boundary, "100",
                          "the claim was made before the fetch — the "
                          "cancelled tail stays recoverable")
+        # And the claim reaches the DURABLE watermark (round 26): live
+        # traffic advanced the processed mark past the tail, but shutdown
+        # persists this getter's answer, and the owed window must win.
+        state.last_processed_ts = "500"
+        self.assertEqual(connector.get_last_processed_ts("chan-1"), "100",
+                         "the getter answers the oldest OWED mark while a "
+                         "claim is open")
 
     async def test_an_era_change_during_the_fetch_rejects_the_whole_batch(self):
         """Codex round 21: the capture must sit BEFORE the history fetch — a
