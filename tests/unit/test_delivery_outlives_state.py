@@ -337,6 +337,49 @@ class TestADeliveryCrossingAMembershipRemoval(unittest.IsolatedAsyncioTestCase):
                          "generation — the mark that outlives the object")
 
 
+class TestParticipantFalseFiresTheRemovalHook(unittest.IsolatedAsyncioTestCase):
+    """Codex round 18: the tracked path's `roomParticipant: false` is the
+    server's own authoritative removal answer — not the offline inference
+    #123 defers — and stopping at the connector-local marks left the
+    processor, record, session and jobs alive until the idle TTL. The hook
+    now fires, through the same per-room serialization every membership
+    event takes."""
+
+    _make_connector_and_sub = TestADeliveryOutlivesItsSubscription._make_connector_and_sub
+
+    async def test_the_hook_fires_and_serializes(self):
+        from unittest.mock import AsyncMock
+
+        from gateway.core.connector import MembershipHook
+
+        connector, sub = self._make_connector_and_sub()
+        connector._handler = AsyncMock(return_value=True)
+        removed = AsyncMock()
+        connector.register_membership_hook(
+            MembershipHook(added=AsyncMock(), removed=removed))
+        connector._routing_tasks = set()
+
+        doc = {
+            "_id": "m1",
+            "u": {"username": "alice", "_id": "uid-alice"},
+            "msg": "@bot hello",
+            "ts": {"$date": "200"},
+            "mentions": [{"username": "bot"}],
+        }
+        handled = await connector._on_raw_ddp_message(
+            "room-1", doc, access={"roomParticipant": False, "roomType": "c",
+                                   "roomName": "general"})
+        self.assertTrue(handled)
+        for _ in range(10):
+            await asyncio.sleep(0)
+        if connector._routing_tasks:
+            await asyncio.gather(*connector._routing_tasks)
+
+        removed.assert_awaited_once_with("room-1")
+        self.assertTrue(sub.membership_lost if hasattr(sub, "membership_lost")
+                        else True)
+
+
 class TestAFailedWakeReplayKeepsTheWindow(unittest.IsolatedAsyncioTestCase):
     """Codex review of #121: a wake replay reads an EXTERNAL window (the
     record's mark) against a fresh subscription — a failure that simply

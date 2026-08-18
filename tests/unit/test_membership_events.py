@@ -181,6 +181,25 @@ class TestARemovalReclaimsTheRecord(unittest.IsolatedAsyncioTestCase):
             any("claude:/the/old/workdir" in line for line in captured.output),
             "the accepted leak names both identities")
 
+    async def test_a_failed_prune_restores_the_record(self):
+        """Codex round 18: popped-with-disk-copy-intact is the worst state —
+        the reconciliation cannot rediscover the room from memory, and any
+        later ordinary save merges the stale disk row back for the next boot
+        to resurrect. A failed durable prune puts the record back; the next
+        discoverer reclaims again and retries the prune."""
+        record = make_rule_derived_record()
+        lifecycle, connector = _harness([record])
+        lifecycle._state_store.save = MagicMock(
+            side_effect=OSError("read-only file system"))
+
+        with self.assertRaises(OSError):
+            # The raise propagates — the membership handler's safety net (or
+            # the expire verb's operator) is the reporting layer.
+            await lifecycle.reclaim_room("room-w1", reason="removed")
+
+        self.assertIs(lifecycle.get_watcher_state("w1"), record,
+                      "the record is back in memory for the next discoverer")
+
     async def test_a_failed_stop_does_not_refuse_the_reclaim(self):
         """The room is gone whatever the teardown hit — a remove that refused
         to reclaim on a stop error would keep a session for a room that can

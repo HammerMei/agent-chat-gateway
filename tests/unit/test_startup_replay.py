@@ -293,6 +293,10 @@ class TestBootRunsTheSweepsEvaluation(unittest.IsolatedAsyncioTestCase):
         mgr._lifecycle.states = MagicMock(
             return_value={r.watcher_name: r for r in records})
         mgr._lifecycle.save_state = MagicMock()
+        # Asked, not remembered: a bare MagicMock answers truthily, and the
+        # boot evaluation's residency re-check (round 18) would then skip
+        # every record — the third instance of this exact trap.
+        mgr._lifecycle.processor_named = MagicMock(return_value=None)
         mgr._watcher_manager = MagicMock()
         mgr._watcher_manager.get_or_create = AsyncMock(return_value="proc")
         self._old = (datetime.now().astimezone()
@@ -315,6 +319,27 @@ class TestBootRunsTheSweepsEvaluation(unittest.IsolatedAsyncioTestCase):
         room = mgr._watcher_manager.get_or_create.await_args.args[1]
         self.assertEqual(room.id, "r1")
         self.assertEqual(record.dropped_at, "")
+
+    async def test_a_resident_record_is_not_stamped_idle_by_boot(self):
+        """Codex round 18: inbound opens before this pass, so a live message
+        can finish recreating a past-TTL record before the loop reaches it —
+        the fresh record carries the OLD clock, and stamping it would mark a
+        RUNNING watcher idle with nothing ever clearing dropped_at: every
+        sweep then takes the expiry leg, whose residency guard blocks it —
+        wedged until a restart."""
+        mgr = self._manager([])
+        record = _dynamic_record(rule={"name": "eng", "session_idle_days": 15})
+        record.last_activity_at = self._old  # past TTL on its face
+        mgr._lifecycle.states = MagicMock(
+            return_value={record.watcher_name: record})
+        # …but a wake already made it resident.
+        mgr._lifecycle.processor_named = MagicMock(return_value="the-proc")
+
+        await mgr._evaluate_lifecycle_at_boot()
+
+        self.assertEqual(record.dropped_at, "",
+                         "a resident record is never stamped idle")
+        mgr._watcher_manager.get_or_create.assert_not_awaited()
 
     async def test_a_garbled_room_kind_degrades_instead_of_aborting_boot(self):
         """Codex round 8: `load_state` promises a corrupted record degrades

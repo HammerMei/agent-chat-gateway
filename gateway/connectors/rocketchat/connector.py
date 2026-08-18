@@ -2130,6 +2130,30 @@ class RocketChatConnector(Connector):
             # was ever delivered.
             sub.left_the_room()
             self._note_membership_loss(room_id)
+            # And the CORE learns it too (Codex round 18): this is the
+            # server's own per-message answer — an authoritative removal
+            # signal, not the offline inference #123 defers — and stopping at
+            # the connector-local marks left the processor, record, session
+            # and jobs alive until the idle TTL aged the room into the
+            # dormant-only reconciliation. Scheduled through the same
+            # per-room serialization every membership hook takes, so it
+            # cannot complete around a concurrent re-add's registration.
+            if self._membership_hook is not None:
+                async def _removed(rid=room_id):
+                    lock = self._membership_serial.setdefault(
+                        rid, asyncio.Lock())
+                    async with lock:
+                        try:
+                            await self._membership_hook.removed(rid)
+                        except Exception:
+                            logger.exception(
+                                "Membership removal (participant-false) for "
+                                "room %s failed — the safety nets cover it",
+                                rid,
+                            )
+                task = asyncio.create_task(_removed())
+                self._routing_tasks.add(task)
+                task.add_done_callback(self._routing_tasks.discard)
             return True
 
         msg_id = doc.get("_id", "")

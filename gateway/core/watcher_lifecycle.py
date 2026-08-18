@@ -571,9 +571,19 @@ class WatcherLifecycle:
         # docstring's whole point), so popping from the in-memory map is not
         # enough — without `prune` the write restores the reclaimed record
         # from disk and the next boot resurrects it, session pointer and all
-        # (Codex round 3, P1).
+        # (Codex round 3, P1). And if the durable prune itself FAILS (volume
+        # full, read-only), the record goes back in memory (Codex round 18):
+        # popped-with-disk-copy-intact is the worst state — the reconciliation
+        # cannot rediscover it from memory, and any later ordinary save
+        # merges the stale disk row straight back. Restored, the record is
+        # simply reclaimed again by whatever discovers it next, and that
+        # retry re-attempts the prune — crash-honest, like the pop-last rule.
         self._states.pop(name, None)
-        self._state_store.save(self._states, prune={name})
+        try:
+            self._state_store.save(self._states, prune={name})
+        except Exception:
+            self._states[name] = state
+            raise
 
     async def reclaim_room(
         self, room_id: str, *, reason: str,

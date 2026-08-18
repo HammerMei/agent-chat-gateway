@@ -419,6 +419,17 @@ class SessionManager:
                 or not record.room_id
             ):
                 continue
+            if self._lifecycle.processor_named(record.watcher_name) is not None:
+                # Resident already (Codex round 18): inbound opened before
+                # this pass, and a live message can finish recreating a
+                # past-TTL record before the loop reaches it — the fresh
+                # record carries the OLD clock, so the stamp below would mark
+                # a RUNNING watcher idle, and nothing ever clears dropped_at
+                # (enqueue advances only last_activity_at): every sweep then
+                # takes the expiry leg, whose residency guard blocks it —
+                # wedged until a restart. The timed drop re-checks residency
+                # under the lock; boot's stamp must too.
+                continue
             if past_idle_ttl(record, now):
                 record.dropped_at = now.isoformat(timespec="seconds")
                 stamped += 1
