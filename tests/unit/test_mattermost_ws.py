@@ -244,7 +244,7 @@ class TestReconnectReplaysCoalesce(unittest.IsolatedAsyncioTestCase):
     before the next starts; its pre-await window claim makes that lossless."""
 
     async def test_a_second_reconnect_cancels_the_parked_replay(self):
-        from unittest.mock import MagicMock, patch
+        from unittest.mock import patch
 
         from gateway.connectors.mattermost.websocket import (
             MattermostWebSocketClient,

@@ -433,7 +433,6 @@ class TestMMReplayAbortsOnAMembershipEraChange(unittest.IsolatedAsyncioTestCase)
         while live traffic advanced last_processed_ts past it — the next boot
         started above the miss. The window is claimed BEFORE the first await
         now, so the boundary survives the cancellation."""
-        from unittest.mock import AsyncMock
 
         from gateway.connectors.mattermost.connector import _ChannelState
         from gateway.core.connector import Room
