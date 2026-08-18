@@ -397,7 +397,17 @@ def config_from_record(record: WatcherState) -> WatcherConfig | None:
         name=raw["name"],
         connector=_str("connector"),
         room=_str("room"),
-        agent=_str("agent"),
+        # The nested value, backstopped by the record's own frozen field
+        # (Codex round 14): a hand-edited or corrupted `config.agent` used to
+        # degrade to "" — which is FALSY, so start's named-but-missing agent
+        # refusal never fired and `_resolve_agent_name` substituted the
+        # default: the room silently ran under a different backend and tool
+        # policy instead of reading failed. `record.agent` is the §5.3
+        # frozen field every other consumer (reclaim, identity checks)
+        # already treats as authoritative; a normal record's two copies
+        # always agree because materialize writes both from the rule.
+        agent=_str("agent") or (record.agent if isinstance(record.agent, str)
+                                else ""),
         context_inject_files=[p for p in files if isinstance(p, str)]
         if isinstance(files, list) else [],
         online_notification=_str("online_notification") or None,
