@@ -772,6 +772,16 @@ def _parse_one_connector(
         raise ValueError(
             f"Connector '{name}': 'type' must be a string (got {type(connector_type).__name__})."
         )
+    if ":" in name:
+        # ':' is the watcher-handle divider (`<connector>:<room label>`,
+        # §2.3) — the boundary is only unforgeable because a connector name
+        # can never carry one. Everything else in a name passes through:
+        # room labels are percent-encoded on THEIR side of the divider.
+        raise ValueError(
+            f"Connector name '{name}' contains ':' — that character is "
+            f"reserved as the watcher-name divider (<connector>:<room>). "
+            f"Rename the connector."
+        )
     if name in seen_connector_names:
         raise ValueError(
             f"Duplicate connector name '{name}' found. "

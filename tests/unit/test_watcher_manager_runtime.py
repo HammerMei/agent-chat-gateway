@@ -110,7 +110,7 @@ class TestCreation(unittest.IsolatedAsyncioTestCase):
         result = await manager.get_or_create("rc", _room())
 
         self.assertEqual(result, "the-processor")
-        self.assertEqual(started["wc"].name, "rc-eng-backend")
+        self.assertEqual(started["wc"].name, "rc:eng-backend")
         self.assertIsNone(started["history_before_ts"])
         # The state passed for a first-ever room is None — there is no record.
         self.assertIsNone(lifecycle.start_watcher_in_room.call_args.args[1])
@@ -231,7 +231,7 @@ class TestTheRecordIsFrozenAtCreation(unittest.IsolatedAsyncioTestCase):
         room = _room()
 
         await manager.get_or_create("rc", room)
-        ws = lifecycle.get_watcher_state("rc-eng-backend")
+        ws = lifecycle.get_watcher_state("rc:eng-backend")
 
         self.assertEqual(ws.room_kind, "channel")
         self.assertEqual(ws.connector, "rc")
@@ -265,10 +265,10 @@ class TestStickyBinding(unittest.IsolatedAsyncioTestCase):
 
     def _record(self, paused=False, config=None):
         return WatcherState(
-            watcher_name="rc-eng-backend", session_id="s1", room_id="r1",
+            watcher_name="rc:eng-backend", session_id="s1", room_id="r1",
             paused=paused,
             config=config if config is not None
-            else {"name": "rc-eng-backend", "connector": "rc",
+            else {"name": "rc:eng-backend", "connector": "rc",
                   "room": "eng-backend", "agent": "claude",
                   "context_inject_files": [], "online_notification": None,
                   "offline_notification": None,
@@ -296,7 +296,7 @@ class TestStickyBinding(unittest.IsolatedAsyncioTestCase):
 
         lifecycle.start_watcher_in_room.assert_called_once()
         wc = lifecycle.start_watcher_in_room.call_args.args[0]
-        self.assertEqual(wc.name, "rc-eng-backend")
+        self.assertEqual(wc.name, "rc:eng-backend")
         self.assertEqual(wc.agent, "claude")
         # The record itself rides along, so the session is resumed, not re-minted.
         self.assertIs(lifecycle.start_watcher_in_room.call_args.args[1], record)
@@ -348,7 +348,7 @@ class TestSingleFlight(unittest.IsolatedAsyncioTestCase):
         release.set()
         results = await asyncio.gather(first, second)
 
-        self.assertEqual(starts, ["rc-eng-backend"], "exactly one creation ran")
+        self.assertEqual(starts, ["rc:eng-backend"], "exactly one creation ran")
         self.assertEqual(results[1], "the-processor")
 
     async def test_two_different_rooms_create_concurrently(self):
@@ -541,7 +541,7 @@ class TestEndToEndThroughTheRealLifecycle(unittest.IsolatedAsyncioTestCase):
                 "rc", room, history_before_ts="2026-08-16T10:00:00+00:00")
 
         self.assertIsNotNone(result)
-        ws = lifecycle.get_watcher_state("rc-eng-backend")
+        ws = lifecycle.get_watcher_state("rc:eng-backend")
         self.assertEqual(ws.room_id, "r1")
         self.assertEqual(ws.rule_name, "eng")
         self.assertEqual(config_from_record(ws), materialize(rule, room))
@@ -570,7 +570,7 @@ class TestEndToEndThroughTheRealLifecycle(unittest.IsolatedAsyncioTestCase):
         with _patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
             MockProc.return_value.start = MagicMock()
             await manager.get_or_create("rc", room)
-            created = lifecycle.get_watcher_state("rc-eng-backend")
+            created = lifecycle.get_watcher_state("rc:eng-backend")
             frozen = {
                 "rule_name": created.rule_name,
                 "rule": dict(created.rule),
@@ -588,7 +588,7 @@ class TestEndToEndThroughTheRealLifecycle(unittest.IsolatedAsyncioTestCase):
             recreated_proc = await manager.get_or_create("rc", room)
 
         self.assertIsNotNone(recreated_proc)
-        ws = lifecycle.get_watcher_state("rc-eng-backend")
+        ws = lifecycle.get_watcher_state("rc:eng-backend")
         for name, value in frozen.items():
             self.assertEqual(getattr(ws, name), value,
                              f"recreation dropped the frozen field {name!r}")
@@ -616,7 +616,7 @@ class TestEndToEndThroughTheRealLifecycle(unittest.IsolatedAsyncioTestCase):
         with _patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
             MockProc.return_value.start = MagicMock()
             await manager.get_or_create("rc", _room())
-            ws = lifecycle.get_watcher_state("rc-eng-backend")
+            ws = lifecycle.get_watcher_state("rc:eng-backend")
             ws.last_processed_ts = "1786874400000"   # what the room had reached
             await lifecycle.stop_all()
 
@@ -645,7 +645,7 @@ class TestEndToEndThroughTheRealLifecycle(unittest.IsolatedAsyncioTestCase):
         with _patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
             MockProc.return_value.start = MagicMock()
             await manager.get_or_create("rc", _room())
-            lifecycle.get_watcher_state("rc-eng-backend").last_processed_ts = "1000"
+            lifecycle.get_watcher_state("rc:eng-backend").last_processed_ts = "1000"
             await lifecycle.stop_all()
 
             with self.assertLogs(
@@ -669,7 +669,7 @@ class TestEndToEndThroughTheRealLifecycle(unittest.IsolatedAsyncioTestCase):
         with _patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
             MockProc.return_value.start = MagicMock()
             await manager.get_or_create("rc", _room())
-            ws = lifecycle.get_watcher_state("rc-eng-backend")
+            ws = lifecycle.get_watcher_state("rc:eng-backend")
             ws.last_processed_ts = "1786874400000"
             # The backend forgot the session while the room was idle.
             ws.session_id = ""
@@ -701,7 +701,7 @@ class TestEndToEndThroughTheRealLifecycle(unittest.IsolatedAsyncioTestCase):
         with _patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
             MockProc.return_value.start = MagicMock()
             await manager.get_or_create("rc", _room())
-            ws = lifecycle.get_watcher_state("rc-eng-backend")
+            ws = lifecycle.get_watcher_state("rc:eng-backend")
             ws.last_processed_ts = "1786874400000"   # the room's own boundary
             ws.session_id = ""                        # backend forgot the session
             await lifecycle.stop_all()
@@ -734,14 +734,14 @@ class TestEndToEndThroughTheRealLifecycle(unittest.IsolatedAsyncioTestCase):
         with _patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
             MockProc.return_value.start = MagicMock()
             await manager.get_or_create("rc", _room())
-            ws = lifecycle.get_watcher_state("rc-eng-backend")
+            ws = lifecycle.get_watcher_state("rc:eng-backend")
             ws.last_activity_at = "2020-01-01T00:00:00+00:00"
             ws.dropped_at = "2020-01-02T00:00:00+00:00"
             await lifecycle.stop_all()
 
             await manager.get_or_create("rc", _room())
 
-        ws = lifecycle.get_watcher_state("rc-eng-backend")
+        ws = lifecycle.get_watcher_state("rc:eng-backend")
         self.assertEqual(
             ws.last_activity_at, "2020-01-01T00:00:00+00:00",
             "a restart is not activity — the idle clock survives recreation",

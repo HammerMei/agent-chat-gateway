@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (voice, script, whose rules must name literal rooms). Rules match top-down;
   the first rule that claims a room wins, and `acg config validate` warns about
   rules an earlier rule shadows. Each created watcher is named
-  `<connector>-<room>`, which is what `list` shows and the operator verbs act
+  `<connector>:<room>`, which is what `list` shows and the operator verbs act
   on. **The static shape — a `room:` key, or `rooms:` as a list — is a hard
   load error** naming the migration guide; see
   `docs/migration-dynamic-watchers.md`, and note the upgrade **resets every

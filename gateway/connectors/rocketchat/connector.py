@@ -370,6 +370,25 @@ class RocketChatConnector(Connector):
             "Rocket.Chat delivery: %s",
             "all rooms" if self._subscribe_all else "per room",
         )
+        if not self._subscribe_all:
+            # Post-cutover, rules are the only watcher shape and they DEPEND
+            # on unsolicited delivery for discovery (Codex round 7). In
+            # per-room fallback the blast radius is worse than "degraded":
+            # rooms whose watchers started this boot keep working; an idle
+            # record wakes only if the boot replay found messages already
+            # waiting (the REST probe still works) — a message arriving
+            # LATER reaches no subscription, so the room is deaf until the
+            # next restart; and a genuinely new matching room or a
+            # membership add is never discovered at all. Loud, not fatal:
+            # the running rooms are real service worth keeping.
+            logger.error(
+                "Rocket.Chat: the server refused the all-rooms subscription, "
+                "so delivery is per-room only. Watchers running now keep "
+                "working, but idle rooms cannot wake on new messages until "
+                "the next restart, and NEW rooms matching your rules will "
+                "not be discovered. Rule-based discovery needs a server that "
+                "allows streaming '__my_messages__'."
+            )
         if self._membership_hook is not None:
             # Gated like the router that gates this method: no hook, no wire
             # cost. A refusal is degraded rather than fatal — joins are

@@ -146,13 +146,13 @@ class TestListStateFilter(IsolatedTestCase):
         await manager.run_once()
         self.assertEqual(manager.list_watchers()[0]["state"], "active")
 
-        await manager.pause_watcher("default-script")
-        await manager.resume_watcher("default-script")
+        await manager.pause_watcher("default:script")
+        await manager.resume_watcher("default:script")
         self.assertEqual(manager.list_watchers()[0]["state"], "active")
 
         # Drop the processor without touching the record: exactly what a start
         # that raised after writing its record leaves behind.
-        await manager._lifecycle._stop_processor("default-script")
+        await manager._lifecycle._stop_processor("default:script")
         self.assertEqual(manager.list_watchers()[0]["state"], "failed")
 
         await manager.shutdown()
@@ -180,7 +180,7 @@ class TestListStateFilter(IsolatedTestCase):
             return await original(wc, state)
 
         with patch.object(manager._lifecycle, "_resume_record", side_effect=observe):
-            await manager.reset_watcher("default-script")
+            await manager.reset_watcher("default:script")
 
         self.assertEqual(seen, ["active"], "a reset in flight must not read failed")
         await manager.shutdown()

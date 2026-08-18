@@ -509,7 +509,7 @@ watchers:
     agent: claude
 ```
 
-Each created watcher is named `<connector>-<room>` — that derived name is
+Each created watcher is named `<connector>:<room>` — that derived name is
 what `list` shows and what `pause`/`resume`/`reset`/`expire` act on. Rules
 match top-down; the first rule that claims a room wins, and `acg config
 validate` warns when an earlier rule shadows a later one completely.

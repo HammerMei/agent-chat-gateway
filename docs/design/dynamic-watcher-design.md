@@ -389,7 +389,7 @@ Three distinct keys, deliberately:
 | Watcher instance, sticky binding, per-room lock | `(connector, room_id)` |
 | Persisted state record | `(connector, room_id)` |
 | Filesystem paths (system prompt, attachment workspace) | `hash(connector, room_id)` — never the raw id |
-| Display and CLI | `<connector>-<room_label>` — cosmetic, never load-bearing |
+| Display and CLI | `<connector>:<room_label>` — cosmetic, never load-bearing |
 
 The `room_name` on the state record is a **human-readable description of the
 room**, refreshed from inbound messages: the platform's own name for a named
@@ -404,12 +404,17 @@ name freed by a rename can be reused by a different room, and resolving by name
 would bind an existing session to the wrong one. This is what makes the field
 safe to hold a description rather than a platform identifier.
 
-Labels need no disambiguating flag: connector names are validated unique at
-config load, so `<connector>-<label>` is unique by construction — **provided a
-connector never spans two namespaces of room names.** On Mattermost a channel
-name is unique only within a team (§6.3), so this holds exactly because one
-connector serves one team; the room *name* is really `(team, channel)` even
-though only the channel part appears in the label.
+Labels join with `:`, and the joiner is what makes the handle injective
+(review of the implementation PR found the original `-` joiner was not:
+connector `rc` + room `home-general` and connector `rc-home` + room `general`
+both derived `rc-home-general`). Two rules hold the boundary: a connector name
+may not contain `:` (refused at config load), and `:` is outside the label
+encoder's safe set, so a literal `:` in a room or user name is percent-encoded
+— the first `:` in a handle always ends the connector component, and the
+`dm:`/`gdm:` kind prefixes cannot be forged by a room name. On Mattermost a
+channel name is unique only within a team (§6.3), so the label half is unique
+exactly because one connector serves one team; the room *name* is really
+`(team, channel)` even though only the channel part appears in the label.
 
 Because the label is cosmetic (below), a collision would produce two
 identical-looking rows and nothing worse. The reason §4.5 still forbids a
@@ -478,8 +483,8 @@ gives up on readability:
 | Room kind | Label | Stable? |
 |---|---|---|
 | channel / private group | the channel name | until renamed |
-| 1:1 DM | `dm-<counterpart>` | until the counterpart is renamed — and see below |
-| group DM | `gdm-<first 8 of a room_id hash>` | yes, by construction |
+| 1:1 DM | `dm:<counterpart>` | until the counterpart is renamed — and see below |
+| group DM | `gdm:<first 8 of a room_id hash>` | yes, by construction |
 
 **A renamed counterpart is a known inconsistency, deliberately left.** This
 table used to claim a username was stable. It is not — Rocket.Chat allows a
@@ -536,9 +541,9 @@ So `list` shows the label, the room id, and for DMs the participants:
 
 ```
 NAME                     ROOM ID                     STATE   PARTICIPANTS
-mm-eng-incident-42       r1o6c8a1k3d8icd931qq1n6g4y  active  —
-mm-eng-dm-alice          iwihkhk9jpf3tngp14ushkx6pe  idle    @alice
-mm-eng-gdm-a3f9c1b2      cib3hjsrgpydtf6tyac7frcu6o  active  @alice, @bob
+mm-eng:incident-42       r1o6c8a1k3d8icd931qq1n6g4y  active  —
+mm-eng:dm:alice          iwihkhk9jpf3tngp14ushkx6pe  idle    @alice
+mm-eng:gdm:a3f9c1b2      cib3hjsrgpydtf6tyac7frcu6o  active  @alice, @bob
 ```
 
 `resolve()` (§2.8) accepts the label **or** the room id, so an operator always
@@ -632,7 +637,7 @@ config's `room` never contains pattern metacharacters.
 Note the split of duties this creates, deliberately: the **label** is a stable
 handle for addressing a watcher, while `room` is a human-meaningful
 *description* of where it lives. For a channel they coincide. For a group DM
-they diverge — label `gdm-a3f9c1b2`, room `@alice, @bob` — and the resolution
+they diverge — label `gdm:a3f9c1b2`, room `@alice, @bob` — and the resolution
 paths that consume `room` must therefore not treat it as a lookup key. Room
 resolution already goes by `room_id` (§2.3), so the only requirement is that
 nothing regresses to resolving by this field.

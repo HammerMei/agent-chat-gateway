@@ -299,9 +299,13 @@ class ControlServer:
     def _find_entry_for_watcher(self, watcher_name: str) -> "ConnectorEntry | dict":
         """Find the ConnectorEntry that owns the named watcher.
 
-        Watcher names are globally unique (enforced at config load time), so
-        searching all entries by name is unambiguous.  Returns an error dict
-        if no entry owns the watcher.
+        Watcher names are globally unique because the handle is injective by
+        construction (Codex round 8 found the old claim false): `:` joins
+        connector and room label, a connector name may not contain `:`
+        (config load refuses it), and the label encoder percent-encodes `:`
+        out of room and user names — so no two (connector, room) pairs can
+        derive one handle, and searching all entries by name is unambiguous.
+        Returns an error dict if no entry owns the watcher.
         """
         if not watcher_name:
             return {"ok": False, "error": "Missing 'watcher_name'"}

@@ -529,6 +529,16 @@ class GatewayService:
                     name="permission-expiry",
                 )
 
+            # The job store LOADS before any connector goes live (Codex round
+            # 8): a membership removal arriving between start_inbound and the
+            # load reclaimed the record and then failed its job cancellation
+            # on the store's not-loaded error — and with the record gone,
+            # nothing could ever rediscover those jobs. Loading is a cheap
+            # file read; only the SCHEDULER must start after run_once (its
+            # catch-up injections need processors), and it still does, below.
+            if getattr(self, "_job_store", None) is not None:
+                self._job_store.load()
+
             # 3. run_once() connects each SessionManager without blocking — the daemon
             #    loop below keeps the process alive.  We intentionally avoid sm.run()
             #    so that only the GatewayService owns the control socket.
@@ -574,11 +584,11 @@ class GatewayService:
                 startup_errors=startup_errors,
             )
 
-            # Load persisted jobs and start the job scheduler AFTER connectors are
-            # connected and watchers are up.  Starting it before run_once() would
-            # cause catch-up messages to be dropped (processors not yet started).
+            # Start the job scheduler AFTER connectors are connected and
+            # watchers are up.  Starting it before run_once() would cause
+            # catch-up messages to be dropped (processors not yet started).
+            # The store itself loaded BEFORE run_once — see above.
             if getattr(self, "_job_store", None) is not None:
-                self._job_store.load()
                 self._scheduler_task = asyncio.create_task(
                     self._job_scheduler.run(),
                     name="job-scheduler",

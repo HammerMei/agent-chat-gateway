@@ -28,7 +28,7 @@ from tests.unit.test_wake_path import (
 )
 
 ROOM_ID = "wake-1"
-NAME = "rc-eng-backend"
+NAME = "rc:eng-backend"
 
 
 class TestVerbsOnRuleDerivedRecords(unittest.IsolatedAsyncioTestCase):

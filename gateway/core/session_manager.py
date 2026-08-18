@@ -39,6 +39,27 @@ from .watcher_rule import RoomKind
 logger = logging.getLogger("agent-chat-gateway.core.session_manager")
 
 
+def _room_kind_or_channel(record) -> RoomKind:
+    """The record's room kind, degraded rather than raised (Codex round 8).
+
+    `load_state` promises a corrupted record degrades instead of taking the
+    service down; a raising `RoomKind(...)` conversion re-introduced the
+    crash one field later. Unknown values fall back to CHANNEL with a
+    warning — the mention gate applies there, which is the safe default.
+    """
+    if not record.room_kind:
+        return RoomKind.CHANNEL
+    try:
+        return RoomKind(record.room_kind)
+    except ValueError:
+        logger.warning(
+            "Watcher '%s': persisted room_kind %r is not a known kind — "
+            "treating the room as a channel",
+            record.watcher_name, record.room_kind,
+        )
+        return RoomKind.CHANNEL
+
+
 class SessionManager:
     """Thin orchestrator: wires collaborators and manages top-level lifecycle.
 
@@ -406,7 +427,13 @@ class SessionManager:
                     record.watcher_name,
                 )
                 continue
-            kind = RoomKind(record.room_kind) if record.room_kind else RoomKind.CHANNEL
+            # Tolerant, not raising (Codex round 8): `load_state` promises to
+            # degrade a corrupted record rather than let one take the service
+            # down, and a raising enum conversion OUTSIDE the per-record try
+            # defeated that contract — one garbled room_kind aborted the
+            # whole connector's boot. Unknown falls back to CHANNEL, loudly:
+            # the mention gate applies there, which is the safe default.
+            kind = _room_kind_or_channel(record)
             try:
                 await self._watcher_manager.get_or_create(
                     self._connector_name,
@@ -818,11 +845,7 @@ class SessionManager:
             # Paused answers None, so pause still outranks a schedule (§4.4).
             record = self._lifecycle.get_watcher_state(watcher_name)
             if record is not None and record.room_id:
-                kind = (
-                    RoomKind(record.room_kind)
-                    if record.room_kind
-                    else RoomKind.CHANNEL
-                )
+                kind = _room_kind_or_channel(record)
                 processor = await self._watcher_manager.get_or_create(
                     self._connector_name,
                     RoomRef(

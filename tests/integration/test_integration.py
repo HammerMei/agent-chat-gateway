@@ -152,7 +152,7 @@ class TestBasicEcho(IsolatedTestCase):
                 # The derived label the eager loop recreates by (§2.4): the
                 # record is the recreation source, so it must look like one
                 # the manager persisted — rule-derived, config frozen.
-                watcher_name="default-script",
+                watcher_name="default:script",
                 session_id="my-existing-session-abc123",
                 room_id="script",
                 room_type="script",
@@ -162,7 +162,7 @@ class TestBasicEcho(IsolatedTestCase):
                 agent="default",
                 rule_name="rule-script",
                 rule={"session_idle_days": 15, "session_expire_days": 15},
-                config={"name": "default-script", "connector": "default",
+                config={"name": "default:script", "connector": "default",
                         "room": "script", "agent": "default"},
             )
         ]
@@ -372,13 +372,13 @@ class TestWatcherLifecycle(IsolatedTestCase):
         self.assertEqual(len(watchers), 1)
         # The derived label (§2.3): connector + the room's encoded name.
         # Names are no longer operator-chosen.
-        self.assertEqual(watchers[0]["watcher_name"], "default-%23my-room")
+        self.assertEqual(watchers[0]["watcher_name"], "default:%23my-room")
         self.assertEqual(watchers[0]["room_name"], "#my-room")
         self.assertEqual(watchers[0]["room_id"], "rid-my-room")
         self.assertEqual(watchers[0]["state"], "active")
         # `state` is derived from the record plus residency, so the processor
         # check the old `["active"]` assertion provided is kept explicitly.
-        self.assertIsNotNone(manager.get_processor("default-%23my-room"))
+        self.assertIsNotNone(manager.get_processor("default:%23my-room"))
         # When no context_inject_files are configured, inject() marks the session
         # as "injected" immediately to prevent per-message retry loops.
         self.assertEqual(watchers[0]["context_injection_state"], "injected")
@@ -397,9 +397,9 @@ class TestWatcherLifecycle(IsolatedTestCase):
         reply = await connector.receive_reply(timeout=5.0)
         self.assertEqual(reply, "before-pause")
 
-        await manager.pause_watcher("default-script")
-        self.assertIsNone(manager.get_processor("default-script"))
-        self.assertEqual(_watcher_info(manager, "default-script")["state"], "paused")
+        await manager.pause_watcher("default:script")
+        self.assertIsNone(manager.get_processor("default:script"))
+        self.assertEqual(_watcher_info(manager, "default:script")["state"], "paused")
 
         await manager.shutdown()
 
@@ -409,11 +409,11 @@ class TestWatcherLifecycle(IsolatedTestCase):
         manager = make_manager(connector, agent, watcher_rules=[make_rule()])
 
         await manager.run_once()
-        await manager.pause_watcher("default-script")
-        await manager.resume_watcher("default-script")
+        await manager.pause_watcher("default:script")
+        await manager.resume_watcher("default:script")
 
-        self.assertIsNotNone(manager.get_processor("default-script"))
-        self.assertEqual(_watcher_info(manager, "default-script")["state"], "active")
+        self.assertIsNotNone(manager.get_processor("default:script"))
+        self.assertEqual(_watcher_info(manager, "default:script")["state"], "active")
 
         await connector.inject("msg-after-resume")
         reply = await connector.receive_reply(timeout=5.0)
@@ -430,7 +430,7 @@ class TestWatcherLifecycle(IsolatedTestCase):
         await manager.run_once()
         first_session_id = agent.created_sessions[0]["session_id"]
 
-        await manager.reset_watcher("default-script")
+        await manager.reset_watcher("default:script")
         self.assertEqual(len(agent.created_sessions), 2)
         second_session_id = agent.created_sessions[1]["session_id"]
         self.assertNotEqual(first_session_id, second_session_id)
@@ -459,7 +459,7 @@ class TestWatcherLifecycle(IsolatedTestCase):
         self.assertEqual(len(agent.created_sessions), 1)
         first = agent.created_sessions[0]["session_id"]
 
-        await manager.reset_watcher("default-script")
+        await manager.reset_watcher("default:script")
         self.assertEqual(len(agent.created_sessions), 2, "reset did not create a session")
         second = agent.created_sessions[1]["session_id"]
         self.assertNotEqual(first, second)
@@ -491,9 +491,9 @@ class TestWatcherLifecycle(IsolatedTestCase):
         self.assertIn("unavailable", errors[0])
 
         with self.assertRaisesRegex(RuntimeError, "No watcher named"):
-            await manager.resume_watcher("default-script")
+            await manager.resume_watcher("default:script")
 
-        self.assertIsNone(manager.get_processor("default-script"))
+        self.assertIsNone(manager.get_processor("default:script"))
 
         await manager.shutdown()
 
@@ -509,9 +509,9 @@ class TestWatcherLifecycle(IsolatedTestCase):
         # The eager start already refused fail-closed, so no record exists —
         # and a reset without a record is refused too, one door earlier.
         with self.assertRaisesRegex(RuntimeError, "No watcher named"):
-            await manager.reset_watcher("default-script")
+            await manager.reset_watcher("default:script")
 
-        self.assertIsNone(manager.get_processor("default-script"))
+        self.assertIsNone(manager.get_processor("default:script"))
 
         await manager.shutdown()
 
@@ -918,13 +918,13 @@ class TestWatermarkCapturedBeforeUnsubscribe(IsolatedTestCase):
         manager = make_manager(connector, agent, watcher_rules=[make_rule("w1")])
         await manager.run_once()
 
-        room_id = manager._lifecycle._states["default-w1"].room_id
+        room_id = manager._lifecycle._states["default:w1"].room_id
         connector.seed(room_id, "2025-06-06T06:06:06Z")
 
-        await manager.dispatch_command({"cmd": "pause", "watcher_name": "default-w1"})
+        await manager.dispatch_command({"cmd": "pause", "watcher_name": "default:w1"})
 
         self.assertEqual(
-            manager._lifecycle._states["default-w1"].last_processed_ts,
+            manager._lifecycle._states["default:w1"].last_processed_ts,
             "2025-06-06T06:06:06Z",
             "watermark was read after the unsubscribe popped the room entry",
         )
@@ -937,13 +937,13 @@ class TestWatermarkCapturedBeforeUnsubscribe(IsolatedTestCase):
         manager = make_manager(connector, agent, watcher_rules=[make_rule("w1")])
         await manager.run_once()
 
-        room_id = manager._lifecycle._states["default-w1"].room_id
+        room_id = manager._lifecycle._states["default:w1"].room_id
         connector.seed(room_id, "2025-06-06T06:06:06Z")
         # Startup's own save already polled this room (before the seed), so
         # observe only the reads the pause itself performs.
         connector.read_order.clear()
 
-        await manager.dispatch_command({"cmd": "pause", "watcher_name": "default-w1"})
+        await manager.dispatch_command({"cmd": "pause", "watcher_name": "default:w1"})
 
         reads = [ts for (rid, ts) in connector.read_order if rid == room_id]
         self.assertTrue(reads, "the watermark was never read at all")
@@ -959,15 +959,15 @@ class TestWatermarkCapturedBeforeUnsubscribe(IsolatedTestCase):
         manager = make_manager(connector, agent, watcher_rules=[make_rule("w1")])
         await manager.run_once()
 
-        room_id = manager._lifecycle._states["default-w1"].room_id
+        room_id = manager._lifecycle._states["default:w1"].room_id
         connector.seed(room_id, "2025-07-07T07:07:07Z")
 
-        await manager.dispatch_command({"cmd": "reset", "watcher_name": "default-w1"})
+        await manager.dispatch_command({"cmd": "reset", "watcher_name": "default:w1"})
 
         # reset restarts the watcher, so the surviving record is the new one —
         # it must have inherited the watermark rather than resetting to empty.
         self.assertEqual(
-            manager._lifecycle._states["default-w1"].last_processed_ts,
+            manager._lifecycle._states["default:w1"].last_processed_ts,
             "2025-07-07T07:07:07Z",
         )
         await manager.shutdown()
@@ -979,12 +979,12 @@ class TestWatermarkCapturedBeforeUnsubscribe(IsolatedTestCase):
         manager = make_manager(connector, agent, watcher_rules=[make_rule("w1")])
         await manager.run_once()
 
-        manager._lifecycle._states["default-w1"].last_processed_ts = "known"
+        manager._lifecycle._states["default:w1"].last_processed_ts = "known"
         # connector.rooms deliberately left empty — nothing live to report.
 
-        await manager.dispatch_command({"cmd": "pause", "watcher_name": "default-w1"})
+        await manager.dispatch_command({"cmd": "pause", "watcher_name": "default:w1"})
 
-        self.assertEqual(manager._lifecycle._states["default-w1"].last_processed_ts, "known")
+        self.assertEqual(manager._lifecycle._states["default:w1"].last_processed_ts, "known")
         await manager.shutdown()
 
 
@@ -1003,7 +1003,7 @@ class TestWatermarkPersistence(IsolatedTestCase):
 
         room_id = "script"
         # Manually set up watcher state with a known room_id
-        manager.get_watcher_state("default-script").room_id = room_id
+        manager.get_watcher_state("default:script").room_id = room_id
 
         # Mock get_last_processed_ts to return a specific timestamp
         with patch.object(
@@ -1012,7 +1012,7 @@ class TestWatermarkPersistence(IsolatedTestCase):
             manager._lifecycle.save_state()
 
         # The saved WatcherState should carry the mocked timestamp
-        saved_ws = manager.get_watcher_state("default-script")
+        saved_ws = manager.get_watcher_state("default:script")
         self.assertEqual(saved_ws.last_processed_ts, "1234567890.000001")
 
         await manager.shutdown()
@@ -1029,7 +1029,7 @@ class TestWatermarkPersistence(IsolatedTestCase):
         cfg = AgentConfig()
         persisted = [
             WatcherState(
-                watcher_name="default-script",
+                watcher_name="default:script",
                 session_id="existing-session",
                 room_id="script",
                 room_type="script",
@@ -1039,7 +1039,7 @@ class TestWatermarkPersistence(IsolatedTestCase):
                 agent="default",
                 rule_name="rule-script",
                 rule={"session_idle_days": 15, "session_expire_days": 15},
-                config={"name": "default-script", "connector": "default",
+                config={"name": "default:script", "connector": "default",
                         "room": "script", "agent": "default"},
                 last_processed_ts=persisted_ts,
                 # The watermark is restored either way, so this test passed while
@@ -1118,10 +1118,10 @@ class TestDeferredRegistration(IsolatedTestCase):
 
         self.assertTrue(len(errors) > 0)
         # No active processor for the failed watcher.
-        self.assertIsNone(manager.get_processor("default-script"))
+        self.assertIsNone(manager.get_processor("default:script"))
         # State retains a partial entry so context_injected is not lost on retry.
-        self.assertIsNotNone(manager.get_watcher_state("default-script"))
-        self.assertFalse(manager.get_watcher_state("default-script").paused)
+        self.assertIsNotNone(manager.get_watcher_state("default:script"))
+        self.assertFalse(manager.get_watcher_state("default:script").paused)
 
         await manager.shutdown()
 
@@ -1167,7 +1167,7 @@ class TestStartupRaceRollback(IsolatedTestCase):
 
         self.assertTrue(len(errors) > 0)
         # No active processor — subscribe failed.
-        self.assertIsNone(manager.get_processor("default-script"))
+        self.assertIsNone(manager.get_processor("default:script"))
         # Routing maps must be cleaned — no dangling session→room or session→connector entries.
         self.assertEqual(
             session_room_map, {}, "session_room_map must be cleaned on rollback"
@@ -1178,7 +1178,7 @@ class TestStartupRaceRollback(IsolatedTestCase):
             "session_connector_map must be cleaned on rollback",
         )
         # State retains a partial entry so context_injected is preserved on retry.
-        self.assertIsNotNone(manager.get_watcher_state("default-script"))
+        self.assertIsNotNone(manager.get_watcher_state("default:script"))
 
         await manager.shutdown()
 
@@ -1197,7 +1197,7 @@ class TestStartupRaceRollback(IsolatedTestCase):
         async def check_then_subscribe(*args, **kwargs):
             # At the moment subscribe is called, processor must already be registered
             processor_ready_at_subscribe_time.append(
-                manager.get_processor("default-script") is not None
+                manager.get_processor("default:script") is not None
             )
             return await original_subscribe(*args, **kwargs)
 

@@ -611,8 +611,8 @@ class TestWatcherLifecycleHardening(IsolatedTestCase):
         await manager.shutdown()
 
         self.assertEqual(manager._lifecycle._processors, {})
-        self.assertIn(("room-a", "default-room-a"), connector.unsubscribed_rooms)
-        self.assertIn(("room-b", "default-room-b"), connector.unsubscribed_rooms)
+        self.assertIn(("room-a", "default:room-a"), connector.unsubscribed_rooms)
+        self.assertIn(("room-b", "default:room-b"), connector.unsubscribed_rooms)
 
     async def test_subscribe_failure_clears_deleted_fresh_session_from_state(self):
         connector = ScriptConnector()
@@ -627,7 +627,7 @@ class TestWatcherLifecycleHardening(IsolatedTestCase):
             errors = await manager.run_once()
 
         self.assertEqual(len(errors), 1)
-        state = manager._lifecycle.get_watcher_state("default-script")
+        state = manager._lifecycle.get_watcher_state("default:script")
         self.assertIsNotNone(state)
         self.assertEqual(state.session_id, "")
         self.assertEqual(agent.deleted_sessions, ["mock-session-0001"])
@@ -649,7 +649,7 @@ class TestUnavailableAgentsBlocksWatchers(IsolatedTestCase):
 
         errors = await manager.run_once(unavailable_agents={"default"})
 
-        self.assertIsNone(manager.get_processor("default-script"))
+        self.assertIsNone(manager.get_processor("default:script"))
         self.assertTrue(
             any("default" in e for e in errors),
             f"Expected 'default' in errors: {errors}",
@@ -668,7 +668,7 @@ class TestUnavailableAgentsBlocksWatchers(IsolatedTestCase):
 
         errors = await manager.run_once(unavailable_agents={"other-agent"})
 
-        self.assertIsNotNone(manager.get_processor("default-script"))
+        self.assertIsNotNone(manager.get_processor("default:script"))
         self.assertEqual(errors, [], f"Unexpected errors: {errors}")
 
         await manager.shutdown()
@@ -684,7 +684,7 @@ class TestUnavailableAgentsBlocksWatchers(IsolatedTestCase):
 
         errors = await manager.run_once(unavailable_agents=set())
 
-        self.assertIsNotNone(manager.get_processor("default-script"))
+        self.assertIsNotNone(manager.get_processor("default:script"))
         self.assertEqual(errors, [])
 
         await manager.shutdown()

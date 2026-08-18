@@ -25,7 +25,7 @@ def _window(mgr):
     return mgr._snapshot_watermarks()
 
 
-def _dynamic_record(name="rc-eng-backend", room_id="r1", **overrides):
+def _dynamic_record(name="rc:eng-backend", room_id="r1", **overrides):
     fields = dict(
         watcher_name=name,
         session_id="sess-1",
@@ -315,6 +315,35 @@ class TestBootRunsTheSweepsEvaluation(unittest.IsolatedAsyncioTestCase):
         room = mgr._watcher_manager.get_or_create.await_args.args[1]
         self.assertEqual(room.id, "r1")
         self.assertEqual(record.dropped_at, "")
+
+    async def test_a_garbled_room_kind_degrades_instead_of_aborting_boot(self):
+        """Codex round 8: `load_state` promises a corrupted record degrades
+        rather than taking the service down, and a raising RoomKind(...)
+        conversion OUTSIDE the per-record try defeated that one field later —
+        one garbled room_kind aborted the whole connector's boot. Unknown
+        kinds fall back to CHANNEL, loudly."""
+        mgr = self._manager([])
+        bad = _dynamic_record(rule={"name": "eng", "session_idle_days": 15})
+        bad.room_kind = "channel_typo"
+        bad.last_activity_at = self._recent
+        good = _dynamic_record(rule={"name": "eng", "session_idle_days": 15})
+        good.watcher_name = "w2"
+        good.room_id = "r2"
+        good.last_activity_at = self._recent
+        mgr._lifecycle.states = MagicMock(return_value={
+            bad.watcher_name: bad, good.watcher_name: good})
+
+        with self.assertLogs(
+            "agent-chat-gateway.core.session_manager", level="WARNING"
+        ) as captured:
+            await mgr._evaluate_lifecycle_at_boot()
+
+        rooms = [c.args[1] for c in
+                 mgr._watcher_manager.get_or_create.await_args_list]
+        self.assertEqual(sorted(r.id for r in rooms), ["r1", "r2"],
+                         "BOTH records were recreated — the garbled one "
+                         "degraded to channel instead of aborting the boot")
+        self.assertTrue(any("channel_typo" in line for line in captured.output))
 
     async def test_a_was_active_record_past_its_ttl_is_marked_idle_fresh(self):
         """Marked idle rather than resumed — and the stamp is *this* boot's

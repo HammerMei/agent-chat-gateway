@@ -100,8 +100,14 @@ def room_label(room: RoomRef) -> str:
     | kind | label | stable? |
     |---|---|---|
     | channel / private group | the channel name | until renamed |
-    | 1:1 DM | `dm-<counterpart>` | until the counterpart is renamed (§2.3) |
-    | group DM | `gdm-<8 hex of the room-id digest>` | yes, by construction |
+    | 1:1 DM | `dm:<counterpart>` | until the counterpart is renamed (§2.3) |
+    | group DM | `gdm:<8 hex of the room-id digest>` | yes, by construction |
+
+    The kind prefixes use `:` — the reserved divider, never emitted by
+    `_encode` (it is outside `_LABEL_SAFE`, so a literal `:` in a room or
+    user name is percent-encoded) — which makes them unforgeable: a channel
+    that happens to be NAMED `dm:alice` labels as `dm%3Aalice`, and can never
+    collide with the DM for alice (Codex review of #121, round 7).
 
     **A group DM's members are deliberately not in its label.** The tempting alternative
     is Mattermost's `channel_display_name`, which *is* the member list — but it moves
@@ -114,24 +120,37 @@ def room_label(room: RoomRef) -> str:
     if room.kind is RoomKind.DM:
         # One counterpart by definition. Falling back to the digest rather than raising:
         # a label is cosmetic, and refusing to name a room would be a worse failure than
-        # naming it dully.
+        # naming it dully. The counterpart is encoded ALONE and the `dm:`
+        # prefix attached outside the encoder, so the prefix stays literal
+        # (and unforgeable) while the name part stays safe.
         counterpart = room.participants[0] if room.participants else _digest(room.id)
-        return _encode(f"dm-{counterpart}", room.id)
+        return f"dm:{_encode(counterpart, room.id)}"
     if room.kind is RoomKind.GROUP_DM:
-        return f"gdm-{_digest(room.id)}"
+        return f"gdm:{_digest(room.id)}"
     return _encode(room.name, room.id) if room.name else _digest(room.id)
 
 
 def watcher_label(connector: str, room: RoomRef) -> str:
-    """`<connector>-<room label>` — the display and CLI handle (§2.3).
+    """`<connector>:<room label>` — the display and CLI handle (§2.3).
 
-    Unique by construction, because connector names are validated unique at config load
-    and one connector serves one namespace of room names. On Mattermost a channel name is
-    unique only within a team, so this holds *because* one connector serves one team
-    (§6.3): the room name is really `(team, channel)` even though only the channel part
-    appears here.
+    Injective by construction (Codex review of #121, round 7 — the old `-`
+    joiner was not: connector `rc` + room `home-general` and connector
+    `rc-home` + room `general` both derived `rc-home-general`). Two
+    guarantees make `:` a real boundary:
+
+    * a connector name may not contain `:` (refused at config load), so the
+      FIRST `:` in a watcher name always ends the connector component;
+    * `:` is outside `_LABEL_SAFE`, so `_encode` percent-encodes it out of
+      every room and user name — a literal `:` in the label portion can only
+      be one this module wrote (the `dm:`/`gdm:` kind prefixes), never one a
+      room name smuggled in.
+
+    On Mattermost a channel name is unique only within a team, and one
+    connector serves one team (§6.3), so the label portion is unique per
+    connector; with the boundary unforgeable, the whole handle is unique
+    across the deployment.
     """
-    return f"{connector}-{room_label(room)}"
+    return f"{connector}:{room_label(room)}"
 
 
 def room_description(room: RoomRef) -> str:

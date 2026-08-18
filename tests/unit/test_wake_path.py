@@ -123,7 +123,7 @@ class TestTheWakeResumesTheSameSession(unittest.IsolatedAsyncioTestCase):
             # 1. Creation, through the real routing episode.
             await connector._on_unrouted_message(_doc("m1", 1500), _ACCESS)
 
-            name = "rc-eng-backend"
+            name = "rc:eng-backend"
             created = lifecycle.get_watcher_state(name)
             self.assertIsNotNone(created, "the episode created the watcher")
             session_id = created.session_id
@@ -203,7 +203,7 @@ class TestTheSweepIdlesAndTheNextMessageWakes(unittest.IsolatedAsyncioTestCase):
 
             # 1. Creation, through the real routing episode.
             await connector._on_unrouted_message(_doc("m1", 1500), _ACCESS)
-            name = "rc-eng-backend"
+            name = "rc:eng-backend"
             created = lifecycle.get_watcher_state(name)
             self.assertIsNotNone(created)
             session_id = created.session_id
@@ -279,7 +279,7 @@ class TestTheFullLifecycleEndsInAFreshWatcher(unittest.IsolatedAsyncioTestCase):
 
             # 1. Create, 2. idle — the arc the money test already pins.
             await connector._on_unrouted_message(_doc("m1", 1500), _ACCESS)
-            name = "rc-eng-backend"
+            name = "rc:eng-backend"
             first_session = lifecycle.get_watcher_state(name).session_id
             clock["now"] += timedelta(days=16)
             self.assertEqual(await sweep.run_once(), [name])
@@ -343,7 +343,7 @@ class TestAWakeLandingMidDropWaits(unittest.IsolatedAsyncioTestCase):
             MockProc.return_value.stop = AsyncMock(side_effect=_slow_stop)
 
             await connector._on_unrouted_message(_doc("m1", 1500), _ACCESS)
-            name = "rc-eng-backend"
+            name = "rc:eng-backend"
             session_id = lifecycle.get_watcher_state(name).session_id
 
             clock["now"] += timedelta(days=16)
@@ -398,7 +398,7 @@ class TestAFailedRecreationKeepsTheRecord(unittest.IsolatedAsyncioTestCase):
 
     async def test_the_prior_record_survives_and_the_retry_resumes(self):
         connector, lifecycle, dispatcher = await self._harness()
-        name = "rc-eng-backend"
+        name = "rc:eng-backend"
 
         with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
             MockProc.return_value.start = MagicMock()
@@ -463,7 +463,7 @@ class TestAWakeParkedOnTheLockRespectsShutdown(unittest.IsolatedAsyncioTestCase)
     async def test_the_late_wake_creates_nothing(self):
         connector, lifecycle, dispatcher = await self._harness()
         manager = self.manager
-        name = "rc-eng-backend"
+        name = "rc:eng-backend"
 
         with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
             MockProc.return_value.start = MagicMock()
@@ -542,7 +542,7 @@ class TestDrainWaitsOutInflightStarts(unittest.IsolatedAsyncioTestCase):
             await self._settle(connector)
 
         self.assertIsNotNone(
-            lifecycle.processor_named("rc-eng-backend"),
+            lifecycle.processor_named("rc:eng-backend"),
             "the episode finished BEFORE drain returned — its processor is "
             "inside the snapshot stop_all takes next",
         )
@@ -571,7 +571,7 @@ class TestARuleLessManagerStillWakesRecords(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_persisted_record_wakes_under_an_empty_rule_list(self):
         connector, lifecycle, dispatcher = await self._harness()
-        name = "rc-eng-backend"
+        name = "rc:eng-backend"
 
         with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
             MockProc.return_value.start = MagicMock()

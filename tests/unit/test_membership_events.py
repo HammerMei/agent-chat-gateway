@@ -304,7 +304,7 @@ class TestAJoinRegistersAnIdleRecord(unittest.IsolatedAsyncioTestCase):
 
         name = await manager.register_on_join(_room())
 
-        self.assertEqual(name, "rc-eng-backend")
+        self.assertEqual(name, "rc:eng-backend")
         record = lifecycle.get_watcher_state(name)
         self.assertIsNotNone(record, "the record is persisted")
         # Idle, not active and not failed: dropped_at is the join stamp.
@@ -328,8 +328,8 @@ class TestAJoinRegistersAnIdleRecord(unittest.IsolatedAsyncioTestCase):
         silently replaced the old room's record, pause and session included."""
         manager, lifecycle, connector = _add_harness()
         old = make_rule_derived_record(
-            name="rc-eng-backend", room_id="old-room-id", paused=True)
-        lifecycle._states["rc-eng-backend"] = old
+            name="rc:eng-backend", room_id="old-room-id", paused=True)
+        lifecycle._states["rc:eng-backend"] = old
 
         with self.assertRaises(RuntimeError) as ctx:
             await manager.register_on_join(
@@ -339,8 +339,8 @@ class TestAJoinRegistersAnIdleRecord(unittest.IsolatedAsyncioTestCase):
         # handler logs and swallows (pinned by
         # test_handler_failures_never_reach_the_connector), and the room's
         # first message reports the same exit loudly via the start guard.
-        self.assertIn("expire rc-eng-backend", str(ctx.exception))
-        self.assertIs(lifecycle.get_watcher_state("rc-eng-backend"), old,
+        self.assertIn("expire rc:eng-backend", str(ctx.exception))
+        self.assertIs(lifecycle.get_watcher_state("rc:eng-backend"), old,
                       "the old room's record — an operator's pause included "
                       "— was left untouched")
 
@@ -373,14 +373,14 @@ class TestAJoinRegistersAnIdleRecord(unittest.IsolatedAsyncioTestCase):
         manager, lifecycle, _ = _add_harness(rules=[_rule(include=("ops-*",))])
 
         self.assertIsNone(await manager.register_on_join(_room()))
-        self.assertIsNone(lifecycle.get_watcher_state("rc-eng-backend"))
+        self.assertIsNone(lifecycle.get_watcher_state("rc:eng-backend"))
 
     async def test_a_disarmed_manager_registers_nothing(self):
         manager, lifecycle, _ = _add_harness()
         manager.disarm()
 
         self.assertIsNone(await manager.register_on_join(_room()))
-        self.assertIsNone(lifecycle.get_watcher_state("rc-eng-backend"))
+        self.assertIsNone(lifecycle.get_watcher_state("rc:eng-backend"))
 
     async def test_a_never_spoken_room_expires_from_the_join_stamp(self):
         """Deliberate (§2.7): the registered record reuses the idle state
@@ -1002,7 +1002,7 @@ class TestAJoinRegisteredRoomWakesOnFirstMessage(unittest.IsolatedAsyncioTestCas
         # 1. The join: an idle, sessionless record — nothing started.
         name = await self.manager.register_on_join(
             _room(id="wake-1", name="eng-backend"))
-        self.assertEqual(name, "rc-eng-backend")
+        self.assertEqual(name, "rc:eng-backend")
         record = lifecycle.get_watcher_state(name)
         self.assertEqual(record.session_id, "")
         self.assertEqual(record.last_processed_ts, "")

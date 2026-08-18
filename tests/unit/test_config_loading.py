@@ -159,6 +159,29 @@ class TestConfigValidationHardening(unittest.TestCase):
             GatewayConfig.from_file(path)
         self.assertIn("Duplicate connector name 'rc'", str(ctx.exception))
 
+    def test_a_colon_in_a_connector_name_is_refused(self):
+        """':' is the watcher-handle divider (<connector>:<room label>) — the
+        boundary is only unforgeable because a connector name can never
+        carry one (Codex review of #121, round 7)."""
+        path = self._write_config("""\
+            connectors:
+              - name: rc:home
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watchers:
+              - name: w1
+                rooms:
+                  include: [general]
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        self.assertIn("reserved", str(ctx.exception))
+        self.assertIn("rc:home", str(ctx.exception))
+
     def test_duplicate_watcher_name_raises(self):
         path = self._write_config("""\
             connectors:
