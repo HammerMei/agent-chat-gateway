@@ -538,18 +538,25 @@ as a list) fail at load — see docs/migration-dynamic-watchers.md.
 > system-prompt file is keyed on the watcher *within* its room, so a rename leaves the
 > old file behind — internal, and safe to delete.
 
-**Watcher Fields:**
+**Watcher Rule Fields:**
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `name` | string | No | Watcher identifier used in CLI commands; auto-derived from `connector`+room if omitted. Only settable on a single-room entry. |
-| `connector` | string | Yes | Must match a connector name above |
-| `room` | string | One of `room`/`rooms` | Room/channel name (as known to the `connector` named above) or `@username` for DMs |
-| `rooms` | list[string] | One of `room`/`rooms` | Bind this connector+agent pair to several rooms at once; expands into one watcher per room |
+| `name` | string | Yes | Rule identifier (frozen into each created watcher's record) |
+| `connector` | string | No | Must match a connector name above; defaults to the first connector |
+| `rooms.include` | list[string] | Yes* | Room-name globs this rule claims (e.g. `[eng-*, general]`). *May be empty only when a DM flag below is set |
+| `rooms.except_for` | list[string] | No | Globs subtracted from this rule's `include` |
+| `rooms.direct` | bool | No | Also serve 1:1 DMs (whole class) |
+| `rooms.group_direct` | bool | No | Also serve group DMs (whole class; mentions required) |
 | `agent` | string | No | Agent backend to use; falls back to `default_agent` if omitted |
-| `context_inject_files` | list | No | Watcher-specific context files |
-| `online_notification` | string | No | Message posted when this watcher starts; default `null` (no message) |
-| `offline_notification` | string | No | Message posted when this watcher stops; default `null` (no message) |
+| `session_idle_days` | int | No | Days without a message before the room's runtime is dropped (session kept); default 15 |
+| `session_expire_days` | int | No | Days idle before the record and session are reclaimed entirely; default 15 |
+| `context_inject_files` | list | No | Rule-specific context files (frozen into each created watcher) |
+| `online_notification` | string | No | Message posted when a watcher starts; default `null` (no message) |
+| `offline_notification` | string | No | Message posted when a watcher stops; default `null` (no message) |
+
+The old static fields (`room:`, list-shaped `rooms:`) are refused at load —
+see `docs/migration-dynamic-watchers.md`.
 
 ### Tool Allow-Lists
 

@@ -409,8 +409,20 @@ def config_from_record(record: WatcherState) -> WatcherConfig | None:
     # as the is-this-config-readable gate only.
     return WatcherConfig(
         name=record.watcher_name,
-        connector=_str("connector"),
-        room=_str("room"),
+        # Round 16 extended the same attack to connector and room: a
+        # valid-but-conflicting `config.connector` injected the wrong
+        # connector's context and keyed the prompt/attachment workspace
+        # under a connector reclamation would never clean (reclaim reads
+        # the top-level column). Column-first for both, like name/agent —
+        # `record.room_name` is the same creation-time description
+        # materialize wrote into the nested copy, and the wake's naming
+        # already prefers it (round 6).
+        connector=(record.connector
+                   if isinstance(record.connector, str) and record.connector
+                   else _str("connector")),
+        room=(record.room_name
+              if isinstance(record.room_name, str) and record.room_name
+              else _str("room")),
         agent=(record.agent if isinstance(record.agent, str) and record.agent
                else _str("agent")),
         context_inject_files=[p for p in files if isinstance(p, str)]
