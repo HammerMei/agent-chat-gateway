@@ -236,6 +236,58 @@ class TestVerbsOnRuleDerivedRecords(unittest.IsolatedAsyncioTestCase):
                 await lifecycle.reset_watcher(NAME)
             self.assertIn("shutting down", str(ctx.exception))
 
+    async def test_pause_and_expire_refuse_after_the_drain(self):
+        """Internal review of the barrier close: pause and expire were the
+        two destructive writers outside flag+counter — protected only by the
+        ControlServer's stop ordering, which is incidental and
+        Python-version-dependent. They now share the verb barrier."""
+        connector, lifecycle, _ = await self._harness()
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            MockProc.return_value.stop = AsyncMock()
+            await self._create(connector, lifecycle)
+
+            await lifecycle.drain_verbs()
+
+            with self.assertRaises(RuntimeError) as ctx:
+                await lifecycle.pause_watcher(NAME)
+            self.assertIn("shutting down", str(ctx.exception))
+            self.assertFalse(lifecycle.get_watcher_state(NAME).paused,
+                             "the refused pause wrote nothing")
+
+    async def test_an_inflight_pause_holds_the_drain_open(self):
+        """The wait-out half for pause: a pause already stopping its
+        processor finishes before drain_verbs returns, so its state write
+        lands before the final save."""
+        connector, lifecycle, _ = await self._harness()
+        gate = asyncio.Event()
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+
+            async def slow_stop():
+                await gate.wait()
+
+            MockProc.return_value.stop = AsyncMock(side_effect=slow_stop)
+            await self._create(connector, lifecycle)
+
+            verb = asyncio.create_task(lifecycle.pause_watcher(NAME))
+            for _ in range(10):
+                await asyncio.sleep(0)
+
+            drain = asyncio.create_task(lifecycle.drain_verbs())
+            for _ in range(10):
+                await asyncio.sleep(0)
+            self.assertFalse(drain.done(),
+                             "the drain must wait for the in-flight pause")
+
+            gate.set()
+            await drain
+            await verb
+
+        self.assertTrue(lifecycle.get_watcher_state(NAME).paused,
+                        "the pause completed BEFORE the drain returned")
+
     async def test_pause_refuses_a_record_reclaimed_while_it_waited(self):
         """TOCTOU sweep after Codex round 4: pause was the odd verb out —
         resume and reset both raise on a record reclaimed while they waited

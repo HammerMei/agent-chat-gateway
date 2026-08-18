@@ -798,14 +798,26 @@ class SessionManager:
                 f"No expirable record for watcher '{name}' — expire acts on a "
                 f"rule-derived record, and this name has none."
             )
-        reclaimed = await self._lifecycle.reclaim_room(
-            state.room_id, reason=f"operator 'expire' on watcher '{name}'",
-            # The identity pin, without require_dormant (Codex round 3): the
-            # operator selected THIS record — following a replacement would
-            # delete a newly created watcher and contradict the error below —
-            # but expire acts on active and dormant records alike.
-            expected=state,
-        )
+        # The destructive verbs join the shutdown barrier (internal review of
+        # the barrier close): expire was outside flag+counter, protected only
+        # by the ControlServer's stop ordering — incidental and
+        # Python-version-dependent. reclaim_room itself stays unbarriered on
+        # purpose: its other two callers are the live removal event (entry-
+        # gated on disarm) and the reconciliation (rides the sweep task,
+        # which shutdown cancels and awaits).
+        self._lifecycle._enter_verb("expire", name)
+        try:
+            reclaimed = await self._lifecycle.reclaim_room(
+                state.room_id, reason=f"operator 'expire' on watcher '{name}'",
+                # The identity pin, without require_dormant (Codex round 3):
+                # the operator selected THIS record — following a replacement
+                # would delete a newly created watcher and contradict the
+                # error below — but expire acts on active and dormant records
+                # alike.
+                expected=state,
+            )
+        finally:
+            self._lifecycle._exit_verb()
         if reclaimed is None:
             raise RuntimeError(
                 f"Watcher '{name}' was not reclaimed — its record changed "

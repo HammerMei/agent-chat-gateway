@@ -956,7 +956,14 @@ class MattermostConnector(Connector):
             self._membership_gen[channel_id] = (
                 self._membership_gen.get(channel_id, 0) + 1
             )
-            coro = self._membership_hook.removed(channel_id)
+            # A FACTORY, not a coroutine (internal review of the
+            # serialization close): the task's first await is the serial
+            # lock, and a task cancelled while parked there would leave an
+            # eagerly-created coroutine never awaited — a RuntimeWarning per
+            # disconnect and a silently skipped hook. Created inside the
+            # lock instead, so a cancelled park abandons only a factory.
+            def make_coro(cid=channel_id):
+                return self._membership_hook.removed(cid)
         else:
             # The generation, captured SYNCHRONOUSLY at dispatch (Codex round
             # 4): the add's REST classification awaits, and a removal that
@@ -964,15 +971,17 @@ class MattermostConnector(Connector):
             # `hook.added` compares against this. A genuine re-add captures
             # the already-bumped generation and still passes.
             entry_gen = self._membership_gen.get(channel_id, 0)
-            coro = self._handle_membership_add(channel_id, entry_gen)
+
+            def make_coro(cid=channel_id, gen=entry_gen):
+                return self._handle_membership_add(cid, gen)
         # Guarded like RC's `_run_membership_callback`, and for the same
         # reason: a hook that raises inside a spawned task is otherwise an
         # unobserved task exception — a GC-time warning, not a log line.
-        task = asyncio.create_task(self._run_membership(coro, channel_id))
+        task = asyncio.create_task(self._run_membership(make_coro, channel_id))
         self._routing_tasks.add(task)
         task.add_done_callback(self._routing_tasks.discard)
 
-    async def _run_membership(self, coro, channel_id: str) -> None:
+    async def _run_membership(self, make_coro, channel_id: str) -> None:
         # Serialized PER CHANNEL, in arrival order (structural close after
         # Codex rounds 4/5/9 each found one interleaving of the unordered
         # version): each event's task is created in arrival order and its
@@ -986,7 +995,7 @@ class MattermostConnector(Connector):
         lock = self._membership_serial.setdefault(channel_id, asyncio.Lock())
         async with lock:
             try:
-                await coro
+                await make_coro()
             except Exception:
                 logger.exception(
                     "Membership handling failed for channel %s — the safety nets "

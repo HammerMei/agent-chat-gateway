@@ -254,6 +254,19 @@ class WatcherLifecycle:
                 f"keep the bot out of a room durably, add the room to the "
                 f"rule's 'rooms.except_for' list instead."
             )
+        # The destructive verbs join the shutdown barrier (internal review of
+        # the barrier close): pause and expire were the two writers left
+        # outside flag+counter, protected only by the ControlServer's stop
+        # ordering — which is incidental and Python-version-dependent. Same
+        # discipline as resume/reset: check+increment in one synchronous
+        # segment, exit via finally, drain_verbs waits them out.
+        self._enter_verb("pause", name)
+        try:
+            await self._pause_locked(name)
+        finally:
+            self._exit_verb()
+
+    async def _pause_locked(self, name: str) -> None:
         async with self._get_watcher_lock(name):
             state = self._states.get(name)
             if state is None or not state.config:
