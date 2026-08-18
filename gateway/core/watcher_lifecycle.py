@@ -125,6 +125,21 @@ class WatcherLifecycle:
         self._verbs_drained = asyncio.Event()
         self._verbs_drained.set()
 
+    @property
+    def transitions_disarmed(self) -> bool:
+        """THE shutdown flag — single source of truth (structural close after
+        Codex rounds 4/5/9 each found one path reading a different flag).
+        The manager's `disarmed` delegates here, so every transition entry —
+        message wake, eager boot, join registration, scheduler wake, operator
+        verb — reads one flag set at one instant."""
+        return self._disarmed
+
+    def disarm_transitions(self) -> None:
+        """Set the single flag. Refuses NEW transitions everywhere at once;
+        the two drains (the manager's episodes, this class's verbs) then wait
+        out what is already in flight."""
+        self._disarmed = True
+
     def _enter_verb(self, verb: str, name: str) -> None:
         """MUST run in the same synchronous segment as the disarm check."""
         if self._disarmed:
@@ -670,6 +685,17 @@ class WatcherLifecycle:
         the per-watcher lock, and has already established no record exists
         for the room.
         """
+        # Belt at the write site (structural close): the caller's disarm
+        # checks read the same single flag, and this method is await-free —
+        # including `save`, whose docstring pins it synchronous ("it contains
+        # no await... Keep it that way") — so a check here is atomic with the
+        # write it guards. A registration after the final save would be a
+        # record the shutdown never persisted consistently.
+        if self._disarmed:
+            raise RuntimeError(
+                f"Cannot register watcher '{wc.name}' — the gateway is "
+                f"shutting down."
+            )
         # The same-name/different-room refusal, at the SECOND install site
         # (Codex round 7): the caller established no record exists for this
         # ROOM, but a room deleted and recreated under the same platform name

@@ -463,7 +463,12 @@ class WatcherManager:
         # every offer answers None — a final decline, so the declined drain
         # drops and remembers the frames, and the watermark stays put for the
         # next boot's replay to recover them.
-        self._shutting_down = False
+        # No flag of its own (structural close): `_shutting_down` reads the
+        # lifecycle's single transition flag, so the manager's episodes and
+        # the lifecycle's verbs are refused by ONE write at ONE instant —
+        # a path checking "a different flag set later" was rounds 4/5/9's
+        # recurring hole.
+
         # In-flight creation/recreation/registration episodes (Codex round 5,
         # P1): the disarm flag stops NEW episodes, but one already inside
         # `start_watcher_in_room` — awaiting session creation, history, or
@@ -493,7 +498,7 @@ class WatcherManager:
         without this a message landing mid-teardown recreates a watcher the
         teardown will never stop (§2.5).
         """
-        self._shutting_down = True
+        self._lifecycle.disarm_transitions()
 
     async def drain(self) -> None:
         """Disarm, then wait for every in-flight episode to finish (Codex
@@ -506,6 +511,10 @@ class WatcherManager:
         is the daemon-level grace window's problem, not this method's."""
         self.disarm()
         await self._drained.wait()
+
+    @property
+    def _shutting_down(self) -> bool:
+        return self._lifecycle.transitions_disarmed
 
     @property
     def disarmed(self) -> bool:

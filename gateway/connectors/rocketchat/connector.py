@@ -277,6 +277,9 @@ class RocketChatConnector(Connector):
         # a delivery captures it at entry, and the fence refuses to redirect
         # across a bump, whichever object the loss happened to mark.
         self._room_membership_gen: dict[str, int] = {}
+        # Per-room serialization of membership HOOK calls — see
+        # `_on_membership_event`. Keyed and retained like the generation.
+        self._membership_serial: dict[str, asyncio.Lock] = {}
         # Rooms with an open routing episode. The routing workers are a pool, so
         # several frames from one untracked room can be in flight at once — and offering a
         # room is slow (a DM needs `im.members` before it can even be classified), which
@@ -912,20 +915,34 @@ class RocketChatConnector(Connector):
         rid = doc.get("rid") or ""
         if not rid:
             return
+        if action == "removed":
+            # Mark the room's CURRENT state before ANY await — this event's
+            # task runs its first synchronous segment in arrival order, so
+            # the delivery fences see the loss immediately, and the per-room
+            # serialization below never delays the stamp (Codex review of
+            # #121): a delivery in flight holds this object, and the
+            # commit-redirection fence reads its epoch to tell a benign
+            # watcher restart from a membership replacement (a pre-removal
+            # frame must not commit into the re-added room's fresh state —
+            # that watermark would point the next replay below the removal,
+            # delivering the whole non-member interval).
+            sub = self._rooms.get(rid)
+            if sub is not None:
+                sub.left_the_room()
+            self._note_membership_loss(rid)
+        # Serialized PER ROOM, in arrival order — the RC twin of Mattermost's
+        # `_run_membership` lock (structural close): a room's add/remove
+        # hooks run in the order the platform sent them, so a removal cannot
+        # complete around an add still classifying, and a parked removal no
+        # longer swallows the re-add behind it. Cross-room events still run
+        # concurrently.
+        lock = self._membership_serial.setdefault(rid, asyncio.Lock())
+        async with lock:
+            await self._run_membership_hooks(action, rid, doc)
+
+    async def _run_membership_hooks(self, action: str, rid: str, doc: dict) -> None:
         try:
             if action == "removed":
-                # Mark the room's CURRENT state before the core reclaims it
-                # (Codex review of #121): a delivery in flight holds this
-                # object, and the commit-redirection fence reads its epoch to
-                # tell a benign watcher restart (redirect to the live state)
-                # from a membership replacement (a pre-removal frame must not
-                # commit into the re-added room's fresh state — that watermark
-                # would point the next replay below the removal, delivering
-                # the whole non-member interval).
-                sub = self._rooms.get(rid)
-                if sub is not None:
-                    sub.left_the_room()
-                self._note_membership_loss(rid)
                 await self._membership_hook.removed(rid)
                 return
             # The generation, captured before the classification awaits (Codex

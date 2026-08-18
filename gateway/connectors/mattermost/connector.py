@@ -191,6 +191,11 @@ class MattermostConnector(Connector):
         # this; a delivery captures it at entry; the commit fence refuses to
         # redirect across a bump.
         self._membership_gen: dict[str, int] = {}
+        # Per-channel serialization of membership HOOK calls — see
+        # `_run_membership`. Keyed like the generation above; never cleaned,
+        # like the generation: a lock is a few hundred bytes and a channel
+        # id space is bounded by rooms the bot is ever told about.
+        self._membership_serial: dict[str, asyncio.Lock] = {}
         self._channels: dict[str, _ChannelState] = {}  # channel_id -> state
         # Channels with an open routing episode — the same single-episode rule as
         # RC's `_pending_routes`, and needed here for a sharper reason: the offer
@@ -968,13 +973,25 @@ class MattermostConnector(Connector):
         task.add_done_callback(self._routing_tasks.discard)
 
     async def _run_membership(self, coro, channel_id: str) -> None:
-        try:
-            await coro
-        except Exception:
-            logger.exception(
-                "Membership handling failed for channel %s — the safety nets "
-                "cover it", channel_id,
-            )
+        # Serialized PER CHANNEL, in arrival order (structural close after
+        # Codex rounds 4/5/9 each found one interleaving of the unordered
+        # version): each event's task is created in arrival order and its
+        # first await is this acquisition, so the lock's FIFO wakeup
+        # processes a channel's add/remove hooks in the order the platform
+        # sent them — a removal can no longer complete around an add that is
+        # still classifying, and a parked removal no longer swallows the
+        # re-add behind it. The delivery fences stamp SYNCHRONOUSLY at
+        # dispatch, before this task exists, so serialization never delays
+        # them. Cross-channel events still run concurrently.
+        lock = self._membership_serial.setdefault(channel_id, asyncio.Lock())
+        async with lock:
+            try:
+                await coro
+            except Exception:
+                logger.exception(
+                    "Membership handling failed for channel %s — the safety nets "
+                    "cover it", channel_id,
+                )
 
     async def _handle_membership_add(
         self, channel_id: str, entry_gen: int = 0,

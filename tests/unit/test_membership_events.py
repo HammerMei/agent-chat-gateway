@@ -754,6 +754,41 @@ class TestRocketChatMembershipEvents(unittest.IsolatedAsyncioTestCase):
 
         added.assert_not_awaited()
 
+    async def test_a_rooms_events_process_in_arrival_order(self):
+        """Structural close: membership hooks are serialized per room, so a
+        removal whose reclaim is slow cannot complete AROUND the add that
+        arrived after it — the interleavings rounds 4/5/9 each found one of."""
+        connector = self._connector()
+        connector._rest.dm_members = AsyncMock(return_value=["alice"])
+        order: list[str] = []
+        removal_gate = asyncio.Event()
+
+        async def slow_removed(rid):
+            order.append("removed-start")
+            await removal_gate.wait()
+            order.append("removed-end")
+
+        async def added(room):
+            order.append("added")
+
+        from gateway.core.connector import MembershipHook
+        connector.register_membership_hook(
+            MembershipHook(added=added, removed=slow_removed))
+
+        t1 = asyncio.create_task(
+            connector._on_membership_event("removed", {"rid": "r1", "t": "c"}))
+        t2 = asyncio.create_task(
+            connector._on_membership_event(
+                "inserted", {"rid": "r1", "t": "c", "name": "eng"}))
+        for _ in range(10):
+            await asyncio.sleep(0)
+        self.assertEqual(order, ["removed-start"],
+                         "the add waits behind the parked removal")
+        removal_gate.set()
+        await asyncio.gather(t1, t2)
+
+        self.assertEqual(order, ["removed-start", "removed-end", "added"])
+
     async def test_a_removed_subscription_reclaims_by_room_id(self):
         connector = self._connector()
         hook, added, removed = _hook()
@@ -851,6 +886,44 @@ class TestMattermostMembershipEvents(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(room.kind, RoomKind.CHANNEL)
         self.assertEqual(room.name, "eng-backend")
         removed.assert_not_awaited()
+
+    async def test_a_channels_events_process_in_arrival_order(self):
+        """The MM twin of the RC ordering pin (structural close): hooks
+        serialize per channel via `_run_membership`'s lock."""
+        connector = self._connector()
+        order: list[str] = []
+        removal_gate = asyncio.Event()
+
+        async def slow_removed(channel_id):
+            order.append("removed-start")
+            await removal_gate.wait()
+            order.append("removed-end")
+
+        async def added(room):
+            order.append("added")
+
+        from gateway.core.connector import MembershipHook
+        connector.register_membership_hook(
+            MembershipHook(added=added, removed=slow_removed))
+
+        await connector._on_membership_event({
+            "event": "user_removed",
+            "data": {"channel_id": "chan-1", "remover_id": "admin"},
+            "broadcast": {"user_id": "bot-id-1"},
+        })
+        await connector._on_membership_event({
+            "event": "user_added",
+            "data": {"user_id": "bot-id-1", "team_id": "team-1"},
+            "broadcast": {"channel_id": "chan-1"},
+        })
+        for _ in range(10):
+            await asyncio.sleep(0)
+        self.assertEqual(order, ["removed-start"],
+                         "the add waits behind the parked removal")
+        removal_gate.set()
+        await self._settle(connector)
+
+        self.assertEqual(order, ["removed-start", "removed-end", "added"])
 
     async def test_an_add_outrun_by_its_own_removal_does_not_register(self):
         """Codex round 4: the add's REST classification awaits, and a removal

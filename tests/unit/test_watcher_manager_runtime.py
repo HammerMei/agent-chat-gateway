@@ -77,6 +77,16 @@ def _mock_lifecycle():
     lifecycle.start_watcher_in_room = AsyncMock(side_effect=start)
     lifecycle.get_watcher_state = MagicMock(side_effect=records.get)
     lifecycle.save_state = MagicMock()
+    # Asked, not remembered: a bare MagicMock answers truthily, and the
+    # manager's `_shutting_down` now reads the lifecycle's single transition
+    # flag — a truthy mock would disarm every test's manager (the
+    # bot_username lesson, again).
+    lifecycle.transitions_disarmed = False
+
+    def _disarm():
+        lifecycle.transitions_disarmed = True
+
+    lifecycle.disarm_transitions = MagicMock(side_effect=_disarm)
     return lifecycle
 
 

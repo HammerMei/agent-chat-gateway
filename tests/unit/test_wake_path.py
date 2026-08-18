@@ -483,7 +483,7 @@ class TestAWakeParkedOnTheLockRespectsShutdown(unittest.IsolatedAsyncioTestCase)
 
             # Shutdown begins while the wake waits; the lock then releases —
             # in production, because the sweep task was cancelled.
-            manager._shutting_down = True
+            manager.disarm()
             lock.release()
             await self._settle(connector)
 

@@ -58,6 +58,7 @@ def _make_connector():
     connector._router = None
     connector._membership_hook = None
     connector._room_membership_gen = {}
+    connector._membership_serial = {}
     connector._pending_routes = {}
     connector._routing_tasks = set()
     connector._subscribe_all = False
@@ -309,6 +310,7 @@ class TestWatermarkAdvancement(unittest.IsolatedAsyncioTestCase):
         connector._attachments_cache_base = Path("/tmp/acg-test-attachments/test")
         connector._turn_store = None  # no agent chain configured
         connector._room_membership_gen = {}
+        connector._membership_serial = {}
 
         room = Room(id="room-1", name="general", type="channel")
         sub = _RoomSubscription(room=room, last_processed_ts="100")
