@@ -801,6 +801,18 @@ class WatcherLifecycle:
                     f"— its record is gone. The room's next message creates "
                     f"a fresh watcher."
                 )
+            if state.paused:
+                # SEAL the muted interval (Codex round 10): §4.4 drops the
+                # paused interval's messages deliberately, and the immediate
+                # replay is already skipped — but the record still carried
+                # its pre-pause watermark, so the NEXT boot's replay probe
+                # (or a reconnect) delivered the muted interval after all.
+                # An empty watermark is "nothing owed": the down-window
+                # snapshot skips it, and the start's never-backwards restore
+                # has nothing to reinstall. Deliberately only when resuming
+                # from PAUSED — an idle record's watermark is a replay the
+                # room is owed, and clearing it would lose real messages.
+                state.last_processed_ts = ""
             try:
                 await self._resume_record(wc, state)
             except Exception as e:

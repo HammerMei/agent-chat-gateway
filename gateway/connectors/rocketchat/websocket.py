@@ -991,6 +991,12 @@ class RCWebSocketClient:
             except Exception as e:
                 logger.error("Error in listen loop: %s", e)
                 self._ws = None
+                # The same invalidation as the ConnectionClosed arm (Codex
+                # round 10): this arm drops the socket and enters the same
+                # backoff, and a frame stamped before the outage must not be
+                # consumed with pre-drop standing during it — whatever
+                # exception subtype took the socket down.
+                self._recovery_generation += 1
                 await self._reconnect()
 
     # Maximum messages buffered per room before drops.  This bounds memory

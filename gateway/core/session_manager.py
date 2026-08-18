@@ -111,7 +111,12 @@ class SessionManager:
         # so Rocket.Chat runs subscribe-all even with zero rules — every
         # offer declined, which is the uniform §2.8 behaviour post-cutover.
         self._watcher_manager = WatcherManager(
-            state_name, connector, self._lifecycle, watcher_rules)
+            state_name, connector, self._lifecycle,
+            # Normalized like `_watcher_rules` below (Codex round 10): a
+            # standalone caller using the declared default None would hand
+            # the always-on manager an un-iterable rule list, and the first
+            # new room's first_matching_rule would raise instead of declining.
+            list(watcher_rules or []))
         # The idle sweep exists only where the transport can wake what it
         # drops: §2.6 rules eager connectors (Script, Voice) "never"
         # idle-eligible — no message can ever arrive to wake an idled room
@@ -610,10 +615,25 @@ class SessionManager:
         """
         if self._watcher_manager is None or self._watcher_manager.disarmed:
             return
-        await self._reclaim_removed_room(
-            room_id,
-            reason="the platform reported the bot removed from the room",
-        )
+        # Counted in the shutdown barrier (Codex round 10): a removal past
+        # the gate above but parked on the watcher lock or mid-reclaim was
+        # invisible to both drains — the final save could run mid-prune, and
+        # disconnect's task cleanup then cancelled the reclamation half-done.
+        # The traced residue was bounded (record popped last, reconciliation
+        # re-reclaims), but the barrier machinery makes counting it three
+        # lines. The reconciliation's calls stay uncounted on purpose: they
+        # ride the sweep task, which shutdown cancels and awaits first.
+        try:
+            self._lifecycle._enter_verb("reclaim", room_id)
+        except RuntimeError:
+            return  # disarm flipped since the gate above — same answer.
+        try:
+            await self._reclaim_removed_room(
+                room_id,
+                reason="the platform reported the bot removed from the room",
+            )
+        finally:
+            self._lifecycle._exit_verb()
 
     async def _reclaim_removed_room(
         self, room_id: str, *, reason: str, expected=None,

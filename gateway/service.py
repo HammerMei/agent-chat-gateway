@@ -369,9 +369,20 @@ class GatewayService:
         answering False would delete a record a job points at, permanently.
         """
         try:
+            # Fallback-owned jobs count too (Codex round 10): the scheduler
+            # explicitly supports a job whose `connector` field is empty or
+            # stale by scanning managers for the watcher — so the exemption
+            # must honor the same claim, or expiry deletes the record that
+            # makes the fallback deliverable. A job claims this watcher when
+            # its connector matches, OR when its connector matches no
+            # configured connector (exactly when the scheduler would fall
+            # back) and the name matches here.
+            configured = {e.name for e in self._entries}
             return any(
                 j.watcher == watcher_name
-                for j in self._job_store.list_jobs(connector=connector_name)
+                and (j.connector == connector_name
+                     or j.connector not in configured)
+                for j in self._job_store.list_jobs()
             )
         except Exception as e:
             logger.warning(

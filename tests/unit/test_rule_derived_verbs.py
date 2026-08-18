@@ -109,6 +109,27 @@ class TestVerbsOnRuleDerivedRecords(unittest.IsolatedAsyncioTestCase):
         # deferred (§4.4) — a resume must not replay the muted interval.
         connector.replay_room_since.assert_not_awaited()
 
+    async def test_resume_seals_the_muted_interval(self):
+        """Codex round 10: the immediate replay was already skipped (§4.4),
+        but the record kept its pre-pause watermark — so the NEXT boot's
+        replay probe delivered the muted interval after all. Resume from
+        paused clears it; an idle wake must NOT (that replay is owed)."""
+        connector, lifecycle, dispatcher = await self._harness()
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            MockProc.return_value.stop = AsyncMock()
+            await self._create(connector, lifecycle)
+            lifecycle.get_watcher_state(NAME).last_processed_ts = "1400"
+
+            await lifecycle.pause_watcher(NAME)
+            await lifecycle.resume_watcher(NAME)
+
+        resumed = lifecycle.get_watcher_state(NAME)
+        self.assertEqual(resumed.last_processed_ts, "",
+                         "the pre-pause watermark was sealed — the muted "
+                         "interval is not owed to any future replay")
+        connector.replay_room_since.assert_not_awaited()
+
     async def test_reset_refuses_a_paused_record(self):
         """§2.5: reset must not silently clear `paused` — the operator's one
         durable mute must not be erased as a side effect of session hygiene."""

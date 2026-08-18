@@ -366,6 +366,16 @@ class TestTheRouterWiring(unittest.IsolatedAsyncioTestCase):
         names = [c[0] for c in parent.mock_calls]
         self.assertEqual(names, ["register_router", "connect"])
 
+    async def test_omitted_rules_normalize_to_an_empty_list(self):
+        """Codex round 10: the always-on manager received the declared
+        default None, and the first new room's first_matching_rule raised
+        iterating it instead of declining the room."""
+        from tests.helpers import make_manager
+
+        mgr = make_manager()  # watcher_rules omitted → None
+        self.assertEqual(mgr._watcher_manager._rules, [],
+                         "None normalizes to [] before reaching the manager")
+
     async def test_no_rules_still_registers_the_router(self):
         """INVERTED with Codex round 5's fix (the old pin protected
         static-only deployments, which no longer load): the manager and the

@@ -40,7 +40,7 @@ watchers:
 Field notes:
 
 - **`name:` is required** and names the *rule*, not a watcher. Each created
-  watcher gets a derived name like `rc-home-general`, which is what
+  watcher gets a derived name like `rc-home:general`, which is what
   `list`/`pause`/`resume`/`reset`/`expire` act on.
 - **`rooms:` is a mapping**: `include:` takes glob patterns over room names
   (`eng-*`, `general`, `*`), `except_for:` subtracts from this rule's own
