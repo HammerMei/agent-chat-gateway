@@ -584,14 +584,33 @@ class TestPersistedRecordsAreClaims(unittest.TestCase):
         self.assertTrue(a.overlaps(b))
 
     def test_static_era_and_channel_records_claim_nothing(self):
+        from unittest.mock import MagicMock as M
+
         from gateway.core.bot_identity import fold_record_dm_claims
 
+        static = M(rule_name="", config={}, room_id="d1", room_kind="dm",
+                   watcher_name="w-static")
         claim = fold_record_dm_claims(DmClaim(), [
-            self._record("dm", "d1", rule_name=""),   # static-era: pruned at boot
+            static,                                   # truly static: BOTH empty
             self._record("channel", "c1"),            # not a DM at all
         ])
         self.assertEqual(claim.rooms, frozenset())
         self.assertEqual(claim.group_rooms, frozenset())
+
+    def test_a_config_only_dm_record_still_claims(self):
+        """Codex round 24, the both-fields eligibility's last consumer: a DM
+        record whose rule_name alone was damaged is preserved and recreated,
+        so it still answers its conversation — the identity barrier must see
+        its claim, or two connectors sharing an account both answer it."""
+        from unittest.mock import MagicMock as M
+
+        from gateway.core.bot_identity import fold_record_dm_claims
+
+        damaged = M(rule_name="", config={"name": "w1", "agent": "a"},
+                    room_id="d1", room_kind="dm", watcher_name="w1")
+        claim = fold_record_dm_claims(DmClaim(), [damaged])
+        self.assertIn("d1", claim.rooms)
+        self.assertTrue(claim.overlaps(DmClaim(direct=True)))
 
     def test_the_refusal_names_the_record_and_the_exit(self):
         """The operator already deleted the rule — a refusal citing rules is

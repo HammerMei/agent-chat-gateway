@@ -266,7 +266,12 @@ def fold_record_dm_claims(claim: DmClaim, records) -> DmClaim:
     group_rooms = set(claim.group_rooms)
     watchers = set(claim.record_watchers)
     for record in records:
-        if not record.rule_name or not record.room_id:
+        # The same rule_name-or-config eligibility as hydration, boot
+        # recovery and the prune (Codex rounds 22-24): a DM record whose
+        # rule_name alone was damaged is preserved and recreated, so it
+        # still answers its conversation — excluding it from the claim let
+        # two connectors sharing an account both answer that DM.
+        if not (record.rule_name or record.config) or not record.room_id:
             continue
         if record.room_kind == "dm":
             rooms.add(record.room_id)
