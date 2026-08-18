@@ -335,11 +335,22 @@ class MattermostConnector(Connector):
         # value comparison would report "unchanged" in exactly the case it exists to
         # catch. Replay is not serialized against live traffic here — it calls
         # `_on_posted_event` directly rather than through the per-channel worker.
-        claims_at_entry = state.boundary_claims
         watermark = after_ts or state.replay_boundary or state.last_processed_ts
         if not watermark:
             logger.debug("Channel '%s': no watermark yet — skipping replay", state.room.name)
             return
+        if not external_window:
+            # Claim the window BEFORE the first await (Codex round 25): this
+            # replay runs detached since round 22, and a cancellation — a
+            # shutdown, another drop's harvest — used to leave nothing
+            # pointing at the unprocessed tail while live traffic advanced
+            # last_processed_ts past it; the next boot then started above
+            # the miss. Claimed, the boundary survives the cancellation and
+            # the for/else below discharges it only after the whole batch
+            # dispatched. (An external window is its caller's to keep — the
+            # failure arms below already claim it on that caller's behalf.)
+            state.claim_boundary(watermark)
+        claims_at_entry = state.boundary_claims
         try:
             page = await self._rest.get_room_history_page(
                 channel_id, count=self._REPLAY_HISTORY_COUNT, after_ts=watermark

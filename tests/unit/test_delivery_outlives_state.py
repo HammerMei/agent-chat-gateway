@@ -427,6 +427,43 @@ class TestMMReplayAbortsOnAMembershipEraChange(unittest.IsolatedAsyncioTestCase)
                          "the batch stopped at the era boundary — the old "
                          "era's remaining posts never reached the new room")
 
+    async def test_a_cancelled_replay_leaves_its_window_claimed(self):
+        """Codex round 25 (P1): the replay runs detached since round 22, and
+        a cancellation used to leave nothing pointing at the unprocessed tail
+        while live traffic advanced last_processed_ts past it — the next boot
+        started above the miss. The window is claimed BEFORE the first await
+        now, so the boundary survives the cancellation."""
+        from unittest.mock import AsyncMock
+
+        from gateway.connectors.mattermost.connector import _ChannelState
+        from gateway.core.connector import Room
+        from tests.unit.test_mattermost_connector import _make_connector
+
+        connector = _make_connector()
+        state = _ChannelState(room=Room(id="chan-1", name="general", type="channel"))
+        state.last_processed_ts = "100"
+        connector._channels["chan-1"] = state
+        fetch_entered = asyncio.Event()
+        gate = asyncio.Event()
+
+        async def hanging_fetch(channel_id, count=50, before_ts=None, after_ts=None):
+            fetch_entered.set()
+            await gate.wait()
+
+        connector._rest.get_room_history_page = hanging_fetch
+
+        task = asyncio.create_task(connector.replay_room_since("chan-1"))
+        await asyncio.wait_for(fetch_entered.wait(), timeout=2)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        self.assertEqual(state.replay_boundary, "100",
+                         "the claim was made before the fetch — the "
+                         "cancelled tail stays recoverable")
+
     async def test_an_era_change_during_the_fetch_rejects_the_whole_batch(self):
         """Codex round 21: the capture must sit BEFORE the history fetch — a
         remove-then-re-add landing during the fetch itself would otherwise be

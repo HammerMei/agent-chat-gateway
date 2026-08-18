@@ -69,6 +69,8 @@ class MattermostWebSocketClient:
         self._listen_task: asyncio.Task | None = None
         self._callback_sem = asyncio.Semaphore(_CALLBACK_CONCURRENCY)
         self._callback_tasks: set[asyncio.Task] = set()
+        # The single in-flight reconnect replay — see _reconnect's coalescing.
+        self._replay_task: asyncio.Task | None = None
         self._channel_queues: dict[str, asyncio.Queue] = {}
         self._channel_workers: dict[str, asyncio.Task] = {}
         # Local bookkeeping only — no wire-protocol subscribe exists.  Tracks
@@ -353,6 +355,21 @@ class MattermostWebSocketClient:
                             logger.error("Error in on_reconnect callback: %r",
                                          task.exception())
 
+                    # COALESCED (Codex round 25): a flaky connection can
+                    # complete another reconnect before the previous replay
+                    # finishes, and two replays over one room interleave
+                    # their dispatches and double the REST work. The prior
+                    # replay is cancelled first — its window was claimed
+                    # before its first await, so the cancellation loses
+                    # nothing: this newer replay reads the same (or older)
+                    # boundary and re-covers the tail.
+                    prev = self._replay_task
+                    if prev is not None and not prev.done():
+                        prev.cancel()
+                        try:
+                            await prev
+                        except (asyncio.CancelledError, Exception):
+                            pass
                     try:
                         result = self._on_reconnect_cb()
                         if asyncio.iscoroutine(result):
@@ -362,9 +379,8 @@ class MattermostWebSocketClient:
                             # 23): stop() must be able to harvest a replay
                             # still fetching when shutdown or another drop
                             # arrives — an untracked task could outlive
-                            # disconnect() and use a closed REST client, and
-                            # rapid reconnects could stack overlapping
-                            # replays.
+                            # disconnect() and use a closed REST client.
+                            self._replay_task = task
                             self._callback_tasks.add(task)
                             task.add_done_callback(self._callback_tasks.discard)
                     except Exception:
