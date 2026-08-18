@@ -403,9 +403,19 @@ class GatewayService:
         rather than being silently lost here.
         """
         try:
+            # The same fallback claim rule as the exemption oracle and the
+            # scheduler's delivery (Codex round 11, the cancel side of round
+            # 10's exemption fix): a job with an empty or stale connector is
+            # deliverable to this watcher via the fallback scan, so it must
+            # also be CANCELLABLE through it — or the reclaim leaves it
+            # orphaned, failing resolution forever (active) or listed
+            # permanently (paused).
+            configured = {e.name for e in self._entries}
             doomed = [
-                j for j in self._job_store.list_jobs(connector=connector_name)
+                j for j in self._job_store.list_jobs()
                 if j.watcher == watcher_name
+                and (j.connector == connector_name
+                     or j.connector not in configured)
             ]
             for job in doomed:
                 self._job_store.remove(job.id)

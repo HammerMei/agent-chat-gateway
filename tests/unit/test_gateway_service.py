@@ -209,6 +209,29 @@ class TestTheExpiryExemptionOracle(unittest.IsolatedAsyncioTestCase):
             side_effect=RuntimeError("not loaded"))
         self.assertTrue(service._has_pending_jobs("rc", "w1"))
 
+    def test_cancellation_applies_the_same_fallback_rule(self):
+        """Codex round 11, the cancel side of the same claim rule: a job
+        deliverable via the fallback scan must be cancellable through it —
+        or the reclaim leaves it orphaned forever."""
+        jobs = [self._job("w1", ""), self._job("w1", "renamed-away"),
+                self._job("w1", "rc"), self._job("w1", "mm"),
+                self._job("other", "rc")]
+        for j, jid in zip(jobs, ["j-empty", "j-stale", "j-mine",
+                                 "j-other-conn", "j-other-watcher"]):
+            j.id = jid
+        service = self._service_with_jobs(jobs)
+        service._entries.append(
+            SimpleNamespace(name="mm", session_manager=MagicMock(),
+                            connector=_accountless()))
+        removed = []
+        service._job_store.remove = MagicMock(side_effect=removed.append)
+
+        service._cancel_jobs_for("rc", "w1")
+
+        self.assertEqual(sorted(removed), ["j-empty", "j-mine", "j-stale"],
+                         "fallback-owned jobs cancel; another configured "
+                         "connector's job and another watcher's do not")
+
 
 class TestIdentityBarrier(unittest.IsolatedAsyncioTestCase):
     """The barrier's value is its *position*, so these assert ordering, not just refusal.

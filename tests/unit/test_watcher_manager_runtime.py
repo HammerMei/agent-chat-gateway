@@ -125,6 +125,25 @@ class TestCreation(unittest.IsolatedAsyncioTestCase):
         # The state passed for a first-ever room is None — there is no record.
         self.assertIsNone(lifecycle.start_watcher_in_room.call_args.args[1])
 
+    async def test_the_snapshot_pin_declines_a_reclaimed_record(self):
+        """Codex round 11: the boot loops walk a snapshot of hydrated
+        records, and a live membership removal can reclaim one mid-walk —
+        the unpinned re-read then found the room recordless and _create
+        RESURRECTED a watcher for a room the bot just left. With the pin, a
+        changed record declines instead."""
+        manager, lifecycle, _ = _manager()
+        snapshot_record = WatcherState(
+            watcher_name="w1", session_id="s1", room_id="r1")
+        # The reclaim, completed before the boot loop's call runs: the room
+        # is recordless now.
+        lifecycle.record_for_room = MagicMock(return_value=None)
+
+        result = await manager.get_or_create(
+            "rc", _room(), expected_record=snapshot_record)
+
+        self.assertIsNone(result)
+        lifecycle.start_watcher_in_room.assert_not_called()
+
     async def test_no_matching_rule_creates_nothing(self):
         manager, lifecycle, _ = _manager(rules=[_rule(include=("ops-*",))])
         result = await manager.get_or_create("rc", _room())

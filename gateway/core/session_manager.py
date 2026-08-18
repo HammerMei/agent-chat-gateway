@@ -437,6 +437,10 @@ class SessionManager:
                         name=record.room_name,
                         participants=tuple(record.participants),
                     ),
+                    # The snapshot pin (Codex round 11): a live removal can
+                    # reclaim this record mid-walk, and an unpinned call
+                    # would _create a fresh watcher for the just-left room.
+                    expected_record=record,
                 )
             except Exception as e:
                 # An abort, not a decision (§2.2): the record keeps reading
@@ -562,6 +566,11 @@ class SessionManager:
                         name=ws.room_name,
                         participants=tuple(ws.participants),
                     ),
+                    # The snapshot pin (Codex round 11) — same as the boot
+                    # evaluation's: this loop walks records hydrated before
+                    # the inbound stream opened, and a live removal can
+                    # reclaim one mid-walk.
+                    expected_record=ws,
                 )
             except Exception as e:
                 logger.warning(

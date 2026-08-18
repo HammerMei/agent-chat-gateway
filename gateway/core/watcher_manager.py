@@ -531,6 +531,7 @@ class WatcherManager:
         room: RoomRef,
         *,
         history_before_ts: str | None = None,
+        expected_record: "WatcherState | None" = None,
     ) -> "MessageProcessor | None":
         """A ready watcher for this room, created from the first matching rule
         if the room has never had one (§2.8). None means "no watcher": no rule
@@ -589,6 +590,21 @@ class WatcherManager:
                     )
                     return None
                 record = self._lifecycle.record_for_room(room.id)
+                if expected_record is not None and record is not expected_record:
+                    # The boot loops' identity pin (Codex round 11): they walk
+                    # a SNAPSHOT of hydrated records, and a live membership
+                    # removal can reclaim one mid-walk — the re-read here then
+                    # finds the room recordless and _create would RESURRECT a
+                    # watcher for a room the bot just left, active until it
+                    # idles into the reconciliation's scope. A message-path
+                    # caller passes nothing and follows current state, which
+                    # is its correct semantics (same split as reclaim_room's
+                    # `expected=`).
+                    logger.info(
+                        "Room %s: its record changed since the boot snapshot "
+                        "— not recreating from stale evidence", room.id,
+                    )
+                    return None
                 if record is not None:
                     resident = self._lifecycle.processor_named(record.watcher_name)
                     if resident is not None:
