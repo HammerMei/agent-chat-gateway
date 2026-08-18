@@ -679,6 +679,22 @@ def _record_from_dict(w: dict) -> WatcherState:
         values[field_name] = (
             dict(value) if want is dict else list(value) if want is list else value
         )
+    # VALUE-layer normalization for the one list whose ELEMENTS have a
+    # demonstrated crashing consumer (the field-walk test): a non-string
+    # participant reaches `_encode` on the wake's naming path and raises
+    # mid-recreation. Display-only field, so dropping the junk is safe —
+    # worst case the label degrades to the room-id digest. Other garbled
+    # values (room_kind, rule TTLs) degrade at their consumers, which log
+    # with more context than the loader has.
+    participants = values.get("participants")
+    if isinstance(participants, list):
+        clean = [p for p in participants if isinstance(p, str)]
+        if len(clean) != len(participants):
+            logger.warning(
+                "Record '%s': dropped %d non-string participant value(s)",
+                name, len(participants) - len(clean),
+            )
+            values["participants"] = clean
     # A required field absent from the payload reads as empty, which is what the
     # previous reader did via its per-field defaults. Derived from `fields()` rather
     # than a hand-written list of "the required ones", and deliberately not solved by

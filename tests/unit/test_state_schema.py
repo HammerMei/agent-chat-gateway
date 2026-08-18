@@ -481,6 +481,83 @@ class TestTheReaderChecksTypes(_RealStateFileTestCase):
         check_state_formats()  # must not raise
 
 
+class TestGarbledValuesNeverCrashConsumers(_RealStateFileTestCase):
+    """The VALUE layer of the type-checking suite above (structural close
+    after Codex rounds 8/9 hit it twice): a field can be the right TYPE and
+    still carry garbage — `room_kind: "channel_typo"`, `session_expire_days:
+    true` — and the crash then fires in a CONSUMER, one field past the
+    loader's graceful-corruption contract. This walk feeds every field
+    correctly-typed junk and drives the consumers the rounds actually broke:
+    load, lifecycle classification, TTL arithmetic, config rebuild, kind
+    conversion, and the room-description path."""
+
+    _VALUE_GARBAGE = {
+        "session_id": "\x00 not a session ::: id",
+        "room_id": ":::",
+        "room_type": "no-such-type",
+        "room_name": "\x00\x01",
+        "room_kind": "channel_typo",
+        "participants": [1, None, {}, "alice"],
+        "connector": ":::bad",
+        "agent": "no-such-agent",
+        "rule_name": "\x00",
+        "rule": {"session_idle_days": True, "session_expire_days": "soon",
+                 "name": [], "rooms": "not-a-dict"},
+        "config": {"name": 123, "connector": [], "room": {},
+                   "history_handoff": {"enabled": "yes"},
+                   "context_inject_files": "not-a-list"},
+        "backend_identity": ":::",
+        "created_at": "not-a-date",
+        "last_activity_at": "also-not-a-date",
+        "dropped_at": "garbage",
+        "last_processed_ts": "\x00",
+        "config_schema_version": -99,
+    }
+
+    def test_every_field_survives_value_garbage(self):
+        from datetime import datetime
+
+        from gateway.core.state import (
+            lifecycle_state,
+            past_expire_ttl,
+            past_idle_ttl,
+            room_kind_or_channel,
+        )
+        from gateway.core.watcher_manager import (
+            RoomRef,
+            config_from_record,
+            room_description,
+            room_label,
+        )
+
+        now = datetime.now().astimezone()
+        for field_name, garbage in self._VALUE_GARBAGE.items():
+            with self.subTest(field=field_name):
+                record = {
+                    "watcher_name": "w1", "session_id": "s1", "room_id": "r1",
+                    "room_kind": "dm", "participants": ["alice"],
+                    "rule_name": "eng",
+                    "rule": {"session_idle_days": 15, "session_expire_days": 15},
+                    "config": {"name": "w1", "connector": "rc", "room": "x",
+                               "agent": "default"},
+                    field_name: garbage,
+                }
+                self.write_raw(
+                    {"version": STATE_FORMAT_VERSION, "watchers": [record]})
+                states = load_state("rc")  # must not raise
+                for ws in states:
+                    lifecycle_state(ws, resident=False)
+                    past_idle_ttl(ws, now)
+                    past_expire_ttl(ws, now)
+                    config_from_record(ws)
+                    kind = room_kind_or_channel(ws)
+                    ref = RoomRef(id=ws.room_id, kind=kind,
+                                  name=ws.room_name,
+                                  participants=tuple(ws.participants))
+                    room_label(ref)        # the wake's naming path
+                    room_description(ref)  # the identity header's path
+
+
 class TestCorruptionStaysGraceful(_RealStateFileTestCase):
     def test_a_corrupt_file_still_degrades_gracefully(self):
         """Deliberately *not* a refusal. A corrupt file holds no recoverable state
