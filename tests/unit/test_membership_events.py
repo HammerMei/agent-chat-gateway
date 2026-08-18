@@ -858,8 +858,14 @@ class TestMattermostMembershipEvents(unittest.IsolatedAsyncioTestCase):
 
         connector = _make_connector()
         connector._rest.team_id = "team-1"
+        # FAITHFUL to the real REST layer (Codex round 13): get_channel
+        # normalizes the platform letter to "channel"/"group"/"dm"/"group_dm"
+        # via room_type_for. The old mock returned the raw letter "O", which
+        # is why no test caught that the letters-only kind lookup made
+        # hook.added unreachable for every real response — the mock-drift
+        # lesson (get_watcher_config) again.
         connector._rest.get_channel = AsyncMock(return_value={
-            "id": "chan-1", "type": "O", "name": "eng-backend",
+            "id": "chan-1", "type": "channel", "name": "eng-backend",
             "display_name": "Eng Backend", "team_id": "team-1",
         })
         return connector

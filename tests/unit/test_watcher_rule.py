@@ -317,6 +317,18 @@ class TestParserHardErrors(unittest.TestCase):
     def test_ttl_rejects_bool_which_is_an_int_subclass(self):
         self._err({**MINIMAL, "session_idle_days": True}, "positive integer")
 
+    def test_an_explicit_null_ttl_takes_the_default_by_contract(self):
+        """Codex round 13, resolved as documentation: null is the documented
+        template-inheritance SUPPRESS (`_deep_merge` keeps an explicit null
+        as a value, so a child rule writes `session_expire_days: null` to
+        undo a template's value and return to the 15-day default). It is not
+        a disable switch — that reading was the F1 defect's side effect. This
+        pin is the contract: null == omitted == the dataclass default."""
+        rule = parse({**MINIMAL, "session_idle_days": None,
+                      "session_expire_days": None})
+        self.assertEqual(rule.session_idle_days, 15)
+        self.assertEqual(rule.session_expire_days, 15)
+
     def test_the_two_legs_need_no_ordering_between_them(self):
         """Inverted deliberately: the old rule required idle < expire, on the
         assumption that both were measured from the moment the room went quiet.

@@ -1130,9 +1130,20 @@ class MattermostConnector(Connector):
 
         kind = _ROOM_KINDS.get(channel_type)
         if kind is None:
-            logger.debug(
-                "Channel %s has unknown type %r — not routable", channel_id, channel_type)
-            return None
+            # BOTH spellings are real inputs (Codex round 13): the wire event
+            # carries the platform letters, but the membership-add path feeds
+            # this helper `get_channel()`'s output, which `room_type_for` has
+            # already normalized — and the letters-only lookup made
+            # `hook.added` unreachable for every real REST response, so a
+            # joined room was never registered until its first message. Same
+            # dual lookup `_room_ref_from_state` already uses.
+            try:
+                kind = RoomKind(channel_type)
+            except ValueError:
+                logger.debug(
+                    "Channel %s has unknown type %r — not routable",
+                    channel_id, channel_type)
+                return None
 
         display = decoded.get("channel_display_name") or ""
         if kind is RoomKind.DM:

@@ -1596,6 +1596,14 @@ def _parse_rule_ttl(wc: Mapping, index: int, field_name: str) -> int | None:
     """
     value = wc.get(field_name)
     if value is None:
+        # An explicit null and an omitted key BOTH take the dataclass default
+        # (15/15, §2.5): null is the documented template-inheritance suppress
+        # (`_deep_merge`: "an explicit null intentionally suppresses a base
+        # value"), so a child rule writes `session_expire_days: null` to undo
+        # a template's value and return to the default. It is NOT a disable
+        # switch — the pre-cutover disabled-TTL reading was the F1 defect's
+        # side effect, never a documented meaning (Codex round 13, resolved
+        # as documentation).
         return None
     # bool is an int subclass; `session_idle_days: true` is a mistake, not a 1.
     if isinstance(value, bool) or not isinstance(value, int):
