@@ -16,7 +16,7 @@ defects, so they are named here once:
   durable identity header on every turn.
 
 Label and description coincide for a channel and **diverge for a group DM**: label
-`gdm-a3f9c1b2`, description `@alice, @bob`. Anything that treats `room` as a lookup key
+`gdm:a3f9c1b2…`, description `@alice, @bob`. Anything that treats `room` as a lookup key
 breaks on that divergence, which is why room resolution goes by `room_id` (§2.3).
 """
 
@@ -57,10 +57,15 @@ class StaleRecordError(RuntimeError):
     retry re-enters `get_or_create` and dispatches against current state.
     """
 
-# How many hex characters of the room-id digest a group DM's label carries. Eight is the
-# design's figure (§2.3): short enough to type from a `list` row, and collisions are
-# cosmetic — two identical-looking rows and nothing worse, since the label is never a key.
-_GROUP_DM_LABEL_DIGITS = 8
+# How many hex characters of the room-id digest a group DM's label carries.
+# Sixteen (64 bits), raised from the design's original eight (Codex round 20):
+# the "collisions are cosmetic" rationale aged out when the same-name guard
+# made the derived name a hard gate — at 32 bits a busy account's group DMs
+# had a real birthday-bound chance of two rooms deriving one name, and the
+# guard would then permanently refuse the second room's watcher. At 64 bits
+# the bound is ~5 billion rooms for the same odds. Still short enough to
+# paste from a `list` row, and `resolve()` accepts the room id besides.
+_GROUP_DM_LABEL_DIGITS = 16
 
 # Characters a label may carry verbatim. Anything else is percent-encoded (§2.3): the old
 # sanitizer collapsed them to `-` and raised on an empty result, which made two different
@@ -101,7 +106,7 @@ def room_label(room: RoomRef) -> str:
     |---|---|---|
     | channel / private group | the channel name | until renamed |
     | 1:1 DM | `dm:<counterpart>` | until the counterpart is renamed (§2.3) |
-    | group DM | `gdm:<8 hex of the room-id digest>` | yes, by construction |
+    | group DM | `gdm:<16 hex of the room-id digest>` | yes, by construction |
 
     The kind prefixes use `:` — the reserved divider, never emitted by
     `_encode` (it is outside `_LABEL_SAFE`, so a literal `:` in a room or

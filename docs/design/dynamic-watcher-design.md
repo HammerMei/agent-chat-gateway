@@ -484,7 +484,7 @@ gives up on readability:
 |---|---|---|
 | channel / private group | the channel name | until renamed |
 | 1:1 DM | `dm:<counterpart>` | until the counterpart is renamed — and see below |
-| group DM | `gdm:<first 8 of a room_id hash>` | yes, by construction |
+| group DM | `gdm:<16 hex of a room_id hash>` | yes, by construction |
 
 **A renamed counterpart is a known inconsistency, deliberately left.** This
 table used to claim a username was stable. It is not — Rocket.Chat allows a
@@ -543,7 +543,7 @@ So `list` shows the label, the room id, and for DMs the participants:
 NAME                     ROOM ID                     STATE   PARTICIPANTS
 mm-eng:incident-42       r1o6c8a1k3d8icd931qq1n6g4y  active  —
 mm-eng:dm:alice          iwihkhk9jpf3tngp14ushkx6pe  idle    @alice
-mm-eng:gdm:a3f9c1b2      cib3hjsrgpydtf6tyac7frcu6o  active  @alice, @bob
+mm-eng:gdm:a3f9c1b2d4e5f607  cib3hjsrgpydtf6tyac7frcu6o  active  @alice, @bob
 ```
 
 `resolve()` (§2.8) accepts the label **or** the room id, so an operator always
@@ -637,7 +637,7 @@ config's `room` never contains pattern metacharacters.
 Note the split of duties this creates, deliberately: the **label** is a stable
 handle for addressing a watcher, while `room` is a human-meaningful
 *description* of where it lives. For a channel they coincide. For a group DM
-they diverge — label `gdm:a3f9c1b2`, room `@alice, @bob` — and the resolution
+they diverge — label `gdm:a3f9c1b2…`, room `@alice, @bob` — and the resolution
 paths that consume `room` must therefore not treat it as a lookup key. Room
 resolution already goes by `room_id` (§2.3), so the only requirement is that
 nothing regresses to resolving by this field.

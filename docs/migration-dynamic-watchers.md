@@ -92,7 +92,11 @@ Field notes:
 3. If any old session's content matters, export it via a summary file first.
 4. Restart the gateway. Expect one `Pruning static-era watcher record`
    log line per old record — that is the clean break, not a fault.
-5. Recreate scheduled jobs against the new watcher names.
+5. Delete every scheduled job that targeted an old static watcher name
+   (`schedule list`, then `schedule delete <id>` for each) — the prune
+   removes the records, NOT the jobs, and an orphaned job re-fires forever
+   against a watcher that no longer exists. Then recreate the jobs against
+   the new watcher names.
 
 ## Changing a connector's server (or type)
 

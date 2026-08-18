@@ -1076,6 +1076,31 @@ class RocketChatConnector(Connector):
                     sub.left_the_room()
                 if rid:
                     self._note_membership_loss(rid)
+                    # The untracked twin of the tracked branch's hook fire
+                    # (Codex round 20, mirroring round 18): reachable when a
+                    # FAILED record's room — never subscribed this boot —
+                    # gets a subscribe-all frame with the server's own
+                    # participant-false answer. A failed record is neither
+                    # paused nor idle, so the reconciliation never sees it;
+                    # without the hook, a later boot recreates the session
+                    # across the membership boundary. Same per-room
+                    # serialization as every membership event.
+                    if self._membership_hook is not None:
+                        async def _removed(room_id=rid):
+                            lock = self._membership_serial.setdefault(
+                                room_id, asyncio.Lock())
+                            async with lock:
+                                try:
+                                    await self._membership_hook.removed(room_id)
+                                except Exception:
+                                    logger.exception(
+                                        "Membership removal (untracked "
+                                        "participant-false) for room %s failed "
+                                        "— the safety nets cover it", room_id,
+                                    )
+                        task = asyncio.create_task(_removed())
+                        self._routing_tasks.add(task)
+                        task.add_done_callback(self._routing_tasks.discard)
             return
         if not sender_allowed(self._config, sender):
             return
