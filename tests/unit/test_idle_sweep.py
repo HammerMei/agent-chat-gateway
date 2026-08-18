@@ -78,6 +78,28 @@ def _harness(records, *, processors=None, registry=None, pending_jobs=None):
 
 class TestTheSweepDropsAnIdleWatcher(unittest.IsolatedAsyncioTestCase):
 
+    async def test_a_failed_watermark_read_does_not_abort_the_drop(self):
+        """Codex round 17: the watermark read sits between the processor pop
+        and its stop — a raise there left a running processor no later pass
+        could see (not resident) and stop_all's snapshot missed. Best-effort,
+        like _stop_processor's twin read: the drop completes, the record
+        keeps its own watermark."""
+        record = _record()
+        record.last_processed_ts = "the-records-own"
+        proc = _resident_processor()
+        sweep, lifecycle, connector = _harness([record], processors={"w1": proc})
+        connector.get_last_processed_ts = MagicMock(
+            side_effect=RuntimeError("connector mid-teardown"))
+
+        dropped = await sweep.run_once()
+
+        self.assertEqual(dropped, ["w1"], "the drop completed")
+        proc.stop.assert_awaited_once()
+        self.assertNotIn("w1", lifecycle._processors)
+        self.assertEqual(record.dropped_at, _iso(NOW))
+        self.assertEqual(record.last_processed_ts, "the-records-own",
+                         "a failed read keeps the record's own watermark")
+
     async def test_past_ttl_is_dropped_and_the_room_stays_subscribed(self):
         record = _record()
         proc = _resident_processor()

@@ -353,8 +353,21 @@ class WatcherLifecycle:
                 # Capture the live watermark while the connector still holds the
                 # room entry — same reason as `_stop_processor` step 2, same
                 # `is not None` rule: None means "no opinion", an empty string
-                # is one.
-                live_ts = self._connector.get_last_processed_ts(state.room_id)
+                # is one. And BEST-EFFORT like that step too (Codex round 17):
+                # this read sits between the processor pop and its stop, so a
+                # raise here left a running processor no later sweep pass
+                # could see (not resident) and stop_all's snapshot missed — a
+                # zombie. A failed read costs a slightly stale watermark,
+                # which the next replay's dedup absorbs.
+                try:
+                    live_ts = self._connector.get_last_processed_ts(state.room_id)
+                except Exception as e:
+                    live_ts = None
+                    logger.warning(
+                        "Watcher '%s': could not read the live watermark "
+                        "during the idle drop (keeping the record's own): %s",
+                        name, e,
+                    )
                 if live_ts is not None:
                     state.last_processed_ts = live_ts
             try:
