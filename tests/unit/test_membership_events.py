@@ -222,6 +222,13 @@ class TestARemovalReclaimsTheRecord(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(lifecycle.get_watcher_state("w1"), record,
                       "the record is back in memory for the next discoverer")
+        # DORMANT-shaped (round 27): the cleanup already stopped the
+        # processor and deleted the session, and the reconciliation only
+        # examines dormant records — an active-shaped restore was invisible
+        # to every retry path.
+        self.assertTrue(record.dropped_at,
+                        "the restore stamps dropped_at so the reconciliation "
+                        "retries the prune")
 
     async def test_a_failed_stop_does_not_refuse_the_reclaim(self):
         """The room is gone whatever the teardown hit — a remove that refused

@@ -603,6 +603,17 @@ class WatcherLifecycle:
         try:
             self._state_store.save(self._states, prune={name})
         except Exception:
+            # Restored DORMANT, not active-shaped (Codex round 27): the
+            # cleanup above already stopped the processor and deleted the
+            # backend session, so active-shaped is a lie — and the
+            # reconciliation only examines paused/dropped records, so an
+            # active restore was invisible to every retry path and the next
+            # boot recreated the watcher against the deleted session. With
+            # dropped_at stamped, the record is honest (nothing is running)
+            # and the next reconciliation round reclaims it again, retrying
+            # this very prune.
+            if not state.dropped_at:
+                state.dropped_at = now_iso()
             self._states[name] = state
             raise
 
