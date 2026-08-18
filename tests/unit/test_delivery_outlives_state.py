@@ -427,6 +427,48 @@ class TestMMReplayAbortsOnAMembershipEraChange(unittest.IsolatedAsyncioTestCase)
                          "the batch stopped at the era boundary — the old "
                          "era's remaining posts never reached the new room")
 
+    async def test_an_era_change_during_the_fetch_rejects_the_whole_batch(self):
+        """Codex round 21: the capture must sit BEFORE the history fetch — a
+        remove-then-re-add landing during the fetch itself would otherwise be
+        snapshotted as the current era, and the OLD era's entire fetched
+        batch would dispatch into the re-added room."""
+        from unittest.mock import AsyncMock
+
+        from gateway.connectors.mattermost.connector import _ChannelState
+        from gateway.core.connector import Room
+        from tests.unit.test_mattermost_connector import _make_connector
+
+        connector = _make_connector()
+        connector._config.require_mention = False
+        connector._config.filter_sender = False
+        connector._rest.resolve_username = AsyncMock(return_value="alice")
+
+        state = _ChannelState(room=Room(id="chan-1", name="general", type="channel"))
+        connector._channels["chan-1"] = state
+        posts = [{"id": "p0", "channel_id": "chan-1", "user_id": "u-alice",
+                  "message": "m0", "create_at": 100, "type": ""}]
+
+        async def fetch_then_era_change(channel_id, count=50, before_ts=None,
+                                        after_ts=None):
+            # The remove + re-add, DURING the fetch.
+            connector._membership_gen["chan-1"] = (
+                connector._membership_gen.get("chan-1", 0) + 1)
+            connector._channels["chan-1"] = _ChannelState(
+                room=Room(id="chan-1", name="general", type="channel"))
+            from gateway.core.connector import HistoryPage
+            return HistoryPage(messages=posts, raw_count=1, limit=count)
+
+        connector._rest.get_room_history_page = fetch_then_era_change
+        delivered = []
+        connector._handler = AsyncMock(
+            side_effect=lambda m: delivered.append(m.id) or True)
+
+        await connector.replay_room_since("chan-1", after_ts="50")
+
+        self.assertEqual(delivered, [],
+                         "the whole batch was rejected — it was fetched for "
+                         "an era that ended during the fetch")
+
 
 class TestAFailedWakeReplayKeepsTheWindow(unittest.IsolatedAsyncioTestCase):
     """Codex review of #121: a wake replay reads an EXTERNAL window (the

@@ -314,6 +314,13 @@ class MattermostConnector(Connector):
         if state is None:
             return
         channel_id = room_id
+        # The membership era, captured in the FIRST synchronous segment —
+        # before the history fetch awaits (Codex rounds 19 and 21): a live
+        # remove-then-re-add can land during the fetch itself, and a capture
+        # taken after it would snapshot the NEW era's generation and happily
+        # dispatch the OLD era's fetched posts into the re-added room. The
+        # loop below re-checks this value before every dispatch.
+        entry_gen = self._membership_gen.get(channel_id, 0)
         # An explicitly named window (startup, post-park) is not this channel's
         # boundary to spend — same rule, same reason, as Rocket.Chat's.
         external_window = after_ts is not None
@@ -387,13 +394,6 @@ class MattermostConnector(Connector):
                 state.room.name, len(raw_msgs), watermark,
             )
 
-        # The membership era, captured at replay entry (Codex round 19): a
-        # live remove-then-re-add can REPLACE the channel state mid-batch,
-        # and an exists-check alone would let the rest of a batch fetched
-        # for the OLD era dispatch into the newly joined room. The
-        # generation is the authoritative removal signal the fences already
-        # use — RC's replay carries the same check via its epoch.
-        entry_gen = self._membership_gen.get(channel_id, 0)
         for idx, post in enumerate(raw_msgs):
             if (channel_id not in self._channels
                     or self._membership_gen.get(channel_id, 0) != entry_gen):
