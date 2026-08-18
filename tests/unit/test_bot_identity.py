@@ -541,6 +541,74 @@ class TestWhoOwnsTheDmStream(unittest.TestCase):
         self.assertFalse(DmClaim().overlaps(DmClaim(direct=True)))
         self.assertFalse(DmClaim(direct=True).overlaps(DmClaim()))
 
+
+class TestPersistedRecordsAreClaims(unittest.TestCase):
+    """Codex round 6 (P1): sticky binding keeps a rule-derived DM record
+    answering its room after the rule that created it is deleted — so a
+    rule-only claim misses exactly the records that outlive their rules, and
+    two connectors sharing one account both answer one private conversation.
+    Persisted records are folded into the claim before the overlap check."""
+
+    def _record(self, kind, room_id, name="w1", rule_name="eng"):
+        from unittest.mock import MagicMock as M
+
+        return M(rule_name=rule_name, room_id=room_id, room_kind=kind,
+                 watcher_name=name)
+
+    def test_a_dm_record_claims_its_room(self):
+        from gateway.core.bot_identity import fold_record_dm_claims
+
+        claim = fold_record_dm_claims(
+            DmClaim(), [self._record("dm", "d1", name="mm-dm-alice")])
+        self.assertIn("d1", claim.rooms)
+        self.assertIn("mm-dm-alice", claim.record_watchers)
+        self.assertTrue(claim.overlaps(DmClaim(direct=True)),
+                        "the sticky record collides with a whole-stream "
+                        "claim on the other connector")
+
+    def test_a_group_dm_record_claims_the_group_side_only(self):
+        from gateway.core.bot_identity import fold_record_dm_claims
+
+        claim = fold_record_dm_claims(
+            DmClaim(), [self._record("group_dm", "g1")])
+        self.assertIn("g1", claim.group_rooms)
+        self.assertTrue(claim.overlaps(DmClaim(group_direct=True)))
+        self.assertFalse(claim.overlaps(DmClaim(direct=True)),
+                         "a group-DM record never collides with the 1:1 side")
+
+    def test_two_records_on_the_same_room_overlap(self):
+        from gateway.core.bot_identity import fold_record_dm_claims
+
+        a = fold_record_dm_claims(DmClaim(), [self._record("group_dm", "g1")])
+        b = fold_record_dm_claims(DmClaim(), [self._record("group_dm", "g1")])
+        self.assertTrue(a.overlaps(b))
+
+    def test_static_era_and_channel_records_claim_nothing(self):
+        from gateway.core.bot_identity import fold_record_dm_claims
+
+        claim = fold_record_dm_claims(DmClaim(), [
+            self._record("dm", "d1", rule_name=""),   # static-era: pruned at boot
+            self._record("channel", "c1"),            # not a DM at all
+        ])
+        self.assertEqual(claim.rooms, frozenset())
+        self.assertEqual(claim.group_rooms, frozenset())
+
+    def test_the_refusal_names_the_record_and_the_exit(self):
+        """The operator already deleted the rule — a refusal citing rules is
+        unfixable from their side. The message must name the persisted
+        watcher and the release path."""
+        from gateway.core.bot_identity import fold_record_dm_claims
+
+        a_claim = fold_record_dm_claims(
+            DmClaim(), [self._record("dm", "d1", name="mm-dm-alice")])
+        conflicts = find_identity_conflicts([
+            _entry("a", scope="team1", dms=a_claim),
+            _entry("b", scope="team2", dms=DmClaim(direct=True)),
+        ])
+        self.assertEqual(len(conflicts), 1)
+        self.assertIn("mm-dm-alice", conflicts[0])
+        self.assertIn("expire", conflicts[0])
+
 class TestStaticDmWatchersReachTheCheck(unittest.TestCase):
     """The wiring, not the helper: `GatewayService` must derive its DM owners this way.
 

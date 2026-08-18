@@ -126,6 +126,67 @@ class TestVerbsOnRuleDerivedRecords(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(lifecycle.get_watcher_state(NAME).paused,
                         "the pause survived the refused reset")
 
+    async def test_reset_on_a_removed_agent_fails_before_any_mutation(self):
+        """Matrix sweep after Codex round 6: reset used to clear the session
+        pointer BEFORE start's step-0 agent gate raised — the verb reported a
+        pure refusal while its destructive half had already executed, and the
+        abandoned session id was never logged anywhere. The named-but-missing
+        agent is now refused by `_ensure_agent_available`, before the lock
+        and before any write."""
+        connector, lifecycle, _ = await self._harness()
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            MockProc.return_value.stop = AsyncMock()
+            record = await self._create(connector, lifecycle)
+            session_id = record.session_id
+            self.assertTrue(session_id)
+
+            # The operator deletes the agent; the frozen binding remains.
+            record.agent = "ghost"
+            record.config = {**dict(record.config), "agent": "ghost"}
+
+            with self.assertRaises(RuntimeError) as ctx:
+                await lifecycle.reset_watcher(NAME)
+
+        self.assertIn("ghost", str(ctx.exception))
+        self.assertIn("expire", str(ctx.exception))
+        state = lifecycle.get_watcher_state(NAME)
+        self.assertEqual(state.session_id, session_id,
+                         "the refusal ran before the destructive half — the "
+                         "session pointer survived")
+        self.assertTrue(state.context_injected,
+                        "context_injected survived the refused reset")
+
+    async def test_a_same_name_start_for_a_different_room_is_refused(self):
+        """Matrix sweep after Codex round 6: a room deleted server-side and
+        recreated under the same name derives the SAME watcher name for a
+        different room_id — installing its record would silently clobber the
+        old room's record (session, watermark, even a pause), with no
+        backstop that ever notices. Refused loudly, before the session
+        provision, so the refusal mints nothing."""
+        from gateway.core.connector import Room
+        from gateway.core.watcher_manager import config_from_record
+
+        connector, lifecycle, _ = await self._harness()
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            record = await self._create(connector, lifecycle)
+            wc = config_from_record(record)
+            agent = lifecycle._agents["default"]
+            sessions_before = len(agent.created_sessions)
+
+            with self.assertRaises(RuntimeError) as ctx:
+                await lifecycle.start_watcher_in_room(
+                    wc, None,
+                    Room(id="recreated-room", name="eng-backend",
+                         type="channel"))
+
+        self.assertIn("expire", str(ctx.exception))
+        self.assertIs(lifecycle.get_watcher_state(NAME), record,
+                      "the old room's record was left untouched")
+        self.assertEqual(len(agent.created_sessions), sessions_before,
+                         "the refusal minted no session")
+
     async def test_pause_refuses_a_record_reclaimed_while_it_waited(self):
         """TOCTOU sweep after Codex round 4: pause was the odd verb out —
         resume and reset both raise on a record reclaimed while they waited

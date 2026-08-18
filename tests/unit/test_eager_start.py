@@ -98,6 +98,35 @@ class TestEagerStart(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(mgr._lifecycle.record_for_room("ops-secret"),
                           "the vetoed room is never offered")
 
+    async def test_a_record_whose_rule_is_gone_still_starts_at_boot(self):
+        """Codex round 6 (P1), completing round 5's unconditional manager:
+        sticky binding (§2.4) keeps a record alive after its rule is deleted,
+        and on an eager connector NO message can ever arrive to wake it — the
+        boot walk is the only starter there is. The eager loop therefore
+        walks persisted records independently of the current rule list."""
+        mgr = _eager_manager()
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            await mgr.sync_only()
+            record = mgr._lifecycle.record_for_room("ops-room")
+            session_id = record.session_id
+            name = record.watcher_name
+
+            # The restart after the operator deleted the rule, in miniature:
+            # processor gone, record hydrated, current rules EMPTY.
+            proc = mgr._lifecycle._processors.pop(name)
+            mgr._dispatcher.remove_processor("ops-room", proc)
+            mgr._watcher_rules = []
+            errors: list[str] = []
+            await mgr._eager_start_rule_rooms(errors)
+
+        self.assertEqual(errors, [])
+        woken = mgr._lifecycle.record_for_room("ops-room")
+        self.assertEqual(woken.session_id, session_id,
+                         "the record walk resumed the frozen session — "
+                         "current rules were never consulted")
+        self.assertIsNotNone(mgr._lifecycle.processor_named(name))
+
     async def test_a_paused_room_is_not_started_and_not_an_error(self):
         """§4.4 through the same door as everywhere else: get_or_create
         refuses a paused record, and the eager loop reads that refusal as

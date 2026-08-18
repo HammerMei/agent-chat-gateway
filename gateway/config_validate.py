@@ -54,6 +54,7 @@ from .core.bot_identity import (
 from .core.state import (
     DuplicateSessionError,
     StateFormatError,
+    backend_identity,
     check_session_uniqueness,
     connector_name_of,
     load_state,
@@ -431,6 +432,43 @@ def _check_state_orphans(config: GatewayConfig, result: ValidationResult) -> Non
             continue
         for st in states:
             if st.rule_name:
+                # The record-vs-agent divergences (matrix sweep after Codex
+                # round 6): the runtime is fail-closed and loud about both,
+                # but only AFTER the restart — this command's job is to say
+                # it before.
+                if st.agent and st.agent not in config.agents:
+                    msg = (
+                        f"Connector '{connector.name}': watcher "
+                        f"'{st.watcher_name}' is bound to agent '{st.agent}', "
+                        f"which is not in config.yaml — it will read 'failed' "
+                        f"at the next boot and refuse every start. Restore "
+                        f"the agent, or release the room with "
+                        f"'expire {st.watcher_name}'."
+                    )
+                    result.warnings.append(msg)
+                    result.findings.append(
+                        Finding("warning", "connector", connector.name, None, msg)
+                    )
+                elif st.agent and st.session_id and st.backend_identity:
+                    agent_cfg = config.agents[st.agent]
+                    current = backend_identity(
+                        agent_cfg.type, agent_cfg.working_directory)
+                    if st.backend_identity != current:
+                        msg = (
+                            f"Connector '{connector.name}': watcher "
+                            f"'{st.watcher_name}' carries session "
+                            f"{st.session_id} created against backend "
+                            f"identity '{st.backend_identity}', but agent "
+                            f"'{st.agent}' now resolves to '{current}' — the "
+                            f"next start will abandon that session and mint "
+                            f"a fresh one. Expected after changing the "
+                            f"agent's type or working_directory."
+                        )
+                        result.warnings.append(msg)
+                        result.findings.append(
+                            Finding("warning", "connector", connector.name,
+                                    None, msg)
+                        )
                 continue
             msg = (
                 f"Connector '{connector.name}': state.json has static-era "

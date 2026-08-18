@@ -417,6 +417,29 @@ class WatcherLifecycle:
         else:
             agent_name = self._resolve_agent_name(state.agent or None)
             agent = self._agents.get(agent_name)
+            # The round-3 gate's twin (Codex round 6): the agent can survive
+            # under the same NAME with a changed type or working directory.
+            # `_provision_session` already refuses to reuse a session across
+            # that boundary; the reclaim must refuse to DELETE across it for
+            # the same reason — the old id means nothing (or someone else's
+            # session) in the new store, and the prompt/attachment walk would
+            # run in the new working directory where the old files are not.
+            # Empty recorded identity proceeds: such a record carries no
+            # session for step 2 to mis-delete.
+            if agent_name is not None and state.backend_identity:
+                agent_cfg = self._config.agent_config(agent_name)
+                current = backend_identity(
+                    agent_cfg.type, agent_cfg.working_directory)
+                if state.backend_identity != current:
+                    logger.warning(
+                        "Watcher '%s': agent '%s' was created against backend "
+                        "identity '%s', which is now '%s' — skipping backend "
+                        "session, prompt-file and attachment cleanup "
+                        "(accepting the leak); the record is still reclaimed",
+                        name, agent_name, state.backend_identity, current,
+                    )
+                    agent_name = None
+                    agent = None
         session_id = state.session_id
 
         # 2. The backend session. False means unsupported or unconfirmed —
@@ -1037,6 +1060,25 @@ class WatcherLifecycle:
         agent = self._agents[agent_name]
         agent_cfg = self._config.agent_config(agent_name)
 
+        # 0.5 Refuse a name that already belongs to a DIFFERENT room (matrix
+        # sweep after Codex round 6). The watcher name is derived from the
+        # room's label, and a short label carries no room-id digest — so a
+        # room deleted server-side and recreated under the same name derives
+        # the same name for a different room_id. Installing that record
+        # would silently clobber the old room's record — session pointer,
+        # watermark, even an operator's pause — with no log line and no
+        # backstop that ever notices. Before the session provision below, so
+        # the refusal mints nothing it would have to clean up.
+        existing = self._states.get(wc.name)
+        if existing is not None and existing.room_id and existing.room_id != room.id:
+            raise RuntimeError(
+                f"Watcher name '{wc.name}' already belongs to room "
+                f"'{existing.room_id}', but this start is for room "
+                f"'{room.id}' — a room recreated under the same name derives "
+                f"the same watcher name. Release the old record with "
+                f"'expire {wc.name}' (or wait out its TTL), then retry."
+            )
+
         # 1.5 Refuse a room another watcher already serves, before anything is built.
         # The authoritative claim is step 8, after the room is subscribed — reaching it
         # first would mean creating a session, injecting context and subscribing, then
@@ -1575,7 +1617,22 @@ class WatcherLifecycle:
             )
 
     def _ensure_agent_available(self, wc: WatcherConfig) -> None:
-        """Fail closed if a watcher's resolved agent is currently unavailable."""
+        """Fail closed if a watcher's resolved agent is currently unavailable.
+
+        A named-but-missing agent is refused HERE, before the verb's first
+        destructive step (matrix sweep after Codex round 6): resolving it to
+        the default made this gate test the wrong agent's availability — a
+        contradictory log pair, and for `reset` a session pointer wiped
+        before start's own step-0 gate raised the refusal the operator then
+        read as "nothing happened". Same rule as step 0, one gate earlier.
+        """
+        if wc.agent and wc.agent not in self._agents:
+            raise RuntimeError(
+                f"Watcher '{wc.name}' is bound to agent '{wc.agent}', which "
+                f"no longer exists in config — refusing to substitute the "
+                f"default (§2.4, the record is authoritative). Restore the "
+                f"agent, or 'expire {wc.name}' to release the room."
+            )
         agent_name = self._resolve_agent_name(wc.agent)
         if agent_name in self._blocked_agents:
             raise RuntimeError(

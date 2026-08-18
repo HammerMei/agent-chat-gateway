@@ -154,6 +154,33 @@ class TestARemovalReclaimsTheRecord(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("ghost" in line for line in captured.output),
                         "the accepted leak names the missing agent")
 
+    async def test_a_changed_backend_identity_skips_cleanup_but_still_reclaims(self):
+        """Codex round 6, the round-3 gate's twin: the agent survives under
+        the same NAME with a changed type or working directory.
+        `_provision_session` refuses to REUSE a session across that boundary;
+        the reclaim must refuse to DELETE across it — the old id means
+        nothing (or someone else's session) in the new store."""
+        record = make_rule_derived_record(
+            backend_identity="claude:/the/old/workdir")
+        lifecycle, connector = _harness([record])
+        default_backend = lifecycle._agents["default"]
+        default_backend.delete_session = AsyncMock()
+
+        with self.assertLogs(
+            "agent-chat-gateway.core.watcher_lifecycle", level="WARNING"
+        ) as captured:
+            name = await lifecycle.reclaim_room("room-w1", reason="removed")
+
+        self.assertEqual(name, "w1")
+        self.assertIsNone(lifecycle.get_watcher_state("w1"), "still reclaimed")
+        default_backend.delete_session.assert_not_awaited()
+        lifecycle._attachment_workspace.reclaim.assert_not_called()
+        lifecycle._state_store.save.assert_called_with(
+            lifecycle._states, prune={"w1"})
+        self.assertTrue(
+            any("claude:/the/old/workdir" in line for line in captured.output),
+            "the accepted leak names both identities")
+
     async def test_a_failed_stop_does_not_refuse_the_reclaim(self):
         """The room is gone whatever the teardown hit — a remove that refused
         to reclaim on a stop error would keep a session for a room that can

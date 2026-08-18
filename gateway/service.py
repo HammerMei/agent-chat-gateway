@@ -33,6 +33,7 @@ from .core.bot_identity import (
     DuplicateBotIdentityError,
     dm_claims,
     find_identity_conflicts,
+    fold_record_dm_claims,
 )
 from .core.config import CoreConfig
 from .core.connector import Connector
@@ -46,7 +47,7 @@ from .core.permission import (
 from .core.scheduler import JobScheduler
 from .core.session_manager import SessionManager
 from .core.session_maps import SessionMaps
-from .core.state import check_session_uniqueness, check_state_formats
+from .core.state import check_session_uniqueness, check_state_formats, load_state
 
 logger = logging.getLogger("agent-chat-gateway.service")
 
@@ -470,11 +471,26 @@ class GatewayService:
             identity = e.connector.bot_identity()
             if identity is None:
                 continue  # declares no shared account to collide over
+            claim = self._dm_claims.get(e.name, DmClaim())
+            # Widened by the connector's persisted DM records (Codex round
+            # 6): sticky binding keeps a record answering its room after its
+            # rule is deleted, so a rule-only claim misses exactly the
+            # records that outlive their rules — and two connectors sharing
+            # an account would both answer one private conversation. Read
+            # best-effort: an unreadable file was already refused loudly by
+            # check_state_formats, so nothing here needs a second refusal.
+            try:
+                claim = fold_record_dm_claims(claim, load_state(e.name))
+            except Exception:
+                logger.debug(
+                    "Could not fold persisted DM claims for connector '%s' — "
+                    "using the rule-derived claim alone", e.name, exc_info=True,
+                )
             identities.append(
                 ConnectorIdentity(
                     connector_name=e.name,
                     identity=identity,
-                    dms=self._dm_claims.get(e.name, DmClaim()),
+                    dms=claim,
                 )
             )
         conflicts = find_identity_conflicts(identities)

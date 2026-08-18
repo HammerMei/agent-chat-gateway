@@ -605,5 +605,43 @@ class TestARuleLessManagerStillWakesRecords(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(lifecycle.processor_named(name))
 
 
+class TestAWakePreservesTheRecordsRoomName(unittest.IsolatedAsyncioTestCase):
+    """Codex round 6: a wake from tracked state offers a ref with NO
+    participants, and deriving the platform room's name from that ref
+    degraded a DM's description to the dm-/gdm-digest — overwriting the
+    meaningful room_name the creation wrote. §2.4: the record is the source."""
+
+    _harness = TestTheWakeResumesTheSameSession._harness
+    _settle = TestTheWakeResumesTheSameSession._settle
+
+    async def test_recreate_names_the_room_from_the_record(self):
+        from gateway.core.watcher_manager import RoomRef
+        from gateway.core.watcher_rule import RoomKind
+        from tests.helpers import make_rule_derived_record
+
+        connector, lifecycle, dispatcher = await self._harness()
+        manager = self.manager
+        record = make_rule_derived_record(
+            name="rc-gdm-1", room_id="gdm-1",
+            room_name="alice, bob", room_kind="group_dm",
+        )
+        lifecycle._states["rc-gdm-1"] = record
+
+        # The wake's offered ref: no participants — the tracked channel
+        # state does not retain them.
+        ref = RoomRef(id="gdm-1", kind=RoomKind.GROUP_DM, name="",
+                      participants=())
+
+        with patch.object(lifecycle, "start_watcher_in_room",
+                          new=AsyncMock()) as start:
+            await manager._recreate(record, ref, None)
+
+        platform_room = start.await_args.args[2]
+        self.assertEqual(platform_room.name, "alice, bob",
+                         "the record's own name, not the digest fallback "
+                         "derived from a participant-less ref")
+        self.assertEqual(platform_room.type, "group_dm")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -265,6 +265,73 @@ class TestValidateConfigStateOrphans(_ValidateConfigTestBase):
         self.assertIn("stale", result.warnings[0])
         self.assertIn("static-era", result.warnings[0])
 
+    def test_a_record_bound_to_a_removed_agent_is_reported(self):
+        """Matrix sweep after Codex round 6: the runtime is fail-closed and
+        loud about a record whose frozen agent was deleted — but only AFTER
+        the restart. This command's job is to say it before."""
+        cfg = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                rooms:
+                  include: [general]
+        """)
+        self.runtime_dir.mkdir()
+        (self.runtime_dir / "state.rc.json").write_text(json.dumps({
+            "version": STATE_FORMAT_VERSION,
+            "watchers": [
+                {"watcher_name": "w1", "session_id": "keep", "room_id": "r1",
+                 "rule_name": "w1", "agent": "ghost"},
+            ]
+        }))
+        result = self._validate(cfg)
+        self.assertTrue(result.ok, "a doomed record is a warning, not an error")
+        self.assertEqual(len(result.warnings), 1)
+        self.assertIn("ghost", result.warnings[0])
+        self.assertIn("failed", result.warnings[0])
+        self.assertIn("expire w1", result.warnings[0])
+
+    def test_a_changed_backend_identity_is_reported(self):
+        """The quieter sibling: the agent still exists but its type or
+        working_directory changed — the next start silently abandons the
+        session. Warned here, where it is still reversible."""
+        cfg = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                rooms:
+                  include: [general]
+        """)
+        self.runtime_dir.mkdir()
+        (self.runtime_dir / "state.rc.json").write_text(json.dumps({
+            "version": STATE_FORMAT_VERSION,
+            "watchers": [
+                {"watcher_name": "w1", "session_id": "sess-1", "room_id": "r1",
+                 "rule_name": "w1", "agent": "default",
+                 "backend_identity": "claude:/the/old/workdir"},
+            ]
+        }))
+        result = self._validate(cfg)
+        self.assertTrue(result.ok)
+        self.assertEqual(len(result.warnings), 1)
+        self.assertIn("sess-1", result.warnings[0])
+        self.assertIn("claude:/the/old/workdir", result.warnings[0])
+        self.assertIn("abandon", result.warnings[0])
+
     def test_a_state_file_of_a_removed_connector_is_reported(self):
         """Codex round 4: a connector renamed or removed in config.yaml leaves
         its state file behind, and no SessionManager will ever hydrate it —

@@ -259,6 +259,10 @@ class SessionManager:
         if self._connector.supports_unsolicited_inbound():
             return
         kind_for = {k.value: k for k in RoomKind}
+        # Rooms the rule loop already attempted — the record walk below must
+        # not retry them: a start that failed loudly there would otherwise be
+        # attempted (and reported) twice in one boot.
+        attempted: set[str] = set()
         for rule in self._watcher_rules:
             for pattern in rule.rooms.include:
                 if not pattern.is_literal:
@@ -285,6 +289,7 @@ class SessionManager:
                         kind=kind_for.get(room.type, RoomKind.CHANNEL),
                         name=room.name,
                     )
+                    attempted.add(ref.id)
                     proc = await self._watcher_manager.get_or_create(
                         self._connector_name, ref)
                 except Exception as e:
@@ -306,6 +311,51 @@ class SessionManager:
                                f"room matches the rule's include patterns")
                         logger.error(msg)
                         errors.append(msg)
+        # The persisted records, independently of the current rules (Codex
+        # round 6, completing round 5's unconditional manager): sticky binding
+        # (§2.4) keeps a record alive after its rule is deleted or renamed,
+        # and on an eager connector no message can ever arrive to wake it —
+        # the rule loop above is the only starter there is. Rooms the rule
+        # loop just started answer with their resident processor; paused
+        # records are skipped silently (an operator's mute, not a failure);
+        # anything else failing to start is loud, per the eager contract.
+        for record in list(self._lifecycle.states().values()):
+            if not record.config or not record.room_id:
+                continue
+            if record.room_id in attempted:
+                # The rule loop already attempted this room this boot — a
+                # failure there was reported once, loudly, and a second
+                # attempt here would double it.
+                continue
+            if self._lifecycle.processor_named(record.watcher_name) is not None:
+                continue
+            if record.paused:
+                logger.info(
+                    "Record '%s': room %s is paused — not started",
+                    record.watcher_name, record.room_id,
+                )
+                continue
+            ref = RoomRef(
+                id=record.room_id,
+                kind=kind_for.get(record.room_kind, RoomKind.CHANNEL),
+                name=record.room_name,
+                participants=tuple(record.participants),
+            )
+            try:
+                proc = await self._watcher_manager.get_or_create(
+                    self._connector_name, ref)
+            except Exception as e:
+                msg = (f"Record '{record.watcher_name}' (room "
+                       f"'{record.room_id}'): eager recreation failed: {e}")
+                logger.error(msg)
+                errors.append(msg)
+                continue
+            if proc is None:
+                msg = (f"Record '{record.watcher_name}' (room "
+                       f"'{record.room_id}'): eager recreation produced no "
+                       f"watcher")
+                logger.error(msg)
+                errors.append(msg)
 
     async def _evaluate_lifecycle_at_boot(self) -> None:
         """Boot runs the same evaluation the sweep runs (§2.5), over the
