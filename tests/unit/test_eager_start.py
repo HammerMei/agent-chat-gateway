@@ -98,6 +98,27 @@ class TestEagerStart(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(mgr._lifecycle.record_for_room("ops-secret"),
                           "the vetoed room is never offered")
 
+    async def test_a_literal_vetoed_by_an_earlier_rule_is_skipped_not_an_error(self):
+        """Codex round 12, extending round 6's own-rule veto: the ORDERED
+        first-match decision governs — an earlier deny rule (include+except
+        the same room) shadows a later rule's include of it, and the later
+        rule's eager walk must read that as an intentional no-op, not a
+        startup failure on every boot."""
+        deny = _rule(name="deny", include=("ops-secret",),
+                     except_for=("ops-secret",))
+        wants = _rule(name="wants", include=("ops-secret", "ops-room"))
+        mgr = _eager_manager(rules=[deny, wants])
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+
+            errors = await mgr.sync_only()
+
+        self.assertEqual(errors, [], "the shadowed literal is not a failure")
+        self.assertIsNotNone(mgr._lifecycle.record_for_room("ops-room"),
+                             "the unshadowed sibling still starts")
+        self.assertIsNone(mgr._lifecycle.record_for_room("ops-secret"),
+                          "the earlier rule's deny holds")
+
     async def test_a_record_whose_rule_is_gone_still_starts_at_boot(self):
         """Codex round 6 (P1), completing round 5's unconditional manager:
         sticky binding (§2.4) keeps a record alive after its rule is deleted,

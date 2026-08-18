@@ -93,3 +93,22 @@ Field notes:
 4. Restart the gateway. Expect one `Pruning static-era watcher record`
    log line per old record — that is the clean break, not a fault.
 5. Recreate scheduled jobs against the new watcher names.
+
+## Changing a connector's server (or type)
+
+A persisted watcher record binds to a **platform room id**, and room ids are
+meaningful only on the server that minted them. If you point an existing
+connector name at a different server (a new `server.url`, or a different
+connector `type`), its old records will try to resume against rooms that do
+not exist there — each watcher reads `failed`, loudly, until it expires.
+
+When you migrate servers, do one of:
+
+- **rename the connector** — the old `state.<name>.json` is then reported by
+  `acg config validate` as belonging to no configured connector, and you can
+  delete it deliberately; or
+- **delete the state file** for that connector before the first start against
+  the new server.
+
+Session content does not survive a server move either way; export anything
+that matters first (checklist step 3).

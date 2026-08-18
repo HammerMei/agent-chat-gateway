@@ -38,7 +38,7 @@ from .state import (
 )
 from .state_store import StateStore
 from .watcher_lifecycle import WatcherLifecycle
-from .watcher_manager import RoomRef, WatcherManager
+from .watcher_manager import RoomRef, WatcherManager, first_matching_rule
 from .watcher_rule import RoomKind
 
 logger = logging.getLogger("agent-chat-gateway.core.session_manager")
@@ -285,16 +285,23 @@ class SessionManager:
                     # belt-and-braces, not a policy.
                     continue
                 name = pattern.raw
-                if any(p.matches(name) for p in rule.rooms.except_for):
-                    # The rule's own veto (Codex round 3): an included literal
-                    # that except_for also matches is DECLINED by the same
-                    # rule, and get_or_create would correctly answer None —
-                    # which the branch below would then misreport as a
-                    # startup failure on every boot. An intentional exclusion
-                    # is a no-op, not an error.
+                # The ORDERED first-match decision, not just this rule's own
+                # except_for (Codex rounds 6 and 12): an earlier rule that
+                # declines or claims this literal shadows this one — shadowed
+                # rules are valid config, only warned about — and
+                # get_or_create would correctly answer None, which the branch
+                # below then misreported as a startup failure on every boot.
+                # An intentional exclusion (or shadowing) is a no-op here.
+                probe = RoomRef(id="", kind=RoomKind.CHANNEL, name=name)
+                winner = first_matching_rule(
+                    self._watcher_rules, self._connector_name, probe)
+                if winner is not rule:
                     logger.info(
-                        "Rule '%s': room '%s' is excluded by the rule's own "
-                        "except_for — not started", rule.name, name,
+                        "Rule '%s': room '%s' is %s — not started here",
+                        rule.name, name,
+                        "excluded by an earlier (or this) rule's except_for"
+                        if winner is None
+                        else f"claimed by earlier rule '{winner.name}'",
                     )
                     continue
                 try:
