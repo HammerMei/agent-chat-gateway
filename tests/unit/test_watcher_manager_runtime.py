@@ -462,23 +462,30 @@ class TestConfigFromRecord(unittest.TestCase):
             config={"connector": "rc"})
         self.assertIsNone(config_from_record(record))
 
-    def test_a_garbled_nested_agent_falls_back_to_the_records_own(self):
-        """Codex round 14 (P1): a corrupted `config.agent` degraded to "" —
-        FALSY, so start's named-but-missing refusal never fired and
-        `_resolve_agent_name` substituted the default: the room silently ran
-        under a different backend and tool policy. `record.agent` is the
-        §5.3 frozen field every other consumer treats as authoritative."""
-        for garbled in ({"name": "w", "connector": "rc", "room": "x"},      # missing
-                        {"name": "w", "connector": "rc", "room": "x",
-                         "agent": ["not", "a", "string"]}):                  # wrong type
-            with self.subTest(config=garbled):
+    def test_identity_fields_rebuild_from_the_records_frozen_columns(self):
+        """Codex rounds 14+15 (P1s): the nested config's values are
+        untypechecked, and a corrupted `config.agent`/`config.name` —
+        missing, wrongly typed, or a VALID-BUT-DIFFERENT value — must never
+        win over the record's top-level frozen columns. A different nested
+        name forked a second record for one room (expiring the original then
+        deleted the live session); a different nested agent ran the room
+        under another backend and tool policy, silently."""
+        for garbled_agent in (None,                      # missing
+                              ["not", "a", "string"],    # wrong type
+                              "another-valid-agent"):    # conflicting value
+            with self.subTest(agent=garbled_agent):
+                config = {"name": "a-conflicting-name", "connector": "rc",
+                          "room": "x"}
+                if garbled_agent is not None:
+                    config["agent"] = garbled_agent
                 record = WatcherState(
-                    watcher_name="w", session_id="s", room_id="r1",
-                    agent="the-frozen-agent", config=garbled)
+                    watcher_name="the-frozen-name", session_id="s",
+                    room_id="r1", agent="the-frozen-agent", config=config)
                 wc = config_from_record(record)
                 self.assertEqual(wc.agent, "the-frozen-agent",
-                                 "the record's own frozen agent backstops the "
-                                 "garbled nested copy — never the default")
+                                 "the frozen agent column wins, always")
+                self.assertEqual(wc.name, "the-frozen-name",
+                                 "the frozen name column wins, always")
 
     def test_wrongly_typed_handoff_values_fall_back_to_defaults(self):
         record = WatcherState(

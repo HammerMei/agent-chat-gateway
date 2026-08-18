@@ -393,21 +393,26 @@ def config_from_record(record: WatcherState) -> WatcherConfig | None:
             if f.name in hh_raw and isinstance(hh_raw[f.name], type(f.default)):
                 hh_kwargs[f.name] = hh_raw[f.name]
     files = raw.get("context_inject_files")
+    # Identity fields rebuild from the record's TOP-LEVEL frozen columns,
+    # unconditionally (Codex rounds 14 and 15): the nested copies are inside
+    # a dict whose values `_record_from_dict` cannot type-check, so a
+    # hand-edited or value-corrupted `config.name`/`config.agent` — absent,
+    # wrongly typed, OR a valid-but-different value — must never win.
+    # A different nested NAME started and stored the watcher under a second
+    # record for the same room, and expiring the original then deleted the
+    # backend session the new one was using; a different nested AGENT ran
+    # the room under another backend and tool policy, silently. The
+    # top-level columns are what every other consumer (reclaim's identity
+    # checks, the uniqueness preflight, validate's warnings) already treats
+    # as authoritative, and materialize writes both copies from the same
+    # rule, so they agree on every honest record. `raw["name"]` above stays
+    # as the is-this-config-readable gate only.
     return WatcherConfig(
-        name=raw["name"],
+        name=record.watcher_name,
         connector=_str("connector"),
         room=_str("room"),
-        # The nested value, backstopped by the record's own frozen field
-        # (Codex round 14): a hand-edited or corrupted `config.agent` used to
-        # degrade to "" — which is FALSY, so start's named-but-missing agent
-        # refusal never fired and `_resolve_agent_name` substituted the
-        # default: the room silently ran under a different backend and tool
-        # policy instead of reading failed. `record.agent` is the §5.3
-        # frozen field every other consumer (reclaim, identity checks)
-        # already treats as authoritative; a normal record's two copies
-        # always agree because materialize writes both from the rule.
-        agent=_str("agent") or (record.agent if isinstance(record.agent, str)
-                                else ""),
+        agent=(record.agent if isinstance(record.agent, str) and record.agent
+               else _str("agent")),
         context_inject_files=[p for p in files if isinstance(p, str)]
         if isinstance(files, list) else [],
         online_notification=_str("online_notification") or None,
