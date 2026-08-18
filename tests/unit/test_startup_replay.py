@@ -258,7 +258,9 @@ class TestTheDownWindowSnapshot(unittest.IsolatedAsyncioTestCase):
         mgr = make_bare_session_manager()
         mgr._lifecycle.states = MagicMock(return_value={
             "keep": _dynamic_record(name="keep"),
-            "static": _dynamic_record(name="static", rule_name=""),
+            # Static = BOTH provenance fields empty (round 22): a damaged
+            # rule_name with a surviving config still replays.
+            "static": _dynamic_record(name="static", rule_name="", config={}),
             "fresh": _dynamic_record(name="fresh", last_processed_ts=""),
         })
 
@@ -423,7 +425,10 @@ class TestBootRunsTheSweepsEvaluation(unittest.IsolatedAsyncioTestCase):
         idle = _dynamic_record(name="i", room_id="r-i")
         idle.dropped_at = "2026-07-01T00:00:00-07:00"
         idle.last_activity_at = self._old
-        static = _dynamic_record(name="s", room_id="r-s", rule_name="", rule={})
+        # Static = BOTH provenance fields empty (round 22): a config-only
+        # record is now boot-eligible, so the untouchable case is truly bare.
+        static = _dynamic_record(name="s", room_id="r-s", rule_name="", rule={},
+                                 config={})
         static.last_activity_at = self._old
         roomless = _dynamic_record(name="r", room_id="")
         roomless.last_activity_at = self._old

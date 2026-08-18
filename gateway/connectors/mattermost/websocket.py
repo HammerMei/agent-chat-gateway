@@ -358,6 +358,15 @@ class MattermostWebSocketClient:
                         if asyncio.iscoroutine(result):
                             task = asyncio.create_task(result)
                             task.add_done_callback(_log_replay_failure)
+                            # Tracked like the channel workers (Codex round
+                            # 23): stop() must be able to harvest a replay
+                            # still fetching when shutdown or another drop
+                            # arrives — an untracked task could outlive
+                            # disconnect() and use a closed REST client, and
+                            # rapid reconnects could stack overlapping
+                            # replays.
+                            self._callback_tasks.add(task)
+                            task.add_done_callback(self._callback_tasks.discard)
                     except Exception:
                         logger.exception("Error in on_reconnect callback")
                 return

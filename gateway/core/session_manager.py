@@ -413,7 +413,9 @@ class SessionManager:
         stamped = 0
         for record in list(self._lifecycle.states().values()):
             if (
-                not record.rule_name
+                # Both-fields eligibility, same as the prune (round 22/23): a
+                # damaged rule_name with a surviving config still recreates.
+                not (record.rule_name or record.config)
                 or record.paused
                 or record.dropped_at
                 or not record.room_id
@@ -483,7 +485,7 @@ class SessionManager:
         return {
             ws.watcher_name: ws.last_processed_ts
             for ws in self._lifecycle.states().values()
-            if ws.rule_name and ws.last_processed_ts
+            if (ws.rule_name or ws.config) and ws.last_processed_ts
         }
 
     async def _replay_persisted_records(self, down_window: dict[str, str]) -> None:
