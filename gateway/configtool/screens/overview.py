@@ -452,7 +452,17 @@ class OverviewScreen(Screen):
             cfg.save()
         except (ValueError, FileNotFoundError) as exc:
             cfg.move_watcher_rule(new_index, -delta)  # swap straight back
-            self.notify(f"Could not move rule: {exc}", severity="error")
+            # Honest wording (owner-ratified): a pure swap reorders the same
+            # entries, and per-entry parse errors are order-independent — so
+            # a refusal here is BY CONSTRUCTION a pre-existing broken rule
+            # whose index-embedded message shifted, never a problem this
+            # move created. Say so, instead of letting the gate's generic
+            # "introduces a new problem" read as "your move broke something".
+            self.notify(
+                "Could not move rule — another rule is already broken (see "
+                f"its ERROR row) and blocks reordering; fix it first: {exc}",
+                severity="error",
+            )
             return
         app.reload_config()
         table = self.query_one("#rules-table", DataTable)

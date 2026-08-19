@@ -525,7 +525,10 @@ class TestReorderAroundABrokenRule:
         saves" intent, but the fix belongs to the gate/parser message
         contract, not to this tab — if this test starts failing because the
         move now SUCCEEDS, that contract changed: update the config-tool
-        docs' known-limitations note along with this test."""
+        docs' known-limitations note along with this test. (Owner-ratified
+        as not-a-bug, 2026-08-19; the refusal notify says outright that a
+        pre-existing broken rule blocks reordering — a pure swap cannot
+        genuinely introduce a new per-entry error.)"""
         config_path = _write_config(tmp_path, f"""\
             connectors:
               - name: rc
