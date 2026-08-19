@@ -67,6 +67,7 @@ from .form_common import (
     find_entries_referencing_template,
     get_nested,
     list_to_text,
+    list_value_is_lossy,
     read_widget_value,
     round_trip_value,
     set_widget_value,
@@ -170,6 +171,7 @@ class TemplateDetailScreen(ToolListEditorMixin, FormScreen):
 
     def _compute_initial_values(self, entry: dict) -> None:
         self._reset_keys = {}
+        self._lossy_list_values = {}
         dataclass_defaults = self._dataclass_defaults()
         for spec in self._field_specs():
             value = get_nested(entry, spec.key)
@@ -183,6 +185,11 @@ class TemplateDetailScreen(ToolListEditorMixin, FormScreen):
             # this line used to do, and covers the quoted-number and
             # delimiter-in-a-list-item cases it missed (a watcher template
             # can carry `session_idle_days: "15"` exactly as a rule can).
+            # Same delimiter-bearing-item guard the base implementation
+            # applies — a watcher/agent template can carry a
+            # context_inject_files path with a comma exactly as an entry can.
+            if spec.kind == "list" and list_value_is_lossy(value):
+                self._lossy_list_values[spec.key] = value
             self._initial_values[spec.key] = round_trip_value(spec, value)
         self._initial_values["description"] = entry.get("description")
 

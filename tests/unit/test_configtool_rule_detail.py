@@ -1238,3 +1238,105 @@ class TestCodexRound5Fixes:
             # the mistake this comment exists to stop being repeated.)
             body = str(app.screen.query_one("#rule-detail-body", Static).render())
             assert "eng-[ab]" in body
+
+
+class TestCodexRound6Fixes:
+    """Round 5 made an UNTOUCHED comma-bearing item safe; round 6 covers the
+    other half — editing the list for any reason used to re-split it."""
+
+    def _config_with(self, work_dir: Path, rooms_or_files: str) -> str:
+        return f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {work_dir}
+            watchers:
+              - name: comma-rule
+                connector: rc
+                agent: default
+{rooms_or_files}
+        """
+
+    async def test_appending_to_a_comma_bearing_pattern_list_is_refused_loudly(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, self._config_with(
+            work_dir,
+            '                rooms:\n                  include: ["team,one"]\n',
+        ))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_rule_row(pilot, app, row=0, key="e")
+            box = app.screen.query_one("#field-rooms-include", Input)
+            assert box.value == "team,one"
+            box.value = "team,one, new-room"     # the operator appends an item
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            assert isinstance(app.screen, MessageModal)
+            body = str(app.screen.query_one("#message-body").render())
+            assert "comma" in body and "EDITOR" in body
+            await pilot.press("enter")
+            await pilot.pause()
+            # Nothing written — the original single pattern survives intact.
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert raw["watchers"][0]["rooms"]["include"] == ["team,one"]
+
+    async def test_editing_a_comma_bearing_context_file_is_refused(
+        self, tmp_path, work_dir
+    ):
+        """The genuinely load-bearing case, and why this is fixed rather
+        than declined: a FILE PATH may legitimately contain a comma, and
+        splitting `my,notes.md` silently stops injecting the real file.
+        (A comma in a room pattern, by contrast, is provably inert — no
+        room name on either platform can contain one.)"""
+        (work_dir / "my,notes.md").write_text("hello")
+        config_path = _write_config(tmp_path, self._config_with(
+            work_dir,
+            '                context_inject_files: ["my,notes.md"]\n'
+            '                rooms:\n                  include: [general]\n',
+        ))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_rule_row(pilot, app, row=0, key="e")
+            box = app.screen.query_one("#field-context_inject_files", Input)
+            assert box.value == "my,notes.md"
+            box.value = "my,notes.md, other.md"
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            assert isinstance(app.screen, MessageModal)
+            await pilot.press("enter")
+            await pilot.pause()
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert raw["watchers"][0]["context_inject_files"] == ["my,notes.md"]
+
+    async def test_an_ordinary_list_field_still_edits_normally(
+        self, tmp_path, work_dir
+    ):
+        """The guard must not have been widened into 'list fields are
+        read-only' — only a delimiter-bearing item blocks."""
+        config_path = _write_config(tmp_path, self._config_with(
+            work_dir,
+            '                rooms:\n                  include: [general]\n',
+        ))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_rule_row(pilot, app, row=0, key="e")
+            app.screen.query_one("#field-rooms-include", Input).value = "general, dev"
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            assert isinstance(app.screen, OverviewScreen)
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert raw["watchers"][0]["rooms"]["include"] == ["general", "dev"]

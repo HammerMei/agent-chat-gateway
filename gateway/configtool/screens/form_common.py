@@ -115,6 +115,34 @@ def text_to_list(text: str) -> list[str]:
     return [part.strip() for part in text.split(",") if part.strip()]
 
 
+def list_value_is_lossy(value: object) -> bool:
+    """Does this list value contain an item the comma-joined box cannot
+    represent — i.e. an item containing the join delimiter itself?
+
+    `list_to_text`/`text_to_list` are only inverses while no item contains a
+    comma. Round-tripping the snapshot (see `round_trip_value`) keeps such an
+    item safe while the box is UNTOUCHED, but the moment the operator edits
+    the list for any reason the re-parse splits it (Codex review of #129,
+    round 6). Callers use this to refuse that edit loudly instead of
+    silently rewriting the item.
+
+    Reachability differs sharply by field, which is why this is fixed rather
+    than declined:
+
+    * For a ROOM PATTERN it is provably inert. Both platforms build room
+      names from slugs that exclude commas (Mattermost: lowercase
+      alphanumeric plus `-`/`_`; Rocket.Chat: `[0-9a-zA-Z-_.]+`), so a
+      literal `team,one` can never match any room, and a comma inside a
+      character class (`eng-[a,b]`) matches exactly what `eng-[ab]` does.
+    * For `context_inject_files` it is real: a filesystem path may
+      legitimately contain a comma, and splitting `my,notes.md` into `my`
+      and `notes.md` silently stops injecting the operator's actual file.
+    """
+    if not isinstance(value, (list, tuple)):
+        return False
+    return any("," in str(item) for item in value)
+
+
 def apply_update(entry: dict, dotted_key: str, value: object) -> None:
     """Write `value` (or clear, if None) into `entry` at `dotted_key`.
 
@@ -450,6 +478,12 @@ class FormScreen(DetailScreen):
         # via clearing the box to blank). If the widget has since changed
         # away from the reset value, normal diffing takes back over.
         self._reset_keys: dict[str, object] = {}
+        # list-kind fields whose RAW on-disk value contains the join
+        # delimiter, mapped to that raw value. The comma-joined box cannot
+        # represent them, so editing such a field is refused rather than
+        # silently re-split — see list_value_is_lossy(). Populated by
+        # _compute_initial_values(), consulted by _collect_field_updates().
+        self._lossy_list_values: dict[str, object] = {}
         # Input/Select fire their own Changed message once at initial mount
         # with whatever value the constructor was given (confirmed
         # empirically — Checkbox does not, but Input/Select do). Without this
@@ -605,6 +639,7 @@ class FormScreen(DetailScreen):
 
     def _compute_initial_values(self, entry: dict) -> None:
         self._reset_keys = {}  # fresh edit session — no lingering reset markers
+        self._lossy_list_values = {}
         try:
             merged = self.cfg.merged_entry(self._template_kind(), entry)
         except (ValueError, FileNotFoundError):
@@ -628,6 +663,8 @@ class FormScreen(DetailScreen):
             # item containing the join delimiter — are documented on
             # round_trip_value(), which is now the single place this
             # render-and-read-back agreement is expressed.
+            if spec.kind == "list" and list_value_is_lossy(value):
+                self._lossy_list_values[spec.key] = value
             self._initial_values[spec.key] = round_trip_value(spec, value)
         self._initial_values["description"] = entry.get("description")
 
@@ -645,6 +682,16 @@ class FormScreen(DetailScreen):
             f"[dim]({provenance_label(provenance, template_name)})[/dim]" if provenance else ""
         )
         initial = self._initial_values.get(spec.key)
+        # A delimiter-bearing list value is DISPLAYED raw, not round-tripped:
+        # the snapshot for `["my,notes.md"]` is the split `["my","notes.md"]`,
+        # which would render as `my, notes.md` and show two entries where the
+        # file has one — misrepresenting a load-bearing value (a path may
+        # legitimately contain a comma). The box therefore shows what is
+        # really on disk, and editing it is refused rather than re-split
+        # (see list_value_is_lossy()). Readback is unaffected: both spellings
+        # parse to the same list, so an untouched field still compares equal.
+        if spec.key in self._lossy_list_values:
+            initial = self._lossy_list_values[spec.key]
         # User-requested: a trailing '*' marks a field that's actually
         # required to Save right now — not obvious otherwise which fields
         # can be safely left blank.
@@ -1021,6 +1068,23 @@ class FormScreen(DetailScreen):
                 updates[spec.key] = None
                 continue
             if new_value != self._initial_values.get(spec.key):
+                # An edit to a list field whose raw value holds an item
+                # containing the join delimiter cannot be applied without
+                # silently re-splitting that item (the box has no way to
+                # express it). Refused loudly, via the same error path a
+                # bad int takes — see list_value_is_lossy(). An UNTOUCHED
+                # field never reaches here: its round-tripped snapshot
+                # equals the readback, so the comparison above is False.
+                raw = self._lossy_list_values.get(spec.key)
+                if raw is not None:
+                    self._last_field_error = (
+                        f"{spec.label}: this list contains an item with a "
+                        f"comma in it ({list_to_text(raw)!r}), which this "
+                        "comma-separated box cannot represent — editing it "
+                        "here would split that item in two. Edit this field "
+                        "in $EDITOR instead (ctrl+e on the list screen)."
+                    )
+                    return None
                 updates[spec.key] = new_value
 
         desc_widget = self.query_one("#field-description", Input)

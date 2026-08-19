@@ -25,6 +25,7 @@ from gateway.configtool.screens.form_common import (
     FieldSpec,
     find_referencing_watcher_labels,
     list_to_text,
+    list_value_is_lossy,
     read_widget_value,
     round_trip_value,
 )
@@ -353,3 +354,23 @@ class TestRoundTripValueEnumeratesEveryKind(unittest.TestCase):
         """Save is refused loudly on it either way; inventing a value here
         would be the silent rewrite this exists to stop."""
         self.assertEqual(round_trip_value(FieldSpec("i", "int", "I"), "abc"), "abc")
+
+
+class TestListValueIsLossy(unittest.TestCase):
+    """Which list values the comma-joined box cannot represent (Codex review
+    of #129, round 6)."""
+
+    def test_an_item_containing_the_delimiter_is_lossy(self):
+        self.assertTrue(list_value_is_lossy(["team,one"]))
+        self.assertTrue(list_value_is_lossy(["ok", "my,notes.md"]))
+
+    def test_ordinary_items_are_not_lossy(self):
+        self.assertFalse(list_value_is_lossy(["a", "b"]))
+        self.assertFalse(list_value_is_lossy([]))
+        self.assertFalse(list_value_is_lossy(None))
+
+    def test_a_non_list_is_not_lossy(self):
+        """A bare string or scalar renders as one item verbatim
+        (list_to_text) and is not split, so there is nothing to lose."""
+        self.assertFalse(list_value_is_lossy("notes.md"))
+        self.assertFalse(list_value_is_lossy(5))
