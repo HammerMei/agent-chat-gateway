@@ -67,6 +67,45 @@ class ConfigToolApp(App):
                 return
         self.exit()
 
+    def notify(  # type: ignore[override]
+        self,
+        message: str,
+        *,
+        title: str = "",
+        severity="information",
+        timeout: float | None = None,
+        markup: bool = False,
+    ) -> None:
+        """Notifications are PLAIN TEXT here — `markup` is FORCED off.
+
+        Textual parses notification text as Rich markup by default, and every
+        notification this app raises names operator-authored data (a rule,
+        connector, agent, template or preset name, or an exception message
+        quoting a config value). Two failures follow, both verified: a name
+        like `[ab]` was swallowed whole (`Deleted rule ''.`), and one
+        spelling a closing tag (`[/]`) raised `MarkupError` from inside the
+        toast, so the notification that was supposed to report an outcome
+        killed the render instead.
+
+        Fixed here rather than at ~12 call sites: `Widget.notify()` delegates
+        to `App.notify()`, so one place covers every screen and modal in the
+        package, and a call site added later inherits it. Nothing here ever
+        wants markup in a toast — the styling comes from `severity`.
+
+        FORCED, not defaulted (Codex review of #129, round 9, catching round
+        8's own fix): `Widget.notify()` declares its own `markup: bool = True`
+        and forwards it EXPLICITLY, so a default here was overridden for every
+        `self.notify(...)` call from a screen — which is nearly all of them.
+        Only direct `app.notify(...)` calls were ever protected, and round 8's
+        test happened to use exactly that path, so it passed while the real
+        doors stayed open. The incoming value is therefore ignored on purpose;
+        the parameter is kept only so the signature stays substitutable.
+        """
+        del markup  # see above: never honoured, deliberately
+        super().notify(
+            message, title=title, severity=severity, timeout=timeout, markup=False
+        )
+
     # ── Shared, non-action helpers (called from OverviewScreen's actions) ───
 
     def run_validate(self) -> ValidationResult:

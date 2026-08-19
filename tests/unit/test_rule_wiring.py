@@ -29,7 +29,6 @@ from pathlib import Path
 
 from gateway.config import GatewayConfig, collect_config
 from gateway.config_validate import validate_config
-from gateway.configtool.model import EditableConfig
 
 HEADER = """\
 connectors:
@@ -229,34 +228,6 @@ class TestShadowingIsReportedAsAWarning(unittest.TestCase):
               rooms: {include: ["*"]}
             """))
         self.assertEqual(result.warnings, [])
-
-
-class TestTheConfigToolSkipsRulesKnowingly(unittest.TestCase):
-    """A rule is not an expanded watcher and never becomes one in that table.
-
-    It must be skipped by shape, not by letting the static parser reject it: post
-    wiring a rule is *valid* config, so nothing reports an issue for it, and relying
-    on the parser would leave a legal entry with no row and no explanation anywhere.
-    """
-
-    def test_a_leftover_static_entry_still_expands_in_the_tool(self):
-        """The TUI's own loader keeps reading the static shape until
-        `impl/config-tooling` rewrites it — the runtime loader refuses the
-        same entry (see TestStaticShapeIsAHardError), and that inconsistency
-        is the integration branch's accepted state, not this test's subject."""
-        path = write_config("""\
-            - {room: general, connector: rc-first}
-            - name: eng-rooms
-              connector: mm-second
-              rooms: {include: ["eng-*"]}
-            """)
-        cfg = EditableConfig.load(path)
-        expanded = cfg.expanded_watchers()
-        self.assertEqual([e.watcher.room for e in expanded], ["general"])
-
-    def test_a_rules_only_config_yields_no_rows_rather_than_failing(self):
-        cfg = EditableConfig.load(write_config(ONE_RULE))
-        self.assertEqual(cfg.expanded_watchers(), [])
 
 
 if __name__ == "__main__":

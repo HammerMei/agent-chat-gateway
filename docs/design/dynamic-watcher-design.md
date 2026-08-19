@@ -2151,6 +2151,17 @@ path that would need maintaining and testing indefinitely.
 
 ### 5.5 Config tooling
 
+> **Amended at implementation (`impl/config-tooling`, 2026-08-18):** the
+> Rules tab shipped as specified below. The **Sessions tab is deferred** by
+> owner decision — the config tool operates on `config.yaml` only and never
+> talks to the control socket; runtime observability stays in `acg list`,
+> and the session verbs (`pause`/`resume`/`reset`/`expire`) stay CLI-only
+> permanently. Of the four display states, only the two that concern the
+> config side remain applicable (valid config → Rules; unparseable → the
+> error banner). The delete-rule warning survives without the daemon: the
+> stranded-session and orphaned-job counts are read directly from the
+> persisted `state.<connector>.json` / `data/jobs.json` files, read-only.
+
 Split the single Watchers view into a config-backed **Rules** tab and a
 runtime-backed **Sessions** tab. Editing a rule and acting on a session are
 different operations on different sources of truth; sharing one screen is

@@ -1,10 +1,10 @@
 """Shared machinery for the config TUI's entity edit/create forms.
 
-`AgentDetailScreen` was the first (Phase 2); `ConnectorDetailScreen` is the
-second, and `WatcherDetailScreen` (Phase 3) will be the third. Extracted
-here once a second concrete user existed, rather than guessed at up front —
-code review item 10 already flagged the cost of letting screens duplicate
-this kind of machinery independently.
+`AgentDetailScreen` was the first (Phase 2); `ConnectorDetailScreen` the
+second; `RuleDetailScreen` is the third. Extracted here once a second
+concrete user existed, rather than guessed at up front — code review item 10
+already flagged the cost of letting screens duplicate this kind of machinery
+independently.
 
 Implements docs/design/config-tool.md decision 2 ("editing an inherited
 field always writes an explicit per-entry override"): nothing is written to
@@ -48,10 +48,14 @@ from textual.containers import Horizontal, VerticalScroll
 from textual.css.query import NoMatches
 from textual.widgets import Checkbox, Footer, Header, Input, Select, Static
 
-from ..formatting import provenance_label
+from ..formatting import markup_safe, provenance_label
 from ..modals import ConfirmModal, MessageModal
 from ..model import EditableConfig, Provenance
 from .base import DetailScreen
+
+# Distinguishes "caller did not supply a provenance" from "provenance is
+# None" (a real value meaning: could not be computed) in _field_annotation().
+_UNSET = object()
 
 
 @dataclass(frozen=True)
@@ -84,13 +88,63 @@ def get_nested(d: dict, dotted_key: str) -> object:
 
 
 def list_to_text(value: object) -> str:
+    """Render a "list"-kind field's value for its Input box.
+
+    Anything that is not a genuine list/tuple renders as ONE item, because
+    the two ways a hand-edited config gets this wrong both used to fail
+    silently or loudly on the bare `for v in value` this replaces
+    (Codex review of #129, round 4 — pre-existing, and the same failure
+    pair `gateway/config.py`'s `_resolve_paths` documents at the loader):
+
+    * A truthy non-iterable (`rooms.include: 5`, `owners: 5`) raised
+      TypeError mid-compose, taking the whole TUI down on a row the
+      validator had just marked ERROR and invited the operator to repair.
+    * A bare string (`context_inject_files: notes.md`) was iterated **per
+      character**, displaying `n, o, t, e, s, ., m, d` — and saving that
+      box wrote eight bogus one-character paths over the operator's one
+      real value.
+
+    Both now show the value verbatim as a single item: visible, repairable,
+    and never silently rewritten. `save()`'s validate-before-write gate
+    remains the backstop for whatever the operator then types.
+    """
     if not value:
         return ""
-    return ", ".join(str(v) for v in value)
+    if isinstance(value, (list, tuple)):
+        return ", ".join(str(v) for v in value)
+    return str(value)
 
 
 def text_to_list(text: str) -> list[str]:
     return [part.strip() for part in text.split(",") if part.strip()]
+
+
+def list_value_is_lossy(value: object) -> bool:
+    """Does this list value contain an item the comma-joined box cannot
+    represent — i.e. an item containing the join delimiter itself?
+
+    `list_to_text`/`text_to_list` are only inverses while no item contains a
+    comma. Round-tripping the snapshot (see `round_trip_value`) keeps such an
+    item safe while the box is UNTOUCHED, but the moment the operator edits
+    the list for any reason the re-parse splits it (Codex review of #129,
+    round 6). Callers use this to refuse that edit loudly instead of
+    silently rewriting the item.
+
+    Reachability differs sharply by field, which is why this is fixed rather
+    than declined:
+
+    * For a ROOM PATTERN it is provably inert. Both platforms build room
+      names from slugs that exclude commas (Mattermost: lowercase
+      alphanumeric plus `-`/`_`; Rocket.Chat: `[0-9a-zA-Z-_.]+`), so a
+      literal `team,one` can never match any room, and a comma inside a
+      character class (`eng-[a,b]`) matches exactly what `eng-[ab]` does.
+    * For `context_inject_files` it is real: a filesystem path may
+      legitimately contain a comma, and splitting `my,notes.md` into `my`
+      and `notes.md` silently stops injecting the operator's actual file.
+    """
+    if not isinstance(value, (list, tuple)):
+        return False
+    return any("," in str(item) for item in value)
 
 
 def apply_update(entry: dict, dotted_key: str, value: object) -> None:
@@ -149,6 +203,62 @@ def read_widget_value(spec: FieldSpec, widget: object) -> object:
     return text or None
 
 
+class _ValueShim:
+    """Minimal stand-in for a widget, so `round_trip_value()` can reuse
+    `read_widget_value()` verbatim instead of restating its conversions."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: object) -> None:
+        self.value = value
+
+
+def round_trip_value(spec: FieldSpec, value: object) -> object:
+    """What a freshly-composed widget for `spec` would read back for `value`.
+
+    The snapshot `_compute_initial_values()` diffs against must be the
+    ROUND-TRIPPED value, not the raw one off disk, or an untouched field
+    reads as edited and Save rewrites it. Two confirmed ways that happened
+    (Codex review of #129, round 5 — one root cause, both verified against
+    the loader):
+
+    * A quoted number (`session_idle_days: "15"`) rendered as `15`, read
+      back as the int `15`, and compared unequal to the string `"15"`. That
+      entry does not parse at all, so merely pressing Save on an unrelated
+      field normalized it and took a rule that was inert **live** — a
+      routing change nobody asked for.
+    * A list item containing the join delimiter (`include: ["team,one"]` —
+      a comma is an ordinary literal in the pattern language) rendered as
+      `team,one` and read back as TWO patterns, `team` and `one`. Both
+      shapes load cleanly, so the save gate had nothing to object to and
+      the rule silently began claiming two different rooms.
+
+    Composing and reading are the pair that must agree, so this applies the
+    same render step `_compose_field_row()` uses and then
+    `read_widget_value()` itself. An unparseable value (`"abc"` in an int
+    field) is returned raw: Save is refused loudly on it either way, and
+    inventing a value here would be the silent rewrite this exists to stop.
+
+    Consequence worth stating: a malformed value cannot be repaired by
+    merely opening the form and saving — that is the point (it is what made
+    the rewrite silent). The row shows ERROR with the real message, and
+    `ctrl+e`/`$EDITOR` remains the documented way to fix the raw file.
+    """
+    if spec.kind == "bool":
+        return bool(value)
+    if spec.kind == "enum":
+        options = spec.options or ()
+        return value if value in options else (options or (None,))[0]
+    if spec.kind == "list":
+        text = list_to_text(value)
+    else:
+        text = "" if value is None else str(value)
+    try:
+        return read_widget_value(spec, _ValueShim(text))
+    except ValueError:
+        return value
+
+
 def set_widget_value(spec: FieldSpec, widget: object, value: object) -> None:
     """Set `widget`'s displayed value for `spec` — the inverse of
     `read_widget_value()`. Used by `action_reset_field()` to show what a
@@ -183,31 +293,55 @@ def sort_required_first(
 def find_referencing_watcher_labels(
     cfg: EditableConfig, *, connector_name: str | None = None, agent_name: str | None = None
 ) -> list[str]:
-    """Which EXPANDED watchers currently reference the given connector and/or
-    agent name — one label per real watcher, using `expanded_watchers()`
-    (the same real loader that names them everywhere else in the TUI, e.g.
-    the Overview's Watchers tab) rather than re-deriving names from the raw
-    entry. Two things this gets right that a raw-entry-only approach
-    wouldn't: (1) an unnamed watcher's real name is `_auto_watcher_name()`'s
-    `"<connector>-<room>"` (gateway/config.py), not the bare room string;
-    (2) a `rooms: [a, b]` group is N separate real watchers with N separate
-    names, not one joined "a, b" label. If the config doesn't currently
-    load at all, returns [] — `save()`'s own validation remains the backstop
-    for whatever's actually broken; a delete pre-check has nothing useful to
-    say about referencing watchers in a config that doesn't parse.
+    """Which watcher RULES currently reference the given connector and/or
+    agent name — one label per rule, labelled by the rule's own `name`
+    (required on a rule; a malformed entry without one falls back to its
+    document position). Checked against the MERGED view (entry resolved
+    against its own `inherits:` template) rather than the raw entry alone,
+    so a rule whose `connector:`/`agent:` comes only from a template still
+    blocks that connector/agent's deletion.
+
+    A rule with NO connector/agent anywhere references the loader's
+    FALLBACK entity (the first connector in document order;
+    `default_agent:` when set, the first agent otherwise) and blocks THAT
+    entity's deletion. Codex review of #129: an earlier version skipped
+    fallback rules on the theory that save()'s validation backstops the
+    deletion — but deleting the fallback entity leaves the config VALID
+    (the fallback silently rebinds to the next entity in line), so nothing
+    blocked and routing changed without a word. Silent rebinding is the
+    exact defect class `_resolve_watcher_connector`'s own docstring calls
+    worse than a crash.
     """
-    try:
-        expanded = cfg.expanded_watchers()
-    except (ValueError, FileNotFoundError):
-        return []
+    fallback_connector = (
+        cfg.connectors_raw[0].get("name") if cfg.connectors_raw else None
+    )
+    raw_default = cfg.document.get("default_agent")
+    fallback_agent = (
+        raw_default
+        if isinstance(raw_default, str) and raw_default in cfg.agents_raw
+        else next(iter(cfg.agents_raw), None)
+    )
     labels = []
-    for ew in expanded:
-        w = ew.watcher
-        if connector_name is not None and w.connector != connector_name:
+    # The UNFILTERED document list, not `watchers_raw` — the `watchers[i]`
+    # fallback label must use the same index space as every other consumer
+    # of that spelling (the Rules tab's row numbers, the validator's
+    # "(index i)"/"watchers[i]" attributions), and watchers_raw drops
+    # non-mapping entries, shifting its indices relative to all of those.
+    for i, entry in enumerate(cfg.watcher_entries):
+        if not isinstance(entry, dict):
             continue
-        if agent_name is not None and w.agent != agent_name:
+        try:
+            merged = cfg.merged_entry("watcher", entry)
+        except (ValueError, FileNotFoundError):
+            merged = entry
+        ref_connector = merged.get("connector") or fallback_connector
+        ref_agent = merged.get("agent") or fallback_agent
+        if connector_name is not None and ref_connector != connector_name:
             continue
-        labels.append(w.name)
+        if agent_name is not None and ref_agent != agent_name:
+            continue
+        name = entry.get("name")
+        labels.append(name if isinstance(name, str) and name else f"watchers[{i}]")
     return labels
 
 
@@ -261,22 +395,17 @@ def find_entries_referencing_template(
     elif kind == "connector":
         entries = [(e.get("name", "?"), e) for e in cfg.connectors_raw]
     else:
-        # Label with the REAL expanded watcher name(s) (matching
-        # `find_referencing_watcher_labels()`'s own naming, and the
-        # Watchers tab), not a synthetic "<connector>/<room>" guess — a raw
-        # entry with a `rooms:` group expands into several real watchers,
-        # matched back to this raw entry by identity (same pattern
-        # `ConnectorDetailScreen._find_own_index()` uses). Falls back to
-        # "?" only if the config doesn't currently load at all (blast-radius
-        # display has nothing better to say in that case either).
-        try:
-            expanded = cfg.expanded_watchers()
-        except (ValueError, FileNotFoundError):
-            expanded = []
+        # A rule's own `name` is required and unique (gateway/config.py's
+        # rule parser), so it IS the label — no expanded-name derivation
+        # left to do. A malformed entry without one falls back to its
+        # document position — the UNFILTERED document index, matching
+        # find_referencing_watcher_labels() and the validator's spellings.
         entries = []
-        for w in cfg.watchers_raw:
-            names = [ew.watcher.name for ew in expanded if ew.raw_entry is w]
-            label = ", ".join(names) if names else (w.get("name") or "?")
+        for i, w in enumerate(cfg.watcher_entries):
+            if not isinstance(w, dict):
+                continue
+            name = w.get("name")
+            label = name if isinstance(name, str) and name else f"watchers[{i}]"
             entries.append((label, w))
     return [(name, entry) for name, entry in entries if entry.get("inherits") == template_name]
 
@@ -353,6 +482,12 @@ class FormScreen(DetailScreen):
         # via clearing the box to blank). If the widget has since changed
         # away from the reset value, normal diffing takes back over.
         self._reset_keys: dict[str, object] = {}
+        # list-kind fields whose RAW on-disk value contains the join
+        # delimiter, mapped to that raw value. The comma-joined box cannot
+        # represent them, so editing such a field is refused rather than
+        # silently re-split — see list_value_is_lossy(). Populated by
+        # _compute_initial_values(), consulted by _collect_field_updates().
+        self._lossy_list_values: dict[str, object] = {}
         # Input/Select fire their own Changed message once at initial mount
         # with whatever value the constructor was given (confirmed
         # empirically — Checkbox does not, but Input/Select do). Without this
@@ -481,6 +616,16 @@ class FormScreen(DetailScreen):
         watchers instead)."""
         return "watcher"
 
+    def _delete_confirm_message(self) -> str:
+        """The ConfirmModal text `_do_delete()` shows. Overridable so a
+        subclass can append entity-specific consequences (RuleDetailScreen
+        adds the stranded-session/orphaned-job counts design §5.5 requires)
+        without duplicating the whole delete flow."""
+        return (
+            f"Delete {self._entity_noun()} '{markup_safe(self._entity_label())}'? "
+            "This cannot be undone."
+        )
+
     async def action_save(self) -> None:
         raise NotImplementedError
 
@@ -496,39 +641,69 @@ class FormScreen(DetailScreen):
 
     # ── generic field snapshot / provenance / row rendering ─────────────────
 
+    def _snapshot_source(self, entry: dict) -> dict:
+        """Which mapping `_compute_initial_values()` reads field values from.
+
+        The ONE thing that differed between this class's snapshot logic and
+        `TemplateDetailScreen`'s, which used to override the whole method to
+        change it — and that fork is what made a fix to field handling land
+        in one copy only (Codex review of #129, round 7: the raw
+        delimiter-bearing display reached the entry forms and not the
+        template form). Expressed as a hook so there is one implementation of
+        the snapshot itself.
+
+        An entry resolves against its `inherits:` template; a template has
+        nothing to resolve against (no nested templates), so it overrides
+        this to return the raw entry.
+        """
+        try:
+            return self.cfg.merged_entry(self._template_kind(), entry)
+        except (ValueError, FileNotFoundError):
+            return dict(entry)
+
     def _compute_initial_values(self, entry: dict) -> None:
         self._reset_keys = {}  # fresh edit session — no lingering reset markers
-        try:
-            merged = self.cfg.merged_entry(self._template_kind(), entry)
-        except (ValueError, FileNotFoundError):
-            merged = dict(entry)
+        self._lossy_list_values = {}
+        merged = self._snapshot_source(entry)
         dataclass_defaults = self._dataclass_defaults()
         for spec in self._field_specs():
             value = get_nested(merged, spec.key)
             if value is None:
                 value = dataclass_defaults.get(spec.key)
-            # read_widget_value() normalizes an untouched "str"/"list"-kind
-            # box that renders as EMPTY TEXT back to None — text_to_list("")
-            # or None for list, text.strip() or None for str — regardless of
-            # whether the effective value is None, "", or []. Without this
-            # same normalization here, a field whose true effective value is
-            # "" or [] (explicit, or absent and defaulting to one of those)
-            # would store that falsy-but-not-None value as its "initial"
-            # value, compare unequal to the widget's real untouched readback
-            # of None, and look spuriously "changed" — both to
-            # _collect_field_updates() (Save would write a no-op-shaped but
-            # semantically wrong explicit null onto an untouched field) and
-            # to _field_has_override() (a false-positive "you'll lose this
-            # edit" confirm when switching inherits: with nothing actually
-            # touched). "int"/"float" are deliberately excluded: an explicit
-            # `0`/`0.0` renders as the text "0" (non-empty), which reads back
-            # as the same number again — no mismatch there, and normalizing
-            # it away would introduce the exact same false positive in
-            # reverse.
-            if spec.kind in ("str", "list") and value is not None and not value:
-                value = None
-            self._initial_values[spec.key] = value
-        self._initial_values["description"] = entry.get("description")
+            # ROUND-TRIPPED, not raw: the snapshot has to be what a
+            # freshly-composed widget for this field would read back, or an
+            # untouched field compares unequal and Save rewrites it. This
+            # replaces (and subsumes) a narrower "str"/"list" falsy-to-None
+            # normalization that lived here: an effective value of "" or []
+            # renders as an empty box, whose readback is None, so the raw
+            # value looked "changed" to both _collect_field_updates() (Save
+            # writing a semantically wrong explicit null onto an untouched
+            # field) and _field_has_override() (a false-positive "you'll
+            # lose this edit" confirm on an inherits: switch). Two further
+            # cases the narrow version missed — a quoted number, and a list
+            # item containing the join delimiter — are documented on
+            # round_trip_value(), which is now the single place this
+            # render-and-read-back agreement is expressed.
+            if spec.kind == "list" and list_value_is_lossy(value):
+                self._lossy_list_values[spec.key] = value
+            self._initial_values[spec.key] = round_trip_value(spec, value)
+        # Coerced to TEXT, because `description` is informational and the
+        # loader does not type-check it — `description: [note]` loads fine
+        # (verified: 1 rule parsed, 0 issues) and then reached
+        # `Input(value=[...])`, which raises AttributeError DURING COMPOSE and
+        # takes the TUI down on the very row the operator opened to inspect
+        # it (Codex review of #129, round 9).
+        #
+        # Round-trip consistent, like every other snapshot here (see
+        # `round_trip_value`): the box shows `str(value)` and reads that same
+        # text back, so an untouched Save writes nothing and the odd on-disk
+        # value is preserved rather than silently repaired into a string.
+        raw_description = entry.get("description")
+        self._initial_values["description"] = (
+            raw_description
+            if raw_description is None or isinstance(raw_description, str)
+            else str(raw_description)
+        )
 
     def _field_provenance(self, spec: FieldSpec, entry: dict) -> Provenance | None:
         top_key = spec.key.split(".", 1)[0]
@@ -537,13 +712,44 @@ class FormScreen(DetailScreen):
         except (ValueError, FileNotFoundError):
             return None
 
-    def _compose_field_row(self, spec: FieldSpec, entry: dict) -> ComposeResult:
-        provenance = self._field_provenance(spec, entry)
+    def _field_annotation(
+        self, spec: FieldSpec, entry: dict, provenance: Provenance | None | object = _UNSET
+    ) -> str:
+        """The trailing annotation rendered beside `spec`'s widget.
+
+        The ONLY thing `TemplateDetailScreen`'s row rendering differed in,
+        which used to justify overriding the whole of `_compose_field_row()`
+        — the fork that let a field-handling fix land in one renderer only
+        (Codex review of #129, round 7). A hook instead, so there is one
+        renderer.
+
+        This class annotates with the field's PROVENANCE (explicit /
+        inherited / default); a template annotates with its BLAST RADIUS
+        instead, since its own fields have no provenance to speak of.
+        `provenance` may be passed explicitly by the live-refresh path,
+        which computes a would-be-on-Save value rather than the entry's
+        current one.
+        """
+        if provenance is _UNSET:
+            provenance = self._field_provenance(spec, entry)
+        if not provenance:
+            return ""
         template_name = self.cfg.entry_template_name(entry)
-        prov_text = (
-            f"[dim]({provenance_label(provenance, template_name)})[/dim]" if provenance else ""
-        )
+        return f"[dim]({provenance_label(provenance, template_name)})[/dim]"
+
+    def _compose_field_row(self, spec: FieldSpec, entry: dict) -> ComposeResult:
+        prov_text = self._field_annotation(spec, entry)
         initial = self._initial_values.get(spec.key)
+        # A delimiter-bearing list value is DISPLAYED raw, not round-tripped:
+        # the snapshot for `["my,notes.md"]` is the split `["my","notes.md"]`,
+        # which would render as `my, notes.md` and show two entries where the
+        # file has one — misrepresenting a load-bearing value (a path may
+        # legitimately contain a comma). The box therefore shows what is
+        # really on disk, and editing it is refused rather than re-split
+        # (see list_value_is_lossy()). Readback is unaffected: both spellings
+        # parse to the same list, so an untouched field still compares equal.
+        if spec.key in self._lossy_list_values:
+            initial = self._lossy_list_values[spec.key]
         # User-requested: a trailing '*' marks a field that's actually
         # required to Save right now — not obvious otherwise which fields
         # can be safely left blank.
@@ -555,7 +761,12 @@ class FormScreen(DetailScreen):
             elif spec.kind == "enum":
                 options = spec.options or ()
                 widget = Select(
-                    [(o, o) for o in options],
+                    # (label, value): the LABEL is escaped because Textual
+                    # renders it as markup inside the Select itself (a
+                    # connector/agent named `agent-[/]` raised MarkupError
+                    # from Select._watch_value, killing the form) — the VALUE
+                    # stays raw, since that is what gets written to config.
+                    [(markup_safe(o), o) for o in options],
                     value=initial if initial in options else (options or (None,))[0],
                     allow_blank=False,
                     id=widget_id(spec.key),
@@ -685,9 +896,11 @@ class FormScreen(DetailScreen):
             provenance = Provenance.EXPLICIT
         else:
             provenance = self._field_provenance(spec, entry)
-        template_name = self.cfg.entry_template_name(entry)
-        text = f"[dim]({provenance_label(provenance, template_name)})[/dim]" if provenance else ""
-        prov_widget.update(text)
+        # Through the same annotation hook the row was composed with, so a
+        # screen that annotates differently (a template's blast radius) has
+        # its annotation refreshed correctly instead of blanked by
+        # provenance logic that does not apply to it.
+        prov_widget.update(self._field_annotation(spec, entry, provenance))
 
     def action_reset_field(self) -> None:
         """ctrl+r: reset the FOCUSED field to its pure-template/dataclass
@@ -859,20 +1072,19 @@ class FormScreen(DetailScreen):
         if blockers:
             await self.app.push_screen_wait(
                 MessageModal(
+                    # Escaped: the blockers are RULE names now, which are
+                    # unrestricted strings (see markup_safe()).
                     f"Cannot delete {self._entity_noun()} "
-                    f"'{self._entity_label()}' — still used by "
-                    f"{self._delete_blocker_noun()}(s): {', '.join(blockers)}.",
+                    f"'{markup_safe(self._entity_label())}' — still used by "
+                    f"{self._delete_blocker_noun()}(s): "
+                    f"{', '.join(markup_safe(b) for b in blockers)}.",
                     title="Cannot delete",
                 )
             )
             return
 
         confirmed = await self.app.push_screen_wait(
-            ConfirmModal(
-                f"Delete {self._entity_noun()} '{self._entity_label()}'? "
-                "This cannot be undone.",
-                confirm_label="Delete",
-            )
+            ConfirmModal(self._delete_confirm_message(), confirm_label="Delete")
         )
         if not confirmed:
             return
@@ -883,7 +1095,7 @@ class FormScreen(DetailScreen):
             self.cfg.save()
         except (ValueError, FileNotFoundError) as exc:
             self._reinsert_entry_into_document()
-            await self.app.push_screen_wait(MessageModal(str(exc), title="Could not delete"))
+            await self.app.push_screen_wait(MessageModal(markup_safe(exc), title="Could not delete"))
             return
 
         self.app.pop_screen()
@@ -921,6 +1133,29 @@ class FormScreen(DetailScreen):
                 updates[spec.key] = None
                 continue
             if new_value != self._initial_values.get(spec.key):
+                # An edit to a list field whose raw value holds an item
+                # containing the join delimiter cannot be applied without
+                # silently re-splitting that item (the box has no way to
+                # express it). Refused loudly, via the same error path a
+                # bad int takes — see list_value_is_lossy(). An UNTOUCHED
+                # field never reaches here: its round-tripped snapshot
+                # equals the readback, so the comparison above is False.
+                raw = self._lossy_list_values.get(spec.key)
+                if raw is not None:
+                    # NOT escaped here: `_last_field_error` is escaped once
+                    # at its sink, where every producer's message is (round
+                    # 10). This message used to escape its own value too,
+                    # and the two together double-escaped it — the modal
+                    # displayed `my,\[/].md`, a backslash the file does not
+                    # contain. Escape at the boundary, exactly once.
+                    self._last_field_error = (
+                        f"{spec.label}: this list contains an item with a "
+                        f"comma in it ({list_to_text(raw)!r}), which this "
+                        "comma-separated box cannot represent — editing it "
+                        "here would split that item in two. Edit this field "
+                        "in $EDITOR instead (ctrl+e on the list screen)."
+                    )
+                    return None
                 updates[spec.key] = new_value
 
         desc_widget = self.query_one("#field-description", Input)

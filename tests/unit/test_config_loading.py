@@ -341,9 +341,11 @@ class TestConfigValidationHardening(unittest.TestCase):
             GatewayConfig.from_file(path)
 
     def test_non_string_watcher_room_raises_value_error_not_attribute_error(self):
-        """The plural 'rooms:' form validates each element already; this
-        singular alias didn't — a non-string 'room' (e.g. an int) reached
-        _sanitize_room_for_name()'s `room.startswith("@")` unchecked."""
+        """A non-string rooms.include element (e.g. an int) must be refused
+        as a clean ValueError, never an AttributeError/TypeError escaping
+        into the loader. (Originally pinned against the deleted static
+        parser's `room:` alias; kept because the rule shape's pattern
+        parsing owes the same contract.)"""
         path = self._write_config("""\
             connectors:
               - name: rc

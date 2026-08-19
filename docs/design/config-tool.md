@@ -21,6 +21,36 @@ blocks alongside Phase 1, specifically so annotations survive a future
 TUI-driven save without needing YAML-comment preservation (see "YAML I/O"
 below).
 
+> **Rules rewrite (done, `impl/config-tooling`):** the dynamic-watcher cutover
+> made a `watchers:` entry a *rule* (name + connector + agent + a `rooms:`
+> matcher — `gateway/core/watcher_rule.py`) and the static shape a hard load
+> error, so the Watchers tab and everything Phase 3 built around the static
+> shape (the two-tier edit rule, merge-on-add/split-on-edit,
+> `add_watcher_rooms()`/`remove_watcher_room()`, "Clone for rooms",
+> `_parse_one_watcher_entry()`) was deleted rather than adapted — the data
+> shape those mechanisms reconciled no longer exists. In its place:
+>
+> - A **Rules tab** — one row per raw rule, keyed and displayed by **list
+>   index** (order is load-bearing: first match wins), never sorted. `[`/`]`
+>   move the rule under the cursor (persisted through the normal save gate).
+> - `RuleDetailScreen` — a plain one-entry form using the same trial-entry
+>   install/rollback pattern `ConnectorDetailScreen` uses; rule `name` is
+>   editable (nothing in config references a rule by name).
+> - Status lookups go through `StatusIndex.status_for_rule()`, which bridges
+>   the three entity-name spellings a rule's findings can carry (its own
+>   name, `(index i)`, `watchers[i]`) — the old tab's key mismatch is how
+>   broken rows used to display OK.
+> - Deleting a rule warns with the persisted session records and scheduled
+>   jobs it strands, counted **read-only off the daemon's files**
+>   (`gateway/configtool/state_peek.py`).
+> - The **Sessions tab** of dynamic-watcher-design §5.5 is deferred (owner
+>   decision 2026-08-18): the config tool operates on `config.yaml` only —
+>   it never talks to the control socket; runtime observability and the
+>   pause/resume/reset/expire verbs stay in the CLI (`acg list` etc.).
+>
+> The Phase 3 sections below are kept as the design record of the static-era
+> tool; where they contradict this block, this block wins.
+
 > **v0.3 reconciliation (done):** the real config loader (`gateway/config.py`)
 > removed `connector_defaults`/`agent_defaults`/`watcher_defaults` entirely in
 > favor of named `connector_templates`/`agent_templates`/`watcher_templates` +

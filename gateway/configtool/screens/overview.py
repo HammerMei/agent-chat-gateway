@@ -1,22 +1,29 @@
 """OverviewScreen — the config TUI's root screen.
 
-Five tabs: Connectors, Agents, Watchers, Templates, Tool Presets — the
+Five tabs: Connectors, Agents, Rules, Templates, Tool Presets — the
 latter two are first-class per docs/design/config-tool.md (shared
 resources, not footnotes). Selecting a row (Enter) pushes a *DetailScreen in
-view mode. 'e'/'d' on the Connectors/Agents/Templates tabs act directly on
-the row under the cursor — edit opens straight into edit mode (no view
-detour), delete runs the same confirm/referencing-watcher-check/save flow
-FormScreen.action_delete() already has, without requiring a screen push
-first (user-reported: 'e' used to be shadowed by this screen's OWN 'e'
-binding for the $EDITOR escape hatch — see action_edit_config() below, now
-on ctrl+e). 'n' (new_entity) creates an entry on the active tab — Agents/
-Connectors/Templates/Tool Presets support it; Watchers still notifies
-rather than doing nothing or crashing (Phase 3). 'd' additionally deletes
-the whole preset under the cursor on the Tool Presets tab (there's no
-separate "edit mode" to give 'e' a meaning there — see tool_presets.py), and
-the whole template under the cursor on the Templates tab (same reasoning —
-a template has no separate "edit mode" distinct from "edit this named
-entity," see template_detail.py).
+view mode. 'e'/'d' act directly on the row under the cursor — edit opens
+straight into edit mode (no view detour), delete runs the same
+confirm/referencing-check/save flow FormScreen.action_delete() already has,
+without requiring a screen push first (user-reported: 'e' used to be
+shadowed by this screen's OWN 'e' binding for the $EDITOR escape hatch —
+see action_edit_config() below, now on ctrl+e). 'n' (new_entity) creates an
+entry on the active tab. 'd' additionally deletes the whole preset under
+the cursor on the Tool Presets tab (there's no separate "edit mode" to give
+'e' a meaning there — see tool_presets.py), and the whole template under
+the cursor on the Templates tab (same reasoning — a template has no
+separate "edit mode" distinct from "edit this named entity," see
+template_detail.py).
+
+The Rules tab (design §5.5) shows one row per `watchers:` RULE, keyed and
+displayed by LIST INDEX — order is load-bearing (first match wins, §2.1),
+which is why this is the one tab NOT sorted by name, and why '['/']' move
+the rule under the cursor up/down (persisted immediately, like every other
+direct list mutation here). The runtime side — which sessions each rule has
+actually materialized — is deliberately NOT shown here: the config tool
+operates on config.yaml only (owner decision 2026-08-18); `acg list` is the
+runtime view.
 
 The Templates tab (v0.3 redesign) replaced the old Defaults tab (a fixed,
 un-creatable, 3-row-per-kind global-block view) — it's now a flat list of
@@ -39,25 +46,25 @@ from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Static, TabbedContent, TabPane
 
 from ...config_validate import ValidationResult
-from ..formatting import status_badge
+from ..formatting import markup_safe, status_badge
 from ..modals import ConfirmModal, MessageModal, TextPromptModal, TypePickerModal
-from ..model import ExpandedWatcher, StatusIndex
+from ..model import StatusIndex
 from .agent_detail import AgentDetailScreen
 from .connector_detail import CONNECTOR_TYPE_PICKER_OPTIONS, ConnectorDetailScreen
 from .form_common import find_agents_referencing_preset, find_entries_referencing_template
+from .rule_detail import RuleDetailScreen, rule_rooms_summary
 from .template_detail import TEMPLATE_KINDS, TemplateDetailScreen
 from .tool_presets import ToolPresetsScreen
-from .watcher_detail import WatcherDetailScreen
 
 _AGENT_TYPES = ("claude", "opencode")
 
 # Tab IDs in display order — used by action_previous_tab()/action_next_tab()
 # to wrap around, and to look up each tab's own DataTable id for focusing.
-_TAB_ORDER = ("tab-connectors", "tab-agents", "tab-watchers", "tab-templates", "tab-presets")
+_TAB_ORDER = ("tab-connectors", "tab-agents", "tab-rules", "tab-templates", "tab-presets")
 _TABLE_ID_FOR_TAB = {
     "tab-connectors": "connectors-table",
     "tab-agents": "agents-table",
-    "tab-watchers": "watchers-table",
+    "tab-rules": "rules-table",
     "tab-templates": "templates-table",
     "tab-presets": "presets-table",
 }
@@ -116,12 +123,14 @@ class OverviewScreen(Screen):
         # the footer doesn't advertise a no-op.
         Binding("e", "edit_row", "Edit", show=True),
         Binding("d", "delete_row", "Delete", show=True),
-        # Watchers tab only (see check_action() below) — user-requested:
-        # WatcherDetailScreen's own "Clone for rooms" action ('c') used to
-        # only be reachable after opening a specific watcher first; this
-        # lets the row under the cursor be cloned directly from the list,
-        # same shortcut precedent as edit_row/delete_row above.
-        Binding("c", "clone_for_rooms", "Clone for rooms", show=True),
+        # Rules tab only (see check_action() below): rule order is
+        # load-bearing (first match wins), so the list must be able to
+        # express it — without these, reordering means a trip to $EDITOR.
+        # Plain printable keys, not shift+up/down: a modifier-arrow chord is
+        # exactly the kind of binding real-terminal testing has already
+        # shown to be unreliable here (see FormScreen's tab-binding comment).
+        Binding("[", "move_rule_up", "Move rule up", show=True),
+        Binding("]", "move_rule_down", "Move rule down", show=True),
         # User-requested: focus starts on the list itself (see on_mount()),
         # not the tab bar, so left/right must be able to switch tabs WITHOUT
         # the user first moving focus off the list. priority=True is
@@ -148,8 +157,8 @@ class OverviewScreen(Screen):
                     yield DataTable(id="connectors-table", cursor_type="row")
                 with TabPane("Agents", id="tab-agents"):
                     yield DataTable(id="agents-table", cursor_type="row")
-                with TabPane("Watchers", id="tab-watchers"):
-                    yield DataTable(id="watchers-table", cursor_type="row")
+                with TabPane("Rules", id="tab-rules"):
+                    yield DataTable(id="rules-table", cursor_type="row")
                 with TabPane("Templates", id="tab-templates"):
                     yield DataTable(id="templates-table", cursor_type="row")
                 with TabPane("Tool Presets", id="tab-presets"):
@@ -162,7 +171,7 @@ class OverviewScreen(Screen):
         # validate_config() a second time.
         self._last_validate_result: ValidationResult | None = None
         for table_id in (
-            "#connectors-table", "#agents-table", "#watchers-table",
+            "#connectors-table", "#agents-table", "#rules-table",
             "#templates-table", "#presets-table",
         ):
             self.query_one(table_id, DataTable).cursor_type = "row"
@@ -210,22 +219,19 @@ class OverviewScreen(Screen):
         Presets: user-requested, for consistency with every other tab —
         'e' here is just an alias for Enter (see action_edit_row()'s own
         docstring; ToolPresetsScreen still has no separate "edit mode" to
-        enter, see tool_presets.py). Watchers (Phase 3): 'e'/'d' edit/delete
-        the row's own single expanded watcher directly — see
-        action_edit_row()/action_delete_row()'s watchers-tab branches for
-        exactly what that means for a watcher that's part of a shared
-        rooms: group."""
+        enter, see tool_presets.py). '['/']' (move rule up/down) only mean
+        anything where order is load-bearing — the Rules tab."""
         active_tab = self.query_one(TabbedContent).active
         if action == "edit_row":
             return active_tab in (
-                "tab-connectors", "tab-agents", "tab-watchers", "tab-templates", "tab-presets",
+                "tab-connectors", "tab-agents", "tab-rules", "tab-templates", "tab-presets",
             )
         if action == "delete_row":
             return active_tab in (
-                "tab-connectors", "tab-agents", "tab-watchers", "tab-templates", "tab-presets",
+                "tab-connectors", "tab-agents", "tab-rules", "tab-templates", "tab-presets",
             )
-        if action == "clone_for_rooms":
-            return active_tab == "tab-watchers"
+        if action in ("move_rule_up", "move_rule_down"):
+            return active_tab == "tab-rules"
         return True
 
     def action_edit_config(self) -> None:
@@ -297,14 +303,22 @@ class OverviewScreen(Screen):
             if entry is None:
                 return
             screen = AgentDetailScreen(cfg, key, entry, mode="edit")
-        elif active_tab == "tab-watchers":
-            key = self._cursor_row_key("watchers-table")
+        elif active_tab == "tab-rules":
+            key = self._cursor_row_key("rules-table")
             if key is None:
                 return
-            ew = self._expanded_watcher_for_key(cfg, key)
-            if ew is None:
+            entry = self._rule_entry_for_key(cfg, key)
+            if entry is None:
+                self._notify_malformed_rule_row(cfg, key)
                 return
-            screen = WatcherDetailScreen(cfg, ew, mode="edit")
+            # Composing the edit form with zero connectors/agents would
+            # crash mid-compose (empty Select) — see
+            # RuleDetailScreen.missing_prerequisites().
+            message = RuleDetailScreen.missing_prerequisites(cfg)
+            if message is not None:
+                self.notify(message, severity="error")
+                return
+            screen = RuleDetailScreen(cfg, entry, mode="edit")
         elif active_tab == "tab-templates":
             row_key = self._cursor_row_key("templates-table")
             if row_key is None:
@@ -377,14 +391,19 @@ class OverviewScreen(Screen):
             if entry is None:
                 return
             screen = AgentDetailScreen(cfg, key, entry, mode="view")
-        elif active_tab == "tab-watchers":
-            key = self._cursor_row_key("watchers-table")
+        elif active_tab == "tab-rules":
+            key = self._cursor_row_key("rules-table")
             if key is None:
                 return
-            ew = self._expanded_watcher_for_key(cfg, key)
-            if ew is None:
+            entry = self._rule_entry_for_key(cfg, key)
+            if entry is None:
+                # A non-mapping entry has no detail screen to route the
+                # delete through, but it still deserves 'd' — it renders as
+                # an ERROR row on purpose, and "visible but unremovable" is
+                # half a fix (Codex review of #129, round 3).
+                await self._delete_malformed_rule_entry(cfg, key)
                 return
-            screen = WatcherDetailScreen(cfg, ew, mode="view")
+            screen = RuleDetailScreen(cfg, entry, mode="view")
         else:
             return
 
@@ -406,39 +425,136 @@ class OverviewScreen(Screen):
             # them back to the list instead, same as Escape would.
             self.app.pop_screen()
 
-    @work
-    async def action_clone_for_rooms(self) -> None:
-        """'c' on the Watchers tab: run the row under the cursor's own
-        "Clone for rooms" bulk-add directly, no "open the watcher first"
-        detour. Pushes WatcherDetailScreen in view mode SILENTLY (mirroring
-        action_delete_row()'s identical shape immediately above), invokes
-        its own _do_clone_for_rooms() as a plain coroutine (same
-        nested-@work-worker fragility reasoning as _do_delete()'s call site),
-        then pops back to the list regardless of outcome — a successful
-        clone already pops itself (WatcherDetailScreen.action_clone_for_rooms()'s
-        own success path), so the extra pop_screen() below only fires for
-        the cancelled/no-op/blocked paths, where staying on a screen the
-        user never asked to see would strand them."""
+    async def _delete_malformed_rule_entry(self, cfg, key: str) -> None:
+        """Delete a NON-MAPPING `watchers:` entry by its list index — the one
+        row shape RuleDetailScreen cannot represent (there is no dict to
+        open a form on). Inline confirm + save + rollback, same shape as
+        _delete_preset_row(). A stale index (the table shrank on disk since
+        the paint) or a row that IS a mapping falls through silently — the
+        mapping case is handled by the normal detail-screen path."""
+        watchers = cfg.watcher_entries
+        index = int(key)
+        if not (0 <= index < len(watchers)) or isinstance(watchers[index], dict):
+            return
+        confirmed = await self.app.push_screen_wait(
+            ConfirmModal(
+                f"Row #{index + 1} is not a rule at all (a malformed, "
+                "non-mapping entry — often stray YAML). Delete it? This "
+                "cannot be undone.",
+                confirm_label="Delete",
+            )
+        )
+        if not confirmed:
+            return
+        was_dirty = cfg.dirty  # see _move_rule()'s note
+        removed = watchers.pop(index)
+        cfg.mark_dirty()
+        try:
+            cfg.save()
+        except (ValueError, FileNotFoundError) as exc:
+            watchers.insert(index, removed)
+            cfg.dirty = was_dirty
+            # Same known limitation the reorder refusal carries, and the
+            # same owner ruling (2026-08-19): a removal renumbers every
+            # LATER entry, so another broken rule below this row has its
+            # index-embedded error message shift and the gate reads the
+            # pre-existing problem as newly introduced. Not fixed at the
+            # gate (that is the parser-message contract, out of this
+            # increment); made honest here and documented in
+            # docs/config-tool.md — repair several broken rows bottom-up,
+            # or fix them in one $EDITOR pass.
+            await self.app.push_screen_wait(
+                MessageModal(
+                    "Could not delete — another rule further down the file "
+                    "has a pre-existing error, and removing this row shifts "
+                    "its position, which the save safety-gate reads as a new "
+                    "problem. Delete the LOWEST ERROR row first, or fix them "
+                    f"together in $EDITOR (ctrl+e).\n\n{markup_safe(exc)}",
+                    title="Could not delete",
+                )
+            )
+            return
+        self.notify("Deleted the malformed entry.", severity="information")
+        app: "ConfigToolApp" = self.app  # type: ignore[assignment]
+        app.reload_config()
+
+    def _notify_malformed_rule_row(self, cfg, key: str) -> bool:
+        """True (and a pointer notify) when the row under `key` is a
+        non-mapping entry — Enter/'e' have no form to open for it, and a
+        silent no-op reads as a dead key (Codex review of #129, round 3)."""
+        watchers = cfg.watcher_entries
+        index = int(key)
+        if 0 <= index < len(watchers) and not isinstance(watchers[index], dict):
+            self.notify(
+                "This entry is not a rule mapping — there is no form to "
+                "open. Press 'd' to delete it, or repair it in $EDITOR "
+                "(ctrl+e).",
+                severity="warning",
+            )
+            return True
+        return False
+
+    def action_move_rule_up(self) -> None:
+        self._move_rule(-1)
+
+    def action_move_rule_down(self) -> None:
+        self._move_rule(+1)
+
+    def _move_rule(self, delta: int) -> None:
+        """'['/']' on the Rules tab: swap the rule under the cursor with its
+        neighbour and persist immediately (same direct-mutation-then-save
+        shape as _delete_preset_row()). Rule order is load-bearing — first
+        match wins — so a move is a REAL semantic change, not cosmetics; it
+        goes through save()'s validate-before-write gate like every other
+        mutation, and a rejected save swaps straight back. On success the
+        cursor follows the rule to its new position (row coordinate ==
+        list index on this tab, the one tab displayed in document order)."""
         app: "ConfigToolApp" = self.app  # type: ignore[assignment]
         cfg = app.editable_config
         if cfg is None:
             self.notify("Config does not currently load.", severity="error")
             return
-
-        if self.query_one(TabbedContent).active != "tab-watchers":
+        if self.query_one(TabbedContent).active != "tab-rules":
             return
-        key = self._cursor_row_key("watchers-table")
+        key = self._cursor_row_key("rules-table")
         if key is None:
             return
-        ew = self._expanded_watcher_for_key(cfg, key)
-        if ew is None:
+        index = int(key)
+        # Captured BEFORE the mutation: rolling the document back restores it
+        # byte-for-byte, but both the move and the counter-move call
+        # mark_dirty(), so the flag stayed True and the quit gate then asked
+        # the operator to discard changes that no longer exist (Codex review
+        # of #129, round 8).
+        was_dirty = cfg.dirty
+        new_index = cfg.move_watcher_rule(index, delta)
+        if new_index is None:
+            return  # already at the edge — nothing to do
+        try:
+            cfg.save()
+        except (ValueError, FileNotFoundError) as exc:
+            cfg.move_watcher_rule(new_index, -delta)  # swap straight back
+            cfg.dirty = was_dirty
+            # Honest wording (owner-ratified): a pure swap reorders the same
+            # entries, and per-entry parse errors are order-independent — so
+            # a refusal here is BY CONSTRUCTION a pre-existing broken rule
+            # whose index-embedded message shifted, never a problem this
+            # move created. Say so, instead of letting the gate's generic
+            # "introduces a new problem" read as "your move broke something".
+            # "This or another" (Codex review of #129): ERROR rows keep the
+            # move bindings, so the broken rule under the cursor itself is a
+            # normal way to arrive here — blaming "another rule" then sends
+            # the user hunting for a culprit that is the row they're on.
+            self.notify(
+                "Could not move rule — a rule with a pre-existing error "
+                "(this one or another; see the ERROR rows) blocks "
+                f"reordering. Fix it first: {exc}",
+                severity="error",
+            )
             return
-
-        screen = WatcherDetailScreen(cfg, ew, mode="view")
-        self.app.push_screen(screen)
-        await screen._do_clone_for_rooms()
-        if self.app.screen is screen:
-            self.app.pop_screen()
+        app.reload_config()
+        table = self.query_one("#rules-table", DataTable)
+        if 0 <= new_index < table.row_count:
+            table.move_cursor(row=new_index)
 
     async def _delete_preset_row(self, cfg) -> None:
         """Delete the WHOLE preset under the cursor on the Tool Presets tab
@@ -457,8 +573,8 @@ class OverviewScreen(Screen):
         if used_by:
             await self.app.push_screen_wait(
                 MessageModal(
-                    f"Cannot delete tool preset '{key}' — still used by agent(s): "
-                    f"{', '.join(used_by)}.",
+                    f"Cannot delete tool preset '{markup_safe(key)}' — still used "
+                    f"by agent(s): {', '.join(markup_safe(u) for u in used_by)}.",
                     title="Cannot delete",
                 )
             )
@@ -466,7 +582,7 @@ class OverviewScreen(Screen):
 
         confirmed = await self.app.push_screen_wait(
             ConfirmModal(
-                f"Delete tool preset '{key}'? This cannot be undone.",
+                f"Delete tool preset '{markup_safe(key)}'? This cannot be undone.",
                 confirm_label="Delete",
             )
         )
@@ -481,7 +597,7 @@ class OverviewScreen(Screen):
         except (ValueError, FileNotFoundError) as exc:
             if removed is not None:
                 presets[key] = removed
-            await self.app.push_screen_wait(MessageModal(str(exc), title="Could not delete"))
+            await self.app.push_screen_wait(MessageModal(markup_safe(exc), title="Could not delete"))
             return
 
         self.notify(f"Deleted tool preset '{key}'.", severity="information")
@@ -507,8 +623,9 @@ class OverviewScreen(Screen):
         if used_by:
             await self.app.push_screen_wait(
                 MessageModal(
-                    f"Cannot delete {kind} template '{name}' — still used by "
-                    f"{kind}(s): {', '.join(used_by)}.",
+                    f"Cannot delete {kind} template '{markup_safe(name)}' — still "
+                    f"used by {kind}(s): "
+                    f"{', '.join(markup_safe(u) for u in used_by)}.",
                     title="Cannot delete",
                 )
             )
@@ -516,7 +633,7 @@ class OverviewScreen(Screen):
 
         confirmed = await self.app.push_screen_wait(
             ConfirmModal(
-                f"Delete {kind} template '{name}'? This cannot be undone.",
+                f"Delete {kind} template '{markup_safe(name)}'? This cannot be undone.",
                 confirm_label="Delete",
             )
         )
@@ -531,7 +648,7 @@ class OverviewScreen(Screen):
         except (ValueError, FileNotFoundError) as exc:
             if removed is not None:
                 templates[name] = removed
-            await self.app.push_screen_wait(MessageModal(str(exc), title="Could not delete"))
+            await self.app.push_screen_wait(MessageModal(markup_safe(exc), title="Could not delete"))
             return
 
         self.notify(f"Deleted {kind} template '{name}'.", severity="information")
@@ -541,7 +658,7 @@ class OverviewScreen(Screen):
     @work
     async def action_new_entity(self) -> None:
         """'n' — scoped to whichever tab is active. Agents, Connectors,
-        Watchers, and Tool Presets support creation. Unsupported tabs just
+        Rules, and Tool Presets support creation. Unsupported tabs just
         notify, rather than doing nothing silently or crashing."""
         app: "ConfigToolApp" = self.app  # type: ignore[assignment]
         if app.editable_config is None:
@@ -567,12 +684,18 @@ class OverviewScreen(Screen):
             self.app.push_screen(
                 ConnectorDetailScreen(app.editable_config, {"type": connector_type}, mode="create")
             )
-        elif active_tab == "tab-watchers":
+        elif active_tab == "tab-rules":
             # No type picker, no EntityPickerModal detour — connector/agent
             # are two plain Select dropdowns directly in the create form
             # itself (docs/design/config-tool.md's Phase 3 owner decision),
-            # same as everything else this screen needs to know.
-            self.app.push_screen(WatcherDetailScreen(app.editable_config, None, mode="create"))
+            # same as everything else this screen needs to know. Which is
+            # also why creation needs both to exist first — an empty Select
+            # crashes at compose (see missing_prerequisites()).
+            message = RuleDetailScreen.missing_prerequisites(app.editable_config)
+            if message is not None:
+                self.notify(message, severity="error")
+                return
+            self.app.push_screen(RuleDetailScreen(app.editable_config, None, mode="create"))
         elif active_tab == "tab-presets":
             # No document/disk write here — a brand-new preset only
             # actually materializes once the first rule is added inside
@@ -638,19 +761,25 @@ class OverviewScreen(Screen):
             return
         app: "ConfigToolApp" = self.app  # type: ignore[assignment]
         sections: list[str] = []
+        # The section headers are this screen's own markup; the messages are
+        # NOT — they quote the operator's own entity names and values back
+        # (an unknown template, a bad pattern), so each one is escaped. This
+        # is the view whose entire job is explaining what is wrong, which
+        # makes it the worst possible place to fail on the wrongness itself.
         if result.errors:
             sections.append(
-                "[bold red]Errors:[/bold red]\n" + "\n".join(f"  • {e}" for e in result.errors)
+                "[bold red]Errors:[/bold red]\n"
+                + "\n".join(f"  • {markup_safe(e)}" for e in result.errors)
             )
         if result.warnings:
             sections.append(
                 "[bold yellow]Warnings:[/bold yellow]\n"
-                + "\n".join(f"  • {w}" for w in result.warnings)
+                + "\n".join(f"  • {markup_safe(w)}" for w in result.warnings)
             )
         if app.lint and result.lint_findings:
             sections.append(
                 "[bold cyan]Lint findings:[/bold cyan]\n"
-                + "\n".join(f"  • {lf}" for lf in result.lint_findings)
+                + "\n".join(f"  • {markup_safe(lf)}" for lf in result.lint_findings)
             )
         if not sections:
             return
@@ -672,16 +801,24 @@ class OverviewScreen(Screen):
 
         connectors_table = self.query_one("#connectors-table", DataTable)
         agents_table = self.query_one("#agents-table", DataTable)
-        watchers_table = self.query_one("#watchers-table", DataTable)
+        rules_table = self.query_one("#rules-table", DataTable)
         templates_table = self.query_one("#templates-table", DataTable)
         presets_table = self.query_one("#presets-table", DataTable)
-        for table in (connectors_table, agents_table, watchers_table, templates_table, presets_table):
+        for table in (connectors_table, agents_table, rules_table, templates_table, presets_table):
             table.clear(columns=True)
 
         if app.load_error is not None:
             self._last_validate_result = None
             banner.update(
-                f"[red]✗ config.yaml does not currently load:[/red] {app.load_error}"
+                # The loader's own message, which quotes the file's content
+                # back (a YAML syntax error, an offending value). This is the
+                # config-does-not-load path — the one moment the operator has
+                # nothing else to go on — so it is the worst place to fail on
+                # the very text being reported. Found by the static markup
+                # check, not by review: no walk-through reaches this banner,
+                # because every behavioural fixture loads.
+                f"[red]✗ config.yaml does not currently load:[/red] "
+                f"{markup_safe(app.load_error)}"
             )
             return
 
@@ -690,9 +827,7 @@ class OverviewScreen(Screen):
         self._last_validate_result = result
 
         if result.ok:
-            summary = f"[green]✓ valid[/green] — {result.watcher_count} watcher(s)"
-            if result.entry_count and result.entry_count != result.watcher_count:
-                summary += f" (expanded from {result.entry_count} entries)"
+            summary = f"[green]✓ valid[/green] — {result.watcher_count} rule(s)"
         else:
             summary = f"[red]✗ {len(result.errors)} error(s)[/red]"
         if result.warnings:
@@ -716,32 +851,28 @@ class OverviewScreen(Screen):
         # Each table is populated defensively: run_validate() already caught
         # any GatewayConfig.from_file failure into `result` (shown in the
         # banner above), but several accessors here call the real loader
-        # AGAIN independently (merged_entry/templates/expanded_watchers all
-        # replay _parse_templates_block/_resolve_inherits — expanded_watchers()
-        # itself uses collect_config() + direct per-entry
-        # _parse_one_watcher_entry() calls, not GatewayConfig.from_file(), so
-        # a broken watcher's own row just disappears rather than raising —
-        # but a STRUCTURAL failure, e.g. `config.yaml` disappearing between
-        # calls, still can) — the exact same failure would otherwise raise a
-        # second, unhandled time here. A table that can't be computed shows
-        # one row saying so rather than crashing the whole
-        # overview; the banner above already has the actual error text.
+        # AGAIN independently (merged_entry/templates both replay
+        # _parse_templates_block/_resolve_inherits) — the exact same failure
+        # would otherwise raise a second, unhandled time here.
 
         # Keyed by list POSITION, not by name — unlike agents_raw (a dict,
-        # inherently-unique keys) or watchers (names GatewayConfig.from_file
-        # already guarantees unique), connectors_raw is the raw, pre-
+        # inherently-unique keys), connectors_raw is the raw, pre-
         # validation list: two connectors can share a name, or both be
         # missing one (falling back to "?"), and Textual's DataTable.add_row
         # raises DuplicateKey on a repeated key — exactly the kind of config
         # mistake this tool exists to surface gracefully, not crash on.
-        # Every table below is sorted by name (user-requested — the create/
-        # merge-on-add flow can insert a new row anywhere in the underlying
+        # Every table below EXCEPT Rules is sorted by name (user-requested —
+        # a create flow can insert a new row anywhere in the underlying
         # list/dict, making a row hard to spot again by scrolling; sorting
         # display order makes it easy to find regardless of where it landed
-        # in the raw document). The row `key=` a cursor's action resolves
-        # against stays the entry's own stable identity (list index for
-        # connectors, its own name for everything else) — sorting here only
-        # changes DISPLAY order, never what a key refers back to.
+        # in the raw document). Rules is the deliberate exception: its order
+        # IS its semantics (first match wins), so it displays in document
+        # order — which also makes row coordinate == list index there, the
+        # property _move_rule() relies on. The row `key=` a cursor's action
+        # resolves against stays the entry's own stable identity (list index
+        # for connectors and rules, its own name for everything else) —
+        # sorting elsewhere only changes DISPLAY order, never what a key
+        # refers back to.
         connectors_table.add_columns("Name", "Type", "Status")
         for i, c in sorted(enumerate(cfg.connectors_raw), key=lambda pair: pair[1].get("name", "?")):
             name = c.get("name", "?")
@@ -750,7 +881,8 @@ class OverviewScreen(Screen):
             except (ValueError, FileNotFoundError):
                 merged = c
             connectors_table.add_row(
-                name, merged.get("type", "?"), status_badge(status.status_for("connector", name)),
+                markup_safe(name), markup_safe(merged.get("type", "?")),
+                status_badge(status.status_for("connector", name)),
                 key=str(i),
             )
 
@@ -761,28 +893,43 @@ class OverviewScreen(Screen):
             except (ValueError, FileNotFoundError):
                 merged = entry
             agents_table.add_row(
-                name,
-                merged.get("type", "claude"),
-                merged.get("command", "claude"),
+                markup_safe(name),
+                markup_safe(merged.get("type", "claude")),
+                markup_safe(merged.get("command", "claude")),
                 status_badge(status.status_for("agent", name)),
                 key=name,
             )
 
-        watchers_table.add_columns("Name", "Connector", "Room", "Agent", "Status")
-        try:
-            expanded = cfg.expanded_watchers()
-        except (ValueError, FileNotFoundError):
-            expanded = None
-        if expanded is None:
-            watchers_table.add_row("(unavailable — config does not currently load)", "", "", "", "")
-        else:
-            for ew in sorted(expanded, key=lambda e: e.watcher.name):
-                w = ew.watcher
-                watchers_table.add_row(
-                    w.name, w.connector, w.room, w.agent,
-                    status_badge(status.status_for("watcher", w.name)),
-                    key=w.name,
-                )
+        # One row per raw rule, in DOCUMENT order (never sorted — see the
+        # comment block above), keyed by list index. The UNFILTERED document
+        # list, not `watchers_raw` (which drops non-mapping entries) —
+        # row/validator/move indices must all refer to the same positions,
+        # and the validator numbers the unfiltered list. A malformed entry
+        # still gets its row: its Status column carries the error (via
+        # status_for_rule()'s three-spelling bridge), which is the whole
+        # point — the previous Watchers tab silently dropped broken entries
+        # AND every rule, leaving the table contradicting the banner.
+        rules_table.add_columns("#", "Name", "Connector", "Agent", "Rooms", "Status")
+        for i, raw in enumerate(cfg.watcher_entries):
+            entry = raw if isinstance(raw, dict) else {}
+            try:
+                merged = cfg.merged_entry("watcher", entry)
+            except (ValueError, FileNotFoundError):
+                merged = entry
+            name = entry.get("name")
+            # DataTable cells parse markup too (that is how status_badge
+            # renders), so every operator-authored cell is escaped — a
+            # character-class pattern like `eng-[ab]` otherwise displayed as
+            # `eng-`, concealing the rule's real routing (see markup_safe()).
+            rules_table.add_row(
+                str(i + 1),
+                markup_safe(name) if isinstance(name, str) and name else "?",
+                markup_safe(merged.get("connector") or "(default)"),
+                markup_safe(merged.get("agent") or "(default)"),
+                markup_safe(rule_rooms_summary(entry)),
+                status_badge(status.status_for_rule(i, entry)),
+                key=str(i),
+            )
 
         templates_table.add_columns("Kind", "Name", "Fields set", "Used by")
         for kind in TEMPLATE_KINDS:
@@ -793,12 +940,13 @@ class OverviewScreen(Screen):
             for name, block in sorted(templates.items()):
                 used_by = [n for n, _ in find_entries_referencing_template(cfg, kind, name)]
                 templates_table.add_row(
-                    kind, name, str(len(block)), str(len(used_by)), key=f"{kind}:{name}"
+                    kind, markup_safe(name), str(len(block)), str(len(used_by)),
+                    key=f"{kind}:{name}",
                 )
 
         presets_table.add_columns("Name", "Rules")
         for name, rules in sorted(cfg.tool_presets_raw.items()):
-            presets_table.add_row(name, str(len(rules)), key=name)
+            presets_table.add_row(markup_safe(name), str(len(rules)), key=name)
 
     # ── Row selection → push detail screens ──────────────────────────────────
 
@@ -825,19 +973,18 @@ class OverviewScreen(Screen):
             return connectors[index]
         return None
 
-    def _expanded_watcher_for_key(self, cfg, key: str) -> ExpandedWatcher | None:
-        """The EXPANDED watcher matching a watchers-table row key (its real,
-        loader-derived name) — same lookup on_data_table_row_selected()'s
-        own "watchers-table" branch already does, shared here for
-        action_edit_row()/action_delete_row()'s direct-from-list shortcuts.
-        Guarded the same way: a config that's become invalid on disk since
-        the table was painted must not crash selecting/editing/deleting a
-        row, just silently find nothing."""
-        try:
-            expanded = cfg.expanded_watchers()
-        except (ValueError, FileNotFoundError):
-            return None
-        return next((e for e in expanded if e.watcher.name == key), None)
+    def _rule_entry_for_key(self, cfg, key: str) -> dict | None:
+        """The raw rule dict for a rules-table row key (its document list
+        position — see repaint_from_memory()) — shared by Enter/edit/delete/
+        move. The UNFILTERED document list, matching how the rows were
+        painted. None for a stale index (table painted before an external
+        shrink) or a non-mapping entry (RuleDetailScreen has nothing to
+        show for it; its row's Status column already explains)."""
+        watchers = cfg.watcher_entries
+        index = int(key)
+        if 0 <= index < len(watchers) and isinstance(watchers[index], dict):
+            return watchers[index]
+        return None
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         app: "ConfigToolApp" = self.app  # type: ignore[assignment]
@@ -855,17 +1002,12 @@ class OverviewScreen(Screen):
             entry = cfg.agents_raw.get(key)
             if entry is not None:
                 self.app.push_screen(AgentDetailScreen(cfg, key, entry, mode="view"))
-        elif table_id == "watchers-table":
-            # Unlike repaint_from_memory()'s population of this same table,
-            # this used to call expanded_watchers() completely unguarded —
-            # if the config became invalid on disk after the table was
-            # painted (e.g. an external edit), selecting ANY row (including
-            # the keyless "(unavailable...)" placeholder row shown in that
-            # case) crashed the whole app. Guarded the same way
-            # repaint_from_memory() already is (via _expanded_watcher_for_key()).
-            ew = self._expanded_watcher_for_key(cfg, key)
-            if ew is not None:
-                self.app.push_screen(WatcherDetailScreen(cfg, ew, mode="view"))
+        elif table_id == "rules-table":
+            entry = self._rule_entry_for_key(cfg, key)
+            if entry is not None:
+                self.app.push_screen(RuleDetailScreen(cfg, entry, mode="view"))
+            else:
+                self._notify_malformed_rule_row(cfg, key)
         elif table_id == "templates-table":
             kind, name = key.split(":", 1)
             # raw_template(), NOT templates() — see action_edit_row()'s

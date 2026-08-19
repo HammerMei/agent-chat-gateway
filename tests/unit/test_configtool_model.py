@@ -46,7 +46,8 @@ class TestEditableConfigLoad(_EditableConfigTestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         cfg = EditableConfig.load(path)
         self.assertEqual(cfg.path, path)
@@ -113,131 +114,18 @@ class TestEditableConfigLoad(_EditableConfigTestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         cfg = EditableConfig.load(path)
         self.assertEqual(len(cfg.watchers_raw), 1)
 
         path.write_text(
             path.read_text()
-            + "  - name: w2\n    room: dev\n"
+            + "  - name: w2\n    rooms: {include: [dev]}\n"
         )
         cfg.reload()
         self.assertEqual(len(cfg.watchers_raw), 2)
-
-
-class TestExpandedWatchersDesync(_EditableConfigTestBase):
-    """Regression: expanded_watchers() must raise ValueError (never a raw
-    IndexError) when the in-memory document and a fresh disk read disagree
-    on watcher count — e.g. an external process edits config.yaml without an
-    intervening reload() on this EditableConfig instance."""
-
-    def _cfg_with_rooms(self, rooms: str) -> tuple[EditableConfig, Path]:
-        path = self._write(f"""\
-            connectors:
-              - name: rc
-                type: rocketchat
-                server: {{url: http://localhost:3000, username: bot, password: pw}}
-            agents:
-              default:
-                type: claude
-                working_directory: {self.agent_dir}
-            watchers:
-              - connector: rc
-                agent: default
-                rooms: [{rooms}]
-        """)
-        return EditableConfig.load(path), path
-
-    def test_fewer_rooms_on_disk_raises_value_error_not_index_error(self):
-        cfg, path = self._cfg_with_rooms("nest, hammer, dev")
-        path.write_text(path.read_text().replace(
-            "rooms: [nest, hammer, dev]", "rooms: [nest, hammer]"
-        ))
-        with self.assertRaises(ValueError) as ctx:
-            cfg.expanded_watchers()
-        self.assertIn("disagree on watcher count", str(ctx.exception))
-
-    def test_more_rooms_on_disk_raises_value_error_not_index_error(self):
-        cfg, path = self._cfg_with_rooms("nest, hammer")
-        path.write_text(path.read_text().replace(
-            "rooms: [nest, hammer]", "rooms: [nest, hammer, dev, extra]"
-        ))
-        with self.assertRaises(ValueError) as ctx:
-            cfg.expanded_watchers()
-        self.assertIn("disagree on watcher count", str(ctx.exception))
-
-    def test_reload_before_calling_resolves_the_desync(self):
-        cfg, path = self._cfg_with_rooms("nest, hammer, dev")
-        path.write_text(path.read_text().replace(
-            "rooms: [nest, hammer, dev]", "rooms: [nest, hammer]"
-        ))
-        cfg.reload()
-        expanded = cfg.expanded_watchers()  # must not raise
-        self.assertEqual(len(expanded), 2)
-
-
-class TestExpandedWatchersMalformedWatcherTemplates(_EditableConfigTestBase):
-    """PR review finding: expanded_watchers() re-parses `watcher_templates:`
-    straight off disk, independently of collect_config() (which already
-    tolerates this same failure internally, falling back to watchers=[]
-    plus its own ConfigIssue). Without an equivalent fallback here, a
-    malformed `watcher_templates:` block used to make this method's
-    ValueError propagate all the way up through OverviewScreen's
-    `except (ValueError, FileNotFoundError): expanded = None`, collapsing
-    the ENTIRE watchers table to the "(unavailable)" placeholder — the
-    exact all-or-nothing failure mode this whole method exists to avoid —
-    even though every watcher entry itself was perfectly fine."""
-
-    def test_malformed_watcher_templates_block_does_not_take_down_every_watcher(self):
-        path = self._write(f"""\
-            connectors:
-              - name: rc
-                type: rocketchat
-                server: {{url: http://localhost:3000, username: bot, password: pw}}
-            agents:
-              default:
-                type: claude
-                working_directory: {self.agent_dir}
-            watcher_templates: not-a-mapping
-            watchers:
-              - name: w1
-                connector: rc
-                agent: default
-                room: general
-        """)
-        cfg = EditableConfig.load(path)
-        expanded = cfg.expanded_watchers()  # must not raise
-        self.assertEqual([ew.watcher.name for ew in expanded], ["w1"])
-
-    def test_a_watcher_that_actually_needs_the_broken_template_still_drops_its_own_row(self):
-        path = self._write(f"""\
-            connectors:
-              - name: rc
-                type: rocketchat
-                server: {{url: http://localhost:3000, username: bot, password: pw}}
-            agents:
-              default:
-                type: claude
-                working_directory: {self.agent_dir}
-            watcher_templates: not-a-mapping
-            watchers:
-              - name: w1
-                connector: rc
-                agent: default
-                room: general
-              - name: w2
-                connector: rc
-                agent: default
-                room: dev
-                inherits: standard
-        """)
-        cfg = EditableConfig.load(path)
-        expanded = cfg.expanded_watchers()  # must not raise
-        # w2 references a template that can't be resolved at all (the whole
-        # block is malformed) — its own row drops, same as any other
-        # independent per-entry failure; w1 (unaffected) still displays.
-        self.assertEqual([ew.watcher.name for ew in expanded], ["w1"])
 
 
 class TestEditableConfigTemplates(_EditableConfigTestBase):
@@ -257,7 +145,8 @@ class TestEditableConfigTemplates(_EditableConfigTestBase):
                 inherits: standard
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         cfg = EditableConfig.load(path)
         standard = cfg.templates("agent")["standard"]
@@ -279,7 +168,8 @@ class TestEditableConfigTemplates(_EditableConfigTestBase):
                 working_directory: /tmp
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         cfg = EditableConfig.load(path)
         with self.assertRaises(ValueError):
@@ -308,7 +198,8 @@ class TestEditableConfigTemplatesCaching(_EditableConfigTestBase):
                 inherits: standard
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         return EditableConfig.load(path), path
 
@@ -346,7 +237,8 @@ class TestEditableConfigTemplatesCaching(_EditableConfigTestBase):
                 working_directory: /tmp
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         cfg = EditableConfig.load(path)
         with self.assertRaises(ValueError):
@@ -384,7 +276,8 @@ class TestEditableConfigProvenance(_EditableConfigTestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         return EditableConfig.load(path)
 
@@ -478,7 +371,8 @@ class TestEditableConfigValidatedView(_EditableConfigTestBase):
                 type: claude
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         cfg = EditableConfig.load(path)
         with self.assertRaises(ValueError):
@@ -498,7 +392,8 @@ class TestEditableConfigDirtyTracking(_EditableConfigTestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         return EditableConfig.load(path)
 
@@ -553,7 +448,8 @@ class TestEditableConfigSave(_EditableConfigTestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """
 
     def test_save_preserves_the_unresolved_env_var_placeholder(self):
@@ -832,205 +728,96 @@ class TestStatusIndexNonStringEntityName(_EditableConfigTestBase):
             watchers:
               - name: [a, b]
                 connector: rc
-                room: general
+                rooms:
+                  include: [general]
                 session_id: null
         """)
         result = validate_config(str(path), lint=True)
         StatusIndex(result.findings)  # must not raise TypeError
 
 
-class TestWatcherCrudPrimitives(_EditableConfigTestBase):
-    """Config TUI Phase 3 (watcher CRUD): EditableConfig.add_watcher_rooms()/
-    find_mergeable_watcher_entry()/remove_watcher_room() — the only two
-    mutation primitives everything else (create, split-on-edit, room
-    rename/move, delete) composes from. See docs/design/config-tool.md's
-    Phase 3 section for the full merge/split design."""
 
-    def _base_config(self, watchers_yaml: str = "") -> Path:
-        return self._write(f"""\
+
+class TestMoveWatcherRule(_EditableConfigTestBase):
+    """move_watcher_rule() — rule order is load-bearing (first match wins,
+    design §2.1), so the Rules tab must be able to express it without a trip
+    to $EDITOR. A move is a plain neighbour swap on the raw document list;
+    persisting it stays the caller's job, same as every other mutation."""
+
+    def _cfg(self) -> EditableConfig:
+        path = self._write(f"""\
             connectors:
               - name: rc
                 type: rocketchat
-                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
             agents:
               default:
                 type: claude
                 working_directory: {self.agent_dir}
             watchers:
-{watchers_yaml}
+              - name: first
+                rooms:
+                  include: [general]
+              - name: second
+                rooms:
+                  include: [dev]
+              - name: third
+                rooms:
+                  include: [ops]
         """)
+        return EditableConfig.load(path)
 
-    def test_add_watcher_rooms_creates_a_new_entry_when_nothing_matches(self):
-        path = self._base_config()
-        cfg = EditableConfig.load(path)
-        added = cfg.add_watcher_rooms("rc", "default", ["general"], {})
-        self.assertEqual(added, ["general"])
-        self.assertEqual(
-            cfg.document["watchers"],
-            [{"connector": "rc", "agent": "default", "room": "general"}],
-        )
+    def _names(self, cfg: EditableConfig) -> list[str]:
+        return [w["name"] for w in cfg.document["watchers"]]
+
+    def test_move_down_swaps_with_the_next_rule_and_returns_the_new_index(self):
+        cfg = self._cfg()
+        self.assertEqual(cfg.move_watcher_rule(0, +1), 1)
+        self.assertEqual(self._names(cfg), ["second", "first", "third"])
         self.assertTrue(cfg.dirty)
 
-    def test_add_watcher_rooms_merges_multiple_rooms_into_one_group(self):
-        """Creating 3 rooms in a single call (the new-watcher form's
-        comma-separated room field) must produce ONE rooms: group, not 3
-        separate near-duplicate entries."""
-        path = self._base_config()
-        cfg = EditableConfig.load(path)
-        added = cfg.add_watcher_rooms("rc", "default", ["general", "dev", "ops"], {})
-        self.assertEqual(added, ["general", "dev", "ops"])
-        self.assertEqual(len(cfg.document["watchers"]), 1)
-        self.assertEqual(cfg.document["watchers"][0]["rooms"], ["general", "dev", "ops"])
+    def test_move_up_swaps_with_the_previous_rule(self):
+        cfg = self._cfg()
+        self.assertEqual(cfg.move_watcher_rule(2, -1), 1)
+        self.assertEqual(self._names(cfg), ["first", "third", "second"])
 
-    def test_add_watcher_rooms_merges_into_an_existing_matching_entry(self):
-        path = self._base_config("""\
-              - connector: rc
-                agent: default
-                room: general
-        """)
-        cfg = EditableConfig.load(path)
-        added = cfg.add_watcher_rooms("rc", "default", ["dev"], {})
-        self.assertEqual(added, ["dev"])
-        self.assertEqual(len(cfg.document["watchers"]), 1)
-        self.assertEqual(cfg.document["watchers"][0]["rooms"], ["general", "dev"])
-
-    def test_add_watcher_rooms_does_not_merge_when_shared_fields_differ(self):
-        path = self._base_config("""\
-              - connector: rc
-                agent: default
-                room: general
-                context_inject_files: [notes.md]
-        """)
-        cfg = EditableConfig.load(path)
-        added = cfg.add_watcher_rooms("rc", "default", ["dev"], {})
-        self.assertEqual(added, ["dev"])
-        self.assertEqual(len(cfg.document["watchers"]), 2)
-
-    def test_add_watcher_rooms_does_not_merge_into_an_entry_with_its_own_name(self):
-        """An entry with an explicit name:/session_id: can never legally
-        become multi-room (gateway/config.py forbids it) — never a merge
-        target, even if every other shared field matches."""
-        path = self._base_config("""\
-              - connector: rc
-                agent: default
-                room: general
-                name: my-watcher
-        """)
-        cfg = EditableConfig.load(path)
-        added = cfg.add_watcher_rooms("rc", "default", ["dev"], {})
-        self.assertEqual(added, ["dev"])
-        self.assertEqual(len(cfg.document["watchers"]), 2)
-
-    def test_add_watcher_rooms_skips_a_room_already_in_the_merge_target(self):
-        """User-requested: typing a room that's already present in the
-        entry it would merge into is a silent no-op, not an error — the
-        end state is identical either way."""
-        path = self._base_config("""\
-              - connector: rc
-                agent: default
-                rooms: [general, dev]
-        """)
-        cfg = EditableConfig.load(path)
-        added = cfg.add_watcher_rooms("rc", "default", ["general", "ops"], {})
-        self.assertEqual(added, ["ops"])  # 'general' silently skipped
-        self.assertEqual(cfg.document["watchers"][0]["rooms"], ["general", "dev", "ops"])
-
-    def test_add_watcher_rooms_deep_copies_shared_nested_values(self):
-        """Regression: `shared`'s nested list/dict values (e.g.
-        context_inject_files) must never alias into a newly-created entry —
-        mutating one entry's nested value later must not silently affect
-        another."""
-        path = self._base_config()
-        cfg = EditableConfig.load(path)
-        shared = {"context_inject_files": ["a.md"]}
-        cfg.add_watcher_rooms("rc", "default", ["general"], shared)
-        cfg.document["watchers"][0]["context_inject_files"].append("b.md")
-        self.assertEqual(shared["context_inject_files"], ["a.md"])  # untouched
-
-    def test_find_mergeable_watcher_entry_ignores_connector_agent_defaults(self):
-        """An entry relying on the implicit connector[0]/default_agent
-        fallback (no explicit connector:/agent: of its own) is never a
-        merge candidate — the fallback could shift later if connectors/
-        agents are added or reordered."""
-        path = self._base_config("""\
-              - room: general
-        """)
-        cfg = EditableConfig.load(path)
-        target = cfg.find_mergeable_watcher_entry("rc", "default", {})
-        self.assertIsNone(target)
-
-    def test_remove_watcher_room_normalizes_rooms_list_to_singular(self):
-        path = self._base_config("""\
-              - connector: rc
-                agent: default
-                rooms: [general, dev]
-        """)
-        cfg = EditableConfig.load(path)
-        entry = cfg.document["watchers"][0]
-        cfg.remove_watcher_room(entry, "dev")
-        self.assertEqual(cfg.document["watchers"], [{"connector": "rc", "agent": "default", "room": "general"}])
-
-    def test_remove_watcher_room_deletes_the_whole_entry_when_empty(self):
-        path = self._base_config("""\
-              - connector: rc
-                agent: default
-                room: general
-        """)
-        cfg = EditableConfig.load(path)
-        entry = cfg.document["watchers"][0]
-        cfg.remove_watcher_room(entry, "general")
-        self.assertEqual(cfg.document["watchers"], [])
-
-    def test_remove_watcher_room_is_a_no_op_for_an_unrelated_room(self):
-        path = self._base_config("""\
-              - connector: rc
-                agent: default
-                room: general
-        """)
-        cfg = EditableConfig.load(path)
-        entry = cfg.document["watchers"][0]
-        self.assertFalse(cfg.dirty)
-        cfg.remove_watcher_room(entry, "does-not-exist")
-        self.assertEqual(cfg.document["watchers"], [{"connector": "rc", "agent": "default", "room": "general"}])
-        self.assertFalse(cfg.dirty)  # genuinely nothing changed — no spurious mark_dirty()
-
-    def test_remove_watcher_room_is_a_no_op_for_a_room_not_in_the_group(self):
-        """Same no-op guarantee as the singular-room case above, but for a
-        multi-room `rooms:` list — a room that was never actually a member
-        must not spuriously mark the config dirty or touch the list."""
-        path = self._base_config("""\
-              - connector: rc
-                agent: default
-                rooms: [general, dev]
-        """)
-        cfg = EditableConfig.load(path)
-        entry = cfg.document["watchers"][0]
-        cfg.remove_watcher_room(entry, "does-not-exist")
-        self.assertEqual(entry["rooms"], ["general", "dev"])
+    def test_moving_past_either_edge_is_a_no_op(self):
+        cfg = self._cfg()
+        self.assertIsNone(cfg.move_watcher_rule(0, -1))
+        self.assertIsNone(cfg.move_watcher_rule(2, +1))
+        self.assertEqual(self._names(cfg), ["first", "second", "third"])
         self.assertFalse(cfg.dirty)
 
+    def test_a_stale_index_is_a_no_op_not_an_error(self):
+        """The table can be painted before an external shrink — a move
+        against an index that no longer exists must find nothing, matching
+        how row lookups elsewhere degrade."""
+        cfg = self._cfg()
+        self.assertIsNone(cfg.move_watcher_rule(7, -1))
+        self.assertFalse(cfg.dirty)
 
-class TestRoomlessEntriesAreNotMergeTargets(_EditableConfigTestBase):
-    """A watcher entry with no room of its own must never absorb a new room.
+    def test_the_moved_order_round_trips_through_save(self):
+        cfg = self._cfg()
+        cfg.move_watcher_rule(0, +1)
+        cfg.save()
+        reloaded = EditableConfig.load(cfg.path)
+        self.assertEqual(self._names(reloaded), ["second", "first", "third"])
 
-    Such an entry is a live hazard rather than a curiosity.  It is invisible in
-    the TUI — expanded_watchers() swallows the ValueError it raises, so it has no
-    row and cannot be opened, edited or deleted — yet it is still in
-    watchers_raw, and with none of the six shared keys _watcher_shared_fields()
-    returns {}, which matched a fresh add's shared={}.
 
-    Merging into it then reached disk, because save()'s gate blocks only errors
-    a save *introduces* and merging a room into a roomless entry REMOVES its
-    pre-existing error.  The result reads as a legal single-room entry, and every
-    other room that should have had its own watcher is gone at the next start.
-    """
+class TestStatusIndexRuleBridge(_EditableConfigTestBase):
+    """status_for_rule() — rule rows are index-keyed, but a rule's findings
+    are filed under THREE entity_name spellings depending on the producer
+    (its own name; collect_config's "(index i)"; _lint_config's
+    "watchers[i]"). The previous Watchers tab's key mismatch is exactly how
+    broken rows displayed OK — a rule row must surface findings whichever
+    spelling they arrived under."""
 
-    def _base_config(self, watchers_yaml: str = "") -> Path:
-        return self._write(f"""\
+    def _status_for(self, watchers_yaml: str, index: int) -> str:
+        path = self._write(f"""\
             connectors:
               - name: rc
                 type: rocketchat
-                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
             agents:
               default:
                 type: claude
@@ -1038,116 +825,80 @@ class TestRoomlessEntriesAreNotMergeTargets(_EditableConfigTestBase):
             watchers:
 {watchers_yaml}
         """)
+        cfg = EditableConfig.load(path)
+        result = validate_config(str(path), lint=True)
+        status = StatusIndex(result.findings)
+        raw = cfg.document["watchers"][index]
+        entry = raw if isinstance(raw, dict) else {}
+        return status.status_for_rule(index, entry)
 
-    ROOMLESS = """\
-              - connector: rc
-                agent: default
-    """
-
-    def test_a_roomless_entry_is_not_selected_as_a_merge_target(self):
-        cfg = EditableConfig.load(self._base_config(self.ROOMLESS))
-
-        self.assertIsNone(cfg.find_mergeable_watcher_entry("rc", "default", {}))
-
-    def test_adding_a_room_creates_a_new_entry_instead_of_mutating_it(self):
-        """The regression: the roomless entry must be left exactly as it was."""
-        cfg = EditableConfig.load(self._base_config(self.ROOMLESS))
-
-        added = cfg.add_watcher_rooms("rc", "default", ["general"], {})
-
-        self.assertEqual(added, ["general"])
-        watchers = cfg.document["watchers"]
-        self.assertEqual(len(watchers), 2, "should have added a second entry")
-        self.assertEqual(watchers[0], {"connector": "rc", "agent": "default"},
-                         "the roomless entry was mutated")
-        self.assertEqual(
-            watchers[1], {"connector": "rc", "agent": "default", "room": "general"}
+    def test_a_shadowing_warning_filed_under_the_rule_name_reaches_its_row(self):
+        """The keystone case: shadowing warnings are attributed to
+        rule.name (config_validate), and the row is index-keyed — a rule
+        with a shadowing warning must NOT display OK."""
+        status = self._status_for(
+            "              - name: broad\n"
+            "                rooms:\n"
+            "                  include: [\"*\"]\n"
+            "              - name: shadowed\n"
+            "                rooms:\n"
+            "                  include: [general]\n",
+            1,
         )
+        self.assertEqual(status, "warning")
 
-    def test_an_entry_with_an_empty_rooms_list_is_also_skipped(self):
-        """`rooms: []` fails the loader's non-empty check just as absence does."""
-        cfg = EditableConfig.load(self._base_config("""\
-              - connector: rc
-                agent: default
-                rooms: []
-        """))
+    def test_an_unnamed_broken_entry_is_found_under_its_index_spelling(self):
+        """collect_config attributes a nameless entry's error to
+        "(index i)" — the bridge must pick it up for the same row."""
+        status = self._status_for(
+            "              - rooms:\n"
+            "                  include: [general]\n",
+            0,
+        )
+        self.assertEqual(status, "error")
 
-        self.assertIsNone(cfg.find_mergeable_watcher_entry("rc", "default", {}))
+    def test_a_named_broken_entry_is_found_under_its_name(self):
+        status = self._status_for(
+            "              - name: w1\n"
+            "                rooms:\n"
+            "                  include: []\n",
+            0,
+        )
+        self.assertEqual(status, "error")
 
-    def test_an_entry_with_an_empty_room_string_is_also_skipped(self):
-        cfg = EditableConfig.load(self._base_config("""\
-              - connector: rc
-                agent: default
-                room: ""
-        """))
-
-        self.assertIsNone(cfg.find_mergeable_watcher_entry("rc", "default", {}))
-
-    def test_a_valid_entry_alongside_a_roomless_one_is_still_matched(self):
-        """The guard must skip only the roomless entry, not disable merging."""
-        cfg = EditableConfig.load(self._base_config("""\
-              - connector: rc
-                agent: default
-              - connector: rc
-                agent: default
-                room: general
-        """))
-
-        target = cfg.find_mergeable_watcher_entry("rc", "default", {})
-
-        self.assertIsNotNone(target)
-        self.assertEqual(target["room"], "general")
-
-    def test_merging_still_works_when_the_roomless_entry_comes_second(self):
-        cfg = EditableConfig.load(self._base_config("""\
-              - connector: rc
-                agent: default
-                room: general
-              - connector: rc
-                agent: default
-        """))
-
-        cfg.add_watcher_rooms("rc", "default", ["dev"], {})
-
-        self.assertEqual(cfg.document["watchers"][0]["rooms"], ["general", "dev"])
-        self.assertEqual(len(cfg.document["watchers"]), 2, "no third entry expected")
+    def test_a_clean_rule_is_ok(self):
+        status = self._status_for(
+            "              - name: w1\n"
+            "                rooms:\n"
+            "                  include: [general]\n",
+            0,
+        )
+        self.assertEqual(status, "ok")
 
 
-class TestWatcherSharedFields(unittest.TestCase):
-    """_watcher_shared_fields() had no direct test, despite deciding merge
-    eligibility — an entry whose result equals the caller's `shared` is adopted."""
-
-    def test_an_entry_with_none_of_the_shared_keys_returns_empty(self):
-        """This is what made a roomless entry match a fresh add's shared={}."""
-        from gateway.configtool.model import _watcher_shared_fields
-
-        self.assertEqual(_watcher_shared_fields({"connector": "rc", "agent": "d"}), {})
-
-    def test_only_the_allowlisted_keys_are_returned(self):
-        from gateway.configtool.model import _watcher_shared_fields
-
-        got = _watcher_shared_fields({
-            "connector": "rc", "agent": "d", "room": "general", "name": "x",
-            "description": "desc", "inherits": "tpl",
-            "context_inject_files": ["a.md"],
-            "history_handoff": {"enabled": True},
-        })
-
-        self.assertEqual(got, {
-            "inherits": "tpl",
-            "context_inject_files": ["a.md"],
-            "history_handoff": {"enabled": True},
-            "description": "desc",
-        })
-
-    def test_absent_keys_are_omitted_rather_than_defaulted(self):
-        from gateway.configtool.model import _watcher_shared_fields
-
-        got = _watcher_shared_fields({"connector": "rc", "agent": "d", "description": "d"})
-
-        self.assertEqual(got, {"description": "d"})
-
-
-
-if __name__ == "__main__":
-    unittest.main()
+class TestStatusIndexStrippedNameSpelling(_EditableConfigTestBase):
+    def test_a_padded_rule_name_still_surfaces_parser_attributed_findings(self):
+        """Codex review of #129 (round 3): the parser canonicalizes (strips)
+        a rule's name before attributing shadowing warnings to it — a row
+        whose raw spelling is padded must still surface them."""
+        path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: broad
+                rooms:
+                  include: ["*"]
+              - name: " shadowed "
+                rooms:
+                  include: [general]
+        """)
+        cfg = EditableConfig.load(path)
+        result = validate_config(str(path), lint=True)
+        status = StatusIndex(result.findings)
+        self.assertEqual(status.status_for_rule(1, cfg.document["watchers"][1]), "warning")

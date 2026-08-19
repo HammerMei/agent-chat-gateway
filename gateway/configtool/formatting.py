@@ -2,7 +2,34 @@
 
 from __future__ import annotations
 
+from rich.markup import escape as _rich_escape
+
 from .model import Provenance
+
+
+def markup_safe(value: object) -> str:
+    """`value` as text that Rich will render VERBATIM.
+
+    Every `Static`/`DataTable` cell in this TUI parses Rich markup, so a
+    square bracket in operator-authored data is read as a tag. That is not
+    exotic here: `[…]` is documented, first-class room-pattern syntax
+    (`gateway/core/room_pattern.py`), and rule names are unrestricted
+    strings. Both failures were confirmed (Codex review of #129, round 5):
+
+    * `eng-[ab]` — a legitimate character-class pattern — rendered as
+      `eng-`, so the display CONCEALED which rooms the rule actually
+      claims. The worse of the two: a reader is told the wrong routing.
+    * A rule named `[/]` raised Rich's `MarkupError` when its row was
+      opened, making that rule unviewable, uneditable and undeletable
+      through the TUI.
+
+    Wrap any dynamic value interpolated into markup-bearing content in
+    this; deliberately NOT applied inside `format_value()`/
+    `rule_rooms_summary()` themselves, so those stay usable for plain-text
+    callers (tests compare their raw output) and escaping stays visible at
+    the point where markup is actually being built.
+    """
+    return _rich_escape("" if value is None else str(value))
 
 # Key names whose values are masked when rendered — mirrors the fields the
 # onboard wizard already treats as secrets (gateway/onboard.py's _write_env:
@@ -26,14 +53,18 @@ def provenance_label(provenance: Provenance, template_name: str | None = None) -
     nit on one row."""
     if provenance == Provenance.EXPLICIT:
         return "explicit"
+    # Escaped here rather than at each call site: this is the single point
+    # where a template NAME (an unrestricted YAML key) reaches markup, and
+    # every screen's field rows go through it.
+    safe_name = markup_safe(template_name)
     if provenance == Provenance.INHERITED:
-        return f"from '{template_name}'"
+        return f"from '{safe_name}'"
     if provenance == Provenance.EXPLICIT_SUPPRESSING:
-        return f"clears '{template_name}'"
+        return f"clears '{safe_name}'"
     # Provenance.DEFAULT
     if template_name is None:
         return "default"
-    return f"default (no '{template_name}')"
+    return f"default (no '{safe_name}')"
 
 
 def mask_if_secret(key: str, value: object) -> str:

@@ -14,7 +14,7 @@ import textwrap
 import unittest
 from pathlib import Path
 
-from gateway.config import _parse_one_watcher_entry, collect_config
+from gateway.config import GatewayConfig, collect_config
 
 
 class _CollectConfigTestBase(unittest.TestCase):
@@ -328,34 +328,6 @@ class TestCollectConfigNonStringNameHint(_CollectConfigTestBase):
         {(i.entity_kind, i.entity_name, i.message) for i in issues}
 
 
-class TestParseOneWatcherEntryEmptyConnectors(_CollectConfigTestBase):
-    """PR review finding: GatewayConfig.from_file() can never call
-    _parse_one_watcher_entry() with an empty `connectors` list — an earlier
-    structural check always raises first. collect_config() guards against
-    it too (its own "no connectors parsed successfully" branch returns
-    before ever reaching the watcher loop). But
-    EditableConfig.expanded_watchers() calls this function directly, per
-    raw watcher entry, against whatever partial `connectors` list
-    collect_config() returned — so an all-connectors-failed config CAN
-    legitimately reach this function with `connectors=[]`. Previously this
-    crashed with an uncaught IndexError (`connectors[0].name`) instead of
-    raising the ValueError every caller's `except ValueError` expects."""
-
-    def test_no_explicit_connector_and_zero_connectors_raises_value_error_not_index_error(self):
-        with self.assertRaises(ValueError):
-            _parse_one_watcher_entry(
-                {"name": "w1", "room": "general"},
-                0,
-                watcher_templates={},
-                connector_names=set(),
-                connectors=[],
-                agents={},
-                default_agent="",
-                config_dir=Path(self.tmp),
-                seen_watcher_names=set(),
-            )
-
-
 class TestCollectConfigQueueSchedulerSessionId(_CollectConfigTestBase):
     """PR review finding: collect_config()'s max_queue_depth/scheduler:/
     duplicate-session_id branches (unlike connectors/agents/watchers) had no
@@ -512,3 +484,51 @@ class TestCollectConfigOnTheFlyWatcherFields(_CollectConfigTestBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestExplicitNullWatchersBlock(_CollectConfigTestBase):
+    """A bare `watchers:` — the natural way to empty the block — used to
+    reach `enumerate(None)` and raise a raw TypeError, because the guard
+    checked truthiness BEFORE type. That crashed the daemon at startup and
+    `acg config validate` with it, on a config an operator produces by
+    deleting their rules. Found while testing the config TUI's rollback
+    (Codex review of PR #129, round 11); the rule this violated is stated in
+    this same file, on `_resolve_watcher_connector`."""
+
+    def _with_watchers(self, literal: str) -> str:
+        return self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:{literal}
+        """)
+
+    def test_an_explicit_null_is_treated_as_no_watchers(self):
+        config, issues = collect_config(self._with_watchers(""))
+        self.assertIsNotNone(config)
+        self.assertEqual(config.watcher_rules, [])
+        self.assertEqual(issues, [])
+
+    def test_the_strict_loader_accepts_it_too(self):
+        GatewayConfig.from_file(self._with_watchers(""))
+
+    def test_a_falsy_non_list_still_gets_the_clean_message(self):
+        """`0`/`""` took the same skipped-guard path as null; they are
+        mistakes rather than an empty block, so they must be REPORTED, not
+        silently treated as empty."""
+        for literal in (" 0", ' ""'):
+            with self.subTest(literal=literal):
+                config, issues = collect_config(self._with_watchers(literal))
+                self.assertTrue(
+                    any("'watchers:' must be a list" in i.message for i in issues),
+                    [i.message for i in issues],
+                )
+
+    def test_a_truthy_non_list_is_unchanged(self):
+        config, issues = collect_config(self._with_watchers(" 5"))
+        self.assertTrue(any("'watchers:' must be a list" in i.message for i in issues))

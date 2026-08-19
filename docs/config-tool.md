@@ -40,14 +40,17 @@ agent-chat-gateway config migrate-env
 
 ## Layout
 
-Five tabs across the top: **Connectors**, **Agents**, **Watchers**,
+Five tabs across the top: **Connectors**, **Agents**, **Rules**,
 **Templates**, **Tool Presets**. A banner above them shows the config's
 current validation status (`✓ valid` or `✗ N error(s)`, plus warning/lint
 counts) — press `v` when it says "press 'v' to view details" to see the
 actual messages, not just a count.
 
-Every list is sorted by name, so a newly created or merged entry is always
-easy to find regardless of where it landed in the underlying file.
+Every list is sorted by name — except **Rules**, which always shows your
+`watchers:` rules in file order, because that order is meaningful: the
+first rule that matches a room wins. A newly created entry on the other
+tabs is always easy to find regardless of where it landed in the
+underlying file.
 
 ## Keybindings
 
@@ -61,7 +64,7 @@ On the list (Overview) screen:
 | `e` | Edit the selected entry directly (skips the view-only step) |
 | `d` | Delete the selected entry |
 | `n` | Create a new entry on the current tab |
-| `c` | *(Watchers tab only)* Clone the selected watcher's settings to more rooms — see [Watchers](#watchers) below |
+| `[` / `]` | *(Rules tab only)* Move the selected rule up / down — rule order decides which rule claims a room, see [Rules](#rules) below |
 | `r` | Refresh from disk (picks up changes made outside the TUI) |
 | `v` | View the full text of any validation errors/warnings/lint findings |
 | `ctrl+e` | Open `$EDITOR` on the whole `config.yaml` file, then reload when you exit |
@@ -120,30 +123,49 @@ and **Edit** to change a selected *inline* rule in place (grayed out until
 you select an inline rule — a preset reference isn't editable here; remove
 it and add a different preset reference instead).
 
-## Watchers
+## Rules
 
-A `rooms: [a, b, c]` entry in `config.yaml` expands into several
-independent watchers that all share one underlying entry — the Watchers tab
-always shows them as separate rows, one per room.
+Each `watchers:` entry is a *rule*: a required unique name, a connector, an
+agent, and a `rooms:` matcher (`include`/`except_for` glob patterns over
+room names, plus `direct`/`group_direct` opt-ins for the two kinds of DMs).
+Which rooms a rule actually claims is decided at runtime, per incoming
+message — see [docs/user-guide.md](user-guide.md) for how matching works.
 
-- **Editing a shared setting** (connector, agent, room, notifications,
-  `inherits`, ...) on one room splits it out into its own
-  entry; the other rooms in the group are untouched. The only field that
-  edits the whole group in place is **Description** (a free-text note with
-  no effect on behavior).
-- **Creating** a room whose connector, agent, and other settings exactly
-  match an existing entry merges it into that entry's `rooms:` list instead
-  of creating a near-duplicate. This also happens automatically when a
-  split-out room's new settings happen to match some other existing entry.
-- **Clone for rooms** (`c`, from the list or from inside a watcher) bulk-adds
-  several rooms sharing the current watcher's settings in one step — type a
-  comma-separated list of room names. A room that's already in the group
-  you're cloning from is silently skipped, not an error.
-- There's no field for a watcher's `name:` (an explicit override of the
-  auto-generated `<connector>-<room>` identity) in this form — it's a rare
-  edge case (only useful when two *different* agents need to watch the same
-  connector+room). A watcher that already has one keeps it; use `ctrl+e` if
-  you need to set one.
+- The tab lists rules **in file order**, numbered — the first rule that
+  matches a room wins, so the order you see is the order that routes.
+  `[`/`]` move the selected rule up/down and save immediately.
+- The edit form covers every rule field, including the two session
+  lifecycle TTLs (`session_idle_days`/`session_expire_days`). A rule needs
+  at least one `include` pattern or one of the DM opt-ins — a rule that
+  can never match anything is refused.
+- **Renaming** a rule is allowed (nothing in `config.yaml` references a
+  rule by name), but to the daemon it's a delete-plus-create: existing
+  sessions stay attributed to the old name and — because a session is
+  sticky-bound to the settings it was created with — keep running with the
+  *old* rule's settings; edits to the renamed rule never reach them. Idle
+  ones age out through their (frozen) TTLs; to move a busy room onto the
+  new rule now, `acg expire` it — the next message in that room then
+  rematches against the current rules and builds a fresh watcher. (`acg
+  reset` is *not* the lever here: it clears the session but rebuilds the
+  watcher from the same persisted record, so the room stays on the old
+  rule's frozen settings.)
+- **Deleting** a rule warns you with what it strands: how many persisted
+  session records on disk still belong to it, and how many scheduled jobs
+  target those sessions. The counts are read from the daemon's own files.
+  Idle stranded sessions are cleaned up by the daemon's lifecycle sweeps —
+  but a session with pending scheduled jobs is exempt from expiry, so its
+  jobs keep running until you remove them (`acg schedule delete <job_id>`).
+- This tab edits `config.yaml` only. To see or act on the *live* sessions a
+  rule has created, use the CLI: `acg list`, `acg pause/resume/reset/expire`.
+- Known limitation: while some rule in the file is broken (its row shows
+  ERROR), moving or deleting any row *above* it is refused, quoting that
+  broken rule's own error — a broken rule's error message is
+  position-dependent, so shifting its position reads to the save safety-gate
+  as a new problem. Two practical consequences: repair a file with several
+  broken rows **bottom-up** (the lowest ERROR row first), and if that's
+  awkward, use `ctrl+e` to fix them all in one `$EDITOR` pass. Everything
+  else — editing rules in place, creating new ones, deleting a row with no
+  ERROR row below it — is unaffected.
 
 ## Templates
 

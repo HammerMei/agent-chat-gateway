@@ -14,28 +14,30 @@ provenance concept") simply no longer holds once the "block" became a set of
 independently named templates.
 
 A template has no `inherits:` of its own (forbidden — no nested templates,
-enforced by `gateway/config.py`'s `_parse_templates_block`), so this overrides
-three of `FormScreen`'s hooks that would otherwise try to merge against one:
-  - `_compute_initial_values()` reads straight off the template's own entry +
-    the dataclass defaults (`AGENT_DATACLASS_DEFAULTS`/etc.) — no
-    `merged_entry()` call. Falsy-empty ("" / []) values are normalized to
-    `None` here (mirroring the old `DefaultsScreen`'s own normalization) —
-    without it, a field whose only value is a falsy dataclass default would
-    look "changed" on every Save purely because of how `read_widget_value()`
-    reads back an untouched str/list Input, producing a false-positive
-    blast-radius confirm below for a field nobody actually edited.
-  - `_field_provenance()` always returns `None` — a template's own fields
-    have no "explicit vs. inherited" distinction (nothing for a template to
-    inherit FROM).
-  - `_compose_field_row()` renders a BLAST-RADIUS count instead of a
-    provenance label — "N inherit, M override", counting entries (of this
-    same kind) whose `inherits:` names THIS specific template
+enforced by `gateway/config.py`'s `_parse_templates_block`), which is the
+only way this screen differs from the entry forms. It therefore fills in
+three small `FormScreen` hooks rather than reimplementing the machinery
+around them:
+  - `_snapshot_source()` returns the template's own raw entry (nothing to
+    merge against), so the shared `_compute_initial_values()` — with its
+    round-trip snapshotting and delimiter-bearing-item handling — is reused
+    verbatim.
+  - `_field_provenance()` always returns `None`: a template's own fields
+    have no "explicit vs. inherited" distinction (nothing to inherit FROM).
+  - `_field_annotation()` renders a BLAST-RADIUS count where the entry forms
+    render a provenance label — "N inherit, M override", counting entries
+    (of this same kind) whose `inherits:` names THIS specific template
     (`find_entries_referencing_template()`, form_common.py) and don't
     already set the field themselves. This is the actual point of the
     whole redesign: blast radius is scoped to ONE named template, not
     (as `DefaultsScreen` computed it) "every entry in the whole config."
   - `action_reset_field()` resets straight to the dataclass default (no
     merge — there's nothing to merge against).
+
+The first and third were whole-method overrides of `_compute_initial_values()`
+and `_compose_field_row()` until Codex review of #129 round 7: with two copies
+of that machinery, an improvement to field handling landed in one of them and
+not the other. One implementation, two hooks.
 
 Connector templates require picking a `type` up front, exactly like a brand
 new connector does (`OverviewScreen.action_new_entity()`/
@@ -56,8 +58,9 @@ from typing import Literal
 from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, VerticalScroll
-from textual.widgets import Button, Checkbox, Input, Select, Static
+from textual.widgets import Button, Input, Static
 
+from ..formatting import markup_safe
 from ..modals import ConfirmModal, MessageModal
 from ..model import EditableConfig
 from .agent_detail import AGENT_DATACLASS_DEFAULTS, AGENT_FORM_FIELDS
@@ -67,14 +70,11 @@ from .form_common import (
     FormScreen,
     apply_update,
     find_entries_referencing_template,
-    get_nested,
-    list_to_text,
     read_widget_value,
     set_widget_value,
-    widget_id,
 )
+from .rule_detail import WATCHER_TEMPLATE_DATACLASS_DEFAULTS, WATCHER_TEMPLATE_FIELDS
 from .tool_list_editor import TOOL_LIST_WIDGET_IDS, ToolListEditorMixin, format_tool_rule
-from .watcher_detail import WATCHER_TEMPLATE_DATACLASS_DEFAULTS, WATCHER_TEMPLATE_FIELDS
 
 # kind -> (field specs, dataclass-defaults fallback). Connector is a
 # function of the template's own `type`, so it's resolved per-instance
@@ -169,55 +169,34 @@ class TemplateDetailScreen(ToolListEditorMixin, FormScreen):
 
     # ── no inherits: concept for a template's own fields ─────────────────────
 
-    def _compute_initial_values(self, entry: dict) -> None:
-        self._reset_keys = {}
-        dataclass_defaults = self._dataclass_defaults()
-        for spec in self._field_specs():
-            value = get_nested(entry, spec.key)
-            if value is None:
-                value = dataclass_defaults.get(spec.key)
-            # See module docstring: normalizes a falsy dataclass-default
-            # value ("" / []) to None so it matches read_widget_value()'s
-            # own untouched-field readback — prevents a false-positive
-            # blast-radius confirm for a field nobody actually edited.
-            if spec.kind in ("str", "list") and value is not None and not value:
-                value = None
-            self._initial_values[spec.key] = value
-        self._initial_values["description"] = entry.get("description")
+    def _snapshot_source(self, entry: dict) -> dict:
+        """A template's own raw entry — there is nothing to merge against
+        (no nested templates), unlike an entry resolving its `inherits:`.
+        This one difference is all this screen ever needed from the base
+        snapshot logic; overriding the whole method for it is what let a
+        field-handling fix land in the entry forms and not here (Codex
+        review of #129, round 7)."""
+        return entry
 
     def _field_provenance(self, spec: FieldSpec, entry: dict):
         return None
 
-    def _compose_field_row(self, spec: FieldSpec, entry: dict) -> ComposeResult:
+    def _field_annotation(self, spec: FieldSpec, entry: dict, provenance=None) -> str:
+        """BLAST RADIUS instead of provenance — "N inherit, M override",
+        counting entries of this same kind whose `inherits:` names THIS
+        template and that don't already set the field themselves. This is
+        the actual point of the templates redesign: blast radius is scoped
+        to ONE named template, not (as the old global-defaults screen
+        computed it) every entry in the config.
+
+        `provenance` is ignored: a template's own fields have no explicit-
+        versus-inherited distinction for the live-refresh path to report.
+        """
         referencing = find_entries_referencing_template(self.cfg, self.kind, self.template_name)
         top_key = spec.key.split(".", 1)[0]
         inherit_count = sum(1 for _, e in referencing if top_key not in e)
         override_count = len(referencing) - inherit_count
-        blast_text = f"[dim]({inherit_count} inherit, {override_count} override)[/dim]"
-        initial = self._initial_values.get(spec.key)
-        with Horizontal(classes="field-row"):
-            yield Static(spec.label, classes="field-label")
-            if spec.kind == "bool":
-                widget = Checkbox(value=bool(initial), id=widget_id(spec.key))
-            elif spec.kind == "enum":
-                options = spec.options or ()
-                widget = Select(
-                    [(o, o) for o in options],
-                    value=initial if initial in options else (options or (None,))[0],
-                    allow_blank=False,
-                    id=widget_id(spec.key),
-                )
-            elif spec.kind == "list":
-                widget = Input(value=list_to_text(initial), id=widget_id(spec.key))
-            else:
-                widget = Input(
-                    value="" if initial is None else str(initial),
-                    id=widget_id(spec.key),
-                    password=spec.secret,
-                )
-            widget.field_key = spec.key
-            yield widget
-            yield Static(blast_text, classes="field-provenance")
+        return f"[dim]({inherit_count} inherit, {override_count} override)[/dim]"
 
     def action_reset_field(self) -> None:
         """ctrl+r: clear the FOCUSED field back to "this template doesn't
@@ -274,12 +253,19 @@ class TemplateDetailScreen(ToolListEditorMixin, FormScreen):
     def _body_text(self) -> str:
         referencing = find_entries_referencing_template(self.cfg, self.kind, self.template_name)
         used_by = ", ".join(name for name, _ in referencing) if referencing else "(none)"
-        type_suffix = f"  (type: {self._connector_type()})" if self.kind == "connector" else ""
-        lines = [f"[bold]{self.template_name}[/bold]{type_suffix}  ({self.kind} template)"]
+        type_suffix = (
+            f"  (type: {markup_safe(self._connector_type())})"
+            if self.kind == "connector"
+            else ""
+        )
+        lines = [
+            f"[bold]{markup_safe(self.template_name)}[/bold]{type_suffix}  "
+            f"({self.kind} template)"
+        ]
         description = self.entry.get("description")
         if description:
-            lines.append(f"[dim]{description}[/dim]")
-        lines.append(f"used by: {used_by}")
+            lines.append(f"[dim]{markup_safe(description)}[/dim]")
+        lines.append(f"used by: {markup_safe(used_by)}")
         lines.append("")
 
         # Raw dump of this template's own top-level fields (mirrors
@@ -298,11 +284,13 @@ class TemplateDetailScreen(ToolListEditorMixin, FormScreen):
             if key in TOOL_LIST_WIDGET_IDS:
                 # Same one-rule-per-line style AgentDetailScreen's own view
                 # mode uses (format_tool_rule()), not a raw Python list dump.
-                lines.append(f"{key}:  {blast_text}")
+                lines.append(f"{markup_safe(key)}:  {blast_text}")
                 for item in value or []:
-                    lines.append(f"  {format_tool_rule(item)}")
+                    lines.append(f"  {markup_safe(format_tool_rule(item))}")
             else:
-                lines.append(f"{key}: {value}  {blast_text}")
+                lines.append(
+                    f"{markup_safe(key)}: {markup_safe(value)}  {blast_text}"
+                )
         if not shown_any:
             lines.append("(empty — this template sets no fields yet)")
 
@@ -311,10 +299,14 @@ class TemplateDetailScreen(ToolListEditorMixin, FormScreen):
     # ── edit/create form ─────────────────────────────────────────────────────
 
     def _compose_form(self) -> ComposeResult:
-        type_suffix = f"  (type: {self._connector_type()})" if self.kind == "connector" else ""
+        type_suffix = (
+            f"  (type: {markup_safe(self._connector_type())})"
+            if self.kind == "connector"
+            else ""
+        )
         with VerticalScroll(classes="entity-form", can_focus=False):
             if self.mode == "create":
-                yield Static(f"[bold]New {self.kind} template[/bold]{type_suffix}")
+                yield Static(f"[bold]New {self.kind} template[/bold]{type_suffix}")  # kind is a literal
                 with Horizontal(classes="field-row"):
                     yield Static("Name", classes="field-label")
                     # Pre-filled with the name already chosen via the
@@ -326,7 +318,9 @@ class TemplateDetailScreen(ToolListEditorMixin, FormScreen):
                         id="field-name", value=self.template_name, placeholder="template name"
                     )
             else:
-                yield Static(f"[bold]{self.template_name}[/bold]{type_suffix}  (editing)")
+                yield Static(
+                    f"[bold]{markup_safe(self.template_name)}[/bold]{type_suffix}  (editing)"
+                )
 
             with Horizontal(classes="field-row"):
                 yield Static("Description", classes="field-label")
@@ -372,7 +366,14 @@ class TemplateDetailScreen(ToolListEditorMixin, FormScreen):
         updates = self._collect_field_updates()
         if updates is None:
             await self.app.push_screen_wait(
-                MessageModal(self._last_field_error or "Invalid field.", title="Could not save")
+                MessageModal(
+                    # read_widget_value() quotes the operator's own text back
+                    # ("must be a whole number, got '[/]'"), so the message
+                    # reporting a bad value must not itself be parsed as
+                    # markup (Codex review of #129, round 10).
+                    markup_safe(self._last_field_error or "Invalid field."),
+                    title="Could not save",
+                )
             )
             return
 
@@ -387,7 +388,8 @@ class TemplateDetailScreen(ToolListEditorMixin, FormScreen):
             if name in self.cfg.templates(self.kind):
                 await self.app.push_screen_wait(
                     MessageModal(
-                        f"A {self.kind} template named '{name}' already exists.",
+                        f"A {self.kind} template named '{markup_safe(name)}' "
+                        "already exists.",
                         title="Could not save",
                     )
                 )
@@ -437,7 +439,13 @@ class TemplateDetailScreen(ToolListEditorMixin, FormScreen):
                 affected[key] = names
 
         if affected:
-            lines = [f"{key}: {', '.join(names)}" for key, names in affected.items()]
+            # The names are entity names (agents/connectors/rules that
+            # inherit this template) and the keys are field names — both
+            # operator-authored, both rendered as markup by ConfirmModal.
+            lines = [
+                f"{markup_safe(key)}: {', '.join(markup_safe(n) for n in names)}"
+                for key, names in affected.items()
+            ]
             confirmed = await self.app.push_screen_wait(
                 ConfirmModal(
                     "This changes the EFFECTIVE value for —\n" + "\n".join(lines) + "\n\nContinue?",
@@ -461,7 +469,7 @@ class TemplateDetailScreen(ToolListEditorMixin, FormScreen):
                 templates.pop(name, None)
             else:
                 self._rollback_trial_entry()
-            await self.app.push_screen_wait(MessageModal(str(exc), title="Could not save"))
+            await self.app.push_screen_wait(MessageModal(markup_safe(exc), title="Could not save"))
             return
 
         self.entry = target_entry

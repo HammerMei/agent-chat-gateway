@@ -184,9 +184,9 @@ class GatewayConfig:
     def from_file(path: str | Path) -> "GatewayConfig":
         """The real, production config loader — deliberately fail-fast: stops
         at the FIRST problem found (single, clear, actionable error), same
-        as always. Per-entity parsing (one connector/agent/watcher at a
+        as always. Per-entity parsing (one connector/agent/watcher rule at a
         time) is delegated to `_parse_one_connector()`/`_parse_one_agent()`/
-        `_parse_one_watcher_entry()` (module-level functions below) so this
+        `_parse_one_watcher_rule()` (module-level functions below) so this
         method and `collect_config()`'s fault-tolerant counterpart (used by
         `gateway/config_validate.py` for the config TUI's Status column and
         the pre-save "did this edit make anything new go wrong" check) share
@@ -289,7 +289,18 @@ class GatewayConfig:
         watchers: list[WatcherConfig] = []
         watcher_rules: list[WatcherRule] = []
         watchers_raw = raw.get("watchers", [])
-        if watchers_raw and not isinstance(watchers_raw, list):
+        # None BEFORE the type check, and the type check without a truthiness
+        # gate — this file's own rule, stated on _resolve_watcher_connector:
+        # "the type check must come BEFORE any truthiness test". The gate let
+        # every FALSY non-list through: a bare `watchers:` (explicit null,
+        # the natural way to empty the block) then reached `enumerate(None)`
+        # and raised a raw TypeError, so the daemon failed to start and
+        # `acg config validate` crashed instead of reporting — on a config an
+        # operator writes by deleting their rules. `0`/`""` took the same
+        # path and now get the clean message.
+        if watchers_raw is None:
+            watchers_raw = []
+        if not isinstance(watchers_raw, list):
             raise ValueError(
                 f"config.yaml 'watchers:' must be a list (got {type(watchers_raw).__name__})."
             )
@@ -593,34 +604,6 @@ def _resolve_tool_entries(
                 f"{field_name}: {e}"
             ) from e
     return rules
-
-
-_NAME_SANITIZE_RE = re.compile(r"[^A-Za-z0-9._-]")
-_NAME_COLLAPSE_DASH_RE = re.compile(r"-{2,}")
-
-
-def _sanitize_room_for_name(room: str) -> str:
-    """Turn a room identifier into a filesystem/CLI-safe watcher-name fragment.
-
-    - A leading '@' (DM room, e.g. '@alice') becomes a 'dm-' prefix: '@alice' -> 'dm-alice'.
-    - Any character outside [A-Za-z0-9._-] (including '/') becomes '-'.
-    - Runs of '-' collapse to one; leading/trailing '-' and '.' are stripped.
-    """
-    prefix = "dm-" if room.startswith("@") else ""
-    body = room[1:] if room.startswith("@") else room
-    body = _NAME_SANITIZE_RE.sub("-", body)
-    sanitized = _NAME_COLLAPSE_DASH_RE.sub("-", prefix + body).strip("-.")
-    if not sanitized:
-        raise ValueError(
-            f"Could not derive a safe watcher name from room {room!r} — "
-            "set an explicit 'name:' for this entry."
-        )
-    return sanitized
-
-
-def _auto_watcher_name(connector: str, room: str) -> str:
-    """Deterministic watcher name for a (connector, room) pair: '<connector>-<room>'."""
-    return f"{connector}-{_sanitize_room_for_name(room)}"
 
 
 def _resolve_paths(paths: object, base_dir: Path, label: str = "context_inject_files") -> list[str]:
@@ -997,39 +980,6 @@ def _key_list(keys) -> str:
     return ", ".join(sorted(repr(str(k)) for k in keys))
 
 
-def _validated_optional_name(raw: object, where: str, field_name: str) -> str | None:
-    """Check a `str | None` field whose value is an identity, not a message.
-
-    `wc.get(field) or None` had the same hole `connector:` did before it was fixed:
-    the type check sat behind a truthiness test, so a *falsy* non-string skipped it
-    and was then read as "not set". That is reachable and silent — pyyaml resolves
-    `name: no` to the boolean False, so an operator naming a watcher `no` (or
-    writing `0`, `[]`) silently gets an auto-generated name instead of an error.
-    The name is the watcher's persistent identity: its state.json session and its
-    `pause`/`resume`/`reset` handle. It is no longer a path component — how the
-    per-room files are named is documented in gateway/core/paths.py, which is the one
-    place that states it.
-
-    An absent key and an explicit null are the two spellings of "no value here" and
-    both mean the default. An empty string is not one of them: it cannot serve as an
-    identity, and silently auto-naming is the failure this check exists to remove.
-    """
-    if raw is _MISSING_FIELD or raw is None:
-        return None
-    if not isinstance(raw, str):
-        raise ValueError(
-            f"{where}: '{field_name}' must be a string "
-            f"(got {type(raw).__name__})."
-        )
-    if not raw:
-        raise ValueError(
-            f"{where}: '{field_name}' must not be empty — omit the key to let it "
-            "be derived."
-        )
-    return raw
-
-
-
 _HH_FIELD_TYPES: dict[str, type] = {
     "enabled": bool,
     "fetch_count": int,
@@ -1135,16 +1085,13 @@ def _resolve_watcher_connector(
             f"{where} references unknown connector '{watcher_connector}'"
         )
     if not watcher_connector and not connectors:
-        # from_file() can never reach either parser with an empty `connectors`
+        # from_file() can never reach the parser with an empty `connectors`
         # list (an earlier structural check already raised), and collect_config()
         # guards against it too (its own "no connectors parsed successfully"
-        # branch returns before ever reaching the watcher loop) — but
-        # EditableConfig.expanded_watchers() calls the static parser directly, per
-        # raw watcher entry, against whatever partial `connectors`
-        # collect_config() returned, so an all-connectors-failed config CAN
-        # legitimately land here. Without this guard, `connectors[0].name` below
-        # raises an uncaught IndexError instead of the ValueError every caller's
-        # `except ValueError` expects.
+        # branch returns before ever reaching the watcher loop). Kept as a
+        # defensive check on a shared helper regardless: without it,
+        # `connectors[0].name` below raises an uncaught IndexError instead of
+        # the ValueError every caller's `except ValueError` expects.
         raise ValueError(
             f"{where} has no explicit 'connector' set and no connectors are "
             "configured to default to."
@@ -1171,225 +1118,6 @@ def _validated_watcher_agent(
     if watcher_agent not in agents:
         raise ValueError(f"{where} references unknown agent '{watcher_agent}'")
     return watcher_agent
-
-
-def _parse_one_watcher_entry(  # LEGACY: configtool-only — see note below
-    wc_raw: object,
-    index: int,
-    watcher_templates: dict[str, dict],
-    connector_names: set[str],
-    connectors: list[ConnectorConfig],
-    agents: dict[str, AgentConfig],
-    default_agent: str,
-    config_dir: Path,
-    seen_watcher_names: set[str],
-) -> list[WatcherConfig]:
-    """Parses ONE raw `watchers:` entry into its expanded list of
-    WatcherConfigs (more than one only when `rooms:` names several rooms).
-
-    **No loader calls this any more.** The static shape is a hard load error
-    at cutover (§5.4, `_static_shape_error`); the one remaining caller is the
-    config TUI (`gateway/configtool/model.py`), whose rewrite is
-    `impl/config-tooling`'s PR — this function's deletion goes with it, not
-    with the runtime cutover, because deleting an import another module
-    holds breaks the build without migrating the module."""
-    if not isinstance(wc_raw, Mapping):
-        raise ValueError(
-            f"Watcher entry at index {index} must be a mapping "
-            f"(got {type(wc_raw).__name__})."
-        )
-    wc = _resolve_inherits(
-        wc_raw, watcher_templates, "watcher_templates",
-        "Watcher entry", f"index {index}",
-    )
-
-    # ── room / rooms: exactly one form, 'room' is a single-item alias ──
-    raw_room = wc.get("room")
-    raw_rooms = wc.get("rooms")
-    if raw_room and raw_rooms:
-        raise ValueError(
-            f"Watcher entry at index {index}: set either 'room' or 'rooms', not both."
-        )
-    if raw_rooms is not None:
-        if not isinstance(raw_rooms, list) or not raw_rooms:
-            raise ValueError(
-                f"Watcher entry at index {index}: 'rooms' must be a non-empty list "
-                "of room names."
-            )
-        if not all(isinstance(r, str) and r for r in raw_rooms):
-            raise ValueError(
-                f"Watcher entry at index {index}: 'rooms' entries must be "
-                "non-empty strings."
-            )
-        if len(set(raw_rooms)) != len(raw_rooms):
-            dupes = sorted({r for r in raw_rooms if raw_rooms.count(r) > 1})
-            raise ValueError(
-                f"Watcher entry at index {index}: 'rooms' contains duplicate "
-                f"room(s): {dupes}."
-            )
-        rooms_list = list(raw_rooms)
-    elif raw_room:
-        if not isinstance(raw_room, str):
-            # PR review finding: the plural 'rooms:' form validates each
-            # element (`isinstance(r, str) and r`, above) but this singular
-            # alias didn't — a truthy-but-non-string 'room' (e.g. an int)
-            # reached _sanitize_room_for_name()'s `room.startswith("@")`
-            # unchecked (via _auto_watcher_name()), crashing with
-            # AttributeError instead of a clean ValueError.
-            raise ValueError(
-                f"Watcher entry at index {index}: 'room' must be a string "
-                f"(got {type(raw_room).__name__})."
-            )
-        rooms_list = [raw_room]
-    else:
-        raise ValueError(
-            f"Watcher entry at index {index} must have a non-empty "
-            "'room' or 'rooms' field"
-        )
-
-    # ── exclude_room: only meaningful alongside room: "*" ──────────────────
-    # (docs/design/dynamic-watcher-design.md). Shape is validated now so this
-    # field is test-covered ahead of the actual rule-matching engine, but
-    # room: "*" itself is rejected below — accepting it today would let a
-    # user configure a watcher the runtime has no way to act on correctly
-    # (there's no room literally named "*").
-    raw_exclude = wc.get("exclude_room")
-    if raw_exclude is not None:
-        if not isinstance(raw_exclude, list) or not raw_exclude:
-            raise ValueError(
-                f"Watcher entry at index {index}: 'exclude_room' must be a "
-                "non-empty list of room names."
-            )
-        if not all(isinstance(r, str) and r for r in raw_exclude):
-            raise ValueError(
-                f"Watcher entry at index {index}: 'exclude_room' entries "
-                "must be non-empty strings."
-            )
-        if len(set(raw_exclude)) != len(raw_exclude):
-            dupes = sorted({r for r in raw_exclude if raw_exclude.count(r) > 1})
-            raise ValueError(
-                f"Watcher entry at index {index}: 'exclude_room' contains "
-                f"duplicate room(s): {dupes}."
-            )
-
-    is_wildcard_room = rooms_list == ["*"]
-    if raw_exclude is not None and not is_wildcard_room:
-        raise ValueError(
-            f"Watcher entry at index {index}: 'exclude_room' is only valid "
-            "when 'room' is the wildcard \"*\" — it has no meaning against "
-            "an explicit room name or a 'rooms:' list."
-        )
-    if is_wildcard_room:
-        raise ValueError(
-            f"Watcher entry at index {index}: room: \"*\" (rule-based room "
-            "matching / on-the-fly watchers) is not implemented yet — use an "
-            "explicit 'room:' or 'rooms:' list for now. See "
-            "docs/design/dynamic-watcher-design.md."
-        )
-
-    # 'name' pins a single sticky identity — only meaningful when the entry
-    # expands to exactly one watcher. It used to type-check only the truthy half;
-    # see _validated_optional_name() for why the falsy half was the worse of the two.
-    where = f"Watcher entry at index {index}"
-    explicit_name = _validated_optional_name(wc.get("name", _MISSING_FIELD), where, "name")
-    if len(rooms_list) > 1 and explicit_name:
-        raise ValueError(
-            f"Watcher entry at index {index}: 'name' can only be set when "
-            f"there is exactly one room (found {len(rooms_list)} in "
-            "'rooms') — remove 'name' or split into single-room entries."
-        )
-
-    # `session_id:` is removed, and refused rather than ignored. Unknown keys on a
-    # watcher entry are silently dropped by every `.get()` here — deliberately, so
-    # `description:` and the like need no handling — which means deleting this field
-    # quietly would demote a released, load-bearing setting to a no-op: the config
-    # would still parse, the session would no longer be pinned, and the operator
-    # would find out from the agent's missing memory. Unlike the fields #97 moved,
-    # this one shipped in v0.5.1 and is documented in its config.example.yaml, so
-    # silence here would land on real deployments.
-    #
-    # There is no replacement field, because pinning was the wrong mechanism rather
-    # than the wrong spelling: with a watcher created per discovered room, nothing
-    # can supply one id, and a pinned id dies anyway once the backend expires the
-    # session it names. A handoff survives that, so the error names it.
-    if "session_id" in wc:
-        raise ValueError(
-            f"Watcher entry at index {index}: 'session_id' is no longer supported. "
-            "Sessions are no longer pinned from config. To carry context into a new "
-            "session, have the agent summarise its session to a file and read that "
-            "file back in the new one — a handoff survives the backend expiring a "
-            "session, which pinning never did. See docs/user-guide.md."
-        )
-
-    resolved_connector = _resolve_watcher_connector(
-        wc, where, connectors, connector_names
-    )
-    watcher_agent = _validated_watcher_agent(wc, where, agents, default_agent)
-
-    # Resolve watcher-level context_inject_files (shared across expanded rooms)
-    raw_ctx = wc.get("context_inject_files", [])
-    ctx_files = _resolve_paths(
-        raw_ctx, config_dir, f"Watcher entry at index {index}: 'context_inject_files'"
-    )
-
-    # `or {}` swallowed two different mistakes, and validating only the outer
-    # mapping left a third — see _parse_history_handoff() for all three.
-    history_handoff = _parse_history_handoff(wc.get("history_handoff"), where)
-
-    # Names are staged here, NOT written into `seen_watcher_names` directly,
-    # until this whole entry finishes successfully (committed just before
-    # returning below). PR review finding: with the old
-    # "add-as-you-go-then-maybe-raise" approach, a multi-room `rooms:` entry
-    # that registered its first room's name fine and then raised on a LATER
-    # room (e.g. that later room's name genuinely collides with something
-    # else) left the FIRST room's name permanently in `seen_watcher_names`
-    # even though this entry's exception means NONE of its watchers actually
-    # exist in the result — harmless in from_file()'s fail-fast mode (any
-    # raise there aborts the whole load anyway) but a real bug once
-    # collect_config() reuses this same function and keeps going past a
-    # failed entry: a later, perfectly valid entry could then be rejected as
-    # a "duplicate" of a watcher that was never actually added.
-    staged_names: set[str] = set()
-    result: list[WatcherConfig] = []
-    for room in rooms_list:
-        watcher_name = explicit_name or _auto_watcher_name(
-            resolved_connector, room
-        )
-        if "/" in watcher_name:
-            raise ValueError(
-                f"Watcher name '{watcher_name}' must not contain '/' — "
-                "watcher names are identifiers, not paths: they key state.json "
-                "records and are the handle for 'pause'/'resume'/'reset'. "
-                "(They are no longer used as path components directly; how per-room "
-                "files are named is documented in gateway/core/paths.py. A '/' in an "
-                "identifier is still a mistake worth refusing.)"
-            )
-        if watcher_name in seen_watcher_names or watcher_name in staged_names:
-            origin = (
-                "explicit 'name:'"
-                if explicit_name
-                else f"auto-generated from connector '{resolved_connector}' "
-                f"+ room '{room}'"
-            )
-            raise ValueError(
-                f"Duplicate watcher name '{watcher_name}' found ({origin}). "
-                "Each watcher must use a unique name — set an explicit "
-                "'name:' to disambiguate."
-            )
-        staged_names.add(watcher_name)
-
-        result.append(
-            WatcherConfig(
-                name=watcher_name,
-                connector=resolved_connector,
-                room=room,
-                agent=watcher_agent,
-                context_inject_files=ctx_files,
-                history_handoff=history_handoff,
-            )
-        )
-    seen_watcher_names.update(staged_names)
-    return result
 
 
 def entry_is_watcher_rule(entry: object) -> bool:
@@ -1624,13 +1352,12 @@ def _parse_one_watcher_rule(
 ) -> WatcherRule:
     """Parse one rule-shaped `watchers:` entry into a `WatcherRule`.
 
-    Runs alongside `_parse_one_watcher_entry` rather than replacing it: until the
-    watcher manager lands, an old-shape config must keep loading and running
-    byte-identically, so neither parser may assume the other is gone.
-
-    Unlike the static parser this returns exactly one object, because a rule is
-    one thing — the expansion that used to turn `rooms: [a, b]` into several
-    watchers now happens at runtime, per discovered room.
+    The only watcher parser left: the static shape is a hard load error at
+    cutover (`_static_shape_error`), and its parser was deleted with the
+    config TUI's rewrite onto rules. This returns exactly one object,
+    because a rule is one thing — the expansion that used to turn
+    `rooms: [a, b]` into several watchers now happens at runtime, per
+    discovered room.
     """
     if not isinstance(entry, Mapping):
         raise ValueError(
@@ -1994,7 +1721,7 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
     stopping at the FIRST bad connector/agent/watcher, collects a
     `ConfigIssue` for EVERY one that fails independently and keeps going —
     reusing `_parse_one_connector()`/`_parse_one_agent()`/
-    `_parse_one_watcher_entry()` verbatim (never a second copy of any rule).
+    `_parse_one_watcher_rule()` verbatim (never a second copy of any rule).
 
     Returns a best-effort `GatewayConfig` built from whatever entities DID
     parse successfully, so callers (`gateway/config_validate.py`'s
@@ -2272,7 +1999,12 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
     watchers: list[WatcherConfig] = []
     watcher_rules: list[WatcherRule] = []
     watchers_raw = raw.get("watchers", [])
-    if watchers_raw and not isinstance(watchers_raw, list):
+    # Same None-then-type ordering as from_file() above; a raw TypeError out
+    # of THIS function is worse, since collecting problems instead of raising
+    # them is its whole contract.
+    if watchers_raw is None:
+        watchers_raw = []
+    if not isinstance(watchers_raw, list):
         # Connectors AND agents have already parsed successfully by this
         # point — same "don't hide an unrelated, already-successful entity's
         # checks behind this" reasoning as every branch above.

@@ -176,7 +176,13 @@ def validate_config(config_path: str, lint: bool = False) -> ValidationResult:
         )
         return result
 
-    result.entry_count = len(raw.get("watchers") or [])
+    # isinstance, not truthiness: `watchers: 5` parses fine and reaches here
+    # (collect_config tolerates it into a ConfigIssue + an empty rule list),
+    # and `len(5)` raised a TypeError out of the one function whose whole
+    # contract is collecting problems instead of raising them — crashing
+    # both `acg config validate` and the TUI's banner (Codex review of #129).
+    raw_watchers = raw.get("watchers")
+    result.entry_count = len(raw_watchers) if isinstance(raw_watchers, list) else 0
 
     _check_connectors(config, result)
     _check_state_orphans(config, result)
@@ -365,6 +371,16 @@ def _check_session_uniqueness(result: ValidationResult) -> None:
         # inflated the error count. Swallowed rather than re-raised so an unreadable file
         # does not abort a run that has more to say.
         return
+    except OSError:
+        # Same dedup reasoning as StateFormatError above, for the enumeration
+        # failure: check_session_uniqueness() re-enumerates via state_files(),
+        # whose ensure_runtime_dir() raises on an uncreatable/unlistable
+        # runtime dir — the exact fault `_check_state_orphans` (which runs
+        # immediately before this) already collected as its own warning.
+        # Codex review of #129, round 3: the round-2 guard covered only the
+        # orphan check's call, so this second call still crashed validation
+        # on the same broken directory.
+        return
 
 
 def _check_state_orphans(config: GatewayConfig, result: ValidationResult) -> None:
@@ -383,7 +399,20 @@ def _check_state_orphans(config: GatewayConfig, result: ValidationResult) -> Non
     # since-renamed connector would pass validation and then be abandoned silently at
     # startup, which is the failure the refusal exists to prevent.
     configured = {c.name for c in config.connectors}
-    for path in state_files():
+    # The enumeration itself can raise before any per-file try is entered —
+    # state_files() calls ensure_runtime_dir(), which fails when the runtime
+    # dir cannot be created or listed (a file squatting on the path, a
+    # read-only $HOME). Collected as a warning rather than raised: this
+    # function's whole contract is reporting problems, not crashing on them
+    # (Codex review of #129 — same contract the entry_count fix restored).
+    try:
+        persisted = state_files()
+    except OSError as exc:
+        msg = f"Could not enumerate persisted state files: {exc}"
+        result.warnings.append(msg)
+        result.findings.append(Finding("warning", "global", None, None, msg))
+        persisted = []
+    for path in persisted:
         file_connector = connector_name_of(path)
         try:
             states = load_state(file_connector)

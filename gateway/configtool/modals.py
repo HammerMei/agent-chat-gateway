@@ -20,6 +20,8 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, ListItem, ListView, Static
 
+from .formatting import markup_safe
+
 
 class ConfirmModal(ModalScreen[bool]):
     """A yes/no confirmation dialog. `dismiss(True)` on confirm, `dismiss(False)`
@@ -190,7 +192,11 @@ class TypePickerModal(ModalScreen[str | None]):
         with Vertical(id="type-picker-dialog"):
             yield Static(self.title_text, id="type-picker-title")
             yield ListView(
-                *[ListItem(Label(label), name=value) for value, label in self.options],
+                # Label parses markup; option labels can be entity names.
+                *[
+                    ListItem(Label(markup_safe(label)), name=value)
+                    for value, label in self.options
+                ],
                 id="type-picker-list",
             )
 
@@ -370,13 +376,13 @@ class InlineToolRuleModal(ModalScreen[dict | None]):
         try:
             re.compile(tool_pattern, re.IGNORECASE)
         except re.error as exc:
-            error_widget.update(f"Invalid tool regex: {exc}")
+            error_widget.update(f"Invalid tool regex: {markup_safe(exc)}")
             return None
         if params_pattern is not None:
             try:
                 re.compile(params_pattern, re.IGNORECASE | re.DOTALL)
             except re.error as exc:
-                error_widget.update(f"Invalid params regex: {exc}")
+                error_widget.update(f"Invalid params regex: {markup_safe(exc)}")
                 return None
         error_widget.update("")
         return tool_pattern, params_pattern
@@ -451,7 +457,7 @@ class PresetOrInlineModal(ModalScreen[tuple[str, str | None] | None]):
         with Vertical(id="preset-or-inline-dialog"):
             yield Static("Add a tool rule", id="preset-or-inline-title")
             items = [
-                ListItem(Label(f"→ preset: {name}"), name=f"preset:{name}")
+                ListItem(Label(f"→ preset: {markup_safe(name)}"), name=f"preset:{name}")
                 for name in self.preset_names
             ]
             items.append(ListItem(Label(self._INLINE_LABEL), name="inline"))
@@ -531,7 +537,10 @@ class InheritsPickerModal(ModalScreen[tuple[str, str | None] | None]):
             for name in self.template_names:
                 suffix = "  (current)" if name == self.current else ""
                 items.append(
-                    ListItem(Label(f"→ template: {name}{suffix}"), name=f"template:{name}")
+                    ListItem(
+                        Label(f"→ template: {markup_safe(name)}{suffix}"),
+                        name=f"template:{name}",
+                    )
                 )
             items.append(ListItem(Label(self._NEW_TEMPLATE_LABEL), name="new_template"))
             yield ListView(*items, id="inherits-picker-list")

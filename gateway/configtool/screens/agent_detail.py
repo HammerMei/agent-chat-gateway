@@ -66,7 +66,7 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal, VerticalScroll
 from textual.widgets import Button, Input, Static
 
-from ..formatting import format_value, provenance_label
+from ..formatting import format_value, markup_safe, provenance_label
 from ..modals import ConfirmModal, InheritsPickerModal, MessageModal, TextPromptModal
 from ..model import EditableConfig
 from .form_common import (
@@ -184,7 +184,11 @@ def _working_directory_warning(config_path: Path, raw_value: str) -> str:
         return ""
     resolved = _resolve_working_directory(config_path, text)
     if not resolved.is_dir():
-        return f"[yellow]⚠ does not exist yet: {resolved}[/yellow]"
+        # The resolved PATH comes from the operator's own working_directory,
+        # and this string is rendered as markup — found by the static markup
+        # check when it was extended to whole-argument sinks (Codex review of
+        # #129, round 10), not by any review round.
+        return f"[yellow]⚠ does not exist yet: {markup_safe(resolved)}[/yellow]"
     return ""
 
 
@@ -375,7 +379,8 @@ class AgentDetailScreen(ToolListEditorMixin, FormScreen):
             if new_name in self.cfg.templates("agent"):
                 await self.app.push_screen_wait(
                     MessageModal(
-                        f"An agent template named '{new_name}' already exists.",
+                        f"An agent template named '{markup_safe(new_name)}' "
+                        "already exists.",
                         title="Could not create",
                     )
                 )
@@ -416,17 +421,21 @@ class AgentDetailScreen(ToolListEditorMixin, FormScreen):
 
     def _body_text(self) -> str:
         description = self.entry.get("description")
-        lines = [f"[bold]{self.agent_name}[/bold]"]
+        lines = [f"[bold]{markup_safe(self.agent_name)}[/bold]"]
         if description:
-            lines.append(f"[dim]{description}[/dim]")
+            lines.append(f"[dim]{markup_safe(description)}[/dim]")
         template_name = self.cfg.entry_template_name(self.entry)
-        lines.append(f"inherits: {template_name if template_name else '(none)'}")
+        lines.append(
+            f"inherits: {markup_safe(template_name) if template_name else '(none)'}"
+        )
         lines.append("")
 
         try:
             merged = self.cfg.merged_entry("agent", self.entry)
         except (ValueError, FileNotFoundError) as exc:
-            lines.append(f"[red]Could not compute effective values: {exc}[/red]")
+            lines.append(
+                f"[red]Could not compute effective values: {markup_safe(exc)}[/red]"
+            )
             return "\n".join(lines)
 
         for key in _KNOWN_FIELDS:
@@ -434,7 +443,7 @@ class AgentDetailScreen(ToolListEditorMixin, FormScreen):
                 continue
             provenance = self.cfg.field_provenance("agent", self.entry, key)
             lines.append(
-                f"{key}: {format_value(merged[key])}  "
+                f"{markup_safe(key)}: {markup_safe(format_value(merged[key]))}  "
                 f"[dim]({provenance_label(provenance, template_name)})[/dim]"
             )
 
@@ -448,7 +457,7 @@ class AgentDetailScreen(ToolListEditorMixin, FormScreen):
             lines.append("")
             lines.append(f"{label}:  [dim]({provenance_label(provenance, template_name)})[/dim]")
             for item in merged.get(field_key) or []:
-                lines.append(f"  {format_tool_rule(item)}")
+                lines.append(f"  {markup_safe(format_tool_rule(item))}")
 
         return "\n".join(lines)
 
@@ -463,12 +472,15 @@ class AgentDetailScreen(ToolListEditorMixin, FormScreen):
         agent_type = self._agent_type()
         with VerticalScroll(classes="entity-form", can_focus=False):
             if self.mode == "create":
-                yield Static(f"[bold]New agent[/bold]  (type: {agent_type})")
+                yield Static(f"[bold]New agent[/bold]  (type: {markup_safe(agent_type)})")
                 with Horizontal(classes="field-row"):
                     yield Static("Name *", classes="field-label")
                     yield Input(id="field-name", value=self._name_live, placeholder="agent name")
             else:
-                yield Static(f"[bold]{self.agent_name}[/bold]  (type: {agent_type}, editing)")
+                yield Static(
+                    f"[bold]{markup_safe(self.agent_name)}[/bold]  "
+                    f"(type: {markup_safe(agent_type)}, editing)"
+                )
 
             with Horizontal(classes="field-row"):
                 yield Static("Description", classes="field-label")
@@ -480,7 +492,10 @@ class AgentDetailScreen(ToolListEditorMixin, FormScreen):
             with Horizontal(classes="field-row"):
                 yield Static("Inherits", classes="field-label")
                 yield Static(
-                    self._inherits_current or "(none)",
+                    # A template name is operator-authored and this Static
+                    # parses markup (see markup_safe()).
+                    markup_safe(self._inherits_current) if self._inherits_current
+                    else "(none)",
                     id="inherits-value",
                     classes="field-value",
                 )
@@ -531,7 +546,14 @@ class AgentDetailScreen(ToolListEditorMixin, FormScreen):
         updates = self._collect_field_updates()
         if updates is None:
             await self.app.push_screen_wait(
-                MessageModal(self._last_field_error or "Invalid field.", title="Could not save")
+                MessageModal(
+                    # read_widget_value() quotes the operator's own text back
+                    # ("must be a whole number, got '[/]'"), so the message
+                    # reporting a bad value must not itself be parsed as
+                    # markup (Codex review of #129, round 10).
+                    markup_safe(self._last_field_error or "Invalid field."),
+                    title="Could not save",
+                )
             )
             return
 
@@ -545,7 +567,10 @@ class AgentDetailScreen(ToolListEditorMixin, FormScreen):
                 return
             if name in self.cfg.agents_raw:
                 await self.app.push_screen_wait(
-                    MessageModal(f"An agent named '{name}' already exists.", title="Could not save")
+                    MessageModal(
+                        f"An agent named '{markup_safe(name)}' already exists.",
+                        title="Could not save",
+                    )
                 )
                 return
 
@@ -589,7 +614,7 @@ class AgentDetailScreen(ToolListEditorMixin, FormScreen):
                 del self.cfg.document["agents"][name]
             else:
                 self._rollback_trial_entry()
-            await self.app.push_screen_wait(MessageModal(str(exc), title="Could not save"))
+            await self.app.push_screen_wait(MessageModal(markup_safe(exc), title="Could not save"))
             return
 
         self.entry = target_entry
