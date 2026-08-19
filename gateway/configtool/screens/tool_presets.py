@@ -152,7 +152,7 @@ class ToolPresetsScreen(DetailScreen):
             rules.pop()
             if not existed_before and not rules:
                 del presets[self.preset_name]
-            await self.app.push_screen_wait(MessageModal(str(exc), title="Could not save"))
+            await self.app.push_screen_wait(MessageModal(markup_safe(exc), title="Could not save"))
             return
         self._refresh_rules()
         self.app.notify(f"Added a rule to '{self.preset_name}'.", severity="information")
@@ -182,7 +182,7 @@ class ToolPresetsScreen(DetailScreen):
             self.cfg.save()
         except (ValueError, FileNotFoundError) as exc:
             rules[idx] = original
-            await self.app.push_screen_wait(MessageModal(str(exc), title="Could not save"))
+            await self.app.push_screen_wait(MessageModal(markup_safe(exc), title="Could not save"))
             return
         self._refresh_rules()
         self.app.notify(f"Updated a rule in '{self.preset_name}'.", severity="information")
@@ -204,7 +204,7 @@ class ToolPresetsScreen(DetailScreen):
             self.cfg.save()
         except (ValueError, FileNotFoundError) as exc:
             rules.insert(idx, removed)
-            await self.app.push_screen_wait(MessageModal(str(exc), title="Could not save"))
+            await self.app.push_screen_wait(MessageModal(markup_safe(exc), title="Could not save"))
             return
         self._refresh_rules()
         self.app.notify("Rule removed.", severity="information")

@@ -469,7 +469,7 @@ class OverviewScreen(Screen):
                     "has a pre-existing error, and removing this row shifts "
                     "its position, which the save safety-gate reads as a new "
                     "problem. Delete the LOWEST ERROR row first, or fix them "
-                    f"together in $EDITOR (ctrl+e).\n\n{exc}",
+                    f"together in $EDITOR (ctrl+e).\n\n{markup_safe(exc)}",
                     title="Could not delete",
                 )
             )
@@ -597,7 +597,7 @@ class OverviewScreen(Screen):
         except (ValueError, FileNotFoundError) as exc:
             if removed is not None:
                 presets[key] = removed
-            await self.app.push_screen_wait(MessageModal(str(exc), title="Could not delete"))
+            await self.app.push_screen_wait(MessageModal(markup_safe(exc), title="Could not delete"))
             return
 
         self.notify(f"Deleted tool preset '{key}'.", severity="information")
@@ -648,7 +648,7 @@ class OverviewScreen(Screen):
         except (ValueError, FileNotFoundError) as exc:
             if removed is not None:
                 templates[name] = removed
-            await self.app.push_screen_wait(MessageModal(str(exc), title="Could not delete"))
+            await self.app.push_screen_wait(MessageModal(markup_safe(exc), title="Could not delete"))
             return
 
         self.notify(f"Deleted {kind} template '{name}'.", severity="information")

@@ -687,7 +687,23 @@ class FormScreen(DetailScreen):
             if spec.kind == "list" and list_value_is_lossy(value):
                 self._lossy_list_values[spec.key] = value
             self._initial_values[spec.key] = round_trip_value(spec, value)
-        self._initial_values["description"] = entry.get("description")
+        # Coerced to TEXT, because `description` is informational and the
+        # loader does not type-check it — `description: [note]` loads fine
+        # (verified: 1 rule parsed, 0 issues) and then reached
+        # `Input(value=[...])`, which raises AttributeError DURING COMPOSE and
+        # takes the TUI down on the very row the operator opened to inspect
+        # it (Codex review of #129, round 9).
+        #
+        # Round-trip consistent, like every other snapshot here (see
+        # `round_trip_value`): the box shows `str(value)` and reads that same
+        # text back, so an untouched Save writes nothing and the odd on-disk
+        # value is preserved rather than silently repaired into a string.
+        raw_description = entry.get("description")
+        self._initial_values["description"] = (
+            raw_description
+            if raw_description is None or isinstance(raw_description, str)
+            else str(raw_description)
+        )
 
     def _field_provenance(self, spec: FieldSpec, entry: dict) -> Provenance | None:
         top_key = spec.key.split(".", 1)[0]
@@ -1079,7 +1095,7 @@ class FormScreen(DetailScreen):
             self.cfg.save()
         except (ValueError, FileNotFoundError) as exc:
             self._reinsert_entry_into_document()
-            await self.app.push_screen_wait(MessageModal(str(exc), title="Could not delete"))
+            await self.app.push_screen_wait(MessageModal(markup_safe(exc), title="Could not delete"))
             return
 
         self.app.pop_screen()

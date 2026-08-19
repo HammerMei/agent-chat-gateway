@@ -375,7 +375,8 @@ class AgentDetailScreen(ToolListEditorMixin, FormScreen):
             if new_name in self.cfg.templates("agent"):
                 await self.app.push_screen_wait(
                     MessageModal(
-                        f"An agent template named '{new_name}' already exists.",
+                        f"An agent template named '{markup_safe(new_name)}' "
+                        "already exists.",
                         title="Could not create",
                     )
                 )
@@ -602,7 +603,7 @@ class AgentDetailScreen(ToolListEditorMixin, FormScreen):
                 del self.cfg.document["agents"][name]
             else:
                 self._rollback_trial_entry()
-            await self.app.push_screen_wait(MessageModal(str(exc), title="Could not save"))
+            await self.app.push_screen_wait(MessageModal(markup_safe(exc), title="Could not save"))
             return
 
         self.entry = target_entry

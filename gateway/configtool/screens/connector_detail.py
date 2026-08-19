@@ -748,7 +748,7 @@ class ConnectorDetailScreen(FormScreen):
                 del self.cfg.document["connectors"][inserted_index]
             else:
                 self._rollback_trial_entry()
-            await self.app.push_screen_wait(MessageModal(str(exc), title="Could not save"))
+            await self.app.push_screen_wait(MessageModal(markup_safe(exc), title="Could not save"))
             return
 
         self.entry = target_entry

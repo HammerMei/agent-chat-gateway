@@ -345,7 +345,8 @@ class RuleDetailScreen(FormScreen):
             if new_name in self.cfg.templates("watcher"):
                 await self.app.push_screen_wait(
                     MessageModal(
-                        f"A watcher template named '{new_name}' already exists.",
+                        f"A watcher template named '{markup_safe(new_name)}' "
+                        "already exists.",
                         title="Could not create",
                     )
                 )
@@ -542,7 +543,10 @@ class RuleDetailScreen(FormScreen):
         )
         if duplicate:
             await self.app.push_screen_wait(
-                MessageModal(f"A rule named '{name}' already exists.", title="Could not save")
+                MessageModal(
+                    f"A rule named '{markup_safe(name)}' already exists.",
+                    title="Could not save",
+                )
             )
             return
 
@@ -601,7 +605,7 @@ class RuleDetailScreen(FormScreen):
                 del self.cfg.document["watchers"][inserted_index]
             else:
                 self._rollback_trial_entry()
-            await self.app.push_screen_wait(MessageModal(str(exc), title="Could not save"))
+            await self.app.push_screen_wait(MessageModal(markup_safe(exc), title="Could not save"))
             return
 
         self.entry = target_entry

@@ -381,7 +381,8 @@ class TemplateDetailScreen(ToolListEditorMixin, FormScreen):
             if name in self.cfg.templates(self.kind):
                 await self.app.push_screen_wait(
                     MessageModal(
-                        f"A {self.kind} template named '{name}' already exists.",
+                        f"A {self.kind} template named '{markup_safe(name)}' "
+                        "already exists.",
                         title="Could not save",
                     )
                 )
@@ -455,7 +456,7 @@ class TemplateDetailScreen(ToolListEditorMixin, FormScreen):
                 templates.pop(name, None)
             else:
                 self._rollback_trial_entry()
-            await self.app.push_screen_wait(MessageModal(str(exc), title="Could not save"))
+            await self.app.push_screen_wait(MessageModal(markup_safe(exc), title="Could not save"))
             return
 
         self.entry = target_entry

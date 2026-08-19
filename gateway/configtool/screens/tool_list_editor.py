@@ -45,6 +45,7 @@ from textual.containers import Horizontal
 from textual.css.query import NoMatches
 from textual.widgets import Button, Label, ListItem, ListView
 
+from ..formatting import markup_safe
 from ..modals import InlineToolRuleModal, MessageModal, PresetOrInlineModal, TextPromptModal
 from .tool_presets import ToolPresetsScreen
 
@@ -250,7 +251,8 @@ class ToolListEditorMixin:
             if name in self.cfg.tool_presets_raw:
                 await self.app.push_screen_wait(
                     MessageModal(
-                        f"A tool preset named '{name}' already exists.", title="Could not create"
+                        f"A tool preset named '{markup_safe(name)}' already exists.",
+                        title="Could not create",
                     )
                 )
                 return
