@@ -289,7 +289,18 @@ class GatewayConfig:
         watchers: list[WatcherConfig] = []
         watcher_rules: list[WatcherRule] = []
         watchers_raw = raw.get("watchers", [])
-        if watchers_raw and not isinstance(watchers_raw, list):
+        # None BEFORE the type check, and the type check without a truthiness
+        # gate — this file's own rule, stated on _resolve_watcher_connector:
+        # "the type check must come BEFORE any truthiness test". The gate let
+        # every FALSY non-list through: a bare `watchers:` (explicit null,
+        # the natural way to empty the block) then reached `enumerate(None)`
+        # and raised a raw TypeError, so the daemon failed to start and
+        # `acg config validate` crashed instead of reporting — on a config an
+        # operator writes by deleting their rules. `0`/`""` took the same
+        # path and now get the clean message.
+        if watchers_raw is None:
+            watchers_raw = []
+        if not isinstance(watchers_raw, list):
             raise ValueError(
                 f"config.yaml 'watchers:' must be a list (got {type(watchers_raw).__name__})."
             )
@@ -1988,7 +1999,12 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
     watchers: list[WatcherConfig] = []
     watcher_rules: list[WatcherRule] = []
     watchers_raw = raw.get("watchers", [])
-    if watchers_raw and not isinstance(watchers_raw, list):
+    # Same None-then-type ordering as from_file() above; a raw TypeError out
+    # of THIS function is worse, since collecting problems instead of raising
+    # them is its whole contract.
+    if watchers_raw is None:
+        watchers_raw = []
+    if not isinstance(watchers_raw, list):
         # Connectors AND agents have already parsed successfully by this
         # point — same "don't hide an unrelated, already-successful entity's
         # checks behind this" reasoning as every branch above.

@@ -1556,3 +1556,71 @@ class TestCodexRound10Fixes:
             assert isinstance(app.screen, MessageModal)
             body = str(app.screen.query_one("#message-body").render())
             assert "[/]" in body, "the modal must name the offending value"
+
+
+class TestCodexRound11Fixes:
+    """A rejected create must restore the document EXACTLY as loaded —
+    including the difference between an absent `watchers:` key and an
+    explicit `watchers:` (null), which `.get()` cannot tell apart."""
+
+    def _config(self, work_dir: Path, watchers_line: str) -> str:
+        return f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {work_dir}
+{watchers_line}
+        """
+
+    async def _reject_a_create(self, pilot, app) -> None:
+        await _open_rules_tab(pilot, app)
+        await pilot.press("n")
+        await pilot.pause()
+        app.screen.query_one("#field-name", Input).value = "new-rule"
+        app.screen.query_one("#field-rooms-include", Input).value = "general"
+        # An except_for that cannot overlap the include is refused by the loader.
+        app.screen.query_one("#field-rooms-except_for", Input).value = "zzz-nothing"
+        await pilot.pause()
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        assert isinstance(app.screen, MessageModal)
+        await pilot.press("enter")
+        await pilot.pause()
+
+    async def test_an_explicit_null_watchers_key_survives_a_rejected_create(
+        self, tmp_path, work_dir
+    ):
+        """Round 10 popped the key here, because `.get()` reports None for
+        an explicit null exactly as it does for an absent key — so the
+        operator's own `watchers:` line would have vanished from the file on
+        the next unrelated successful save."""
+        config_path = _write_config(tmp_path, self._config(work_dir, "            watchers:"))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert "watchers" in app.editable_config.document
+            assert app.editable_config.document["watchers"] is None
+            await self._reject_a_create(pilot, app)
+
+            doc = app.editable_config.document
+            assert "watchers" in doc, "the explicit key was popped"
+            assert doc["watchers"] is None, "the explicit null was replaced"
+            assert app.editable_config.dirty is False
+
+    async def test_an_absent_watchers_key_stays_absent_after_a_rejected_create(
+        self, tmp_path, work_dir
+    ):
+        """The other half, so the fix cannot drift into always restoring a
+        key that was never there."""
+        config_path = _write_config(tmp_path, self._config(work_dir, ""))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert "watchers" not in app.editable_config.document
+            await self._reject_a_create(pilot, app)
+            assert "watchers" not in app.editable_config.document
+            assert app.editable_config.dirty is False

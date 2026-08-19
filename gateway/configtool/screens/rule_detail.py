@@ -576,6 +576,7 @@ class RuleDetailScreen(FormScreen):
         inserted_index: int | None = None
         was_dirty = self.cfg.dirty  # captured BEFORE any mutation; see below
         watchers_key_was_absent = False
+        watchers_original_value: object = None
         if self.mode == "create":
             existing = self.cfg.document.get("watchers")
             if existing is not None and not isinstance(existing, list):
@@ -598,12 +599,17 @@ class RuleDetailScreen(FormScreen):
                     )
                 )
                 return
-            # Whether the key existed at all, so a REJECTED create can put
-            # the document back to that exact shape rather than leaving an
-            # empty `watchers: []` behind where there was no key (Codex
-            # review of #129, round 10).
-            watchers_key_was_absent = existing is None
-            if existing is None:
+            # KEY MEMBERSHIP, not the value: `document.get("watchers")`
+            # returns None both for an absent key and for an explicit
+            # `watchers:` (null), so round 10's `existing is None` popped a
+            # key the operator had actually written — and a later unrelated
+            # successful save then wrote the file without it (Codex review of
+            # #129, round 11). Both the presence and the original value are
+            # captured so a rejected create restores the document exactly as
+            # loaded.
+            watchers_key_was_absent = "watchers" not in self.cfg.document
+            watchers_original_value = self.cfg.document.get("watchers")
+            if not isinstance(existing, list):
                 self.cfg.document["watchers"] = []
             watchers = self.cfg.document["watchers"]
             watchers.append(target_entry)
@@ -619,6 +625,11 @@ class RuleDetailScreen(FormScreen):
                 del self.cfg.document["watchers"][inserted_index]
                 if watchers_key_was_absent:
                     self.cfg.document.pop("watchers", None)
+                elif not isinstance(watchers_original_value, list):
+                    # It was there, holding something this form replaced with
+                    # a list (an explicit null). Put that value back rather
+                    # than the empty list standing in for it.
+                    self.cfg.document["watchers"] = watchers_original_value
             else:
                 self._rollback_trial_entry()
             # Same rollback contract the reorder and malformed-row delete

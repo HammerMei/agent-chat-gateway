@@ -14,7 +14,7 @@ import textwrap
 import unittest
 from pathlib import Path
 
-from gateway.config import collect_config
+from gateway.config import GatewayConfig, collect_config
 
 
 class _CollectConfigTestBase(unittest.TestCase):
@@ -484,3 +484,51 @@ class TestCollectConfigOnTheFlyWatcherFields(_CollectConfigTestBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestExplicitNullWatchersBlock(_CollectConfigTestBase):
+    """A bare `watchers:` — the natural way to empty the block — used to
+    reach `enumerate(None)` and raise a raw TypeError, because the guard
+    checked truthiness BEFORE type. That crashed the daemon at startup and
+    `acg config validate` with it, on a config an operator produces by
+    deleting their rules. Found while testing the config TUI's rollback
+    (Codex review of PR #129, round 11); the rule this violated is stated in
+    this same file, on `_resolve_watcher_connector`."""
+
+    def _with_watchers(self, literal: str) -> str:
+        return self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:{literal}
+        """)
+
+    def test_an_explicit_null_is_treated_as_no_watchers(self):
+        config, issues = collect_config(self._with_watchers(""))
+        self.assertIsNotNone(config)
+        self.assertEqual(config.watcher_rules, [])
+        self.assertEqual(issues, [])
+
+    def test_the_strict_loader_accepts_it_too(self):
+        GatewayConfig.from_file(self._with_watchers(""))
+
+    def test_a_falsy_non_list_still_gets_the_clean_message(self):
+        """`0`/`""` took the same skipped-guard path as null; they are
+        mistakes rather than an empty block, so they must be REPORTED, not
+        silently treated as empty."""
+        for literal in (" 0", ' ""'):
+            with self.subTest(literal=literal):
+                config, issues = collect_config(self._with_watchers(literal))
+                self.assertTrue(
+                    any("'watchers:' must be a list" in i.message for i in issues),
+                    [i.message for i in issues],
+                )
+
+    def test_a_truthy_non_list_is_unchanged(self):
+        config, issues = collect_config(self._with_watchers(" 5"))
+        self.assertTrue(any("'watchers:' must be a list" in i.message for i in issues))
