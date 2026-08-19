@@ -810,7 +810,15 @@ class OverviewScreen(Screen):
         if app.load_error is not None:
             self._last_validate_result = None
             banner.update(
-                f"[red]✗ config.yaml does not currently load:[/red] {app.load_error}"
+                # The loader's own message, which quotes the file's content
+                # back (a YAML syntax error, an offending value). This is the
+                # config-does-not-load path — the one moment the operator has
+                # nothing else to go on — so it is the worst place to fail on
+                # the very text being reported. Found by the static markup
+                # check, not by review: no walk-through reaches this banner,
+                # because every behavioural fixture loads.
+                f"[red]✗ config.yaml does not currently load:[/red] "
+                f"{markup_safe(app.load_error)}"
             )
             return
 
