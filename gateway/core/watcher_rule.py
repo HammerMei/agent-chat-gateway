@@ -143,11 +143,19 @@ class WatcherRule:
     connector: str
     agent: str
     rooms: RoomMatcher
-    session_idle_days: int | None = None
-    session_expire_days: int | None = None
+    # A month from last activity to reclamation, in two independent legs (§2.5).
+    # Deliberately not `None`: an unset TTL would mean "ask somewhere else", and
+    # there is nowhere else — these live on the rule so two rules sharing an
+    # agent can have different lifecycles.
+    session_idle_days: int = 15
+    # Measured from the moment the watcher becomes idle, **not** from its last
+    # activity. That is what makes an outage survivable: a watcher active when
+    # the daemon stopped gets a fresh `dropped_at` on the first sweep after it
+    # starts, so `active -> expired` cannot happen through an outage of any
+    # length. It is also why this is not required to exceed the idle leg — they
+    # measure different intervals from different origins.
+    session_expire_days: int = 15
     context_inject_files: list[str] = field(default_factory=list)
-    online_notification: str | None = None
-    offline_notification: str | None = None
     history_handoff: HistoryHandoffConfig = field(default_factory=HistoryHandoffConfig)
 
     def match(self, name: str, kind: RoomKind) -> RuleMatch:

@@ -28,7 +28,8 @@ from tests.helpers import (
     MockAgentBackend,
     make_lifecycle,
     make_manager,
-    make_watcher,
+    make_rule,
+    start_watcher,
 )
 
 # Patch load_state/save_state globally so tests never touch live state files.
@@ -68,8 +69,6 @@ def _make_lifecycle_r14(watcher_names=None):
         wc.room = f"#{name}"
         wc.connector = "rc"
         wc.agent = None
-        wc.online_notification = None
-        wc.offline_notification = None
         watcher_configs.append(wc)
 
     connector = MagicMock()
@@ -117,7 +116,6 @@ def _make_lifecycle_r14(watcher_names=None):
     lifecycle._agents = {"default": agent}
     lifecycle._default_agent = "default"
     lifecycle._config = config
-    lifecycle._watcher_configs = watcher_configs
     lifecycle._state_store = state_store
     lifecycle._dispatcher = dispatcher
     lifecycle._injector = injector
@@ -144,7 +142,6 @@ class TestWatcherLifecycleLock(unittest.IsolatedAsyncioTestCase):
         lc._agents = {}
         lc._default_agent = "default"
         lc._config = MagicMock()
-        lc._watcher_configs = []
         lc._state_store = MagicMock()
         lc._dispatcher = MagicMock(holder=MagicMock(return_value=None))
         lc._injector = MagicMock()
@@ -221,7 +218,7 @@ class TestWatcherLifecycleLock(unittest.IsolatedAsyncioTestCase):
 
 
 class TestAttachmentWorkspaceInThread(unittest.IsolatedAsyncioTestCase):
-    """WatcherLifecycle._start_watcher() must call setup() via asyncio.to_thread."""
+    """start_watcher(WatcherLifecycle, ) must call setup() via asyncio.to_thread."""
 
     async def test_setup_called_via_to_thread(self):
         """setup() must be wrapped in asyncio.to_thread(), not called directly."""
@@ -285,7 +282,7 @@ class TestAttachmentWorkspaceInThread(unittest.IsolatedAsyncioTestCase):
             patch.object(lc, "_cleanup_startup_session_best_effort", new_callable=AsyncMock),
         ):
             try:
-                await lc._start_watcher(wc, None)
+                await start_watcher(lc, wc, None)
             except Exception:
                 pass
 
@@ -349,7 +346,7 @@ class TestAttachmentWorkspaceRollback(unittest.IsolatedAsyncioTestCase):
                   side_effect=OSError("permission denied")),
         ):
             with self.assertRaises(OSError):
-                await lc._start_watcher(wc, None)
+                await start_watcher(lc, wc, None)
 
         self.assertNotIn("test-watcher", lc._states, "_states must be rolled back after setup() failure")
         maps.remove_session.assert_called_once()
@@ -415,7 +412,7 @@ class TestContextInjectedResetOnSubscribeFailure(unittest.IsolatedAsyncioTestCas
                   new_callable=AsyncMock, return_value=None),
         ):
             with self.assertRaises(RuntimeError):
-                await lc._start_watcher(wc, None)
+                await start_watcher(lc, wc, None)
 
         saved_ws = lc._states.get("test-watcher")
         self.assertIsNotNone(saved_ws)
@@ -483,7 +480,7 @@ class TestContextInjectedResetOnSubscribeFailure(unittest.IsolatedAsyncioTestCas
                   new_callable=AsyncMock, return_value=None),
         ):
             with self.assertRaises(RuntimeError):
-                await lc._start_watcher(wc, None)
+                await start_watcher(lc, wc, None)
 
         saved_ws = lc._states.get("test-watcher2")
         self.assertIsNotNone(saved_ws)
@@ -491,124 +488,6 @@ class TestContextInjectedResetOnSubscribeFailure(unittest.IsolatedAsyncioTestCas
 
 
 # ── Tests from test_round14_fixes.py ──────────────────────────────────────────
-
-
-class TestSyncWatchersHoldsLock(unittest.IsolatedAsyncioTestCase):
-    """sync_watchers must hold the per-watcher lock during _start_watcher."""
-
-    async def test_sync_watchers_acquires_watcher_lock(self):
-        """sync_watchers must acquire the per-watcher lock before calling _start_watcher."""
-        lifecycle, watcher_configs, connector, agent = _make_lifecycle_r14(["support"])
-
-        lock_was_held_during_start = False
-        start_watcher_entered = asyncio.Event()
-        start_watcher_proceed = asyncio.Event()
-
-        async def slow_start_watcher(wc, state):
-            start_watcher_entered.set()
-            await start_watcher_proceed.wait()
-            lifecycle._processors[wc.name] = MagicMock()
-
-        async def try_acquire_lock():
-            nonlocal lock_was_held_during_start
-            await start_watcher_entered.wait()
-            lock = lifecycle._get_watcher_lock("support")
-            if lock.locked():
-                lock_was_held_during_start = True
-            start_watcher_proceed.set()
-
-        with patch.object(lifecycle, "_start_watcher", slow_start_watcher):
-            prober = asyncio.create_task(try_acquire_lock())
-            await lifecycle.sync_watchers()
-            await prober
-
-        self.assertTrue(lock_was_held_during_start)
-
-    async def test_pause_during_sync_watchers_blocks_until_start_completes(self):
-        """pause_watcher must wait for sync_watchers' _start_watcher to finish."""
-        lifecycle, watcher_configs, connector, agent = _make_lifecycle_r14(["support"])
-
-        ordering: list[str] = []
-        start_entered = asyncio.Event()
-        pause_can_run = asyncio.Event()
-
-        async def controlled_start(wc, state):
-            ordering.append("start:begin")
-            start_entered.set()
-            await pause_can_run.wait()
-            await asyncio.sleep(0)
-            lifecycle._processors[wc.name] = MagicMock(stop=AsyncMock(), start=MagicMock())
-            ordering.append("start:end")
-
-        async def concurrent_pause():
-            await start_entered.wait()
-            pause_can_run.set()
-            ordering.append("pause:attempt")
-            try:
-                await asyncio.wait_for(lifecycle.pause_watcher("support"), timeout=2.0)
-                ordering.append("pause:done")
-            except Exception:
-                ordering.append("pause:error")
-
-        with patch.object(lifecycle, "_start_watcher", controlled_start):
-            pause_task = asyncio.create_task(concurrent_pause())
-            await lifecycle.sync_watchers()
-            await pause_task
-
-        start_end_idx = ordering.index("start:end")
-        pause_done_idx = ordering.index("pause:done") if "pause:done" in ordering else ordering.index("pause:error")
-        self.assertGreater(pause_done_idx, start_end_idx)
-
-    async def test_sync_watchers_still_starts_watcher_normally(self):
-        """The lock acquisition must not break normal startup flow."""
-        lifecycle, watcher_configs, connector, agent = _make_lifecycle_r14(["support"])
-
-        processor_mock = MagicMock(start=MagicMock(), stop=AsyncMock())
-
-        async def simple_start(wc, state):
-            lifecycle._processors[wc.name] = processor_mock
-
-        with patch.object(lifecycle, "_start_watcher", simple_start):
-            errors = await lifecycle.sync_watchers()
-
-        self.assertEqual(errors, [])
-        self.assertIn("support", lifecycle._processors)
-
-    async def test_sync_watchers_error_still_captured_with_lock(self):
-        """If _start_watcher raises, the error is captured and the lock is released."""
-        lifecycle, watcher_configs, connector, agent = _make_lifecycle_r14(["support"])
-
-        async def failing_start(wc, state):
-            raise RuntimeError("subscribe failed")
-
-        with patch.object(lifecycle, "_start_watcher", failing_start):
-            errors = await lifecycle.sync_watchers()
-
-        self.assertEqual(len(errors), 1)
-        self.assertIn("failed to start", errors[0])
-
-        lock = lifecycle._get_watcher_lock("support")
-        self.assertFalse(lock.locked(), "Lock is still held after _start_watcher raised!")
-
-    async def test_multiple_watchers_each_get_own_lock(self):
-        """Each watcher gets an independent lock."""
-        lifecycle, watcher_configs, connector, agent = _make_lifecycle_r14(["alpha", "beta"])
-
-        started: list[str] = []
-
-        async def simple_start(wc, state):
-            started.append(wc.name)
-            lifecycle._processors[wc.name] = MagicMock(start=MagicMock(), stop=AsyncMock())
-
-        with patch.object(lifecycle, "_start_watcher", simple_start):
-            errors = await lifecycle.sync_watchers()
-
-        self.assertEqual(errors, [])
-        self.assertEqual(set(started), {"alpha", "beta"})
-
-        for name in ["alpha", "beta"]:
-            lock = lifecycle._get_watcher_lock(name)
-            self.assertFalse(lock.locked())
 
 
 class TestGetWatcherLock(unittest.IsolatedAsyncioTestCase):
@@ -645,7 +524,6 @@ class TestSyncWatchersPreservesBlockedAgents(unittest.IsolatedAsyncioTestCase):
         lc._agents = {"default": MagicMock()}
         lc._default_agent = "default"
         lc._config = MagicMock()
-        lc._watcher_configs = []
         lc._state_store = MagicMock()
         lc._state_store.load = MagicMock(return_value={})
         lc._state_store.save = MagicMock()
@@ -700,7 +578,7 @@ class TestWatcherLifecycleHardening(IsolatedTestCase):
     async def test_new_session_cleaned_up_when_context_injection_fails(self):
         connector = ScriptConnector()
         agent = CleanupTrackingAgent()
-        manager = make_manager(connector, agent, watcher_configs=[make_watcher()])
+        manager = make_manager(connector, agent, watcher_rules=[make_rule()])
 
         with patch.object(
             manager._lifecycle._injector,
@@ -721,9 +599,9 @@ class TestWatcherLifecycleHardening(IsolatedTestCase):
         manager = make_manager(
             connector,
             agent,
-            watcher_configs=[
-                make_watcher(room="room-a", name="w1"),
-                make_watcher(room="room-b", name="w2"),
+            watcher_rules=[
+                make_rule("room-a"),
+                make_rule("room-b"),
             ],
         )
         await manager.run_once()
@@ -731,13 +609,13 @@ class TestWatcherLifecycleHardening(IsolatedTestCase):
         await manager.shutdown()
 
         self.assertEqual(manager._lifecycle._processors, {})
-        self.assertIn(("room-a", "w1"), connector.unsubscribed_rooms)
-        self.assertIn(("room-b", "w2"), connector.unsubscribed_rooms)
+        self.assertIn(("room-a", "default:room-a"), connector.unsubscribed_rooms)
+        self.assertIn(("room-b", "default:room-b"), connector.unsubscribed_rooms)
 
     async def test_subscribe_failure_clears_deleted_fresh_session_from_state(self):
         connector = ScriptConnector()
         agent = CleanupTrackingAgent()
-        manager = make_manager(connector, agent, watcher_configs=[make_watcher()])
+        manager = make_manager(connector, agent, watcher_rules=[make_rule()])
 
         with patch.object(
             connector,
@@ -747,7 +625,7 @@ class TestWatcherLifecycleHardening(IsolatedTestCase):
             errors = await manager.run_once()
 
         self.assertEqual(len(errors), 1)
-        state = manager._lifecycle.get_watcher_state("script")
+        state = manager._lifecycle.get_watcher_state("default:script")
         self.assertIsNotNone(state)
         self.assertEqual(state.session_id, "")
         self.assertEqual(agent.deleted_sessions, ["mock-session-0001"])
@@ -764,12 +642,12 @@ class TestUnavailableAgentsBlocksWatchers(IsolatedTestCase):
         agent = MockAgentBackend()
 
         manager = make_manager(
-            connector, agent, watcher_configs=[make_watcher(name="w1")]
+            connector, agent, watcher_rules=[make_rule()]
         )
 
         errors = await manager.run_once(unavailable_agents={"default"})
 
-        self.assertIsNone(manager.get_processor("w1"))
+        self.assertIsNone(manager.get_processor("default:script"))
         self.assertTrue(
             any("default" in e for e in errors),
             f"Expected 'default' in errors: {errors}",
@@ -783,13 +661,13 @@ class TestUnavailableAgentsBlocksWatchers(IsolatedTestCase):
         agent = MockAgentBackend()
 
         manager = make_manager(
-            connector, agent, watcher_configs=[make_watcher(name="w1")]
+            connector, agent, watcher_rules=[make_rule()]
         )
 
         errors = await manager.run_once(unavailable_agents={"other-agent"})
 
-        self.assertIsNotNone(manager.get_processor("w1"))
-        self.assertFalse(any("w1" in e for e in errors), f"Unexpected errors: {errors}")
+        self.assertIsNotNone(manager.get_processor("default:script"))
+        self.assertEqual(errors, [], f"Unexpected errors: {errors}")
 
         await manager.shutdown()
 
@@ -799,152 +677,52 @@ class TestUnavailableAgentsBlocksWatchers(IsolatedTestCase):
         agent = MockAgentBackend()
 
         manager = make_manager(
-            connector, agent, watcher_configs=[make_watcher(name="w1")]
+            connector, agent, watcher_rules=[make_rule()]
         )
 
         errors = await manager.run_once(unavailable_agents=set())
 
-        self.assertIsNotNone(manager.get_processor("w1"))
+        self.assertIsNotNone(manager.get_processor("default:script"))
         self.assertEqual(errors, [])
 
         await manager.shutdown()
 
 
-class TestSyncWatchersPrunesOnlyRemovedWatchers(unittest.IsolatedAsyncioTestCase):
+class TestSyncWatchersPruneSemantics(unittest.IsolatedAsyncioTestCase):
     """sync_watchers() must name what it deletes, and delete only that.
 
-    StateStore.save() merges, so a record the run did not touch survives on its
-    own.  That protection would also resurrect a watcher the operator deleted
-    from config, so sync_watchers has to pass an explicit prune set.  These pin
-    which names land in it — the distinction between "we chose to forget this"
-    and "we failed to start this" is exactly what used to be lost.
-    """
+    Post-cutover the rule is the record's own shape: a static-era record (no
+    `rule_name`) has no owner left — config.yaml cannot name it, no rule
+    recreates it — and is pruned; a rule-derived record is never pruned by
+    this loop, whatever its state, because "absent from config" is its normal
+    condition (§2.4)."""
 
-    async def test_a_watcher_removed_from_config_is_pruned(self):
-        lc, _wcs, connector, _agent = _make_lifecycle_r14(watcher_names=["kept"])
+    async def test_a_static_era_record_is_pruned(self):
+        lc, _wcs, connector, _agent = _make_lifecycle_r14()
         lc._state_store.load = MagicMock(
             return_value={
-                "kept": WatcherState(watcher_name="kept", session_id="s1", room_id="r1"),
-                "deleted-from-config": WatcherState(
-                    watcher_name="deleted-from-config", session_id="s2", room_id="r2"
-                ),
+                "old-static": WatcherState(
+                    watcher_name="old-static", session_id="s2", room_id="r2"),
             }
         )
 
         await lc.sync_watchers()
 
         prune = lc._state_store.save.call_args.kwargs["prune"]
-        self.assertEqual(prune, {"deleted-from-config"})
+        self.assertEqual(prune, {"old-static"})
 
-    async def test_a_watcher_skipped_for_an_unavailable_agent_is_not_pruned(self):
-        """The regression. A fail-closed skip is not a removal — its session id,
-        watermark and paused flag must all survive, and merging only saves them
-        if the name stays out of the prune set."""
-        lc, _wcs, connector, _agent = _make_lifecycle_r14(watcher_names=["blocked"])
-        lc._state_store.load = MagicMock(
-            return_value={
-                "blocked": WatcherState(
-                    watcher_name="blocked",
-                    session_id="precious-session",
-                    room_id="r1",
-                    last_processed_ts="2025-01-01T00:00:09Z",
-                )
-            }
-        )
+    async def test_a_rule_derived_record_is_never_pruned(self):
+        from tests.helpers import make_rule_derived_record
 
-        errors = await lc.sync_watchers(unavailable_agents={"default"})
-
-        self.assertTrue(any("unavailable" in e for e in errors), "should report the skip")
-        prune = lc._state_store.save.call_args.kwargs["prune"]
-        self.assertEqual(prune, set(), "a blocked watcher must not be pruned")
-
-    async def test_a_watcher_whose_start_raised_is_not_pruned(self):
-        lc, _wcs, connector, _agent = _make_lifecycle_r14(watcher_names=["broken"])
-        lc._state_store.load = MagicMock(
-            return_value={
-                "broken": WatcherState(
-                    watcher_name="broken", session_id="precious-session", room_id="r1"
-                )
-            }
-        )
-        connector.resolve_room = AsyncMock(side_effect=RuntimeError("room gone"))
-
-        errors = await lc.sync_watchers()
-
-        self.assertTrue(any("failed to start" in e for e in errors))
-        prune = lc._state_store.save.call_args.kwargs["prune"]
-        self.assertEqual(prune, set(), "a failed start must not be pruned")
-
-    async def test_nothing_is_pruned_when_config_and_state_agree(self):
-        lc, _wcs, connector, _agent = _make_lifecycle_r14(watcher_names=["a"])
-        lc._state_store.load = MagicMock(
-            return_value={"a": WatcherState(watcher_name="a", session_id="s", room_id="r")}
-        )
+        lc, _wcs, connector, _agent = _make_lifecycle_r14()
+        record = make_rule_derived_record(name="kept")
+        lc._state_store.load = MagicMock(return_value={"kept": record})
 
         await lc.sync_watchers()
 
         self.assertEqual(lc._state_store.save.call_args.kwargs["prune"], set())
-
+        self.assertIs(lc._states["kept"], record, "hydrated, not forgotten")
 
 
 if __name__ == "__main__":
     unittest.main()
-
-
-class TestOneLookupOneFailureSemantic(unittest.IsolatedAsyncioTestCase):
-    """`self._watcher_configs` had two readers with different ideas of "not found".
-
-    One raised with a hint, the other returned None. The duplication was the smaller half:
-    which behaviour a reader got depended on which name they happened to call, and the two
-    could drift on what "found" means. There is one lookup now; only the empty case differs.
-    """
-
-    def _lifecycle(self, names=("w1",)):
-        from gateway.core.config import WatcherConfig
-
-        lc = make_lifecycle()
-        lc._watcher_configs = [
-            WatcherConfig(name=n, connector="rc", room=n, agent="a") for n in names
-        ]
-        return lc
-
-    def test_the_optional_reader_returns_none(self):
-        lc = self._lifecycle()
-        self.assertIsNone(lc.get_watcher_config("absent"))
-        self.assertIsNotNone(lc.get_watcher_config("w1"))
-
-    def test_the_required_reader_raises_and_lists_what_exists(self):
-        """The hint is the reason a second function existed at all; it is kept, on top of
-        the one lookup, rather than being a second lookup."""
-        lc = self._lifecycle(names=("w1", "w2"))
-        with self.assertRaises(RuntimeError) as cm:
-            lc._require_watcher_config("absent")
-        message = str(cm.exception)
-        self.assertIn("absent", message)
-        self.assertIn("w1", message)
-        self.assertIn("w2", message)
-
-    def test_both_agree_on_what_exists(self):
-        """The property the divergence threatened: one lookup, so "found" cannot mean two
-        things depending on which reader asked."""
-        lc = self._lifecycle(names=("w1", "w2"))
-        for name in ("w1", "w2"):
-            with self.subTest(name=name):
-                self.assertIs(lc._require_watcher_config(name), lc.get_watcher_config(name))
-
-    def test_both_agree_on_a_near_miss(self):
-        """Where a *second* lookup would show itself.
-
-        Asserting agreement on names that exist does not detect one: any reasonable
-        variant lookup still finds `w1` when asked for `w1`. It shows up on a name that
-        differs slightly — a second lookup that normalised case, trimmed whitespace, or
-        matched a prefix would find something here while the other reader found nothing,
-        and CLI commands would then disagree about whether a watcher exists. Written after
-        injecting exactly that fault and watching the earlier assertions stay green.
-        """
-        lc = self._lifecycle(names=("w1",))
-        for near in ("W1", " w1", "w1 ", "w", "w1x"):
-            with self.subTest(name=near):
-                self.assertIsNone(lc.get_watcher_config(near))
-                with self.assertRaises(RuntimeError):
-                    lc._require_watcher_config(near)

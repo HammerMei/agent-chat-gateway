@@ -49,7 +49,8 @@ class TestValidateConfigBasics(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         result = self._validate(cfg)
         self.assertTrue(result.ok)
@@ -73,7 +74,8 @@ class TestValidateConfigBasics(_ValidateConfigTestBase):
                 type: claude
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         result = self._validate(cfg)
         self.assertFalse(result.ok)
@@ -93,7 +95,8 @@ class TestValidateConfigConnectorChecks(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         result = self._validate(cfg)
         self.assertFalse(result.ok)
@@ -116,7 +119,8 @@ class TestValidateConfigConnectorChecks(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         result = self._validate(cfg)
         self.assertFalse(result.ok)
@@ -134,7 +138,8 @@ class TestValidateConfigConnectorChecks(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         result = self._validate(cfg)
         self.assertFalse(result.ok)
@@ -154,7 +159,8 @@ class TestValidateConfigConnectorChecks(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         result = self._validate(cfg)
         self.assertFalse(result.ok)
@@ -176,7 +182,8 @@ class TestValidateConfigConnectorChecks(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         result = self._validate(cfg)
         self.assertTrue(result.ok)
@@ -195,7 +202,8 @@ class TestValidateConfigConnectorChecks(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         result = self._validate(cfg)
         url_errors = [e for e in result.errors if "server.url" in e]
@@ -214,7 +222,8 @@ class TestValidateConfigConnectorChecks(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         result = self._validate(cfg)
         self.assertTrue(result.ok)
@@ -233,7 +242,8 @@ class TestValidateConfigStateOrphans(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         self.runtime_dir.mkdir()
         (self.runtime_dir / "state.rc.json").write_text(json.dumps({
@@ -241,7 +251,11 @@ class TestValidateConfigStateOrphans(_ValidateConfigTestBase):
             # without one is now refused, and this fixture is a *current* file.
             "version": STATE_FORMAT_VERSION,
             "watchers": [
-                {"watcher_name": "w1", "session_id": "keep", "room_id": "r1"},
+                # A rule-derived record is never an orphan (§2.4): its
+                # recreation source is the record, not a config entry.
+                {"watcher_name": "w1", "session_id": "keep", "room_id": "r1",
+                 "rule_name": "w1"},
+                # A static-era record (no rule_name) is pruned at next start.
                 {"watcher_name": "stale", "session_id": "x", "room_id": "r2"},
             ]
         }))
@@ -249,6 +263,134 @@ class TestValidateConfigStateOrphans(_ValidateConfigTestBase):
         self.assertTrue(result.ok)  # orphans are warnings, not errors
         self.assertEqual(len(result.warnings), 1)
         self.assertIn("stale", result.warnings[0])
+        self.assertIn("static-era", result.warnings[0])
+
+    def test_a_record_bound_to_a_removed_agent_is_reported(self):
+        """Matrix sweep after Codex round 6: the runtime is fail-closed and
+        loud about a record whose frozen agent was deleted — but only AFTER
+        the restart. This command's job is to say it before."""
+        cfg = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                rooms:
+                  include: [general]
+        """)
+        self.runtime_dir.mkdir()
+        (self.runtime_dir / "state.rc.json").write_text(json.dumps({
+            "version": STATE_FORMAT_VERSION,
+            "watchers": [
+                {"watcher_name": "w1", "session_id": "keep", "room_id": "r1",
+                 "rule_name": "w1", "agent": "ghost"},
+            ]
+        }))
+        result = self._validate(cfg)
+        self.assertTrue(result.ok, "a doomed record is a warning, not an error")
+        self.assertEqual(len(result.warnings), 1)
+        self.assertIn("ghost", result.warnings[0])
+        self.assertIn("failed", result.warnings[0])
+        self.assertIn("expire w1", result.warnings[0])
+
+    def test_a_changed_backend_identity_is_reported(self):
+        """The quieter sibling: the agent still exists but its type or
+        working_directory changed — the next start silently abandons the
+        session. Warned here, where it is still reversible."""
+        cfg = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                rooms:
+                  include: [general]
+        """)
+        self.runtime_dir.mkdir()
+        (self.runtime_dir / "state.rc.json").write_text(json.dumps({
+            "version": STATE_FORMAT_VERSION,
+            "watchers": [
+                {"watcher_name": "w1", "session_id": "sess-1", "room_id": "r1",
+                 "rule_name": "w1", "agent": "default",
+                 "backend_identity": "claude:/the/old/workdir"},
+            ]
+        }))
+        result = self._validate(cfg)
+        self.assertTrue(result.ok)
+        self.assertEqual(len(result.warnings), 1)
+        self.assertIn("sess-1", result.warnings[0])
+        self.assertIn("claude:/the/old/workdir", result.warnings[0])
+        self.assertIn("abandon", result.warnings[0])
+
+    def test_a_state_file_of_a_removed_connector_is_reported(self):
+        """Codex round 4: a connector renamed or removed in config.yaml leaves
+        its state file behind, and no SessionManager will ever hydrate it —
+        without this warning its records (and their sessions) are abandoned
+        silently. Rule-derived records are exactly the ones this matters for:
+        they are 'never an orphan' by shape, so the connector-set comparison
+        is the only check that can catch them."""
+        cfg = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                rooms:
+                  include: [general]
+        """)
+        self.runtime_dir.mkdir()
+        (self.runtime_dir / "state.old-rc.json").write_text(json.dumps({
+            "version": STATE_FORMAT_VERSION,
+            "watchers": [
+                {"watcher_name": "w1", "session_id": "keep", "room_id": "r1",
+                 "rule_name": "w1"},
+            ]
+        }))
+        result = self._validate(cfg)
+        self.assertTrue(result.ok, "abandoned records are a warning, not an error")
+        self.assertEqual(len(result.warnings), 1)
+        self.assertIn("old-rc", result.warnings[0])
+        self.assertIn("not in config.yaml", result.warnings[0])
+
+    def test_an_empty_leftover_state_file_is_not_reported(self):
+        """The noise gate: a removed connector's file with no records has
+        nothing to abandon."""
+        cfg = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                rooms:
+                  include: [general]
+        """)
+        self.runtime_dir.mkdir()
+        (self.runtime_dir / "state.old-rc.json").write_text(json.dumps({
+            "version": STATE_FORMAT_VERSION, "watchers": []
+        }))
+        result = self._validate(cfg)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.warnings, [])
 
     def test_a_legacy_state_file_is_reported_as_an_error_not_skipped(self):
         """The branch that reads state used to be `except Exception: continue`.
@@ -270,7 +412,8 @@ class TestValidateConfigStateOrphans(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         self.runtime_dir.mkdir()
         # No version marker — the shape written by every earlier release.
@@ -308,7 +451,8 @@ class TestValidateConfigStateOrphans(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         self.runtime_dir.mkdir()
         (self.runtime_dir / "state.retired.json").write_text(json.dumps({
@@ -334,7 +478,8 @@ class TestValidateConfigStateOrphans(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         self.runtime_dir.mkdir()
         (self.runtime_dir / "state.rc.json").write_text("{ not json")
@@ -353,7 +498,8 @@ class TestValidateConfigStateOrphans(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         result = self._validate(cfg)
         self.assertEqual(result.warnings, [])
@@ -373,7 +519,8 @@ class TestValidateConfigLint(_ValidateConfigTestBase):
                 timeout: 360
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         result = self._validate(cfg, lint=False)
         self.assertEqual(result.lint_findings, [])
@@ -391,7 +538,8 @@ class TestValidateConfigLint(_ValidateConfigTestBase):
                 timeout: 360
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         result = self._validate(cfg, lint=True)
         self.assertTrue(
@@ -415,7 +563,8 @@ class TestValidateConfigLint(_ValidateConfigTestBase):
                 timeout: 500
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         result = self._validate(cfg, lint=True)
         self.assertTrue(
@@ -442,7 +591,8 @@ class TestValidateConfigLint(_ValidateConfigTestBase):
                 timeout: 999
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         result = self._validate(cfg, lint=True)
         self.assertEqual(
@@ -464,7 +614,8 @@ class TestValidateConfigLint(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         result = self._validate(cfg, lint=True)
         joined = " ".join(result.lint_findings)
@@ -487,7 +638,8 @@ class TestValidateConfigLint(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
                 description: "General channel"
         """)
         result = self._validate(cfg, lint=True)
@@ -515,7 +667,8 @@ class TestValidateConfigLint(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         result = self._validate(cfg, lint=True)  # must not raise
         self.assertFalse(result.ok)
@@ -565,8 +718,9 @@ class TestValidateConfigLint(_ValidateConfigTestBase):
             watchers:
               - name: [a, b]
                 connector: rc
-                room: general
-                online_notification: null
+                rooms:
+                  include: [general]
+                context_inject_files: []
         """)
         result = self._validate(cfg, lint=True)  # must not raise
         watcher_findings = [f for f in result.findings if f.entity_kind == "watcher"]
@@ -637,7 +791,8 @@ class TestFindingsExtension(_ValidateConfigTestBase):
                 type: claude
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         result = self._validate(cfg)
         self.assertEqual(len(result.findings), 2)
@@ -667,7 +822,8 @@ class TestFindingsExtension(_ValidateConfigTestBase):
             watchers:
               - connector: rc
                 agent: agent1
-                room: general
+                rooms:
+                  include: [general]
         """)
         result = self._validate(cfg)
         agent_findings = {
@@ -729,7 +885,8 @@ class TestFindingsExtension(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         result = self._validate(cfg)
         connector_findings = {f.field: f for f in result.findings if f.entity_kind == "connector"}
@@ -750,7 +907,8 @@ class TestFindingsExtension(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         result = self._validate(cfg)
         connector_findings = {f.field: f for f in result.findings if f.entity_kind == "connector"}
@@ -772,7 +930,8 @@ class TestFindingsExtension(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         self.runtime_dir.mkdir()
         (self.runtime_dir / "state.rc.json").write_text(json.dumps({
@@ -799,7 +958,8 @@ class TestFindingsExtension(_ValidateConfigTestBase):
                 timeout: 360
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         result = self._validate(cfg, lint=True)
         lint_findings = [f for f in result.findings if f.severity == "lint"]
@@ -822,7 +982,8 @@ class TestFindingsExtension(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         result = self._validate(cfg)
         self.assertEqual(result.findings, [])
@@ -845,7 +1006,8 @@ class TestFindingsExtension(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         with patch("gateway.config_validate.open", side_effect=OSError("boom")):
             result = self._validate(cfg)

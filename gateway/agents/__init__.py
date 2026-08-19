@@ -178,6 +178,19 @@ class AgentBackend(ABC):
         stopped must return immediately without raising.
         """
 
+    async def reclaim_durable_instructions(self, path_key: str) -> None:
+        """Remove whatever ``ensure_durable_instructions`` left on disk for this key.
+
+        Expiry's half of that contract (§2.5, "expiry reclaims everything"): the
+        file's location and layout are the backend's own knowledge — the caller
+        holds only the opaque ``path_key`` it passed in — so the backend that
+        wrote it is the one that can remove it. Best-effort and idempotent:
+        a missing file is success, not an error.
+
+        The default implementation is a no-op, for backends whose delivery
+        leaves nothing on disk (the send()-based fallback).
+        """
+
     async def delete_session(self, session_id: str) -> bool:
         """Best-effort deletion of a previously created session.
 

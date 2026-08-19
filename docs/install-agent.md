@@ -337,18 +337,20 @@ To monitor additional rooms/channels:
 
 1. Add the bot to the room (Rocket.Chat) or channel (Mattermost — must also already be a
    team member, see Step 2)
-2. Edit `~/.agent-chat-gateway/config.yaml` and add the room to your watcher. If you're
-   watching several rooms with the same connector+agent, use `rooms:` instead of adding a
-   whole new entry per room — it expands into one watcher per room automatically, naming
-   each one `<connector>-<room>`:
+2. Edit `~/.agent-chat-gateway/config.yaml` and make sure a watcher RULE claims the
+   room. Rules match room names by glob, so one rule usually covers many rooms — the
+   watcher itself is created automatically on the room's first message, named
+   `<connector>:<room>`:
    ```yaml
-   - connector: rc-home   # or mm-home
-     agent: my-agent
-     rooms: ["general", "dev"]   # bare channel name, no leading "#", on either platform
+   watchers:
+     - name: my-rooms
+       connector: rc-home   # or mm-home
+       agent: my-agent
+       rooms:
+         include: ["general", "dev"]   # bare channel names or globs (eng-*), no leading "#"
    ```
-   A one-off room still works as a single entry with `room:` instead of `rooms:` — see
-   `config.example.yaml` for the full annotated format, including `name:` for pinning a
-   specific watcher's identity (needed if you rely on its session surviving a config edit).
+   See `config.example.yaml` for the full annotated format (DM opt-ins, `except_for`,
+   per-rule session TTLs).
 3. Validate before restarting: `agent-chat-gateway config validate --config ~/.agent-chat-gateway/config.yaml`
 4. Restart the daemon: `agent-chat-gateway restart`
 

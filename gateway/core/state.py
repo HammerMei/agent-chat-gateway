@@ -144,8 +144,13 @@ class WatcherState:
     # Written by the watcher manager; empty on records the static path creates,
     # which is why every one of them defaults rather than being required.
 
-    # The platform's own name for the room, refreshed from inbound messages.
-    # Empty for DMs, which have no name to carry.
+    # A human-readable description of the room, refreshed from inbound messages
+    # (§2.3): the platform's own name for a named room, and for the DM kinds the
+    # room's description — the counterpart for a 1:1, the participant list for a
+    # group DM. Direct rooms have no platform name, and an empty field left the
+    # `list` column blank for exactly the rooms an operator cannot otherwise tell
+    # apart. Display only: resolution goes by `room_id`, which is what makes this
+    # safe to hold a description rather than an identifier.
     room_name: str = ""
     # channel / group / dm / group_dm — decides the label form and whether
     # require_mention applies (§2.7). Distinct from `room_type` above, which is the
@@ -177,6 +182,162 @@ class WatcherState:
     # Which config schema the two snapshots above were written under. 0 means "no snapshot"
     # — a record that predates rule-derived creation, or one written by the static path.
     config_schema_version: int = 0
+
+
+# ── What a start rebuilds, and what it must carry ────────────────────────────
+#
+# Starting a watcher constructs a fresh `WatcherState`, so every field is either
+# *rebuilt* by that start or *carried* into it from the record being recreated.
+# Getting that split wrong is silent and compounding: a recreation that rebuilt
+# the record without carrying `rule_name`/`config` wiped the very snapshot
+# recreation reads, and the next boot then pruned the emptied record as an
+# orphan — two restarts and a room's session was gone.
+#
+# These are named here, next to the dataclass, rather than being a hand-built
+# dict at the one call site that needs them. A hand-built list is a defect with
+# a delay on it: the next §5.3 field silently stops surviving recreation. The
+# enumeration test walks `fields(WatcherState)` and requires every field to be
+# in exactly one set, so a new field cannot be added without classifying it.
+
+# Rebuilt by every start, from the config and the resolved room.
+SESSION_SCOPED_FIELDS = frozenset({
+    "watcher_name",
+    "session_id",
+    "room_id",
+    "room_type",
+    "room_name",
+    "context_injected",
+    "paused",
+    "last_processed_ts",
+    "backend_identity",
+})
+
+# Written once, when the watcher is first created from a rule, and never again:
+# recreation reads them, so a start must carry them across unchanged (§2.4, §5.3).
+FROZEN_AT_CREATION_FIELDS = frozenset({
+    "room_kind",
+    "participants",
+    "connector",
+    "agent",
+    "created_at",
+    "config",
+    "rule_name",
+    "rule",
+    "config_schema_version",
+})
+
+# Neither rebuilt nor frozen: the lifecycle clocks (§2.5). They move over a
+# record's life — but they move on *lifecycle* events, not on a start, so a
+# start carries them rather than resetting them.
+LIFECYCLE_CLOCK_FIELDS = frozenset({
+    "last_activity_at",
+    "dropped_at",
+})
+
+
+def now_iso() -> str:
+    """Local-time ISO seconds — the shape every timestamp in the state file
+    carries (§5.2). One function, because every writer of a lifecycle clock
+    must agree on the representation, and two private copies is how one of
+    them drifts."""
+    from datetime import datetime
+
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def past_idle_ttl(record: "WatcherState", now) -> bool:
+    """Whether this record's idle TTL has elapsed — the idle leg's arithmetic (§2.5).
+
+    One function, two callers by design: the sweep asks it on a timer, and boot
+    asks the same question once at start — a boot rule and a running rule would
+    drift on exactly the restart-only path nothing exercises.
+
+    Reads the **frozen** rule, never current config (§2.5): the sweep reads what
+    the record carries, and rule updates belong to a future config-reload that
+    diffs current against frozen. Answers False — never destructive — when the
+    record carries no rule snapshot (a static-model record, whose lifecycle is
+    `config.yaml`'s), no TTL, no activity clock, or a clock it cannot parse.
+
+    `now` is an aware datetime, injected by the caller: tests cannot sleep
+    fifteen days, and the sweep stamps `dropped_at` from the same value so one
+    pass reads one instant.
+    """
+    return _past_ttl(record, "session_idle_days", record.last_activity_at, now)
+
+
+def past_expire_ttl(record: "WatcherState", now) -> bool:
+    """Whether this record's expiry TTL has elapsed — the destructive leg (§2.5).
+
+    Measured from `dropped_at` — the moment the watcher became idle — and never
+    from its last activity. That origin is the whole outage story: a watcher
+    active at shutdown gets a fresh `dropped_at` from the first sweep after the
+    restart, so the outage is not counted and `active → expired` cannot happen
+    through a downtime of any length. Same frozen-rule, never-destructive-on-
+    bad-data contract as `past_idle_ttl`; same injected clock.
+    """
+    return _past_ttl(record, "session_expire_days", record.dropped_at, now)
+
+
+def _past_ttl(record: "WatcherState", field_name: str, origin: str, now) -> bool:
+    from datetime import datetime, timedelta
+
+    days = (record.rule or {}).get(field_name)
+    # bool is an int subtype, so `True` read as a ONE-DAY TTL — and the
+    # expiry leg is destructive, which is exactly what this helper's
+    # never-destructive-on-bad-data contract forbids (Codex round 9). The
+    # config parser already rejects booleans; a hand-edited or corrupted
+    # record must degrade the same way.
+    if isinstance(days, bool) or not isinstance(days, int) or days <= 0 or not origin:
+        return False
+    try:
+        start = datetime.fromisoformat(origin)
+    except ValueError:
+        return False
+    if start.tzinfo is None:
+        # A naive stamp is a legacy record; local time is what wrote it.
+        start = start.astimezone()
+    return (now - start) >= timedelta(days=days)
+
+
+def room_kind_or_channel(record: "WatcherState"):
+    """The record's room kind, degraded rather than raised (Codex round 9 —
+    the THIRD raising conversion site made this the shared helper).
+
+    `load_state` promises a corrupted record degrades instead of taking the
+    service down; a raising `RoomKind(...)` conversion re-introduces the
+    crash one field later, wherever it runs. Unknown values fall back to
+    CHANNEL with a warning — the mention gate applies there, which is the
+    safe default.
+    """
+    from gateway.core.watcher_rule import RoomKind
+
+    if not record.room_kind:
+        return RoomKind.CHANNEL
+    try:
+        return RoomKind(record.room_kind)
+    except ValueError:
+        logger.warning(
+            "Watcher '%s': persisted room_kind %r is not a known kind — "
+            "treating the room as a channel",
+            record.watcher_name, record.room_kind,
+        )
+        return RoomKind.CHANNEL
+
+
+def carried_fields(state: "WatcherState | None") -> dict:
+    """The fields a recreation must carry out of the record it is recreating.
+
+    Derived from the sets above rather than listed again here, so adding a
+    frozen field extends this automatically. Returns `{}` for a record that
+    does not exist (a first-ever creation) or one the static path wrote (no
+    frozen snapshot — its recreation source is `config.yaml`).
+    """
+    if state is None:
+        return {}
+    return {
+        name: getattr(state, name)
+        for name in FROZEN_AT_CREATION_FIELDS | LIFECYCLE_CLOCK_FIELDS
+    }
 
 
 class StateFilter(Flag):
@@ -228,12 +389,14 @@ def lifecycle_state(record: "WatcherState", *, resident: bool) -> StateFilter:
       would hide the only one of the two that someone has to act on.
     * **idle** is a record the manager dropped. It is checked *before*
       residency because an idle record is supposed to have no processor;
-      reversing the two would report every idle watcher as failed. **Nothing
-      writes ``dropped_at`` yet** — the watcher manager will, when it releases a
-      watcher and clears it on recreation (§2.5) — so this branch is unreachable
-      in production today and ``--idle`` legitimately returns nothing. The
-      reader lands before the writer on purpose: it is what makes idling
-      observable as soon as the lifecycle increment produces it.
+      reversing the two would report every idle watcher as failed. Two writers
+      stamp ``dropped_at`` (§2.5): the sweep's ``drop_idle`` when it releases a
+      quiet room, and the boot evaluation for a was-active record already past
+      its idle TTL. Recreation clears it. The boot writer means a record whose
+      start failed *and* whose room then stayed quiet past the TTL converts to
+      idle rather than being retried at the next boot — deliberate: reviving a
+      15-days-quiet room to sit idle is the resume cost §2.5 declines to pay,
+      and its next message or scheduled injection retries the start anyway.
     * **failed** is the record and reality disagreeing: it wants to be resident
       and is not, which is what a start that got far enough to write a record
       and then raised leaves behind. Derived rather than stored, so the next
@@ -516,6 +679,22 @@ def _record_from_dict(w: dict) -> WatcherState:
         values[field_name] = (
             dict(value) if want is dict else list(value) if want is list else value
         )
+    # VALUE-layer normalization for the one list whose ELEMENTS have a
+    # demonstrated crashing consumer (the field-walk test): a non-string
+    # participant reaches `_encode` on the wake's naming path and raises
+    # mid-recreation. Display-only field, so dropping the junk is safe —
+    # worst case the label degrades to the room-id digest. Other garbled
+    # values (room_kind, rule TTLs) degrade at their consumers, which log
+    # with more context than the loader has.
+    participants = values.get("participants")
+    if isinstance(participants, list):
+        clean = [p for p in participants if isinstance(p, str)]
+        if len(clean) != len(participants):
+            logger.warning(
+                "Record '%s': dropped %d non-string participant value(s)",
+                name, len(participants) - len(clean),
+            )
+            values["participants"] = clean
     # A required field absent from the payload reads as empty, which is what the
     # previous reader did via its per-field defaults. Derived from `fields()` rather
     # than a hand-written list of "the required ones", and deliberately not solved by

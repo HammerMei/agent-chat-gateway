@@ -56,8 +56,6 @@ def _make_processor(agent: AgentBackend) -> MessageProcessor:
     connector.send_text = AsyncMock()
     connector.format_prompt_prefix = MagicMock(return_value="")
     connector.notify_typing = AsyncMock()
-    connector.notify_online = AsyncMock()
-    connector.notify_offline = AsyncMock()
     return MessageProcessor(
         session_id="ses_001",
         room=Room(id="room_1", name="test-room"),
@@ -81,8 +79,6 @@ def _make_processor_with_prompt_file(
     connector.send_text = AsyncMock()
     connector.format_prompt_prefix = MagicMock(return_value="")
     connector.notify_typing = AsyncMock()
-    connector.notify_online = AsyncMock()
-    connector.notify_offline = AsyncMock()
     connector.notify_agent_event = AsyncMock()
     return MessageProcessor(
         session_id="ses_001",
@@ -223,8 +219,6 @@ class TestGracefulDrain(unittest.IsolatedAsyncioTestCase):
         connector.send_text = AsyncMock()
         connector.format_prompt_prefix = MagicMock(return_value="")
         connector.notify_typing = AsyncMock()
-        connector.notify_online = AsyncMock()
-        connector.notify_offline = AsyncMock()
         proc = MessageProcessor(
             session_id="ses_001",
             room=Room(id="room_1", name="test-room"),
@@ -338,8 +332,6 @@ class TestEnsureContextInjectedRetryOnMessage(unittest.IsolatedAsyncioTestCase):
         connector.send_text = AsyncMock()
         connector.format_prompt_prefix = MagicMock(return_value="")
         connector.notify_typing = AsyncMock()
-        connector.notify_online = AsyncMock()
-        connector.notify_offline = AsyncMock()
         connector.agent_username = "bot"
         return MessageProcessor(
             session_id="ses_retry",

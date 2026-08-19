@@ -30,8 +30,6 @@ class _MockAgent(AgentBackend):
 
 def _make_processor() -> tuple[MessageProcessor, MagicMock]:
     connector = MagicMock()
-    connector.notify_online = AsyncMock()
-    connector.notify_offline = AsyncMock()
     connector.send_text = AsyncMock()
     connector.notify_typing = AsyncMock()
     connector.notify_agent_event = AsyncMock()

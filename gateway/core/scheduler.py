@@ -445,7 +445,10 @@ class JobScheduler:
         if sm is not None:
             return sm
         for manager in self._session_managers.values():
-            if manager.get_watcher_config(job.watcher) is not None:
+            # Record-based identity (§2.8): `get_watcher_config` was removed
+            # with the static path, and calling it here raised AttributeError
+            # before the fire's failure accounting could run (Codex round 4).
+            if manager.get_watcher_state(job.watcher) is not None:
                 return manager
         return None
 

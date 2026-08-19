@@ -100,6 +100,14 @@ def main():
     )
     reset_p.add_argument("watcher_name", help="Watcher name as defined in config.yaml")
 
+    # expire
+    expire_p = sub.add_parser(
+        "expire",
+        help="Expire a rule-derived watcher now: reclaim its record, session "
+             "and files, and cancel its scheduled jobs (overrides pause, audibly)",
+    )
+    expire_p.add_argument("watcher_name", help="Watcher name as shown by 'list'")
+
     # onboard
     onboard_p = sub.add_parser(
         "onboard",
@@ -383,6 +391,16 @@ def main():
         result = _send_command(cmd_data)
         if result["ok"]:
             print(f"Watcher '{args.watcher_name}' resumed")
+        else:
+            print(f"Error: {result.get('error')}", file=sys.stderr)
+            sys.exit(1)
+
+    elif args.command == "expire":
+        cmd_data = {"cmd": "expire", "watcher_name": args.watcher_name}
+        result = _send_command(cmd_data)
+        if result["ok"]:
+            print(f"Watcher '{args.watcher_name}' expired — record, session and "
+                  f"scheduled jobs reclaimed")
         else:
             print(f"Error: {result.get('error')}", file=sys.stderr)
             sys.exit(1)

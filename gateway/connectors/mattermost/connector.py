@@ -21,6 +21,7 @@ docstring for the confirmed payload-shape details behind this design.
 
 from __future__ import annotations
 
+import asyncio
 import collections
 import logging
 import re
@@ -42,6 +43,13 @@ from ...core.connector import (
     Room,
     RoomCapacity,
 )
+from ...core.dispatch import RoomAlreadyRoutedError
+from ...core.paths import resolve_under
+from ...core.pending_route import (
+    STARTING_UP_NOTICE,
+    PendingRoute,
+    route_attempts,
+)
 from ...core.replay_window import ReplayWindow, just_before
 from ...core.tz_utils import local_iana_timezone as _server_local_timezone
 from ...core.watcher_manager import RoomRef
@@ -59,7 +67,7 @@ from .normalize import (
 from .outbound import send_media as _send_media
 from .outbound import send_text as _send_text
 from .policy import apply_thread_policy
-from .rest import MattermostREST, RoomNotFoundError, iso_to_epoch_ms_str
+from .rest import MattermostREST, RoomNotFoundError
 from .websocket import MattermostWebSocketClient
 
 logger = logging.getLogger("agent-chat-gateway.connectors.mattermost")
@@ -97,6 +105,12 @@ class _ChannelState(ReplayWindow):
     # its queues are full.
     replay_boundary: str | None = None
     boundary_claims: int = 0
+    # Set by the membership-removal hook while this object is still the
+    # channel's current state. RC carries a membership_epoch for the same
+    # job; Mattermost has no epoch machinery, and the commit-redirection
+    # fence needs exactly one bit: did a membership loss happen while a
+    # delivery holding this object was in flight.
+    membership_lost: bool = False
     seen_ids: collections.deque = field(default_factory=lambda: collections.deque())
     seen_ids_set: set = field(default_factory=set)
     watcher_ids: set = field(default_factory=set)
@@ -147,6 +161,14 @@ class MattermostConnector(Connector):
     # is 16383 — leave a safety margin below that.
     _TEXT_CHUNK_LIMIT = 16_000
 
+    # One routing episode's buffer — matches the transport's per-channel queue
+    # depth (websocket._CHANNEL_QUEUE_DEPTH), same reasoning as RC's.
+    _PENDING_BUFFER_DEPTH = 50
+    # Bounded backoff for a creation that raised (§2.2 outcome 4). MM episodes
+    # run on their own task, so the backoff holds no shared worker — the bound
+    # exists so a dead backend does not retry forever.
+    _ROUTE_RETRY_DELAYS: tuple[float, ...] = (0.5, 1.0, 2.0)
+
     def __init__(self, config: MattermostConfig) -> None:
         self._config = config
         self._rest = MattermostREST(
@@ -161,7 +183,31 @@ class MattermostConnector(Connector):
         self._handler: MessageHandler | None = None
         self._capacity_check: CapacityCheck | None = None
         self._router = None
+        self._membership_hook = None
+        # Room-level membership-loss generation — RC's twin (round 2 of the
+        # #121 review): the membership_lost bit on _ChannelState dies with
+        # the object, so a loss that marked a mid-flight replacement was
+        # invisible to a delivery holding the original. Every loss bumps
+        # this; a delivery captures it at entry; the commit fence refuses to
+        # redirect across a bump.
+        self._membership_gen: dict[str, int] = {}
+        # Per-channel serialization of membership HOOK calls — see
+        # `_run_membership`. Keyed like the generation above; never cleaned,
+        # like the generation: a lock is a few hundred bytes and a channel
+        # id space is bounded by rooms the bot is ever told about.
+        self._membership_serial: dict[str, asyncio.Lock] = {}
         self._channels: dict[str, _ChannelState] = {}  # channel_id -> state
+        # Channels with an open routing episode — the same single-episode rule as
+        # RC's `_pending_routes`, and needed here for a sharper reason: the offer
+        # runs off the handler path (see `_offer_to_router`), so the per-channel
+        # worker's serialization no longer covers the creation, and two back-to-back
+        # messages for one new channel could otherwise both trigger it. Frames that
+        # arrive during the episode wait in its bounded buffer (§2.7 step 3) and
+        # drain in arrival order when it ends.
+        self._pending_routes: dict[str, PendingRoute] = {}
+        # The off-handler routing tasks, tracked so disconnect() can cancel them
+        # rather than leaving offers running against a closed transport.
+        self._routing_tasks: set[asyncio.Task] = set()
         self._attachments_cache_base = (
             Path(config.attachments.cache_dir_global).expanduser() / config.name
         )
@@ -182,6 +228,7 @@ class MattermostConnector(Connector):
         await self._rest.resolve_team(self._config.team)
 
         self._ws.register_handler(self._on_posted_event)
+        self._ws.register_membership_handler(self._on_membership_event)
         self._ws.set_reconnect_callback(self._on_ws_reconnect)
         # The socket opens here; the listen loop starts in `start_inbound()`, after the
         # watchers exist. Events arriving in between are buffered by the client rather
@@ -206,8 +253,22 @@ class MattermostConnector(Connector):
         await self._ws.start()
 
     async def disconnect(self) -> None:
-        """Close the WebSocket and release HTTP client resources."""
+        """Close the WebSocket and release HTTP client resources.
+
+        The transport stops **first** — the channel workers are what spawn
+        routing and wake episodes (§2.5), so cancelling `_routing_tasks`
+        before they stop lets a worker spawn a newcomer during the gather:
+        never cancelled, and `clear()` then drops its only strong reference
+        while it runs against a dead transport. Stop the spawner, then
+        harvest; the offers themselves run off the handler path, which is why
+        they still need the explicit cancel afterwards.
+        """
         await self._ws.stop()
+        for task in list(self._routing_tasks):
+            task.cancel()
+        if self._routing_tasks:
+            await asyncio.gather(*self._routing_tasks, return_exceptions=True)
+        self._routing_tasks.clear()
         await self._rest.close()
         logger.info("MattermostConnector disconnected")
 
@@ -234,87 +295,137 @@ class MattermostConnector(Connector):
             "WebSocket reconnected — replaying missed messages for %d channel(s)",
             len(self._channels),
         )
-        for channel_id, state in list(self._channels.items()):
-            # Snapshot the watermark NOW, before any await in this iteration —
-            # same race rationale as RC: a concurrent live message must not be
-            # allowed to advance the watermark mid-replay and cause the rest
-            # of this channel's replay window to be skipped as "already
-            # processed".
-            # Captured before the fetch so the close below can tell whether anyone has
-            # claimed this window since. A hand-back landing while this batch is dispatching
-            # claims the very window it is reading and writes back the same timestamp, so a
-            # value comparison would report "unchanged" in exactly the case it exists to
-            # catch. Replay is not serialized against live traffic here — it calls
-            # `_on_posted_event` directly rather than through the per-channel worker.
-            claims_at_entry = state.boundary_claims
-            watermark = state.replay_boundary or state.last_processed_ts
-            if not watermark:
-                logger.debug("Channel '%s': no watermark yet — skipping replay", state.room.name)
-                continue
-            try:
-                page = await self._rest.get_room_history_page(
-                    channel_id, count=self._REPLAY_HISTORY_COUNT, after_ts=watermark
-                )
-                raw_msgs = page.messages
-            except Exception as e:
-                logger.warning("Channel '%s': failed to fetch history for replay: %s", state.room.name, e)
-                continue
+        for channel_id in list(self._channels):
+            await self.replay_room_since(channel_id)
 
-            if not raw_msgs:
-                if page.was_full:
-                    # Not an empty window — a page the server filled entirely with system
-                    # posts, because `per_page` is applied before ACG filters them out.
-                    # Every user post older than this page is still waiting behind it, and
-                    # reporting the outage as read would skip them silently. Same rule, and
-                    # same reason, as the Rocket.Chat replay: the count the server applied
-                    # is not the count that survived filtering.
-                    logger.warning(
-                        "Channel '%s': the newest %d history entries are all system posts "
-                        "— any user posts older than them cannot be reached in one page "
-                        "and may be permanently missed",
-                        state.room.name, self._REPLAY_HISTORY_COUNT,
-                    )
-                else:
-                    logger.debug(
-                        "Channel '%s': no missed messages since %s",
-                        state.room.name, watermark)
-                    # A read that found nothing is still a read — of the window this replay
-                    # came in for, not one claimed during the fetch above.
-                    state.discharge_boundary(claims_at_entry)
-                continue
+    async def replay_room_since(
+        self, room_id: str, after_ts: str | None = None
+    ) -> None:
+        """Replay one tracked channel's outage window from its watermark.
 
+        The per-channel half of the reconnect replay, shared with the startup
+        replay for the same reason as RC's: what "cannot copy the reconnect
+        path" forbids is the iteration source (live channels vs persisted
+        records), not this fetch-and-inject. The channel must already be
+        tracked; startup recreates the watcher first, which restores the
+        watermark this reads.
+        """
+        state = self._channels.get(room_id)
+        if state is None:
+            return
+        channel_id = room_id
+        # The membership era, captured in the FIRST synchronous segment —
+        # before the history fetch awaits (Codex rounds 19 and 21): a live
+        # remove-then-re-add can land during the fetch itself, and a capture
+        # taken after it would snapshot the NEW era's generation and happily
+        # dispatch the OLD era's fetched posts into the re-added room. The
+        # loop below re-checks this value before every dispatch.
+        entry_gen = self._membership_gen.get(channel_id, 0)
+        # An explicitly named window (startup, post-park) is not this channel's
+        # boundary to spend — same rule, same reason, as Rocket.Chat's.
+        external_window = after_ts is not None
+        # Snapshot the watermark NOW, before any await in this iteration —
+        # same race rationale as RC: a concurrent live message must not be
+        # allowed to advance the watermark mid-replay and cause the rest
+        # of this channel's replay window to be skipped as "already
+        # processed".
+        # Captured before the fetch so the close below can tell whether anyone has
+        # claimed this window since. A hand-back landing while this batch is dispatching
+        # claims the very window it is reading and writes back the same timestamp, so a
+        # value comparison would report "unchanged" in exactly the case it exists to
+        # catch. Replay is not serialized against live traffic here — it calls
+        # `_on_posted_event` directly rather than through the per-channel worker.
+        watermark = after_ts or state.replay_boundary or state.last_processed_ts
+        if not watermark:
+            logger.debug("Channel '%s': no watermark yet — skipping replay", state.room.name)
+            return
+        if not external_window:
+            # Claim the window BEFORE the first await (Codex round 25): this
+            # replay runs detached since round 22, and a cancellation — a
+            # shutdown, another drop's harvest — used to leave nothing
+            # pointing at the unprocessed tail while live traffic advanced
+            # last_processed_ts past it; the next boot then started above
+            # the miss. Claimed, the boundary survives the cancellation and
+            # the for/else below discharges it only after the whole batch
+            # dispatched. (An external window is its caller's to keep — the
+            # failure arms below already claim it on that caller's behalf.)
+            state.claim_boundary(watermark)
+        claims_at_entry = state.boundary_claims
+        try:
+            page = await self._rest.get_room_history_page(
+                channel_id, count=self._REPLAY_HISTORY_COUNT, after_ts=watermark
+            )
+            raw_msgs = page.messages
+        except Exception as e:
+            # An EXTERNAL window that was not read is claimed (Codex review of
+            # #121, RC's twin has the same rule): the caller's mark lives in
+            # the record, this channel state is fresh, and the triggering
+            # post's commit would otherwise seal the unread interval away
+            # permanently. Whoever fails to replay owns keeping it reachable.
+            if external_window:
+                state.claim_boundary(after_ts)
+            logger.warning("Channel '%s': failed to fetch history for replay: %s", state.room.name, e)
+            return
+
+        if not raw_msgs:
             if page.was_full:
+                # Not an empty window — a page the server filled entirely with system
+                # posts, because `per_page` is applied before ACG filters them out.
+                # Every user post older than this page is still waiting behind it, and
+                # reporting the outage as read would skip them silently. Same rule, and
+                # same reason, as the Rocket.Chat replay: the count the server applied
+                # is not the count that survived filtering.
                 logger.warning(
-                    "Channel '%s': replay fetched the maximum %d message(s) — "
-                    "the outage window may have produced more; some messages "
-                    "could be permanently lost",
+                    "Channel '%s': the newest %d history entries are all system posts "
+                    "— any user posts older than them cannot be reached in one page "
+                    "and may be permanently missed",
                     state.room.name, self._REPLAY_HISTORY_COUNT,
                 )
             else:
-                logger.info(
-                    "Channel '%s': replaying %d missed message(s) since %s",
-                    state.room.name, len(raw_msgs), watermark,
-                )
+                logger.debug(
+                    "Channel '%s': no missed messages since %s",
+                    state.room.name, watermark)
+                # A read that found nothing is still a read — of the window this replay
+                # came in for, not one claimed during the fetch above. An externally
+                # named window is not this channel's mark to spend either way.
+                if not external_window:
+                    state.discharge_boundary(claims_at_entry)
+            return
 
-            for idx, post in enumerate(raw_msgs):
-                if channel_id not in self._channels:
-                    logger.debug(
-                        "Channel '%s' was unsubscribed during replay — skipping %d remaining message(s)",
-                        state.room.name, len(raw_msgs) - idx,
-                    )
-                    break
-                decoded = self._synthesize_decoded_for_replay(post)
-                await self._on_posted_event(decoded, is_replay=True, replay_after_ts=watermark)
-            else:
-                # `for`/`else`, so a cancellation or the `break` above does not reach it: a
-                # window is spent once its batch has been *dispatched*, not once it was
-                # fetched. Any hand-back during the batch — this replay's own or a live one
-                # — left a newer claim, and the window stays open for the next recovery.
-                if not state.discharge_boundary(claims_at_entry):
-                    logger.info(
-                        "Channel '%s': the replay window was claimed again while this batch "
-                        "was being dispatched — leaving it open", state.room.name,
-                    )
+        if page.was_full:
+            logger.warning(
+                "Channel '%s': replay fetched the maximum %d message(s) — "
+                "the outage window may have produced more; some messages "
+                "could be permanently lost",
+                state.room.name, self._REPLAY_HISTORY_COUNT,
+            )
+        else:
+            logger.info(
+                "Channel '%s': replaying %d missed message(s) since %s",
+                state.room.name, len(raw_msgs), watermark,
+            )
+
+        for idx, post in enumerate(raw_msgs):
+            if (channel_id not in self._channels
+                    or self._membership_gen.get(channel_id, 0) != entry_gen):
+                logger.debug(
+                    "Channel '%s' was unsubscribed or its membership changed "
+                    "during replay — skipping %d remaining message(s)",
+                    state.room.name, len(raw_msgs) - idx,
+                )
+                break
+            decoded = self._synthesize_decoded_for_replay(post)
+            await self._on_posted_event(decoded, is_replay=True, replay_after_ts=watermark)
+        else:
+            # `for`/`else`, so a cancellation or the `break` above does not reach it: a
+            # window is spent once its batch has been *dispatched*, not once it was
+            # fetched. Any hand-back during the batch — this replay's own or a live one
+            # — left a newer claim, and the window stays open for the next recovery.
+            if not external_window and not state.discharge_boundary(claims_at_entry):
+                logger.info(
+                    "Channel '%s': the replay window was claimed again while this batch "
+                    "was being dispatched — leaving it open", state.room.name,
+                )
 
     def _synthesize_decoded_for_replay(self, post: dict) -> dict:
         """Build a decoded-event dict for a REST-history post (replay path only).
@@ -517,13 +628,37 @@ class MattermostConnector(Connector):
 
     def get_last_processed_ts(self, room_id: str) -> str | None:
         state = self._channels.get(room_id)
-        return state.last_processed_ts if state else None
+        if state is None:
+            return None
+        # The oldest OWED mark, not merely the newest processed one (Codex
+        # round 26): a claimed replay boundary is a window someone still owes
+        # a read of, and shutdown's watermark capture persists this getter's
+        # answer — returning only last_processed_ts let a cancelled replay's
+        # claimed-but-undischarged tail vanish from the durable record, and
+        # the next boot started above it. Older is the safe direction: a low
+        # watermark costs a re-fetch dedup absorbs; a high one loses messages.
+        if state.boundary_claims and state.replay_boundary:
+            from gateway.core.replay_window import ts_to_float
+
+            lp = ts_to_float(state.last_processed_ts or "")
+            rb = ts_to_float(state.replay_boundary)
+            if lp is None or (rb is not None and rb < lp):
+                return state.replay_boundary
+        return state.last_processed_ts
 
     # ── Attachment cache ────────────────────────────────────────────────────────
 
     def _cache_dir_for(self, channel_id: str) -> Path:
+        """The channel's cache directory, contained under the cache base.
+
+        The character-class sanitize alone lets `..` through — dots are legal
+        filename characters — and expiry `rmtree`s this directory, so
+        `resolve_under` is the actual fence. See Rocket.Chat's
+        `attachment_cache_dir` twin; a refused component raises to the caller
+        below, which answers None (no caching for this channel).
+        """
         safe_channel_id = re.sub(r"[^\w.\-]", "_", channel_id)
-        return self._attachments_cache_base / safe_channel_id
+        return resolve_under(self._attachments_cache_base, safe_channel_id)
 
     @property
     def text_chunk_limit(self) -> int | None:
@@ -654,18 +789,6 @@ class MattermostConnector(Connector):
             except Exception as e:
                 logger.debug("Failed to send typing indicator: %s", e)
 
-    async def notify_online(self, room_id: str, text: str) -> None:
-        try:
-            await self._rest.post_message(room_id, text)
-        except Exception as e:
-            logger.warning("Failed to post online notification: %s", e)
-
-    async def notify_offline(self, room_id: str, text: str) -> None:
-        try:
-            await self._rest.post_message(room_id, text)
-        except Exception as e:
-            logger.warning("Failed to post offline notification: %s", e)
-
     def on_agent_chain_drop(self, room_id: str, thread_id: str | None, sender: str) -> None:
         """Reset the sender's turn counter after an agent-chain termination drop."""
         if self._turn_store is not None:
@@ -683,7 +806,14 @@ class MattermostConnector(Connector):
 
     def attachment_cache_dir(self, room_id: str) -> str | None:
         """Return the global cache directory for a channel's attachments."""
-        return str(self._cache_dir_for(room_id))
+        try:
+            return str(self._cache_dir_for(room_id))
+        except ValueError:
+            logger.warning(
+                "Refusing an attachment cache path for channel id %r — it does "
+                "not name a directory under the cache base", room_id,
+            )
+            return None
 
     # ── History ──────────────────────────────────────────────────────────────
 
@@ -711,17 +841,20 @@ class MattermostConnector(Connector):
         included with role="agent"/username="me"; peer agents are included
         with role="agent" and their real (sanitized) username.
 
-        Note: before_ts/after_ts are ISO 8601 strings per the Connector ABC
-        contract — converted here to the epoch-ms strings
-        MattermostREST.get_room_history expects natively (see that method's
-        docstring), and applied as a best-effort client-side filter, not
-        exact server-side pagination.
+        `before_ts`/`after_ts` are epoch milliseconds, the internal
+        representation (§5.2), which is what `MattermostREST.get_room_history`
+        wants natively — so they pass straight through. They used to be
+        converted from ISO here, and the converter *raised* on an epoch-ms
+        value: the same bound that worked on Rocket.Chat, whose normalizer
+        tolerates both, silently cost every Mattermost recreation its history
+        handoff. Applied as a best-effort client-side filter, not exact
+        server-side pagination.
         """
         raw_msgs = await self._rest.get_room_history(
             room.id,
             count,
-            before_ts=iso_to_epoch_ms_str(before_ts) if before_ts else None,
-            after_ts=iso_to_epoch_ms_str(after_ts) if after_ts else None,
+            before_ts=before_ts or None,
+            after_ts=after_ts or None,
         )
         bot_username = self.agent_username
         owners = set(self._config.owners)
@@ -774,13 +907,186 @@ class MattermostConnector(Connector):
 
         Replaces "unknown channel → discard" with "unknown channel → ask". The connector
         supplies a `RoomRef`; deciding whether a watcher should exist for it is the core's
-        business (a rule has to match, §2.2), and creating one is a later increment's.
+        business (a rule has to match, §2.2).
+
+        Called as `router(room, trigger)`, where `trigger` is the decoded event that
+        prompted the offer — the same contract as Rocket.Chat's, and for the same
+        non-hypothetical reason: a creation whose `history_handoff` fetches with no upper
+        bound picks up the trigger, which this connector then hands back as the live
+        prompt, and the agent sees the same message twice. The trigger is passed rather
+        than a timestamp because the creation path decides what it needs from it
+        (`fetch_room_history` takes a `before_ts`; excluding by id is also open to it).
 
         Optional on purpose: with no router registered the connector behaves exactly as
         before, which is what keeps this branch runnable while creation is still driven by
         static config.
         """
         self._router = router
+
+    def register_membership_hook(self, hook) -> None:
+        """Register the callbacks for the bot's own membership events (§2.7).
+
+        Registration alone changes nothing on the wire — the websocket already
+        receives `user_added`/`user_removed`; with no hook they stay ignored,
+        which is what keeps a static deployment's behaviour byte-identical.
+        """
+        self._membership_hook = hook
+
+    async def _on_membership_event(self, evt: dict) -> None:
+        """Filter a raw membership event to the bot's own, and act off-path.
+
+        The two events carry their ids in asymmetric places (verified against
+        the server's `NewWebSocketEvent` calls in `channel.go`):
+
+        * `user_added` — `data.user_id` is the added user; the channel is in
+          `broadcast.channel_id` on both the channel-scoped and user-scoped
+          variants.
+        * `user_removed` broadcast to the channel — `data.user_id` is the
+          removed user, channel in `broadcast.channel_id`. The removed user
+          no longer belongs to the channel, so the bot sees this only for
+          *other* people's removals.
+        * `user_removed` broadcast to the removed user — the one the bot gets
+          for itself: the user is `broadcast.user_id`, the channel is
+          `data.channel_id`, and `data.user_id` is absent.
+
+        Reading user-then-broadcast for the id and broadcast-then-data for the
+        channel covers all three without knowing which arrived. Everything
+        past the own-id filter runs on its own task (`_routing_tasks`, so
+        disconnect cancels it): the add needs a REST call, and this method
+        runs on the listen loop, where an await stalls every channel.
+        """
+        if self._membership_hook is None:
+            return
+        own_id = self._rest.bot_user_id
+        if not own_id:
+            return
+        data = evt.get("data") or {}
+        broadcast = evt.get("broadcast") or {}
+        user_id = data.get("user_id") or broadcast.get("user_id") or ""
+        if user_id != own_id:
+            return
+        channel_id = broadcast.get("channel_id") or data.get("channel_id") or ""
+        if not channel_id:
+            return
+        if evt.get("event") == "user_removed":
+            # Mark the channel's CURRENT state before anything reclaims it —
+            # synchronously, before the task below is even created — so a
+            # delivery in flight that holds this object can tell a membership
+            # replacement from a benign watcher restart (see the commit
+            # fence in `_on_posted_event`).
+            state = self._channels.get(channel_id)
+            if state is not None:
+                state.membership_lost = True
+            self._membership_gen[channel_id] = (
+                self._membership_gen.get(channel_id, 0) + 1
+            )
+            # A FACTORY, not a coroutine (internal review of the
+            # serialization close): the task's first await is the serial
+            # lock, and a task cancelled while parked there would leave an
+            # eagerly-created coroutine never awaited — a RuntimeWarning per
+            # disconnect and a silently skipped hook. Created inside the
+            # lock instead, so a cancelled park abandons only a factory.
+            def make_coro(cid=channel_id):
+                return self._membership_hook.removed(cid)
+        else:
+            # The generation, captured SYNCHRONOUSLY at dispatch (Codex round
+            # 4): the add's REST classification awaits, and a removal that
+            # lands in that window must not be outrun — the recheck before
+            # `hook.added` compares against this. A genuine re-add captures
+            # the already-bumped generation and still passes.
+            entry_gen = self._membership_gen.get(channel_id, 0)
+
+            def make_coro(cid=channel_id, gen=entry_gen):
+                return self._handle_membership_add(cid, gen)
+        # Guarded like RC's `_run_membership_callback`, and for the same
+        # reason: a hook that raises inside a spawned task is otherwise an
+        # unobserved task exception — a GC-time warning, not a log line.
+        task = asyncio.create_task(self._run_membership(make_coro, channel_id))
+        self._routing_tasks.add(task)
+        task.add_done_callback(self._routing_tasks.discard)
+
+    async def _run_membership(self, make_coro, channel_id: str) -> None:
+        # Serialized PER CHANNEL, in arrival order (structural close after
+        # Codex rounds 4/5/9 each found one interleaving of the unordered
+        # version): each event's task is created in arrival order and its
+        # first await is this acquisition, so the lock's FIFO wakeup
+        # processes a channel's add/remove hooks in the order the platform
+        # sent them — a removal can no longer complete around an add that is
+        # still classifying, and a parked removal no longer swallows the
+        # re-add behind it. The delivery fences stamp SYNCHRONOUSLY at
+        # dispatch, before this task exists, so serialization never delays
+        # them. Cross-channel events still run concurrently.
+        lock = self._membership_serial.setdefault(channel_id, asyncio.Lock())
+        async with lock:
+            try:
+                await make_coro()
+            except Exception:
+                logger.exception(
+                    "Membership handling failed for channel %s — the safety nets "
+                    "cover it", channel_id,
+                )
+
+    async def _handle_membership_add(
+        self, channel_id: str, entry_gen: int = 0,
+    ) -> None:
+        """Classify a joined channel via REST and hand it to the hook.
+
+        The event itself is sparse — `data` carries only `user_id` and
+        `team_id` — so unlike a post there is no metadata to classify from,
+        and one REST call per join is the price of the registration. Failure
+        is logged and dropped: an add is a supplement (§2.7), and the room's
+        first message still creates its watcher.
+        """
+        try:
+            chan = await self._rest.get_channel(channel_id)
+        except Exception as e:
+            logger.warning(
+                "Could not classify joined channel %s — it stays unregistered "
+                "until its first message: %s", channel_id, e,
+            )
+            return
+        decoded = {
+            "channel_type": chan.get("type"),
+            "channel_name": chan.get("name"),
+            "channel_display_name": chan.get("display_name"),
+            "team_id": chan.get("team_id"),
+        }
+        if not self._in_scope(decoded):
+            logger.debug(
+                "Joined channel %s belongs to another team — not registered",
+                channel_id,
+            )
+            return
+        room = self._room_ref_from_event(channel_id, decoded)
+        if room is None:
+            return
+        if self._membership_gen.get(channel_id, 0) != entry_gen:
+            # A removal landed while the classification awaited (Codex round
+            # 4): registering now would create an idle record for a room the
+            # bot has already left. The last recheck before the hook, so both
+            # interleavings are correct — a removal after this add's dispatch
+            # fails here, and a genuine re-add captured the bumped generation
+            # at dispatch and passes.
+            logger.info(
+                "Channel %s: membership was lost while the join was being "
+                "classified — not registering", channel_id,
+            )
+            return
+        await self._membership_hook.added(room)
+
+    async def membership_snapshot(self) -> set[str] | None:
+        """See `Connector.membership_snapshot`. The full-membership listing is
+        the one probe that is unambiguous with the bot's own token (§6.2) —
+        the per-channel member lookup 403s for a non-member, which a
+        permissions problem also does."""
+        try:
+            return await self._rest.get_member_channel_ids()
+        except Exception as e:
+            logger.warning(
+                "Could not read the channel-membership set — membership is "
+                "unknown this pass: %s", e,
+            )
+            return None
 
     def reap_room(self, room_id: str) -> None:
         """Forget a channel's local state without touching watcher bookkeeping.
@@ -796,6 +1102,37 @@ class MattermostConnector(Connector):
         if self._channels.pop(room_id, None) is not None:
             self._ws.unregister_channel(room_id)
             logger.info("Reaped channel state for %s", room_id)
+
+    async def probe_missed_since(self, room: Room, after_ts: str) -> bool:
+        """See `Connector.probe_missed_since`. Raw posts, so `user_id` is still
+        on them — `fetch_room_history` maps the bot's own posts to `"me"`."""
+        page = await self._rest.get_room_history_page(
+            room.id, count=self._REPLAY_HISTORY_COUNT, after_ts=after_ts
+        )
+        if page.was_full:
+            # Same trap, same reason as Rocket.Chat's: `count` is applied before
+            # system posts are filtered out, so an empty filtered list can mean
+            # "nothing here" or "a full page of joins hiding everything older".
+            return True
+        own_id = self._rest.bot_user_id
+        for post in page.messages:
+            if own_id and post.get("user_id") == own_id:
+                continue
+            # Strictly after: `after_ts` is inclusive, so the message that set
+            # this watermark is in the page and is not a gap.
+            if ts_gt(str(post.get("create_at", "")), after_ts):
+                return True
+        return False
+
+    def trigger_history_bound(self, trigger) -> str | None:
+        """The trigger's `post.create_at` — already epoch milliseconds, which is
+        the internal representation (§5.2), so this reads it rather than
+        converting it."""
+        if not isinstance(trigger, dict):
+            return None
+        post = trigger.get("post")
+        create_at = post.get("create_at", "") if isinstance(post, dict) else ""
+        return str(create_at) if create_at else None
 
     def _room_ref_from_event(self, channel_id: str, decoded: dict) -> "RoomRef | None":
         """Build a `RoomRef` from the event, or None when the event cannot describe a room.
@@ -817,9 +1154,20 @@ class MattermostConnector(Connector):
 
         kind = _ROOM_KINDS.get(channel_type)
         if kind is None:
-            logger.debug(
-                "Channel %s has unknown type %r — not routable", channel_id, channel_type)
-            return None
+            # BOTH spellings are real inputs (Codex round 13): the wire event
+            # carries the platform letters, but the membership-add path feeds
+            # this helper `get_channel()`'s output, which `room_type_for` has
+            # already normalized — and the letters-only lookup made
+            # `hook.added` unreachable for every real REST response, so a
+            # joined room was never registered until its first message. Same
+            # dual lookup `_room_ref_from_state` already uses.
+            try:
+                kind = RoomKind(channel_type)
+            except ValueError:
+                logger.debug(
+                    "Channel %s has unknown type %r — not routable",
+                    channel_id, channel_type)
+                return None
 
         display = decoded.get("channel_display_name") or ""
         if kind is RoomKind.DM:
@@ -865,7 +1213,15 @@ class MattermostConnector(Connector):
         return team_id == self._rest.team_id
 
     async def _offer_to_router(self, channel_id: str, decoded: dict) -> None:
-        """Hand an untracked channel to the router, if there is one and it is in scope."""
+        """Hand an untracked channel to the router, if there is one and it is in scope.
+
+        The router itself runs **off the handler path**. This method executes on the
+        channel's worker, which holds the connector-wide `_callback_sem` for the whole
+        call (§6.2) — so awaiting a creation here would stall delivery for *every*
+        channel, which is exactly the stall §2.7 step 3 moves creation off the handler
+        to avoid. The gates below are cheap (one cached REST call at most); everything
+        after them is spawned as a task and this method returns, releasing the permit.
+        """
         if self._router is None:
             return
         if not self._in_scope(decoded):
@@ -886,8 +1242,8 @@ class MattermostConnector(Connector):
         #
         # The *mention* gate deliberately stays out of here. It is kind-dependent —
         # `require_mention` does not apply to a 1:1 DM but does to a group DM — so §2.7
-        # runs it after classification, and `impl/creation-path` owns that ordering along
-        # with the buffer that replays the triggering message.
+        # runs it after classification, on the tracked path the trigger is handed back
+        # through below.
         sender_id = decoded["post"].get("user_id", "")
         try:
             sender_username = await self._rest.resolve_username(sender_id)
@@ -904,10 +1260,224 @@ class MattermostConnector(Connector):
             )
             return
 
+        self._route_or_buffer(channel_id, room, decoded)
+
+    def _channel_is_served(self, channel_id: str) -> bool:
+        """A processor answers for this channel now. Tracked is necessary, not sufficient.
+
+        The idle drop keeps a channel's local state (§2.2), so `channel_id in
+        self._channels` goes on answering True for a channel whose next message has
+        nowhere to go. Every deliver-or-route decision keys on this predicate rather
+        than on tracked-ness, and the drain's branch is the load-bearing one:
+        delivering an unserved channel's frame puts it back on the tracked path, whose
+        UNROUTED arm routes it back here — a hot loop with no retry delay anywhere in
+        it, entered by every message to a channel whose offer was declined.
+        """
+        if channel_id not in self._channels:
+            return False
+        if self._capacity_check is None:
+            # No dispatcher wired: nothing can answer UNROUTED, so tracked is served.
+            return True
+        return self._capacity_check(channel_id) is not RoomCapacity.UNROUTED
+
+    def _room_ref_from_state(self, state: "_ChannelState") -> "RoomRef":
+        """A RoomRef for a channel this connector already tracks — the wake's classification.
+
+        No event metadata needed, which is what lets a *replayed* post wake a channel:
+        the reconnect path synthesizes its events from REST history with no channel
+        metadata at all, so `_room_ref_from_event` answers None for every one of them.
+        The tracked state holds what the original classification decided. For a channel
+        with a record none of this is load-bearing anyway — `_recreate` reads the kind
+        and participants from the record itself (§2.4); the fallback matters only on
+        the recordless edge, where `_create` rule-matches this ref.
+        """
+        kind = _ROOM_KINDS.get(state.room.type)
+        if kind is None:
+            try:
+                kind = RoomKind(state.room.type)
+            except ValueError:
+                kind = RoomKind.CHANNEL
+        return RoomRef(
+            id=state.room.id,
+            kind=kind,
+            # A direct room's tracked name is its *description* (the counterpart, the
+            # member list — §2.3); `RoomRef.name` is the platform's own name, empty
+            # for both DM kinds by contract.
+            name="" if kind.is_direct else (state.room.name or ""),
+            # Empty where Rocket.Chat's twin reads its permanent DM cache: Mattermost
+            # gets participants from event metadata, and the tracked state keeps
+            # none. Rule matching keys on the kind, and a room with a record never
+            # consults this ref's participants — the only consequence lives on the
+            # recordless-DM wake edge, where `_create` labels the watcher by digest
+            # rather than counterpart. Display-only, accepted.
+            participants=(),
+        )
+
+    def _route_or_buffer(self, channel_id: str, room: "RoomRef", decoded: dict) -> None:
+        """One entrance to the routing episode — untracked offers and wakes alike.
+
+        `_offer_to_router` arrives from the untracked path with a gate-checked,
+        event-classified room; the tracked handler's UNROUTED arm arrives with the room
+        resolved from the tracked state — the wake (§2.5). Both share the pending
+        buffer, the single open episode and `_route_channel`'s drain, because a second
+        creation entrance is how a wake would skip exactly the guarantees the episode
+        exists to make.
+        """
+        pending = self._pending_routes.get(channel_id)
+        if pending is not None:
+            # An episode for this channel is open. Checked *before* the served
+            # check: the channel may have become served an instant ago with its
+            # buffer not yet drained, and delivering this frame directly would put
+            # it ahead of every frame that arrived before it.
+            verdict = pending.add(decoded["post"].get("id", ""), decoded)
+            if verdict == "duplicate":
+                # §2.2 outcome 6: the reservation is not disturbed, the copy goes.
+                logger.debug(
+                    "Channel %s: discarding a duplicate of a reserved message",
+                    channel_id)
+            elif verdict == "full":
+                # §2.2 outcome 5: audible in the room, once per episode.
+                logger.warning(
+                    "Channel %s: pending buffer full — dropping a frame", channel_id)
+                # Spawned, not awaited: this runs on the channel worker, which
+                # holds the connector-wide permit for the whole handler call
+                # (§6.2), so a slow REST post here would stall delivery for
+                # every channel. The notice is owed, not urgent.
+                notice = asyncio.create_task(
+                    self._post_starting_up_notice(pending, channel_id))
+                self._routing_tasks.add(notice)
+                notice.add_done_callback(self._routing_tasks.discard)
+            return
+        if self._channel_is_served(channel_id):
+            # Served now — a creation finished while this frame was on its way here.
+            # Deliver rather than offer: the per-channel callback that would have
+            # taken this frame was registered after it was routed here, so nobody else
+            # is going to deliver it. Served, not tracked: an idle channel is tracked
+            # and its frame still has nowhere to go — delivering it would bounce it
+            # off the tracked path's UNROUTED arm straight back here.
+            self._ws.deliver_to_channel(decoded)
+            return
+        pending = PendingRoute(self._PENDING_BUFFER_DEPTH)
+        pending.add(decoded["post"].get("id", ""), decoded)
+        self._pending_routes[channel_id] = pending
+        task = asyncio.create_task(self._route_channel(channel_id, room, decoded))
+        self._routing_tasks.add(task)
+        task.add_done_callback(self._routing_tasks.discard)
+
+    async def _route_channel(self, channel_id: str, room: "RoomRef", decoded: dict) -> None:
+        """Run one routing episode to completion, off the handler path.
+
+        Owns the `_pending_routes` entry it was spawned under: popped in `finally`,
+        whatever happened, so a channel whose offer failed is offerable again on
+        its next message — holding the reservation would make one transient
+        failure permanent for that channel.
+
+        The router raising means a creation was started and not carried out
+        (§2.2 outcome 4) — retryable with bounded backoff, because the manager
+        deliberately lets those propagate. A None-shaped outcome (rule miss,
+        pause, cap) does not raise and is final. Unlike RC there is no
+        classification stage: the kind arrived free on the event.
+        """
+        # Whether the routing decision was *completed* — see Rocket.Chat's twin:
+        # a decline is an answer and its frames are remembered; a park or a
+        # cancellation is the absence of one, and remembering those ids would
+        # have the park's promised recovery — the next wake's replay from the
+        # record watermark — die at the dedup check, silently.
+        declined = False
         try:
-            await self._router(room)
-        except Exception as e:
-            logger.error("Router failed for channel %s: %s", channel_id, e)
+            async def offer() -> None:
+                try:
+                    await self._router(room, decoded)
+                except RoomAlreadyRoutedError:
+                    # Final, not retryable — see Rocket.Chat's copy of this arm.
+                    logger.warning(
+                        "Channel %s is already served by another watcher — not "
+                        "creating a second one", channel_id,
+                    )
+                    return
+
+            declined = await route_attempts(
+                offer, retry_on=Exception,
+                delays=self._ROUTE_RETRY_DELAYS, logger=logger,
+                label=f"Creating a watcher for channel {channel_id}",
+            )
+        finally:
+            # The episode ends, and the buffer has one of two fates — same rule,
+            # same honesty, as RC's `_on_unrouted_message`: drained trigger-first
+            # onto the channel's own queue when the channel became tracked, or
+            # dropped audibly with the episode when it did not.
+            ended = self._pending_routes.pop(channel_id, None)
+            frames = ended.drain() if ended is not None else []
+            state = self._channels.get(channel_id)
+            if state is not None and not self._channel_is_served(channel_id):
+                # Tracked and still unserved. Served, not tracked, decides delivery
+                # here: these frames' only tracked-path outcome is the UNROUTED arm,
+                # which routes them straight back into a new episode — a hot loop
+                # with no delay in it, entered by every message to a declined
+                # channel. What happens to the ids depends on WHICH way the offer
+                # ended — see Rocket.Chat's twin of this branch.
+                if declined:
+                    # A completed decline: re-remembered (the wake arm forgot them
+                    # so a served redelivery could pass the dedup check). The
+                    # decline is a configuration state and can persist
+                    # indefinitely, so an id left unknown would have every
+                    # reconnect re-fetch and re-offer a batch that can never be
+                    # spent. The watermark is left where it is, so a user who
+                    # resends is served normally once a watcher exists (§2.7).
+                    for frame in frames:
+                        fid = frame["post"].get("id", "")
+                        if fid:
+                            self._remember_seen(state, fid)
+                    if frames:
+                        logger.warning(
+                            "Channel %s: dropping %d buffered frame(s) — no watcher "
+                            "took the channel. A declined offer: no rule claims it, "
+                            "or its record is paused.", channel_id, len(frames),
+                        )
+                elif frames:
+                    # Parked or cancelled: the decision was never made, and this
+                    # channel HAS a record — the park's promised recovery is the
+                    # next wake's replay from that record's watermark (§2.2), and
+                    # a remembered id would have it die at the dedup check. The
+                    # wake arm already forgot the trigger and claimed a boundary
+                    # below it (`_keep_replayable`), so the ids stay unknown and
+                    # the window stays open.
+                    logger.warning(
+                        "Channel %s: %d buffered frame(s) not delivered — the offer "
+                        "parked or was cancelled. Their ids stay unknown so the "
+                        "next wake's replay recovers them.", channel_id, len(frames),
+                    )
+            elif state is not None:
+                # Same rule, same mechanism, same reason as Rocket.Chat's: the
+                # watermark is a scalar, so a live message accepted during this
+                # episode has already advanced it past these frames and the
+                # filter would reject them as already processed. The claim is a
+                # promise that a recovery comes back for them (§2.2), which is
+                # what makes a filtered delivery a deferral and not a loss.
+                oldest = min(
+                    (str(f["post"].get("create_at", "")) for f in frames
+                     if f["post"].get("create_at")),
+                    default="",
+                )
+                if oldest:
+                    state.claim_boundary(state.last_processed_ts, just_before(oldest))
+                for frame in frames:
+                    self._ws.deliver_to_channel(frame)
+            elif frames:
+                logger.info(
+                    "Channel %s: dropping %d buffered frame(s) — no watcher was created",
+                    channel_id, len(frames),
+                )
+
+    async def _post_starting_up_notice(self, pending: PendingRoute, channel_id: str) -> None:
+        """Tell the room its messages are outrunning its setup — once per episode."""
+        if pending.notice_posted:
+            return
+        pending.notice_posted = True
+        try:
+            await self.send_text(channel_id, AgentResponse(text=STARTING_UP_NOTICE))
+        except Exception:
+            logger.debug("Could not post the starting-up notice", exc_info=True)
 
     async def _on_posted_event(
         self,
@@ -979,8 +1549,21 @@ class MattermostConnector(Connector):
             return  # Own message — also skipped before spending a resolve_username call.
 
         state = self._channels.get(channel_id)
+        entry_mgen = self._membership_gen.get(channel_id, 0)
         if not state:
             await self._offer_to_router(channel_id, decoded)
+            return
+        if state.membership_lost:
+            # The removal hook stamped this state, but the reclamation runs in
+            # its own task and can wait on the watcher lock — a post handled
+            # in that window used to be normalized and DELIVERED to the agent
+            # of a room the bot had already been removed from, with the flag
+            # consulted only later at the commit fence (Codex round 9). The
+            # bot cannot answer in a room it left; drop at entry.
+            logger.debug(
+                "Channel %s: membership lost, reclamation pending — "
+                "dropping post", channel_id,
+            )
             return
 
         msg_id = post.get("id", "")
@@ -1046,14 +1629,36 @@ class MattermostConnector(Connector):
 
         capacity = self._capacity_check(channel_id) if self._capacity_check else None
         if capacity is RoomCapacity.UNROUTED:
-            # Not backpressure — see the Rocket.Chat connector's twin of this branch.
-            # No watcher serves this channel, so "server busy" would be a wrong answer
-            # from an idle gateway (§2.7).
-            logger.warning(
-                "Message for channel '%s' has no watcher — dropping without a reply.",
-                state.room.name,
+            # No processor serves this *tracked* channel. The idle drop keeps the
+            # channel's local state on purpose (§2.2), so an idle channel's next
+            # message arrives here, and this arm is the wake (§2.5): the channel is
+            # offered back through the same episode funnel an untracked one goes
+            # through — see the Rocket.Chat connector's twin of this branch.
+            #
+            # The id was registered optimistically above, before the first await —
+            # undone here, with the window kept open below the post, or the episode's
+            # redelivery dies at the dedup check. The declined episode's drain is what
+            # re-remembers it, so a channel nothing claims still converges. The turn
+            # is released because the redelivery runs the filter — and its charge —
+            # again.
+            if self._router is None:
+                # No router registered — a static-only deployment. The old arm's
+                # behaviour, verbatim: drop audibly, id left registered so reconnect
+                # replays do not re-offer it, watermark untouched.
+                logger.warning(
+                    "Message for channel '%s' has no watcher — dropping without a "
+                    "reply.", state.room.name,
+                )
+                self._release_turn_for(post, result, turn_generation, "no watcher")
+                return
+            logger.info(
+                "Message for channel '%s' has no processor — offering the channel "
+                "back to the router (wake).", state.room.name,
             )
-            self._release_turn_for(post, result, turn_generation, "no watcher")
+            self._keep_replayable(state, msg_id, str(post.get("create_at", "")))
+            self._release_turn_for(post, result, turn_generation, "waking the channel")
+            self._route_or_buffer(
+                channel_id, self._room_ref_from_state(state), decoded)
             return
         if capacity is RoomCapacity.FULL:
             logger.warning(
@@ -1123,9 +1728,42 @@ class MattermostConnector(Connector):
             self._release_turn_for(post, result, turn_generation, "handler raised")
             return
 
+        # The commit target may no longer be `state` (#115, RC's sibling has the
+        # same fence): a watcher stop→start while the handler ran popped it from
+        # `self._channels` and installed a fresh `_ChannelState`, so a watermark,
+        # dedup id or hand-back boundary written to `state` vanishes with it —
+        # the next reconnect replay re-delivers an accepted post, and a
+        # handed-back one is never recovered. The commit follows the channel.
+        live = self._channels.get(channel_id)
+        if live is not state and live is not None:
+            if (state.membership_lost
+                    or self._membership_gen.get(channel_id, 0) != entry_mgen):
+                # A membership loss happened while this delivery ran: the live
+                # state belongs to a re-add's fresh membership, and a
+                # pre-removal post has no claim on its watermark or window —
+                # committing one would point the next replay below the
+                # removal, delivering the whole non-member interval.
+                logger.warning(
+                    "Channel %s: discarding the marks of a delivery that "
+                    "crossed a membership removal", channel_id,
+                )
+                if not accepted:
+                    self._release_turn_for(post, result, turn_generation,
+                                           "handler queue full")
+                return
+            logger.warning(
+                "Channel %s: a delivery outlived its state (watcher restarted "
+                "mid-delivery) — committing to the live one", channel_id,
+            )
+
         if not accepted:
             logger.warning("Message from %s was dropped (queue full)", result.sender)
-            self._keep_replayable(state, msg_id, result.msg_ts)
+            if live is state:
+                self._keep_replayable(state, msg_id, result.msg_ts)
+            elif live is not None:
+                self._keep_replayable(live, msg_id, result.msg_ts)
+            # else: the channel is gone; there is nowhere for a replay to
+            # recover into.
             # Forgetting the id is not enough: the filter already spent a turn of this
             # sender's agent-chain budget, before anything knew whether the post could be
             # delivered. Every retry spends another, and once the budget is gone the
@@ -1135,6 +1773,16 @@ class MattermostConnector(Connector):
             # hand-back path, which this branch is.
             self._release_turn_for(post, result, turn_generation, "handler queue full")
             return
+
+        if live is not state:
+            if live is None:
+                logger.warning(
+                    "Channel %s: discarding the watermark of a post whose channel "
+                    "was reclaimed mid-delivery", channel_id,
+                )
+                return
+            self._remember_seen(live, msg_id)
+            state = live
 
         # Never backwards, for the reason Rocket.Chat's sibling site gives: replay calls
         # `_on_posted_event` directly rather than through the per-channel worker, so a
@@ -1170,12 +1818,13 @@ class MattermostConnector(Connector):
     def _release_turn_for(self, post: dict, result, generation: int, reason: str) -> None:
         """Give back the turn a post took, for a post that was not delivered.
 
-        One place, because Mattermost has **six** ways to decline a post after the filter
-        has already charged it — no watcher for the channel, the preflight for a replay,
-        the preflight for live traffic, normalization raising, the handler raising, and the
-        handler queue — and they were added one at a time. The count is in the comment
-        because it was wrong here once: it said three, which was true when three of the six
-        released and nobody had counted the rest.
+        One place, because Mattermost has **seven** ways to decline a post after the
+        filter has already charged it — the wake (the post is re-charged when the
+        episode redelivers it), the no-router drop, the preflight for a replay, the
+        preflight for live traffic, normalization raising, the handler raising, and
+        the handler queue — and they were added one at a time. The count is in the
+        comment because it was wrong here twice: it said three when three of six
+        released, and six after the wake made it seven.
         """
         if not result.agent_chain_token or self._turn_store is None:
             return

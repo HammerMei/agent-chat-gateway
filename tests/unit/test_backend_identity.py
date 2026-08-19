@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from gateway.core.state import WatcherState, backend_identity
+from tests.helpers import start_watcher
 
 
 class TestBackendIdentityValue(unittest.TestCase):
@@ -134,7 +135,6 @@ class TestSessionReuseRequiresMatchingIdentity(unittest.IsolatedAsyncioTestCase)
             agents={"claude": agent},
             default_agent="claude",
             config=config,
-            watcher_configs=[wc],
             state_store=state_store,
             # `holder()` on a bare MagicMock answers with a truthy mock, which now
             # reads as "another watcher already serves this room" (§4.1).
@@ -150,7 +150,7 @@ class TestSessionReuseRequiresMatchingIdentity(unittest.IsolatedAsyncioTestCase)
     async def _start(self, lifecycle, wc, state):
         with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
             MockProc.return_value.start = MagicMock()
-            await lifecycle._start_watcher(wc, state=state)
+            await start_watcher(lifecycle, wc, state=state)
 
     def _stored(self, session_id, identity):
         return WatcherState(

@@ -488,42 +488,30 @@ class TestTheRealConnectorsReportTheirIdentity(unittest.TestCase):
 
 
 class TestWhoOwnsTheDmStream(unittest.TestCase):
-    """Both watcher shapes reach a DM, and only one of them runs today.
-
-    `direct:`/`group_direct:` are rule fields, and rules have no runtime effect until
-    the watcher manager lands. A **static** watcher naming `@someone` is the form that
-    actually works now — so counting only rules guarded the case that cannot yet happen
-    and missed the one that can.
-    """
+    """A rule's DM opt-ins are the only claim shape left: `direct` and
+    `group_direct` each claim a whole DM class — a DM has no room name for a
+    pattern to match. The per-room claim (`DmClaim.rooms`) survives as a type
+    for §2.7's reserved object form, so `overlaps` keeps understanding it,
+    but nothing produces one from config today."""
 
     def _rule(self, connector, direct=False, group_direct=False):
         from unittest.mock import MagicMock as M
 
         return M(connector=connector, rooms=M(direct=direct, group_direct=group_direct))
 
-    def _watcher(self, connector, room):
-        from unittest.mock import MagicMock as M
-
-        return M(connector=connector, room=room)
-
-    def test_a_static_at_room_claims_that_room_only(self):
-        claims = dm_claims([self._watcher("mm-eng", "@alice")], [])
-        self.assertEqual(claims["mm-eng"], DmClaim(rooms=frozenset({"@alice"})))
-        self.assertFalse(claims["mm-eng"].direct, "a named room is not every 1:1 DM")
-
-    def test_a_static_channel_claims_nothing(self):
-        self.assertEqual(dm_claims([self._watcher("mm-eng", "incidents")], []), {})
-
     def test_a_rule_opting_in_claims_that_class_only(self):
         """The two DM kinds are separate in `RoomMatcher.match()`, so a rule taking one
         must not be recorded as taking the other."""
-        one_to_one = dm_claims([], [self._rule("mm-eng", direct=True)])["mm-eng"]
+        one_to_one = dm_claims([self._rule("mm-eng", direct=True)])["mm-eng"]
         self.assertTrue(one_to_one.direct)
         self.assertFalse(one_to_one.group_direct)
 
-        group = dm_claims([], [self._rule("mm-eng", group_direct=True)])["mm-eng"]
+        group = dm_claims([self._rule("mm-eng", group_direct=True)])["mm-eng"]
         self.assertTrue(group.group_direct)
         self.assertFalse(group.direct)
+
+    def test_a_rule_with_no_dm_opt_in_claims_nothing(self):
+        self.assertEqual(dm_claims([self._rule("mm-eng")]), {})
 
     def test_the_two_dm_classes_do_not_collide(self):
         """A connector on 1:1 DMs and one on group DMs answer different conversations;
@@ -533,32 +521,129 @@ class TestWhoOwnsTheDmStream(unittest.TestCase):
         self.assertTrue(
             DmClaim(group_direct=True).overlaps(DmClaim(group_direct=True)))
 
-    def test_a_named_room_is_a_one_to_one_conversation(self):
-        """`@someone` addresses one person and resolves through the direct-channel
-        endpoint, so it overlaps a 1:1 claim and never a group-DM one."""
+    def test_two_whole_stream_claims_overlap(self):
+        """Two connectors both opting into 1:1 DMs would both answer every DM
+        on the account — exactly what the identity barrier must see."""
+        a = dm_claims([self._rule("mm-eng", direct=True)])["mm-eng"]
+        b = dm_claims([self._rule("mm-sales", direct=True)])["mm-sales"]
+        self.assertTrue(a.overlaps(b))
+
+    def test_a_reserved_per_room_claim_still_overlaps_the_stream(self):
+        """`DmClaim.rooms` is the reserved object form's shape (§2.7): nothing
+        produces it from config today, but `overlaps` must keep understanding
+        it so reviving per-DM include lists later extends this rather than
+        rewriting it."""
         named = DmClaim(rooms=frozenset({"@alice"}))
         self.assertTrue(named.overlaps(DmClaim(direct=True)))
         self.assertFalse(named.overlaps(DmClaim(group_direct=True)))
-
-    def test_room_names_are_compared_casefolded(self):
-        """One username spelled two ways is one channel, and a missed match here is the
-        costly direction: it lets two connectors answer the same DM."""
-        claims = dm_claims(
-            [self._watcher("a", "@Alice"), self._watcher("b", "@alice")], [])
-        self.assertTrue(claims["a"].overlaps(claims["b"]))
-
-    def test_both_shapes_combine_on_one_connector(self):
-        claims = dm_claims(
-            [self._watcher("mm-sales", "@bob"), self._watcher("mm-eng", "general")],
-            [self._rule("mm-eng", direct=True)],
-        )
-        self.assertTrue(claims["mm-eng"].direct)
-        self.assertEqual(claims["mm-sales"].rooms, frozenset({"@bob"}))
 
     def test_a_connector_claiming_nothing_never_overlaps(self):
         self.assertFalse(DmClaim().overlaps(DmClaim(direct=True)))
         self.assertFalse(DmClaim(direct=True).overlaps(DmClaim()))
 
+
+class TestPersistedRecordsAreClaims(unittest.TestCase):
+    """Codex round 6 (P1): sticky binding keeps a rule-derived DM record
+    answering its room after the rule that created it is deleted — so a
+    rule-only claim misses exactly the records that outlive their rules, and
+    two connectors sharing one account both answer one private conversation.
+    Persisted records are folded into the claim before the overlap check."""
+
+    def _record(self, kind, room_id, name="w1", rule_name="eng"):
+        from unittest.mock import MagicMock as M
+
+        return M(rule_name=rule_name, room_id=room_id, room_kind=kind,
+                 watcher_name=name)
+
+    def test_a_dm_record_claims_its_room(self):
+        from gateway.core.bot_identity import fold_record_dm_claims
+
+        claim = fold_record_dm_claims(
+            DmClaim(), [self._record("dm", "d1", name="mm-dm-alice")])
+        self.assertIn("d1", claim.rooms)
+        self.assertIn("mm-dm-alice", claim.record_watchers)
+        self.assertTrue(claim.overlaps(DmClaim(direct=True)),
+                        "the sticky record collides with a whole-stream "
+                        "claim on the other connector")
+
+    def test_a_group_dm_record_claims_the_group_side_only(self):
+        from gateway.core.bot_identity import fold_record_dm_claims
+
+        claim = fold_record_dm_claims(
+            DmClaim(), [self._record("group_dm", "g1")])
+        self.assertIn("g1", claim.group_rooms)
+        self.assertTrue(claim.overlaps(DmClaim(group_direct=True)))
+        self.assertFalse(claim.overlaps(DmClaim(direct=True)),
+                         "a group-DM record never collides with the 1:1 side")
+
+    def test_two_records_on_the_same_room_overlap(self):
+        from gateway.core.bot_identity import fold_record_dm_claims
+
+        a = fold_record_dm_claims(DmClaim(), [self._record("group_dm", "g1")])
+        b = fold_record_dm_claims(DmClaim(), [self._record("group_dm", "g1")])
+        self.assertTrue(a.overlaps(b))
+
+    def test_static_era_and_channel_records_claim_nothing(self):
+        from unittest.mock import MagicMock as M
+
+        from gateway.core.bot_identity import fold_record_dm_claims
+
+        static = M(rule_name="", config={}, room_id="d1", room_kind="dm",
+                   watcher_name="w-static")
+        claim = fold_record_dm_claims(DmClaim(), [
+            static,                                   # truly static: BOTH empty
+            self._record("channel", "c1"),            # not a DM at all
+        ])
+        self.assertEqual(claim.rooms, frozenset())
+        self.assertEqual(claim.group_rooms, frozenset())
+
+    def test_a_damaged_room_kind_still_claims_via_room_type(self):
+        """Codex round 26: a preserved record whose room_kind was corrupted
+        can still answer its DM (the live wake supplies the kind), so an
+        unknown kind must not read as no claim — the surviving room_type
+        claims BOTH DM classes, conservatively."""
+        from unittest.mock import MagicMock as M
+
+        from gateway.core.bot_identity import fold_record_dm_claims
+
+        damaged = M(rule_name="eng", config={"name": "w1"}, room_id="d1",
+                    room_kind="", room_type="dm", watcher_name="w1")
+        claim = fold_record_dm_claims(DmClaim(), [damaged])
+        self.assertIn("d1", claim.rooms)
+        self.assertIn("d1", claim.group_rooms)
+        self.assertTrue(claim.overlaps(DmClaim(direct=True)))
+        self.assertTrue(claim.overlaps(DmClaim(group_direct=True)))
+
+    def test_a_config_only_dm_record_still_claims(self):
+        """Codex round 24, the both-fields eligibility's last consumer: a DM
+        record whose rule_name alone was damaged is preserved and recreated,
+        so it still answers its conversation — the identity barrier must see
+        its claim, or two connectors sharing an account both answer it."""
+        from unittest.mock import MagicMock as M
+
+        from gateway.core.bot_identity import fold_record_dm_claims
+
+        damaged = M(rule_name="", config={"name": "w1", "agent": "a"},
+                    room_id="d1", room_kind="dm", watcher_name="w1")
+        claim = fold_record_dm_claims(DmClaim(), [damaged])
+        self.assertIn("d1", claim.rooms)
+        self.assertTrue(claim.overlaps(DmClaim(direct=True)))
+
+    def test_the_refusal_names_the_record_and_the_exit(self):
+        """The operator already deleted the rule — a refusal citing rules is
+        unfixable from their side. The message must name the persisted
+        watcher and the release path."""
+        from gateway.core.bot_identity import fold_record_dm_claims
+
+        a_claim = fold_record_dm_claims(
+            DmClaim(), [self._record("dm", "d1", name="mm-dm-alice")])
+        conflicts = find_identity_conflicts([
+            _entry("a", scope="team1", dms=a_claim),
+            _entry("b", scope="team2", dms=DmClaim(direct=True)),
+        ])
+        self.assertEqual(len(conflicts), 1)
+        self.assertIn("mm-dm-alice", conflicts[0])
+        self.assertIn("expire", conflicts[0])
 
 class TestStaticDmWatchersReachTheCheck(unittest.TestCase):
     """The wiring, not the helper: `GatewayService` must derive its DM owners this way.
@@ -568,7 +653,7 @@ class TestStaticDmWatchersReachTheCheck(unittest.TestCase):
     With static watchers being the only form that runs, this is the path that matters.
     """
 
-    def _config(self, root, second_room):
+    def _config(self, root, second_rooms_block):
         import textwrap
 
         path = root / "config.yaml"
@@ -595,14 +680,16 @@ class TestStaticDmWatchersReachTheCheck(unittest.TestCase):
             watchers:
               - name: w1
                 connector: mm-eng
-                room: "@alice"
+                rooms:
+                  direct: true
               - name: w2
                 connector: mm-sales
-                room: "{second_room}"
+                rooms:
+{second_rooms_block}
         """))
         return path
 
-    def _service_dm_owners(self, second_room):
+    def _service_dm_owners(self, second_rooms_block):
         import tempfile
         from pathlib import Path as P
         from unittest.mock import patch
@@ -613,23 +700,30 @@ class TestStaticDmWatchersReachTheCheck(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as d:
             root = P(d)
-            cfg = GatewayConfig.from_file(str(self._config(root, second_room)))
+            cfg = GatewayConfig.from_file(str(self._config(root, second_rooms_block)))
             with patch.object(state_mod, "RUNTIME_DIR", root / "runtime"):
                 service = GatewayService(cfg)
             return service._dm_claims
 
-    def test_static_dm_watchers_become_per_room_claims(self):
-        claims = self._service_dm_owners("@bob")
-        self.assertEqual(claims["mm-eng"].rooms, frozenset({"@alice"}))
-        self.assertEqual(claims["mm-sales"].rooms, frozenset({"@bob"}))
-        self.assertFalse(
+    def test_rule_dm_opt_ins_become_stream_claims(self):
+        """A rule's `direct: true` claims the whole 1:1 stream — the per-room
+        claim died with the static shape, because DMs have no name for a rule
+        pattern to match. Two connectors both opting in therefore overlap,
+        which is exactly what the identity barrier must see."""
+        claims = self._service_dm_owners("                  direct: true")
+        self.assertTrue(claims["mm-eng"].direct)
+        self.assertTrue(claims["mm-sales"].direct)
+        self.assertTrue(
             claims["mm-eng"].overlaps(claims["mm-sales"]),
-            "disjoint DMs on two connectors are a working configuration",
+            "two whole-stream claims on one account overlap",
         )
 
-    def test_a_channel_watcher_claims_nothing(self):
+    def test_a_channel_rule_claims_nothing(self):
         """Otherwise the test above would pass against a map that always holds both."""
-        self.assertNotIn("mm-sales", self._service_dm_owners("incidents"))
+        self.assertNotIn(
+            "mm-sales",
+            self._service_dm_owners("                  include: [incidents]"),
+        )
 
 
 class TestInboundStartsAfterWatchersExist(unittest.IsolatedAsyncioTestCase):
@@ -645,13 +739,11 @@ class TestInboundStartsAfterWatchersExist(unittest.IsolatedAsyncioTestCase):
     async def test_sync_only_starts_the_stream_after_restoring_watchers(self):
         from unittest.mock import AsyncMock, MagicMock, call
 
-        from gateway.core.session_manager import SessionManager
+        from tests.helpers import make_bare_session_manager
 
-        sm = SessionManager.__new__(SessionManager)
+        sm = make_bare_session_manager()
         order = MagicMock()
-        sm._connector = MagicMock()
         sm._connector.start_inbound = AsyncMock(side_effect=lambda: order("inbound"))
-        sm._lifecycle = MagicMock()
         sm._lifecycle.sync_watchers = AsyncMock(side_effect=lambda **kw: order("sync") or [])
 
         await sm.sync_only()
@@ -661,14 +753,11 @@ class TestInboundStartsAfterWatchersExist(unittest.IsolatedAsyncioTestCase):
     async def test_the_stream_starts_even_when_a_watcher_failed(self):
         """Per-watcher failures are reported, not a reason to leave the connector deaf
         for the rooms that did start."""
-        from unittest.mock import AsyncMock, MagicMock
+        from unittest.mock import AsyncMock
 
-        from gateway.core.session_manager import SessionManager
+        from tests.helpers import make_bare_session_manager
 
-        sm = SessionManager.__new__(SessionManager)
-        sm._connector = MagicMock()
-        sm._connector.start_inbound = AsyncMock()
-        sm._lifecycle = MagicMock()
+        sm = make_bare_session_manager()
         sm._lifecycle.sync_watchers = AsyncMock(return_value=["w1 failed"])
 
         errors = await sm.sync_only()

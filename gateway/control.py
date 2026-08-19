@@ -17,7 +17,9 @@ import logging
 from typing import TYPE_CHECKING
 
 from . import runtime_lock
+from .core.connector import Room
 from .core.tz_utils import local_iana_timezone as _server_local_timezone
+from .core.watcher_manager import config_from_record
 from .runtime_lock import RUNTIME_DIR
 
 if TYPE_CHECKING:
@@ -25,6 +27,20 @@ if TYPE_CHECKING:
     from .service import ConnectorEntry
 
 logger = logging.getLogger("agent-chat-gateway.control")
+
+
+def _to_epoch_ms(dt) -> str | None:
+    """An operator's ISO timestamp as the internal representation (§5.2).
+
+    A naive datetime is read as local time, which is what an operator who
+    omitted the offset meant — the alternative, UTC, would silently shift the
+    window by the local offset.
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.astimezone()
+    return str(int(dt.timestamp() * 1000))
 
 CONTROL_SOCK = RUNTIME_DIR / "control.sock"
 
@@ -228,9 +244,9 @@ class ControlServer:
         if cmd and cmd.startswith("schedule-"):
             return self._handle_schedule(cmd, request)
 
-        # pause/resume/reset: auto-resolve connector from watcher name (watcher names are
-        # globally unique across all connectors, so no --connector is needed).
-        if cmd in ("pause", "resume", "reset") and not connector_name:
+        # pause/resume/reset/expire: auto-resolve connector from watcher name (watcher
+        # names are globally unique across all connectors, so no --connector is needed).
+        if cmd in ("pause", "resume", "reset", "expire") and not connector_name:
             watcher_name = request.get("watcher_name", "")
             entry = self._find_entry_for_watcher(watcher_name)
             if isinstance(entry, dict):
@@ -283,14 +299,20 @@ class ControlServer:
     def _find_entry_for_watcher(self, watcher_name: str) -> "ConnectorEntry | dict":
         """Find the ConnectorEntry that owns the named watcher.
 
-        Watcher names are globally unique (enforced at config load time), so
-        searching all entries by name is unambiguous.  Returns an error dict
-        if no entry owns the watcher.
+        Watcher names are globally unique because the handle is injective by
+        construction (Codex round 8 found the old claim false): `:` joins
+        connector and room label, a connector name may not contain `:`
+        (config load refuses it), and the label encoder percent-encodes `:`
+        out of room and user names — so no two (connector, room) pairs can
+        derive one handle, and searching all entries by name is unambiguous.
+        Returns an error dict if no entry owns the watcher.
         """
         if not watcher_name:
             return {"ok": False, "error": "Missing 'watcher_name'"}
+        # The persisted record is the only watcher identity left (§2.8) —
+        # the config lookup died with the static shape.
         for entry in self._entries:
-            if entry.session_manager.get_watcher_config(watcher_name) is not None:
+            if entry.session_manager.get_watcher_state(watcher_name) is not None:
                 return entry
         return {"ok": False, "error": f"Unknown watcher: {watcher_name!r}"}
 
@@ -565,9 +587,12 @@ class ControlServer:
                 ),
             }
 
-        wc = entry.session_manager.get_watcher_config(watcher_name)
+        state = entry.session_manager.get_watcher_state(watcher_name)
+        if state is None or not state.room_id:
+            return {"ok": False, "error": f"No watcher record found for '{watcher_name}'"}
+        wc = config_from_record(state)
         if wc is None:
-            return {"ok": False, "error": f"Watcher config not found for '{watcher_name}'"}
+            return {"ok": False, "error": f"Watcher record for '{watcher_name}' carries no config"}
 
         # Validate and parse count.
         raw_count = request.get("count", 50)
@@ -639,9 +664,23 @@ class ControlServer:
                 pass  # mixed tz-aware/naive: skip comparison, connector will handle
 
         try:
-            room = await entry.connector.resolve_room(wc.room)
+            # By id, never by name (§2.8): the record's `room` is a
+            # description — a group DM's description resolves to nothing.
+            room = Room(
+                id=state.room_id,
+                name=state.room_name or watcher_name,
+                type=state.room_kind or state.room_type or "channel",
+            )
+            # Converted here, at the one boundary where a human types a
+            # timestamp: connector bounds are epoch milliseconds like every
+            # other timestamp inside ACG (§5.2). Both values are already
+            # parsed above, so this reuses the datetimes rather than the
+            # strings.
             msgs = await entry.connector.fetch_room_history(
-                room, count, before_ts=before_ts, after_ts=after_ts
+                room,
+                count,
+                before_ts=_to_epoch_ms(before_dt),
+                after_ts=_to_epoch_ms(after_dt),
             )
         except Exception as e:
             logger.error("fetch_room_history failed for watcher '%s': %s", watcher_name, e)

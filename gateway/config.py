@@ -302,32 +302,26 @@ class GatewayConfig:
         # separate because they identify different things: a WatcherConfig name is a
         # single room's runtime handle, a rule name is the rule's identity in
         # persisted state and in shadowing warnings.
-        seen_watcher_names: set[str] = set()
         seen_rule_names: set[str] = set()
         for i, wc_raw in enumerate(watchers_raw):
-            if entry_is_watcher_rule(wc_raw):
-                watcher_rules.append(
-                    _parse_one_watcher_rule(
-                        wc_raw, i,
-                        connectors=connectors,
-                        connector_names=connector_names,
-                        agents=agents,
-                        default_agent=default_agent,
-                        config_dir=config_dir,
-                        templates=watcher_templates,
-                        seen_rule_names=seen_rule_names,
-                    )
-                )
-                continue
-            watchers.extend(
-                _parse_one_watcher_entry(
-                    wc_raw, i, watcher_templates, connector_names, connectors, agents,
-                    default_agent, config_dir, seen_watcher_names,
+            if not entry_is_watcher_rule(wc_raw):
+                # The static watcher shape was removed at cutover (§5.4):
+                # every removed field is a hard load error, never silently
+                # ignored — a config that used to mean something must not
+                # load meaning nothing.
+                raise ValueError(_static_shape_error(wc_raw, i))
+            watcher_rules.append(
+                _parse_one_watcher_rule(
+                    wc_raw, i,
+                    connectors=connectors,
+                    connector_names=connector_names,
+                    agents=agents,
+                    default_agent=default_agent,
+                    config_dir=config_dir,
+                    templates=watcher_templates,
+                    seen_rule_names=seen_rule_names,
                 )
             )
-
-        for conflict in find_room_collisions(watchers):
-            raise ValueError(conflict)
 
         # The cross-watcher duplicate-session_id pass that used to sit here is gone
         # with the field: `session_id:` is refused per entry above, so no watcher can
@@ -778,6 +772,16 @@ def _parse_one_connector(
         raise ValueError(
             f"Connector '{name}': 'type' must be a string (got {type(connector_type).__name__})."
         )
+    if ":" in name:
+        # ':' is the watcher-handle divider (`<connector>:<room label>`,
+        # §2.3) — the boundary is only unforgeable because a connector name
+        # can never carry one. Everything else in a name passes through:
+        # room labels are percent-encoded on THEIR side of the divider.
+        raise ValueError(
+            f"Connector name '{name}' contains ':' — that character is "
+            f"reserved as the watcher-name divider (<connector>:<room>). "
+            f"Rename the connector."
+        )
     if name in seen_connector_names:
         raise ValueError(
             f"Duplicate connector name '{name}' found. "
@@ -1025,24 +1029,6 @@ def _validated_optional_name(raw: object, where: str, field_name: str) -> str | 
     return raw
 
 
-def _validated_notification(raw: object, where: str, field_name: str) -> str | None:
-    """Check a notification field against its declared `str | None` contract.
-
-    Copied through unchecked, a YAML boolean or number reaches the platform REST
-    client's message field much later, where the send fails and is only logged as a
-    warning — so the operator's status message silently never appears. An actionable
-    load error is the whole point of checking it here. Unlike a name, an empty
-    string is a legitimate "nothing to announce".
-    """
-    if raw is None:
-        return None
-    if not isinstance(raw, str):
-        raise ValueError(
-            f"{where}: '{field_name}' must be a string or null "
-            f"(got {type(raw).__name__})."
-        )
-    return raw
-
 
 _HH_FIELD_TYPES: dict[str, type] = {
     "enabled": bool,
@@ -1187,7 +1173,7 @@ def _validated_watcher_agent(
     return watcher_agent
 
 
-def _parse_one_watcher_entry(
+def _parse_one_watcher_entry(  # LEGACY: configtool-only — see note below
     wc_raw: object,
     index: int,
     watcher_templates: dict[str, dict],
@@ -1200,13 +1186,13 @@ def _parse_one_watcher_entry(
 ) -> list[WatcherConfig]:
     """Parses ONE raw `watchers:` entry into its expanded list of
     WatcherConfigs (more than one only when `rooms:` names several rooms).
-    Callers (from_file()/collect_config()) must ensure `connectors` is
-    non-empty before calling this — `resolved_connector` falls back to
-    `connectors[0].name` when an entry doesn't set its own `connector:`,
-    exactly as from_file() always guaranteed by construction (an earlier
-    raise would have stopped everything before reaching here); collect_config()
-    checks this explicitly since it can legitimately end up with zero
-    successfully-parsed connectors."""
+
+    **No loader calls this any more.** The static shape is a hard load error
+    at cutover (§5.4, `_static_shape_error`); the one remaining caller is the
+    config TUI (`gateway/configtool/model.py`), whose rewrite is
+    `impl/config-tooling`'s PR — this function's deletion goes with it, not
+    with the runtime cutover, because deleting an import another module
+    holds breaks the build without migrating the module."""
     if not isinstance(wc_raw, Mapping):
         raise ValueError(
             f"Watcher entry at index {index} must be a mapping "
@@ -1350,13 +1336,6 @@ def _parse_one_watcher_entry(
     # mapping left a third — see _parse_history_handoff() for all three.
     history_handoff = _parse_history_handoff(wc.get("history_handoff"), where)
 
-    online_notification = _validated_notification(
-        wc.get("online_notification"), where, "online_notification"
-    )
-    offline_notification = _validated_notification(
-        wc.get("offline_notification"), where, "offline_notification"
-    )
-
     # Names are staged here, NOT written into `seen_watcher_names` directly,
     # until this whole entry finishes successfully (committed just before
     # returning below). PR review finding: with the old
@@ -1406,8 +1385,6 @@ def _parse_one_watcher_entry(
                 room=room,
                 agent=watcher_agent,
                 context_inject_files=ctx_files,
-                online_notification=online_notification,
-                offline_notification=offline_notification,
                 history_handoff=history_handoff,
             )
         )
@@ -1427,6 +1404,34 @@ def entry_is_watcher_rule(entry: object) -> bool:
     parser an entry belongs to.
     """
     return isinstance(entry, Mapping) and isinstance(entry.get("rooms"), Mapping)
+
+
+def _static_shape_error(entry: object, index: int) -> str:
+    """The message a removed-shape `watchers:` entry fails to load with (§5.4).
+
+    The static shape — `room:`, or `rooms:` as a list — was replaced by
+    watcher rules at cutover, and the contract is that a removed field is a
+    **hard load error naming its replacement**, never a silently ignored key:
+    a config that used to mean something must not load meaning nothing, which
+    is exactly how the parser's `.get()` style would otherwise fail (the
+    `_MOVED_TO_RULE_KEYS` precedent).
+    """
+    if not isinstance(entry, Mapping):
+        return (
+            f"Watcher entry at index {index} must be a mapping "
+            f"(got {type(entry).__name__})."
+        )
+    label = entry.get("name") or entry.get("room") or f"index {index}"
+    return (
+        f"Watcher entry '{label}': the static watcher shape (a 'room:' key, or "
+        f"'rooms:' as a list) has been removed — watchers are now created from "
+        f"rules, where 'rooms:' is a mapping ('rooms: {{include: [...]}}'). "
+        f"Rewrite this entry as a rule, and note the upgrade RESETS every "
+        f"existing watcher session: the old records are reclaimed at the next "
+        f"start, each room begins a fresh session on its first message, and a "
+        f"paused room must be re-expressed as 'rooms.except_for'. It is not a "
+        f"1:1 rename — see docs/migration-dynamic-watchers.md before rewriting."
+    )
 
 
 def _parse_pattern_list(
@@ -1564,6 +1569,14 @@ def _parse_rule_ttl(wc: Mapping, index: int, field_name: str) -> int | None:
     """
     value = wc.get(field_name)
     if value is None:
+        # An explicit null and an omitted key BOTH take the dataclass default
+        # (15/15, §2.5): null is the documented template-inheritance suppress
+        # (`_deep_merge`: "an explicit null intentionally suppresses a base
+        # value"), so a child rule writes `session_expire_days: null` to undo
+        # a template's value and return to the default. It is NOT a disable
+        # switch — the pre-cutover disabled-TTL reading was the F1 defect's
+        # side effect, never a documented meaning (Codex round 13, resolved
+        # as documentation).
         return None
     # bool is an int subclass; `session_idle_days: true` is a mistake, not a 1.
     if isinstance(value, bool) or not isinstance(value, int):
@@ -1593,8 +1606,6 @@ WATCHER_RULE_KEYS: frozenset[str] = frozenset({
     "session_idle_days",
     "session_expire_days",
     "context_inject_files",
-    "online_notification",
-    "offline_notification",
     "history_handoff",
 })
 
@@ -1660,7 +1671,8 @@ def _parse_one_watcher_rule(
             f"Watcher rule at index {index}: 'session_id' is no longer "
             "supported. To carry context into a new session, have the agent "
             "summarise the session to a file and read it back — a handoff "
-            "survives the backend expiring a session, which pinning never did."
+            "survives the backend expiring a session, which pinning never "
+            "did. See docs/user-guide.md."
         )
 
     # entry_is_watcher_rule() guarantees this for entries routed here by the
@@ -1744,12 +1756,16 @@ def _parse_one_watcher_rule(
 
     idle_days = _parse_rule_ttl(wc, index, "session_idle_days")
     expire_days = _parse_rule_ttl(wc, index, "session_expire_days")
-    if idle_days is not None and expire_days is not None and idle_days >= expire_days:
-        raise ValueError(
-            f"Watcher rule at index {index} ('{rule_name}'): "
-            f"'session_idle_days' ({idle_days}) must be strictly less than "
-            f"'session_expire_days' ({expire_days})."
-        )
+    # No ordering constraint between them, and the absence is deliberate. The
+    # old rule — idle strictly less than expire — assumed both were measured
+    # from the same origin, the moment the room went quiet. They are not:
+    # expiry is measured from the moment the watcher becomes *idle* (§2.5), so
+    # they are two independent legs of a sequence and `15/15` is the default.
+    # Requiring an order here would reject that.
+    #
+    # Positivity is not re-checked here: `_parse_rule_ttl` already refuses a
+    # zero or negative value, and stating one rule in two places is how it ends
+    # up enforced in one.
 
     history_handoff = _parse_history_handoff(wc.get("history_handoff"), where)
 
@@ -1760,13 +1776,24 @@ def _parse_one_watcher_rule(
     # later valid rule with the same name was rejected as a duplicate of something
     # that does not exist. Harmless under from_file()'s fail-fast loading, wrong
     # under collect_config(), which keeps going after a failed entry.
+    # Omitted TTLs must fall through to the dataclass defaults (15/15, the
+    # §2.5 ruling). Passing the parser's None explicitly OVERRODE them — every
+    # config that did not spell the TTLs out had the whole idle/expiry
+    # lifecycle silently off, and no test caught it because tests construct
+    # WatcherRule directly, where the defaults apply. One source of truth:
+    # the default lives on the dataclass, and this call simply does not
+    # mention a field the operator did not mention.
+    ttl_kwargs = {}
+    if idle_days is not None:
+        ttl_kwargs["session_idle_days"] = idle_days
+    if expire_days is not None:
+        ttl_kwargs["session_expire_days"] = expire_days
     rule = WatcherRule(
         name=rule_name,
         connector=resolved_connector,
         agent=watcher_agent,
         rooms=matcher,
-        session_idle_days=idle_days,
-        session_expire_days=expire_days,
+        **ttl_kwargs,
         # _resolve_paths validates the container and every element itself, so
         # there is one implementation of this check rather than a rule-shaped copy
         # beside a static-shaped one.
@@ -1774,12 +1801,6 @@ def _parse_one_watcher_rule(
             wc.get("context_inject_files", []),
             config_dir,
             f"Watcher rule at index {index}: 'context_inject_files'",
-        ),
-        online_notification=_validated_notification(
-            wc.get("online_notification"), where, "online_notification"
-        ),
-        offline_notification=_validated_notification(
-            wc.get("offline_notification"), where, "offline_notification"
         ),
         history_handoff=history_handoff,
     )
@@ -1804,44 +1825,6 @@ class ShadowFinding:
     rule: WatcherRule
     shadowed_by: WatcherRule
     scope: str
-
-
-def find_room_collisions(watchers: list[WatcherConfig]) -> list[str]:
-    """Static watchers that would claim the same room on the same connector (§4.1).
-
-    One room on one bot account is served by one watcher. Two would both receive every
-    message and both answer it, and neither would see the other's reply — each
-    connector filters its own account's messages — so the room gets two agents talking
-    past each other. The dispatcher refuses the second claim at runtime; this catches
-    the same thing at load, where it can name both entries instead of failing whichever
-    happens to start second.
-
-    Compared on the configured room *string*, which is deliberately the weaker half of
-    the pair: two spellings that resolve to one room (a name and its id) pass here and
-    are caught by the dispatcher once resolved. A missed collision is a startup error
-    later; a false one would reject a working config, so the string comparison leans the
-    safe way.
-
-    Watchers on **different connectors** are untouched. That is the supported multi-agent
-    shape: each agent has its own bot account, so each has its own connector and its own
-    dispatcher, and two agents in one room see each other normally.
-    """
-    seen: dict[tuple[str, str], str] = {}
-    conflicts: list[str] = []
-    for w in watchers:
-        if not w.room:
-            continue
-        key = (w.connector, w.room)
-        first = seen.setdefault(key, w.name)
-        if first != w.name:
-            conflicts.append(
-                f"Watchers '{first}' and '{w.name}' both watch room '{w.room}' on "
-                f"connector '{w.connector}'. One room on one bot account belongs to one "
-                f"watcher: both would answer every message, and neither would see the "
-                f"other's reply. Give the second watcher its own connector — its own bot "
-                f"account — or its own room."
-            )
-    return conflicts
 
 
 def find_shadowed_rules(rules: list[WatcherRule]) -> list[ShadowFinding]:
@@ -2323,9 +2306,8 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
             issues,
         )
 
-    # Mirrors from_file()'s routing, per entry and by shape — one `seen_*` set each
+    # Mirrors from_file()'s routing, per entry and by shape — one `seen_*` set
     # per load, for the whole loop rather than per entry.
-    seen_watcher_names: set[str] = set()
     seen_rule_names: set[str] = set()
     for i, wc_raw in enumerate(watchers_raw):
         # See the identical connector-loop comment above: only ever use
@@ -2333,29 +2315,26 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
         name_hint = wc_raw.get("name") if isinstance(wc_raw, Mapping) else None
         if not isinstance(name_hint, str) or not name_hint:
             name_hint = None
-        # Every failure inside either parser is a ValueError and never a TypeError
+        # Every failure inside the parser is a ValueError and never a TypeError
         # precisely so this `except` can attribute it to one entry and keep going;
         # a TypeError escaping here would abort the whole validation pass and report
         # one global error instead of one bad entry among many good ones.
         try:
-            if entry_is_watcher_rule(wc_raw):
-                watcher_rules.append(
-                    _parse_one_watcher_rule(
-                        wc_raw, i,
-                        connectors=connectors,
-                        connector_names=connector_names,
-                        agents=agents,
-                        default_agent=default_agent,
-                        config_dir=config_dir,
-                        templates=watcher_templates,
-                        seen_rule_names=seen_rule_names,
-                    )
-                )
-                continue
-            watchers.extend(
-                _parse_one_watcher_entry(
-                    wc_raw, i, watcher_templates, connector_names, connectors, agents,
-                    default_agent, config_dir, seen_watcher_names,
+            if not entry_is_watcher_rule(wc_raw):
+                # The static shape is a hard error at cutover (§5.4), reported
+                # per entry here so a half-migrated config lists every
+                # remaining static entry in one pass.
+                raise ValueError(_static_shape_error(wc_raw, i))
+            watcher_rules.append(
+                _parse_one_watcher_rule(
+                    wc_raw, i,
+                    connectors=connectors,
+                    connector_names=connector_names,
+                    agents=agents,
+                    default_agent=default_agent,
+                    config_dir=config_dir,
+                    templates=watcher_templates,
+                    seen_rule_names=seen_rule_names,
                 )
             )
         except ValueError as exc:
@@ -2372,12 +2351,6 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
     # entity dependency at all, so there's no reason an early return
     # elsewhere should ever have hardcoded these to their defaults instead
     # of actually parsing them.
-    for conflict in find_room_collisions(watchers):
-        # Attributed to "global" rather than to one of the two watchers: the fault is
-        # the pair, and blaming whichever came second would mark a row that is no more
-        # wrong than the other.
-        issues.append(ConfigIssue("global", None, conflict))
-
     max_queue_depth, scheduler_cfg = _max_queue_depth_and_scheduler_or_defaults(raw, issues)
 
     config = GatewayConfig(

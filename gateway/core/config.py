@@ -219,8 +219,6 @@ class WatcherConfig:
     # supported (docs/design/dynamic-watcher-design.md) — the config loader currently rejects
     # room == "*" with a clear "not implemented yet" error, so this is always empty today.
     context_inject_files: list[str] = field(default_factory=list)  # watcher-level context (layer 3)
-    online_notification: str | None = None   # message text on startup; None = suppress (default: quiet)
-    offline_notification: str | None = None  # message text on shutdown; None = suppress (default: quiet)
     history_handoff: HistoryHandoffConfig = field(default_factory=HistoryHandoffConfig)  # session context recovery
 
 

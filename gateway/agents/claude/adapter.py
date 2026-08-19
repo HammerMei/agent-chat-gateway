@@ -469,6 +469,18 @@ class ClaudeBackend(AgentBackend):
         await asyncio.to_thread(_atomic_write_text, path, content)
         return str(path)
 
+    async def reclaim_durable_instructions(self, path_key: str) -> None:
+        """Remove the per-watcher prompt file `ensure_durable_instructions` wrote.
+
+        Expiry's half of that contract (§2.5): same directory, same
+        `resolve_under` containment check — the key is built from external
+        connector data and a path from such data is validated on the way out
+        exactly as it was on the way in. Idempotent: a missing file is
+        success.
+        """
+        path = resolve_under(RUNTIME_DIR / "system-prompts", f"{path_key}.md")
+        await asyncio.to_thread(path.unlink, missing_ok=True)
+
     async def create_session(
         self,
         working_directory: str,

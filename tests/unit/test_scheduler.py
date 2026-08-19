@@ -122,7 +122,10 @@ def _make_sm_mock(inject_result: bool = True, paused: bool = False, room_id: str
     sm = MagicMock()
     sm.inject_message = AsyncMock(return_value=inject_result)
     sm.notify_watcher_room = AsyncMock(return_value=True)
-    sm.get_watcher_config = MagicMock(return_value=MagicMock())
+    # `get_watcher_config` was removed with the static path (Codex round 4) —
+    # a bare MagicMock would keep answering for it and hide exactly the
+    # AttributeError the scheduler's fallback used to raise in production.
+    del sm.get_watcher_config
     watcher_state = MagicMock()
     watcher_state.paused = paused
     watcher_state.room_id = room_id
@@ -1156,6 +1159,97 @@ class TestParseStarting(unittest.TestCase):
         self.assertEqual(fr.day, 15)
 
 
+class TestInjectMessageWakesAnIdleRoom(unittest.IsolatedAsyncioTestCase):
+    """The wake, from the inside (§2.5).
+
+    The sweep exempts job-bearing rooms from expiry on the sentence "idling
+    one is harmless — the job wakes it", and `inject_message` bypasses the
+    connector entirely, so nothing on the message path can wake it for the
+    job. The injection must therefore recreate through the same
+    `get_or_create` a message would — and a pause must still win (§4.4),
+    which it does because a paused record answers None there.
+    """
+
+    def _record(self, **kw):
+        from gateway.core.state import WatcherState
+
+        defaults = dict(
+            watcher_name="rc-eng", session_id="sess-1", room_id="room-1",
+            room_type="channel", room_kind="channel", room_name="eng-backend",
+            participants=["alice"], rule_name="eng",
+        )
+        defaults.update(kw)
+        return WatcherState(**defaults)
+
+    async def test_an_idle_watchers_injection_recreates_it(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from gateway.core.watcher_manager import RoomRef
+        from gateway.core.watcher_rule import RoomKind
+        from tests.helpers import make_bare_session_manager
+
+        woken_processor = MagicMock()
+        woken_processor.enqueue = AsyncMock(return_value=True)
+
+        sm = make_bare_session_manager(_connector_name="rc")
+        sm._lifecycle.get_processor = MagicMock(return_value=None)  # idle
+        sm._lifecycle.get_watcher_state = MagicMock(return_value=self._record())
+        sm._lifecycle.get_watcher_config = MagicMock(return_value=None)
+        sm._watcher_manager = MagicMock()
+        sm._watcher_manager.get_or_create = AsyncMock(return_value=woken_processor)
+
+        result = await sm.inject_message("rc-eng", "check stock prices")
+
+        self.assertTrue(result)
+        woken_processor.enqueue.assert_awaited_once()
+        call = sm._watcher_manager.get_or_create.await_args
+        self.assertEqual(call.args[0], "rc")
+        room = call.args[1]
+        self.assertIsInstance(room, RoomRef)
+        self.assertEqual(room.id, "room-1")
+        self.assertIs(room.kind, RoomKind.CHANNEL)
+        self.assertEqual(room.participants, ("alice",))
+
+    async def test_a_declined_wake_is_a_visible_failure(self):
+        """Paused, or no frozen config: get_or_create answers None, and the
+        injection reports False with the same warning as before — a schedule
+        must not override a pause (§4.4)."""
+        import logging
+        from unittest.mock import AsyncMock, MagicMock
+
+        from tests.helpers import make_bare_session_manager
+
+        sm = make_bare_session_manager(_connector_name="rc")
+        sm._lifecycle.get_processor = MagicMock(return_value=None)
+        sm._lifecycle.get_watcher_state = MagicMock(
+            return_value=self._record(paused=True))
+        sm._watcher_manager = MagicMock()
+        sm._watcher_manager.get_or_create = AsyncMock(return_value=None)
+
+        with self.assertLogs("agent-chat-gateway.core.session_manager",
+                             level=logging.WARNING):
+            result = await sm.inject_message("rc-eng", "hello")
+
+        self.assertFalse(result)
+
+    async def test_a_static_deployment_keeps_the_old_answer(self):
+        """No watcher manager → no creation path; the injection fails exactly
+        as it always has rather than reaching for a router that is not there."""
+        import logging
+        from unittest.mock import MagicMock
+
+        from tests.helpers import make_bare_session_manager
+
+        sm = make_bare_session_manager()
+        sm._lifecycle.get_processor = MagicMock(return_value=None)
+
+        with self.assertLogs("agent-chat-gateway.core.session_manager",
+                             level=logging.WARNING):
+            result = await sm.inject_message("static-w", "hello")
+
+        self.assertFalse(result)
+
+
 class TestInjectMessageStateNone(unittest.IsolatedAsyncioTestCase):
     """T3: inject_message logs a warning when persisted state is None (room_id unknown)."""
 
@@ -1169,24 +1263,15 @@ class TestInjectMessageStateNone(unittest.IsolatedAsyncioTestCase):
         import logging
         from unittest.mock import AsyncMock, MagicMock
 
-        from gateway.core.session_manager import SessionManager
-
-        # Build a minimal SessionManager with mocked collaborators
-        mock_connector = MagicMock()
-        mock_connector.connect = AsyncMock()
-        mock_connector.register_handler = MagicMock()
-        mock_connector.register_capacity_check = MagicMock()
+        from tests.helpers import make_bare_session_manager
 
         mock_processor = MagicMock()
         mock_processor.enqueue = AsyncMock(return_value=True)
 
-        mock_lifecycle = MagicMock()
-        mock_lifecycle.get_processor = MagicMock(return_value=mock_processor)
-        mock_lifecycle.get_watcher_state = MagicMock(return_value=None)   # ← no state
-        mock_lifecycle.get_watcher_config = MagicMock(return_value=None)
-
-        sm = SessionManager.__new__(SessionManager)
-        sm._lifecycle = mock_lifecycle
+        sm = make_bare_session_manager()
+        sm._lifecycle.get_processor = MagicMock(return_value=mock_processor)
+        sm._lifecycle.get_watcher_state = MagicMock(return_value=None)   # ← no state
+        sm._lifecycle.get_watcher_config = MagicMock(return_value=None)
 
         with self.assertLogs("agent-chat-gateway.core.session_manager", level=logging.WARNING) as log_ctx:
             result = await sm.inject_message("test-watcher", "hello")
@@ -1209,7 +1294,7 @@ class TestInjectMessageTimestampFormat(unittest.IsolatedAsyncioTestCase):
         from gateway.config import AttachmentConfig
         from gateway.connectors.rocketchat.config import RocketChatConfig
         from gateway.connectors.rocketchat.connector import RocketChatConnector
-        from gateway.core.session_manager import SessionManager
+        from tests.helpers import make_bare_session_manager
 
         captured: list = []
 
@@ -1221,13 +1306,10 @@ class TestInjectMessageTimestampFormat(unittest.IsolatedAsyncioTestCase):
 
         mock_processor.enqueue = _capture_enqueue
 
-        mock_lifecycle = MagicMock()
-        mock_lifecycle.get_processor = MagicMock(return_value=mock_processor)
-        mock_lifecycle.get_watcher_state = MagicMock(return_value=None)
-        mock_lifecycle.get_watcher_config = MagicMock(return_value=None)
-
-        sm = SessionManager.__new__(SessionManager)
-        sm._lifecycle = mock_lifecycle
+        sm = make_bare_session_manager()
+        sm._lifecycle.get_processor = MagicMock(return_value=mock_processor)
+        sm._lifecycle.get_watcher_state = MagicMock(return_value=None)
+        sm._lifecycle.get_watcher_config = MagicMock(return_value=None)
 
         result = await sm.inject_message("test-watcher", "check stock prices")
         self.assertTrue(result)
@@ -1238,6 +1320,10 @@ class TestInjectMessageTimestampFormat(unittest.IsolatedAsyncioTestCase):
         # connector's header formatter — this is the code path a scheduled
         # job's message actually goes through.
         connector = RocketChatConnector.__new__(RocketChatConnector)
+        # Pre-login: agent_username falls back to the configured spelling (#112).
+        from unittest.mock import MagicMock as _M
+        connector._rest = _M()
+        connector._rest.bot_username = None
         connector._config = RocketChatConfig(
             server_url="http://chat.example.com",
             username="bot",
@@ -1315,7 +1401,7 @@ class TestInjectionResolvesOnceAndReportsFailure(unittest.IsolatedAsyncioTestCas
 
     async def test_no_owner_reports_a_lookup_miss(self):
         stranger = _make_sm_mock()
-        stranger.get_watcher_config = MagicMock(return_value=None)
+        stranger.get_watcher_state = MagicMock(return_value=None)
         scheduler = self._scheduler({"mm-eng": stranger})
 
         with self.assertLogs("agent-chat-gateway.core.scheduler", "WARNING") as logs:

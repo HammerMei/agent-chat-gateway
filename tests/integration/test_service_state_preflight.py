@@ -66,7 +66,8 @@ class TestServiceStatePreflight(unittest.TestCase):
             watchers:
               - name: w1
                 connector: {connector_name}
-                room: script
+                rooms:
+                  include: [script]
         """))
         return GatewayConfig.from_file(str(path))
 
@@ -245,7 +246,8 @@ class TestBackendSignaturePreflight(unittest.TestCase):
             watchers:
               - name: w1
                 connector: script
-                room: script
+                rooms:
+                  include: [script]
         """))
 
         with patch.object(state_mod, "RUNTIME_DIR", runtime), \

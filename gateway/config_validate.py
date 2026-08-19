@@ -54,6 +54,7 @@ from .core.bot_identity import (
 from .core.state import (
     DuplicateSessionError,
     StateFormatError,
+    backend_identity,
     check_session_uniqueness,
     connector_name_of,
     load_state,
@@ -81,8 +82,6 @@ _AGENT_LINT_DEFAULTS: list[tuple[str, object]] = [
 ]
 _WATCHER_LINT_DEFAULTS: list[tuple[str, object]] = [
     ("context_inject_files", []),
-    ("online_notification", None),
-    ("offline_notification", None),
 ]
 _CONNECTOR_LINT_DEFAULTS: list[tuple[str, object]] = [
     ("reply_in_thread", False),
@@ -162,7 +161,9 @@ def validate_config(config_path: str, lint: bool = False) -> ValidationResult:
     if config is None:
         return result
 
-    result.watcher_count = len(config.watchers)
+    # Rules are the only watcher shape after cutover; `config.watchers` is
+    # always empty (the static list died with its parser).
+    result.watcher_count = len(config.watcher_rules)
 
     try:
         with open(config_path) as f:
@@ -246,7 +247,7 @@ def _check_declared_bot_accounts(config: GatewayConfig, result: ValidationResult
     are missed duplicates that the runtime check still catches — never a rejection of a
     configuration that would have worked.
     """
-    claims = dm_claims(config.watchers, config.watcher_rules)
+    claims = dm_claims(config.watcher_rules)
     declared: list[ConnectorIdentity] = []
     for connector in config.connectors:
         validator = _CONNECTOR_VALIDATORS.get(connector.type)
@@ -367,29 +368,53 @@ def _check_session_uniqueness(result: ValidationResult) -> None:
 
 
 def _check_state_orphans(config: GatewayConfig, result: ValidationResult) -> None:
-    """Warn when a connector's persisted state.<connector>.json references a
-    watcher name no longer present in the (expanded) config."""
-    configured_by_connector: dict[str, set[str]] = {}
-    for w in config.watchers:
-        configured_by_connector.setdefault(w.connector, set()).add(w.name)
+    """Warn when a connector's persisted state carries records the next boot
+    will prune.
 
+    After cutover the orphan test is the record's own shape, not a config
+    lookup: a rule-derived record (`rule_name` set) is never an orphan — its
+    recreation source is the record itself (§2.4), and "absent from config"
+    is its normal state — while a static-era record has no config entry left
+    to own it and is pruned at the next start, per the clean-break migration
+    ruling."""
     # Checked over the files on disk, not over config.connectors: a connector renamed
     # or removed in config.yaml leaves its state file behind, and only iterating
     # configured connectors would never open it — so an unreadable file belonging to a
     # since-renamed connector would pass validation and then be abandoned silently at
     # startup, which is the failure the refusal exists to prevent.
+    configured = {c.name for c in config.connectors}
     for path in state_files():
+        file_connector = connector_name_of(path)
         try:
-            load_state(connector_name_of(path))
+            states = load_state(file_connector)
         except StateFormatError as exc:
             msg = str(exc)
             result.errors.append(msg)
             result.findings.append(
                 Finding("error", "global", None, None, msg)
             )
+            continue
         except Exception:
             # Handled inside load_state by starting fresh; nothing to report.
-            pass
+            continue
+        if file_connector not in configured and states:
+            # A state file whose connector was renamed or removed (Codex round
+            # 4): its records are valid but no SessionManager will ever
+            # hydrate them — the loop below iterates configured connectors
+            # only, so without this the file's sessions are abandoned with no
+            # warning anywhere. Only files that actually carry records are
+            # reported; an empty leftover file is noise.
+            msg = (
+                f"State file '{path.name}' belongs to connector "
+                f"'{file_connector}', which is not in config.yaml — its "
+                f"{len(states)} record(s) will never be loaded and their "
+                "sessions stay abandoned. Restore the connector name to "
+                "reclaim them, or delete the file if they are unwanted."
+            )
+            result.warnings.append(msg)
+            result.findings.append(
+                Finding("warning", "global", None, None, msg)
+            )
 
     for connector in config.connectors:
         try:
@@ -403,20 +428,62 @@ def _check_state_orphans(config: GatewayConfig, result: ValidationResult) -> Non
             # unexpected — skip this connector's orphan check rather than failing the
             # whole validation over it.
             continue
-        configured = configured_by_connector.get(connector.name, set())
         for st in states:
-            if st.watcher_name not in configured:
-                msg = (
-                    f"Connector '{connector.name}': state.json has watcher "
-                    f"'{st.watcher_name}' with no matching entry in this config — "
-                    "its session/pause state will be dropped on next start. "
-                    "Restore the old watcher name (e.g. an explicit 'name:') "
-                    "if you want to keep it."
-                )
-                result.warnings.append(msg)
-                result.findings.append(
-                    Finding("warning", "connector", connector.name, None, msg)
-                )
+            if st.rule_name or st.config:
+                # Same both-fields prune test as sync_watchers (Codex round
+                # 22): a materialized config alone is enough for sticky
+                # recreation, so such a record is NOT pruned and must not be
+                # warned about as static-era.
+                # The record-vs-agent divergences (matrix sweep after Codex
+                # round 6): the runtime is fail-closed and loud about both,
+                # but only AFTER the restart — this command's job is to say
+                # it before.
+                if st.agent and st.agent not in config.agents:
+                    msg = (
+                        f"Connector '{connector.name}': watcher "
+                        f"'{st.watcher_name}' is bound to agent '{st.agent}', "
+                        f"which is not in config.yaml — it will read 'failed' "
+                        f"at the next boot and refuse every start. Restore "
+                        f"the agent, or release the room with "
+                        f"'expire {st.watcher_name}'."
+                    )
+                    result.warnings.append(msg)
+                    result.findings.append(
+                        Finding("warning", "connector", connector.name, None, msg)
+                    )
+                elif st.agent and st.session_id and st.backend_identity:
+                    agent_cfg = config.agents[st.agent]
+                    current = backend_identity(
+                        agent_cfg.type, agent_cfg.working_directory)
+                    if st.backend_identity != current:
+                        msg = (
+                            f"Connector '{connector.name}': watcher "
+                            f"'{st.watcher_name}' carries session "
+                            f"{st.session_id} created against backend "
+                            f"identity '{st.backend_identity}', but agent "
+                            f"'{st.agent}' now resolves to '{current}' — the "
+                            f"next start will abandon that session and mint "
+                            f"a fresh one. Expected after changing the "
+                            f"agent's type or working_directory."
+                        )
+                        result.warnings.append(msg)
+                        result.findings.append(
+                            Finding("warning", "connector", connector.name,
+                                    None, msg)
+                        )
+                continue
+            msg = (
+                f"Connector '{connector.name}': state.json has static-era "
+                f"watcher '{st.watcher_name}' — the static shape was removed, "
+                "so its session/pause state will be pruned on the next start. "
+                "To keep the room, add a rule that matches it (a fresh session "
+                "starts on its first message); see "
+                "docs/migration-dynamic-watchers.md."
+            )
+            result.warnings.append(msg)
+            result.findings.append(
+                Finding("warning", "connector", connector.name, None, msg)
+            )
 
 
 def _lint_config(raw: dict, result: ValidationResult) -> None:

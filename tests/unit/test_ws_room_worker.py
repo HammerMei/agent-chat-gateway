@@ -427,3 +427,316 @@ class TestBoundedWebSocketCallbacks(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDeliverToRoom(unittest.IsolatedAsyncioTestCase):
+    """`deliver_to_room` is the only way a document should reach a room's handler.
+
+    It exists so the creation path can *ask* for delivery instead of performing
+    it. `_on_unrouted_message` runs on one of several routing workers, so a
+    caller that dispatches directly puts concurrent deliveries into a room whose
+    entire ordering guarantee is that one queue serialises them — and an older
+    frame handed back after a newer one committed claims a boundary already past
+    itself.
+    """
+
+    def _client(self):
+        from gateway.connectors.rocketchat.websocket import RCWebSocketClient
+
+        return RCWebSocketClient(
+            server_url="http://localhost:3000", username="t", password="t"
+        )
+
+    async def test_it_queues_onto_the_rooms_worker(self):
+        ws = self._client()
+        seen: list[str] = []
+
+        async def cb(doc, access=None):
+            seen.append(doc["_id"])
+
+        ws.register_room_callback("r1", cb)
+        ws.deliver_to_room("r1", {"_id": "m1"}, {"roomParticipant": True})
+
+        self.assertIn("r1", ws._room_queues, "no queue was created for the room")
+        await asyncio.sleep(0.05)
+        self.assertEqual(seen, ["m1"])
+        await ws.stop()
+
+    async def test_documents_reach_the_handler_in_the_order_delivered(self):
+        """The property the whole hand-off exists for.
+
+        Asserted through a handler that yields between documents, so a delivery
+        path that did not serialise would interleave them.
+        """
+        ws = self._client()
+        seen: list[str] = []
+
+        async def cb(doc, access=None):
+            await asyncio.sleep(0.01)
+            seen.append(doc["_id"])
+
+        ws.register_room_callback("r1", cb)
+        for mid in ("m1", "m2", "m3"):
+            ws.deliver_to_room("r1", {"_id": mid}, None)
+
+        await asyncio.sleep(0.2)
+        self.assertEqual(seen, ["m1", "m2", "m3"])
+        await ws.stop()
+
+    async def test_a_dead_worker_is_replaced_rather_than_dropped(self):
+        """Preserved from the block this was extracted from: a worker that died
+        (after a reconnect, say) must not leave the room permanently undeliverable."""
+        ws = self._client()
+        seen: list[str] = []
+
+        async def cb(doc, access=None):
+            seen.append(doc["_id"])
+
+        ws.register_room_callback("r1", cb)
+        ws.deliver_to_room("r1", {"_id": "m1"}, None)
+        await asyncio.sleep(0.05)
+
+        ws._room_workers["r1"].cancel()
+        await asyncio.sleep(0.05)
+
+        ws.deliver_to_room("r1", {"_id": "m2"}, None)
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(seen, ["m1", "m2"])
+        await ws.stop()
+
+
+class TestTheCreationPathJoinsTheRoomsQueue(unittest.IsolatedAsyncioTestCase):
+    """The seam, driven end to end through a real `RCWebSocketClient`.
+
+    The connector test asserts the hand-off and `TestDeliverToRoom` asserts the
+    queue serialises — but each is on one side of the boundary, and a revert
+    could satisfy both halves separately while losing the property. This drives
+    a frame through `_on_unrouted_message` into a room whose queue is already
+    busy, which is the situation the step exists for.
+    """
+
+    def _connector_with_real_transport(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from gateway.connectors.rocketchat.connector import (
+            RocketChatConnector,
+            _RoomSubscription,
+        )
+        from gateway.connectors.rocketchat.websocket import RCWebSocketClient
+        from gateway.core.connector import Room
+
+        c = RocketChatConnector.__new__(RocketChatConnector)
+        c._ws = RCWebSocketClient(
+            server_url="http://localhost:3000", username="t", password="t"
+        )
+        c._rooms = {
+            "r1": _RoomSubscription(room=Room(id="r1", name="general", type="channel"))
+        }
+        c._pending_routes = {}
+        # The routing path asks whether a tracked room is *served* (§2.5, the wake);
+        # None reads as "no dispatcher wired: tracked is served", which is this
+        # fixture's situation.
+        c._capacity_check = None
+        async def _noop_router(room, trigger):
+            pass
+
+        c._router = _noop_router
+        c._rest = MagicMock(user_id="bot-id")
+        c._config = MagicMock(require_mention=False, filter_sender=False)
+        c._on_raw_ddp_message = AsyncMock(return_value=True)
+        return c
+
+    async def test_a_frame_lands_behind_what_is_already_queued_and_never_overlaps(self):
+        c = self._connector_with_real_transport()
+        seen: list[str] = []
+        overlapping = False
+
+        async def cb(doc, access=None):
+            nonlocal overlapping
+            if seen and seen[-1].endswith("-start"):
+                overlapping = True
+            seen.append(f"{doc['_id']}-start")
+            await asyncio.sleep(0.02)
+            seen.append(doc["_id"])
+
+        c._ws.register_room_callback("r1", cb)
+        # Already in flight when the routing worker gets there.
+        c._ws.deliver_to_room("r1", {"_id": "queued"}, None)
+        await asyncio.sleep(0)
+
+        await c._on_unrouted_message(
+            {"_id": "routed", "rid": "r1", "msg": "hi",
+             "u": {"username": "alice"}, "ts": {"$date": 500}},
+            {"roomParticipant": True, "roomType": "c", "roomName": "general"},
+        )
+        await asyncio.sleep(0.2)
+
+        self.assertFalse(overlapping, "two deliveries for one room ran at once")
+        self.assertEqual(
+            [s for s in seen if not s.endswith("-start")], ["queued", "routed"],
+            "the handed-off frame must land behind what was already queued",
+        )
+        # And not around the queue.
+        c._on_raw_ddp_message.assert_not_awaited()
+        await c._ws.stop()
+
+    async def test_a_frame_for_a_room_with_no_callback_is_dropped_audibly(self):
+        """The window this step opened: `connector._rooms` and the transport's
+        callback map are populated at different moments when a per-room subscribe
+        has to wait for the server. Losing the frame is the accepted trade; losing
+        it silently is not.
+        """
+        c = self._connector_with_real_transport()
+        # Tracked by the connector, not yet by the transport.
+        self.assertNotIn("r1", c._ws._callbacks)
+
+        with self.assertLogs(
+            "agent-chat-gateway.connectors.rocketchat.ws", level="WARNING"
+        ) as logs:
+            c._ws.deliver_to_room("r1", {"_id": "m1"}, None)
+            await asyncio.sleep(0.05)
+
+        self.assertTrue(
+            any("no callback is registered" in line for line in logs.output),
+            f"the drop was not reported: {logs.output}",
+        )
+        await c._ws.stop()
+
+
+class TestRoutingFramesDoNotOutliveARecovery(unittest.IsolatedAsyncioTestCase):
+    """A routing frame carries the account's standing *at read time*.
+
+    The routing queue and its workers survive a reconnect untouched, so without
+    a generation a frame read before an outage is acted on after one — and its
+    `access` still says `roomParticipant: true` for a channel the account may
+    have been removed from while the socket was down. Creating a watcher on that
+    is the one outcome routing must not produce.
+    """
+
+    def _client(self):
+        from gateway.connectors.rocketchat.websocket import RCWebSocketClient
+
+        return RCWebSocketClient(
+            server_url="http://localhost:3000", username="t", password="t"
+        )
+
+    async def test_a_frame_read_before_a_recovery_is_not_routed(self):
+        ws = self._client()
+        routed: list[str] = []
+
+        async def default_cb(doc, access=None):
+            routed.append(doc["_id"])
+
+        ws.register_default_callback(default_cb)
+        ws._queue_for_routing({"_id": "stale", "rid": "r1"}, {"roomParticipant": True})
+
+        # The recovery lands before the worker gets to it.
+        ws._recovery_generation += 1
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(routed, [], "a pre-recovery frame must not create a watcher")
+        await ws.stop()
+
+    async def test_a_frame_read_after_the_recovery_is_routed(self):
+        """The control: the generation must not simply block everything."""
+        ws = self._client()
+        routed: list[str] = []
+
+        async def default_cb(doc, access=None):
+            routed.append(doc["_id"])
+
+        ws.register_default_callback(default_cb)
+        ws._recovery_generation += 1
+        ws._queue_for_routing({"_id": "fresh", "rid": "r1"}, {"roomParticipant": True})
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(routed, ["fresh"])
+        await ws.stop()
+
+    async def test_frames_are_dropped_from_the_moment_the_socket_drops(self):
+        """Driven through the listen loop's own `ConnectionClosed` handler.
+
+        Two earlier versions of this test were vacuous. The first called
+        `_retire_recovery` and claimed to use "the entry point a real drop
+        uses" — it is not; `_reconnect` sleeps out a backoff of up to a minute
+        and only bumps after `connect()` succeeds, which is precisely the
+        interval where frames were still routed on pre-drop standing. The
+        second bumped the counter by hand to "simulate what the listen loop
+        does", which tested the comparison and not the production line: with
+        that bump deleted, it still passed.
+
+        So this raises `ConnectionClosed` out of `recv()` and lets the real
+        handler run. Nothing pauses the routing workers across an outage, and a
+        socket-only failure leaves REST healthy, so the backlog would otherwise
+        drain at full speed while the client sleeps.
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from websockets.exceptions import ConnectionClosedError
+
+        ws = self._client()
+        routed: list[str] = []
+
+        async def default_cb(doc, access=None):
+            routed.append(doc["_id"])
+            await asyncio.sleep(0.15)
+
+        ws.register_default_callback(default_cb)
+        # One routing worker, because the pool would otherwise dequeue both frames
+        # at once and there would be no backlog to hold anything back. The property
+        # under test is the generation, not the pool size.
+        ws._ROUTING_WORKERS = 1
+        # Two frames and a slow callback, because the situation is a *backlog*
+        # draining during the backoff. With one frame and an instant callback the
+        # worker finishes before the drop is even detected, and the test would be
+        # measuring scheduling order rather than the guard.
+        ws._queue_for_routing({"_id": "in-flight", "rid": "r1"}, {"roomParticipant": True})
+        ws._queue_for_routing({"_id": "still-queued", "rid": "r2"}, {"roomParticipant": True})
+        await asyncio.sleep(0.01)              # worker picks up the first and blocks
+
+        ws._running = True          # what `connect()` sets; the loop is gated on it
+        sock = MagicMock()
+        sock.recv = AsyncMock(side_effect=ConnectionClosedError(None, None))
+        ws._ws = sock
+
+        async def _slow_reconnect():
+            await asyncio.sleep(0.5)          # stands in for the backoff
+
+        with patch.object(ws, "_reconnect", _slow_reconnect):
+            task = asyncio.create_task(ws._listen_loop())
+            await asyncio.sleep(0.3)           # still inside the backoff
+            self.assertEqual(
+                routed, ["in-flight"],
+                "the frame still queued when the socket dropped must not be routed "
+                "during the backoff",
+            )
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        await ws.stop()
+
+    async def test_the_drop_is_reported(self):
+        """Nothing re-offers the room until its next message, so the loss has to
+        be visible — the sibling queue-full drop warns for the same reason."""
+        ws = self._client()
+
+        async def default_cb(doc, access=None):
+            pass
+
+        ws.register_default_callback(default_cb)
+        ws._queue_for_routing({"_id": "stale", "rid": "room-1"}, {"roomParticipant": True})
+        ws._recovery_generation += 1
+
+        with self.assertLogs(
+            "agent-chat-gateway.connectors.rocketchat.ws", level="WARNING"
+        ) as logs:
+            await asyncio.sleep(0.05)
+
+        self.assertTrue(
+            any("read before a recovery" in line for line in logs.output),
+            f"the drop was not reported: {logs.output}",
+        )
+        await ws.stop()

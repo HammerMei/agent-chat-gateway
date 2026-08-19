@@ -171,16 +171,30 @@ class TestParserHappyPath(unittest.TestCase):
         r = parse({**MINIMAL, "session_idle_days": 7, "session_expire_days": 30})
         self.assertEqual((r.session_idle_days, r.session_expire_days), (7, 30))
 
-    def test_ttls_default_to_none_meaning_no_lifecycle(self):
+    def test_omitted_ttls_take_the_dataclass_defaults(self):
+        """Inverted (Codex review of #121): this used to pin None — 'no
+        lifecycle' — which was the defect, not the contract. §2.5's ruling is
+        15/15 by default, and the parser passing its None explicitly was
+        exactly how the defaults got silently overridden."""
         r = parse(MINIMAL)
-        self.assertIsNone(r.session_idle_days)
-        self.assertIsNone(r.session_expire_days)
+        self.assertEqual(r.session_idle_days, 15)
+        self.assertEqual(r.session_expire_days, 15)
 
-    def test_notifications_and_history_handoff(self):
-        r = parse({**MINIMAL, "online_notification": "hi", "history_handoff": {"fetch_count": 5}})
-        self.assertEqual(r.online_notification, "hi")
-        self.assertIsNone(r.offline_notification)
+    def test_history_handoff_is_read(self):
+        r = parse({**MINIMAL, "history_handoff": {"fetch_count": 5}})
         self.assertEqual(r.history_handoff.fetch_count, 5)
+
+    def test_the_retired_notification_fields_are_refused(self):
+        """Removed 2026-08-02 by owner decision (platform presence is the
+        signal; idle/wake cycles made per-transition announcements noise),
+        executed with the runtime cutover. A config still carrying them must
+        fail loudly, per the same breaking-change precedent as the static
+        shape."""
+        for field in ("online_notification", "offline_notification"):
+            with self.subTest(field=field):
+                with self.assertRaises(ValueError) as cm:
+                    parse({**MINIMAL, field: "hi"})
+                self.assertIn("unknown key", str(cm.exception))
 
     def test_inherits_supplies_shared_fields(self):
         templates = {"base": {"agent": "claude-ops", "session_idle_days": 3}}
@@ -313,15 +327,39 @@ class TestParserHardErrors(unittest.TestCase):
     def test_ttl_rejects_bool_which_is_an_int_subclass(self):
         self._err({**MINIMAL, "session_idle_days": True}, "positive integer")
 
-    def test_idle_must_be_strictly_less_than_expire(self):
-        self._err(
-            {**MINIMAL, "session_idle_days": 30, "session_expire_days": 30},
-            "strictly less than",
-        )
-        self._err(
-            {**MINIMAL, "session_idle_days": 31, "session_expire_days": 30},
-            "strictly less than",
-        )
+    def test_an_explicit_null_ttl_takes_the_default_by_contract(self):
+        """Codex round 13, resolved as documentation: null is the documented
+        template-inheritance SUPPRESS (`_deep_merge` keeps an explicit null
+        as a value, so a child rule writes `session_expire_days: null` to
+        undo a template's value and return to the 15-day default). It is not
+        a disable switch — that reading was the F1 defect's side effect. This
+        pin is the contract: null == omitted == the dataclass default."""
+        rule = parse({**MINIMAL, "session_idle_days": None,
+                      "session_expire_days": None})
+        self.assertEqual(rule.session_idle_days, 15)
+        self.assertEqual(rule.session_expire_days, 15)
+
+    def test_the_two_legs_need_no_ordering_between_them(self):
+        """Inverted deliberately: the old rule required idle < expire, on the
+        assumption that both were measured from the moment the room went quiet.
+        They are not (§2.5) — expiry is measured from the moment the watcher
+        becomes *idle*, so they are two independent legs of a sequence and the
+        default is 15/15, which the old rule would have rejected outright."""
+        for idle, expire in ((15, 15), (30, 30), (31, 30)):
+            with self.subTest(idle=idle, expire=expire):
+                rule = parse({**MINIMAL, "session_idle_days": idle,
+                              "session_expire_days": expire})
+                self.assertEqual(rule.session_idle_days, idle)
+                self.assertEqual(rule.session_expire_days, expire)
+
+    def test_a_non_positive_lifetime_is_still_refused(self):
+        """The ordering rule went; this one stays, and it is `_parse_rule_ttl`'s
+        — checked here so removing the ordering rule cannot be read as removing
+        every constraint on these fields."""
+        for field in ("session_idle_days", "session_expire_days"):
+            for bad in (0, -1):
+                with self.subTest(field=field, value=bad):
+                    self._err({**MINIMAL, field: bad}, "must be a positive integer")
 
     def test_entry_must_be_a_mapping(self):
         self._err(["not", "a", "mapping"], "must be a mapping")
@@ -388,8 +426,7 @@ class TestUnknownRuleKeysAreRejected(unittest.TestCase):
             "name": "eng", "connector": "mm-home", "agent": "claude-eng",
             "description": "x", "rooms": {"include": ["eng-*"]},
             "session_idle_days": 7, "session_expire_days": 30,
-            "context_inject_files": [], "online_notification": "hi",
-            "offline_notification": "bye", "history_handoff": {"enabled": False},
+            "context_inject_files": [], "history_handoff": {"enabled": False},
         }
         self.assertEqual(parse(entry).name, "eng")
 
@@ -460,8 +497,6 @@ class TestEveryRuleFieldIsTypeChecked(unittest.TestCase):
         "session_idle_days": "seven",
         "session_expire_days": [30],
         "context_inject_files": "notes.md",
-        "online_notification": True,
-        "offline_notification": 3,
         "history_handoff": True,
     }
     # `description` is annotation only and never read; `inherits` is resolved
@@ -735,13 +770,6 @@ class TestSharedHelpersAttributeToTheRuleParser(unittest.TestCase):
             f"expected a rule-parser prefix, got: {msg}",
         )
 
-    def test_notification_error_names_the_rule_and_index(self):
-        msg = self._msg({**MINIMAL, "online_notification": True})
-        self.assertTrue(
-            msg.startswith("Watcher rule at index 3:"),
-            f"expected a rule-parser prefix, got: {msg}",
-        )
-
     def test_connector_error_names_the_rule_and_index(self):
         msg = self._msg({**MINIMAL, "connector": False})
         self.assertTrue(
@@ -759,3 +787,50 @@ class TestSharedHelpersAttributeToTheRuleParser(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestOmittedTtlsGetTheDefaults(unittest.TestCase):
+    """Codex review of #121, P1 — and real: the parser passed its None
+    explicitly, overriding the dataclass defaults, so every config that did
+    not spell the TTLs out had the whole idle/expiry lifecycle silently off.
+    Pinned at the loader seam, because tests that construct WatcherRule
+    directly get the defaults and can never see this."""
+
+    def _load(self, watcher_block):
+        import tempfile
+        import textwrap
+
+        from gateway.config import GatewayConfig
+
+        cfg = (
+            "connectors:\n"
+            "  - name: rc\n"
+            "    type: rocketchat\n"
+            "    server: {url: https://x.com, username: b, password: s}\n"
+            "agents:\n"
+            "  default: {type: claude, working_directory: /tmp}\n"
+            "watchers:\n"
+            + textwrap.indent(textwrap.dedent(watcher_block), "  ")
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(cfg)
+        return GatewayConfig.from_file(f.name).watcher_rules[0]
+
+    def test_omitted_ttls_are_15_15(self):
+        rule = self._load("- name: w1\n  rooms: {include: [general]}\n")
+        self.assertEqual(rule.session_idle_days, 15)
+        self.assertEqual(rule.session_expire_days, 15)
+        # And the frozen snapshot — what the runtime actually judges against —
+        # carries the defaults too.
+        from gateway.core.watcher_manager import rule_snapshot
+
+        snap = rule_snapshot(rule)
+        self.assertEqual(snap["session_idle_days"], 15)
+        self.assertEqual(snap["session_expire_days"], 15)
+
+    def test_explicit_ttls_still_win(self):
+        rule = self._load(
+            "- name: w1\n  rooms: {include: [general]}\n"
+            "  session_idle_days: 3\n  session_expire_days: 40\n")
+        self.assertEqual(rule.session_idle_days, 3)
+        self.assertEqual(rule.session_expire_days, 40)

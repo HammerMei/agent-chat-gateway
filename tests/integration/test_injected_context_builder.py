@@ -586,7 +586,7 @@ class TestEnsureForwardsAlreadyDelivered(unittest.IsolatedAsyncioTestCase):
 class TestContextInjectionOrdering(unittest.IsolatedAsyncioTestCase):
     """Issue #9: session maps must be registered BEFORE context injection."""
 
-    async def _run_test(self, watcher_configs, check_fn):
+    async def _run_test(self, watcher_rules, check_fn):
         from gateway.agents import AgentBackend
         from gateway.agents.response import AgentResponse
         from gateway.config import AgentConfig
@@ -621,7 +621,7 @@ class TestContextInjectionOrdering(unittest.IsolatedAsyncioTestCase):
             config = CoreConfig(agents={"default": agent_cfg}, default_agent="default")
             manager = SessionManager(
                 connector, {"default": agent}, "default", config,
-                watcher_configs=watcher_configs, session_maps=maps,
+                watcher_rules=watcher_rules, session_maps=maps,
             )
             await check_fn(manager, connector, agent, maps)
             await manager.shutdown()
@@ -631,10 +631,11 @@ class TestContextInjectionOrdering(unittest.IsolatedAsyncioTestCase):
 
     async def test_maps_registered_before_injection(self):
         """session maps must be populated before ensure() runs."""
-        from gateway.config import WatcherConfig
+
+        from tests.helpers import make_rule
 
         maps_at_injection: dict = {}
-        wc = WatcherConfig(name="script", connector="script", room="script", agent="default")
+        wc = make_rule("script")
 
         async def check_fn(manager, connector, agent, maps):
             original_ensure = manager._lifecycle._injector.ensure
@@ -660,7 +661,6 @@ class TestContextInjectionOrdering(unittest.IsolatedAsyncioTestCase):
 
     async def test_injection_failure_rolls_back_maps(self):
         """If build()/ensure() fails, session maps must be cleaned up."""
-        from gateway.config import WatcherConfig
         from gateway.core.session_maps import SessionMaps
 
         _patch_load = patch("gateway.core.state_store.load_state", return_value=[])
@@ -691,15 +691,14 @@ class TestContextInjectionOrdering(unittest.IsolatedAsyncioTestCase):
             agent = MockAgent()
             maps = SessionMaps()
 
-            wc = WatcherConfig(
-                name="script", connector="script", room="script", agent="default",
-                context_inject_files=["/nonexistent/context.md"],
-            )
+            from tests.helpers import make_rule
+            rule = make_rule("script",
+                             context_inject_files=["/nonexistent/context.md"])
             agent_cfg = AgentConfig(timeout=10, context_inject_files=[])
             config = CoreConfig(agents={"default": agent_cfg}, default_agent="default")
             manager = SessionManager(
                 connector, {"default": agent}, "default", config,
-                watcher_configs=[wc], session_maps=maps,
+                watcher_rules=[rule], session_maps=maps,
             )
 
             errors = await manager.run_once()
@@ -750,7 +749,7 @@ class TestAsyncFileIOInContextInjection(unittest.IsolatedAsyncioTestCase):
                 f.write("test context content")
                 ctx_file = f.name
 
-            wc = WatcherConfig(
+            WatcherConfig(
                 name="script",
                 connector="script",
                 room="script",
@@ -760,8 +759,10 @@ class TestAsyncFileIOInContextInjection(unittest.IsolatedAsyncioTestCase):
             agent_cfg = AgentConfig(timeout=10)
             config = CoreConfig(agents={"default": agent_cfg}, default_agent="default")
 
+            from tests.helpers import make_rule
+            rule = make_rule("script", context_inject_files=[ctx_file])
             manager = SessionManager(
-                connector, {"default": agent}, "default", config, watcher_configs=[wc]
+                connector, {"default": agent}, "default", config, watcher_rules=[rule]
             )
 
             to_thread_calls = []

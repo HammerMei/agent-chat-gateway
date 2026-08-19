@@ -24,8 +24,6 @@ from dataclasses import dataclass
 from ipaddress import ip_address
 from urllib.parse import urlsplit
 
-from .room_pattern import is_direct_room_name
-
 _DEFAULT_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443}
 
 
@@ -176,6 +174,17 @@ class DmClaim:
     direct: bool = False        # every 1:1 DM
     group_direct: bool = False  # every group DM
     rooms: frozenset[str] = frozenset()  # named 1:1 conversations
+    # Specific group-DM conversations, claimed by persisted records (Codex
+    # round 6): sticky binding keeps a record answering its room after the
+    # rule that created it is gone, so a record is a claim exactly the way a
+    # rule is. Nothing rule-shaped produces one — group_direct claims the
+    # class — so this is populated only from state files.
+    group_rooms: frozenset[str] = frozenset()
+    # Provenance for the refusal message, never part of the overlap logic:
+    # the watchers whose persisted records contributed to `rooms`/
+    # `group_rooms`. An operator who already deleted the rule cannot fix a
+    # refusal that cites rules — the exit is `expire <name>` or the TTL.
+    record_watchers: frozenset[str] = frozenset()
 
     def overlaps(self, other: "DmClaim") -> bool:
         """Whether both connectors could answer the same direct message.
@@ -187,7 +196,9 @@ class DmClaim:
 
         A named room is a 1:1 conversation — `@someone` addresses one person, and both
         connectors resolve it through their direct-channel endpoint — so it overlaps a
-        1:1 claim but never a group-DM one.
+        1:1 claim but never a group-DM one. A named GROUP room (a persisted
+        group-DM record) symmetrically overlaps the group class and other
+        named group rooms, never the 1:1 side.
         """
         mine_1to1 = self.direct or bool(self.rooms)
         theirs_1to1 = other.direct or bool(other.rooms)
@@ -195,7 +206,13 @@ class DmClaim:
             return True
         if other.direct and mine_1to1:
             return True
-        if self.group_direct and other.group_direct:
+        mine_group = self.group_direct or bool(self.group_rooms)
+        theirs_group = other.group_direct or bool(other.group_rooms)
+        if self.group_direct and theirs_group:
+            return True
+        if other.group_direct and mine_group:
+            return True
+        if self.group_rooms & other.group_rooms:
             return True
         return bool(self.rooms & other.rooms)
 
@@ -209,36 +226,77 @@ class ConnectorIdentity:
     dms: DmClaim = DmClaim()
 
 
-def dm_claims(watchers, watcher_rules) -> dict[str, DmClaim]:
+def dm_claims(watcher_rules) -> dict[str, DmClaim]:
     """What each connector claims of its account's direct messages.
 
-    Both watcher shapes reach a DM, and they claim different amounts — see `DmClaim`.
-    Only one of the two shapes runs today: rules have no runtime effect until the
-    watcher manager lands, while a static `@someone` watcher works now, so a check
-    reading only rules guards the form that cannot yet happen.
+    Post-cutover a rule's DM opt-ins are the only claim shape: `direct` and
+    `group_direct` each claim a whole DM class, because a DM has no room name
+    for a pattern to match. `DmClaim.rooms` — the per-room claim the static
+    `@someone` watchers used to make — stays as a *type* for §2.7's reserved
+    object form (`direct: {include: [...]}`), but nothing produces one today,
+    so two connectors that both opt into a class simply overlap.
 
-    Room names are compared casefolded. Two spellings of one username are one channel,
-    and here a missed match is the costly direction — it lets two connectors answer the
-    same DM — whereas over-matching only refuses a pair that was already suspicious.
-
-    Takes the two lists rather than a `GatewayConfig` because this module is in
+    Takes the list rather than a `GatewayConfig` because this module is in
     `gateway.core`, which the config layer imports and must not import back.
     """
     direct = {r.connector for r in watcher_rules if r.rooms.direct}
     group = {r.connector for r in watcher_rules if r.rooms.group_direct}
-    rooms: dict[str, set[str]] = {}
-    for w in watchers:
-        if is_direct_room_name(w.room):
-            rooms.setdefault(w.connector, set()).add(w.room.casefold())
 
     return {
         name: DmClaim(
             direct=name in direct,
             group_direct=name in group,
-            rooms=frozenset(rooms.get(name, ())),
         )
-        for name in direct | group | rooms.keys()
+        for name in direct | group
     }
+
+
+def fold_record_dm_claims(claim: DmClaim, records) -> DmClaim:
+    """The claim above, widened by what a connector's persisted records still
+    answer (Codex round 6).
+
+    Sticky binding (§2.4) keeps a rule-derived DM record answering its room
+    after the rule that created it is deleted — so a rule-only claim misses
+    exactly the records that outlive their rules, and two connectors sharing
+    an account can both answer one private conversation. Paused records are
+    included: `resume` revives them, so they still claim. Static-era records
+    (no rule_name) are pruned at the next boot and claim nothing.
+    """
+    rooms = set(claim.rooms)
+    group_rooms = set(claim.group_rooms)
+    watchers = set(claim.record_watchers)
+    for record in records:
+        # The same rule_name-or-config eligibility as hydration, boot
+        # recovery and the prune (Codex rounds 22-24): a DM record whose
+        # rule_name alone was damaged is preserved and recreated, so it
+        # still answers its conversation — excluding it from the claim let
+        # two connectors sharing an account both answer that DM.
+        if not (record.rule_name or record.config) or not record.room_id:
+            continue
+        # A damaged room_kind falls back to room_type (Codex round 26):
+        # the record is preserved and can still answer its DM — a live wake
+        # supplies the kind — so an unknown kind must not read as no claim.
+        # The fallback is conservative: a bare "dm" room_type with no finer
+        # kind claims BOTH classes rather than neither.
+        kind = record.room_kind or ""
+        if kind not in ("dm", "group_dm") and getattr(
+                record, "room_type", "") == "dm":
+            rooms.add(record.room_id)
+            group_rooms.add(record.room_id)
+            watchers.add(record.watcher_name)
+        elif kind == "dm":
+            rooms.add(record.room_id)
+            watchers.add(record.watcher_name)
+        elif kind == "group_dm":
+            group_rooms.add(record.room_id)
+            watchers.add(record.watcher_name)
+    return DmClaim(
+        direct=claim.direct,
+        group_direct=claim.group_direct,
+        rooms=frozenset(rooms),
+        group_rooms=frozenset(group_rooms),
+        record_watchers=frozenset(watchers),
+    )
 
 
 def find_identity_conflicts(entries: list[ConnectorIdentity]) -> list[str]:
@@ -284,18 +342,35 @@ def find_identity_conflicts(entries: list[ConnectorIdentity]) -> list[str]:
                     continue
                 pair = ", ".join(
                     sorted(f"'{e.connector_name}'" for e in (a, b)))
-                shared = sorted(a.dms.rooms & b.dms.rooms)
+                shared = sorted((a.dms.rooms & b.dms.rooms)
+                                | (a.dms.group_rooms & b.dms.group_rooms))
                 if shared:
                     detail = f"both watch {', '.join(shared)}"
                 elif a.dms.direct or b.dms.direct:
                     detail = "one of them takes every 1:1 direct message"
                 else:
                     detail = "both take every group direct message"
+                # A claim from a persisted record needs its own exit named:
+                # the operator may have already deleted the rule, so a
+                # refusal citing rules would be unfixable from their side.
+                record_note = ""
+                holders = sorted(
+                    f"'{w}' (connector '{e.connector_name}')"
+                    for e in (a, b) for w in e.dms.record_watchers)
+                if holders:
+                    record_note = (
+                        f" Part of this claim comes from persisted watcher "
+                        f"record(s) {', '.join(holders)}, which sticky "
+                        f"binding keeps answering their rooms even though no "
+                        f"current rule names them — release them with "
+                        f"'expire <name>' or wait out their session TTL."
+                    )
                 conflicts.append(
                     f"Connectors {pair} share the bot account {user_id} on {origin} and "
                     f"their direct-message coverage overlaps — {detail}. Different teams "
                     f"keep their channels apart, but a DM has no team and reaches every "
                     f"connection the account has open, so both would answer it. Leave "
                     f"the overlapping direct messages to one of them."
+                    f"{record_note}"
                 )
     return conflicts

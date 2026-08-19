@@ -460,7 +460,12 @@ class TestOnPostedEvent(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(received[0].text, "hi")
         self.assertEqual(connector.get_last_processed_ts("chan1"), "12345")
 
-    async def test_dropped_message_does_not_advance_watermark(self):
+    async def test_dropped_message_leaves_an_owed_mark_not_an_advance(self):
+        """A queue-full hand-back must not ADVANCE the watermark past the
+        refused message — and since round 26 the getter answers the oldest
+        OWED mark, so the hand-back's claimed window (just below the refused
+        post) is what a shutdown would persist: the next boot replays it
+        instead of losing it."""
         connector = await self._connector_with_channel(owners=["alice"])
         connector._rest.resolve_username = AsyncMock(return_value="alice")
         handler = AsyncMock(return_value=False)  # queue full
@@ -471,7 +476,12 @@ class TestOnPostedEvent(unittest.IsolatedAsyncioTestCase):
             "mentions": ["bot-id-1"],
         })
 
-        self.assertIsNone(connector.get_last_processed_ts("chan1"))
+        self.assertEqual(connector.get_last_processed_ts("chan1"), "12344",
+                         "the owed window, never a mark at-or-above the "
+                         "refused message")
+        state = connector._channels["chan1"]
+        self.assertIsNone(state.last_processed_ts,
+                          "the PROCESSED mark itself did not advance")
 
     async def test_duplicate_message_id_skipped(self):
         connector = await self._connector_with_channel(owners=["alice"])
@@ -678,15 +688,24 @@ class TestOnWsReconnect(unittest.IsolatedAsyncioTestCase):
 
 
 class TestFetchRoomHistoryTimestampWiring(unittest.IsolatedAsyncioTestCase):
-    async def test_iso_before_after_converted_to_epoch_ms_for_rest_call(self):
+    async def test_epoch_ms_bounds_reach_rest_unchanged(self):
+        """Inverted from "ISO converted to epoch-ms" (§5.2).
+
+        The bounds are epoch milliseconds, like every timestamp inside ACG, and
+        that is what this REST client wants natively — so nothing converts. The
+        old conversion *raised* on an epoch-ms value, and the caller's blanket
+        `except` turned that into "starting without history": the same bound
+        that worked on Rocket.Chat, whose normalizer tolerates both forms,
+        silently cost every Mattermost recreation its handoff.
+        """
         connector = _make_connector()
         connector._rest.get_room_history = AsyncMock(return_value=[])
 
         await connector.fetch_room_history(
             Room(id="chan1", name="general", type="channel"),
             count=10,
-            before_ts="2026-01-01T00:00:00+00:00",
-            after_ts="2025-12-31T00:00:00+00:00",
+            before_ts="1767225600000",
+            after_ts="1767139200000",
         )
 
         connector._rest.get_room_history.assert_called_once_with(
@@ -752,9 +771,21 @@ class TestRoutingUntrackedChannels(unittest.IsolatedAsyncioTestCase):
         connector._ws.unregister_channel = MagicMock()
         connector.register_handler(AsyncMock(return_value=True))
         self.offered = []
+        self.triggers = []
         if register_router:
-            connector.register_router(AsyncMock(side_effect=self.offered.append))
+            connector.register_router(AsyncMock(side_effect=self._record_offer))
         return connector
+
+    def _record_offer(self, room, trigger):
+        # The router contract is `router(room, trigger)` — the trigger is the decoded
+        # event, kept so the creation path can bound history handoff by its timestamp.
+        self.offered.append(room)
+        self.triggers.append(trigger)
+
+    async def _drain(self, connector):
+        """Wait out the off-handler routing tasks the offer spawned."""
+        while connector._routing_tasks:
+            await asyncio.gather(*list(connector._routing_tasks))
 
     def _event(self, **overrides):
         event = {
@@ -771,13 +802,188 @@ class TestRoutingUntrackedChannels(unittest.IsolatedAsyncioTestCase):
 
     async def test_an_untracked_channel_is_offered_to_the_router(self):
         connector = await self._connector()
-        await connector._on_posted_event(self._event())
+        event = self._event()
+        await connector._on_posted_event(event)
+        await self._drain(connector)
 
         self.assertEqual(len(self.offered), 1)
         room = self.offered[0]
         self.assertEqual(room.id, "chan-new")
         self.assertEqual(room.kind, RoomKind.CHANNEL)
         self.assertEqual(room.name, "incident-42")
+        # The trigger rides along, so the creation path can bound history handoff
+        # by its timestamp — same contract as Rocket.Chat's router.
+        self.assertIs(self.triggers[0], event)
+
+    async def test_the_offer_does_not_hold_the_handler_path(self):
+        """The router runs off the handler (§2.7 step 3): the channel worker holds the
+        connector-wide permit for the whole handler call, so a creation awaited inside
+        it would stall delivery for every channel."""
+        connector = await self._connector()
+        release = asyncio.Event()
+
+        async def slow_router(room, trigger):
+            await release.wait()
+
+        connector.register_router(slow_router)
+
+        # Returns while the router is still blocked — the offer was spawned, not awaited.
+        await asyncio.wait_for(connector._on_posted_event(self._event()), timeout=1)
+        self.assertEqual(len(connector._routing_tasks), 1)
+
+        release.set()
+        await self._drain(connector)
+
+    async def test_a_second_frame_during_a_creation_is_dropped_not_reoffered(self):
+        """Single-flight per channel: an offer in flight means a second offer would
+        create a second watcher. The dropped frame is the stated residue of this
+        coalescing — same rule as RC's `_on_unrouted_message`."""
+        connector = await self._connector()
+        release = asyncio.Event()
+        calls = []
+
+        async def slow_router(room, trigger):
+            calls.append(room)
+            await release.wait()
+
+        connector.register_router(slow_router)
+
+        await connector._on_posted_event(self._event())
+        await connector._on_posted_event(
+            self._event(post={"channel_id": "chan-new", "id": "m2", "type": "",
+                              "user_id": "u1", "message": "second", "create_at": 2}))
+        release.set()
+        await self._drain(connector)
+
+        self.assertEqual(len(calls), 1)
+
+    async def test_the_trigger_is_handed_back_once_the_channel_is_tracked(self):
+        """A brand-new channel has no watermark for a replay to fetch from, so the
+        message that caused the watcher to exist would otherwise be the one message
+        it never sees. Handed back through the channel's own queue, so every gate a
+        tracked message passes applies to it too."""
+        connector = await self._connector()
+        connector._ws.deliver_to_channel = MagicMock()
+        event = self._event()
+
+        async def creating_router(room, trigger):
+            # What a real creation does that matters here: the channel becomes tracked.
+            connector._channels["chan-new"] = MagicMock()
+
+        connector.register_router(creating_router)
+        await connector._on_posted_event(event)
+        await self._drain(connector)
+
+        connector._ws.deliver_to_channel.assert_called_once_with(event)
+
+    async def test_no_hand_back_when_the_router_declines(self):
+        """A router that creates nothing (no rule matched) leaves the frame dropped —
+        delivering it would mean delivering to nobody."""
+        connector = await self._connector()
+        connector._ws.deliver_to_channel = MagicMock()
+
+        await connector._on_posted_event(self._event())
+        await self._drain(connector)
+
+        connector._ws.deliver_to_channel.assert_not_called()
+
+    async def test_frames_arriving_during_creation_drain_in_arrival_order(self):
+        """Same episode rule as RC's (§2.2): buffered while open, drained
+        trigger-first onto the channel's own queue when it becomes tracked."""
+        connector = await self._connector()
+        connector._ws.deliver_to_channel = MagicMock()
+        release = asyncio.Event()
+        entered = asyncio.Event()
+
+        async def creating_router(room, trigger):
+            entered.set()
+            await release.wait()
+            connector._channels["chan-new"] = MagicMock()
+
+        connector.register_router(creating_router)
+
+        def _evt(msg_id, text):
+            return self._event(post={"channel_id": "chan-new", "id": msg_id,
+                                     "type": "", "user_id": "u1",
+                                     "message": text, "create_at": 1})
+
+        await connector._on_posted_event(_evt("m1", "first"))
+        await entered.wait()
+        await connector._on_posted_event(_evt("m2", "second"))
+        await connector._on_posted_event(_evt("m2", "second-copy"))  # duplicate
+        await connector._on_posted_event(_evt("m3", "third"))
+        release.set()
+        await self._drain(connector)
+
+        delivered = [c.args[0]["post"]["id"]
+                     for c in connector._ws.deliver_to_channel.call_args_list]
+        self.assertEqual(delivered, ["m1", "m2", "m3"])
+
+    async def test_a_full_buffer_is_audible_in_the_room_once(self):
+        connector = await self._connector()
+        connector._PENDING_BUFFER_DEPTH = 1
+        connector.send_text = AsyncMock()
+        release = asyncio.Event()
+        entered = asyncio.Event()
+
+        async def slow_router(room, trigger):
+            entered.set()
+            await release.wait()
+
+        connector.register_router(slow_router)
+
+        def _evt(msg_id):
+            return self._event(post={"channel_id": "chan-new", "id": msg_id,
+                                     "type": "", "user_id": "u1",
+                                     "message": "x", "create_at": 1})
+
+        await connector._on_posted_event(_evt("m1"))
+        await entered.wait()
+        await connector._on_posted_event(_evt("m2"))  # full
+        await connector._on_posted_event(_evt("m3"))  # full again — no second notice
+        release.set()
+        await self._drain(connector)
+
+        connector.send_text.assert_awaited_once()
+        self.assertEqual(connector.send_text.await_args.args[0], "chan-new")
+
+    async def test_a_transient_creation_failure_recovers_in_place(self):
+        connector = await self._connector()
+        connector._ROUTE_RETRY_DELAYS = (0,)
+        connector._ws.deliver_to_channel = MagicMock()
+        calls = []
+
+        async def flaky_router(room, trigger):
+            calls.append(1)
+            if len(calls) < 2:
+                raise RuntimeError("backend hiccup")
+            connector._channels["chan-new"] = MagicMock()
+
+        connector.register_router(flaky_router)
+        await connector._on_posted_event(self._event())
+        await self._drain(connector)
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(connector._ws.deliver_to_channel.call_count, 1,
+                         "the trigger survived the first failure")
+
+    async def test_a_failed_offer_leaves_the_channel_offerable_again(self):
+        """The single-flight reservation is released whatever happened — holding it
+        would make one transient failure permanent for that channel."""
+        connector = await self._connector()
+        connector._ROUTE_RETRY_DELAYS = ()
+        connector.register_router(AsyncMock(side_effect=RuntimeError("boom")))
+
+        with self.assertLogs("agent-chat-gateway.connectors.mattermost", "WARNING"):
+            await connector._on_posted_event(self._event())
+            await self._drain(connector)
+        self.assertEqual(connector._pending_routes, {})
+
+        # And the next message for the same channel is offered again.
+        connector.register_router(AsyncMock(side_effect=self._record_offer))
+        await connector._on_posted_event(self._event())
+        await self._drain(connector)
+        self.assertEqual(len(self.offered), 1)
 
     async def test_with_no_router_registered_nothing_changes(self):
         """What keeps this branch runnable while creation is still driven by static
@@ -793,6 +999,7 @@ class TestRoutingUntrackedChannels(unittest.IsolatedAsyncioTestCase):
         await connector._on_posted_event(
             self._event(channel_type="D", channel_name="u1__u2",
                         channel_display_name="alice", team_id=""))
+        await self._drain(connector)
 
         room = self.offered[0]
         self.assertEqual(room.kind, RoomKind.DM)
@@ -804,6 +1011,7 @@ class TestRoutingUntrackedChannels(unittest.IsolatedAsyncioTestCase):
         await connector._on_posted_event(
             self._event(channel_type="G", channel_name="1b4c4b32",
                         channel_display_name="glin, probe-bot, alice", team_id=""))
+        await self._drain(connector)
 
         room = self.offered[0]
         self.assertEqual(room.kind, RoomKind.GROUP_DM)
@@ -824,6 +1032,7 @@ class TestRoutingUntrackedChannels(unittest.IsolatedAsyncioTestCase):
         connector._rest.team_id = "team-1"
         await connector._on_posted_event(
             self._event(channel_type="D", channel_display_name="alice", team_id=""))
+        await self._drain(connector)
         self.assertEqual(len(self.offered), 1)
 
     async def test_a_replayed_event_is_not_offered_and_not_swallowed(self):
@@ -902,17 +1111,83 @@ class TestRoutingUntrackedChannels(unittest.IsolatedAsyncioTestCase):
         connector._ws.register_channel = MagicMock()
         connector.register_handler(AsyncMock(return_value=True))
         offered = []
-        connector.register_router(AsyncMock(side_effect=offered.append))
+        connector.register_router(
+            AsyncMock(side_effect=lambda room, trigger: offered.append(room)))
 
         await connector._on_posted_event(self._event())
+        while connector._routing_tasks:
+            await asyncio.gather(*list(connector._routing_tasks))
 
         self.assertEqual(len(offered), 1)
 
     async def test_a_router_failure_does_not_break_delivery(self):
         connector = await self._connector()
+        connector._ROUTE_RETRY_DELAYS = ()
         connector.register_router(AsyncMock(side_effect=RuntimeError("boom")))
-        with self.assertLogs("agent-chat-gateway.connectors.mattermost", "ERROR"):
+        with self.assertLogs("agent-chat-gateway.connectors.mattermost", "WARNING"):
             await connector._on_posted_event(self._event())
+            await self._drain(connector)
+
+
+class TestProbeMissedSince(unittest.IsolatedAsyncioTestCase):
+    """Same two confounders as Rocket.Chat's probe: the bot's own posts (which
+    history includes by design, while the watermark only advances on accepted
+    inbound) and the inclusive boundary message."""
+
+    def _connector(self, posts, *, was_full=False):
+        from gateway.core.connector import HistoryPage
+
+        connector = _make_connector()
+        connector._rest.get_room_history_page = AsyncMock(return_value=HistoryPage(
+            messages=posts,
+            raw_count=connector._REPLAY_HISTORY_COUNT if was_full else len(posts),
+            limit=connector._REPLAY_HISTORY_COUNT,
+        ))
+        return connector
+
+    _ROOM = Room(id="c1", name="eng", type="channel")
+
+    def _post(self, ms, user_id="u1"):
+        return {"id": f"m{ms}", "user_id": user_id, "message": "hi", "create_at": ms}
+
+    async def test_the_bots_own_post_above_the_watermark_is_not_a_gap(self):
+        connector = self._connector([self._post(2000, user_id="bot-id-1")])
+        self.assertFalse(await connector.probe_missed_since(self._ROOM, "1000"))
+
+    async def test_the_boundary_post_itself_is_not_a_gap(self):
+        connector = self._connector([self._post(1000)])
+        self.assertFalse(await connector.probe_missed_since(self._ROOM, "1000"))
+
+    async def test_a_real_user_post_above_the_watermark_is_a_gap(self):
+        connector = self._connector([self._post(1000), self._post(2000)])
+        self.assertTrue(await connector.probe_missed_since(self._ROOM, "1000"))
+
+    async def test_a_page_filled_by_system_posts_is_a_gap(self):
+        """Same trap as Rocket.Chat's: the count is applied before the filter."""
+        connector = self._connector([], was_full=True)
+        self.assertTrue(await connector.probe_missed_since(self._ROOM, "1000"))
+
+
+class TestTriggerHistoryBound(unittest.TestCase):
+    """Mattermost's trigger is the decoded event; the bound is post.create_at."""
+
+    def test_create_at_reads_through_as_epoch_ms(self):
+        """`create_at` is already the internal representation (§5.2), so this
+        reads it rather than converting it."""
+        connector = _make_connector(timezone="UTC")
+        bound = connector.trigger_history_bound(
+            {"post": {"id": "m1", "create_at": 1786874400000}})
+        self.assertEqual(bound, "1786874400000")
+
+    def test_a_missing_or_garbled_frame_answers_none(self):
+        connector = _make_connector(timezone="UTC")
+        self.assertIsNone(connector.trigger_history_bound({"post": {}}))
+        self.assertIsNone(connector.trigger_history_bound({}))
+        self.assertIsNone(connector.trigger_history_bound(None))
+        # A non-numeric create_at is not something this connector can produce;
+        # it is passed through as the string it is rather than guessed at.
+        self.assertEqual(
+            connector.trigger_history_bound({"post": {"create_at": "soon"}}), "soon")
 
 
 class TestReaping(unittest.IsolatedAsyncioTestCase):
@@ -1422,6 +1697,256 @@ class TestEveryWayOfNotDeliveringGivesTheTurnBack(unittest.IsolatedAsyncioTestCa
         c = await self._connector()
         await c._on_posted_event(self._event())
         self.assertEqual(self._turns(c), 1)
+
+
+class TestHostileChannelIdsAreContained(unittest.TestCase):
+    """Rocket.Chat's twin — same fence, same reason (§2.3): the character
+    sanitize alone lets `..` through, and expiry `rmtree`s this path."""
+
+    def test_dot_components_and_empties_are_refused_outright(self):
+        connector = _make_connector()
+        for cid in ("..", ".", ""):
+            with self.subTest(cid=cid):
+                self.assertIsNone(connector.attachment_cache_dir(cid))
+
+    def test_no_id_resolves_outside_the_cache_base(self):
+        from pathlib import Path
+
+        connector = _make_connector()
+        base = connector._attachments_cache_base.resolve()
+        for cid in ("a/../b", "../../etc", "x\\..\\y", "chan123"):
+            with self.subTest(cid=cid):
+                p = connector.attachment_cache_dir(cid)
+                if p is None:
+                    continue  # refused is also contained
+                resolved = Path(p).resolve()
+                self.assertTrue(
+                    resolved.is_relative_to(base) and resolved != base,
+                    f"{cid!r} escaped to {resolved}",
+                )
+
+
+class TestAnIdleChannelWakesOnItsNextMessage(unittest.IsolatedAsyncioTestCase):
+    """The wake (§2.5), Mattermost's twin of Rocket.Chat's.
+
+    The idle drop keeps the channel's local state (§2.2), so its next message takes
+    the tracked path — where the UNROUTED arm used to drop it with a warning. The arm
+    now offers the channel back through the same episode funnel an untracked one goes
+    through. Mattermost's one wrinkle: the tracked path registers the post's id
+    *before* its first await, so the wake must forget it or the episode's redelivery
+    dies at the dedup check.
+    """
+
+    def setUp(self):
+        self.delivered: list[str] = []
+        self.offered: list = []
+        self.served = False
+
+    async def _connector(self):
+        connector = _make_connector(filter_sender=False)
+        connector._config.require_mention = False
+        room = Room(id="chan1", name="general", type="channel")
+        connector._ws.register_channel = MagicMock()
+        await connector.subscribe_room(room, watcher_id="w1")
+        connector._rest.resolve_username = AsyncMock(return_value="alice")
+        connector.register_capacity_check(
+            lambda *a, **kw:
+                RoomCapacity.AVAILABLE if self.served else RoomCapacity.UNROUTED)
+        connector.register_handler(AsyncMock(return_value=True))
+        connector._ws.deliver_to_channel = MagicMock(
+            side_effect=lambda decoded: self.delivered.append(decoded["post"]["id"]))
+
+        async def _router(room_ref, trigger):
+            self.offered.append(room_ref)
+            self.served = True
+
+        connector.register_router(_router)
+        return connector
+
+    def _event(self, post_id="p1", create_at=500):
+        return {"post": {"id": post_id, "channel_id": "chan1", "user_id": "u1",
+                         "message": "hi", "root_id": "", "type": "",
+                         "create_at": create_at},
+                "mentions": []}
+
+    async def _settle(self, connector):
+        from tests.helpers import settle_routing_tasks
+
+        await settle_routing_tasks(connector)
+
+    async def test_the_wake_offers_the_channel_and_redelivers_the_trigger(self):
+        from gateway.core.watcher_manager import RoomRef
+
+        connector = await self._connector()
+        state = connector._channels["chan1"]
+
+        await connector._on_posted_event(self._event())
+        await self._settle(connector)
+
+        self.assertEqual(len(self.offered), 1, "the channel was offered exactly once")
+        self.assertIsInstance(self.offered[0], RoomRef)
+        self.assertEqual(self.offered[0].id, "chan1")
+        self.assertEqual(self.delivered, ["p1"])
+        # The optimistic registration was undone, or this redelivery would have
+        # died at the dedup check; and the watermark never moved.
+        self.assertNotIn("p1", state.seen_ids_set)
+        self.assertFalse(state.last_processed_ts)
+
+    async def test_a_replayed_post_wakes_too(self):
+        """The outage wake. A replayed event carries no channel metadata — the
+        untracked path's `_room_ref_from_event` answers None for every one of them —
+        so the wake must resolve the room from the tracked state instead."""
+        connector = await self._connector()
+
+        await connector._on_posted_event(
+            self._event(), is_replay=True, replay_after_ts="100")
+        await self._settle(connector)
+
+        self.assertEqual(len(self.offered), 1)
+        self.assertEqual(self.delivered, ["p1"])
+
+
+class TestADeclinedChannelWakeDoesNotLoop(unittest.IsolatedAsyncioTestCase):
+    """The drain decides deliver-vs-drop on *served*, not on *tracked* — see
+    Rocket.Chat's twin for the loop this closes."""
+
+    def setUp(self):
+        self.delivered: list[str] = []
+        self.offers = 0
+
+    async def _connector(self):
+        connector = _make_connector(filter_sender=False)
+        connector._config.require_mention = False
+        room = Room(id="chan1", name="general", type="channel")
+        connector._ws.register_channel = MagicMock()
+        await connector.subscribe_room(room, watcher_id="w1")
+        connector._rest.resolve_username = AsyncMock(return_value="alice")
+        connector.register_capacity_check(lambda *a, **kw: RoomCapacity.UNROUTED)
+        connector.register_handler(AsyncMock(return_value=True))
+        connector._ws.deliver_to_channel = MagicMock(
+            side_effect=lambda decoded: self.delivered.append(decoded["post"]["id"]))
+
+        async def _declining_router(room_ref, trigger):
+            self.offers += 1
+
+        connector.register_router(_declining_router)
+        return connector
+
+    def _event(self, post_id="p1", create_at=500):
+        return {"post": {"id": post_id, "channel_id": "chan1", "user_id": "u1",
+                         "message": "hi", "root_id": "", "type": "",
+                         "create_at": create_at},
+                "mentions": []}
+
+    async def _settle(self, connector):
+        from tests.helpers import settle_routing_tasks
+
+        await settle_routing_tasks(connector)
+
+    async def test_declined_frames_are_dropped_and_remembered_not_redelivered(self):
+        connector = await self._connector()
+        state = connector._channels["chan1"]
+
+        await connector._on_posted_event(self._event())
+        await self._settle(connector)
+
+        self.assertEqual(self.offers, 1)
+        self.assertEqual(self.delivered, [],
+                         "a declined wake's frames must not go back on the tracked path")
+        self.assertIn("p1", state.seen_ids_set,
+                      "re-remembered, so reconnect replays do not re-offer it forever")
+        self.assertFalse(state.last_processed_ts, "the watermark is left where it is")
+
+    async def test_a_redelivered_duplicate_does_not_reopen_an_episode(self):
+        connector = await self._connector()
+
+        await connector._on_posted_event(self._event())
+        await self._settle(connector)
+        await connector._on_posted_event(self._event())
+        await self._settle(connector)
+
+        self.assertEqual(self.offers, 1, "the remembered id stops the re-offer")
+
+    async def test_a_new_message_retries_the_wake_once(self):
+        connector = await self._connector()
+
+        await connector._on_posted_event(self._event("p1", 500))
+        await self._settle(connector)
+        await connector._on_posted_event(self._event("p2", 600))
+        await self._settle(connector)
+
+        self.assertEqual(self.offers, 2,
+                         "each new message re-asks once — bounded, not a loop")
+
+
+class TestAParkedChannelWakeStaysRecoverable(unittest.IsolatedAsyncioTestCase):
+    """A park is not a decline — see Rocket.Chat's twin. The wake arm forgot
+    the optimistically-registered id (`_keep_replayable`), and a park must
+    leave it forgotten: the next wake's replay from the record watermark is
+    the recovery, and a re-remembered id has it die at the dedup check."""
+
+    def setUp(self):
+        self.delivered: list[str] = []
+        self.offers = 0
+
+    async def _connector(self):
+        connector = _make_connector(filter_sender=False)
+        connector._config.require_mention = False
+        connector._ROUTE_RETRY_DELAYS = ()  # park after one attempt
+        room = Room(id="chan1", name="general", type="channel")
+        connector._ws.register_channel = MagicMock()
+        await connector.subscribe_room(room, watcher_id="w1")
+        connector._rest.resolve_username = AsyncMock(return_value="alice")
+        connector.register_capacity_check(lambda *a, **kw: RoomCapacity.UNROUTED)
+        connector.register_handler(AsyncMock(return_value=True))
+        connector._ws.deliver_to_channel = MagicMock(
+            side_effect=lambda decoded: self.delivered.append(decoded["post"]["id"]))
+
+        async def _parking_router(room_ref, trigger):
+            self.offers += 1
+            raise RuntimeError("backend down")
+
+        connector.register_router(_parking_router)
+        return connector
+
+    def _event(self, post_id="p1", create_at=500):
+        return {"post": {"id": post_id, "channel_id": "chan1", "user_id": "u1",
+                         "message": "hi", "root_id": "", "type": "",
+                         "create_at": create_at},
+                "mentions": []}
+
+    async def _settle(self, connector):
+        from tests.helpers import settle_routing_tasks
+
+        await settle_routing_tasks(connector)
+
+    async def test_parked_frames_are_not_re_remembered(self):
+        connector = await self._connector()
+        state = connector._channels["chan1"]
+
+        await connector._on_posted_event(self._event())
+        await self._settle(connector)
+
+        self.assertEqual(self.offers, 1)
+        self.assertEqual(self.delivered, [])
+        self.assertNotIn(
+            "p1", state.seen_ids_set,
+            "a re-remembered id would have the recovery replay die at dedup",
+        )
+        self.assertTrue(state.replay_boundary,
+                        "the wake arm's claim holds the window open")
+
+    async def test_the_same_post_can_reopen_an_episode_after_a_park(self):
+        connector = await self._connector()
+
+        await connector._on_posted_event(self._event())
+        await self._settle(connector)
+        await connector._on_posted_event(
+            self._event(), is_replay=True, replay_after_ts="400")
+        await self._settle(connector)
+
+        self.assertEqual(self.offers, 2,
+                         "the parked frame is re-offerable, not suppressed")
 
 
 class TestAPageOfSystemPostsIsNotAnEmptyWindow(unittest.IsolatedAsyncioTestCase):

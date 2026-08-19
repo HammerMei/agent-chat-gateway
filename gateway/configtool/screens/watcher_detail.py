@@ -20,15 +20,15 @@ docs/design/config-tool.md's Phase 3 "two-tier rule" (decision 3):
     with no bearing on which connector/agent/room is actually watched)
     edits the shared raw entry in place — the whole group moves together.
   - Editing a PER-ROOM field (`room` itself, `name` — see below,
-    `connector`, `agent`, `inherits`, `online_notification`,
-    `offline_notification`, `context_inject_files`, `history_handoff.*`)
+    `connector`, `agent`, `inherits`, `context_inject_files`,
+    `history_handoff.*`)
     auto-splits this one room out of its group into its own entry
     (`remove_watcher_room()` + `add_watcher_rooms()` — the same primitive
     pair used for a plain rename/move, and for new-watcher creation).
     User-reported bug, fixed: `connector`/`agent` used to be treated as
     GROUP-SHARED ("move the whole group in place") — every one of these
     fields is stored as a SINGLE value on the shared raw entry (exactly
-    like `online_notification` etc., already correctly per-room), so
+    like `context_inject_files` etc., already correctly per-room), so
     there's no way to give one room in a group a divergent value without
     splitting; treating connector/agent as an exception silently moved an
     ENTIRE group to a different connector when the user only meant to
@@ -89,7 +89,6 @@ if TYPE_CHECKING:
     from ..app import ConfigToolApp
 
 _KNOWN_FIELDS = [
-    "online_notification", "offline_notification",
     "context_inject_files", "history_handoff",
 ]
 
@@ -102,8 +101,6 @@ _KNOWN_FIELDS = [
 # the fields _parse_one_watcher_entry() treats as entry-level/shared (per
 # the two-tier split rule) rather than per-room-identity.
 WATCHER_TEMPLATE_FIELDS: tuple[FieldSpec, ...] = (
-    FieldSpec("online_notification", "str", "Online notification"),
-    FieldSpec("offline_notification", "str", "Offline notification"),
     FieldSpec("context_inject_files", "list", "Context inject files (comma-separated)"),
     FieldSpec("history_handoff.enabled", "bool", "History handoff enabled"),
     FieldSpec("history_handoff.fetch_count", "int", "History handoff fetch count"),
@@ -126,8 +123,6 @@ _HH_DEFAULTS = HistoryHandoffConfig()
 # reverse would have left dead entries nothing reads.  Now a spec without a
 # default raises KeyError at import, not at some later render.
 _WATCHER_TEMPLATE_DEFAULT_VALUES: dict[str, object] = {
-    "online_notification": None,
-    "offline_notification": None,
     "context_inject_files": [],
     "history_handoff.enabled": _HH_DEFAULTS.enabled,
     "history_handoff.fetch_count": _HH_DEFAULTS.fetch_count,
@@ -142,7 +137,7 @@ WATCHER_TEMPLATE_DATACLASS_DEFAULTS: dict[str, object] = {
 # group: 'description' is a free-text annotation _parse_one_watcher_entry()
 # never even reads — it has no bearing on which connector/agent/room is
 # actually being watched, unlike every other entry-level field (connector,
-# agent, inherits, online_notification, ...), which — despite ALSO being
+# agent, inherits, context_inject_files, ...), which — despite ALSO being
 # stored as a single value on the shared raw entry — identifies or
 # configures the watching itself and therefore can't legitimately apply to
 # one room without splitting it out first (see module docstring's two-tier
@@ -156,7 +151,7 @@ WATCHER_TEMPLATE_DATACLASS_DEFAULTS: dict[str, object] = {
 #
 # User-reported bug, fixed: 'connector'/'agent' used to ALSO be in this set
 # ("group-shared, move the whole group in place") — that's wrong for the
-# same reason online_notification etc. are already NOT in this set:
+# same reason the other shared fields are already NOT in this set:
 # reassigning one room's connector/agent must split it out, not silently
 # drag every sibling room in the group along with it.
 _SHARED_FIELD_KEYS = frozenset({"description"})
@@ -245,7 +240,7 @@ class WatcherDetailScreen(FormScreen):
 
     def _current_entry(self) -> dict:
         """The PROBE entry: `self.raw_entry`'s shared fields (connector/
-        agent/inherits/online_notification/etc.) with `rooms:` stripped and
+        agent/inherits/etc.) with `rooms:` stripped and
         `room:` pinned to THIS specific expanded watcher's own room — so the
         generic field-rendering/diffing machinery always sees a clean
         single-room shape, regardless of whether the real underlying entry
@@ -448,8 +443,7 @@ class WatcherDetailScreen(FormScreen):
         return {
             key: merged[key]
             for key in (
-                "online_notification", "offline_notification",
-                "context_inject_files", "history_handoff", "description",
+                            "context_inject_files", "history_handoff", "description",
             )
             if key in merged
         }
@@ -679,7 +673,7 @@ class WatcherDetailScreen(FormScreen):
 
         if per_room_updates or inherits_changed:
             # A per-room field changed (room/name/connector/agent/
-            # online_notification/offline_notification/context_inject_files/
+            # context_inject_files/
             # history_handoff.*) OR inherits changed — every one of these
             # identifies or configures the room being watched, so there's no
             # way to give just THIS room a divergent value without splitting

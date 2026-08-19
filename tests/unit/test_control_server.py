@@ -37,9 +37,16 @@ def _make_entry(name: str, dispatch_result: dict | None = None,
     else:
         entry.connector.send_to_room = AsyncMock(return_value=None)
     if watcher_names is not None:
-        def _get_watcher_config(wname: str):
-            return MagicMock() if wname in watcher_names else None
-        entry.session_manager.get_watcher_config = MagicMock(side_effect=_get_watcher_config)
+        from tests.helpers import make_rule_derived_record
+
+        def _get_watcher_state(wname: str):
+            # Ownership is the persisted record (§2.8) — the config lookup
+            # died with the static shape. A real record shape, because
+            # fetch-history reads room fields and config_from_record off it.
+            if wname in watcher_names:
+                return make_rule_derived_record(name=wname)
+            return None
+        entry.session_manager.get_watcher_state = MagicMock(side_effect=_get_watcher_state)
     return entry
 
 
@@ -483,30 +490,32 @@ def _make_history_entry(
     """Build a ConnectorEntry mock suited for fetch-history tests."""
     from unittest.mock import AsyncMock, MagicMock
 
-    from gateway.core.config import HistoryHandoffConfig, WatcherConfig
+    from tests.helpers import make_rule_derived_record
 
-    hh_cfg = HistoryHandoffConfig(max_fetch_count=max_fetch_count)
-    wc = MagicMock(spec=WatcherConfig)
-    wc.room = "#test-room"
-    wc.history_handoff = hh_cfg
+    record = make_rule_derived_record(
+        name=watcher_name, room_id="ROOM_ID", room_name="test-room",
+        config={
+            "name": watcher_name, "connector": "rc", "room": "#test-room",
+            "agent": "default",
+            "history_handoff": {"max_fetch_count": max_fetch_count},
+        },
+    )
 
     entry = MagicMock()
     entry.name = "rc"
     entry.connector.supports_history.return_value = supports_history
 
-    if resolve_room_raises:
-        entry.connector.resolve_room = AsyncMock(side_effect=resolve_room_raises)
-    else:
-        from gateway.core.connector import Room
-        room = Room(id="ROOM_ID", name="test-room", type="c")
-        entry.connector.resolve_room = AsyncMock(return_value=room)
-
     entry.connector.fetch_room_history = AsyncMock(return_value=history_messages or [])
+    if resolve_room_raises is not None:
+        # The room is built from the record now, never resolved by name; a
+        # caller that used to simulate a resolve failure simulates the fetch
+        # failing instead — the same operator-visible outcome.
+        entry.connector.fetch_room_history = AsyncMock(side_effect=resolve_room_raises)
 
     def _get_watcher_config(name):
-        return wc if name == watcher_name else None
+        return record if name == watcher_name else None
 
-    entry.session_manager.get_watcher_config = MagicMock(side_effect=_get_watcher_config)
+    entry.session_manager.get_watcher_state = MagicMock(side_effect=_get_watcher_config)
     return entry
 
 
@@ -614,17 +623,23 @@ class TestHandleFetchHistory(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["ok"])
         self.assertIn("after_ts", result["error"])
 
-    async def test_after_ts_passed_to_connector(self):
-        """after_ts must be forwarded to fetch_room_history."""
+    async def test_after_ts_is_converted_at_this_boundary(self):
+        """The operator types ISO; the connector is handed epoch-ms (§5.2).
+
+        This is the one place a human writes a timestamp, so it is the one
+        place that converts — connector bounds are epoch-ms like every other
+        timestamp inside ACG, and leaving the ISO to travel further is how a
+        value that looked right met an interface that wanted the other form.
+        """
         entry = _make_history_entry("my-watcher")
         server = _make_server(entry)
-        ts = "2026-05-10T19:25:00+08:00"
         await server.dispatch_command({
-            "cmd": "fetch-history", "watcher": "my-watcher", "after_ts": ts
+            "cmd": "fetch-history", "watcher": "my-watcher",
+            "after_ts": "2026-05-10T19:25:00+08:00",
         })
         entry.connector.fetch_room_history.assert_called_once()
         _, kwargs = entry.connector.fetch_room_history.call_args
-        self.assertEqual(kwargs.get("after_ts"), ts)
+        self.assertEqual(kwargs.get("after_ts"), "1778412300000")
 
     async def test_combined_after_and_before_passed_to_connector(self):
         """Both after_ts and before_ts must be forwarded when a time window is specified."""
@@ -641,8 +656,9 @@ class TestHandleFetchHistory(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["ok"])
         entry.connector.fetch_room_history.assert_called_once()
         _, kwargs = entry.connector.fetch_room_history.call_args
-        self.assertEqual(kwargs.get("after_ts"), after)
-        self.assertEqual(kwargs.get("before_ts"), before)
+        # Both converted at this boundary; the window is preserved.
+        self.assertEqual(kwargs.get("after_ts"), "1778371200000")
+        self.assertEqual(kwargs.get("before_ts"), "1778414400000")
 
     async def test_inverted_range_returns_error(self):
         """after_ts >= before_ts must return a clear error, not silently return empty results."""

@@ -29,52 +29,6 @@ class _CollectConfigTestBase(unittest.TestCase):
         return str(path)
 
 
-class TestCollectConfigWatcherNameLeak(_CollectConfigTestBase):
-    """PR review finding: seen_watcher_names (shared across ALL watcher
-    entries in one collect_config() pass) used to be updated AS EACH ROOM
-    was processed, not just once the whole entry succeeded. A multi-room
-    entry that registered its first room's name fine and then raised on a
-    LATER room left that first room's name permanently staged as "seen" —
-    even though the entry's failure means NONE of its watchers actually
-    exist in the result — so a later, perfectly valid entry wanting that
-    same name was rejected as a false "duplicate"."""
-
-    def test_a_failed_multi_room_entry_does_not_poison_later_valid_entries(self):
-        config_path = self._write(f"""\
-            connectors:
-              - name: rc
-                type: rocketchat
-                server: {{url: "http://localhost:3000", username: bot, password: pw}}
-            agents:
-              default:
-                type: claude
-                working_directory: {self.agent_dir}
-            watchers:
-              - name: rc-random
-                connector: rc
-                room: "collision-room"
-              - connector: rc
-                rooms: ["general", "random"]
-              - name: rc-general
-                connector: rc
-                room: "another-room"
-        """)
-        config, issues = collect_config(config_path)
-        self.assertIsNotNone(config)
-        names = [w.name for w in config.watchers]
-        # entry 2 ("random" room auto-name collides with entry 0's explicit
-        # name "rc-random"? No — entry 1's SECOND room "random" auto-names
-        # to "rc-random" too, genuinely colliding with entry 0 — entry 1 as
-        # a whole is correctly rejected. What must NOT happen: entry 2
-        # ("rc-general") getting rejected as a phantom duplicate of
-        # something entry 1 never actually contributed.
-        self.assertIn("rc-general", names)
-        watcher_issues = [i for i in issues if i.entity_kind == "watcher"]
-        # Exactly the genuinely-broken entry (index 1) should be reported —
-        # not entry 2.
-        self.assertEqual(len(watcher_issues), 1)
-
-
 class TestCollectConfigPartialProgressPreserved(_CollectConfigTestBase):
     """PR review finding: several structural-failure branches used to
     `return None, issues` outright, discarding every connector/agent that
@@ -98,7 +52,8 @@ class TestCollectConfigPartialProgressPreserved(_CollectConfigTestBase):
             watchers:
               - connector: rc1
                 agent: other_agent
-                room: general
+                rooms:
+                  include: [general]
         """)
         config, issues = collect_config(config_path)
         self.assertIsNotNone(config)
@@ -223,7 +178,9 @@ class TestCollectConfigNonStringScalarFields(_CollectConfigTestBase):
                 type: claude
                 working_directory: {self.agent_dir}
             watchers:
-              - room: general
+              - name: w1
+                rooms:
+                  include: [general]
                 connector: [rc]
         """)
         config, issues = collect_config(config_path)
@@ -241,7 +198,9 @@ class TestCollectConfigNonStringScalarFields(_CollectConfigTestBase):
                 type: claude
                 working_directory: {self.agent_dir}
             watchers:
-              - room: general
+              - name: w1
+                rooms:
+                  include: [general]
                 connector: rc
                 agent: [default]
         """)
@@ -260,12 +219,14 @@ class TestCollectConfigNonStringScalarFields(_CollectConfigTestBase):
                 type: claude
                 working_directory: {self.agent_dir}
             watchers:
-              - room: 12345
+              - name: w1
+                rooms:
+                  include: [12345]
                 connector: rc
         """)
         config, issues = collect_config(config_path)
         self.assertIsNotNone(config)
-        self.assertTrue(any("'room' must be a string" in i.message for i in issues))
+        self.assertTrue(any("'rooms.include' entries must be non-empty strings" in i.message for i in issues))
 
     def test_non_string_watcher_session_id_is_a_collected_issue(self):
         config_path = self._write(f"""\
@@ -278,7 +239,9 @@ class TestCollectConfigNonStringScalarFields(_CollectConfigTestBase):
                 type: claude
                 working_directory: {self.agent_dir}
             watchers:
-              - room: general
+              - name: w1
+                rooms:
+                  include: [general]
                 connector: rc
                 session_id: [abc]
         """)
@@ -331,7 +294,8 @@ class TestCollectConfigNonStringNameHint(_CollectConfigTestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         config, issues = collect_config(config_path)
         self.assertIsNotNone(config)
@@ -420,7 +384,8 @@ class TestCollectConfigQueueSchedulerSessionId(_CollectConfigTestBase):
               - name: w1
                 connector: rc
                 agent: default
-                room: general
+                rooms:
+                  include: [general]
 {indented_extra}
         """)
 
@@ -460,17 +425,20 @@ class TestCollectConfigQueueSchedulerSessionId(_CollectConfigTestBase):
               - name: w1
                 connector: rc
                 agent: default
-                room: general
+                rooms:
+                  include: [general]
                 session_id: sticky-1
               - name: w2
                 connector: rc
                 agent: default
-                room: dev
+                rooms:
+                  include: [dev]
                 session_id: sticky-1
               - name: w3
                 connector: rc
                 agent: default
-                room: ops
+                rooms:
+                  include: [ops]
         """)
         config, issues = collect_config(config_path)
         self.assertIsNotNone(config)
@@ -481,7 +449,7 @@ class TestCollectConfigQueueSchedulerSessionId(_CollectConfigTestBase):
         for issue in issues:
             self.assertIn("'session_id' is no longer supported", issue.message)
         # The clean entry either side still parses — the "not a discard" half.
-        self.assertEqual([w.name for w in config.watchers], ["w3"])
+        self.assertEqual([r.name for r in config.watcher_rules], ["w3"])
 
 
 class TestCollectConfigOnTheFlyWatcherFields(_CollectConfigTestBase):
@@ -506,7 +474,8 @@ class TestCollectConfigOnTheFlyWatcherFields(_CollectConfigTestBase):
                 working_directory: {self.agent_dir}
                 session_idle_days: 30
             watchers:
-              - room: general
+              - rooms:
+                  include: [general]
         """)
         config, issues = collect_config(config_path)
         self.assertIsNotNone(config)
@@ -528,12 +497,17 @@ class TestCollectConfigOnTheFlyWatcherFields(_CollectConfigTestBase):
             watchers:
               - connector: rc
                 agent: default
-                room: "*"
+                rooms:
+                  include: ["*"]
         """)
         config, issues = collect_config(config_path)
         self.assertIsNotNone(config)
-        self.assertEqual(config.watchers, [])
-        self.assertTrue(any("not implemented yet" in i.message for i in issues))
+        # The static-era "not implemented yet" rejection died with its shape:
+        # a wildcard include is exactly what a rule is for — on an inbound
+        # connector it is valid config, refused only where nothing can ever
+        # offer a room (test_literal_rooms).
+        self.assertEqual(len(issues), 1, [i.message for i in issues])
+        self.assertIn("'name' is required", issues[0].message)
 
 
 if __name__ == "__main__":

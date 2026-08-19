@@ -199,10 +199,22 @@ class RocketChatREST:
 
         self.auth_token = data["data"]["authToken"]
         self.user_id = data["data"]["userId"]
-        self.bot_username = username
+        # The CANONICAL spelling the server knows, not what the operator
+        # typed (#112). Rocket.Chat's login is not spelling-exact — probed on
+        # 6.12, `probebot9207` and the account's email both log into
+        # `ProbeBot9207` — and every message frame carries the canonical
+        # form in `u.username`, so identity comparisons against the typed
+        # spelling silently fail under an ordinary configuration. The typed
+        # value is kept only for re-login.
+        self.bot_username = (
+            data["data"].get("me", {}).get("username") or username
+        )
         self._username = username
         self._password = password
-        logger.info("Logged in as %s (uid=%s)", username, self.user_id)
+        logger.info(
+            "Logged in as %s (canonical username=%s, uid=%s)",
+            username, self.bot_username, self.user_id,
+        )
 
     async def _get_server_major_version(self) -> int | None:
         """Fetch and cache the RC server's major version via ``GET /api/info``.
@@ -512,9 +524,11 @@ class RocketChatREST:
         """Fetch the last ``count`` messages from a room via the REST API.
 
         Selects the correct history endpoint based on room type:
-          - ``channel`` → ``channels.history``
-          - ``group``   → ``groups.history``
-          - ``dm``      → ``im.history``
+          - ``channel``  → ``channels.history``
+          - ``group``    → ``groups.history``
+          - ``dm``       → ``im.history``
+          - ``group_dm`` → ``im.history`` (one direct endpoint serves both DM
+            kinds; the distinction is ACG's, not the server's — §6.4)
 
         Returns messages in **chronological order** (oldest first).
         System messages (RC ``t`` field present) and messages with empty
@@ -552,10 +566,18 @@ class RocketChatREST:
         filtered chronological list; `get_room_history_page` wants the unfiltered page so
         it can say how full it was.
         """
+        # Both DM kinds go to `im.history`: Rocket.Chat has one direct-room
+        # endpoint and no group-DM equivalent, which is the same asymmetry that
+        # makes `roomType: "d"` cover both on the wire (§6.4). The creation path
+        # types a room from its *classified* kind, so `"group_dm"` reaches here
+        # for real — and defaulting it to `channels.history` asked a channel
+        # endpoint about a direct room, so history handoff and outage replay
+        # both failed for every group DM, permanently.
         endpoint_map = {
-            "channel": "channels.history",
-            "group":   "groups.history",
-            "dm":      "im.history",
+            "channel":  "channels.history",
+            "group":    "groups.history",
+            "dm":       "im.history",
+            "group_dm": "im.history",
         }
         endpoint = endpoint_map.get(room_type, "channels.history")
         params: dict = {"roomId": room_id, "count": count, "unreads": "false"}
@@ -622,18 +644,18 @@ class RocketChatREST:
         no name and its participants are the only thing that identifies it to a human
         (§2.3).
 
-        Returns an empty list when the lookup fails. That is *no answer*, and the caller
-        treats it as one: it declines to classify the room rather than assuming either kind.
-        There is no safe default to pick. Reading a group as a 1:1 drops the mention gate and
-        the agent answers everyone in it; reading a 1:1 as a group makes it wait for a
-        mention its user has no reason to type, and it looks broken. Both are wrong, so the
-        room simply waits for its next message and the question is asked again.
+        **A failed request raises; only a readable-but-empty answer returns `[]`.**
+        The two used to be one return value, and the routing transaction (§2.2) is why
+        they cannot be: a network failure is *retryable* — the classification was never
+        made, so the message must stay redeliverable (abort) — while a server that
+        answers with no members is a *data condition* the retry cannot change (final).
+        Collapsing them made outcome 3 of the dedup transaction unreachable.
+
+        There is still no safe default kind to guess in either case. Reading a group as
+        a 1:1 drops the mention gate and the agent answers everyone in it; reading a
+        1:1 as a group makes it wait for a mention its user has no reason to type.
         """
-        try:
-            result = await self._request("GET", "im.members", params={"roomId": room_id})
-        except Exception as e:
-            logger.warning("Could not read members of direct room %s: %s", room_id, e)
-            return []
+        result = await self._request("GET", "im.members", params={"roomId": room_id})
         members = result.get("members") or []
         if not isinstance(members, list):
             return []
@@ -695,6 +717,24 @@ class RocketChatREST:
             )
             return None
         return bool(result.get("subscription"))
+
+    async def get_subscription_room_ids(self) -> set[str]:
+        """Every room id this account holds a subscription record for.
+
+        `subscriptions.get` without `updatedSince` returns the full set in
+        `update` (verified in the handler: `getSubscriptions(userId)` with no
+        date returns an array, wrapped as `{update: result, remove: []}`).
+        Hidden rooms are included — a hidden room keeps its record and is
+        still membership, same rule as `is_room_member`. Raises on failure;
+        the caller owns the tri-state (a set that could not be read is
+        unknown, never empty).
+        """
+        result = await self._request("GET", "subscriptions.get")
+        return {
+            sub["rid"]
+            for sub in result.get("update", [])
+            if isinstance(sub, dict) and sub.get("rid")
+        }
 
     async def resolve_room(self, room_name: str) -> dict[str, Any]:
         """Resolve a room name to its info dict.

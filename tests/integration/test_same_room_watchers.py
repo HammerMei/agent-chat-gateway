@@ -31,7 +31,7 @@ import pytest
 
 from gateway.agents import AgentBackend
 from gateway.agents.response import AgentResponse
-from gateway.config import AgentConfig, WatcherConfig
+from gateway.config import AgentConfig
 from gateway.connectors.script import ScriptConnector
 from gateway.core.config import CoreConfig
 from gateway.core.session_manager import SessionManager
@@ -75,20 +75,24 @@ class TestTwoWatchersOneRoom(unittest.IsolatedAsyncioTestCase):
             config = CoreConfig(
                 agents={"a1": agent_cfg, "a2": agent_cfg}, default_agent="a1"
             )
-            watchers = [
-                WatcherConfig(name="w-a1", connector="script", room="script", agent="a1"),
-                WatcherConfig(name="w-a2", connector="script", room="script", agent="a2"),
-            ]
+            # Two rules on one room cannot both fire (first-match precedence
+            # decides at the rule layer, with a shadowing warning at load) —
+            # so the dispatcher's occupancy refusal is exercised where it
+            # still lives: the start path itself, entered directly.
             manager = SessionManager(
                 connector, {"a1": agent, "a2": agent}, "a1", config,
-                watcher_configs=watchers,
             )
-            errors = await manager.run_once()
+            await manager.run_once()
+            from gateway.core.dispatch import RoomAlreadyRoutedError
+            from tests.helpers import make_watcher, start_watcher
 
-            self.assertTrue(
-                any("w-a2" in e for e in errors),
-                f"the second watcher on the room should have failed to start: {errors}",
-            )
+            await start_watcher(
+                manager._lifecycle,
+                make_watcher("script", name="w-a1", agent="a1"))
+            with self.assertRaises(RoomAlreadyRoutedError):
+                await start_watcher(
+                    manager._lifecycle,
+                    make_watcher("script", name="w-a2", agent="a2"))
             # Which watcher is *serving* the room is a question about processors,
             # not about records — `list_watchers()` answers the second one.
             # Scanned over every row rather than a hardcoded pair, so an
@@ -123,12 +127,18 @@ class TestTwoWatchersOneRoom(unittest.IsolatedAsyncioTestCase):
             )
             manager = SessionManager(
                 connector, {"a1": agent, "a2": agent}, "a1", config,
-                watcher_configs=[
-                    WatcherConfig(name="w-a1", connector="script", room="script", agent="a1"),
-                    WatcherConfig(name="w-a2", connector="script", room="script", agent="a2"),
-                ],
             )
             await manager.run_once()
+            from gateway.core.dispatch import RoomAlreadyRoutedError
+            from tests.helpers import make_watcher, start_watcher
+
+            await start_watcher(
+                manager._lifecycle,
+                make_watcher("script", name="w-a1", agent="a1"))
+            with self.assertRaises(RoomAlreadyRoutedError):
+                await start_watcher(
+                    manager._lifecycle,
+                    make_watcher("script", name="w-a2", agent="a2"))
 
             written = sorted((root / "system-prompts").glob("*.md"))
             self.assertEqual(
@@ -152,13 +162,13 @@ class TestTwoWatchersOneRoom(unittest.IsolatedAsyncioTestCase):
             config = CoreConfig(agents={"a1": agent_cfg}, default_agent="a1")
             manager = SessionManager(
                 connector, {"a1": agent}, "a1", config,
-                watcher_configs=[
-                    WatcherConfig(
-                        name="only", connector="script", room="script", agent="a1"
-                    )
-                ],
             )
             await manager.run_once()
+            from tests.helpers import make_watcher, start_watcher
+
+            await start_watcher(
+                manager._lifecycle,
+                make_watcher("script", name="only", agent="a1"))
             self.assertEqual(len(list((root / "system-prompts").glob("*.md"))), 1)
             await manager.shutdown()
 

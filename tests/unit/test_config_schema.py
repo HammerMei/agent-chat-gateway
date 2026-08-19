@@ -129,9 +129,11 @@ class TestRuleShapedWatchersValidate:
             "name": "dms", "rooms": {"direct": {"include": ["alice"], "except_for": ["bob"]}},
         })
 
-    def test_the_static_shape_still_validates(self, validator, base_doc):
-        self._ok(validator, base_doc, {"room": "general", "connector": "rc-main"})
-        self._ok(validator, base_doc, {"rooms": ["a", "b"], "connector": "rc-main"})
+    def test_the_static_shape_is_rejected(self, validator, base_doc):
+        """The schema matches the loader's cutover refusal (§5.4) — a static
+        entry must fail schema validation too, not slip through one gate."""
+        self._rejected(validator, base_doc, {"room": "general", "connector": "rc-main"})
+        self._rejected(validator, base_doc, {"rooms": ["a", "b"], "connector": "rc-main"})
 
     def test_a_rule_without_a_name_is_rejected(self, validator, base_doc):
         self._rejected(validator, base_doc, {"rooms": {"include": ["eng-*"]}})

@@ -138,3 +138,47 @@ class AttachmentWorkspace:
             logger.info("Created attachment symlink: %s → %s", link, cache_path)
 
         return str(link)
+
+    def reclaim(self, path_key: str, room_id: str, working_directory: str) -> None:
+        """Remove the per-room symlink and the cached attachment directory.
+
+        Expiry's half of `setup` (§2.5, "expiry reclaims everything"). Symlink
+        handling is defined *before* deletion, per the design's own requirement:
+
+        * The link is **unlinked, never followed** — `unlink` on the link
+          itself; its target is not resolved for the removal.
+        * The cache directory is removed only when it is a real directory. A
+          cache path that is itself a symlink is unlinked, not descended into:
+          `rmtree` through a link would delete whatever tree the link points
+          at, which is exactly the escape the design forbids. Links *inside*
+          the tree are removed as links by `rmtree`'s own contract.
+
+        Best-effort and idempotent: a missing link or directory is success,
+        and a filesystem error logs rather than blocking the expiry — the
+        record's reclamation must not be held hostage by a stale mount.
+        """
+        try:
+            acg_dir = Path(working_directory) / ".acg-attachments"
+            link = resolve_under(acg_dir, path_key)
+            if link.is_symlink():
+                link.unlink(missing_ok=True)
+                logger.info("Removed attachment symlink %s", link)
+        except Exception as e:
+            logger.warning("Could not remove attachment symlink for %s: %s",
+                           path_key, e)
+
+        cache_dir = self._connector.attachment_cache_dir(room_id)
+        if not cache_dir:
+            return
+        try:
+            cache_path = Path(cache_dir)
+            if cache_path.is_symlink():
+                cache_path.unlink(missing_ok=True)
+            elif cache_path.is_dir():
+                import shutil
+
+                shutil.rmtree(cache_path)
+                logger.info("Removed attachment cache %s", cache_path)
+        except Exception as e:
+            logger.warning("Could not remove attachment cache for room %s: %s",
+                           room_id, e)

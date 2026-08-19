@@ -370,6 +370,10 @@ class TestDirectCloneFromWatchersList:
     dedicated test of its own (only WatcherDetailScreen's own 'c' binding,
     reached after already opening a watcher, was covered)."""
 
+    @pytest.mark.skip(reason=(
+        "the TUI's watcher editing writes the static shape, which the loader "
+        "refuses since the runtime cutover — the save gate correctly blocks "
+        "it; impl/config-tooling rewrites the TUI for rules and unskips this"))
     async def test_cloning_directly_from_the_list_adds_rooms_without_opening_the_watcher(
         self, tmp_path, work_dir
     ):

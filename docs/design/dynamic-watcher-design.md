@@ -70,8 +70,8 @@ watchers:
     rooms:
       include: ["eng-*", "incident-*"]
       except_for: ["eng-archive"]
-    session_idle_days: 7
-    session_expire_days: 30
+    session_idle_days: 15        # default 15 — see §2.5
+    session_expire_days: 15      # default 15, measured from the idle moment
     # plus every existing watcher parameter: context_inject_files,
     # history_handoff, notifications, inherits, …
 ```
@@ -321,6 +321,48 @@ guarantee is not read as stronger than it is.
 This supersedes the "defer bookkeeping until accepted" phrasing in §2.7, which
 described only the success path.
 
+##### Replay ownership: one interval, one owner
+
+Three mechanisms replay a room's history, and they were built one increment at
+a time without ever being stated together. Three consecutive review rounds then
+landed in the seams between them — each round moved a boundary, and the next
+found a defect at its new position. This is that statement.
+
+**Every replay is defined by the interval it owes, and every interval has
+exactly one owner.**
+
+| Owner | Interval | Names the window? | May discharge the boundary? |
+|---|---|---|---|
+| `_on_ws_reconnect` | the outage the socket just ended | no — reads the room's own marks | **yes**, it read the window those marks describe |
+| `WatcherManager._recreate` | everything below the record's watermark, for the room it is recreating | yes (`after_ts=record.last_processed_ts`) | no |
+| the drain of a routing episode | nothing — it *claims*, never replays | — | no |
+
+Two consequences that are not obvious and were each got wrong once:
+
+* **A caller that names a window may not discharge the room's boundary.** The
+  boundary is set by the room's own hand-back accounting — "a message below
+  here was refused and must come back" — and a replay that read a *different*
+  window has no claim on it. Discharging it anyway loses the refused message
+  permanently, because the live watermark has moved past it by then. The rule
+  applies at **every** discharge site, of which there are two per connector
+  (the empty page and the dispatched batch); guarding one and not the other
+  reads as correct in a single file.
+
+* **The startup replay owns no interval at all.** It exists to *notice* that a
+  room has a gap and to trigger the recreation that covers it — the recreation
+  is what replays. A room in the startup scan that is already resident got that
+  way through `_recreate` (its record rules out `_create`, and a rule-derived
+  record is not in `watchers:` so the static path never starts it), so its
+  interval has already been replayed and a second pass is pure duplication:
+  replay hands the filter its own boundary rather than the live watermark, so
+  the ts filter suppresses nothing and only the bounded id window separates the
+  two passes.
+
+The claim the drain makes is the one piece that is deliberately *not* a replay:
+the frames are handed to the room's worker immediately, and the claim only
+covers the case where the scalar watermark has already moved past them (above).
+It is discharged by whichever reconnect next reads its own window.
+
 An unmatched message is dropped deliberately. The connector knows nothing
 about watcher lifecycle, which is both the correct separation and the reason
 idle becomes cheap: **no unsubscribe means the connector's per-room state —
@@ -347,19 +389,32 @@ Three distinct keys, deliberately:
 | Watcher instance, sticky binding, per-room lock | `(connector, room_id)` |
 | Persisted state record | `(connector, room_id)` |
 | Filesystem paths (system prompt, attachment workspace) | `hash(connector, room_id)` — never the raw id |
-| Display and CLI | `<connector>-<room_label>` — cosmetic, never load-bearing |
+| Display and CLI | `<connector>:<room_label>` — cosmetic, never load-bearing |
 
-The `room_name` on the state record is the platform's own name, refreshed from
-inbound messages. **Boot and recreation resolve by `room_id`, never by the
-persisted name** — a name freed by a rename can be reused by a different
-room, and resolving by name would bind an existing session to the wrong one.
+The `room_name` on the state record is a **human-readable description of the
+room**, refreshed from inbound messages: the platform's own name for a named
+room, and for the DM kinds the room's description — the counterpart for a 1:1,
+the participant list for a group DM (§2.4). Direct rooms have no platform name
+to carry, and leaving the field empty for them made `list` show a blank column
+for exactly the rooms an operator cannot otherwise tell apart, so the
+description fills it instead. It is a display value and nothing keys on it.
 
-Labels need no disambiguating flag: connector names are validated unique at
-config load, so `<connector>-<label>` is unique by construction — **provided a
-connector never spans two namespaces of room names.** On Mattermost a channel
-name is unique only within a team (§6.3), so this holds exactly because one
-connector serves one team; the room *name* is really `(team, channel)` even
-though only the channel part appears in the label.
+**Boot and recreation resolve by `room_id`, never by the persisted name** — a
+name freed by a rename can be reused by a different room, and resolving by name
+would bind an existing session to the wrong one. This is what makes the field
+safe to hold a description rather than a platform identifier.
+
+Labels join with `:`, and the joiner is what makes the handle injective
+(review of the implementation PR found the original `-` joiner was not:
+connector `rc` + room `home-general` and connector `rc-home` + room `general`
+both derived `rc-home-general`). Two rules hold the boundary: a connector name
+may not contain `:` (refused at config load), and `:` is outside the label
+encoder's safe set, so a literal `:` in a room or user name is percent-encoded
+— the first `:` in a handle always ends the connector component, and the
+`dm:`/`gdm:` kind prefixes cannot be forged by a room name. On Mattermost a
+channel name is unique only within a team (§6.3), so the label half is unique
+exactly because one connector serves one team; the room *name* is really
+`(team, channel)` even though only the channel part appears in the label.
 
 Because the label is cosmetic (below), a collision would produce two
 identical-looking rows and nothing worse. The reason §4.5 still forbids a
@@ -395,6 +450,14 @@ assert it is still under the intended root), and **define symlink handling
 before deletion** during expiry, so reclaiming an attachment workspace cannot
 follow a link out of the tree.
 
+The containment requirement has a second implementation site the expiry
+increment added: **the attachment cache directory itself** —
+`attachment_cache_dir` on both connectors joins a *server-supplied* room id
+under the cache base, and expiry deletes the directory it names. A
+character-class sanitize alone is not the fence, because dots are legal
+filename characters and `..` passes it; `resolve_under` is, and an id it
+refuses means no attachment caching for that room rather than an escape.
+
 The reason this is worth doing rather than tolerating is that *three separate
 things* all want to change the display name, and only this decoupling makes
 all three harmless at once: a channel rename, a group DM's membership
@@ -420,8 +483,8 @@ gives up on readability:
 | Room kind | Label | Stable? |
 |---|---|---|
 | channel / private group | the channel name | until renamed |
-| 1:1 DM | `dm-<counterpart>` | until the counterpart is renamed — and see below |
-| group DM | `gdm-<first 8 of a room_id hash>` | yes, by construction |
+| 1:1 DM | `dm:<counterpart>` | until the counterpart is renamed — and see below |
+| group DM | `gdm:<16 hex of a room_id hash>` | yes, by construction |
 
 **A renamed counterpart is a known inconsistency, deliberately left.** This
 table used to claim a username was stable. It is not — Rocket.Chat allows a
@@ -478,9 +541,9 @@ So `list` shows the label, the room id, and for DMs the participants:
 
 ```
 NAME                     ROOM ID                     STATE   PARTICIPANTS
-mm-eng-incident-42       r1o6c8a1k3d8icd931qq1n6g4y  active  —
-mm-eng-dm-alice          iwihkhk9jpf3tngp14ushkx6pe  idle    @alice
-mm-eng-gdm-a3f9c1b2      cib3hjsrgpydtf6tyac7frcu6o  active  @alice, @bob
+mm-eng:incident-42       r1o6c8a1k3d8icd931qq1n6g4y  active  —
+mm-eng:dm:alice          iwihkhk9jpf3tngp14ushkx6pe  idle    @alice
+mm-eng:gdm:a3f9c1b2d4e5f607  cib3hjsrgpydtf6tyac7frcu6o  active  @alice, @bob
 ```
 
 `resolve()` (§2.8) accepts the label **or** the room id, so an operator always
@@ -512,11 +575,17 @@ operator asks. The hash remains the label; the header describes the room.
 **The header sources that description from the state record, not the frozen
 config.** The materialized config is a snapshot taken at creation (§2.4), so a
 group DM whose membership later changes would keep announcing its original
-members forever. `state.participants` is refreshed from inbound messages, so
-reading the header from there keeps the agent's stated sense of place true —
-which matters precisely because that header is also the "ask the agent which
-watcher this is" affordance. The frozen copy in the config stays as the drift
-baseline it exists to be; it is not what gets shown.
+members forever. `state.participants` is *intended* to be refreshed from
+inbound messages, so reading the header from there keeps the agent's stated
+sense of place true — which matters precisely because that header is also the
+"ask the agent which watcher this is" affordance. The frozen copy in the
+config stays as the drift baseline it exists to be; it is not what gets shown.
+
+> **Refresh deferred** (issue #124): the first implementation freezes
+> `state.participants` at creation too, because the message path carries no
+> participant set to refresh from — adding that carrier is its own change.
+> Until then the header and `list` show the creation-time members; nothing
+> keys on participants (above), so the staleness is display-only.
 
 One consequence worth stating: a Mattermost group DM's `channel_name` is itself
 a stable hash, so it *could* serve as the label. It is not used, because it is
@@ -568,7 +637,7 @@ config's `room` never contains pattern metacharacters.
 Note the split of duties this creates, deliberately: the **label** is a stable
 handle for addressing a watcher, while `room` is a human-meaningful
 *description* of where it lives. For a channel they coincide. For a group DM
-they diverge — label `gdm-a3f9c1b2`, room `@alice, @bob` — and the resolution
+they diverge — label `gdm:a3f9c1b2…`, room `@alice, @bob` — and the resolution
 paths that consume `room` must therefore not treat it as a lookup key. Room
 resolution already goes by `room_id` (§2.3), so the only requirement is that
 nothing regresses to resolving by this field.
@@ -683,6 +752,100 @@ A watcher can therefore exist as a record before it has ever run — which is
 what makes a newly-joined room listable and pausable before its first
 message.
 
+#### Defaults, and what a long outage does to them
+
+`session_idle_days: 15` and `session_expire_days: 15` — a month from last
+activity to reclamation. Chosen to sit in the range agent backends retain
+sessions for anyway, so the expectation an operator already has is the one this
+meets.
+
+Both timers are wall-clock and know nothing about whether ACG was running, so a
+daemon that is down for a week returns to find every record a week older. What
+keeps that survivable is **where each timer starts**, and the two halves of the
+fleet are protected differently.
+
+**Expiry is measured from the moment a watcher becomes idle — not from its last
+activity.** `dropped_at` is written when the sweep drops the watcher, so for a
+watcher that was *active* when the daemon stopped, the expiry clock begins at
+the first sweep after it starts and the outage is not counted at all.
+`active → expired` therefore cannot happen through an outage of any length.
+
+This requires one rule of the implementation, because the naive version breaks
+it: **a sweep advances a watcher by at most one state.** Deriving the final
+state from the timestamps and acting on it would take a watcher that was busy
+right up to the shutdown from `active` straight to `expired` in a single pass,
+deleting the session the `dropped_at` reset exists to protect. One step per
+sweep costs nothing and is what makes the guarantee above true.
+
+**A watcher that was already idle when the daemon stopped is not protected by
+that**, and this is accepted rather than solved. Its `dropped_at` predates the
+outage, and `idle → expired` is itself a single transition, so nothing but the
+size of the window helps: an outage longer than `session_expire_days` puts its
+session at risk. Three reasons this is a decision and not a gap:
+
+* **The case is uncommon.** With the defaults it takes more than two weeks of
+  continuous downtime, and a session nobody has touched in the month that
+  precedes it is one it is reasonable to let go.
+* **It has an operator remedy that needs no code.** A deployment that expects
+  long outages raises `session_expire_days`; the setting is per rule, so it can
+  be raised only where the sessions are worth keeping. Note the prerequisite:
+  a watcher reads the **frozen** rule it was created against (below), so until
+  config reload exists the raised value applies to watchers created after the
+  change. That suits the case — an operator who knows their environment has
+  long outages sets it up front — but it is prophylactic, not a repair applied
+  after the fact.
+* **The automatic version is not cheap.** Crediting the outage back means
+  persisting a heartbeat and subtracting the downtime when a TTL is evaluated —
+  and a single global downtime figure does not compose across repeated
+  restarts, since it remembers only the last one. A correct version needs
+  either a per-record accumulator or a boot-time mutation of
+  `last_activity_at`, and the second makes the record claim activity at a
+  moment there was none.
+
+Support for the outage case can be added later if a deployment shows it is
+needed. Nothing here is a one-way door: every §5.3 field defaults, so an
+accumulator is additive, and a heartbeat is a new file rather than a schema
+change.
+
+#### The lifecycle timers read the frozen rule, always
+
+A watcher evaluates its TTLs against the rule snapshot frozen at creation
+(§2.4) — never against the current `config.yaml`. There is deliberately no
+exception for "operational" fields:
+
+**One rule with a carve-out is a rule applied inconsistently.** "Identity comes
+from the frozen copy, policy from the current one" reads well and is a
+maintenance trap: every reader then has to know which half it is holding, and
+the answer for a room whose rule has since been *deleted* is a third case
+again. A watcher that always reads its own snapshot needs none of that.
+
+**It also gives the frozen copy a consumer.** §2.4 stores the resolved rule so
+drift can be detected, and drift detection has had no caller: the snapshot has
+been groundwork waiting for one. Updating a live watcher's rule becomes an
+explicit step — diff the current rule against the frozen one and apply the
+difference — rather than a value that silently changes meaning on the next
+sweep. An operator can then see what a config change did, which the silent
+version cannot offer.
+
+So the config-reload capability owns rule updates, and this section owns only
+the reading: **the sweep reads what the record carries.** Until reload exists,
+a rule edit reaches existing watchers by the blunt route — expire the watcher,
+let the next message recreate it against the current rule.
+
+**One ordering constraint is not optional, whatever the arithmetic does:** the
+first expiry sweep must not run until the startup replay (§2.2) has finished.
+Expiry is the destructive step — it deletes the record recreation reads from —
+and the replay's whole job is reviving rooms that have messages waiting. A
+sweep that runs first reclaims exactly the rooms the replay was about to wake,
+irreversibly.
+
+**A related question the lifecycle increment has to answer**, and it is not
+settled by "boot recreates active records only" below: a record that was
+`active` at shutdown has no `dropped_at`, so between the start and whatever
+processes it, it is neither resident nor dropped — and `lifecycle_state` reads
+that as **`failed`**, which is in the default `list` view. What it must not do
+is leave `list` reporting a healthy fleet as broken after every restart.
+
 #### `failed`: a record that wants to be resident and is not
 
 A start writes its record partway through, before the room subscription and the
@@ -774,6 +937,23 @@ whose staleness is a second bug. Under rule-derived creation the same reasoning
 gives the per-room park a deliberately short memory: a resolve that keeps
 failing backs off and parks **in process only** (§2.7), and a restart clears the
 park and tries again.
+
+**One qualification, ruled during the idle-tick increment's review: a failed
+record whose room has also been quiet past its idle TTL converts to `idle` at
+boot instead of being retried.** The boot evaluation cannot tell was-active
+from failed — the rollback table above is why no field distinguishes them —
+and it judges both by the same clock. The conversion is deliberate rather than
+an accident of that blindness: reviving a room nobody has spoken in for
+`session_idle_days` just to have it sit resident is the resume cost the boot
+evaluation exists to avoid paying, and the record's next message or scheduled
+injection retries the start through the wake anyway. What it costs is
+visibility — `idle` is outside the default `list` view, so a broken watcher
+whose room went quiet stops being reported after the first restart past its
+TTL. Accepted because the staleness bounds the harm: the failure is at least
+`session_idle_days` old, nobody has been affected by it in all that time, and
+the wake retries it the moment somebody would be. Retry-on-every-start remains
+the rule for every failed record *inside* its idle TTL — the case where
+someone is plausibly waiting.
 
 ##### `failed` is in the default `list` view
 
@@ -1196,6 +1376,19 @@ The room becomes listable and addressable immediately; the first message
 wakes it through the normal path. This reuses the existing idle state rather
 than inventing a fourth one.
 
+Reusing idle means inheriting its expiry: the registered record's
+`dropped_at` is the join instant — being born idle, that *is* the moment it
+became idle — so a room nobody ever speaks in is reclaimed
+`session_expire_days` after the join. Accepted deliberately (owner,
+2026-08-17), and the usual pattern makes it the uncommon case anyway: a bot
+is normally added to a room *in order to* be spoken to, and the first message
+makes the watcher active. A registration that expires never-spoken had no
+session to lose — the record is the only thing reclaimed, and a later first
+message recreates it at full fidelity through the same path it would have
+taken anyway. Once woken, the join time never participates in any calculation
+again; a later quiet spell restamps `dropped_at` and expiry measures from the
+new stamp.
+
 Three properties this must have:
 
 - **It is a supplement, never a replacement.** Mattermost's websocket has no
@@ -1383,6 +1576,12 @@ wrong — a job scheduled a year out would hold a session resident for a year
 for nothing. Expiry is the destructive step, because it deletes the record
 the recreation reads from, leaving the job pointing at nothing. So expiry
 skips any room with a pending job.
+
+"Pending" includes **paused** jobs, not only active ones (owner, 2026-08-17):
+a pause is "not now", not "never" — deleting the record under a paused job
+would orphan it the moment an operator resumes it, and the operator's next
+move after resuming would be wondering why the job fires at nothing. Only a
+completed job stops holding its room.
 
 One interaction worth stating: a room idle for a long time will have had its
 session deleted by the agent backend regardless of what ACG persisted
@@ -1681,6 +1880,50 @@ Independently shippable, and each is a separate change. The first two are
 
 ### 5.2 Connector interface
 
+#### Timestamps: one representation inside, ISO only where a human reads it
+
+Two representations are in play and nothing said which went where, so a value
+that looked right crossed an interface that wanted the other one. The rule:
+
+> **Every timestamp crossing an ACG interface is epoch milliseconds as a
+> string.** ISO-8601 appears in exactly two places, both of them edges: what
+> the control socket accepts from an operator, and what `fetch_room_history`
+> returns *inside its message dicts*, which an agent reads.
+
+This is not a new convention — it is the one the system already followed almost
+everywhere. `get_last_processed_ts`, `update_last_processed_ts`,
+`probe_missed_since`, `replay_room_since`, both connectors' message-timestamp
+extraction, `WatcherState.last_processed_ts`, `claim_boundary`, `just_before`
+and the replay filter are all epoch-ms today. Writing it down closes the two
+that were not.
+
+**Why epoch-ms and not ISO**, given ISO is the friendlier form: the comparison
+helpers are numeric. `ts_to_float` cannot parse ISO at all, so `ts_gt` falls
+through to a *string* comparison — and `ts_gt(iso, epoch)` is therefore `True`
+for every pair a deployment can currently produce, regardless of which instant
+is actually later, because `"2026…" > "1786…"`. That accident expires when
+epoch-ms crosses `"2000000000000"` in 2033. `just_before(iso)` is worse: it
+returns its argument unchanged, so a bound meant to be exclusive silently is
+not. A representation that the ordering primitives cannot order is not a
+candidate for the internal one.
+
+**Consequences at the two edges:**
+
+* The control socket keeps accepting ISO from operators — it is the only
+  human-typed timestamp in the system — and converts once, at that boundary,
+  before calling any connector method.
+* `fetch_room_history`'s `before_ts`/`after_ts` are epoch-ms like everything
+  else. Its *return* dicts keep ISO in their `ts` field: that value is read by
+  an agent, not compared by ACG.
+
+**The failure this closes**, recorded because it was silent: connectors were
+free to differ on tolerance. Rocket.Chat's bound normalizer accepted both forms
+and Mattermost's raised on the wrong one, so the same epoch-ms value worked on
+one connector and, on the other, raised into a blanket `except` that logged
+"starting without history" — every recreation that minted a fresh session lost
+its handoff, on the exact path the bound exists to serve. One documented
+contract, two behaviours, no test that could see it.
+
 ```python
 class Connector(ABC):
     # new
@@ -1756,7 +1999,7 @@ Records are keyed on `(connector, room_id)`. Added to each record:
 
 | Field | Purpose |
 |---|---|
-| `room_name` | the platform's own name, refreshed from inbound messages; empty for DMs |
+| `room_name` | a human-readable description of the room, refreshed from inbound messages: the platform's name for a named room, the counterpart or participant list for the DM kinds (§2.3). Display only — nothing keys on it |
 | `room_kind` | `channel` / `group` / `dm` / `group_dm` — decides the label form and whether `require_mention` applies (§2.7) |
 | `participants` | DM counterparts, for the `list` column; refreshed, never part of a key |
 | `connector`, `agent` | so a rule edit cannot silently re-point a dormant session |

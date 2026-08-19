@@ -2,22 +2,27 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/HammerMei/agent-chat-gateway/main/gateway/schema/config.schema.json",
   "title": "agent-chat-gateway config.yaml",
-  "description": "Hand-written schema for editor autocomplete / typo-checking of config.yaml. It intentionally does NOT re-validate every connector-type-specific field (server/allowed_users/attachments/agent_chain vary by connector 'type') — that stays the job of `acg config validate`. See docs/migration-0.3.md for the format this schema describes (v0.3+: connector_templates/agent_templates/watcher_templates + per-entry 'inherits:', tool_presets, watcher rooms:).",
+  "description": "Hand-written schema for editor autocomplete / typo-checking of config.yaml. It intentionally does NOT re-validate every connector-type-specific field (server/allowed_users/attachments/agent_chain vary by connector 'type') \u2014 that stays the job of `acg config validate`. See docs/migration-0.3.md for the format this schema describes (v0.3+: connector_templates/agent_templates/watcher_templates + per-entry 'inherits:', tool_presets, watcher rooms:).",
   "type": "object",
   "additionalProperties": false,
-  "required": ["connectors", "agents"],
+  "required": [
+    "connectors",
+    "agents"
+  ],
   "properties": {
     "tool_presets": {
       "type": "object",
       "description": "Named, reusable lists of inline tool rules. Reference a preset by name from owner_allowed_tools/guest_allowed_tools. A preset's own list may only contain inline rules (no preset-of-presets).",
       "additionalProperties": {
         "type": "array",
-        "items": { "$ref": "#/$defs/toolRule" }
+        "items": {
+          "$ref": "#/$defs/toolRule"
+        }
       }
     },
     "agent_templates": {
       "type": "object",
-      "description": "Named, reusable field blocks for agents. Reference one by name via an agent's 'inherits:' field (the agent's own fields win on conflict; flat one-tier merge — no nested templates).",
+      "description": "Named, reusable field blocks for agents. Reference one by name via an agent's 'inherits:' field (the agent's own fields win on conflict; flat one-tier merge \u2014 no nested templates).",
       "additionalProperties": {
         "type": "object",
         "properties": {
@@ -26,12 +31,16 @@
             "description": "Optional annotation for this template (informational only; never merged into entries)."
           }
         },
-        "not": { "required": ["inherits"] }
+        "not": {
+          "required": [
+            "inherits"
+          ]
+        }
       }
     },
     "connector_templates": {
       "type": "object",
-      "description": "Named, reusable field blocks for connectors. Reference one by name via a connector's 'inherits:' field. Must not set 'name' — that identifies a specific connector. No nested templates.",
+      "description": "Named, reusable field blocks for connectors. Reference one by name via a connector's 'inherits:' field. Must not set 'name' \u2014 that identifies a specific connector. No nested templates.",
       "additionalProperties": {
         "type": "object",
         "properties": {
@@ -42,15 +51,23 @@
         },
         "not": {
           "anyOf": [
-            { "required": ["name"] },
-            { "required": ["inherits"] }
+            {
+              "required": [
+                "name"
+              ]
+            },
+            {
+              "required": [
+                "inherits"
+              ]
+            }
           ]
         }
       }
     },
     "watcher_templates": {
       "type": "object",
-      "description": "Named, reusable field blocks for watchers. Reference one by name via a watcher's 'inherits:' field. Must not set 'name', 'room', or 'rooms' — those identify a specific watcher — nor 'session_id', which is removed entirely (sessions are no longer pinned from config; use a handoff file via context_inject_files). No nested templates.",
+      "description": "Named, reusable field blocks for watchers. Reference one by name via a watcher's 'inherits:' field. Must not set 'name', 'room', or 'rooms' \u2014 those identify a specific watcher \u2014 nor 'session_id', which is removed entirely (sessions are no longer pinned from config; use a handoff file via context_inject_files). No nested templates.",
       "additionalProperties": {
         "type": "object",
         "properties": {
@@ -61,11 +78,31 @@
         },
         "not": {
           "anyOf": [
-            { "required": ["name"] },
-            { "required": ["room"] },
-            { "required": ["rooms"] },
-            { "required": ["session_id"] },
-            { "required": ["inherits"] }
+            {
+              "required": [
+                "name"
+              ]
+            },
+            {
+              "required": [
+                "room"
+              ]
+            },
+            {
+              "required": [
+                "rooms"
+              ]
+            },
+            {
+              "required": [
+                "session_id"
+              ]
+            },
+            {
+              "required": [
+                "inherits"
+              ]
+            }
           ]
         }
       }
@@ -73,12 +110,16 @@
     "connectors": {
       "type": "array",
       "minItems": 1,
-      "items": { "$ref": "#/$defs/connector" }
+      "items": {
+        "$ref": "#/$defs/connector"
+      }
     },
     "agents": {
       "type": "object",
       "minProperties": 1,
-      "additionalProperties": { "$ref": "#/$defs/agent" }
+      "additionalProperties": {
+        "$ref": "#/$defs/agent"
+      }
     },
     "default_agent": {
       "type": "string",
@@ -86,7 +127,9 @@
     },
     "watchers": {
       "type": "array",
-      "items": { "$ref": "#/$defs/watcher" }
+      "items": {
+        "$ref": "#/$defs/watcher"
+      }
     },
     "max_queue_depth": {
       "type": "integer",
@@ -97,7 +140,10 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "completed_job_ttl_days": { "type": "integer", "minimum": 0 }
+        "completed_job_ttl_days": {
+          "type": "integer",
+          "minimum": 0
+        }
       }
     }
   },
@@ -105,7 +151,9 @@
     "toolRule": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["tool"],
+      "required": [
+        "tool"
+      ],
       "properties": {
         "tool": {
           "type": "string",
@@ -120,37 +168,66 @@
     "toolEntry": {
       "description": "Either the name of a 'tool_presets:' entry (string), or an inline tool rule (object). The two forms may be freely mixed in one list.",
       "oneOf": [
-        { "type": "string" },
-        { "$ref": "#/$defs/toolRule" }
+        {
+          "type": "string"
+        },
+        {
+          "$ref": "#/$defs/toolRule"
+        }
       ]
     },
     "permissions": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "enabled": { "type": "boolean" },
-        "timeout": { "type": "integer", "minimum": 0 },
-        "skip_owner_approval": { "type": "boolean" }
+        "enabled": {
+          "type": "boolean"
+        },
+        "timeout": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "skip_owner_approval": {
+          "type": "boolean"
+        }
       }
     },
     "historyHandoff": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "enabled": { "type": "boolean" },
-        "fetch_count": { "type": "integer", "minimum": 0 },
-        "verbatim_tail": { "type": "integer", "minimum": 0 }
+        "enabled": {
+          "type": "boolean"
+        },
+        "fetch_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "verbatim_tail": {
+          "type": "integer",
+          "minimum": 0
+        }
       }
     },
     "connector": {
       "type": "object",
-      "description": "additionalProperties is intentionally left open — server/allowed_users/attachments/agent_chain and other fields vary by connector 'type' (rocketchat/mattermost/voice/script) and are validated by each connector's own config parser, not by this schema.",
-      "required": ["name", "type"],
+      "description": "additionalProperties is intentionally left open \u2014 server/allowed_users/attachments/agent_chain and other fields vary by connector 'type' (rocketchat/mattermost/voice/script) and are validated by each connector's own config parser, not by this schema.",
+      "required": [
+        "name",
+        "type"
+      ],
       "properties": {
-        "name": { "type": "string" },
+        "name": {
+          "type": "string"
+        },
         "type": {
           "type": "string",
-          "enum": ["rocketchat", "mattermost", "voice", "script"]
+          "enum": [
+            "rocketchat",
+            "mattermost",
+            "voice",
+            "script"
+          ]
         },
         "description": {
           "type": "string",
@@ -162,7 +239,9 @@
         },
         "context_inject_files": {
           "type": "array",
-          "items": { "type": "string" }
+          "items": {
+            "type": "string"
+          }
         }
       }
     },
@@ -180,60 +259,86 @@
         },
         "type": {
           "type": "string",
-          "enum": ["claude", "opencode"],
-          "description": "Required (directly or via an inherits: agent_templates entry) — no fallback."
+          "enum": [
+            "claude",
+            "opencode"
+          ],
+          "description": "Required (directly or via an inherits: agent_templates entry) \u2014 no fallback."
         },
         "command": {
           "type": "string",
-          "description": "Defaults based on 'type' when omitted ('claude' for type: claude, 'opencode' for type: opencode) — not a single fixed fallback."
+          "description": "Defaults based on 'type' when omitted ('claude' for type: claude, 'opencode' for type: opencode) \u2014 not a single fixed fallback."
         },
         "new_session_args": {
           "type": "array",
-          "items": { "type": "string" }
+          "items": {
+            "type": "string"
+          }
         },
         "working_directory": {
           "type": "string",
           "description": "Required (directly or via an inherits: agent_templates entry); must exist on disk when the gateway loads."
         },
-        "session_prefix": { "type": "string" },
-        "lazy_instruction_loading": { "type": "boolean" },
+        "session_prefix": {
+          "type": "string"
+        },
+        "lazy_instruction_loading": {
+          "type": "boolean"
+        },
         "context_inject_files": {
           "type": "array",
-          "items": { "type": "string" }
+          "items": {
+            "type": "string"
+          }
         },
         "owner_allowed_tools": {
           "type": "array",
-          "items": { "$ref": "#/$defs/toolEntry" }
+          "items": {
+            "$ref": "#/$defs/toolEntry"
+          }
         },
         "guest_allowed_tools": {
           "type": "array",
-          "items": { "$ref": "#/$defs/toolEntry" }
+          "items": {
+            "$ref": "#/$defs/toolEntry"
+          }
         },
         "timeout": {
           "type": "integer",
           "minimum": 1,
           "description": "Must be greater than permissions.timeout."
         },
-        "permissions": { "$ref": "#/$defs/permissions" }
+        "permissions": {
+          "$ref": "#/$defs/permissions"
+        }
       }
     },
     "watcher": {
-      "description": "A 'watchers:' entry, in either shape. The two are told apart by the type of 'rooms': an object is a rule (docs/design/dynamic-watcher-design.md §2.1), an array is the static multi-room shorthand. Exactly one branch can match, so 'oneOf' is a discriminated union rather than a guess. Both are accepted while the rule path is being built; the static branch is removed at cutover.",
-      "oneOf": [
-        { "$ref": "#/$defs/staticWatcher" },
-        { "$ref": "#/$defs/watcherRule" }
-      ]
+      "description": "A 'watchers:' entry \u2014 a watcher RULE (docs/design/dynamic-watcher-design.md \u00a72.1). The static shape ('room:', or 'rooms:' as an array) was removed at cutover; the loader refuses it with a pointer at docs/migration-dynamic-watchers.md, and this schema matches that refusal rather than dual-accepting a shape nothing runs.",
+      "$ref": "#/$defs/watcherRule"
     },
     "dmOptIn": {
-      "description": "Opt in to a DM class. Only true/false is accepted by the loader today. The object form is reserved for per-DM include/except_for (§2.7) and is accepted here so that adding it later extends this union instead of changing the schema's shape — a config written against the newer loader still validates against this schema.",
+      "description": "Opt in to a DM class. Only true/false is accepted by the loader today. The object form is reserved for per-DM include/except_for (\u00a72.7) and is accepted here so that adding it later extends this union instead of changing the schema's shape \u2014 a config written against the newer loader still validates against this schema.",
       "anyOf": [
-        { "type": "boolean" },
+        {
+          "type": "boolean"
+        },
         {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "include": { "type": "array", "items": { "type": "string" } },
-            "except_for": { "type": "array", "items": { "type": "string" } }
+            "include": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "except_for": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
           }
         }
       ]
@@ -241,7 +346,10 @@
     "watcherRule": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "rooms"],
+      "required": [
+        "name",
+        "rooms"
+      ],
       "properties": {
         "description": {
           "type": "string",
@@ -254,10 +362,14 @@
         "name": {
           "type": "string",
           "minLength": 1,
-          "description": "The rule's identity — required and unique. Unlike the static shape there is no single room to derive a name from, and this is what shadowing warnings and persisted rule_name refer to."
+          "description": "The rule's identity \u2014 required and unique. Unlike the static shape there is no single room to derive a name from, and this is what shadowing warnings and persisted rule_name refer to."
         },
-        "connector": { "type": "string" },
-        "agent": { "type": "string" },
+        "connector": {
+          "type": "string"
+        },
+        "agent": {
+          "type": "string"
+        },
         "rooms": {
           "type": "object",
           "additionalProperties": false,
@@ -265,89 +377,51 @@
           "properties": {
             "include": {
               "type": "array",
-              "items": { "type": "string" },
+              "items": {
+                "type": "string"
+              },
               "description": "Globs ('*', '?', '[...]') matched against the room's full name, anchored at both ends, case-sensitively. Required unless the rule opts into DMs only."
             },
             "except_for": {
               "type": "array",
-              "items": { "type": "string" },
-              "description": "Evaluated after include, within this rule. An excluded room does NOT fall through to a later rule — this rule claimed it and then declined it."
+              "items": {
+                "type": "string"
+              },
+              "description": "Evaluated after include, within this rule. An excluded room does NOT fall through to a later rule \u2014 this rule claimed it and then declined it."
             },
-            "direct": { "$ref": "#/$defs/dmOptIn" },
-            "group_direct": { "$ref": "#/$defs/dmOptIn" }
+            "direct": {
+              "$ref": "#/$defs/dmOptIn"
+            },
+            "group_direct": {
+              "$ref": "#/$defs/dmOptIn"
+            }
           }
         },
         "session_idle_days": {
-          "type": ["integer", "null"],
+          "type": [
+            "integer",
+            "null"
+          ],
           "minimum": 1,
           "description": "Days with no message before this watcher's runtime object is dropped (session kept). Lives on the rule rather than the agent so two rules sharing an agent can differ. Must be strictly less than session_expire_days when both are set."
         },
         "session_expire_days": {
-          "type": ["integer", "null"],
+          "type": [
+            "integer",
+            "null"
+          ],
           "minimum": 1,
           "description": "Days with no message before the session itself is dropped too."
         },
         "context_inject_files": {
           "type": "array",
-          "items": { "type": "string" }
+          "items": {
+            "type": "string"
+          }
         },
-        "online_notification": { "type": ["string", "null"] },
-        "offline_notification": { "type": ["string", "null"] },
-        "history_handoff": { "$ref": "#/$defs/historyHandoff" }
-      }
-    },
-    "staticWatcher": {
-      "type": "object",
-      "additionalProperties": false,
-      "allOf": [
-        {
-          "anyOf": [
-            { "required": ["room"] },
-            { "required": ["rooms"] }
-          ]
-        },
-        {
-          "not": { "required": ["room", "rooms"] }
+        "history_handoff": {
+          "$ref": "#/$defs/historyHandoff"
         }
-      ],
-      "properties": {
-        "description": {
-          "type": "string",
-          "description": "Optional annotation for this watcher (informational only; ignored at runtime)."
-        },
-        "inherits": {
-          "type": "string",
-          "description": "Name of a 'watcher_templates:' entry to deep-merge as this watcher's base (this watcher's own fields win on conflict)."
-        },
-        "name": {
-          "type": "string",
-          "description": "Only allowed when the entry has exactly one room; auto-derived from connector+room otherwise."
-        },
-        "connector": { "type": "string" },
-        "room": {
-          "type": "string",
-          "description": "Exactly one room; alias for rooms: [<room>]."
-        },
-        "rooms": {
-          "type": "array",
-          "minItems": 1,
-          "items": { "type": "string" },
-          "description": "Bind this connector+agent pair to several rooms at once; expands into one watcher per room."
-        },
-        "exclude_room": {
-          "type": "array",
-          "minItems": 1,
-          "items": { "type": "string" },
-          "description": "Only meaningful once room: \"*\" (rule-based room matching) is implemented; the loader currently rejects room: \"*\" outright with a 'not implemented yet' error regardless of this field. See docs/design/dynamic-watcher-design.md."
-        },
-        "agent": { "type": "string" },
-        "context_inject_files": {
-          "type": "array",
-          "items": { "type": "string" }
-        },
-        "online_notification": { "type": ["string", "null"] },
-        "offline_notification": { "type": ["string", "null"] },
-        "history_handoff": { "$ref": "#/$defs/historyHandoff" }
       }
     }
   }

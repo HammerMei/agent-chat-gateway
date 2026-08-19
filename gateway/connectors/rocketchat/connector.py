@@ -24,6 +24,7 @@ from pathlib import Path
 from ...agents.response import AgentEvent, AgentResponse
 from ...core.adapter_utils import ts_gt as _ts_gt
 from ...core.adapter_utils import ts_ms_to_iso_local, weekday_abbrev
+from ...core.adapter_utils import ts_to_float as _ts_to_float
 from ...core.bot_identity import (
     BotIdentity,
     ConnectorIdentityError,
@@ -37,6 +38,13 @@ from ...core.connector import (
     Room,
     RoomCapacity,
 )
+from ...core.dispatch import RoomAlreadyRoutedError
+from ...core.paths import resolve_under
+from ...core.pending_route import (
+    STARTING_UP_NOTICE,
+    PendingRoute,
+    route_attempts,
+)
 from ...core.replay_window import ReplayWindow
 from ...core.replay_window import just_before as _just_before
 from ...core.sender_policy import sender_allowed
@@ -46,7 +54,12 @@ from ...core.watcher_rule import RoomKind
 from .agent_chain import TurnStore
 from .config import RocketChatConfig
 from .mentions import is_room_wide_mention
-from .normalize import FilterResult, filter_rc_message, normalize_rc_message
+from .normalize import (
+    FilterResult,
+    extract_ts,
+    filter_rc_message,
+    normalize_rc_message,
+)
 from .outbound import send_media as _send_media
 from .outbound import send_text as _send_text
 from .policy import apply_thread_policy
@@ -54,6 +67,18 @@ from .rest import RocketChatREST, RoomNotFoundError, room_type_for
 from .websocket import RCWebSocketClient
 
 logger = logging.getLogger("agent-chat-gateway.connectors.rocketchat")
+
+
+class ClassificationUnavailable(Exception):
+    """A room's kind could not be determined *this time* — retryable (§2.2).
+
+    Raised instead of returning None because the routing transaction needs the
+    two apart: None from `_room_ref_from_access` is a **final** decline (a room
+    with no name, a direct room the server says has no counterpart — conditions
+    a retry cannot change), while this is an **abort** — the classification was
+    never made, so the routing decision was never made, and the message must
+    stay eligible for redelivery rather than being committed as decided.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +241,17 @@ class RocketChatConnector(Connector):
 
     _TEXT_CHUNK_LIMIT = 40_000
 
+    # One routing episode's buffer — matches the transport's per-room queue
+    # depth, since a room that cannot hold this many live frames has no better
+    # claim to hold more while it is being created.
+    _PENDING_BUFFER_DEPTH = 50
+    # Bounded backoff for the two retryable resolution stages (§2.2): a
+    # classification the network ate, and a creation that raised. Three retries,
+    # ~3.5s worst case, holding one of the four routing workers — bounded on
+    # purpose, because an unbounded retry would turn one dead REST endpoint
+    # into a parked worker pool.
+    _ROUTE_RETRY_DELAYS: tuple[float, ...] = (0.5, 1.0, 2.0)
+
     def __init__(self, config: RocketChatConfig) -> None:
         self._config = config
         self._rest = RocketChatREST(config.server_url)
@@ -230,12 +266,36 @@ class RocketChatConnector(Connector):
         ] = {}  # room_id -> [watcher...]
         self._room_refcount: dict[str, int] = {}  # room_id -> subscriber count
         self._router = None
-        # Rooms currently being offered to the router. The routing workers are a pool, so
+        self._membership_hook = None
+        # Room-level membership-loss generation (Codex review of #121, round
+        # 2). `membership_epoch` lives on the subscription OBJECT and dies
+        # with it, so a delivery holding subscription A could not see a loss
+        # that marked its replacement B before re-add installed C — three
+        # transitions inside one flight, and the commit fence would have
+        # redirected a pre-removal watermark into the new membership. This
+        # counter belongs to the ROOM: every membership-loss site bumps it,
+        # a delivery captures it at entry, and the fence refuses to redirect
+        # across a bump, whichever object the loss happened to mark.
+        self._room_membership_gen: dict[str, int] = {}
+        # Per-room serialization of membership HOOK calls — see
+        # `_on_membership_event`. Keyed and retained like the generation.
+        self._membership_serial: dict[str, asyncio.Lock] = {}
+        # Rooms with an open routing episode. The routing workers are a pool, so
         # several frames from one untracked room can be in flight at once — and offering a
         # room is slow (a DM needs `im.members` before it can even be classified), which
         # makes the overlap the normal case for a room that has just started talking rather
-        # than a rare one. Two offers for one room are two watchers and two sessions for it.
-        self._rooms_being_routed: set[str] = set()
+        # than a rare one. Two offers for one room are two watchers and two sessions for
+        # it, which is what the single open episode prevents; the frames that arrive
+        # during it wait in the episode's bounded buffer instead of being dropped (§2.7
+        # step 3) and are drained in arrival order when it ends.
+        self._pending_routes: dict[str, PendingRoute] = {}
+        # Episodes opened from the *tracked* path (§2.5, the wake): the untracked path
+        # runs its episode inline on a routing worker, but the tracked handler runs on
+        # the room's own worker, and awaiting a creation there would stall the very
+        # queue the drain is about to deliver into. Strong references, because a task
+        # nothing holds is collected mid-flight; discarded on completion, cancelled and
+        # gathered on disconnect — the same shape Mattermost's `_routing_tasks` has.
+        self._routing_tasks: set[asyncio.Task] = set()
         # What `start_inbound` decided, once — **not** whether the stream is live now, and
         # nothing may read it as that. The stream can die under a healthy socket, and a copy
         # of its liveness would go on saying otherwise while a watcher added in that window
@@ -313,10 +373,46 @@ class RocketChatConnector(Connector):
             "Rocket.Chat delivery: %s",
             "all rooms" if self._subscribe_all else "per room",
         )
+        if not self._subscribe_all:
+            # Post-cutover, rules are the only watcher shape and they DEPEND
+            # on unsolicited delivery for discovery (Codex round 7). In
+            # per-room fallback the blast radius is worse than "degraded":
+            # rooms whose watchers started this boot keep working; an idle
+            # record wakes only if the boot replay found messages already
+            # waiting (the REST probe still works) — a message arriving
+            # LATER reaches no subscription, so the room is deaf until the
+            # next restart; and a genuinely new matching room or a
+            # membership add is never discovered at all. Loud, not fatal:
+            # the running rooms are real service worth keeping.
+            logger.error(
+                "Rocket.Chat: the server refused the all-rooms subscription, "
+                "so delivery is per-room only. Watchers running now keep "
+                "working, but idle rooms cannot wake on new messages until "
+                "the next restart, and NEW rooms matching your rules will "
+                "not be discovered. Rule-based discovery needs a server that "
+                "allows streaming '__my_messages__'."
+            )
+        if self._membership_hook is not None:
+            # Gated like the router that gates this method: no hook, no wire
+            # cost. A refusal is degraded rather than fatal — joins are
+            # discovered by first messages, removals by the reconciliation.
+            await self._ws.subscribe_membership_events()
 
     async def disconnect(self) -> None:
-        """Close the WebSocket and release HTTP client resources."""
+        """Close the WebSocket and release HTTP client resources.
+
+        The transport stops **first**: the room workers are what spawn wake
+        episodes (§2.5), so cancelling `_routing_tasks` before they stop lets
+        a worker spawn a newcomer during the gather — never cancelled, and
+        `clear()` then drops its only strong reference while it runs against a
+        dead transport. Stop the spawner, then harvest.
+        """
         await self._ws.stop()
+        for task in list(self._routing_tasks):
+            task.cancel()
+        if self._routing_tasks:
+            await asyncio.gather(*self._routing_tasks, return_exceptions=True)
+        self._routing_tasks.clear()
         await self._rest.close()
         logger.info("RocketChatConnector disconnected")
 
@@ -367,241 +463,295 @@ class RocketChatConnector(Connector):
         fall below the last-processed timestamp.
         """
         logger.info("WebSocket reconnected — replaying missed messages for %d room(s)", len(self._rooms))
-        for room_id, sub in list(self._rooms.items()):
-            # Snapshot the watermark NOW, before any await in this iteration.
-            # The live DDP listen loop runs concurrently: awaiting get_room_history
-            # for an earlier room yields the event loop and allows live messages for
-            # subsequent rooms to advance their last_processed_ts.  If we read the
-            # watermark inside the await we would use a newer ts that skips the
-            # entire outage window for those rooms.
-            # Captured so the completion below can tell whether anyone has claimed this
-            # window since. A live message rejected for capacity while this batch is
-            # dispatching claims the boundary, and closing it on this batch's success
-            # loses that message: the next accepted message advances the watermark past it
-            # and nothing points below it any more.
+        for room_id in list(self._rooms):
+            await self.replay_room_since(room_id)
+
+    async def replay_room_since(
+        self, room_id: str, after_ts: str | None = None
+    ) -> None:
+        """Replay one tracked room's outage window.
+
+        The per-room half of the reconnect replay, and deliberately shared with
+        the startup replay (§2.2): "cannot copy the reconnect path" forbids the
+        *iteration source* — reconnect walks live subscriptions, startup walks
+        persisted records — not the fetch-and-inject this method owns. The room
+        must already be tracked; startup recreates the watcher first.
+
+        Everything is re-injected through the normal filter/normalize/dispatch
+        pipeline with the replay flags set, so the id window and the watermark
+        dedup the frames that also arrived live.
+
+        ``after_ts`` names the window explicitly. Without it the room's own
+        marks are read, which is the reconnect case. With it — the startup and
+        post-park cases — the caller is asking about a window it froze earlier,
+        and **the boundary is not discharged**: that mark belongs to the room's
+        own hand-back accounting, and a replay that read a different window has
+        no claim to spend it. Leaving it costs one deduped re-read at the next
+        reconnect; spending it wrongly costs a window nobody ever reads.
+        """
+        sub = self._rooms.get(room_id)
+        if sub is None:
+            return
+        # An explicitly named window is not this room's boundary to spend.
+        external_window = after_ts is not None
+        # Snapshot the watermark NOW, before any await in this iteration.
+        # The live DDP listen loop runs concurrently: awaiting get_room_history
+        # for an earlier room yields the event loop and allows live messages for
+        # subsequent rooms to advance their last_processed_ts.  If we read the
+        # watermark inside the await we would use a newer ts that skips the
+        # entire outage window for those rooms.
+        # Captured so the completion below can tell whether anyone has claimed this
+        # window since. A live message rejected for capacity while this batch is
+        # dispatching claims the boundary, and closing it on this batch's success
+        # loses that message: the next accepted message advances the watermark past it
+        # and nothing points below it any more.
+        #
+        # The *claim count*, not the value. A hand-back inside a replay claims the
+        # window the replay is already reading, so it writes back the same timestamp —
+        # comparing values reports "unchanged" for precisely the case this guard is
+        # for. That was the bug, and it read as correct for four review rounds.
+        claims_at_entry = sub.boundary_claims
+
+        # The outage boundary if one was captured, and the live watermark only as a
+        # fallback for a replay that no outage callback preceded. Cleared where the
+        # history is actually read, not here — a replay that declines below (membership
+        # unknown, or the fetch failing) has not read the window, and dropping the mark
+        # would close a gap nobody looked at. Those two failures are correlated with the
+        # outage itself, so this is the likely path, not the exotic one.
+        watermark = after_ts or sub.replay_boundary or sub.last_processed_ts
+        if not watermark:
+            logger.debug(
+                "Room '%s': no watermark yet — skipping replay", sub.room.name
+            )
+            return
+
+        # Membership is re-established before the outage is replayed, because the
+        # outage is exactly when it can have changed and nobody was listening. The
+        # live path is gated on `roomParticipant` (see `_on_raw_ddp_message`); replay
+        # has no access object to read it from, so it asks. Without this, an account
+        # removed from a public channel mid-outage still replays that channel — REST
+        # history for a public channel does not require membership, so the fetch
+        # succeeds and the agent answers in a room it was thrown out of.
+        # Read before the lookup, and compared again around every await below. The
+        # fetch is a REST round trip and the dispatch loop is up to 200 handler calls;
+        # a live rejection arriving anywhere inside that is news this batch has to act
+        # on, and it cannot see the cleared marks because it is holding a snapshot.
+        epoch = sub.membership_epoch
+        member = await self._rest.is_room_member(sub.room.id)
+        if sub.membership_epoch != epoch:
+            logger.warning(
+                "Room '%s': this account was removed while its membership was being "
+                "checked — abandoning the replay",
+                sub.room.name,
+            )
+            return
+        if member is False:
+            # Removed, confirmed. Both marks are dropped, not just the boundary: an
+            # account that is later re-added would otherwise replay from before its
+            # removal, delivering everything said while it was not in the room. A
+            # retained boundary is a promise to read that window later, and after a
+            # removal nobody is entitled to read it.
             #
-            # The *claim count*, not the value. A hand-back inside a replay claims the
-            # window the replay is already reading, so it writes back the same timestamp —
-            # comparing values reports "unchanged" for precisely the case this guard is
-            # for. That was the bug, and it read as correct for four review rounds.
-            claims_at_entry = sub.boundary_claims
+            # The watermark has to go with it, because the watermark *is* the fallback
+            # boundary and it is frozen at the moment of removal — the live gate
+            # remembers a rejected id without advancing it. Left in place, a reconnect
+            # that arrives before the first post-re-add message would snapshot that
+            # frozen value and replay the whole time away. Empty means what it means
+            # for a room seen for the first time: no window, and ts-dedup off until
+            # live traffic establishes one (`normalize.py`, step 4).
+            sub.left_the_room()
+            self._note_membership_loss(room_id)
+            logger.warning(
+                "Room '%s': this account is no longer a member — skipping replay and "
+                "closing the outage window; a later re-add starts from that point, "
+                "not from before the removal",
+                sub.room.name,
+            )
+            return
+        if member is None:
+            # Unknown is not removal. The lookup failing is correlated with the outage
+            # itself, so this is the likely path, and the window stays open for the
+            # next attempt to read.
+            #
+            # For an EXTERNAL window (the wake, the startup replay) "stays open"
+            # is not automatic (Codex review of #121): the caller's mark lives in
+            # the record, this subscription is fresh, and the triggering message
+            # commits a newer watermark moments after this return — past the
+            # whole unread interval, permanently. Whoever fails to replay owns
+            # keeping the window reachable, so the failure claims it here.
+            if external_window:
+                sub.claim_boundary(after_ts)
+            logger.warning(
+                "Room '%s': membership could not be established — skipping replay; "
+                "live delivery is unaffected and the next reconnect will ask again",
+                sub.room.name,
+            )
+            return
 
-            # The outage boundary if one was captured, and the live watermark only as a
-            # fallback for a replay that no outage callback preceded. Cleared where the
-            # history is actually read, not here — a replay that declines below (membership
-            # unknown, or the fetch failing) has not read the window, and dropping the mark
-            # would close a gap nobody looked at. Those two failures are correlated with the
-            # outage itself, so this is the likely path, not the exotic one.
-            watermark = sub.replay_boundary or sub.last_processed_ts
-            if not watermark:
-                logger.debug(
-                    "Room '%s': no watermark yet — skipping replay", sub.room.name
-                )
-                continue
+        try:
+            page = await self._rest.get_room_history_page(
+                sub.room.id,
+                sub.room.type,
+                count=self._REPLAY_HISTORY_COUNT,
+                after_ts=watermark,
+            )
+            raw_msgs = page.messages
+        except Exception as e:
+            # Same rule as the membership-unknown arm above: an external
+            # window that was not read is claimed, so the next reconnect
+            # recovers what the triggering message's commit would otherwise
+            # seal away.
+            if external_window:
+                sub.claim_boundary(after_ts)
+            logger.warning(
+                "Room '%s': failed to fetch history for replay: %s",
+                sub.room.name, e,
+            )
+            return
 
-            # Membership is re-established before the outage is replayed, because the
-            # outage is exactly when it can have changed and nobody was listening. The
-            # live path is gated on `roomParticipant` (see `_on_raw_ddp_message`); replay
-            # has no access object to read it from, so it asks. Without this, an account
-            # removed from a public channel mid-outage still replays that channel — REST
-            # history for a public channel does not require membership, so the fetch
-            # succeeds and the agent answers in a room it was thrown out of.
-            # Read before the lookup, and compared again around every await below. The
-            # fetch is a REST round trip and the dispatch loop is up to 200 handler calls;
-            # a live rejection arriving anywhere inside that is news this batch has to act
-            # on, and it cannot see the cleared marks because it is holding a snapshot.
-            epoch = sub.membership_epoch
-            member = await self._rest.is_room_member(sub.room.id)
-            if sub.membership_epoch != epoch:
-                logger.warning(
-                    "Room '%s': this account was removed while its membership was being "
-                    "checked — abandoning the replay",
-                    sub.room.name,
-                )
-                continue
-            if member is False:
-                # Removed, confirmed. Both marks are dropped, not just the boundary: an
-                # account that is later re-added would otherwise replay from before its
-                # removal, delivering everything said while it was not in the room. A
-                # retained boundary is a promise to read that window later, and after a
-                # removal nobody is entitled to read it.
-                #
-                # The watermark has to go with it, because the watermark *is* the fallback
-                # boundary and it is frozen at the moment of removal — the live gate
-                # remembers a rejected id without advancing it. Left in place, a reconnect
-                # that arrives before the first post-re-add message would snapshot that
-                # frozen value and replay the whole time away. Empty means what it means
-                # for a room seen for the first time: no window, and ts-dedup off until
-                # live traffic establishes one (`normalize.py`, step 4).
-                sub.left_the_room()
-                logger.warning(
-                    "Room '%s': this account is no longer a member — skipping replay and "
-                    "closing the outage window; a later re-add starts from that point, "
-                    "not from before the removal",
-                    sub.room.name,
-                )
-                continue
-            if member is None:
-                # Unknown is not removal. The lookup failing is correlated with the outage
-                # itself, so this is the likely path, and the window stays open for the
-                # next attempt to read.
-                logger.warning(
-                    "Room '%s': membership could not be established — skipping replay; "
-                    "live delivery is unaffected and the next reconnect will ask again",
-                    sub.room.name,
-                )
-                continue
+        if sub.membership_epoch != epoch:
+            logger.warning(
+                "Room '%s': this account was removed while its history was being "
+                "fetched — discarding %d message(s) rather than dispatching them",
+                sub.room.name, len(raw_msgs),
+            )
+            return
 
-            try:
-                page = await self._rest.get_room_history_page(
-                    sub.room.id,
-                    sub.room.type,
-                    count=self._REPLAY_HISTORY_COUNT,
-                    after_ts=watermark,
-                )
-                raw_msgs = page.messages
-            except Exception as e:
-                logger.warning(
-                    "Room '%s': failed to fetch history for replay: %s",
-                    sub.room.name, e,
-                )
-                continue
-
-            if sub.membership_epoch != epoch:
-                logger.warning(
-                    "Room '%s': this account was removed while its history was being "
-                    "fetched — discarding %d message(s) rather than dispatching them",
-                    sub.room.name, len(raw_msgs),
-                )
-                continue
-
-            if not raw_msgs:
-                if page.was_full:
-                    # Not an empty window — a page the server filled entirely with system
-                    # events, because the count is applied before they are filtered out.
-                    # Every user message older than this page is still waiting behind it,
-                    # and reporting the outage as read would skip them silently. This is
-                    # the same bound the warning below describes, reached from the one
-                    # direction that produced no evidence at all.
-                    logger.warning(
-                        "Room '%s': the newest %d history entries are all system events "
-                        "— any user messages older than them cannot be reached in one "
-                        "page and may be permanently missed",
-                        sub.room.name, self._REPLAY_HISTORY_COUNT,
-                    )
-                elif not sub.discharge_boundary(claims_at_entry):
-                    # A read that found nothing is still a read — but only of the window
-                    # this replay came in for. The membership check and the history fetch
-                    # above are both awaits, and a live hand-back inside either of them
-                    # claims a window this fetch has not looked below.
-                    logger.info(
-                        "Room '%s': the outage window was claimed again while its history "
-                        "was being fetched — leaving it open",
-                        sub.room.name,
-                    )
-                logger.debug(
-                    "Room '%s': no missed messages since %s",
-                    sub.room.name, watermark,
-                )
-                continue
-
+        if not raw_msgs:
             if page.was_full:
+                # Not an empty window — a page the server filled entirely with system
+                # events, because the count is applied before they are filtered out.
+                # Every user message older than this page is still waiting behind it,
+                # and reporting the outage as read would skip them silently. This is
+                # the same bound the warning below describes, reached from the one
+                # direction that produced no evidence at all.
                 logger.warning(
-                    "Room '%s': replay fetched the maximum %d message(s) — "
-                    "the outage window may have produced more; some messages "
-                    "could be permanently lost",
+                    "Room '%s': the newest %d history entries are all system events "
+                    "— any user messages older than them cannot be reached in one "
+                    "page and may be permanently missed",
                     sub.room.name, self._REPLAY_HISTORY_COUNT,
                 )
-            else:
+            elif external_window:
+                pass  # not this replay's mark to spend — see the docstring
+            elif not sub.discharge_boundary(claims_at_entry):
+                # A read that found nothing is still a read — but only of the window
+                # this replay came in for. The membership check and the history fetch
+                # above are both awaits, and a live hand-back inside either of them
+                # claims a window this fetch has not looked below.
                 logger.info(
-                    "Room '%s': replaying %d missed message(s) since %s",
-                    sub.room.name, len(raw_msgs), watermark,
+                    "Room '%s': the outage window was claimed again while its history "
+                    "was being fetched — leaving it open",
+                    sub.room.name,
                 )
+            logger.debug(
+                "Room '%s': no missed messages since %s",
+                sub.room.name, watermark,
+            )
+            return
 
-            # Warn when the live DDP subscription for this room is not healthy.
-            # History replay still proceeds — the user gets missed messages —
-            # but future live messages will be lost until the sub recovers.
-            ws_status = self._ws.subscription_statuses.get(room_id, {})
-            if ws_status.get("status") not in ("active", None, ""):
+        if page.was_full:
+            logger.warning(
+                "Room '%s': replay fetched the maximum %d message(s) — "
+                "the outage window may have produced more; some messages "
+                "could be permanently lost",
+                sub.room.name, self._REPLAY_HISTORY_COUNT,
+            )
+        else:
+            logger.info(
+                "Room '%s': replaying %d missed message(s) since %s",
+                sub.room.name, len(raw_msgs), watermark,
+            )
+
+        # Warn when the live DDP subscription for this room is not healthy.
+        # History replay still proceeds — the user gets missed messages —
+        # but future live messages will be lost until the sub recovers.
+        ws_status = self._ws.subscription_statuses.get(room_id, {})
+        if ws_status.get("status") not in ("active", None, ""):
+            logger.warning(
+                "Room '%s': DDP subscription is in '%s' state — "
+                "replaying history but future live messages will be lost "
+                "until the subscription recovers",
+                sub.room.name, ws_status.get("status"),
+            )
+
+        all_accepted = True
+        for idx, doc in enumerate(raw_msgs):
+            # Guard against concurrent unsubscribe_room: if the room was
+            # removed while we were awaiting get_room_history, skip the
+            # remaining docs rather than logging spurious "unknown room_id"
+            # warnings for each one.
+            if sub.membership_epoch != epoch:
                 logger.warning(
-                    "Room '%s': DDP subscription is in '%s' state — "
-                    "replaying history but future live messages will be lost "
-                    "until the subscription recovers",
-                    sub.room.name, ws_status.get("status"),
+                    "Room '%s': this account was removed mid-replay — dropping the "
+                    "remaining %d message(s)",
+                    sub.room.name, len(raw_msgs) - idx,
                 )
-
-            all_accepted = True
-            for idx, doc in enumerate(raw_msgs):
-                # Guard against concurrent unsubscribe_room: if the room was
-                # removed while we were awaiting get_room_history, skip the
-                # remaining docs rather than logging spurious "unknown room_id"
-                # warnings for each one.
-                if sub.membership_epoch != epoch:
-                    logger.warning(
-                        "Room '%s': this account was removed mid-replay — dropping the "
-                        "remaining %d message(s)",
-                        sub.room.name, len(raw_msgs) - idx,
-                    )
-                    break
-                if room_id not in self._rooms:
-                    logger.debug(
-                        "Room '%s' was unsubscribed during replay — "
-                        "skipping %d remaining message(s)",
-                        sub.room.name,
-                        len(raw_msgs) - idx,
-                    )
-                    break
-                accepted = await self._on_raw_ddp_message(
-                    room_id, doc, is_replay=True, replay_after_ts=watermark
+                break
+            if room_id not in self._rooms:
+                logger.debug(
+                    "Room '%s' was unsubscribed during replay — "
+                    "skipping %d remaining message(s)",
+                    sub.room.name,
+                    len(raw_msgs) - idx,
                 )
-                if sub.membership_epoch != epoch:
-                    # The removal landed *inside* that handler. The check at the top of the
-                    # loop cannot reach this: the last document has no next iteration, so
-                    # the `for`/`else` below would bless a revoked batch as complete.
-                    #
-                    # The marks are not re-cleared here. `left_the_room()` cleared them and
-                    # `_on_raw_ddp_message` refuses to commit a watermark once the epoch has
-                    # moved under it, so there is nothing left to repair — and repairing it
-                    # here as well would be the same rule in two places, which is how the
-                    # rule ends up applied in one.
-                    logger.warning(
-                        "Room '%s': this account was removed while message %d of %d was "
-                        "being handled — dropping the rest and re-closing the window",
-                        sub.room.name, idx + 1, len(raw_msgs),
-                    )
-                    break
-                if not accepted:
-                    all_accepted = False
-            else:
-                # Only once the batch has actually been *dispatched*. Fetching it is not
-                # reading it: a shutdown or another disconnect cancelling this loop midway
-                # leaves the tail unprocessed, and by then the restored live traffic has
-                # moved `last_processed_ts` past it — so a boundary cleared at fetch time
-                # would have the next recovery snapshot the newer mark and skip the tail
-                # for good.
+                break
+            accepted = await self._on_raw_ddp_message(
+                room_id, doc, is_replay=True, replay_after_ts=watermark
+            )
+            if sub.membership_epoch != epoch:
+                # The removal landed *inside* that handler. The check at the top of the
+                # loop cannot reach this: the last document has no next iteration, so
+                # the `for`/`else` below would bless a revoked batch as complete.
                 #
-                # `for`/`else`, so neither a cancellation nor the `break` above reaches it.
-                # The cancellation case is the one this exists for; the `break` means the
-                # room stopped being tracked mid-replay, and leaving a boundary on a
-                # subscription nobody holds any more costs nothing.
-                #
-                # Completing the call is not the handler accepting: a full processor queue
-                # hands the message back and forgets its id so a later replay can bring it
-                # back. Spending the boundary on a batch that contains one of those removes
-                # the only mark that could — the live watermark has moved past it by then.
-                if all_accepted:
-                    if not sub.discharge_boundary(claims_at_entry):
-                        logger.info(
-                            "Room '%s': the outage window was claimed again while this "
-                            "batch was being dispatched — leaving it open",
-                            sub.room.name,
-                        )
-                else:
-                    logger.warning(
-                        "Room '%s': part of the replayed batch was handed back (queue "
-                        "full) — keeping the outage window open for the next recovery",
-                        sub.room.name,
-                    )
+                # The marks are not re-cleared here. `left_the_room()` cleared them and
+                # `_on_raw_ddp_message` refuses to commit a watermark once the epoch has
+                # moved under it, so there is nothing left to repair — and repairing it
+                # here as well would be the same rule in two places, which is how the
+                # rule ends up applied in one.
+                logger.warning(
+                    "Room '%s': this account was removed while message %d of %d was "
+                    "being handled — dropping the rest and re-closing the window",
+                    sub.room.name, idx + 1, len(raw_msgs),
+                )
+                break
+            if not accepted:
+                all_accepted = False
+        else:
+            # Only once the batch has actually been *dispatched*. Fetching it is not
+            # reading it: a shutdown or another disconnect cancelling this loop midway
+            # leaves the tail unprocessed, and by then the restored live traffic has
+            # moved `last_processed_ts` past it — so a boundary cleared at fetch time
+            # would have the next recovery snapshot the newer mark and skip the tail
+            # for good.
+            #
+            # `for`/`else`, so neither a cancellation nor the `break` above reaches it.
+            # The cancellation case is the one this exists for; the `break` means the
+            # room stopped being tracked mid-replay, and leaving a boundary on a
+            # subscription nobody holds any more costs nothing.
+            #
+            # Completing the call is not the handler accepting: a full processor queue
+            # hands the message back and forgets its id so a later replay can bring it
+            # back. Spending the boundary on a batch that contains one of those removes
+            # the only mark that could — the live watermark has moved past it by then.
+            #
+            # Two independent questions, and folding them into one condition
+            # made the `else` speak for both: an externally-named window took
+            # the hand-back arm and logged that a queue was full, on the most
+            # ordinary path there is. Whose window this was decides whether the
+            # mark may be spent; whether the batch was accepted decides whether
+            # it *should* be.
+            if not all_accepted:
+                logger.warning(
+                    "Room '%s': part of the replayed batch was handed back (queue "
+                    "full) — keeping the outage window open for the next recovery",
+                    sub.room.name,
+                )
+            elif not external_window and not sub.discharge_boundary(claims_at_entry):
+                logger.info(
+                    "Room '%s': the outage window was claimed again while this "
+                    "batch was being dispatched — leaving it open",
+                    sub.room.name,
+                )
 
     # ── Inbound ──────────────────────────────────────────────────────────────
 
@@ -736,6 +886,141 @@ class RocketChatConnector(Connector):
         self._router = router
         self._ws.register_default_callback(self._on_unrouted_message)
 
+    def register_membership_hook(self, hook) -> None:
+        """Register the callbacks for the bot's own membership events (§2.7).
+
+        The wire subscription is opened in `start_inbound`, gated on this hook
+        existing — registration alone changes nothing, which is what keeps a
+        static deployment's behaviour byte-identical.
+        """
+        self._membership_hook = hook
+        self._ws.register_membership_callback(self._on_membership_event)
+
+    async def _on_membership_event(self, action: str, doc: dict) -> None:
+        """A subscriptions-changed event for this account (§2.7).
+
+        The stream is already scoped to the bot's own user id (the event name
+        is `<uid>/subscriptions-changed`), so unlike Mattermost there is no
+        own-id filter to apply — every event here is about the bot's own
+        membership. The doc is the server's subscription record (verified
+        against `notifyOnSubscriptionChanged`'s callers: both `inserted` and
+        `removed` carry the full document), so `rid`, `t` and `name` are on it.
+
+        Failures are logged and dropped, never raised: an add is a supplement
+        (the room's first message still creates its watcher), and a remove is
+        re-discovered by the reconciliation.
+        """
+        if self._membership_hook is None:
+            return
+        rid = doc.get("rid") or ""
+        if not rid:
+            return
+        if action == "removed":
+            # Mark the room's CURRENT state before ANY await — this event's
+            # task runs its first synchronous segment in arrival order, so
+            # the delivery fences see the loss immediately, and the per-room
+            # serialization below never delays the stamp (Codex review of
+            # #121): a delivery in flight holds this object, and the
+            # commit-redirection fence reads its epoch to tell a benign
+            # watcher restart from a membership replacement (a pre-removal
+            # frame must not commit into the re-added room's fresh state —
+            # that watermark would point the next replay below the removal,
+            # delivering the whole non-member interval).
+            sub = self._rooms.get(rid)
+            if sub is not None:
+                sub.left_the_room()
+            self._note_membership_loss(rid)
+        # Serialized PER ROOM, in arrival order — the RC twin of Mattermost's
+        # `_run_membership` lock (structural close): a room's add/remove
+        # hooks run in the order the platform sent them, so a removal cannot
+        # complete around an add still classifying, and a parked removal no
+        # longer swallows the re-add behind it. Cross-room events still run
+        # concurrently.
+        lock = self._membership_serial.setdefault(rid, asyncio.Lock())
+        async with lock:
+            await self._run_membership_hooks(action, rid, doc)
+
+    async def _run_membership_hooks(self, action: str, rid: str, doc: dict) -> None:
+        try:
+            if action == "removed":
+                await self._membership_hook.removed(rid)
+                return
+            # The generation, captured before the classification awaits (Codex
+            # round 4): a removal landing in that window bumps it, and the
+            # recheck below is the last statement before the hook — so an add
+            # outrun by its own removal never registers a record for a room
+            # the bot has already left, while a genuine re-add captures the
+            # bumped generation here and still passes.
+            entry_gen = self._room_membership_gen.get(rid, 0)
+            room = await self._room_ref_from_sub_doc(rid, doc)
+            if room is not None:
+                if self._room_membership_gen.get(rid, 0) != entry_gen:
+                    logger.info(
+                        "Room %s: membership was lost while the join was "
+                        "being classified — not registering", rid,
+                    )
+                    return
+                await self._membership_hook.added(room)
+        except Exception:
+            logger.exception(
+                "Membership event (%s) for room %s failed — the safety nets "
+                "cover it", action, rid,
+            )
+
+    async def _room_ref_from_sub_doc(
+        self, rid: str, doc: dict
+    ) -> "RoomRef | None":
+        """Classify a joined room from its subscription document.
+
+        The same shape as `_room_ref_from_access`, from the other source: the
+        subscription's `t` is the room type letter and `name` the room name,
+        and a direct room takes the member lookup because the letter `d`
+        covers both DM kinds and the difference decides whether the mention
+        gate applies (§6.4). `ClassificationUnavailable` propagates to the
+        caller's catch — an add that cannot classify is dropped, not guessed.
+        """
+        t = doc.get("t") or ""
+        if t == "d":
+            identity = await self._direct_room_identity(rid)
+            if identity is None:
+                logger.warning(
+                    "Joined direct room %s has no counterpart to classify by — "
+                    "not registered", rid,
+                )
+                return None
+            kind, participants = identity
+            return RoomRef(id=rid, kind=kind, participants=participants)
+        if t not in ("c", "p"):
+            logger.debug(
+                "Joined room %s has unsupported type %r — not registered", rid, t)
+            return None
+        name = doc.get("name") or ""
+        if not name:
+            logger.debug(
+                "Joined room %s has no name and is not direct — not registered", rid)
+            return None
+        kind = RoomKind.GROUP if t == "p" else RoomKind.CHANNEL
+        return RoomRef(id=rid, kind=kind, name=name)
+
+    def _note_membership_loss(self, room_id: str) -> None:
+        """Record a membership loss at ROOM level — see `_room_membership_gen`."""
+        self._room_membership_gen[room_id] = (
+            self._room_membership_gen.get(room_id, 0) + 1
+        )
+
+    async def membership_snapshot(self) -> set[str] | None:
+        """See `Connector.membership_snapshot`. Read from the subscription
+        records, same source of truth as `is_room_member` — hidden rooms are
+        included, because hidden is a display choice, not a departure."""
+        try:
+            return await self._rest.get_subscription_room_ids()
+        except Exception as e:
+            logger.warning(
+                "Could not read the subscription set — membership is unknown "
+                "this pass: %s", e,
+            )
+            return None
+
     async def _on_unrouted_message(self, doc: dict, access: dict | None = None) -> None:
         """A message for a room this connector has no watcher for (§2.2).
 
@@ -765,7 +1050,7 @@ class RocketChatConnector(Connector):
             return
         sender = doc.get("u", {}).get("username", "")
         if doc.get("u", {}).get("_id") == self._rest.user_id or (
-            sender == self._config.username
+            sender == self.agent_username
         ):
             # By id first, and by name only as a fallback for frames that carry no id.
             # A login whose canonical username differs in casing, or which is an alias,
@@ -777,6 +1062,45 @@ class RocketChatConnector(Connector):
             # The same rule as `dm_members`: who someone is, not how their name is spelled.
             return
         if not access or not access.get("roomParticipant"):
+            # An explicit `roomParticipant: False` for a room this connector
+            # still tracks is the news the account was removed (#115): the
+            # tracked path records it (`left_the_room()` clears the watermark
+            # and bumps the epoch), and this path used to drop it — so a
+            # later re-add replayed the whole non-member interval from the
+            # stale watermark. Absence stays a plain return: "nobody said"
+            # is not "not a participant".
+            if access is not None and access.get("roomParticipant") is False:
+                rid = doc.get("rid", "")
+                sub = self._rooms.get(rid)
+                if sub is not None:
+                    sub.left_the_room()
+                if rid:
+                    self._note_membership_loss(rid)
+                    # The untracked twin of the tracked branch's hook fire
+                    # (Codex round 20, mirroring round 18): reachable when a
+                    # FAILED record's room — never subscribed this boot —
+                    # gets a subscribe-all frame with the server's own
+                    # participant-false answer. A failed record is neither
+                    # paused nor idle, so the reconciliation never sees it;
+                    # without the hook, a later boot recreates the session
+                    # across the membership boundary. Same per-room
+                    # serialization as every membership event.
+                    if self._membership_hook is not None:
+                        async def _removed(room_id=rid):
+                            lock = self._membership_serial.setdefault(
+                                room_id, asyncio.Lock())
+                            async with lock:
+                                try:
+                                    await self._membership_hook.removed(room_id)
+                                except Exception:
+                                    logger.exception(
+                                        "Membership removal (untracked "
+                                        "participant-false) for room %s failed "
+                                        "— the safety nets cover it", room_id,
+                                    )
+                        task = asyncio.create_task(_removed())
+                        self._routing_tasks.add(task)
+                        task.add_done_callback(self._routing_tasks.discard)
             return
         if not sender_allowed(self._config, sender):
             return
@@ -784,55 +1108,330 @@ class RocketChatConnector(Connector):
         room_id = doc.get("rid", "")
         if not room_id:
             return
-        if room_id in self._rooms:
-            # Tracked now — so deliver it rather than offer it again. The frame reached
-            # this path because the room was untracked when it was routed here, and the
+        await self._route_room(room_id, doc, access)
+
+    def _room_is_served(self, room_id: str) -> bool:
+        """A processor answers for this room now. Tracked is necessary, not sufficient.
+
+        The idle drop keeps a room subscribed (§2.2), so `room_id in self._rooms` goes
+        on answering True for a room whose next message has nowhere to go. Every
+        deliver-or-route decision keys on this predicate rather than on tracked-ness,
+        and the drain's branch is the load-bearing one: delivering an unserved room's
+        frame puts it back on the tracked path, whose UNROUTED arm routes it back here
+        — a hot loop with no retry delay anywhere in it, entered by every message to a
+        room whose offer was declined.
+        """
+        if room_id not in self._rooms:
+            return False
+        if self._capacity_check is None:
+            # No dispatcher wired: nothing can answer UNROUTED, so tracked is served.
+            return True
+        return self._capacity_check(room_id) is not RoomCapacity.UNROUTED
+
+    async def _route_room(
+        self,
+        room_id: str,
+        doc: dict,
+        access: dict | None,
+        *,
+        resolved_room: "RoomRef | None" = None,
+    ) -> None:
+        """One routing episode for one room — the single entrance to creation (§2.7).
+
+        Two callers, one funnel. `_on_unrouted_message` arrives from the routing
+        workers with an untracked room and classifies it here; the tracked handler's
+        UNROUTED arm arrives with `resolved_room` already in hand — the wake (§2.5),
+        where the room was classified when it was first routed — and skips straight
+        to the offer. Both share the pending buffer, the single open episode and the
+        drain, because a second creation entrance is how a wake would skip exactly
+        the guarantees the episode exists to make.
+        """
+        pending = self._pending_routes.get(room_id)
+        if pending is not None:
+            # An episode for this room is open. Checked *before* the served
+            # check on purpose: the room may have become served an instant ago
+            # with its buffer not yet drained, and delivering this frame
+            # directly would put it ahead of every frame that arrived before
+            # it. While an episode is open, the buffer is the room's order.
+            #
+            # **This check only covers the routing path, and that is a real
+            # limit rather than a formality.** Once the room is tracked, later
+            # frames go straight to its worker and never consult the buffer —
+            # so a frame can overtake the trigger in the window between the
+            # tracked-write (inside the router call, `start_watcher_in_room`
+            # step 7) and the drain below.
+            #
+            # That window is **not** empty — a recreation replays the interval
+            # its room owes before returning — so a live frame can land in it
+            # and advance the watermark past the buffered trigger. The
+            # watermark is a scalar, so that commit implicitly claims
+            # everything below it and the trigger is then filtered as already
+            # processed (§2.2, "commits within a room must be ordered").
+            #
+            # **Which is why the drain claims the window before handing the
+            # frames over** — see the `finally` below. A filtered frame is then
+            # a deferral rather than a loss: the claim is a promise that a
+            # recovery comes back for it, the same promise the queue-full
+            # hand-back makes with the same mechanism.
+            verdict = pending.add(doc.get("_id", ""), (doc, access))
+            if verdict == "duplicate":
+                # §2.2 outcome 6: the reservation is not disturbed, the copy goes.
+                logger.debug(
+                    "Room %s: discarding a duplicate of a reserved message", room_id[:8])
+            elif verdict == "full":
+                # §2.2 outcome 5: the drop is audible in the room, once per
+                # episode — the sender watched this message arrive.
+                logger.warning(
+                    "Room %s: pending buffer full — dropping a frame", room_id[:8])
+                await self._post_starting_up_notice(pending, room_id)
+            return
+        if self._room_is_served(room_id):
+            # Served now — so deliver it rather than offer it again. The frame reached
+            # this path because the room was unserved when it was routed here, and the
             # watcher was created while it waited: the per-room callback that would have
             # taken it was registered after the routing decision was made, so nobody else
             # is going to deliver it. Returning here is how the message that arrived
-            # during a creation used to be lost.
-            await self._on_raw_ddp_message(room_id, doc, access=access)
-            return
-        if room_id in self._rooms_being_routed:
-            # An offer for this room is in flight and a second one would create a second
-            # watcher. This frame is dropped: the watcher does not exist yet, so there is
-            # nothing to deliver it to, and holding it would need a queue per room being
-            # created. The window is the duration of one creation, and the frames in it
-            # are the residue this coalescing costs — stated rather than implied, because
-            # the comment that used to be here called the loss "nothing".
-            logger.debug(
-                "Room %s is being created; dropping a frame that arrived during it",
-                room_id,
-            )
-            return
-        self._rooms_being_routed.add(room_id)
-        try:
-            room = await self._room_ref_from_access(room_id, access)
-            if room is None:
-                return
-            try:
-                await self._router(room, doc)
-            except Exception as e:
-                logger.error("Router failed for room %s: %s", room_id, e)
-                return
-            # The message that prompted the creation is delivered now, through the
-            # ordinary path. Offering a room is not delivering a message, and a brand-new
-            # room has no watermark for the replay to fetch it from later, so without this
-            # the message that caused the watcher to exist is the one message it never
-            # sees — and its sender waits for an answer that needs a second message to
-            # arrive.
+            # during a creation used to be lost. Served, not tracked: an idle room is
+            # tracked and its frame still has nowhere to go — delivering it would bounce
+            # it off the tracked path's UNROUTED arm straight back here.
             #
-            # Through `_on_raw_ddp_message` rather than around it, so every gate that
-            # applies to a tracked room's message applies to this one: the mention gate,
-            # the sender policy, dedup, the capacity preflight. Creating a watcher and
-            # answering unprompted are separate decisions, and this keeps them separate.
-            if room_id in self._rooms:
-                await self._on_raw_ddp_message(room_id, doc, access=access)
+            # **Onto the room's worker, not around it.** This runs on one of several
+            # routing workers, so dispatching here directly puts concurrent deliveries
+            # into a room whose whole guarantee is that one queue serialises them.
+            # Serialising does not reorder: an older frame still lands behind a newer
+            # one that arrived live, and the filter rejects it as already processed.
+            # What it prevents is the two running at once, and a hand-back from the
+            # older one claiming a boundary already past itself.
+            self._ws.deliver_to_room(room_id, doc, access)
+            return
+
+        # First frame for this room: open the episode with the trigger buffered
+        # as its first frame, so success drains trigger-first in arrival order.
+        pending = PendingRoute(self._PENDING_BUFFER_DEPTH)
+        pending.add(doc.get("_id", ""), (doc, access))
+        self._pending_routes[room_id] = pending
+        # Whether the routing decision was *completed* — a decline is an answer
+        # ("no watcher": rule miss, pause, cap), a park or a cancellation is the
+        # absence of one, and the drain below must treat them oppositely: a
+        # declined frame is remembered so it cannot re-offer forever, a parked
+        # frame's id must stay unknown or the recovery the park is promised —
+        # the next wake's replay from the record watermark — dies at the dedup
+        # check, silently.
+        declined = False
+        try:
+            # Stage 1 — classify, unless the caller already holds the answer (the
+            # wake, whose room was classified when it was first routed). Only
+            # ClassificationUnavailable is retryable (§2.2 outcome 3: the routing
+            # decision was never made); None is a final decline and anything else
+            # is a bug that should surface.
+            room = resolved_room
+            if room is None:
+                resolved: dict = {}
+
+                async def classify() -> None:
+                    resolved["room"] = await self._room_ref_from_access(room_id, access)
+
+                if not await route_attempts(
+                    classify, retry_on=ClassificationUnavailable,
+                    delays=self._ROUTE_RETRY_DELAYS, logger=logger,
+                    label=f"Classifying room {room_id[:8]}",
+                ):
+                    return  # parked; the finally drops the buffer
+                room = resolved["room"]
+            if room is None:
+                declined = True  # final: no name to match, or no counterpart
+                return
+
+            # Stage 2 — offer. The router raising means a creation was started
+            # and not carried out (§2.2 outcome 4) — retryable, because the
+            # manager deliberately lets those propagate. A None-shaped outcome
+            # (rule miss, pause, cap) does not raise and is final.
+            async def offer() -> None:
+                try:
+                    await self._router(room, doc)
+                except RoomAlreadyRoutedError:
+                    # Final, not retryable: another watcher already serves this
+                    # room, and three backoffs cannot change that — they would
+                    # only hold a routing worker for ~3.5s per message to a room
+                    # that will never be claimed.
+                    logger.warning(
+                        "Room %s is already served by another watcher — not "
+                        "creating a second one", room_id[:8],
+                    )
+                    return
+
+            # True when the offer ran to completion (its answer may still be
+            # "no watcher" — that is the decline); False when every attempt
+            # raised and the room parked. A cancellation propagates past this
+            # line, leaving `declined` False, which is the same honest answer.
+            declined = await route_attempts(
+                offer, retry_on=Exception,
+                delays=self._ROUTE_RETRY_DELAYS, logger=logger,
+                label=f"Creating a watcher for room {room_id[:8]}",
+            )
         finally:
-            # Released whatever happened. A room that failed to be offered must be
-            # offerable again on its next message — holding the reservation would make one
-            # transient REST failure permanent for that room.
-            self._rooms_being_routed.discard(room_id)
+            # The episode ends here, whatever happened, and the buffer has one
+            # of two fates. Tracked: every frame — trigger first, then the ones
+            # that arrived during the episode — goes onto the room's worker, so
+            # every gate a tracked message passes applies to each of them, and
+            # so does the queue's ordering. Not tracked: the decision was "no
+            # watcher" or the room parked, and the frames go with it — stated
+            # audibly, because a brand-new room has no watermark for any replay
+            # to recover them from.
+            ended = self._pending_routes.pop(room_id, None)
+            frames = ended.drain() if ended is not None else []
+            sub = self._rooms.get(room_id)
+            if sub is not None and not self._room_is_served(room_id):
+                # Tracked and still unserved. Served, not tracked, decides delivery
+                # here for the same reason it does above: these frames' only
+                # tracked-path outcome is the UNROUTED arm, which routes them
+                # straight back into a new episode — a hot loop with no delay in
+                # it, entered by every message to a declined room.
+                #
+                # What happens to the ids depends on WHICH way the offer ended,
+                # because the two promises point in opposite directions:
+                if declined:
+                    # A completed decline — no rule claims the room, its record is
+                    # paused. A configuration state that can persist indefinitely,
+                    # so an id left unknown would have every reconnect re-fetch and
+                    # re-offer a batch that can never be spent. Remembered, exactly
+                    # as the old arm remembered the frames it dropped. The watermark
+                    # is left where it is, so a user who resends is served normally
+                    # once a watcher exists (§2.7).
+                    for pending_doc, _ in frames:
+                        sub.remember(pending_doc.get("_id", ""))
+                    if frames:
+                        logger.warning(
+                            "Room %s: dropping %d buffered frame(s) — no watcher took "
+                            "the room. A declined offer: no rule claims it, or its "
+                            "record is paused.", room_id[:8], len(frames),
+                        )
+                elif frames:
+                    # Parked (every attempt raised) or cancelled: the decision was
+                    # never made, and this room HAS a record — the park's promised
+                    # recovery is the next wake's replay from that record's
+                    # watermark (§2.2). A remembered id would have that replay die
+                    # at the dedup check, silently and permanently; unknown ids are
+                    # exactly what lets it bring these frames back.
+                    logger.warning(
+                        "Room %s: %d buffered frame(s) not delivered — the offer "
+                        "parked or was cancelled. Their ids stay unknown so the "
+                        "next wake's replay recovers them.", room_id[:8], len(frames),
+                    )
+            elif sub is not None:
+                # **Claim the window before handing the frames over.** The
+                # watermark is a scalar high-water mark, so a live message
+                # accepted while this episode was resolving has already
+                # advanced it past these buffered frames — one timestamp
+                # cannot say "committed the later one but not the earlier"
+                # (§2.2, "commits within a room must be ordered"). The filter
+                # would then reject each of them as already processed, and
+                # nothing would point below the mark any more.
+                #
+                # This is the same promise the queue-full hand-back makes with
+                # the same mechanism: a message below here was not read, so a
+                # recovery must come back for it. Delivery below is still
+                # attempted first — the claim is what makes the case where it
+                # is filtered a *deferral* rather than a loss.
+                oldest = min(
+                    (extract_ts(d) for d, _ in frames if extract_ts(d)),
+                    default="",
+                )
+                if oldest:
+                    sub.claim_boundary(sub.last_processed_ts, _just_before(oldest))
+                for pending_doc, pending_access in frames:
+                    self._ws.deliver_to_room(room_id, pending_doc, pending_access)
+            elif frames:
+                logger.info(
+                    "Room %s: dropping %d buffered frame(s) — no watcher was created",
+                    room_id[:8], len(frames),
+                )
+
+    async def _post_starting_up_notice(self, pending: PendingRoute, room_id: str) -> None:
+        """Tell the room its messages are outrunning its setup — once per episode.
+
+        Best-effort: the notice is owed, but a REST failure posting it must not
+        take the routing worker down with it.
+        """
+        if pending.notice_posted:
+            return
+        pending.notice_posted = True
+        try:
+            await self.send_text(room_id, AgentResponse(text=STARTING_UP_NOTICE))
+        except Exception:
+            logger.debug("Could not post the starting-up notice", exc_info=True)
+
+    async def probe_missed_since(self, room: Room, after_ts: str) -> bool:
+        """See `Connector.probe_missed_since`. Raw docs, so the sender id is
+        still on them — `fetch_room_history` has already reduced the bot's own
+        posts to `username: "me"` by the time it returns."""
+        page = await self._rest.get_room_history_page(
+            room.id, room.type, self._REPLAY_HISTORY_COUNT, after_ts=after_ts
+        )
+        if page.was_full:
+            # The page, and the *filter*: `count` is applied by the server and
+            # system events are dropped afterwards, so a window whose newest
+            # entries are all joins and topic changes filters down to nothing
+            # while every user message in it waits behind that page. An empty
+            # filtered list therefore has two meanings, and only `raw_count`
+            # tells them apart — the reconnect replay reads it for the same
+            # reason. Answering "gap" when they cannot be told apart costs one
+            # recreation; answering "no gap" costs someone their reply.
+            return True
+        own_id = self._rest.user_id
+        for doc in page.messages:
+            if own_id and doc.get("u", {}).get("_id") == own_id:
+                continue
+            # Strictly after: `after_ts` is inclusive, so the boundary message —
+            # the one that set this watermark — is in the page and is not a gap.
+            if _ts_gt(extract_ts(doc), after_ts):
+                return True
+        return False
+
+    def trigger_history_bound(self, trigger) -> str | None:
+        """The trigger doc's `ts` as epoch milliseconds (§5.2).
+
+        DDP carries it as `{"$date": ms}` or a bare numeric — both already the
+        internal representation, so this extracts rather than converts. It used
+        to convert to ISO, which then met an epoch-ms watermark in a numeric
+        comparison that could not parse it.
+        """
+        if not isinstance(trigger, dict):
+            return None
+        ts = extract_ts(trigger)
+        return ts if ts and _ts_to_float(ts) is not None else None
+
+    def _room_ref_from_sub(self, sub: "_RoomSubscription") -> "RoomRef":
+        """A RoomRef for a room this connector already tracks — the wake's classification.
+
+        No REST call and no access object: the room was classified when it was first
+        routed, and what that classification decided is in the tracked state — the
+        room's type (a `RoomKind` value for every room the dynamic path subscribed) and,
+        for a direct room, the permanently-cached kind and participants (§6.4). For a
+        room with a record none of this is load-bearing anyway: `_recreate` reads the
+        kind and participants from the record itself (§2.4). The fallback matters only
+        on the recordless edge, where `_create` rule-matches this ref — and a room the
+        dynamic path never touched carries a platform type no `RoomKind` names, which
+        the channel fallback covers.
+        """
+        kind = RoomKind.CHANNEL
+        try:
+            kind = RoomKind(sub.room.type)
+        except ValueError:
+            pass
+        participants: tuple[str, ...] = ()
+        cached = self._dm_kinds.get(sub.room.id)
+        if cached is not None:
+            kind, participants = cached
+        return RoomRef(
+            id=sub.room.id,
+            kind=kind,
+            # A direct room's tracked name is its *description* (the counterpart, the
+            # member list — §2.3), and `RoomRef.name` is the platform's own name,
+            # empty for both DM kinds by contract.
+            name="" if kind.is_direct else (sub.room.name or ""),
+            participants=participants,
+        )
 
     async def _room_ref_from_access(
         self, room_id: str, access: dict
@@ -845,15 +1444,19 @@ class RocketChatConnector(Connector):
         """
         room_type = room_type_for(access.get("roomType"))
         if room_type == "dm":
+            # May raise ClassificationUnavailable — deliberately not caught here:
+            # None from this method means *final* (a retry cannot change the
+            # answer), and a network failure is the opposite of that. The caller
+            # owns the retry (§2.2 outcome 3).
             identity = await self._direct_room_identity(room_id)
             if identity is None:
-                # An unknown classification is not a kind. Answering `dm` here would create
-                # a 1:1 watcher for what may be a group DM, and a room typed `dm` skips the
-                # mention gate entirely (§6.4) — so the agent would answer every message
-                # from everyone in that group. The room is not lost: the next message from
-                # it arrives on the same unrouted path and asks again.
+                # The server answered, and the answer names nobody. An unknown
+                # classification is not a kind: answering `dm` here would create
+                # a 1:1 watcher for what may be a group DM, and a room typed `dm`
+                # skips the mention gate entirely (§6.4) — so the agent would
+                # answer every message from everyone in that group.
                 logger.warning(
-                    "Direct room %s could not be classified — not routing it this time",
+                    "Direct room %s has no counterpart to classify by — not routing it",
                     room_id,
                 )
                 return None
@@ -890,17 +1493,36 @@ class RocketChatConnector(Connector):
         persisted config rather than re-deriving the label, so a stale name cannot split a
         watcher's identity. Recorded in §2.3.
 
-        A failed lookup returns `None` — unknown — and caches nothing. It deliberately does
-        not fall back to 1:1: this answer decides whether the mention gate applies at all, so
-        a wrong one is not a slightly-off label but a watcher that replies to everyone.
+        Neither outcome caches, and the two are deliberately different shapes
+        (§2.2): a *failed* lookup raises `ClassificationUnavailable`, because the
+        classification was never made and the message must stay redeliverable,
+        while a lookup that succeeds and names nobody returns `None` — final,
+        since a retry cannot invent a counterpart.
+
+        Neither falls back to 1:1. This answer decides whether the mention gate
+        applies at all, so a wrong one is not a slightly-off label but a watcher
+        that replies to everyone in a group.
         """
         cached = self._dm_kinds.get(room_id)
         if cached is not None:
             return cached
 
-        members = await self._rest.dm_members(room_id)
+        try:
+            members = await self._rest.dm_members(room_id)
+        except Exception as e:
+            # Retryable, and typed so the routing path can tell it from a final
+            # decline (§2.2 outcome 3): the classification was never made, so the
+            # routing decision was never made either, and the message must stay
+            # redeliverable. Not cached, for the same reason.
+            raise ClassificationUnavailable(
+                f"could not read members of direct room {room_id}: {e}"
+            ) from e
         if not members:
-            return None  # unknown, and unknown is not a kind
+            # Final, not retryable: the server answered and the answer names
+            # nobody. A retry cannot invent a counterpart, and there is still no
+            # safe kind to guess — so the room is declined, uncached, and the
+            # next message asks again with fresh data.
+            return None
 
         # `dm_members` has already excluded this account, by id rather than by the
         # spelling of its configured username — so everything here is a counterpart, and
@@ -935,8 +1557,26 @@ class RocketChatConnector(Connector):
         )
 
         if room.id in self._rooms:
+            contexts = self._watcher_contexts.setdefault(room.id, [])
+            for i, existing in enumerate(contexts):
+                if existing.watcher_id == ctx.watcher_id:
+                    # The same watcher re-subscribing to a room it already holds — a
+                    # wake after an idle drop, which keeps the room tracked (§2.2) and
+                    # then runs the same start path a fresh creation does. Idempotent,
+                    # like the dispatcher's claim ("replaces its own; refuses
+                    # another's"): appending a second context and bumping the refcount
+                    # here would leak one of each per idle/wake cycle, and the leaked
+                    # refcount means the room's real unsubscribe never reaches zero.
+                    contexts[i] = ctx
+                    logger.debug(
+                        "Room '%s' (id=%s) already subscribed by watcher '%s' — "
+                        "replaced its context, refcount stays %d",
+                        room.name, room.id, ctx.watcher_id,
+                        self._room_refcount[room.id],
+                    )
+                    return
             self._room_refcount[room.id] += 1
-            self._watcher_contexts.setdefault(room.id, []).append(ctx)
+            contexts.append(ctx)
             logger.debug(
                 "Room '%s' (id=%s) already subscribed — added watcher '%s', refcount=%d",
                 room.name,
@@ -1041,15 +1681,48 @@ class RocketChatConnector(Connector):
             self._rooms[room_id].last_processed_ts = ts
 
     def get_last_processed_ts(self, room_id: str) -> str | None:
-        """Return the last processed message timestamp for a room."""
+        """The oldest OWED mark for the room — the claimed replay boundary
+        when one is open and older, else the processed watermark (Codex
+        round 26, the MM twin): shutdown persists this getter's answer, and
+        a claimed-but-undischarged window must survive into the durable
+        record or the next boot starts above the unprocessed tail."""
         sub = self._rooms.get(room_id)
-        return sub.last_processed_ts if sub else None
+        if sub is None:
+            return None
+        if sub.boundary_claims and sub.replay_boundary:
+            from gateway.core.replay_window import ts_to_float
+
+            lp = ts_to_float(sub.last_processed_ts or "")
+            rb = ts_to_float(sub.replay_boundary)
+            if lp is None or (rb is not None and rb < lp):
+                return sub.replay_boundary
+        return sub.last_processed_ts
 
     # ── Attachment cache ────────────────────────────────────────────────────────
 
     def attachment_cache_dir(self, room_id: str) -> str | None:
-        """Return the global cache directory for a room's attachments."""
-        return str(self._attachments_cache_base / room_id)
+        """Return the global cache directory for a room's attachments.
+
+        Contained via `resolve_under`, not raw joining: the id arrives from
+        the server and is a path component here, and expiry `rmtree`s this
+        directory — so an id spelling `..` (which survives a character-class
+        sanitize, because dots are legal) must not be able to name a path
+        outside the cache base. Sanitized first for the characters a filename
+        cannot carry, exactly as Mattermost's `_cache_dir_for` does; a
+        component `resolve_under` still refuses answers None, which the
+        pipeline already reads as "no attachment caching for this room" — the
+        fail-closed direction. Rocket.Chat ids are alphanumeric in practice,
+        so real rooms resolve to the same directory they always did.
+        """
+        safe_room_id = re.sub(r"[^\w.\-]", "_", room_id)
+        try:
+            return str(resolve_under(self._attachments_cache_base, safe_room_id))
+        except ValueError:
+            logger.warning(
+                "Refusing an attachment cache path for room id %r — it does "
+                "not name a directory under the cache base", room_id,
+            )
+            return None
 
     @property
     def text_chunk_limit(self) -> int | None:
@@ -1096,8 +1769,15 @@ class RocketChatConnector(Connector):
 
     @property
     def agent_username(self) -> str:
-        """The bot's own RC username (from connector config)."""
-        return self._config.username
+        """The bot's own RC username — the CANONICAL spelling once logged in.
+
+        Never the configured one when the server has answered (#112): login
+        is not spelling-exact, message frames carry the canonical form, and
+        every identity comparison this property feeds (the mention gate, the
+        history handoff's own-turn labels, the own-message fallback) fails
+        silently under a lowercase or email login otherwise. Falls back to
+        the config before login, exactly like Mattermost's."""
+        return self._rest.bot_username or self._config.username
 
     @property
     def timezone(self) -> str:
@@ -1127,7 +1807,7 @@ class RocketChatConnector(Connector):
         if msg.room.type == "dm":
             return "to: me"
 
-        own = self._config.username
+        own = self.agent_username
         agent_names = set(self._config.agent_chain.agent_usernames)
         mentioned = set(msg.mentions)
 
@@ -1193,7 +1873,7 @@ class RocketChatConnector(Connector):
         raw_msgs = await self._rest.get_room_history(
             room.id, room.type, count, before_ts=before_ts, after_ts=after_ts
         )
-        bot_username = self._config.username
+        bot_username = self.agent_username
         owners = set(self._config.owners)
         guests = set(self._config.guests)
         peer_agents = set(self._config.agent_chain.agent_usernames)
@@ -1285,20 +1965,8 @@ class RocketChatConnector(Connector):
         activity = ["user-typing"] if is_typing else []
         await self._ws.call_method(
             "stream-notify-room",
-            [f"{room_id}/user-activity", self._config.username, activity],
+            [f"{room_id}/user-activity", self.agent_username, activity],
         )
-
-    async def notify_online(self, room_id: str, text: str) -> None:
-        try:
-            await self._rest.post_message(room_id, text)
-        except Exception as e:
-            logger.warning("Failed to post online notification: %s", e)
-
-    async def notify_offline(self, room_id: str, text: str) -> None:
-        try:
-            await self._rest.post_message(room_id, text)
-        except Exception as e:
-            logger.warning("Failed to post offline notification: %s", e)
 
     def on_agent_chain_drop(self, room_id: str, thread_id: str | None, sender: str) -> None:
         """Called when an agent chain LLM response was dropped (termination token detected).
@@ -1446,6 +2114,12 @@ class RocketChatConnector(Connector):
         # other side of it. The commit at the end is the write that matters: it is what a
         # later re-add would replay from.
         entry_epoch = sub.membership_epoch
+        # The ROOM-level loss generation, captured beside the object's epoch:
+        # the epoch cannot survive the object, and a benign restart replacing
+        # the object mid-flight would otherwise hide a loss that marked the
+        # replacement (round 2). The commit fence compares this, not the
+        # replacement's own epoch.
+        entry_mgen = self._room_membership_gen.get(room_id, 0)
 
         # --- _id dedup (live + replay race guard) ---
         # A message can arrive on both the live DDP stream and the reconnect
@@ -1481,6 +2155,31 @@ class RocketChatConnector(Connector):
             # was not a member, none of which is in the 200-id window because none of it
             # was ever delivered.
             sub.left_the_room()
+            self._note_membership_loss(room_id)
+            # And the CORE learns it too (Codex round 18): this is the
+            # server's own per-message answer — an authoritative removal
+            # signal, not the offline inference #123 defers — and stopping at
+            # the connector-local marks left the processor, record, session
+            # and jobs alive until the idle TTL aged the room into the
+            # dormant-only reconciliation. Scheduled through the same
+            # per-room serialization every membership hook takes, so it
+            # cannot complete around a concurrent re-add's registration.
+            if self._membership_hook is not None:
+                async def _removed(rid=room_id):
+                    lock = self._membership_serial.setdefault(
+                        rid, asyncio.Lock())
+                    async with lock:
+                        try:
+                            await self._membership_hook.removed(rid)
+                        except Exception:
+                            logger.exception(
+                                "Membership removal (participant-false) for "
+                                "room %s failed — the safety nets cover it",
+                                rid,
+                            )
+                task = asyncio.create_task(_removed())
+                self._routing_tasks.add(task)
+                task.add_done_callback(self._routing_tasks.discard)
             return True
 
         msg_id = doc.get("_id", "")
@@ -1508,6 +2207,7 @@ class RocketChatConnector(Connector):
             last_processed_ts=filter_ts,
             turn_store=self._turn_store,
             bot_user_id=self._rest.user_id or "",
+            bot_username=self.agent_username,
         )
         # Captured here, with no await between the filter's increment and this read, so
         # it names the count that increment belonged to. `_hand_back` compares it before
@@ -1541,32 +2241,69 @@ class RocketChatConnector(Connector):
         # optimization, not a hard guarantee.
         capacity = self._capacity_check(room_id) if self._capacity_check else None
         if capacity is RoomCapacity.UNROUTED:
-            # Not backpressure: no watcher serves this room, so there is nothing to be
-            # busy with and nothing to tell its members. Telling them the gateway is
-            # busy would be a wrong answer from an idle gateway (§2.7).
+            # No processor serves this *tracked* room. The idle drop keeps a room
+            # subscribed on purpose (§2.2) — the watermark and seen-id window are what
+            # make recreation cheap — so an idle room's next message arrives here, on
+            # the tracked path, and this arm is the wake (§2.5): the room is offered
+            # back through the same episode funnel an untracked room goes through, so
+            # the pending buffer, the single open episode and the recreation's replay
+            # all apply. A direct recreate-on-UNROUTED shortcut would skip exactly
+            # those, and they are the defects the routing transaction closed.
             #
-            # The id is recorded, and that is a *decision* rather than an inheritance
-            # from the branch below, which no longer records during replay.
+            # NOT remembered, deliberately — the inverse of what this arm did when it
+            # only dropped. The episode ends by delivering this frame back through
+            # this handler, and a remembered id would be rejected at the dedup check
+            # above; the declined episode's drain is what remembers it instead, so a
+            # room nothing claims still converges. The watermark is left where it is
+            # either way.
             #
-            # The difference is whether the rejection is transient. A full queue drains,
-            # so a replayed message rejected for capacity is owed another attempt, and
-            # recording it would lose it silently. UNROUTED is not like that: it means no
-            # watcher serves this room, which is a configuration state and can persist
-            # indefinitely. Keeping the window open for it would have every recovery
-            # re-fetch a batch that can never be spent — a boundary that is never
-            # consumed is its own defect, and a worse one than a message that no watcher
-            # was ever going to see.
-            #
-            # The watermark is left where it is, so a user who resends is served normally
-            # once a watcher exists.
-            logger.warning(
-                "Message for room '%s' has no watcher — dropping without a reply. "
-                "A watcher that failed to start, or a room subscribed with none "
-                "configured.",
-                sub.room.name,
+            # The turn is released because the redelivery runs the filter — and its
+            # charge — again. Spawned, not awaited: this runs on the room's own
+            # worker, and the episode ends by delivering into that worker's queue.
+            # Tasks run in creation order, and the episode reserves `_pending_routes`
+            # before its first await, so a burst of frames buffers behind its first.
+            if self._router is None:
+                # No router registered — a static-only deployment. The old arm's
+                # behaviour, verbatim: drop audibly, remember the id so reconnect
+                # replays do not re-fetch a batch nothing can spend, watermark
+                # untouched so a resend is served once a watcher exists.
+                logger.warning(
+                    "Message for room '%s' has no watcher — dropping without a "
+                    "reply. A watcher that failed to start, or a room subscribed "
+                    "with none configured.", sub.room.name,
+                )
+                sub.remember(msg_id)
+                self._release_unused_turn(doc, result, turn_generation, "no watcher")
+                return True
+            logger.info(
+                "Message for room '%s' has no processor — offering the room back "
+                "to the router (wake).", sub.room.name,
             )
-            sub.remember(msg_id)
-            self._release_unused_turn(doc, result, turn_generation, "no watcher")
+            # Claim a boundary below this frame, exactly as Mattermost's
+            # `_keep_replayable` does on its wake arm. Without it a *replayed*
+            # frame that lands here returns True, the batch reports itself
+            # all-accepted, and `discharge_boundary` spends the outage window
+            # on a frame that is only sitting in an episode buffer — so if the
+            # episode then parks, nothing points below the watermark any more
+            # and the frame is unrecoverable. The claim makes that discharge
+            # refuse. Only a replay ever discharges: the served drain *claims*
+            # too (the opposite operation), so on a happy wake this boundary
+            # lingers until the next reconnect replay reads its own window and
+            # spends it — dedup absorbs the refetch, the same lifecycle every
+            # successful episode's drain claim already has. A claim never
+            # narrows an open window.
+            ts = extract_ts(doc)
+            if ts:
+                sub.claim_boundary(sub.last_processed_ts, _just_before(ts))
+            self._release_unused_turn(doc, result, turn_generation, "waking the room")
+            task = asyncio.create_task(
+                self._route_room(
+                    room_id, doc, access,
+                    resolved_room=self._room_ref_from_sub(sub),
+                )
+            )
+            self._routing_tasks.add(task)
+            task.add_done_callback(self._routing_tasks.discard)
             return True
         if capacity is RoomCapacity.FULL:
             logger.warning(
@@ -1748,12 +2485,39 @@ class RocketChatConnector(Connector):
             #
             # Nothing is owed by not claiming: this message belongs to a membership the
             # account no longer has, so leaving it unreachable is the outcome, not a loss.
-            if sub.membership_epoch == entry_epoch:
-                sub.claim_boundary(sub.last_processed_ts, _just_before(result.msg_ts))
-            else:
+            #
+            # And not to a DETACHED object (#115): a watcher stop→start while this
+            # delivery was in flight popped `sub` and installed a fresh one, so a
+            # boundary written to `sub` is a note left in an object nothing reads
+            # again — the hand-back is never recovered. The claim goes to the room's
+            # LIVE subscription when one exists; when none does, the room is gone
+            # and there is nowhere for a replay to recover into anyway.
+            live = self._rooms.get(room_id)
+            if live is sub:
+                if sub.membership_epoch == entry_epoch:
+                    sub.claim_boundary(sub.last_processed_ts, _just_before(result.msg_ts))
+                else:
+                    logger.warning(
+                        "Room %s: not reopening the outage window for a message that was in "
+                        "flight when this account was removed", room_id,
+                    )
+            elif (live is not None
+                  and self._room_membership_gen.get(room_id, 0) == entry_mgen):
                 logger.warning(
-                    "Room %s: not reopening the outage window for a message that was in "
-                    "flight when this account was removed", room_id,
+                    "Room %s: a hand-back outlived its subscription (watcher "
+                    "restarted mid-delivery) — claiming the outage window on the "
+                    "live one instead", room_id,
+                )
+                live.claim_boundary(live.last_processed_ts, _just_before(result.msg_ts))
+            elif live is not None:
+                # A membership loss happened somewhere in this delivery's
+                # flight — whichever object it marked (the room generation
+                # survives replacements, round 2): the live object belongs to
+                # a NEW membership, and a pre-removal frame has no claim on
+                # its window.
+                logger.warning(
+                    "Room %s: not claiming a window for a hand-back that "
+                    "crossed a membership removal", room_id,
                 )
             # The one outcome that leaves this message pending: its id was just forgotten
             # precisely so a later replay can bring it back, and a boundary spent on a
@@ -1773,15 +2537,52 @@ class RocketChatConnector(Connector):
         # This is a much smaller race than waiting for the entire handler
         # duration, so the previous "advance before handler" behaviour did not
         # meaningfully reduce reconnect duplication in practice.
-        if sub.membership_epoch != entry_epoch:
-            # The account left this room while this message was in flight. Committing now
-            # would restore the very watermark the removal cleared, and a later re-add
-            # would replay from before the removal — delivering the interval the account
-            # was not a member for. The message itself is already handled; only the mark
-            # it would leave behind is refused.
+        # The commit target may no longer be `sub` (#115): a watcher stop→start
+        # while the handler ran popped it and installed a fresh subscription, so
+        # a watermark and dedup id written to `sub` vanish with it — the next
+        # reconnect replay re-delivers this very message to the new processor.
+        # The commit follows the room, not the object.
+        live = self._rooms.get(room_id)
+        if live is sub:
+            if sub.membership_epoch != entry_epoch:
+                # The account left this room while this message was in flight.
+                # Committing now would restore the very watermark the removal
+                # cleared, and a later re-add would replay from before the
+                # removal — delivering the interval the account was not a
+                # member for. The message itself is already handled; only the
+                # mark it would leave behind is refused.
+                logger.warning(
+                    "Room %s: discarding the watermark of a message that was in flight when "
+                    "this account left", room_id,
+                )
+                return True
+            target = sub
+        elif (live is not None
+              and self._room_membership_gen.get(room_id, 0) == entry_mgen):
             logger.warning(
-                "Room %s: discarding the watermark of a message that was in flight when "
-                "this account left", room_id,
+                "Room %s: a delivery outlived its subscription (watcher restarted "
+                "mid-delivery) — committing its watermark and dedup id to the live "
+                "one", room_id,
+            )
+            live.remember(msg_id)
+            target = live
+        elif live is not None:
+            # A membership loss happened somewhere in this delivery's flight —
+            # whichever object it marked, because the room generation survives
+            # replacements (round 2): the live state is a re-add's fresh
+            # membership, and committing a pre-removal watermark into it would
+            # point the next replay below the removal — delivering the whole
+            # non-member interval, which the epoch machinery exists to prevent.
+            logger.warning(
+                "Room %s: discarding the watermark of a delivery that crossed "
+                "a membership removal", room_id,
+            )
+            return True
+        else:
+            # The room is gone entirely; there is nothing to commit into.
+            logger.warning(
+                "Room %s: discarding the watermark of a message whose room was "
+                "reclaimed mid-delivery", room_id,
             )
             return True
 
@@ -1790,10 +2591,11 @@ class RocketChatConnector(Connector):
         # and an unconditional assignment then rewinds the cursor. In memory the seen-id
         # window hides that; across a save and a restart it does not, and history after
         # the regressed cursor is dispatched a second time.
-        if _ts_gt(result.msg_ts, sub.last_processed_ts or ""):
-            sub.last_processed_ts = result.msg_ts
+        if _ts_gt(result.msg_ts, target.last_processed_ts or ""):
+            target.last_processed_ts = result.msg_ts
         # msg_id was already added to seen_ids_set by the optimistic registration
-        # block above (before the first await).  No second add needed here.
+        # block above (before the first await; re-added to the live subscription
+        # above when the original was replaced mid-delivery).
         return True
 
     async def _handler_send_busy(self, room_id: str, doc: dict) -> None:

@@ -266,13 +266,17 @@ class TestWhatMustKeepWorking(unittest.TestCase):
         self.assertTrue(rule.rooms.direct)
         self.assertTrue(rule.rooms.group_direct)
 
-    def test_a_static_watcher_on_a_voice_connector_is_unaffected(self):
-        """The static shape names one concrete room, so it was never at risk — and
-        this enforcement must not leak onto that path."""
+    def test_a_literal_rule_on_a_voice_connector_loads(self):
+        """The positive case the enforcement must not over-reach into: a rule
+        naming its rooms literally is exactly what §2.6 requires of a
+        connector with no unsolicited inbound, and the eager-start loop is
+        what materializes it at boot."""
         cfg = GatewayConfig.from_file(_write_config("""\
-            - {room: hotline, connector: voice}
+            - name: hotline
+              connector: voice
+              rooms: {include: [hotline]}
             """))
-        self.assertEqual([w.room for w in cfg.watchers], ["hotline"])
+        self.assertEqual([r.name for r in cfg.watcher_rules], ["hotline"])
 
 
 def _write_config(watchers_block: str) -> str:

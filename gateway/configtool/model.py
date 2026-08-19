@@ -724,8 +724,8 @@ def _watcher_shared_fields(entry: dict) -> dict:
     return {
         key: entry[key]
         for key in (
-            "inherits", "context_inject_files", "online_notification",
-            "offline_notification", "history_handoff", "description",
+            "inherits", "context_inject_files", "history_handoff",
+            "description",
         )
         if key in entry
     }

@@ -96,9 +96,36 @@ class TestLogin(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(rest.auth_token, "tok123")
         self.assertEqual(rest.user_id, "uid456")
+        # No `me` in the response → the typed spelling is all there is.
         self.assertEqual(rest.bot_username, "bot")
         self.assertEqual(rest._username, "bot")
         self.assertEqual(rest._password, "pass")
+
+    async def test_login_stores_the_canonical_username_not_the_typed_one(self):
+        """#112: login is not spelling-exact (probed on 6.12 — 'probebot9207'
+        and the account's email both log into 'ProbeBot9207'), and every
+        message frame carries the canonical form. Identity comparisons built
+        on the typed spelling silently fail — the bot never recognises its
+        own @mention — so the canonical one is what login must keep."""
+        rest = _make_rest()
+        ok_resp = _make_response(
+            200,
+            {
+                "status": "success",
+                "data": {
+                    "authToken": "tok123",
+                    "userId": "uid456",
+                    "me": {"username": "ProbeBot9207"},
+                },
+            },
+        )
+        rest._client.post = AsyncMock(return_value=ok_resp)
+
+        await rest.login("probebot9207", "pass")
+
+        self.assertEqual(rest.bot_username, "ProbeBot9207")
+        # The typed spelling survives for re-login only.
+        self.assertEqual(rest._username, "probebot9207")
 
     async def test_login_status_not_success_raises(self):
         rest = _make_rest()
@@ -1318,6 +1345,48 @@ class TestGetRoomHistory(unittest.IsolatedAsyncioTestCase):
             params={"roomId": "ROOM_ID", "count": 20, "unreads": "false"},
         )
 
+    async def test_group_dm_uses_im_history_endpoint(self):
+        """One direct endpoint serves both DM kinds — the group/1:1 distinction
+        is ACG's, not the server's (§6.4).
+
+        Reached for real: the creation path types a room from its *classified*
+        kind, so `"group_dm"` arrives here. It used to fall through to the
+        unknown-type default and ask a channel endpoint about a direct room, so
+        history handoff and outage replay failed for every group DM, forever.
+        """
+        rest = _make_rest()
+        rest._request = AsyncMock(return_value={"messages": [], "success": True})
+        await rest.get_room_history("ROOM_ID", "group_dm", count=20)
+        rest._request.assert_called_once_with(
+            "GET", "im.history",
+            params={"roomId": "ROOM_ID", "count": 20, "unreads": "false"},
+        )
+
+    async def test_every_room_type_the_gateway_produces_has_an_endpoint(self):
+        """Derived from `RoomKind`, not a hand-written list.
+
+        The group-DM miss was invisible because the map was written when three
+        room types existed and the fourth arrived somewhere else entirely. This
+        walks the enum that decides a room's type, so the next kind fails here
+        rather than in production — and the unknown-type default stays a
+        default, not the answer for a kind the gateway itself creates.
+        """
+        from gateway.core.watcher_rule import RoomKind
+
+        for kind in RoomKind:
+            with self.subTest(kind=kind.value):
+                rest = _make_rest()
+                rest._request = AsyncMock(
+                    return_value={"messages": [], "success": True})
+                await rest.get_room_history("ROOM_ID", kind.value, count=1)
+                endpoint = rest._request.call_args[0][1]
+                expected = "im.history" if kind.is_direct else (
+                    "groups.history" if kind is RoomKind.GROUP else "channels.history")
+                self.assertEqual(
+                    endpoint, expected,
+                    f"{kind.value} must not fall through to the unknown-type default",
+                )
+
     async def test_unknown_room_type_defaults_to_channels_history(self):
         rest = _make_rest()
         rest._request = AsyncMock(return_value={"messages": [], "success": True})
@@ -1620,6 +1689,24 @@ class TestDmMembersExcludesThisAccountById(unittest.IsolatedAsyncioTestCase):
         ])
 
         self.assertEqual(await rest.dm_members("r1"), ["alice", "carol"])
+
+    async def test_a_failed_request_raises_instead_of_answering_empty(self):
+        """A network failure and a memberless answer used to be one return
+        value, which made the routing transaction's abort outcome (§2.2)
+        unreachable: retryable and final must arrive as different shapes."""
+        rest = _make_rest()
+        rest.user_id = "BOT_ID"
+        rest._request = AsyncMock(side_effect=RuntimeError("api down"))
+
+        with self.assertRaises(RuntimeError):
+            await rest.dm_members("r1")
+
+    async def test_a_malformed_members_payload_is_still_an_empty_final_answer(self):
+        rest = _make_rest()
+        rest.user_id = "BOT_ID"
+        rest._request = AsyncMock(return_value={"success": True, "members": "what"})
+
+        self.assertEqual(await rest.dm_members("r1"), [])
 
 
 class TestHistoryBoundsAreSentInTheFormatTheServerParses(unittest.IsolatedAsyncioTestCase):

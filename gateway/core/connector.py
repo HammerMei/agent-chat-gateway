@@ -89,7 +89,11 @@ class Room:
     id   — opaque platform identifier used when sending replies (RC room _id,
             Slack channel ID, Discord channel snowflake, etc.)
     name — human-readable label (#channel, @username, "script", …)
-    type — "channel" | "group" | "dm" | "thread" | "script"
+    type — "channel" | "group" | "dm" | "group_dm" | "thread" | "script".
+            "group_dm" only ever comes from the creation path, which types the
+            room from its classified kind (§2.2) — platform resolvers that
+            cannot tell the two DM kinds apart keep answering "dm", and the
+            mention gate treats only "dm" as exempt (§6.4).
     """
 
     id: str
@@ -168,6 +172,21 @@ class RoomCapacity(Enum):
 # routing miss, the second is backpressure, and reporting the first as the second made
 # an idle gateway announce that it was busy (§2.7).
 CapacityCheck = Callable[[str], RoomCapacity]
+
+
+@dataclass(frozen=True)
+class MembershipHook:
+    """The callbacks a connector fires for the bot's own membership events (§2.7).
+
+    `added` takes the classified room (a `RoomRef` — annotated loosely because
+    `watcher_manager` imports this module); `removed` takes only the room id,
+    since a room the bot was removed from may no longer be resolvable. A pair
+    of named callables rather than two registration methods so a connector
+    cannot end up holding one half of the contract.
+    """
+
+    added: Callable[[Any], Awaitable[None]]
+    removed: Callable[[str], Awaitable[None]]
 
 
 # Connector *types* whose transport delivers unsolicited inbound — the load-time
@@ -286,6 +305,34 @@ class Connector(ABC):
         The check returns a `RoomCapacity`, not a bool: `FULL` is backpressure and
         deserves the "server busy" reply, while `UNROUTED` means no watcher serves this
         room, which is not something to tell the room's members about.
+        """
+
+    async def membership_snapshot(self) -> set[str] | None:
+        """Room ids this account is currently a member of, or None for unknown.
+
+        The periodic membership reconciliation's probe (§2.7): a dormant
+        record whose room id is absent from an answered snapshot has
+        unambiguously lost its membership and is reclaimed. **None means the
+        question could not be answered** — unsupported on this connector, or
+        the lookup failed — and the caller must keep everything: an empty set
+        is a claim ("member of nothing"), and a connector that cannot answer
+        must never make it. The base returns None, so a connector without a
+        membership stream needs no carve-out here either.
+        """
+        return None
+
+    def register_membership_hook(self, hook: "MembershipHook") -> None:
+        """Register the callbacks for the bot's own membership events (§2.7).
+
+        Implemented only where a membership stream exists (Rocket.Chat's
+        subscriptions-changed notification, Mattermost's user_added/user_removed
+        events). The base is a no-op, so a connector without one needs no
+        carve-out — the caller registers unconditionally alongside the router.
+
+        The hook's `added` receives the room the bot was added to, classified
+        exactly as a router offer would be; `removed` receives only the room id,
+        because a room the bot was removed from may no longer be resolvable at
+        all. Both fire for the *bot's own* membership only, never other users'.
         """
 
     # ── Outbound ─────────────────────────────────────────────────────────────
@@ -467,6 +514,79 @@ class Connector(ABC):
         """
         return False
 
+    async def probe_missed_since(self, room: Room, after_ts: str) -> bool:
+        """Whether this room holds a message the gateway has not processed.
+
+        The startup replay's cheap question, asked before a watcher is
+        recreated (§2.2): recreating every recorded room at every boot would
+        pay a session resume per room for nothing, which is precisely the eager
+        cost the lazy model exists to avoid.
+
+        Two exclusions decide the answer, and both need platform knowledge,
+        which is why this lives on the connector rather than in the replay loop:
+
+        * **The bot's own messages.** History includes them by design (the
+          agent is shown what it said), but the watermark only advances on
+          *accepted inbound*, so the agent's own last reply always sits above
+          it — and a naive probe therefore reports a gap for every room that
+          ended with the agent speaking, which is nearly all of them. Compared
+          **by id, not by username**: an account whose canonical spelling
+          differs from the configured one is a real and documented case here.
+        * **The boundary message itself.** ``after_ts`` is an inclusive lower
+          bound, so the very message that set the watermark comes back — and it
+          is a user message, so the own-message rule does not remove it.
+
+        ``after_ts`` is epoch milliseconds, like every timestamp inside ACG
+        (§5.2).
+
+        Default: ``False`` — a connector with no history API has nothing to
+        probe, and a startup replay over its records must be harmless.
+        """
+        return False
+
+    async def replay_room_since(
+        self, room_id: str, after_ts: str | None = None
+    ) -> None:
+        """Replay one tracked room's missed messages.
+
+        The per-room half of the reconnect replay, exposed so other recoveries
+        can drive it room by room (§2.2, "abort is only retryable if something
+        replays"): reconnect iterates live subscriptions, startup iterates
+        persisted records, and a recreation replays the interval its own room
+        parked. This is the fetch-and-inject all three share. The room must
+        already be tracked — recreation restores the watermark it reads.
+
+        ``after_ts`` names the window explicitly; without it the room's own
+        marks are used. A caller that names a window is asking about an
+        interval it froze earlier, so the room's replay boundary is left
+        undischarged — that mark belongs to the room's own accounting.
+
+        Default: no-op. Connectors with no history API have nothing to replay,
+        and a startup replay over their records must be harmless.
+        """
+        return None
+
+    def trigger_history_bound(self, trigger: Any) -> str | None:
+        """A router trigger frame's timestamp, for bounding history handoff.
+
+        Epoch milliseconds as a string, like every timestamp inside ACG (§5.2):
+        its consumer compares it against a room's watermark and forwards it as
+        a `fetch_room_history` bound, and both of those are epoch-ms.
+
+        `register_router` passes the platform-native frame that prompted an offer;
+        the creation path needs one thing from it — an exclusive upper bound for
+        `fetch_room_history`, so the trigger itself is not fetched as history and
+        then delivered a second time as the live prompt (§2.7). Each connector
+        knows its own frame shape, which is why this lives here and not in the
+        routing layer.
+
+        Default: ``None`` (no bound) — connectors that never offer rooms to a
+        router need not override it, and an unparseable frame answers None rather
+        than raising, because the cost of no bound is one duplicated message
+        while the cost of raising is a failed creation.
+        """
+        return None
+
     async def fetch_room_history(
         self,
         room: Room,
@@ -495,14 +615,18 @@ class Connector(ABC):
         Args:
             room     : Resolved ``Room`` object (provides ``id`` and ``type``).
             count    : Maximum number of messages to retrieve.
-            before_ts: ISO 8601 exclusive upper-bound timestamp.  When provided,
-                       only messages older than this timestamp are returned.
-                       Maps to the platform ``latest`` parameter.
-            after_ts : ISO 8601 inclusive lower-bound timestamp.  When provided,
-                       only messages newer than or equal to this timestamp are
-                       returned.  Maps to the platform ``oldest`` parameter.
-                       Connectors that do not support this parameter may silently
-                       ignore it.
+            before_ts: Exclusive upper bound, **epoch milliseconds as a string**
+                       — the internal representation for every timestamp
+                       crossing an ACG interface (§5.2). Only messages older
+                       than it are returned. Maps to the platform's own
+                       upper-bound parameter, which each connector converts to
+                       if its API wants something else.
+            after_ts : Inclusive lower bound, epoch milliseconds as a string.
+                       Connectors that do not support it may silently ignore it.
+
+        Note the asymmetry, which is deliberate: the *bounds* are epoch-ms
+        because ACG compares them, while the ``ts`` field of each returned dict
+        is ISO because an agent reads it.
         """
         return []
 
@@ -683,28 +807,6 @@ class Connector(ABC):
         return ""
 
     # ── Optional status notifications ─────────────────────────────────────────
-
-    async def notify_online(self, room_id: str, text: str) -> None:
-        """Post a status message when the agent comes online in a room.
-
-        Args:
-            room_id: Opaque platform room ID.
-            text   : Message text to post (watcher-configured, may include emoji/markdown).
-
-        Default: no-op.  Override for platforms that support status messages.
-        """
-        pass
-
-    async def notify_offline(self, room_id: str, text: str) -> None:
-        """Post a status message when the agent goes offline in a room.
-
-        Args:
-            room_id: Opaque platform room ID.
-            text   : Message text to post (watcher-configured, may include emoji/markdown).
-
-        Default: no-op.  Override for platforms that support status messages.
-        """
-        pass
 
     async def notify_agent_event(
         self,

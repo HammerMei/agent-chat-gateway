@@ -75,7 +75,8 @@ class TestEditableConfigLoad(_EditableConfigTestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         cfg = EditableConfig.load(path)
         self.assertEqual(
@@ -457,13 +458,14 @@ class TestEditableConfigValidatedView(_EditableConfigTestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         cfg = EditableConfig.load(path)
         view = cfg.validated_view()
         self.assertIsInstance(view, GatewayConfig)
-        self.assertEqual(len(view.watchers), 1)
-        self.assertEqual(view.watchers[0].name, "w1")
+        self.assertEqual(len(view.watcher_rules), 1)
+        self.assertEqual(view.watcher_rules[0].name, "w1")
 
     def test_validated_view_raises_same_as_from_file_on_invalid_config(self):
         path = self._write("""\
@@ -648,12 +650,16 @@ class TestEditableConfigScopedSaveGate(_EditableConfigTestBase):
                 type: claude
                 working_directory: {self.agent_dir}
             watchers:
-              - connector: conn1
+              - name: w-conn1
+                connector: conn1
                 agent: default
-                room: general
-              - connector: conn2
+                rooms:
+                  include: [general]
+              - name: w-conn2
+                connector: conn2
                 agent: default
-                room: dev
+                rooms:
+                  include: [dev]
         """
 
     def test_fixing_one_connector_saves_despite_the_others_pre_existing_error(self):
@@ -731,9 +737,11 @@ class TestEditableConfigScopedSaveGate(_EditableConfigTestBase):
                 working_directory: {self.agent_dir}
             default_agent: broken_default
             watchers:
-              - connector: rc1
+              - name: w1
+                connector: rc1
                 agent: other_agent
-                room: general
+                rooms:
+                  include: [general]
         """)
         cfg = EditableConfig.load(path)
         cfg.document["agents"]["broken_default"]["working_directory"] = str(self.agent_dir)
@@ -891,7 +899,7 @@ class TestWatcherCrudPrimitives(_EditableConfigTestBase):
               - connector: rc
                 agent: default
                 room: general
-                online_notification: "hi"
+                context_inject_files: [notes.md]
         """)
         cfg = EditableConfig.load(path)
         added = cfg.add_watcher_rooms("rc", "default", ["dev"], {})
@@ -1122,15 +1130,12 @@ class TestWatcherSharedFields(unittest.TestCase):
             "connector": "rc", "agent": "d", "room": "general", "name": "x",
             "description": "desc", "inherits": "tpl",
             "context_inject_files": ["a.md"],
-            "online_notification": "up", "offline_notification": "down",
             "history_handoff": {"enabled": True},
         })
 
         self.assertEqual(got, {
             "inherits": "tpl",
             "context_inject_files": ["a.md"],
-            "online_notification": "up",
-            "offline_notification": "down",
             "history_handoff": {"enabled": True},
             "description": "desc",
         })

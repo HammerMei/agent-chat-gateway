@@ -308,7 +308,8 @@ class TestCLIConfigValidate(_CLITestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         stdout, stderr, code = self._run_validate(config_path=cfg_path)
 
@@ -328,7 +329,8 @@ class TestCLIConfigValidate(_CLITestBase):
                 type: claude
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         stdout, stderr, code = self._run_validate(config_path=cfg_path)
 
@@ -349,7 +351,8 @@ class TestCLIConfigValidate(_CLITestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         stdout, stderr, code = self._run_validate(config_path=cfg_path)
 
@@ -371,7 +374,8 @@ class TestCLIConfigValidate(_CLITestBase):
                 timeout: 360
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         stdout, stderr, code = self._run_validate(["--lint"], config_path=cfg_path)
 
@@ -391,7 +395,8 @@ class TestCLIConfigValidate(_CLITestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         stdout, stderr, code = self._run_validate(["--lint"], config_path=cfg_path)
 
@@ -409,14 +414,18 @@ class TestCLIConfigValidate(_CLITestBase):
                 type: claude
                 working_directory: {self.agent_dir}
             watchers:
-              - connector: rc
-                rooms: [general, dev]
+              - name: two-rooms
+                connector: rc
+                rooms:
+                  include: [general, dev]
         """)
         stdout, stderr, code = self._run_validate(config_path=cfg_path)
 
         self.assertEqual(code, 0)
-        self.assertIn("2 watcher(s)", stdout)
-        self.assertIn("expanded from 1 entries", stdout)
+        # One rule covering two rooms is one watcher entry — the static
+        # expansion ("2 watcher(s), expanded from 1 entries") died with its
+        # shape; rooms materialize at runtime now.
+        self.assertIn("1 watcher(s)", stdout)
 
     def test_state_orphan_produces_warning(self):
         cfg_path = self._write(f"""\
@@ -430,7 +439,8 @@ class TestCLIConfigValidate(_CLITestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         # Imported here, not at module scope: this file defers every gateway import
         # (see _import_main) so the CLI's own import-time behaviour stays under test.
@@ -446,7 +456,7 @@ class TestCLIConfigValidate(_CLITestBase):
 
         self.assertEqual(code, 0)
         self.assertIn("stale-watcher", stdout)
-        self.assertIn("dropped on next start", stdout)
+        self.assertIn("pruned on the next start", stdout)
 
 
 class TestCLIConfigMigrateEnv(_CLITestBase):
@@ -493,7 +503,8 @@ class TestCLIConfigMigrateEnv(_CLITestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         stdout, stderr, code = self._run_migrate(cfg_path)
 
@@ -512,7 +523,8 @@ class TestCLIConfigMigrateEnv(_CLITestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         (Path(self.tmp) / ".env").write_text("RC_PASSWORD=hunter2\n")
 
@@ -536,7 +548,8 @@ class TestCLIConfigMigrateEnv(_CLITestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
         (Path(self.tmp) / ".env").write_text("UNRELATED=1\n")
 
@@ -562,7 +575,8 @@ class TestCLIConfigMigrateEnv(_CLITestBase):
                 working_directory: {self.agent_dir}
             watchers:
               - name: w1
-                room: general
+                rooms:
+                  include: [general]
         """)
 
         with patch(
@@ -840,6 +854,19 @@ class TestCLIPauseResumeReset(_CLITestBase):
         _, stderr, code = self._run(["pause", "nonexistent"])
         self.assertEqual(code, 1)
         self.assertIn("watcher not found", stderr)
+
+    def test_expire_normal_path(self):
+        """Successful expire → print confirmation + exit 0 (§2.8)."""
+        self._start_daemon({"expire": {"ok": True}})
+        stdout, _, code = self._run(["expire", "rc-eng"])
+        self.assertEqual(code, 0)
+        self.assertIn("expired", stdout.lower())
+
+    def test_expire_failure_exits_1(self):
+        self._start_daemon({"expire": {"ok": False, "error": "no expirable record"}})
+        _, stderr, code = self._run(["expire", "ghost"])
+        self.assertEqual(code, 1)
+        self.assertIn("no expirable record", stderr)
 
     def test_resume_normal_path(self):
         """Successful resume → print confirmation + exit 0."""

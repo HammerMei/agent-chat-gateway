@@ -33,6 +33,7 @@ from .core.bot_identity import (
     DuplicateBotIdentityError,
     dm_claims,
     find_identity_conflicts,
+    fold_record_dm_claims,
 )
 from .core.config import CoreConfig
 from .core.connector import Connector
@@ -46,7 +47,7 @@ from .core.permission import (
 from .core.scheduler import JobScheduler
 from .core.session_manager import SessionManager
 from .core.session_maps import SessionMaps
-from .core.state import check_session_uniqueness, check_state_formats
+from .core.state import check_session_uniqueness, check_state_formats, load_state
 
 logger = logging.getLogger("agent-chat-gateway.service")
 
@@ -302,25 +303,40 @@ class GatewayService:
         # needs only this, and config is immutable after load. A DM has no team, so it
         # is the one thing the Mattermost different-teams exception cannot keep apart
         # (§4.5).
-        self._dm_claims: dict[str, DmClaim] = dm_claims(
-            config.watchers, config.watcher_rules
-        )
+        self._dm_claims: dict[str, DmClaim] = dm_claims(config.watcher_rules)
         self._entries: list[ConnectorEntry] = []
         for cc in config.connectors:
             connector = connector_factory(cc)
-            # Filter watcher configs belonging to this connector
-            connector_watchers = [
-                wc for wc in config.watchers if wc.connector == cc.name
-            ]
             sm = SessionManager(
                 connector=connector,
                 agents=agents,
                 default_agent=config.default_agent,
                 config=core_config,
                 state_name=cc.name,
-                watcher_configs=connector_watchers,
                 permission_registry=self._registry,
                 session_maps=self._maps,
+                # Rules give the manager runtime effect (§2.8). Filtered like the
+                # watcher configs: a rule binds to one connector by name, and the
+                # manager keys its matches on that same name.
+                watcher_rules=[
+                    r for r in config.watcher_rules if r.connector == cc.name
+                ],
+                # The expiry exemption's oracle (§2.5): a room with a pending
+                # scheduled job must not have its record deleted — the job's
+                # injection can wake an idle room, never a reclaimed one. The
+                # closure binds this connector's name (jobs are unique per
+                # connector, not globally) and reads the store lazily — it is
+                # loaded later in startup, and the sweep's first pass is an
+                # hour away. Fails EXEMPT: if the store cannot answer, keeping
+                # a record one more pass beats deleting one a job points at.
+                pending_jobs=(
+                    lambda name, _cn=cc.name: self._has_pending_jobs(_cn, name)
+                ),
+                # The membership-remove handler's job cancellation (§2.7):
+                # same closure shape and same key as the oracle above.
+                cancel_jobs=(
+                    lambda name, _cn=cc.name: self._cancel_jobs_for(_cn, name)
+                ),
             )
             self._entries.append(
                 ConnectorEntry(name=cc.name, connector=connector, session_manager=sm)
@@ -339,6 +355,81 @@ class GatewayService:
             self._entries,
             job_store=self._job_store,
         )
+
+    def _has_pending_jobs(self, connector_name: str, watcher_name: str) -> bool:
+        """Whether any non-completed scheduled job targets this watcher.
+
+        The expiry exemption's oracle (§2.5). ACTIVE **and PAUSED** jobs both
+        exempt: deleting a record under a paused job orphans it the moment an
+        operator resumes it. Jobs key by watcher name and connector — names
+        are unique only per connector, so both halves matter.
+
+        Fails EXEMPT: a store that cannot answer (not yet loaded, corrupt
+        file) keeps the record one more pass, which costs a state-file entry;
+        answering False would delete a record a job points at, permanently.
+        """
+        try:
+            # Fallback-owned jobs count too (Codex round 10): the scheduler
+            # explicitly supports a job whose `connector` field is empty or
+            # stale by scanning managers for the watcher — so the exemption
+            # must honor the same claim, or expiry deletes the record that
+            # makes the fallback deliverable. A job claims this watcher when
+            # its connector matches, OR when its connector matches no
+            # configured connector (exactly when the scheduler would fall
+            # back) and the name matches here.
+            configured = {e.name for e in self._entries}
+            return any(
+                j.watcher == watcher_name
+                and (j.connector == connector_name
+                     or j.connector not in configured)
+                for j in self._job_store.list_jobs()
+            )
+        except Exception as e:
+            logger.warning(
+                "Could not read the job store for the expiry exemption "
+                "(keeping watcher '%s' one more pass): %s", watcher_name, e,
+            )
+            return True
+
+    def _cancel_jobs_for(self, connector_name: str, watcher_name: str) -> None:
+        """Cancel every scheduled job targeting a reclaimed watcher (§2.7).
+
+        Fired by the membership-remove handler after `reclaim_room` succeeds:
+        the room can never receive another message, so a job left in the store
+        would fire forever at nothing. Each cancellation is logged as an audit
+        line with the reason — a job disappearing from `schedule list` must be
+        explainable. Best-effort like the oracle: a store that cannot answer
+        leaves the jobs, and each fires audibly against the missing room
+        rather than being silently lost here.
+        """
+        try:
+            # The same fallback claim rule as the exemption oracle and the
+            # scheduler's delivery (Codex round 11, the cancel side of round
+            # 10's exemption fix): a job with an empty or stale connector is
+            # deliverable to this watcher via the fallback scan, so it must
+            # also be CANCELLABLE through it — or the reclaim leaves it
+            # orphaned, failing resolution forever (active) or listed
+            # permanently (paused).
+            configured = {e.name for e in self._entries}
+            doomed = [
+                j for j in self._job_store.list_jobs()
+                if j.watcher == watcher_name
+                and (j.connector == connector_name
+                     or j.connector not in configured)
+            ]
+            for job in doomed:
+                self._job_store.remove(job.id)
+                logger.warning(
+                    "AUDIT: cancelled scheduled job %s (watcher '%s', "
+                    "connector '%s') — the bot was removed from the room, so "
+                    "the job could never deliver", job.id, watcher_name,
+                    connector_name,
+                )
+        except Exception as e:
+            logger.warning(
+                "Could not cancel scheduled jobs for reclaimed watcher '%s': %s",
+                watcher_name, e,
+            )
 
     async def _settle(
         self,
@@ -401,11 +492,26 @@ class GatewayService:
             identity = e.connector.bot_identity()
             if identity is None:
                 continue  # declares no shared account to collide over
+            claim = self._dm_claims.get(e.name, DmClaim())
+            # Widened by the connector's persisted DM records (Codex round
+            # 6): sticky binding keeps a record answering its room after its
+            # rule is deleted, so a rule-only claim misses exactly the
+            # records that outlive their rules — and two connectors sharing
+            # an account would both answer one private conversation. Read
+            # best-effort: an unreadable file was already refused loudly by
+            # check_state_formats, so nothing here needs a second refusal.
+            try:
+                claim = fold_record_dm_claims(claim, load_state(e.name))
+            except Exception:
+                logger.debug(
+                    "Could not fold persisted DM claims for connector '%s' — "
+                    "using the rule-derived claim alone", e.name, exc_info=True,
+                )
             identities.append(
                 ConnectorIdentity(
                     connector_name=e.name,
                     identity=identity,
-                    dms=self._dm_claims.get(e.name, DmClaim()),
+                    dms=claim,
                 )
             )
         conflicts = find_identity_conflicts(identities)
@@ -443,6 +549,16 @@ class GatewayService:
                     run_expiry_task(self._registry, notifier),
                     name="permission-expiry",
                 )
+
+            # The job store LOADS before any connector goes live (Codex round
+            # 8): a membership removal arriving between start_inbound and the
+            # load reclaimed the record and then failed its job cancellation
+            # on the store's not-loaded error — and with the record gone,
+            # nothing could ever rediscover those jobs. Loading is a cheap
+            # file read; only the SCHEDULER must start after run_once (its
+            # catch-up injections need processors), and it still does, below.
+            if getattr(self, "_job_store", None) is not None:
+                self._job_store.load()
 
             # 3. run_once() connects each SessionManager without blocking — the daemon
             #    loop below keeps the process alive.  We intentionally avoid sm.run()
@@ -489,11 +605,11 @@ class GatewayService:
                 startup_errors=startup_errors,
             )
 
-            # Load persisted jobs and start the job scheduler AFTER connectors are
-            # connected and watchers are up.  Starting it before run_once() would
-            # cause catch-up messages to be dropped (processors not yet started).
+            # Start the job scheduler AFTER connectors are connected and
+            # watchers are up.  Starting it before run_once() would cause
+            # catch-up messages to be dropped (processors not yet started).
+            # The store itself loaded BEFORE run_once — see above.
             if getattr(self, "_job_store", None) is not None:
-                self._job_store.load()
                 self._scheduler_task = asyncio.create_task(
                     self._job_scheduler.run(),
                     name="job-scheduler",

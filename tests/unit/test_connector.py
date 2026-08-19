@@ -11,38 +11,20 @@ Run with:
 from __future__ import annotations
 
 import asyncio
+import textwrap
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from gateway.connectors.rocketchat.connector import _just_before
-from gateway.core.connector import RoomCapacity
+from gateway.core.adapter_utils import ts_gt as _ts_gt
+from gateway.core.connector import Room, RoomCapacity
 from gateway.core.watcher_rule import RoomKind
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-
-
-def _make_config(
-    server_url: str = "http://chat.example.com",
-    username: str = "bot",
-    password: str = "pw",
-    name: str = "rc",
-    owners: list[str] | None = None,
-    **overrides,
-):
-    """Build a minimal RocketChatConfig for testing."""
-    from gateway.config import AttachmentConfig
-    from gateway.connectors.rocketchat.config import RocketChatConfig
-    return RocketChatConfig(
-        server_url=server_url,
-        username=username,
-        password=password,
-        name=name,
-        owners=owners or ["alice"],
-        attachments=AttachmentConfig(cache_dir_global="/tmp/rc-cache"),
-        **overrides,
-    )
-
+# Shared with the wake-path suite; the builder lives beside the other shared
+# fixtures so a config field added for one consumer reaches both.
+from tests.helpers import make_rc_config as _make_config  # noqa: E402
 
 
 def _page(msgs, limit=200):
@@ -74,10 +56,16 @@ def _make_connector():
     # Hand-built connector: `__init__` never runs, so anything the code reads has to be
     # set here. Delivery defaults to per-room, which is what these tests exercise.
     connector._router = None
-    connector._rooms_being_routed = set()
+    connector._membership_hook = None
+    connector._room_membership_gen = {}
+    connector._membership_serial = {}
+    connector._pending_routes = {}
+    connector._routing_tasks = set()
     connector._subscribe_all = False
     connector._dm_kinds = {}
     connector._rest = MagicMock()
+    # Pre-login: agent_username falls back to the configured spelling.
+    connector._rest.bot_username = None
     # Membership is the ordinary case, so replay tests are not all about the gate. A bare
     # MagicMock would answer with a truthy object that is still `is not True`, which reads
     # as "removed" and would make every replay test pass by replaying nothing.
@@ -311,6 +299,8 @@ class TestWatermarkAdvancement(unittest.IsolatedAsyncioTestCase):
         connector = RocketChatConnector.__new__(RocketChatConnector)
         connector._config = config
         connector._rest = MagicMock()
+        # Pre-login: agent_username falls back to the configured spelling.
+        connector._rest.bot_username = None
         connector._ws = MagicMock()
         connector._handler = None
         connector._capacity_check = None
@@ -319,6 +309,10 @@ class TestWatermarkAdvancement(unittest.IsolatedAsyncioTestCase):
         connector._room_refcount = {}
         connector._attachments_cache_base = Path("/tmp/acg-test-attachments/test")
         connector._turn_store = None  # no agent chain configured
+        connector._room_membership_gen = {}
+        connector._membership_serial = {}
+        connector._membership_hook = None
+        connector._routing_tasks = set()
 
         room = Room(id="room-1", name="general", type="channel")
         sub = _RoomSubscription(room=room, last_processed_ts="100")
@@ -411,6 +405,9 @@ def _make_rc_connector():
 
     connector = RocketChatConnector.__new__(RocketChatConnector)
     connector._config = _make_config()
+    # Pre-login: agent_username falls back to the configured spelling (#112).
+    connector._rest = MagicMock()
+    connector._rest.bot_username = None
     return connector
 
 
@@ -563,6 +560,9 @@ def _make_rc_connector_with_agents(agent_usernames: list[str]):
     cfg = _make_config()
     cfg.agent_chain = AgentChainConfig(agent_usernames=agent_usernames)
     connector._config = cfg
+    # Pre-login: agent_username falls back to the configured spelling (#112).
+    connector._rest = MagicMock()
+    connector._rest.bot_username = None
     return connector
 
 
@@ -863,7 +863,7 @@ class TestTimestampAndCacheDir(unittest.TestCase):
         self.assertIn("room-xyz", result)
 
 
-# ── Tests: notify_typing / notify_online / notify_offline (T3) ────────────────
+# ── Tests: notify_typing (T3) ─────────────────────────────────────────────────
 
 
 class TestNotifications(unittest.IsolatedAsyncioTestCase):
@@ -893,28 +893,6 @@ class TestNotifications(unittest.IsolatedAsyncioTestCase):
         args = connector._ws.call_method.call_args[0]
         self.assertEqual(args[1][2], [])  # empty activity list
 
-    async def test_notify_online_posts_message(self):
-        connector = _make_connector()
-        connector._rest.post_message = AsyncMock()
-        await connector.notify_online("room-1", "✅ online")
-        connector._rest.post_message.assert_awaited_once_with("room-1", "✅ online")
-
-    async def test_notify_online_swallows_exception(self):
-        """notify_online must not raise when post_message fails."""
-        connector = _make_connector()
-        connector._rest.post_message = AsyncMock(side_effect=RuntimeError("network error"))
-        await connector.notify_online("room-1", "✅ online")  # must not raise
-
-    async def test_notify_offline_posts_message(self):
-        connector = _make_connector()
-        connector._rest.post_message = AsyncMock()
-        await connector.notify_offline("room-1", "❌ offline")
-        connector._rest.post_message.assert_awaited_once_with("room-1", "❌ offline")
-
-    async def test_notify_offline_swallows_exception(self):
-        connector = _make_connector()
-        connector._rest.post_message = AsyncMock(side_effect=OSError("timeout"))
-        await connector.notify_offline("room-1", "❌ offline")  # must not raise
 
 
 # ── Tests: subscribe_room rollback on DDP failure (T3) ───────────────────────
@@ -945,6 +923,108 @@ class TestSubscribeRoomRollback(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("new-room", connector._rooms)
         self.assertNotIn("new-room", connector._watcher_contexts)
         self.assertNotIn("new-room", connector._room_refcount)
+
+
+class TestHostileRoomIdsAreContained(unittest.TestCase):
+    """The attachment cache path is fenced (§2.3): the id comes from the
+    server, and expiry `rmtree`s the directory it names, so no id may name a
+    path outside the cache base. Dot components survive a character-class
+    sanitize — dots are legal filename characters — which is why the fence is
+    `resolve_under`, not the regex."""
+
+    def test_dot_components_and_empties_are_refused_outright(self):
+        connector = _make_connector()
+        for rid in ("..", ".", ""):
+            with self.subTest(rid=rid):
+                self.assertIsNone(connector.attachment_cache_dir(rid))
+
+    def test_no_id_resolves_outside_the_cache_base(self):
+        connector = _make_connector()
+        base = Path("/tmp/test-cache").resolve()
+        for rid in ("a/../b", "../../etc", "x\\..\\y", "GENERAL123", "室內"):
+            with self.subTest(rid=rid):
+                p = connector.attachment_cache_dir(rid)
+                if p is None:
+                    continue  # refused is also contained
+                resolved = Path(p).resolve()
+                self.assertTrue(
+                    resolved.is_relative_to(base) and resolved != base,
+                    f"{rid!r} escaped to {resolved}",
+                )
+
+    def test_a_real_id_resolves_where_it_always_did(self):
+        connector = _make_connector()
+        self.assertEqual(
+            connector.attachment_cache_dir("GENERAL123abcDEF0"),
+            str(Path("/tmp/test-cache") / "GENERAL123abcDEF0"),
+        )
+
+    def test_reclaim_of_a_hostile_id_deletes_nothing(self):
+        """The destructive consumer, end to end: expiry's reclaim given an id
+        spelling '..' must not delete the directory above the cache base."""
+        import tempfile
+
+        from gateway.core.attachment_workspace import AttachmentWorkspace
+        from gateway.core.paths import room_path_key
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / "cache" / "rc"
+            base.mkdir(parents=True)
+            sentinel = Path(td) / "cache" / "sentinel.txt"
+            sentinel.write_text("must survive")
+            working = Path(td) / "wd"
+            working.mkdir()
+
+            connector = _make_connector()
+            connector._attachments_cache_base = base
+            workspace = AttachmentWorkspace(connector)
+
+            workspace.reclaim(room_path_key("rc", ".."), "..", str(working))
+
+            self.assertTrue(sentinel.exists(),
+                            "reclaim escaped the cache base and deleted its parent")
+            self.assertTrue(base.exists())
+
+
+class TestSubscribeRoomIsIdempotentPerWatcher(unittest.IsolatedAsyncioTestCase):
+    """The same watcher re-subscribing to a room it already holds must not leak.
+
+    A wake after an idle drop runs the same start path a fresh creation does
+    (§2.5), and the idle drop deliberately keeps the room tracked (§2.2) — so
+    `subscribe_room` is re-entered for a (room, watcher) pair that is already
+    registered. Appending a second context and bumping the refcount there leaks
+    one of each per idle/wake cycle, and the leaked refcount means the room's
+    real unsubscribe never reaches zero.
+    """
+
+    async def test_same_watcher_resubscribe_does_not_grow_state(self):
+        connector = _make_connector()
+        room = connector._rooms["room-1"].room
+
+        # The fixture already holds watcher "w1" with refcount 1 — a wake.
+        await connector.subscribe_room(room, watcher_id="w1")
+
+        self.assertEqual(connector._room_refcount["room-1"], 1)
+        contexts = connector._watcher_contexts["room-1"]
+        self.assertEqual([c.watcher_id for c in contexts], ["w1"])
+
+        # And after several cycles, still one of each.
+        await connector.subscribe_room(room, watcher_id="w1")
+        await connector.subscribe_room(room, watcher_id="w1")
+        self.assertEqual(connector._room_refcount["room-1"], 1)
+        self.assertEqual(
+            [c.watcher_id for c in connector._watcher_contexts["room-1"]], ["w1"])
+
+    async def test_a_different_watcher_still_refcounts(self):
+        connector = _make_connector()
+        room = connector._rooms["room-1"].room
+
+        await connector.subscribe_room(room, watcher_id="w2")
+
+        self.assertEqual(connector._room_refcount["room-1"], 2)
+        self.assertEqual(
+            [c.watcher_id for c in connector._watcher_contexts["room-1"]],
+            ["w1", "w2"])
 
 
 # ── Tests: _on_raw_ddp_message edge paths (T3) ───────────────────────────────
@@ -1109,6 +1189,8 @@ class TestNotifyAgentEvent(unittest.IsolatedAsyncioTestCase):
         connector = RocketChatConnector.__new__(RocketChatConnector)
         connector._config = _make_config()
         connector._rest = MagicMock()
+        # Pre-login: agent_username falls back to the configured spelling.
+        connector._rest.bot_username = None
         connector._ws = MagicMock()
         connector._ws.call_method = AsyncMock()
         return connector
@@ -2099,6 +2181,225 @@ class TestSystemMessagesOnTheLivePath(unittest.TestCase):
         self.assertTrue(result.accepted)
 
 
+class TestTheMentionGateUsesTheCanonicalUsername(unittest.TestCase):
+    """#112: login is not spelling-exact, and mentions carry the CANONICAL
+    spelling. Under a lowercase or email login, a gate comparing against the
+    configured spelling never recognises being @-mentioned — the bot
+    connects, subscribes, and silently ignores everyone in every
+    require_mention room."""
+
+    def _config(self):
+        from gateway.connectors.rocketchat.config import RocketChatConfig
+
+        # The operator typed the lowercase form; the server knows ProbeBot9207.
+        return RocketChatConfig(
+            server_url="https://x", username="probebot9207", password="pw",
+            name="rc", owners=["glin"],
+        )
+
+    def _doc(self, mention):
+        return {"_id": "m1", "rid": "ch1", "msg": f"@{mention} hello",
+                "u": {"username": "glin"}, "ts": {"$date": 1},
+                "mentions": [{"username": mention}]}
+
+    def test_a_canonical_mention_is_recognised_when_passed_through(self):
+        from gateway.connectors.rocketchat.normalize import filter_rc_message
+
+        result = filter_rc_message(
+            self._doc("ProbeBot9207"), self._config(),
+            room_type="channel", last_processed_ts=None,
+            bot_username="ProbeBot9207",
+        )
+        self.assertTrue(result.accepted, result.reason)
+
+    def test_without_the_canonical_name_the_gate_goes_deaf(self):
+        """The failure #112 documents, pinned so the fallback's limits stay
+        visible: config-spelling comparison misses the canonical mention."""
+        from gateway.connectors.rocketchat.normalize import filter_rc_message
+
+        result = filter_rc_message(
+            self._doc("ProbeBot9207"), self._config(),
+            room_type="channel", last_processed_ts=None,
+        )
+        self.assertFalse(result.accepted)
+
+    def test_an_own_message_is_recognised_by_canonical_name(self):
+        from gateway.connectors.rocketchat.normalize import filter_rc_message
+
+        doc = {"_id": "m1", "rid": "ch1", "msg": "my own reply",
+               "u": {"username": "ProbeBot9207"}, "ts": {"$date": 1}}
+        result = filter_rc_message(
+            doc, self._config(), room_type="dm", last_processed_ts=None,
+            bot_username="ProbeBot9207",
+        )
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "own message")
+
+
+class TestTheMentionGateIsKindAware(unittest.TestCase):
+    """A group DM goes down the mention-required side (§2.7, §6.4).
+
+    `require_mention` skips 1:1 DMs only. Rocket.Chat reports both DM kinds as
+    type `d`, so nothing on the wire distinguishes them — the distinction comes
+    from classification (`_direct_room_identity`), and the creation path types
+    the room `group_dm` from the classified kind. The filter's `!= "dm"` test
+    then puts a group DM on the mention-required side, which is the §6.4
+    failure mode this class pins: a group DM misclassified as a plain DM makes
+    the agent answer every message from anyone in that group.
+    """
+
+    def _config(self):
+        from gateway.connectors.rocketchat.config import RocketChatConfig
+
+        return RocketChatConfig(
+            server_url="https://x", username="bot", password="pw", name="rc",
+            owners=["glin"],
+        )
+
+    def test_a_group_dm_requires_a_mention(self):
+        from gateway.connectors.rocketchat.normalize import filter_rc_message
+
+        result = filter_rc_message(
+            {"_id": "m1", "rid": "gdm1", "msg": "no mention here",
+             "u": {"username": "glin"}, "ts": {"$date": 1}},
+            self._config(), room_type="group_dm", last_processed_ts=None,
+        )
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "bot not mentioned")
+
+    def test_a_group_dm_message_mentioning_the_bot_passes(self):
+        from gateway.connectors.rocketchat.normalize import filter_rc_message
+
+        result = filter_rc_message(
+            {"_id": "m1", "rid": "gdm1", "msg": "@bot hello",
+             "u": {"username": "glin"}, "ts": {"$date": 1},
+             "mentions": [{"username": "bot"}]},
+            self._config(), room_type="group_dm", last_processed_ts=None,
+        )
+        self.assertTrue(result.accepted)
+
+    def test_a_one_to_one_dm_still_bypasses_the_gate(self):
+        from gateway.connectors.rocketchat.normalize import filter_rc_message
+
+        result = filter_rc_message(
+            {"_id": "m1", "rid": "dm1", "msg": "no mention here",
+             "u": {"username": "glin"}, "ts": {"$date": 1}},
+            self._config(), room_type="dm", last_processed_ts=None,
+        )
+        self.assertTrue(result.accepted)
+
+
+class TestProbeMissedSince(unittest.IsolatedAsyncioTestCase):
+    """The startup replay's gap question, and the two things that make it lie.
+
+    The watermark advances only on accepted *inbound*, while history includes
+    the bot's own replies by design — so the agent's last answer always sits
+    above the watermark. And `after_ts` is an inclusive lower bound, so the very
+    message that set the watermark comes back too. A probe that counted either
+    would report a gap for nearly every room at every boot, recreating every
+    watcher on every start — the eager cost the lazy model exists to avoid.
+    """
+
+    def _connector(self, docs, *, was_full=False):
+        from gateway.core.connector import HistoryPage
+
+        connector = _make_connector()
+        connector._rest = MagicMock()
+        # Pre-login: agent_username falls back to the configured spelling.
+        connector._rest.bot_username = None
+        connector._rest.user_id = "BOT_ID"
+        connector._rest.get_room_history_page = AsyncMock(return_value=HistoryPage(
+            messages=docs,
+            raw_count=connector._REPLAY_HISTORY_COUNT if was_full else len(docs),
+            limit=connector._REPLAY_HISTORY_COUNT,
+        ))
+        return connector
+
+    def _doc(self, ms, user_id="U1"):
+        return {"_id": f"m{ms}", "msg": "hi", "u": {"_id": user_id, "username": "x"},
+                "ts": {"$date": ms}}
+
+    _ROOM = Room(id="r1", name="eng", type="channel")
+
+    async def test_only_the_bots_own_reply_above_the_watermark_is_not_a_gap(self):
+        connector = self._connector([self._doc(2000, user_id="BOT_ID")])
+        self.assertFalse(await connector.probe_missed_since(self._ROOM, "1000"))
+
+    async def test_the_boundary_message_itself_is_not_a_gap(self):
+        """It is a *user* message, so the own-message rule does not remove it —
+        only the strictly-after comparison does."""
+        connector = self._connector([self._doc(1000)])
+        self.assertFalse(await connector.probe_missed_since(self._ROOM, "1000"))
+
+    async def test_a_real_user_message_above_the_watermark_is_a_gap(self):
+        connector = self._connector([self._doc(1000), self._doc(2000)])
+        self.assertTrue(await connector.probe_missed_since(self._ROOM, "1000"))
+
+    async def test_the_bot_is_recognised_by_id_not_by_spelling(self):
+        """A login whose canonical username differs from the configured one is
+        a real, documented case here — a name comparison would count the bot's
+        own reply as a gap."""
+        connector = self._connector([
+            {"_id": "m1", "msg": "hi", "ts": {"$date": 2000},
+             "u": {"_id": "BOT_ID", "username": "ProbeBot9207"}},
+        ])
+        self.assertFalse(await connector.probe_missed_since(self._ROOM, "1000"))
+
+    async def test_an_empty_room_is_not_a_gap(self):
+        connector = self._connector([])
+        self.assertFalse(await connector.probe_missed_since(self._ROOM, "1000"))
+
+    async def test_a_page_filled_by_system_events_is_a_gap_not_an_empty_window(self):
+        """`count` is the server's, the filter is ACG's, and it runs after — so
+        a window whose newest entries are all joins and topic changes arrives
+        as an empty list with every user message in it still waiting behind
+        that page. Only `raw_count` tells that apart from a genuinely empty
+        window, and the reconnect replay already reads it for this reason.
+
+        Answering "gap" when the two cannot be told apart costs one recreation;
+        answering "no gap" costs someone the reply they are waiting for — and
+        costs it silently, which is the half that decides this.
+        """
+        connector = self._connector([], was_full=True)
+        self.assertTrue(await connector.probe_missed_since(self._ROOM, "1000"))
+
+
+class TestTriggerHistoryBound(unittest.TestCase):
+    """The one thing the creation path needs from a trigger frame: an exclusive
+    upper bound for history handoff, so the trigger is not delivered twice."""
+
+    def _connector(self):
+        from gateway.connectors.rocketchat.config import RocketChatConfig
+        from gateway.connectors.rocketchat.connector import RocketChatConnector
+
+        return RocketChatConnector(RocketChatConfig(
+            server_url="https://x", username="bot", password="pw", name="rc",
+            owners=["glin"], timezone="UTC",
+        ))
+
+    def test_a_ddp_date_object_reads_as_epoch_ms(self):
+        """Epoch milliseconds, not ISO (§5.2): the consumer compares this
+        against a room's watermark and forwards it as a history bound, and both
+        of those are epoch-ms. Converting to ISO here put an unparseable value
+        into a numeric comparison, which then fell back to string ordering."""
+        bound = self._connector().trigger_history_bound(
+            {"_id": "m1", "ts": {"$date": 1786874400000}})
+        self.assertEqual(bound, "1786874400000")
+
+    def test_a_bare_epoch_ms_reads_through(self):
+        bound = self._connector().trigger_history_bound(
+            {"_id": "m1", "ts": 1786874400000})
+        self.assertEqual(bound, "1786874400000")
+
+    def test_a_missing_or_garbled_ts_answers_none_not_a_raise(self):
+        """The cost of no bound is one duplicated message; the cost of raising
+        is a failed creation."""
+        connector = self._connector()
+        self.assertIsNone(connector.trigger_history_bound({"_id": "m1"}))
+        self.assertIsNone(connector.trigger_history_bound({"ts": "not-a-ts"}))
+        self.assertIsNone(connector.trigger_history_bound(None))
+
+
 class TestSystemMessagesAndTheAgentChain(unittest.TestCase):
     """The side effect of filtering at step 0, stated because nothing else would say it.
 
@@ -2289,6 +2590,8 @@ class TestUnroutedMessages(unittest.IsolatedAsyncioTestCase):
         connector = _make_connector()
         connector._ws = MagicMock(register_default_callback=MagicMock())
         connector._rest = MagicMock()
+        # Pre-login: agent_username falls back to the configured spelling.
+        connector._rest.bot_username = None
         connector._rest.dm_member_count = AsyncMock(return_value=2)
         self.offered = []
         connector._config = _make_config(owners=["glin"])
@@ -2384,6 +2687,8 @@ class TestDirectRoomClassification(unittest.IsolatedAsyncioTestCase):
         connector = _make_connector()
         connector._ws = MagicMock(register_default_callback=MagicMock())
         connector._rest = MagicMock()
+        # Pre-login: agent_username falls back to the configured spelling.
+        connector._rest.bot_username = None
         connector._rest.dm_members = AsyncMock(return_value=list(members))
         self.offered = []
         connector._config = _make_config(owners=["glin"])
@@ -2426,18 +2731,43 @@ class TestDirectRoomClassification(unittest.IsolatedAsyncioTestCase):
 
         connector._rest.dm_members.assert_awaited_once()
 
-    async def test_a_failed_lookup_offers_nothing_and_caches_nothing(self):
-        """Unknown is not a kind.
+    async def test_a_memberless_answer_offers_nothing_and_caches_nothing(self):
+        """Unknown is not a kind — and this one is *final* (§2.2): the server
+        answered and named nobody, so a retry cannot change it.
 
-        Answering `dm` on a failed lookup would let a group DM be claimed by a `direct: true`
-        rule and skip the mention gate with it — the agent then answers everyone in the
-        group. Nothing is lost by declining: the room's next message asks again, which is
-        also why the failure must not be cached.
+        Answering `dm` would let a group DM be claimed by a `direct: true` rule and
+        skip the mention gate with it — the agent then answers everyone in the
+        group. The next message asks again with fresh data, which is also why the
+        decline is not cached.
         """
         connector = self._connector(members=())
         await self._deliver(connector)
         self.assertEqual(self.offered, [], "an unclassifiable room must not be offered")
         self.assertEqual(connector._dm_kinds, {})
+
+    async def test_a_lookup_failure_is_retryable_not_final(self):
+        """The other half of the split (§2.2 outcome 3): a network failure means
+        the classification was never made. The frame is dropped audibly, nothing
+        is cached, the single-flight reservation is released — and the raise
+        never escapes to the routing worker as an anonymous callback failure."""
+        connector = self._connector()
+        connector._ROUTE_RETRY_DELAYS = ()
+        connector._rest.dm_members = AsyncMock(side_effect=RuntimeError("api down"))
+
+        with self.assertLogs(
+            "agent-chat-gateway.connectors.rocketchat", "WARNING"
+        ) as logs:
+            await self._deliver(connector)
+
+        self.assertEqual(self.offered, [])
+        self.assertEqual(connector._dm_kinds, {})
+        self.assertEqual(connector._pending_routes, {})
+        self.assertTrue(any("parking" in line for line in logs.output))
+
+        # And the room recovers on its next message.
+        connector._rest.dm_members = AsyncMock(return_value=["alice"])
+        await self._deliver(connector)
+        self.assertEqual(len(self.offered), 1)
 
     async def test_a_lookup_that_recovers_offers_the_room_it_declined(self):
         """The decline is for this message only — the retry is the whole reason it is safe."""
@@ -3049,8 +3379,12 @@ class TestARoomIsOfferedOnceAtATime(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sorted(offered), ["new-room", "other-room"])
 
     async def test_a_room_that_failed_to_be_offered_can_be_offered_again(self):
-        """Holding the reservation would make one transient REST failure permanent."""
+        """Holding the reservation would make one transient REST failure permanent.
+
+        Delays zeroed so the park is immediate: what this pins is that a parked
+        episode releases its reservation, not how long the backoff waits."""
         connector = self._connector()
+        connector._ROUTE_RETRY_DELAYS = ()
         attempts = []
 
         async def _failing_router(room, trigger):
@@ -3064,7 +3398,278 @@ class TestARoomIsOfferedOnceAtATime(unittest.IsolatedAsyncioTestCase):
         await connector._on_unrouted_message(doc, access)
 
         self.assertEqual(len(attempts), 2)
-        self.assertEqual(connector._rooms_being_routed, set())
+        self.assertEqual(connector._pending_routes, {})
+
+
+class TestTheRoutingTransaction(unittest.IsolatedAsyncioTestCase):
+    """The reserve/resolve/commit-or-abort episode on the unrouted path (§2.2).
+
+    One episode per room, frames buffered while it is open, drained in arrival
+    order on success, dropped with the episode otherwise. Each of the design's
+    terminal outcomes that this path owns is pinned here; the tracked path's
+    accounting (watermark commit, hand-back) has its own tests and is released
+    behaviour this increment does not touch.
+    """
+
+    def _connector(self):
+        connector = _make_connector()
+        connector._config.filter_sender = False
+        connector._ROUTE_RETRY_DELAYS = (0,)
+        return connector
+
+    def _doc(self, msg_id="m1"):
+        return {"_id": msg_id, "msg": "hi", "u": {"username": "alice"},
+                "rid": "new-room", "ts": {"$date": 1}}
+
+    _ACCESS = {"roomParticipant": True, "roomType": "c", "roomName": "general"}
+
+    async def test_frames_arriving_during_creation_drain_in_arrival_order(self):
+        """Outcome 1, plus the ordering rule: the trigger first, then every
+        frame that arrived during the episode, all through the room's worker."""
+        connector = self._connector()
+        release = asyncio.Event()
+        entered = asyncio.Event()
+
+        async def creating_router(room, trigger):
+            entered.set()
+            await release.wait()
+            connector._rooms["new-room"] = MagicMock()  # what a creation does
+
+        connector.register_router(creating_router)
+
+        first = asyncio.create_task(
+            connector._on_unrouted_message(self._doc("m1"), self._ACCESS))
+        await entered.wait()
+        await connector._on_unrouted_message(self._doc("m2"), self._ACCESS)
+        await connector._on_unrouted_message(self._doc("m3"), self._ACCESS)
+        release.set()
+        await first
+
+        delivered = [c.args[1]["_id"]
+                     for c in connector._ws.deliver_to_room.call_args_list]
+        self.assertEqual(delivered, ["m1", "m2", "m3"])
+
+    async def test_a_duplicate_of_a_reserved_message_is_discarded(self):
+        """Outcome 6 — and the episode's seen-set is the only guard there is:
+        the new subscription's own dedup window starts empty."""
+        connector = self._connector()
+        release = asyncio.Event()
+        entered = asyncio.Event()
+
+        async def creating_router(room, trigger):
+            entered.set()
+            await release.wait()
+            connector._rooms["new-room"] = MagicMock()
+
+        connector.register_router(creating_router)
+
+        first = asyncio.create_task(
+            connector._on_unrouted_message(self._doc("m1"), self._ACCESS))
+        await entered.wait()
+        await connector._on_unrouted_message(self._doc("m2"), self._ACCESS)
+        await connector._on_unrouted_message(self._doc("m2"), self._ACCESS)  # dup
+        release.set()
+        await first
+
+        delivered = [c.args[1]["_id"]
+                     for c in connector._ws.deliver_to_room.call_args_list]
+        self.assertEqual(delivered, ["m1", "m2"], "the copy went, the original stayed")
+
+    async def test_a_full_buffer_is_audible_in_the_room_once(self):
+        """Outcome 5: silently committing would drop a message the user watched
+        arrive — and one episode owes one notice, however many frames overflow."""
+        connector = self._connector()
+        connector._PENDING_BUFFER_DEPTH = 1
+        connector.send_text = AsyncMock()
+        release = asyncio.Event()
+        entered = asyncio.Event()
+
+        async def slow_router(room, trigger):
+            entered.set()
+            await release.wait()
+
+        connector.register_router(slow_router)
+
+        first = asyncio.create_task(
+            connector._on_unrouted_message(self._doc("m1"), self._ACCESS))
+        await entered.wait()
+        await connector._on_unrouted_message(self._doc("m2"), self._ACCESS)  # full
+        await connector._on_unrouted_message(self._doc("m3"), self._ACCESS)  # full again
+        release.set()
+        await first
+
+        connector.send_text.assert_awaited_once()
+        self.assertEqual(connector.send_text.await_args.args[0], "new-room")
+
+    async def test_a_transient_classification_failure_recovers_in_place(self):
+        """Outcome 3, the retry half: the routing decision was never made, so
+        the same episode asks again — the trigger is not lost to one timeout."""
+        connector = self._connector()
+        offered = []
+        connector.register_router(
+            AsyncMock(side_effect=lambda room, trigger: offered.append(room)))
+        connector._rest.dm_members = AsyncMock(
+            side_effect=[RuntimeError("timeout"), ["alice"]])
+
+        await connector._on_unrouted_message(
+            self._doc("m1"), {"roomParticipant": True, "roomType": "d"})
+
+        self.assertEqual(len(offered), 1)
+        self.assertEqual(offered[0].kind, RoomKind.DM)
+
+    async def test_a_transient_creation_failure_recovers_in_place(self):
+        """Outcome 4, the retry half: the manager lets a failed start propagate
+        precisely so this loop can tell it from a final no."""
+        connector = self._connector()
+        calls = []
+
+        async def flaky_router(room, trigger):
+            calls.append(1)
+            if len(calls) < 2:
+                raise RuntimeError("backend hiccup")
+            connector._rooms["new-room"] = MagicMock()
+
+        connector.register_router(flaky_router)
+        await connector._on_unrouted_message(self._doc("m1"), self._ACCESS)
+
+        self.assertEqual(len(calls), 2)
+        delivered = [c.args[1]["_id"]
+                     for c in connector._ws.deliver_to_room.call_args_list]
+        self.assertEqual(delivered, ["m1"], "the trigger survived the first failure")
+
+    async def test_the_recreations_replay_is_the_only_await_in_the_drain_window(self):
+        """The exposure, pinned to exactly one call so a second cannot be added
+        without a decision.
+
+        The pending-before-tracked check covers the *routing* path only; once
+        the room is tracked, frames go straight to its worker. So a frame can
+        overtake the buffered trigger between the tracked-write (inside the
+        router call) and the drain — and that span is not empty: a recreation
+        replays the interval its room owes before returning. If that replay
+        delivers nothing and a live frame lands meanwhile, the trigger is
+        filtered as already processed and lost.
+
+        One await is the accepted exposure and it is documented at the drain;
+        this walks the span so the *next* one fails here rather than silently.
+        """
+        import ast
+        import inspect
+
+        from gateway.core import watcher_manager
+
+        source = inspect.getsource(watcher_manager.WatcherManager._recreate)
+        tree = ast.parse(textwrap.dedent(source))
+        awaited = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Await):
+                call = node.value
+                name = (call.func.attr if isinstance(call, ast.Call)
+                        and isinstance(call.func, ast.Attribute) else "?")
+                awaited.append(name)
+
+        self.assertEqual(
+            sorted(awaited), ["replay_room_since", "start_watcher_in_room"],
+            "an await added to the recreation path widens the window in which "
+            "a live frame can overtake the buffered trigger — the drain's own "
+            "comment names this as the accepted, singular exposure",
+        )
+
+    async def test_a_drained_frame_the_watermark_outran_is_deferred_not_lost(self):
+        """The scalar-watermark case §2.2 names, at the episode boundary.
+
+        Nothing marks the buffered trigger as processed. What happens is that a
+        live message accepted while the episode was resolving commits *its own*
+        timestamp — and one timestamp cannot say "committed the later one but
+        not the earlier", so the filter then rejects everything below it,
+        including the trigger.
+
+        The episode claims the window before handing its frames over, which is
+        the same promise the queue-full hand-back makes with the same
+        mechanism: a message below this mark was not read, so a recovery must
+        come back for it.
+        """
+        connector = self._connector()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def creating_router(room, trigger):
+            entered.set()
+            await release.wait()
+            from gateway.connectors.rocketchat.connector import _RoomSubscription
+
+            sub = _RoomSubscription(room=Room(id="new-room", name="general"))
+            # What a live message accepted during the episode leaves behind.
+            sub.last_processed_ts = "9999"
+            connector._rooms["new-room"] = sub
+
+        connector.register_router(creating_router)
+        first = asyncio.create_task(
+            connector._on_unrouted_message(self._doc("m1"), self._ACCESS))
+        await entered.wait()
+        release.set()
+        await first
+
+        sub = connector._rooms["new-room"]
+        self.assertTrue(
+            sub.replay_boundary,
+            "the window below the drained frames is claimed, so a recovery "
+            "returns for anything the advanced watermark filtered out",
+        )
+        self.assertTrue(
+            _ts_gt("1", sub.replay_boundary or "1"),
+            "the claimed mark sits strictly below the buffered frame",
+        )
+
+    async def test_the_claim_holds_for_a_brand_new_room_with_no_watermark(self):
+        """The common episode, and the one the first version of the test above
+        did not cover: it seeded a watermark, so both claim candidates were
+        non-empty.
+
+        A first-ever room offers `("", just_before(trigger))`. If the empty
+        string won and were stored, the read site — `after_ts or
+        replay_boundary or last_processed_ts` — would treat it as falsy and
+        skip the room entirely, leaving the claim inert exactly where it
+        matters most. `claim_boundary` filters falsy candidates rather than
+        sorting them oldest, which is what makes this work; pinned here because
+        the docstring's "an unparseable candidate sorts as the oldest" reads
+        like it would not.
+        """
+        connector = self._connector()
+
+        async def creating_router(room, trigger):
+            from gateway.connectors.rocketchat.connector import _RoomSubscription
+
+            # A brand-new room: no watermark yet, by definition.
+            connector._rooms["new-room"] = _RoomSubscription(
+                room=Room(id="new-room", name="general"))
+
+        connector.register_router(creating_router)
+        await connector._on_unrouted_message(self._doc("m1"), self._ACCESS)
+
+        sub = connector._rooms["new-room"]
+        self.assertTrue(
+            sub.replay_boundary,
+            "an empty watermark must not become the claimed mark — a falsy "
+            "boundary is skipped by every reader, so the claim would be inert",
+        )
+        # And a recovery reading its own window actually uses it.
+        self.assertEqual(
+            sub.replay_boundary or sub.last_processed_ts, sub.replay_boundary)
+
+    async def test_a_parked_room_commits_nothing(self):
+        """Outcomes 4-exhausted and 7 share one observable: nothing was
+        committed. No room state exists, no watermark was written, no frame was
+        delivered — so a later replay (for a room with a record) or the room's
+        next message (for a first-ever room) finds the field untouched."""
+        connector = self._connector()
+        connector._ROUTE_RETRY_DELAYS = ()
+        connector.register_router(AsyncMock(side_effect=RuntimeError("dead")))
+
+        await connector._on_unrouted_message(self._doc("m1"), self._ACCESS)
+
+        self.assertNotIn("new-room", connector._rooms)
+        connector._ws.deliver_to_room.assert_not_called()
+        self.assertEqual(connector._pending_routes, {})
 
 
 class TestAQueuedFrameDoesNotReofferATrackedRoom(unittest.IsolatedAsyncioTestCase):
@@ -3701,6 +4306,12 @@ class TestTheMessageThatCreatedTheWatcherIsDelivered(unittest.IsolatedAsyncioTes
     callback is registered *after* the frame was routed here — so without an explicit
     delivery, the message that caused the watcher to exist is the one message it never
     sees, and its sender waits for an answer that needs a second message to arrive.
+
+    **These assert where the document ends up, not which function was called.** They
+    used to mock `_on_raw_ddp_message` and assert it was awaited, which pinned the
+    mechanism rather than the outcome: the change that moved delivery onto the room's
+    worker broke them while delivering the message perfectly well. A test that fails
+    when the implementation improves is testing the implementation.
     """
 
     def _connector(self):
@@ -3708,44 +4319,98 @@ class TestTheMessageThatCreatedTheWatcherIsDelivered(unittest.IsolatedAsyncioTes
         connector._config.require_mention = False
         connector._config.filter_sender = False
         connector._handler = AsyncMock(return_value=True)
+        # Capture what reaches the room's queue — the observable end of delivery,
+        # whichever path put it there.
+        connector._ws.deliver_to_room = MagicMock(
+            side_effect=lambda rid, doc, access=None, **kw:
+                self.delivered.append((rid, doc["_id"]))
+        )
         return connector
 
-    def _frame(self, rid="new-room"):
+    def setUp(self):
+        self.delivered: list[tuple[str, str]] = []
+
+    def _frame(self, mid="m1", rid="new-room"):
         return (
-            {"_id": "m1", "rid": rid, "msg": "hi", "u": {"username": "alice"},
+            {"_id": mid, "rid": rid, "msg": "hi", "u": {"username": "alice"},
              "ts": {"$date": 500}},
             {"roomParticipant": True, "roomType": "c", "roomName": "general"},
         )
 
-    async def test_the_trigger_is_dispatched_after_the_watcher_exists(self):
+    def _creating_router(self, connector):
         from gateway.connectors.rocketchat.connector import _RoomSubscription
         from gateway.core.connector import Room
-
-        connector = self._connector()
-        dispatched: list[str] = []
-        connector._on_raw_ddp_message = AsyncMock(
-            side_effect=lambda rid, doc, **kw: dispatched.append(doc["_id"]) or True
-        )
 
         async def _router(room, trigger):
             # what creating a watcher does to the connector
             connector._rooms[room.id] = _RoomSubscription(
                 room=Room(id=room.id, name="general", type="channel"))
+        return _router
 
-        connector.register_router(_router)
+    async def test_the_trigger_reaches_the_room(self):
+        connector = self._connector()
+        connector.register_router(self._creating_router(connector))
         doc, access = self._frame()
+
         await connector._on_unrouted_message(doc, access)
 
         self.assertEqual(
-            dispatched, ["m1"],
+            self.delivered, [("new-room", "m1")],
             "the message that created the watcher must reach it",
         )
 
-    async def test_a_failed_creation_dispatches_nothing(self):
+    async def test_a_frame_for_a_room_created_meanwhile_reaches_the_room(self):
+        """The room became tracked while this frame waited in the routing queue.
+
+        Nobody else will deliver it — the per-room callback was registered after
+        the routing decision was made.
+        """
+        from gateway.connectors.rocketchat.connector import _RoomSubscription
+        from gateway.core.connector import Room
+
+        connector = self._connector()
+        offered: list[str] = []
+
+        async def _router(room, trigger):
+            offered.append(room.id)
+
+        connector.register_router(_router)
+        connector._rooms["new-room"] = _RoomSubscription(
+            room=Room(id="new-room", name="general", type="channel"))
+        doc, access = self._frame()
+
+        await connector._on_unrouted_message(doc, access)
+
+        self.assertEqual(offered, [], "a tracked room is not offered again")
+        self.assertEqual(self.delivered, [("new-room", "m1")])
+
+    async def test_the_connector_hands_off_rather_than_dispatching(self):
+        """Where the two layers meet.
+
+        Ordering is the *transport's* property — one queue per room — so the
+        connector's job here is to hand the frame over, not to deliver it.
+        `_on_unrouted_message` runs on one of several routing workers, so a
+        connector that dispatches directly puts concurrent deliveries into a
+        room whose whole guarantee is that they are serialised.
+
+        This asserts the hand-off across the layer boundary; that the hand-off
+        actually queues is
+        `TestDeliverToRoom.test_it_queues_onto_the_rooms_worker`.
+        """
+        connector = self._connector()
+        connector._on_raw_ddp_message = AsyncMock(return_value=True)
+        connector.register_router(self._creating_router(connector))
+        doc, access = self._frame()
+
+        await connector._on_unrouted_message(doc, access)
+
+        self.assertEqual(self.delivered, [("new-room", "m1")])
+        connector._on_raw_ddp_message.assert_not_awaited()
+
+    async def test_a_failed_creation_delivers_nothing(self):
         """The near miss: delivering into a room with no watcher would be dropped as
         unknown and would hide the creation failure."""
         connector = self._connector()
-        connector._on_raw_ddp_message = AsyncMock(return_value=True)
 
         async def _router(room, trigger):
             raise RuntimeError("creation failed")
@@ -3754,23 +4419,282 @@ class TestTheMessageThatCreatedTheWatcherIsDelivered(unittest.IsolatedAsyncioTes
         doc, access = self._frame()
         await connector._on_unrouted_message(doc, access)
 
-        connector._on_raw_ddp_message.assert_not_awaited()
+        self.assertEqual(self.delivered, [])
 
-    async def test_a_frame_for_a_room_created_meanwhile_is_delivered_not_reoffered(self):
-        """The other half: a frame routed here before the watcher existed, arriving after
-        it does. Nobody else will deliver it — the callback was registered after this
-        frame had already been routed."""
+
+class TestAnIdleRoomWakesOnItsNextMessage(unittest.IsolatedAsyncioTestCase):
+    """The wake (§2.5): a tracked room with no processor is offered back to the router.
+
+    The idle drop keeps the room subscribed (§2.2), so its next message takes the
+    *tracked* path — where the UNROUTED arm used to drop it with a warning. Nothing on
+    that path called the router, so an idle room was permanently deaf. The arm now
+    routes the frame into the same episode funnel an untracked room goes through: same
+    pending buffer, same single open episode, same drain.
+    """
+
+    def setUp(self):
+        self.delivered: list[tuple[str, str]] = []
+        self.offered: list = []
+        self.served = False
+
+    def _connector(self):
+        connector = _make_connector()
+        connector._config.require_mention = False
+        connector._config.filter_sender = False
+        connector._handler = AsyncMock(return_value=True)
+        # Tracked-but-unserved is the wake's precondition, and `_capacity_check` is
+        # what says so — the fixture's None reads as "no dispatcher wired: served".
+        connector._capacity_check = lambda rid: (
+            RoomCapacity.AVAILABLE if self.served else RoomCapacity.UNROUTED)
+        connector._ws.deliver_to_room = MagicMock(
+            side_effect=lambda rid, doc, access=None, **kw:
+                self.delivered.append((rid, doc["_id"]))
+        )
+
+        async def _router(room, trigger):
+            # What a successful recreation does that this layer can see: the room
+            # gains a processor.
+            self.offered.append(room)
+            self.served = True
+
+        connector.register_router(_router)
+        return connector
+
+    def _doc(self, mid="m1", ts=500):
+        return {"_id": mid, "rid": "room-1", "msg": "hi",
+                "u": {"username": "alice"}, "ts": {"$date": ts}}
+
+    async def _settle(self, connector):
+        from tests.helpers import settle_routing_tasks
+
+        await settle_routing_tasks(connector)
+
+    async def test_the_wake_offers_the_room_and_redelivers_the_trigger(self):
+        from gateway.core.watcher_manager import RoomRef
+
         connector = self._connector()
-        offered: list[str] = []
-        connector.register_router(
-            lambda room, trigger: offered.append(room.id) or _noop())
-        connector._on_raw_ddp_message = AsyncMock(return_value=True)
+        sub = connector._rooms["room-1"]
 
-        doc, access = self._frame(rid="room-1")   # already tracked by the fixture
-        await connector._on_unrouted_message(doc, access)
+        handled = await connector._on_raw_ddp_message("room-1", self._doc())
+        await self._settle(connector)
 
-        self.assertEqual(offered, [], "a tracked room is not offered again")
-        connector._on_raw_ddp_message.assert_awaited_once()
+        self.assertTrue(handled)
+        self.assertEqual(len(self.offered), 1, "the room was offered exactly once")
+        self.assertIsInstance(self.offered[0], RoomRef)
+        self.assertEqual(self.offered[0].id, "room-1")
+        # The trigger came back through the room's own worker, in order.
+        self.assertEqual(self.delivered, [("room-1", "m1")])
+        # Not remembered and the watermark unmoved: the redelivery must pass the
+        # dedup check, and a resend must be served normally either way.
+        self.assertNotIn("m1", sub.seen_ids_set)
+        self.assertFalse(sub.last_processed_ts)
+
+    async def test_a_replayed_frame_wakes_too(self):
+        """The outage wake: a reconnect replay reconstructs docs from REST history and
+        carries no access object — the funnel's untracked gates would drop it, so the
+        wake must enter below them, with the room resolved from the tracked state."""
+        connector = self._connector()
+
+        await connector._on_raw_ddp_message(
+            "room-1", self._doc(), is_replay=True, replay_after_ts="100")
+        await self._settle(connector)
+
+        self.assertEqual(len(self.offered), 1)
+        self.assertEqual(self.delivered, [("room-1", "m1")])
+
+    async def test_frames_during_the_wake_buffer_behind_its_episode(self):
+        """The single open episode covers the wake exactly as it covers a creation:
+        a burst into a waking room is one offer, and the drain keeps arrival order."""
+        connector = self._connector()
+        release = asyncio.Event()
+        offered = self.offered
+
+        async def _slow_router(room, trigger):
+            offered.append(room)
+            await release.wait()
+            self.served = True
+
+        connector.register_router(_slow_router)
+
+        await connector._on_raw_ddp_message("room-1", self._doc("m1", 500))
+        await asyncio.sleep(0)  # the episode reserves _pending_routes before its await
+        await connector._on_raw_ddp_message("room-1", self._doc("m2", 600))
+        await asyncio.sleep(0)
+        release.set()
+        await self._settle(connector)
+
+        self.assertEqual(len(offered), 1, "one episode, not one per frame")
+        self.assertEqual(self.delivered, [("room-1", "m1"), ("room-1", "m2")])
+
+
+class TestADeclinedWakeDoesNotLoop(unittest.IsolatedAsyncioTestCase):
+    """The drain decides deliver-vs-drop on *served*, not on *tracked*.
+
+    A wake's room is tracked by definition, so a drain that keys on tracked-ness
+    redelivers a declined wake's frames — onto the tracked path, whose UNROUTED arm
+    routes them straight back into a new episode. No retry delay exists anywhere in
+    that cycle, and every message to a paused or rule-less room enters it.
+    """
+
+    def setUp(self):
+        self.delivered: list[str] = []
+        self.offers = 0
+
+    def _connector(self):
+        connector = _make_connector()
+        connector._config.require_mention = False
+        connector._config.filter_sender = False
+        connector._handler = AsyncMock(return_value=True)
+        connector._capacity_check = lambda rid: RoomCapacity.UNROUTED
+        connector._ws.deliver_to_room = MagicMock(
+            side_effect=lambda rid, doc, access=None, **kw:
+                self.delivered.append(doc["_id"])
+        )
+
+        async def _declining_router(room, trigger):
+            # A rule miss, a paused record, the cap: a completed decision, None-shaped.
+            self.offers += 1
+
+        connector.register_router(_declining_router)
+        return connector
+
+    def _doc(self, mid="m1", ts=500):
+        return {"_id": mid, "rid": "room-1", "msg": "hi",
+                "u": {"username": "alice"}, "ts": {"$date": ts}}
+
+    async def _settle(self, connector):
+        from tests.helpers import settle_routing_tasks
+
+        await settle_routing_tasks(connector)
+
+    async def test_declined_frames_are_dropped_and_remembered_not_redelivered(self):
+        connector = self._connector()
+        sub = connector._rooms["room-1"]
+
+        await connector._on_raw_ddp_message("room-1", self._doc())
+        await self._settle(connector)
+
+        self.assertEqual(self.offers, 1)
+        self.assertEqual(self.delivered, [],
+                         "a declined wake's frames must not go back on the tracked path")
+        # Remembered, exactly as the old arm remembered a frame it dropped: the
+        # decline can persist indefinitely, and an unknown id would have every
+        # reconnect re-fetch and re-offer a batch that can never be spent.
+        self.assertIn("m1", sub.seen_ids_set)
+        self.assertFalse(sub.last_processed_ts, "the watermark is left where it is")
+
+    async def test_a_redelivered_duplicate_does_not_reopen_an_episode(self):
+        connector = self._connector()
+
+        await connector._on_raw_ddp_message("room-1", self._doc())
+        await self._settle(connector)
+        # The same frame again — a reconnect replay bringing the batch back.
+        await connector._on_raw_ddp_message("room-1", self._doc())
+        await self._settle(connector)
+
+        self.assertEqual(self.offers, 1, "the remembered id stops the re-offer")
+
+    async def test_a_new_message_retries_the_wake_once(self):
+        connector = self._connector()
+
+        await connector._on_raw_ddp_message("room-1", self._doc("m1", 500))
+        await self._settle(connector)
+        await connector._on_raw_ddp_message("room-1", self._doc("m2", 600))
+        await self._settle(connector)
+
+        self.assertEqual(self.offers, 2,
+                         "each new message re-asks once — bounded, not a loop")
+
+
+class TestAParkedWakeStaysRecoverable(unittest.IsolatedAsyncioTestCase):
+    """A park is not a decline, and confusing them loses the message for good.
+
+    A parked room's promised recovery is the next wake's replay from the
+    record's watermark (`route_attempts`' own contract) — a remembered id has
+    that replay die at the dedup check, silently and permanently. So the
+    drain's remember applies to completed declines only; a park's ids stay
+    unknown, and the wake arm's boundary claim keeps the window open so a
+    replay batch cannot spend it on frames that only reached the buffer.
+    """
+
+    def setUp(self):
+        self.delivered: list[str] = []
+        self.offers = 0
+
+    def _connector(self):
+        connector = _make_connector()
+        connector._config.require_mention = False
+        connector._config.filter_sender = False
+        connector._handler = AsyncMock(return_value=True)
+        connector._capacity_check = lambda rid: RoomCapacity.UNROUTED
+        connector._ROUTE_RETRY_DELAYS = ()  # park after one attempt, not ~3.5s
+        connector._ws.deliver_to_room = MagicMock(
+            side_effect=lambda rid, doc, access=None, **kw:
+                self.delivered.append(doc["_id"])
+        )
+
+        async def _parking_router(room, trigger):
+            # A creation started and not carried out (§2.2 outcome 4): the
+            # backend is down, every attempt raises, the room parks.
+            self.offers += 1
+            raise RuntimeError("backend down")
+
+        connector.register_router(_parking_router)
+        return connector
+
+    def _doc(self, mid="m1", ts=500):
+        return {"_id": mid, "rid": "room-1", "msg": "hi",
+                "u": {"username": "alice"}, "ts": {"$date": ts}}
+
+    async def _settle(self, connector):
+        from tests.helpers import settle_routing_tasks
+
+        await settle_routing_tasks(connector)
+
+    async def test_parked_frames_are_not_remembered(self):
+        connector = self._connector()
+        sub = connector._rooms["room-1"]
+
+        await connector._on_raw_ddp_message("room-1", self._doc())
+        await self._settle(connector)
+
+        self.assertEqual(self.offers, 1)
+        self.assertEqual(self.delivered, [])
+        self.assertNotIn(
+            "m1", sub.seen_ids_set,
+            "a remembered id would have the recovery replay die at dedup",
+        )
+
+    async def test_the_wake_arm_claims_a_boundary_below_the_frame(self):
+        """The Mattermost twin does this via _keep_replayable; without it a
+        *replayed* frame that parks leaves the batch reporting itself
+        all-accepted, and the discharge spends the outage window on a frame
+        that only reached the episode buffer."""
+        connector = self._connector()
+        sub = connector._rooms["room-1"]
+        sub.last_processed_ts = "400"
+
+        await connector._on_raw_ddp_message("room-1", self._doc("m1", 500))
+        await self._settle(connector)
+
+        self.assertTrue(sub.replay_boundary,
+                        "the window is held open below the parked frame")
+        self.assertTrue(_ts_gt("500", sub.replay_boundary),
+                        "the claim points below the frame it preserves")
+
+    async def test_the_same_message_can_reopen_an_episode_after_a_park(self):
+        """The recovery path in miniature: the replay redelivers the same id,
+        and a park must not have suppressed it."""
+        connector = self._connector()
+
+        await connector._on_raw_ddp_message("room-1", self._doc())
+        await self._settle(connector)
+        await connector._on_raw_ddp_message(
+            "room-1", self._doc(), is_replay=True, replay_after_ts="400")
+        await self._settle(connector)
+
+        self.assertEqual(self.offers, 2,
+                         "the parked frame is re-offerable, not suppressed")
 
 
 class TestTheFirstMessageIntoARoomKeepsARetryCursor(unittest.IsolatedAsyncioTestCase):

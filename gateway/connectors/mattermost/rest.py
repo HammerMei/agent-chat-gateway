@@ -442,6 +442,25 @@ class MattermostREST:
             channel_id, count=count, before_ts=before_ts, after_ts=after_ts)
         return page.messages
 
+    async def get_member_channel_ids(self) -> set[str]:
+        """Every channel id this account is a member of, across all teams.
+
+        `GET /users/{user_id}/channels` streams the caller's full membership
+        (verified in `getChannelsForUser`: it pages internally and writes the
+        complete array). This is the one membership probe that is unambiguous
+        with the bot's own token — the per-channel member lookup answers 403
+        for a non-member, indistinguishable from a permissions problem (§6.2).
+        Raises on failure; the caller owns the tri-state (a set that could not
+        be read is unknown, never empty).
+        """
+        result = await self._request(
+            "GET", f"users/{self.bot_user_id or 'me'}/channels")
+        return {
+            chan["id"]
+            for chan in (result or [])
+            if isinstance(chan, dict) and chan.get("id")
+        }
+
     async def get_channel(self, channel_id: str) -> dict[str, Any]:
         """Channel info by id — the fallback for a room the event could not describe.
 

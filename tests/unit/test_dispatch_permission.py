@@ -487,10 +487,15 @@ class _MockAgentBackend(_AgentBackend):
         return None
 
 
-def _make_watcher_cr(room="script", name=None):
-    from gateway.config import WatcherConfig
-    return WatcherConfig(
-        name=name or room, connector="script", room=room, agent="default"
+def _make_rule_cr(room="script", name=None):
+    """A rule naming the script room literally — the eager-start loop (§2.6)
+    creates the watcher at run_once, the port of the old static start."""
+    from gateway.core.room_pattern import RoomPattern
+    from gateway.core.watcher_rule import RoomMatcher, WatcherRule
+
+    return WatcherRule(
+        name=name or room, connector="script", agent="default",
+        rooms=RoomMatcher(include=(RoomPattern(room),)),
     )
 
 
@@ -507,7 +512,7 @@ def _make_permission_request_cr(registry, room_id="script", session_id="mock-ses
     return req
 
 
-def _make_manager_cr(connector, agent, watcher_configs=None, permission_registry=None):
+def _make_manager_cr(connector, agent, watcher_rules=None, permission_registry=None):
     from gateway.config import AgentConfig
     from gateway.core.config import CoreConfig
     from gateway.core.session_manager import SessionManager
@@ -519,7 +524,10 @@ def _make_manager_cr(connector, agent, watcher_configs=None, permission_registry
         {"default": agent},
         "default",
         config,
-        watcher_configs=watcher_configs or [],
+        # The name rules bind to: _make_rule_cr's rules say connector="script",
+        # and the manager keys its matches on state_name.
+        state_name="script",
+        watcher_rules=watcher_rules,
         permission_registry=permission_registry,
     )
 
@@ -537,7 +545,7 @@ class TestPermissionCommandPreFanOut(_IsolatedTestCase):
         agent = _MockAgentBackend()
         registry = PermissionRegistry()
         manager = _make_manager_cr(
-            connector, agent, watcher_configs=[_make_watcher_cr()], permission_registry=registry
+            connector, agent, watcher_rules=[_make_rule_cr()], permission_registry=registry
         )
         await manager.run_once()
 
@@ -559,7 +567,7 @@ class TestPermissionCommandPreFanOut(_IsolatedTestCase):
         agent = _MockAgentBackend()
         registry = PermissionRegistry()
         manager = _make_manager_cr(
-            connector, agent, watcher_configs=[_make_watcher_cr()], permission_registry=registry
+            connector, agent, watcher_rules=[_make_rule_cr()], permission_registry=registry
         )
         await manager.run_once()
 
@@ -579,7 +587,7 @@ class TestPermissionCommandPreFanOut(_IsolatedTestCase):
         agent = _MockAgentBackend()
         registry = PermissionRegistry()
         manager = _make_manager_cr(
-            connector, agent, watcher_configs=[_make_watcher_cr()], permission_registry=registry
+            connector, agent, watcher_rules=[_make_rule_cr()], permission_registry=registry
         )
         await manager.run_once()
 
@@ -601,7 +609,7 @@ class TestPermissionCommandPreFanOut(_IsolatedTestCase):
         agent = _MockAgentBackend()
         registry = PermissionRegistry()
         manager = _make_manager_cr(
-            connector, agent, watcher_configs=[_make_watcher_cr()], permission_registry=registry
+            connector, agent, watcher_rules=[_make_rule_cr()], permission_registry=registry
         )
         await manager.run_once()
 
@@ -620,7 +628,7 @@ class TestPermissionCommandPreFanOut(_IsolatedTestCase):
         agent = _MockAgentBackend()
         registry = PermissionRegistry()
         manager = _make_manager_cr(
-            connector, agent, watcher_configs=[_make_watcher_cr()], permission_registry=registry
+            connector, agent, watcher_rules=[_make_rule_cr()], permission_registry=registry
         )
         await manager.run_once()
 
@@ -639,7 +647,7 @@ class TestPermissionCommandPreFanOut(_IsolatedTestCase):
         agent = _MockAgentBackend()
         registry = PermissionRegistry()
         manager = _make_manager_cr(
-            connector, agent, watcher_configs=[_make_watcher_cr()], permission_registry=registry
+            connector, agent, watcher_rules=[_make_rule_cr()], permission_registry=registry
         )
         await manager.run_once()
 
@@ -661,7 +669,7 @@ class TestPermissionCommandPreFanOut(_IsolatedTestCase):
         agent = _MockAgentBackend(responses=["hello back"])
         registry = PermissionRegistry()
         manager = _make_manager_cr(
-            connector, agent, watcher_configs=[_make_watcher_cr()], permission_registry=registry
+            connector, agent, watcher_rules=[_make_rule_cr()], permission_registry=registry
         )
         await manager.run_once()
 

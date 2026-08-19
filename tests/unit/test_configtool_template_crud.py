@@ -68,7 +68,8 @@ def _config_text(work_dir: Path) -> str:
             timeout: 100
         watcher_templates:
           wstd:
-            online_notification: "hi"
+            history_handoff:
+              fetch_count: 25
         agents:
           agent-a:
             inherits: standard
@@ -94,7 +95,8 @@ def _config_text(work_dir: Path) -> str:
             connector: rc
             agent: agent-b
             room: dev
-            online_notification: "custom"
+            history_handoff:
+              fetch_count: 40
             inherits: wstd
     """
 
@@ -380,7 +382,7 @@ class TestTemplateSaveDiffing:
 
 
 class TestTemplateEditWatcherTemplates:
-    async def test_editing_online_notification_requires_confirm_naming_the_watcher(
+    async def test_editing_a_watcher_template_field_requires_confirm_naming_the_watcher(
         self, tmp_path, work_dir
     ):
         config_path = _write_config(tmp_path, _config_text(work_dir))
@@ -388,9 +390,11 @@ class TestTemplateEditWatcherTemplates:
         async with app.run_test() as pilot:
             await pilot.pause()
             await _open_template_edit(pilot, app, row=3)  # watcher:wstd
-            assert app.screen.query_one("#field-online_notification", Input).value == "hi"
+            assert app.screen.query_one(
+                "#field-history_handoff-fetch_count", Input).value == "25"
 
-            app.screen.query_one("#field-online_notification", Input).value = "bye"
+            app.screen.query_one(
+                "#field-history_handoff-fetch_count", Input).value = "30"
             await pilot.pause()
             await pilot.press("ctrl+s")
             await pilot.pause()
@@ -403,7 +407,7 @@ class TestTemplateEditWatcherTemplates:
             await pilot.press("tab", "enter")
             await pilot.pause()
             raw = yaml.safe_load(Path(config_path).read_text())
-            assert raw["watcher_templates"]["wstd"]["online_notification"] == "bye"
+            assert raw["watcher_templates"]["wstd"]["history_handoff"]["fetch_count"] == 30
 
 
 class TestTemplateEditDiscard:

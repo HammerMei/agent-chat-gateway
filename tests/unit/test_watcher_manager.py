@@ -43,11 +43,37 @@ def _rule(name="eng", connector="mm-eng", agent="claude", include=(), except_for
 class TestLabels(unittest.TestCase):
     def test_a_channel_is_labelled_by_its_name(self):
         room = RoomRef(id="r1o6c8", kind=RoomKind.CHANNEL, name="incident-42")
-        self.assertEqual(watcher_label("mm-eng", room), "mm-eng-incident-42")
+        self.assertEqual(watcher_label("mm-eng", room), "mm-eng:incident-42")
+
+    def test_the_divider_makes_handles_injective_across_connectors(self):
+        """Codex review of #121, round 7: with `-` as the joiner, connector
+        `rc` + room `home-general` and connector `rc-home` + room `general`
+        both derived `rc-home-general` — and pause/reset/expire could then
+        act on the wrong watcher. The first `:` always ends the connector
+        component, because a connector name may not contain one."""
+        a = watcher_label("rc", RoomRef(id="r1", kind=RoomKind.CHANNEL,
+                                        name="home-general"))
+        b = watcher_label("rc-home", RoomRef(id="r2", kind=RoomKind.CHANNEL,
+                                             name="general"))
+        self.assertNotEqual(a, b)
+        self.assertEqual(a, "rc:home-general")
+        self.assertEqual(b, "rc-home:general")
+
+    def test_the_kind_prefixes_cannot_be_forged_by_a_room_name(self):
+        """A channel NAMED `dm:alice` must never collide with the DM for
+        alice: `:` is outside `_LABEL_SAFE`, so the channel's colon is
+        percent-encoded while the DM prefix stays literal."""
+        channel = watcher_label("rc", RoomRef(
+            id="r1", kind=RoomKind.CHANNEL, name="dm:alice"))
+        dm = watcher_label("rc", RoomRef(
+            id="r2", kind=RoomKind.DM, participants=("alice",)))
+        self.assertNotEqual(channel, dm)
+        self.assertEqual(channel, "rc:dm%3Aalice")
+        self.assertEqual(dm, "rc:dm:alice")
 
     def test_a_one_to_one_dm_is_labelled_by_its_counterpart(self):
         room = RoomRef(id="iwihkh", kind=RoomKind.DM, participants=("alice",))
-        self.assertEqual(watcher_label("mm-eng", room), "mm-eng-dm-alice")
+        self.assertEqual(watcher_label("mm-eng", room), "mm-eng:dm:alice")
 
     def test_a_group_dm_is_labelled_by_a_digest_of_its_room_id(self):
         """Deliberately not by its members.
@@ -59,7 +85,7 @@ class TestLabels(unittest.TestCase):
         """
         room = RoomRef(id="cib3hj", kind=RoomKind.GROUP_DM, participants=("@bob", "@alice"))
         label = watcher_label("mm-eng", room)
-        self.assertTrue(label.startswith("mm-eng-gdm-"), label)
+        self.assertTrue(label.startswith("mm-eng:gdm:"), label)
         self.assertNotIn("alice", label)
 
         # And it does not move when the members do.
@@ -83,7 +109,7 @@ class TestLabels(unittest.TestCase):
         character onto one so two different rooms could label identically (§2.3).
         """
         room = RoomRef(id="r1", kind=RoomKind.CHANNEL, name="a/b")
-        self.assertEqual(watcher_label("voice", room), "voice-a%2Fb")
+        self.assertEqual(watcher_label("voice", room), "voice:a%2Fb")
 
     def test_two_rooms_differing_only_in_unsafe_characters_stay_distinct(self):
         a = RoomRef(id="r1", kind=RoomKind.CHANNEL, name="a/b")
@@ -143,7 +169,7 @@ class TestMaterialization(unittest.TestCase):
 
         wc = materialize(rule, room)
 
-        self.assertEqual(wc.name, "mm-eng-eng-backend", "the rule's name is not a watcher's")
+        self.assertEqual(wc.name, "mm-eng:eng-backend", "the rule's name is not a watcher's")
         self.assertEqual(wc.room, "eng-backend")
         self.assertEqual(wc.connector, "mm-eng")
         self.assertEqual(wc.agent, "claude")
@@ -170,15 +196,11 @@ class TestMaterialization(unittest.TestCase):
         rule = _rule(
             include=["eng-*"],
             context_inject_files=["/srv/notes.md"],
-            online_notification="up",
-            offline_notification="down",
             history_handoff=HistoryHandoffConfig(enabled=True, fetch_count=25),
         )
         wc = materialize(rule, RoomRef(id="r1", kind=RoomKind.CHANNEL, name="eng-x"))
 
         self.assertEqual(wc.context_inject_files, ["/srv/notes.md"])
-        self.assertEqual(wc.online_notification, "up")
-        self.assertEqual(wc.offline_notification, "down")
         self.assertTrue(wc.history_handoff.enabled)
         self.assertEqual(wc.history_handoff.fetch_count, 25)
 

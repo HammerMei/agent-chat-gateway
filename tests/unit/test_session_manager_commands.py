@@ -15,30 +15,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 def _make_manager():
     """Build a minimal SessionManager with all collaborators mocked."""
-    from gateway.core.session_manager import SessionManager
+    from tests.helpers import make_bare_session_manager
 
-    mgr = SessionManager.__new__(SessionManager)
-    mgr._connector = MagicMock()
-    mgr._connector.register_handler = MagicMock()
-    mgr._connector.register_capacity_check = MagicMock()
-    mgr._connector.connect = AsyncMock()
-    # Startup's second phase ends by opening the inbound stream, once the watchers
-    # that give arriving events a destination exist.
-    mgr._connector.start_inbound = AsyncMock()
-    mgr._connector.disconnect = AsyncMock()
-    mgr._lifecycle = MagicMock()
+    mgr = make_bare_session_manager()
     mgr._lifecycle.list_watchers = MagicMock(return_value=[])
-    mgr._lifecycle.pause_watcher = AsyncMock()
-    mgr._lifecycle.resume_watcher = AsyncMock()
-    mgr._lifecycle.reset_watcher = AsyncMock()
-    mgr._lifecycle.stop_all = AsyncMock()
     mgr._lifecycle.save_state = MagicMock()
-    mgr._lifecycle.sync_watchers = AsyncMock(return_value=[])
-    mgr._dispatcher = MagicMock()
-    mgr._dispatcher.dispatch = MagicMock()
-    mgr._dispatcher.has_capacity = MagicMock()
-    mgr._injector = MagicMock()
-    mgr._state_store = MagicMock()
     return mgr
 
 
@@ -254,6 +235,41 @@ class TestShutdownOrdering(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(call_order[:2], ["stop_all", "save_state"])
 
+    async def test_the_manager_is_drained_before_anything_stops(self):
+        """The wake arms stay reachable until the connector disconnects, so a
+        shutdown that stops things before disarming leaves a window where an
+        idle room's message recreates a watcher nothing below will stop —
+        absent from stop_all's snapshot, its save rewriting the state file
+        after the final save (§2.5). Since Codex round 5 the first step is
+        `drain()` — disarm PLUS waiting out in-flight starts, because an
+        episode already inside start_watcher_in_room installs its processor
+        after stop_all's snapshot."""
+        mgr = _make_manager()
+        call_order: list[str] = []
+
+        mgr._watcher_manager = MagicMock()
+
+        async def _drain():
+            call_order.append("drain")
+
+        mgr._watcher_manager.drain = _drain
+        sweep = MagicMock()
+
+        async def _sweep_stop():
+            call_order.append("sweep_stop")
+
+        sweep.stop = _sweep_stop
+        mgr._sweep = sweep
+
+        async def _stop_all():
+            call_order.append("stop_all")
+
+        mgr._lifecycle.stop_all = _stop_all
+
+        await mgr.shutdown()
+
+        self.assertEqual(call_order[:3], ["drain", "sweep_stop", "stop_all"])
+
     async def test_disconnect_called_after_save_state(self):
         mgr = _make_manager()
 
@@ -307,6 +323,89 @@ class TestRunOnce(unittest.IsolatedAsyncioTestCase):
         await mgr.run_once(unavailable_agents=unavailable)
         mgr._lifecycle.sync_watchers.assert_called_once_with(unavailable_agents=unavailable)
 
+
+
+class TestTheRouterWiring(unittest.IsolatedAsyncioTestCase):
+    """Rules give the manager runtime effect (§2.8), and the registration order
+    is load-bearing: Rocket.Chat's start_inbound attempts subscribe-all only
+    when a router is already registered."""
+
+    def _real_manager(self, rules):
+        from gateway.core.session_manager import SessionManager
+        from tests.helpers import make_core_config
+
+        connector = MagicMock()
+        connector.register_handler = MagicMock()
+        connector.register_capacity_check = MagicMock()
+        connector.register_router = MagicMock()
+        connector.connect = AsyncMock()
+        connector.start_inbound = AsyncMock()
+        connector.trigger_history_bound = MagicMock(
+            return_value="2026-08-16T10:00:00+00:00")
+        return SessionManager(
+            connector, {"default": MagicMock()}, "default", make_core_config(),
+            state_name="rc", watcher_rules=rules,
+        ), connector
+
+    def _rule(self):
+        from gateway.core.room_pattern import RoomPattern
+        from gateway.core.watcher_rule import RoomMatcher, WatcherRule
+
+        return WatcherRule(
+            name="eng", connector="rc", agent="default",
+            rooms=RoomMatcher(include=(RoomPattern("eng-*"),)))
+
+    async def test_rules_register_a_router_before_connect(self):
+        mgr, connector = self._real_manager([self._rule()])
+        parent = MagicMock()
+        parent.attach_mock(connector.register_router, "register_router")
+        parent.attach_mock(connector.connect, "connect")
+
+        await mgr.connect_only()
+
+        names = [c[0] for c in parent.mock_calls]
+        self.assertEqual(names, ["register_router", "connect"])
+
+    async def test_omitted_rules_normalize_to_an_empty_list(self):
+        """Codex round 10: the always-on manager received the declared
+        default None, and the first new room's first_matching_rule raised
+        iterating it instead of declining the room."""
+        from tests.helpers import make_manager
+
+        mgr = make_manager()  # watcher_rules omitted → None
+        self.assertEqual(mgr._watcher_manager._rules, [],
+                         "None normalizes to [] before reaching the manager")
+
+    async def test_no_rules_still_registers_the_router(self):
+        """INVERTED with Codex round 5's fix (the old pin protected
+        static-only deployments, which no longer load): the manager and the
+        router now exist unconditionally — removing a connector's last rule
+        must not strand its hydrated rule-derived records with no router, no
+        recreation and no replay. RC running subscribe-all with zero rules
+        (every offer declined) is the named, accepted consequence."""
+        mgr, connector = self._real_manager([])
+        await mgr.connect_only()
+        connector.register_router.assert_called_once()
+
+    # The startup-replay ordering is pinned in test_startup_replay.py, which
+    # asserts all four points (sync -> snapshot -> inbound -> replay). Stating
+    # a weaker version of the same rule here would be a second copy of it.
+
+    async def test_the_router_asks_the_manager_with_the_triggers_bound(self):
+        from gateway.core.watcher_manager import RoomRef
+        from gateway.core.watcher_rule import RoomKind
+
+        mgr, connector = self._real_manager([self._rule()])
+        mgr._watcher_manager = MagicMock()
+        mgr._watcher_manager.get_or_create = AsyncMock()
+        room = RoomRef(id="r1", kind=RoomKind.CHANNEL, name="eng-backend")
+        trigger = {"_id": "m1"}
+
+        await mgr._route_unclaimed_room(room, trigger)
+
+        connector.trigger_history_bound.assert_called_once_with(trigger)
+        mgr._watcher_manager.get_or_create.assert_awaited_once_with(
+            "rc", room, history_before_ts="2026-08-16T10:00:00+00:00")
 
 
 class TestNotifyWatcherRoomNeedsLoadedState(unittest.IsolatedAsyncioTestCase):
@@ -387,7 +486,6 @@ def _make_manager_sm(connector, agent, watcher_configs=None):
         {"default": agent},
         "default",
         config,
-        watcher_configs=watcher_configs or [],
     )
 
 
@@ -421,3 +519,20 @@ class TestDispatchCommandPublic(_IsolatedTestCase2):
         self.assertIn("Unknown command", result["error"])
 
         await manager.shutdown()
+
+
+class TestTheBareSessionManagerMatchesARealOne(unittest.IsolatedAsyncioTestCase):
+    """`make_bare_session_manager` builds via `__new__`, so every field is set
+    by hand — the same drift the connector fixture test pins, on the object
+    that broke seven tests across two files when `_sweep` arrived."""
+
+    async def test_no_field_from_init_is_missing(self):
+        from tests.helpers import make_bare_session_manager, make_manager
+
+        real = make_manager()
+        missing = set(vars(real)) - set(vars(make_bare_session_manager()))
+        self.assertEqual(
+            missing, set(),
+            "fields on a real SessionManager that make_bare_session_manager "
+            "never sets — add them there, with the value __init__ gives them",
+        )

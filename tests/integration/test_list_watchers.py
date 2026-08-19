@@ -21,7 +21,7 @@ from tests.helpers import (
     IsolatedTestCase,
     MockAgentBackend,
     make_manager,
-    make_watcher,
+    make_rule,
 )
 
 
@@ -37,7 +37,7 @@ def _record(name, **kwargs) -> WatcherState:
 class TestListEnumeratesRecords(IsolatedTestCase):
     """Which watchers appear — the half that changed."""
 
-    def _manager(self, disk_records, watcher_configs=None):
+    def _manager(self, disk_records, watcher_rules=None):
         # Overrides tests.helpers' blanket patch for this test only: the point
         # of the increment is that disk records are what `list` reads.
         patcher = patch(
@@ -46,13 +46,13 @@ class TestListEnumeratesRecords(IsolatedTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         return make_manager(
-            ScriptConnector(), MockAgentBackend(), watcher_configs=watcher_configs or []
+            ScriptConnector(), MockAgentBackend(), watcher_rules=watcher_rules or []
         )
 
     async def test_a_record_with_no_config_entry_is_listed(self):
         """Under rule-derived watchers there is no config entry to enumerate,
         so a record has to be enough on its own."""
-        manager = self._manager([_record("rule-derived")], watcher_configs=[])
+        manager = self._manager([_record("rule-derived")], watcher_rules=[])
 
         names = [w["watcher_name"] for w in manager.list_watchers()]
 
@@ -65,7 +65,7 @@ class TestListEnumeratesRecords(IsolatedTestCase):
         failure is now reported by startup instead, which is where a start-time
         failure belongs.
         """
-        manager = self._manager([], watcher_configs=[make_watcher(name="never-ran")])
+        manager = self._manager([], watcher_rules=[make_rule("never-ran")])
 
         self.assertEqual(manager.list_watchers(), [])
 
@@ -76,7 +76,7 @@ class TestListEnumeratesRecords(IsolatedTestCase):
         """
         manager = self._manager(
             [_record("w1", session_id="s-from-last-boot")],
-            watcher_configs=[make_watcher(name="w1")],
+            watcher_rules=[make_rule("w1")],
         )
 
         await manager.run_once(unavailable_agents={"default"})
@@ -89,7 +89,7 @@ class TestListEnumeratesRecords(IsolatedTestCase):
     async def test_a_blocked_agent_with_no_prior_record_is_reported_by_sync(self):
         """Only true when there is no record — see the test above for the case
         where an earlier boot left one."""
-        manager = self._manager([], watcher_configs=[make_watcher(name="w1")])
+        manager = self._manager([], watcher_rules=[make_rule("w1")])
 
         errors = await manager.run_once(unavailable_agents={"default"})
 
@@ -113,14 +113,14 @@ class TestListEnumeratesRecords(IsolatedTestCase):
 
 
 class TestListStateFilter(IsolatedTestCase):
-    def _manager(self, disk_records, watcher_configs=None):
+    def _manager(self, disk_records, watcher_rules=None):
         patcher = patch(
             "gateway.core.state_store.load_state", return_value=list(disk_records)
         )
         patcher.start()
         self.addCleanup(patcher.stop)
         return make_manager(
-            ScriptConnector(), MockAgentBackend(), watcher_configs=watcher_configs or []
+            ScriptConnector(), MockAgentBackend(), watcher_rules=watcher_rules or []
         )
 
     async def test_default_shows_everything_except_idle(self):
@@ -141,18 +141,18 @@ class TestListStateFilter(IsolatedTestCase):
 
     async def test_a_started_watcher_reads_active_and_a_stopped_one_failed(self):
         """The two halves of the residency input, through the real lifecycle."""
-        manager = self._manager([], watcher_configs=[make_watcher(name="script")])
+        manager = self._manager([], watcher_rules=[make_rule("script")])
 
         await manager.run_once()
         self.assertEqual(manager.list_watchers()[0]["state"], "active")
 
-        await manager.pause_watcher("script")
-        await manager.resume_watcher("script")
+        await manager.pause_watcher("default:script")
+        await manager.resume_watcher("default:script")
         self.assertEqual(manager.list_watchers()[0]["state"], "active")
 
         # Drop the processor without touching the record: exactly what a start
         # that raised after writing its record leaves behind.
-        await manager._lifecycle._stop_processor("script")
+        await manager._lifecycle._stop_processor("default:script")
         self.assertEqual(manager.list_watchers()[0]["state"], "failed")
 
         await manager.shutdown()
@@ -167,11 +167,11 @@ class TestListStateFilter(IsolatedTestCase):
         accusing itself, and send the operator to a startup log with nothing in
         it.
         """
-        manager = self._manager([], watcher_configs=[make_watcher(name="script")])
+        manager = self._manager([], watcher_rules=[make_rule("script")])
         await manager.run_once()
 
         seen: list[str] = []
-        original = manager._lifecycle._start_watcher
+        original = manager._lifecycle._resume_record
 
         async def observe(wc, state):
             # Inside reset: the processor is gone and the record is not yet
@@ -179,8 +179,8 @@ class TestListStateFilter(IsolatedTestCase):
             seen.append(manager.list_watchers()[0]["state"])
             return await original(wc, state)
 
-        with patch.object(manager._lifecycle, "_start_watcher", side_effect=observe):
-            await manager.reset_watcher("script")
+        with patch.object(manager._lifecycle, "_resume_record", side_effect=observe):
+            await manager.reset_watcher("default:script")
 
         self.assertEqual(seen, ["active"], "a reset in flight must not read failed")
         await manager.shutdown()
@@ -188,7 +188,7 @@ class TestListStateFilter(IsolatedTestCase):
     async def test_a_subscribe_failure_reads_failed_not_active(self):
         """End to end: the rollback keeps the record on purpose, and the row
         has to say so rather than reporting a healthy watcher."""
-        manager = self._manager([], watcher_configs=[make_watcher(name="script")])
+        manager = self._manager([], watcher_rules=[make_rule("script")])
 
         async def boom(*a, **k):
             raise RuntimeError("DDP subscription failed")
@@ -233,14 +233,14 @@ class TestListStateFilter(IsolatedTestCase):
 
 
 class TestListRowContents(IsolatedTestCase):
-    def _manager(self, disk_records, watcher_configs=None):
+    def _manager(self, disk_records, watcher_rules=None):
         patcher = patch(
             "gateway.core.state_store.load_state", return_value=list(disk_records)
         )
         patcher.start()
         self.addCleanup(patcher.stop)
         return make_manager(
-            ScriptConnector(), MockAgentBackend(), watcher_configs=watcher_configs or []
+            ScriptConnector(), MockAgentBackend(), watcher_rules=watcher_rules or []
         )
 
     async def test_room_id_and_participants_are_reported(self):
@@ -283,9 +283,12 @@ class TestListRowContents(IsolatedTestCase):
 
         self.assertEqual(record.participants, ["@alice"])
 
-    async def test_connector_and_agent_fall_back_while_records_are_unstamped(self):
-        """The static path writes neither field; the row still has to attribute
-        the watcher to a connector, or a multi-connector `list` is unreadable."""
+    async def test_connector_falls_back_while_a_record_is_unstamped(self):
+        """A static-era record (pre-cutover, unstamped) can still be on disk
+        before its pruning boot; the row still has to attribute it to a
+        connector, or a multi-connector `list` is unreadable. The agent
+        column stays honest instead: there is no config left to look a name
+        up in, and inventing one would claim more than the record knows."""
         manager = SessionManager(
             ScriptConnector(),
             {"default": MockAgentBackend()},
@@ -293,7 +296,6 @@ class TestListRowContents(IsolatedTestCase):
             CoreConfig(
                 agents={"default": AgentConfig(timeout=10)}, default_agent="default"
             ),
-            watcher_configs=[make_watcher(name="w1", agent="triage")],
             state_name="rc-home",
         )
         patcher = patch(
@@ -308,14 +310,11 @@ class TestListRowContents(IsolatedTestCase):
         # per-connector lifecycle always knows, and what `state.<name>.json` is
         # named after.
         self.assertEqual(row["connector"], "rc-home")
-        # Deliberately not "default": that is also the manager's default agent,
-        # so asserting it could not tell a config lookup from a global fallback.
-        self.assertEqual(row["agent_name"], "triage")
+        self.assertEqual(row["agent_name"], "")
 
     async def test_a_stamped_record_uses_its_own_connector_and_agent(self):
         manager = self._manager(
             [_record("w1", connector="rc-home", agent="triage")],
-            watcher_configs=[make_watcher(name="w1", agent="default")],
         )
 
         row = manager.list_watchers()[0]
@@ -332,7 +331,7 @@ class TestListRowContents(IsolatedTestCase):
         default would pass on the `room_name or room_id` fallback alone and
         could not tell whether the name was recorded at all.
         """
-        manager = self._manager([], watcher_configs=[make_watcher(room="script")])
+        manager = self._manager([], watcher_rules=[make_rule("#support")])
 
         async def resolve(room_name):
             return Room(id="rid-42", name="#support", type="script")

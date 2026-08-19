@@ -216,7 +216,7 @@ class TurnStore:
         thread_id: str | None,
         sender: str,
         max_turns: int,
-    ) -> tuple[bool, int]:
+    ) -> tuple[bool, int, int]:
         """Check turn budget and increment if allowed.
 
         Returns:
