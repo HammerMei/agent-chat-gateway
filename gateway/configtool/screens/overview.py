@@ -46,7 +46,7 @@ from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Static, TabbedContent, TabPane
 
 from ...config_validate import ValidationResult
-from ..formatting import status_badge
+from ..formatting import markup_safe, status_badge
 from ..modals import ConfirmModal, MessageModal, TextPromptModal, TypePickerModal
 from ..model import StatusIndex
 from .agent_detail import AgentDetailScreen
@@ -892,12 +892,16 @@ class OverviewScreen(Screen):
             except (ValueError, FileNotFoundError):
                 merged = entry
             name = entry.get("name")
+            # DataTable cells parse markup too (that is how status_badge
+            # renders), so every operator-authored cell is escaped — a
+            # character-class pattern like `eng-[ab]` otherwise displayed as
+            # `eng-`, concealing the rule's real routing (see markup_safe()).
             rules_table.add_row(
                 str(i + 1),
-                name if isinstance(name, str) and name else "?",
-                str(merged.get("connector") or "(default)"),
-                str(merged.get("agent") or "(default)"),
-                rule_rooms_summary(entry),
+                markup_safe(name) if isinstance(name, str) and name else "?",
+                markup_safe(merged.get("connector") or "(default)"),
+                markup_safe(merged.get("agent") or "(default)"),
+                markup_safe(rule_rooms_summary(entry)),
                 status_badge(status.status_for_rule(i, entry)),
                 key=str(i),
             )

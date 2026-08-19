@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 import yaml
-from textual.widgets import Checkbox, DataTable, Input
+from textual.widgets import Checkbox, DataTable, Input, Static
 
 from gateway.configtool.app import ConfigToolApp
 from gateway.configtool.modals import ConfirmModal, MessageModal
@@ -1075,3 +1075,166 @@ class TestCodexRound4Fixes:
 
             raw = yaml.safe_load(Path(config_path).read_text())
             assert [w.get("name") for w in raw["watchers"]] == ["good-rule"]
+
+
+class TestCodexRound5Fixes:
+    """Untouched means untouched, and operator text is displayed verbatim."""
+
+    async def test_saving_an_unrelated_field_does_not_activate_a_quoted_ttl_rule(
+        self, tmp_path, work_dir
+    ):
+        """Codex round 5: `session_idle_days: "15"` makes the rule fail to
+        parse entirely (verified at the loader: 0 rules, 1 issue). The int
+        field rendered `15`, read back the int `15`, compared unequal to the
+        string, and merely pressing Save normalized it — taking a rule that
+        was inert LIVE. A routing change nobody asked for."""
+        config_path = _write_config(tmp_path, f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {work_dir}
+            watchers:
+              - name: inert-rule
+                connector: rc
+                agent: default
+                session_idle_days: "15"
+                rooms:
+                  include: [general]
+        """)
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_rule_row(pilot, app, row=0, key="e")
+            assert isinstance(app.screen, RuleDetailScreen)
+            # Edit something UNRELATED, then save.
+            app.screen.query_one("#field-description", Input).value = "a note"
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            raw = yaml.safe_load(Path(config_path).read_text())
+            entry = raw["watchers"][0]
+            assert entry["description"] == "a note"       # the real edit landed
+            assert entry["session_idle_days"] == "15"     # still quoted, still inert
+            # And it is still reported as broken, not silently repaired.
+            from gateway.config import collect_config
+            cfg, issues = collect_config(config_path)
+            assert [i for i in issues if i.entity_kind == "watcher"]
+
+    async def test_saving_an_unrelated_field_does_not_split_a_comma_bearing_pattern(
+        self, tmp_path, work_dir
+    ):
+        """Codex round 5: a comma is an ordinary literal in the pattern
+        language, so `include: ["team,one"]` is legal and loads cleanly —
+        and so does the two-pattern shape it used to be rewritten into, so
+        the save gate had nothing to object to and the rule silently began
+        claiming two different rooms."""
+        config_path = _write_config(tmp_path, f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {work_dir}
+            watchers:
+              - name: comma-rule
+                connector: rc
+                agent: default
+                rooms:
+                  include: ["team,one"]
+        """)
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_rule_row(pilot, app, row=0, key="e")
+            app.screen.query_one("#field-description", Input).value = "a note"
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            raw = yaml.safe_load(Path(config_path).read_text())
+            entry = raw["watchers"][0]
+            assert entry["description"] == "a note"
+            assert entry["rooms"]["include"] == ["team,one"]  # NOT split
+
+    async def test_a_rule_named_with_markup_characters_opens_instead_of_crashing(
+        self, tmp_path, work_dir
+    ):
+        """Codex round 5: rule names are unrestricted, and a name like `[/]`
+        raised Rich's MarkupError when its row was opened — making that rule
+        unviewable, uneditable and undeletable through the TUI."""
+        config_path = _write_config(tmp_path, f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {work_dir}
+            watchers:
+              - name: "[/]"
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
+        """)
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_rules_tab(pilot, app)
+            assert app.is_running is True
+            await _open_rule_row(pilot, app, row=0, key="enter")
+            assert app.is_running is True
+            assert isinstance(app.screen, RuleDetailScreen)
+            # And the delete confirm — which interpolates the label too.
+            await pilot.press("d")
+            await pilot.pause()
+            assert app.is_running is True
+            assert isinstance(app.screen, ConfirmModal)
+
+    async def test_a_character_class_pattern_is_displayed_in_full(
+        self, tmp_path, work_dir
+    ):
+        """The worse half of the same finding: `[…]` is documented,
+        first-class pattern syntax, and `eng-[ab]` rendered as `eng-` —
+        the display CONCEALED which rooms the rule actually claims."""
+        config_path = _write_config(tmp_path, f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {work_dir}
+            watchers:
+              - name: class-rule
+                connector: rc
+                agent: default
+                rooms:
+                  include: ["eng-[ab]"]
+        """)
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_rules_tab(pilot, app)
+            table = app.screen.query_one("#rules-table", DataTable)
+            # The cell renders through Rich; its VISIBLE text must keep the
+            # class intact.
+            from rich.markup import render
+            assert render(str(table.get_row_at(0)[4])).plain == "eng-[ab]"
+
+            await _open_rule_row(pilot, app, row=0, key="enter")
+            # Static.render() hands back the ALREADY-PARSED Text, so its str
+            # is the visible plain text — the class must survive into it.
+            # (Rendering it a second time would re-parse the brackets and is
+            # the mistake this comment exists to stop being repeated.)
+            body = str(app.screen.query_one("#rule-detail-body", Static).render())
+            assert "eng-[ab]" in body

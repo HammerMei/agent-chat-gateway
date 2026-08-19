@@ -18,12 +18,10 @@ enforced by `gateway/config.py`'s `_parse_templates_block`), so this overrides
 three of `FormScreen`'s hooks that would otherwise try to merge against one:
   - `_compute_initial_values()` reads straight off the template's own entry +
     the dataclass defaults (`AGENT_DATACLASS_DEFAULTS`/etc.) — no
-    `merged_entry()` call. Falsy-empty ("" / []) values are normalized to
-    `None` here (mirroring the old `DefaultsScreen`'s own normalization) —
-    without it, a field whose only value is a falsy dataclass default would
-    look "changed" on every Save purely because of how `read_widget_value()`
-    reads back an untouched str/list Input, producing a false-positive
-    blast-radius confirm below for a field nobody actually edited.
+    `merged_entry()` call. Values are snapshotted through
+    `round_trip_value()` (form_common.py), the shared render-and-read-back
+    pair, so an untouched field can never read as edited — which here means
+    no false-positive blast-radius confirm for a field nobody touched.
   - `_field_provenance()` always returns `None` — a template's own fields
     have no "explicit vs. inherited" distinction (nothing for a template to
     inherit FROM).
@@ -70,6 +68,7 @@ from .form_common import (
     get_nested,
     list_to_text,
     read_widget_value,
+    round_trip_value,
     set_widget_value,
     widget_id,
 )
@@ -176,13 +175,15 @@ class TemplateDetailScreen(ToolListEditorMixin, FormScreen):
             value = get_nested(entry, spec.key)
             if value is None:
                 value = dataclass_defaults.get(spec.key)
-            # See module docstring: normalizes a falsy dataclass-default
-            # value ("" / []) to None so it matches read_widget_value()'s
-            # own untouched-field readback — prevents a false-positive
-            # blast-radius confirm for a field nobody actually edited.
-            if spec.kind in ("str", "list") and value is not None and not value:
-                value = None
-            self._initial_values[spec.key] = value
+            # Round-tripped through the same render-and-read-back pair the
+            # widget will use (see round_trip_value()'s docstring), so an
+            # untouched field never reads as edited — which here also means
+            # no false-positive blast-radius confirm for a field nobody
+            # touched. Subsumes the narrower falsy-to-None normalization
+            # this line used to do, and covers the quoted-number and
+            # delimiter-in-a-list-item cases it missed (a watcher template
+            # can carry `session_idle_days: "15"` exactly as a rule can).
+            self._initial_values[spec.key] = round_trip_value(spec, value)
         self._initial_values["description"] = entry.get("description")
 
     def _field_provenance(self, spec: FieldSpec, entry: dict):

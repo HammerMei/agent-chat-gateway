@@ -48,7 +48,7 @@ from textual.containers import Horizontal, VerticalScroll
 from textual.css.query import NoMatches
 from textual.widgets import Checkbox, Footer, Header, Input, Select, Static
 
-from ..formatting import provenance_label
+from ..formatting import markup_safe, provenance_label
 from ..modals import ConfirmModal, MessageModal
 from ..model import EditableConfig, Provenance
 from .base import DetailScreen
@@ -169,6 +169,62 @@ def read_widget_value(spec: FieldSpec, widget: object) -> object:
             raise ValueError(f"{spec.label}: must be a number, got {text!r}") from None
     text = widget.value.strip()
     return text or None
+
+
+class _ValueShim:
+    """Minimal stand-in for a widget, so `round_trip_value()` can reuse
+    `read_widget_value()` verbatim instead of restating its conversions."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: object) -> None:
+        self.value = value
+
+
+def round_trip_value(spec: FieldSpec, value: object) -> object:
+    """What a freshly-composed widget for `spec` would read back for `value`.
+
+    The snapshot `_compute_initial_values()` diffs against must be the
+    ROUND-TRIPPED value, not the raw one off disk, or an untouched field
+    reads as edited and Save rewrites it. Two confirmed ways that happened
+    (Codex review of #129, round 5 — one root cause, both verified against
+    the loader):
+
+    * A quoted number (`session_idle_days: "15"`) rendered as `15`, read
+      back as the int `15`, and compared unequal to the string `"15"`. That
+      entry does not parse at all, so merely pressing Save on an unrelated
+      field normalized it and took a rule that was inert **live** — a
+      routing change nobody asked for.
+    * A list item containing the join delimiter (`include: ["team,one"]` —
+      a comma is an ordinary literal in the pattern language) rendered as
+      `team,one` and read back as TWO patterns, `team` and `one`. Both
+      shapes load cleanly, so the save gate had nothing to object to and
+      the rule silently began claiming two different rooms.
+
+    Composing and reading are the pair that must agree, so this applies the
+    same render step `_compose_field_row()` uses and then
+    `read_widget_value()` itself. An unparseable value (`"abc"` in an int
+    field) is returned raw: Save is refused loudly on it either way, and
+    inventing a value here would be the silent rewrite this exists to stop.
+
+    Consequence worth stating: a malformed value cannot be repaired by
+    merely opening the form and saving — that is the point (it is what made
+    the rewrite silent). The row shows ERROR with the real message, and
+    `ctrl+e`/`$EDITOR` remains the documented way to fix the raw file.
+    """
+    if spec.kind == "bool":
+        return bool(value)
+    if spec.kind == "enum":
+        options = spec.options or ()
+        return value if value in options else (options or (None,))[0]
+    if spec.kind == "list":
+        text = list_to_text(value)
+    else:
+        text = "" if value is None else str(value)
+    try:
+        return read_widget_value(spec, _ValueShim(text))
+    except ValueError:
+        return value
 
 
 def set_widget_value(spec: FieldSpec, widget: object, value: object) -> None:
@@ -528,7 +584,7 @@ class FormScreen(DetailScreen):
         adds the stranded-session/orphaned-job counts design §5.5 requires)
         without duplicating the whole delete flow."""
         return (
-            f"Delete {self._entity_noun()} '{self._entity_label()}'? "
+            f"Delete {self._entity_noun()} '{markup_safe(self._entity_label())}'? "
             "This cannot be undone."
         )
 
@@ -558,27 +614,21 @@ class FormScreen(DetailScreen):
             value = get_nested(merged, spec.key)
             if value is None:
                 value = dataclass_defaults.get(spec.key)
-            # read_widget_value() normalizes an untouched "str"/"list"-kind
-            # box that renders as EMPTY TEXT back to None — text_to_list("")
-            # or None for list, text.strip() or None for str — regardless of
-            # whether the effective value is None, "", or []. Without this
-            # same normalization here, a field whose true effective value is
-            # "" or [] (explicit, or absent and defaulting to one of those)
-            # would store that falsy-but-not-None value as its "initial"
-            # value, compare unequal to the widget's real untouched readback
-            # of None, and look spuriously "changed" — both to
-            # _collect_field_updates() (Save would write a no-op-shaped but
-            # semantically wrong explicit null onto an untouched field) and
-            # to _field_has_override() (a false-positive "you'll lose this
-            # edit" confirm when switching inherits: with nothing actually
-            # touched). "int"/"float" are deliberately excluded: an explicit
-            # `0`/`0.0` renders as the text "0" (non-empty), which reads back
-            # as the same number again — no mismatch there, and normalizing
-            # it away would introduce the exact same false positive in
-            # reverse.
-            if spec.kind in ("str", "list") and value is not None and not value:
-                value = None
-            self._initial_values[spec.key] = value
+            # ROUND-TRIPPED, not raw: the snapshot has to be what a
+            # freshly-composed widget for this field would read back, or an
+            # untouched field compares unequal and Save rewrites it. This
+            # replaces (and subsumes) a narrower "str"/"list" falsy-to-None
+            # normalization that lived here: an effective value of "" or []
+            # renders as an empty box, whose readback is None, so the raw
+            # value looked "changed" to both _collect_field_updates() (Save
+            # writing a semantically wrong explicit null onto an untouched
+            # field) and _field_has_override() (a false-positive "you'll
+            # lose this edit" confirm on an inherits: switch). Two further
+            # cases the narrow version missed — a quoted number, and a list
+            # item containing the join delimiter — are documented on
+            # round_trip_value(), which is now the single place this
+            # render-and-read-back agreement is expressed.
+            self._initial_values[spec.key] = round_trip_value(spec, value)
         self._initial_values["description"] = entry.get("description")
 
     def _field_provenance(self, spec: FieldSpec, entry: dict) -> Provenance | None:
@@ -910,9 +960,12 @@ class FormScreen(DetailScreen):
         if blockers:
             await self.app.push_screen_wait(
                 MessageModal(
+                    # Escaped: the blockers are RULE names now, which are
+                    # unrestricted strings (see markup_safe()).
                     f"Cannot delete {self._entity_noun()} "
-                    f"'{self._entity_label()}' — still used by "
-                    f"{self._delete_blocker_noun()}(s): {', '.join(blockers)}.",
+                    f"'{markup_safe(self._entity_label())}' — still used by "
+                    f"{self._delete_blocker_noun()}(s): "
+                    f"{', '.join(markup_safe(b) for b in blockers)}.",
                     title="Cannot delete",
                 )
             )

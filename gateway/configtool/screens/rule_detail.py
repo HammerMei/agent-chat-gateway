@@ -36,7 +36,7 @@ from textual.widgets import Button, Input, Select, Static
 
 from ...config import HistoryHandoffConfig
 from ...core.watcher_rule import WatcherRule
-from ..formatting import format_value, provenance_label
+from ..formatting import format_value, markup_safe, provenance_label
 from ..modals import ConfirmModal, InheritsPickerModal, MessageModal, TextPromptModal
 from ..model import EditableConfig
 from ..state_peek import stranded_by_rule
@@ -419,9 +419,12 @@ class RuleDetailScreen(FormScreen):
         description = entry.get("description")
         template_name = self.cfg.entry_template_name(entry)
 
-        lines = [f"[bold]{self._entity_label()}[/bold]"]
+        # Every dynamic value here is operator-authored and reaches a
+        # markup-parsing Static — rule names are unrestricted and patterns
+        # legitimately contain `[…]` (see markup_safe()).
+        lines = [f"[bold]{markup_safe(self._entity_label())}[/bold]"]
         if description:
-            lines.append(f"[dim]{description}[/dim]")
+            lines.append(f"[dim]{markup_safe(description)}[/dim]")
         try:
             merged = self.cfg.merged_entry("watcher", entry)
         except (ValueError, FileNotFoundError) as exc:
@@ -429,10 +432,14 @@ class RuleDetailScreen(FormScreen):
             return "\n".join(lines)
 
         defaults = self._dataclass_defaults()
-        lines.append(f"connector: {merged.get('connector') or defaults['connector']}")
-        lines.append(f"agent: {merged.get('agent') or defaults['agent']}")
-        lines.append(f"rooms: {rule_rooms_summary(entry)}")
-        lines.append(f"inherits: {template_name if template_name else '(none)'}")
+        lines.append(
+            f"connector: {markup_safe(merged.get('connector') or defaults['connector'])}"
+        )
+        lines.append(f"agent: {markup_safe(merged.get('agent') or defaults['agent'])}")
+        lines.append(f"rooms: {markup_safe(rule_rooms_summary(entry))}")
+        lines.append(
+            f"inherits: {markup_safe(template_name) if template_name else '(none)'}"
+        )
         lines.append("")
 
         for spec in WATCHER_TEMPLATE_FIELDS:
@@ -444,7 +451,7 @@ class RuleDetailScreen(FormScreen):
             if value is None:
                 value = WATCHER_TEMPLATE_DATACLASS_DEFAULTS.get(spec.key)
             lines.append(
-                f"{spec.key}: {format_value(value)}  "
+                f"{spec.key}: {markup_safe(format_value(value))}  "
                 f"[dim]({provenance_label(provenance, template_name)})[/dim]"
             )
         return "\n".join(lines)
@@ -456,7 +463,7 @@ class RuleDetailScreen(FormScreen):
             if self.mode == "create":
                 yield Static("[bold]New rule[/bold]")
             else:
-                yield Static(f"[bold]{self._entity_label()}[/bold]  (editing)")
+                yield Static(f"[bold]{markup_safe(self._entity_label())}[/bold]  (editing)")
 
             with Horizontal(classes="field-row"):
                 yield Static("Description", classes="field-label")

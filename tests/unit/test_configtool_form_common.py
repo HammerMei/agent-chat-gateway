@@ -22,8 +22,11 @@ from pathlib import Path
 
 from gateway.configtool.model import EditableConfig
 from gateway.configtool.screens.form_common import (
+    FieldSpec,
     find_referencing_watcher_labels,
     list_to_text,
+    read_widget_value,
+    round_trip_value,
 )
 
 
@@ -281,3 +284,72 @@ class TestListToTextTolerance(unittest.TestCase):
         'n, o, t, e, s, ., m, d' — and saving that box wrote eight bogus
         one-character paths over the operator's one real value."""
         self.assertEqual(list_to_text("notes.md"), "notes.md")
+
+
+class _Shim:
+    def __init__(self, value):
+        self.value = value
+
+
+class TestRoundTripValueEnumeratesEveryKind(unittest.TestCase):
+    """The snapshot a form diffs against must be what a freshly-composed
+    widget reads back, or an untouched field looks edited and Save rewrites
+    it. Two rounds of review each found another value shape where the two
+    disagreed, so this enumerates the surface: for EVERY field kind, the
+    round-tripped snapshot must be a fixed point of the widget's own
+    read-back (Codex review of #129, rounds 4-5)."""
+
+    # (spec, on-disk value) pairs covering each kind plus the shapes that
+    # actually broke: a quoted number, a bare string in a list field, a
+    # list item containing the join delimiter, falsy-but-present values.
+    CASES = [
+        (FieldSpec("s", "str", "S"), "hello"),
+        (FieldSpec("s", "str", "S"), ""),
+        (FieldSpec("s", "str", "S"), None),
+        (FieldSpec("i", "int", "I"), 15),
+        (FieldSpec("i", "int", "I"), 0),
+        (FieldSpec("i", "int", "I"), "15"),          # quoted number
+        (FieldSpec("i", "int", "I"), None),
+        (FieldSpec("f", "float", "F"), 1.5),
+        (FieldSpec("f", "float", "F"), 0.0),
+        (FieldSpec("f", "float", "F"), "1.5"),       # quoted number
+        (FieldSpec("b", "bool", "B"), True),
+        (FieldSpec("b", "bool", "B"), False),
+        (FieldSpec("b", "bool", "B"), None),
+        (FieldSpec("l", "list", "L"), ["a", "b"]),
+        (FieldSpec("l", "list", "L"), []),
+        (FieldSpec("l", "list", "L"), None),
+        (FieldSpec("l", "list", "L"), "notes.md"),   # bare string
+        (FieldSpec("l", "list", "L"), ["team,one"]),  # delimiter in an item
+        (FieldSpec("l", "list", "L"), 5),            # truthy non-iterable
+        (FieldSpec("e", "enum", "E", options=("x", "y")), "y"),
+        (FieldSpec("e", "enum", "E", options=("x", "y")), "nope"),
+    ]
+
+    def test_every_kind_and_shape_is_a_fixed_point_of_the_widget_readback(self):
+        for spec, raw in self.CASES:
+            with self.subTest(kind=spec.kind, raw=raw):
+                snapshot = round_trip_value(spec, raw)
+                # What the composed widget shows for that snapshot, read back
+                # exactly as _collect_field_updates() would read it.
+                if spec.kind == "bool":
+                    readback = read_widget_value(spec, _Shim(bool(snapshot)))
+                elif spec.kind == "enum":
+                    readback = read_widget_value(spec, _Shim(snapshot))
+                elif spec.kind == "list":
+                    readback = read_widget_value(spec, _Shim(list_to_text(snapshot)))
+                else:
+                    readback = read_widget_value(
+                        spec, _Shim("" if snapshot is None else str(snapshot))
+                    )
+                self.assertEqual(
+                    readback, snapshot,
+                    f"{spec.kind} field with {raw!r} on disk would read as "
+                    f"{readback!r} against a snapshot of {snapshot!r} — an "
+                    "untouched field that Save would rewrite",
+                )
+
+    def test_an_unparseable_number_is_kept_raw_rather_than_invented(self):
+        """Save is refused loudly on it either way; inventing a value here
+        would be the silent rewrite this exists to stop."""
+        self.assertEqual(round_trip_value(FieldSpec("i", "int", "I"), "abc"), "abc")
