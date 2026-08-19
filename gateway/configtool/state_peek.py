@@ -73,7 +73,14 @@ def stranded_by_rule(
             # choice that resuming re-arms.
             if job.get("status") == JobStatus.COMPLETED.value:
                 continue
-            if job.get("watcher") in watcher_names:
+            # isinstance first: a non-string `watcher` (a list or mapping in
+            # a hand-edited jobs.json) is UNHASHABLE, so the membership test
+            # raised TypeError straight out of this function and crashed the
+            # rule-delete confirmation — the exact opposite of the
+            # best-effort contract stated above (Codex review of #129,
+            # round 10).
+            watcher = job.get("watcher")
+            if isinstance(watcher, str) and watcher in watcher_names:
                 jobs += 1
     return records, jobs
 

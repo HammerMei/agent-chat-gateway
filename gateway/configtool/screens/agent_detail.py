@@ -184,7 +184,11 @@ def _working_directory_warning(config_path: Path, raw_value: str) -> str:
         return ""
     resolved = _resolve_working_directory(config_path, text)
     if not resolved.is_dir():
-        return f"[yellow]⚠ does not exist yet: {resolved}[/yellow]"
+        # The resolved PATH comes from the operator's own working_directory,
+        # and this string is rendered as markup — found by the static markup
+        # check when it was extended to whole-argument sinks (Codex review of
+        # #129, round 10), not by any review round.
+        return f"[yellow]⚠ does not exist yet: {markup_safe(resolved)}[/yellow]"
     return ""
 
 
@@ -542,7 +546,14 @@ class AgentDetailScreen(ToolListEditorMixin, FormScreen):
         updates = self._collect_field_updates()
         if updates is None:
             await self.app.push_screen_wait(
-                MessageModal(self._last_field_error or "Invalid field.", title="Could not save")
+                MessageModal(
+                    # read_widget_value() quotes the operator's own text back
+                    # ("must be a whole number, got '[/]'"), so the message
+                    # reporting a bad value must not itself be parsed as
+                    # markup (Codex review of #129, round 10).
+                    markup_safe(self._last_field_error or "Invalid field."),
+                    title="Could not save",
+                )
             )
             return
 

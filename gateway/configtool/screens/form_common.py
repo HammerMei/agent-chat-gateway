@@ -1142,23 +1142,18 @@ class FormScreen(DetailScreen):
                 # equals the readback, so the comparison above is False.
                 raw = self._lossy_list_values.get(spec.key)
                 if raw is not None:
-                    # markup_safe on the interpolated value: this message
-                    # reaches a markup-parsing MessageModal, and the very
-                    # values it names are operator-authored — a legal
-                    # filename like `my,[notes].md` was rendered as
-                    # `my,.md` (naming the WRONG item), and one spelling a
-                    # closing tag (`my,[/].md`) raised MarkupError, which
-                    # crashed the modal and so defeated the loud refusal
-                    # this branch exists to give (Codex review of #129,
-                    # round 7 — a fresh unescaped interpolation opened one
-                    # round after the escaping sweep).
+                    # NOT escaped here: `_last_field_error` is escaped once
+                    # at its sink, where every producer's message is (round
+                    # 10). This message used to escape its own value too,
+                    # and the two together double-escaped it — the modal
+                    # displayed `my,\[/].md`, a backslash the file does not
+                    # contain. Escape at the boundary, exactly once.
                     self._last_field_error = (
                         f"{spec.label}: this list contains an item with a "
-                        f"comma in it ({markup_safe(repr(list_to_text(raw)))}), "
-                        "which this comma-separated box cannot represent — "
-                        "editing it here would split that item in two. Edit "
-                        "this field in $EDITOR instead (ctrl+e on the list "
-                        "screen)."
+                        f"comma in it ({list_to_text(raw)!r}), which this "
+                        "comma-separated box cannot represent — editing it "
+                        "here would split that item in two. Edit this field "
+                        "in $EDITOR instead (ctrl+e on the list screen)."
                     )
                     return None
                 updates[spec.key] = new_value

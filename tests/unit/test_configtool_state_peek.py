@@ -109,6 +109,21 @@ class TestStrandedByRule(unittest.TestCase):
         with patch("gateway.configtool.state_peek.state_files", side_effect=OSError("nope")):
             self.assertEqual(stranded_by_rule("my-rule"), (0, 0))
 
+    def test_a_non_string_job_watcher_is_skipped_not_raised(self):
+        """Codex round 10: a non-string `watcher` is UNHASHABLE, so the
+        membership test raised TypeError out of this function and crashed
+        the rule-delete confirmation — the opposite of the best-effort
+        contract this module states."""
+        states = [self._state_file("rc", [
+            {"watcher_name": "rc:general", "rule_name": "my-rule"},
+        ])]
+        jobs = self._jobs_file([
+            {"id": "j1", "watcher": ["rc:general"]},      # unhashable
+            {"id": "j2", "watcher": {"k": "v"}},          # unhashable
+            {"id": "j3", "watcher": "rc:general"},        # the real one
+        ])
+        self.assertEqual(stranded_by_rule("my-rule", states, jobs), (1, 1))
+
     def test_a_record_without_a_watcher_name_still_counts_as_a_record(self):
         states = [self._state_file("rc", [
             {"rule_name": "my-rule"},  # malformed but attributable

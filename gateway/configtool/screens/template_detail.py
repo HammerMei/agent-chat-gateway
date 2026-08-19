@@ -366,7 +366,14 @@ class TemplateDetailScreen(ToolListEditorMixin, FormScreen):
         updates = self._collect_field_updates()
         if updates is None:
             await self.app.push_screen_wait(
-                MessageModal(self._last_field_error or "Invalid field.", title="Could not save")
+                MessageModal(
+                    # read_widget_value() quotes the operator's own text back
+                    # ("must be a whole number, got '[/]'"), so the message
+                    # reporting a bad value must not itself be parsed as
+                    # markup (Codex review of #129, round 10).
+                    markup_safe(self._last_field_error or "Invalid field."),
+                    title="Could not save",
+                )
             )
             return
 
@@ -432,7 +439,13 @@ class TemplateDetailScreen(ToolListEditorMixin, FormScreen):
                 affected[key] = names
 
         if affected:
-            lines = [f"{key}: {', '.join(names)}" for key, names in affected.items()]
+            # The names are entity names (agents/connectors/rules that
+            # inherit this template) and the keys are field names — both
+            # operator-authored, both rendered as markup by ConfirmModal.
+            lines = [
+                f"{markup_safe(key)}: {', '.join(markup_safe(n) for n in names)}"
+                for key, names in affected.items()
+            ]
             confirmed = await self.app.push_screen_wait(
                 ConfirmModal(
                     "This changes the EFFECTIVE value for —\n" + "\n".join(lines) + "\n\nContinue?",

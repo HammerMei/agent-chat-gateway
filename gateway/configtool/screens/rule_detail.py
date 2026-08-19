@@ -503,7 +503,14 @@ class RuleDetailScreen(FormScreen):
         updates = self._collect_field_updates()
         if updates is None:
             await self.app.push_screen_wait(
-                MessageModal(self._last_field_error or "Invalid field.", title="Could not save")
+                MessageModal(
+                    # read_widget_value() quotes the operator's own text back
+                    # ("must be a whole number, got '[/]'"), so the message
+                    # reporting a bad value must not itself be parsed as
+                    # markup (Codex review of #129, round 10).
+                    markup_safe(self._last_field_error or "Invalid field."),
+                    title="Could not save",
+                )
             )
             return
 
@@ -567,6 +574,8 @@ class RuleDetailScreen(FormScreen):
             return
 
         inserted_index: int | None = None
+        was_dirty = self.cfg.dirty  # captured BEFORE any mutation; see below
+        watchers_key_was_absent = False
         if self.mode == "create":
             existing = self.cfg.document.get("watchers")
             if existing is not None and not isinstance(existing, list):
@@ -589,6 +598,11 @@ class RuleDetailScreen(FormScreen):
                     )
                 )
                 return
+            # Whether the key existed at all, so a REJECTED create can put
+            # the document back to that exact shape rather than leaving an
+            # empty `watchers: []` behind where there was no key (Codex
+            # review of #129, round 10).
+            watchers_key_was_absent = existing is None
             if existing is None:
                 self.cfg.document["watchers"] = []
             watchers = self.cfg.document["watchers"]
@@ -603,8 +617,16 @@ class RuleDetailScreen(FormScreen):
         except (ValueError, FileNotFoundError) as exc:
             if self.mode == "create" and inserted_index is not None:
                 del self.cfg.document["watchers"][inserted_index]
+                if watchers_key_was_absent:
+                    self.cfg.document.pop("watchers", None)
             else:
                 self._rollback_trial_entry()
+            # Same rollback contract the reorder and malformed-row delete
+            # already honour: restoring the document is only half of it, or
+            # the quit gate goes on offering to discard changes that no
+            # longer exist. This site was MINE and I missed it when scoping
+            # round 8's fix — the sibling pre-existing paths are #131.
+            self.cfg.dirty = was_dirty
             await self.app.push_screen_wait(MessageModal(markup_safe(exc), title="Could not save"))
             return
 

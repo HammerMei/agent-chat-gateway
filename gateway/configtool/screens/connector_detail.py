@@ -688,7 +688,14 @@ class ConnectorDetailScreen(FormScreen):
         updates = self._collect_field_updates()
         if updates is None:
             await self.app.push_screen_wait(
-                MessageModal(self._last_field_error or "Invalid field.", title="Could not save")
+                MessageModal(
+                    # read_widget_value() quotes the operator's own text back
+                    # ("must be a whole number, got '[/]'"), so the message
+                    # reporting a bad value must not itself be parsed as
+                    # markup (Codex review of #129, round 10).
+                    markup_safe(self._last_field_error or "Invalid field."),
+                    title="Could not save",
+                )
             )
             return
 

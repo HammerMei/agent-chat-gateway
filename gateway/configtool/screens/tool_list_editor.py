@@ -102,7 +102,7 @@ class ToolListEditorMixin:
 
     def _tool_list_items(self, key: str) -> list[ListItem]:
         return [
-            ListItem(Label(format_tool_rule(item)), name=str(i))
+            ListItem(Label(markup_safe(format_tool_rule(item))), name=str(i))
             for i, item in enumerate(self._tool_lists[key])
         ]
 
@@ -117,7 +117,7 @@ class ToolListEditorMixin:
         prev_index = list_view.index
         list_view.clear()
         for i, item in enumerate(self._tool_lists[key]):
-            list_view.append(ListItem(Label(format_tool_rule(item)), name=str(i)))
+            list_view.append(ListItem(Label(markup_safe(format_tool_rule(item))), name=str(i)))
         # Re-`.append()`ing items after `.clear()` does NOT restore an
         # auto-selection the way a `ListView` composed WITH its children up
         # front does (see `on_list_view_highlighted()`'s own comment on

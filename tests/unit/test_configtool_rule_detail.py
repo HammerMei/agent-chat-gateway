@@ -1472,3 +1472,87 @@ class TestCodexRound8Fixes:
             await pilot.press("enter")
             await pilot.pause()
             assert app.editable_config.dirty is False
+
+
+class TestCodexRound10Fixes:
+    async def test_a_rejected_rule_save_restores_dirty_and_the_document_shape(
+        self, tmp_path, work_dir
+    ):
+        """Codex round 10: the rule form's own save rollback left
+        `cfg.dirty` set, so quitting offered to discard changes that no
+        longer existed. This site is MINE and I missed it when scoping
+        round 8's fix (the pre-existing siblings are issue #131). A
+        rejected CREATE also left an empty `watchers: []` where the key had
+        been absent."""
+        config_path = _write_config(tmp_path, f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {work_dir}
+        """)
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert "watchers" not in app.editable_config.document
+            await _open_rules_tab(pilot, app)
+            await pilot.press("n")
+            await pilot.pause()
+            app.screen.query_one("#field-name", Input).value = "new-rule"
+            # An except_for with no overlapping include is refused by the loader.
+            app.screen.query_one("#field-rooms-include", Input).value = "general"
+            app.screen.query_one("#field-rooms-except_for", Input).value = "zzz-nothing"
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            assert isinstance(app.screen, MessageModal)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.editable_config.dirty is False, (
+                "a rejected save must not leave the config looking edited"
+            )
+            assert "watchers" not in app.editable_config.document, (
+                "a rejected create must not leave an empty watchers list behind"
+            )
+
+    async def test_an_unparseable_number_reports_the_value_without_crashing(
+        self, tmp_path, work_dir
+    ):
+        """Codex round 10: read_widget_value() quotes the operator's own
+        text into the error ("got '[/]'"), and that message went into a
+        markup-parsing modal — so the report of a bad value crashed on the
+        value. The static markup check missed it because the argument is not
+        an f-string; that blind spot is now closed too."""
+        config_path = _write_config(tmp_path, f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {work_dir}
+            watchers:
+              - name: r1
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
+        """)
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_rule_row(pilot, app, row=0, key="e")
+            app.screen.query_one("#field-session_idle_days", Input).value = "[/]"
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            assert app.is_running is True, "the field-error modal killed the app"
+            assert isinstance(app.screen, MessageModal)
+            body = str(app.screen.query_one("#message-body").render())
+            assert "[/]" in body, "the modal must name the offending value"
