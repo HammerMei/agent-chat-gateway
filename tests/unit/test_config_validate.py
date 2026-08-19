@@ -945,6 +945,35 @@ class TestFindingsExtension(_ValidateConfigTestBase):
         self.assertEqual(warning_findings[0].entity_name, "rc")
         self.assertIsNone(warning_findings[0].field)
 
+    def test_a_failed_state_file_enumeration_is_a_warning_not_a_crash(self):
+        """Codex review of #129 (round 2): state_files() itself can raise —
+        ensure_runtime_dir() on an uncreatable/unlistable runtime dir —
+        BEFORE the per-file try is entered, crashing the one function whose
+        contract is collecting problems instead of raising them (and the
+        TUI's banner with it)."""
+        from unittest.mock import patch
+
+        cfg = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: w1
+                rooms:
+                  include: [general]
+        """)
+        with patch("gateway.config_validate.state_files", side_effect=OSError("denied")):
+            result = self._validate(cfg)
+        enumeration_warnings = [
+            w for w in result.warnings if "enumerate persisted state files" in w
+        ]
+        self.assertEqual(len(enumeration_warnings), 1)
+
     def test_lint_findings_are_attributed_per_entity_and_field(self):
         cfg = self._write(f"""\
             connectors:

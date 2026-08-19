@@ -389,7 +389,20 @@ def _check_state_orphans(config: GatewayConfig, result: ValidationResult) -> Non
     # since-renamed connector would pass validation and then be abandoned silently at
     # startup, which is the failure the refusal exists to prevent.
     configured = {c.name for c in config.connectors}
-    for path in state_files():
+    # The enumeration itself can raise before any per-file try is entered —
+    # state_files() calls ensure_runtime_dir(), which fails when the runtime
+    # dir cannot be created or listed (a file squatting on the path, a
+    # read-only $HOME). Collected as a warning rather than raised: this
+    # function's whole contract is reporting problems, not crashing on them
+    # (Codex review of #129 — same contract the entry_count fix restored).
+    try:
+        persisted = state_files()
+    except OSError as exc:
+        msg = f"Could not enumerate persisted state files: {exc}"
+        result.warnings.append(msg)
+        result.findings.append(Finding("warning", "global", None, None, msg))
+        persisted = []
+    for path in persisted:
         file_connector = connector_name_of(path)
         try:
             states = load_state(file_connector)

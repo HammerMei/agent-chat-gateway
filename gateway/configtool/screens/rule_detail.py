@@ -171,6 +171,13 @@ class RuleDetailScreen(FormScreen):
         self.mode = mode
         self._inherits_initial: str | None = self.cfg.entry_template_name(self.entry)
         self._inherits_current: str | None = self._inherits_initial
+        # Whether the user actually touched the Name field this session —
+        # `_name_live` alone can't distinguish "cleared to empty" from
+        # "never touched" (both read ""), and a cleared name must survive a
+        # template switch just like a typed one (Codex review of #129,
+        # round 2). Reset alongside the other per-session state in
+        # _on_enter_edit_mode().
+        self._name_edited = False
         if self.mode != "view":
             self._compute_initial_values(self._current_entry())
             self._description_live = self._initial_values.get("description") or ""
@@ -380,17 +387,28 @@ class RuleDetailScreen(FormScreen):
         supply `name` (forbidden key), so restoring the live value can't
         mask a template-provided one. `_name_live` is already maintained by
         FormScreen.on_input_changed() because widget_id("name") happens to
-        be the exact "#field-name" id it tracks."""
+        be the exact "#field-name" id it tracks. Gated on `_name_edited`,
+        not on `_name_live`'s truthiness (round 2): a name CLEARED to empty
+        is an edit too, and restoring the old name over it would silently
+        resurrect the identity the user just removed — while an untouched
+        form ("" because nothing was ever typed) must keep showing the
+        entry's own name."""
         await super()._recompute_form()
-        if self._name_live:
+        if self._name_edited:
             try:
                 self.query_one("#" + widget_id("name"), Input).value = self._name_live
             except NoMatches:
                 pass
 
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if not self._populating and (event.input.id or "") == "field-name":
+            self._name_edited = True
+        super().on_input_changed(event)
+
     def _on_enter_edit_mode(self) -> None:
         self._inherits_initial = self.cfg.entry_template_name(self.entry)
         self._inherits_current = self._inherits_initial
+        self._name_edited = False  # fresh edit session — see __init__
         self._compute_initial_values(self._current_entry())
         self._description_live = self._initial_values.get("description") or ""
 

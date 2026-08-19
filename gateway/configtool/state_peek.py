@@ -43,7 +43,17 @@ def stranded_by_rule(
     """
     watcher_names: set[str] = set()
     records = 0
-    for path in state_files() if state_paths is None else state_paths:
+    if state_paths is None:
+        # The enumeration itself can raise (state_files() ->
+        # ensure_runtime_dir() on an uncreatable/unlistable runtime dir) —
+        # this module's contract is best-effort read-only counting, so a
+        # failed enumeration counts nothing rather than crashing the
+        # delete-confirm flow (Codex review of #129).
+        try:
+            state_paths = state_files()
+        except OSError:
+            state_paths = []
+    for path in state_paths:
         for record in _read_list(path, "watchers"):
             if record.get("rule_name") == rule_name:
                 records += 1

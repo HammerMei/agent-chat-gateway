@@ -100,6 +100,15 @@ class TestStrandedByRule(unittest.TestCase):
         ])
         self.assertEqual(stranded_by_rule("my-rule", states, jobs), (1, 2))
 
+    def test_a_failed_default_enumeration_counts_nothing(self):
+        """Codex round 2: state_files() itself can raise (ensure_runtime_dir
+        on an uncreatable/unlistable runtime dir) BEFORE any per-file
+        tolerance applies — best-effort counting must swallow that too."""
+        from unittest.mock import patch
+
+        with patch("gateway.configtool.state_peek.state_files", side_effect=OSError("nope")):
+            self.assertEqual(stranded_by_rule("my-rule"), (0, 0))
+
     def test_a_record_without_a_watcher_name_still_counts_as_a_record(self):
         states = [self._state_file("rc", [
             {"rule_name": "my-rule"},  # malformed but attributable

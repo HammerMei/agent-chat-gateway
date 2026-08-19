@@ -782,3 +782,62 @@ class TestCodexRound1Fixes:
             # Nothing was written — the scalar is still on disk, untouched.
             raw = yaml.safe_load(Path(config_path).read_text())
             assert raw["watchers"] == 5
+
+
+class TestCodexRound2Fixes:
+    def _config_with_template(self, work_dir: Path) -> str:
+        return f"""\
+            watcher_templates:
+              slow:
+                session_idle_days: 30
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {work_dir}
+            watchers:
+              - name: old-name
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
+        """
+
+    async def test_a_cleared_name_survives_a_template_switch(self, tmp_path, work_dir):
+        """Codex round 2: `_name_live` truthiness can't distinguish 'cleared
+        to empty' from 'never touched' — clearing the name and then picking
+        a template silently resurrected the old identity."""
+        config_path = _write_config(tmp_path, self._config_with_template(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_rule_row(pilot, app, row=0, key="e")
+            app.screen.query_one("#field-name", Input).value = ""
+            await pilot.pause()
+
+            app.screen._inherits_current = "slow"
+            await app.screen._recompute_form()
+            await pilot.pause()
+
+            assert app.screen.query_one("#field-name", Input).value == ""
+
+    async def test_an_untouched_name_still_shows_the_entrys_own_after_a_switch(
+        self, tmp_path, work_dir
+    ):
+        """The other half of the same gate: an untouched form ('' because
+        nothing was ever typed) must keep showing the entry's own name
+        after a template switch, not get blanked by an over-eager restore."""
+        config_path = _write_config(tmp_path, self._config_with_template(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_rule_row(pilot, app, row=0, key="e")
+
+            app.screen._inherits_current = "slow"
+            await app.screen._recompute_form()
+            await pilot.pause()
+
+            assert app.screen.query_one("#field-name", Input).value == "old-name"
