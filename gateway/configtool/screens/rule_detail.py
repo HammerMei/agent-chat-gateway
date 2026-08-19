@@ -121,6 +121,41 @@ def rule_rooms_summary(entry: dict) -> str:
 class RuleDetailScreen(FormScreen):
     BODY_ID = "rule-detail-body"
 
+    @staticmethod
+    def missing_prerequisites(cfg: EditableConfig) -> str | None:
+        """Why this screen's edit/create form cannot open right now, or None.
+
+        Internal review (lens B): the connector/agent dropdowns are the
+        first enum FieldSpecs whose options come from a config list that can
+        be EMPTY — and Textual's `Select(options, allow_blank=False)` raises
+        EmptySelectError at construction on empty options, mid-compose,
+        which takes the whole app down. Every entry point into a non-view
+        mode (Overview's 'n'/'e' and this screen's own view→edit 'e') asks
+        here first and notifies instead of composing."""
+        missing = [
+            noun
+            for noun, present in (
+                ("connector", bool(cfg.connectors_raw)),
+                ("agent", bool(cfg.agents_raw)),
+            )
+            if not present
+        ]
+        if not missing:
+            return None
+        return (
+            f"Rules need at least one {' and one '.join(missing)} to exist "
+            "first — create those before editing rules."
+        )
+
+    async def action_edit(self) -> None:
+        # The view→edit transition composes the Select widgets too — same
+        # guard as the Overview's entry points (see missing_prerequisites()).
+        message = self.missing_prerequisites(self.cfg)
+        if message is not None and self.mode == "view":
+            self.notify(message, severity="error")
+            return
+        await super().action_edit()
+
     def __init__(
         self,
         cfg: EditableConfig,

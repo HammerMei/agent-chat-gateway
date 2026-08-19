@@ -108,6 +108,22 @@ class TestFindReferencingWatcherLabels(unittest.TestCase):
         )
         self.assertEqual(find_referencing_watcher_labels(cfg, connector_name="rc"), ["watchers[0]"])
 
+    def test_the_position_label_uses_the_unfiltered_document_index(self):
+        """Internal review (lens A): the `watchers[i]` fallback used to be
+        numbered over the FILTERED dict-only list, so a non-mapping entry
+        earlier in `watchers:` made the label disagree with every other
+        consumer of that spelling — the Rules tab's row numbers and the
+        validator's own `(index i)`/`watchers[i]` attributions all number
+        the unfiltered document list."""
+        cfg = self._base(
+            "              - \"garbage string, not a mapping\"\n"
+            "              - connector: rc\n"
+            "                agent: default\n"
+            "                rooms:\n"
+            "                  include: [general]\n"
+        )
+        self.assertEqual(find_referencing_watcher_labels(cfg, connector_name="rc"), ["watchers[1]"])
+
     def test_a_broken_config_still_blocks_on_explicit_references(self):
         """Regression: the old expanded-watchers implementation returned []
         whenever the config didn't fully load, so deleting a connector that

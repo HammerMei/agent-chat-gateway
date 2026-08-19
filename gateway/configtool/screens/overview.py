@@ -310,6 +310,13 @@ class OverviewScreen(Screen):
             entry = self._rule_entry_for_key(cfg, key)
             if entry is None:
                 return
+            # Composing the edit form with zero connectors/agents would
+            # crash mid-compose (empty Select) — see
+            # RuleDetailScreen.missing_prerequisites().
+            message = RuleDetailScreen.missing_prerequisites(cfg)
+            if message is not None:
+                self.notify(message, severity="error")
+                return
             screen = RuleDetailScreen(cfg, entry, mode="edit")
         elif active_tab == "tab-templates":
             row_key = self._cursor_row_key("templates-table")
@@ -583,7 +590,13 @@ class OverviewScreen(Screen):
             # No type picker, no EntityPickerModal detour — connector/agent
             # are two plain Select dropdowns directly in the create form
             # itself (docs/design/config-tool.md's Phase 3 owner decision),
-            # same as everything else this screen needs to know.
+            # same as everything else this screen needs to know. Which is
+            # also why creation needs both to exist first — an empty Select
+            # crashes at compose (see missing_prerequisites()).
+            message = RuleDetailScreen.missing_prerequisites(app.editable_config)
+            if message is not None:
+                self.notify(message, severity="error")
+                return
             self.app.push_screen(RuleDetailScreen(app.editable_config, None, mode="create"))
         elif active_tab == "tab-presets":
             # No document/disk write here — a brand-new preset only

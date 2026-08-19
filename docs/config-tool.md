@@ -139,9 +139,12 @@ message — see [docs/user-guide.md](user-guide.md) for how matching works.
   at least one `include` pattern or one of the DM opt-ins — a rule that
   can never match anything is refused.
 - **Renaming** a rule is allowed (nothing in `config.yaml` references a
-  rule by name), but note the daemon attributes its running sessions to the
-  old name — they get reclaimed by the normal lifecycle sweeps, same as if
-  the rule had been deleted and recreated.
+  rule by name), but to the daemon it's a delete-plus-create: existing
+  sessions stay attributed to the old name and — because a session is
+  sticky-bound to the settings it was created with — keep running with the
+  *old* rule's settings; edits to the renamed rule never reach them. Idle
+  ones age out through their (frozen) TTLs; to move a busy room onto the
+  new rule now, `acg reset` or `acg expire` it.
 - **Deleting** a rule warns you with what it strands: how many persisted
   session records on disk still belong to it, and how many scheduled jobs
   target those sessions. The counts are read from the daemon's own files.

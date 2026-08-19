@@ -563,3 +563,66 @@ class TestReorderAroundABrokenRule:
             assert [w["name"] for w in app.editable_config.watchers_raw] == [
                 "good-rule", "broken-rule",
             ]
+
+
+class TestEmptyPrerequisiteGuards:
+    """Internal review (lens B): the connector/agent dropdowns are the first
+    enum fields whose options come from a config list that can be EMPTY,
+    and Textual's Select(allow_blank=False) raises EmptySelectError at
+    construction on empty options — mid-compose, taking the app down. Every
+    entry into a non-view mode notifies instead."""
+
+    def _config_with_no_connectors(self, work_dir: Path) -> str:
+        return f"""\
+            connectors: []
+            agents:
+              default:
+                type: claude
+                working_directory: {work_dir}
+            watchers:
+              - name: orphan-rule
+                connector: rc-gone
+                agent: default
+                rooms:
+                  include: [general]
+        """
+
+    async def test_n_with_zero_connectors_notifies_instead_of_crashing(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, self._config_with_no_connectors(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_rules_tab(pilot, app)
+            await pilot.press("n")
+            await pilot.pause()
+            assert app.is_running is True
+            assert isinstance(app.screen, OverviewScreen)
+
+    async def test_e_on_a_rule_with_zero_connectors_notifies_instead_of_crashing(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, self._config_with_no_connectors(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_rule_row(pilot, app, row=0, key="e")
+            assert app.is_running is True
+            assert isinstance(app.screen, OverviewScreen)
+
+    async def test_view_to_edit_with_zero_connectors_stays_in_view_mode(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, self._config_with_no_connectors(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_rule_row(pilot, app, row=0, key="enter")
+            assert isinstance(app.screen, RuleDetailScreen)
+            assert app.screen.mode == "view"
+            await pilot.press("e")
+            await pilot.pause()
+            assert app.is_running is True
+            assert isinstance(app.screen, RuleDetailScreen)
+            assert app.screen.mode == "view"

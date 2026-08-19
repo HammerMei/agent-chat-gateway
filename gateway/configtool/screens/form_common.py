@@ -199,7 +199,14 @@ def find_referencing_watcher_labels(
     pre-check in this module already has.
     """
     labels = []
-    for i, entry in enumerate(cfg.watchers_raw):
+    # The UNFILTERED document list, not `watchers_raw` — the `watchers[i]`
+    # fallback label must use the same index space as every other consumer
+    # of that spelling (the Rules tab's row numbers, the validator's
+    # "(index i)"/"watchers[i]" attributions), and watchers_raw drops
+    # non-mapping entries, shifting its indices relative to all of those.
+    for i, entry in enumerate(cfg.document.get("watchers") or []):
+        if not isinstance(entry, dict):
+            continue
         try:
             merged = cfg.merged_entry("watcher", entry)
         except (ValueError, FileNotFoundError):
@@ -266,9 +273,12 @@ def find_entries_referencing_template(
         # A rule's own `name` is required and unique (gateway/config.py's
         # rule parser), so it IS the label — no expanded-name derivation
         # left to do. A malformed entry without one falls back to its
-        # document position, matching find_referencing_watcher_labels().
+        # document position — the UNFILTERED document index, matching
+        # find_referencing_watcher_labels() and the validator's spellings.
         entries = []
-        for i, w in enumerate(cfg.watchers_raw):
+        for i, w in enumerate(cfg.document.get("watchers") or []):
+            if not isinstance(w, dict):
+                continue
             name = w.get("name")
             label = name if isinstance(name, str) and name else f"watchers[{i}]"
             entries.append((label, w))
