@@ -955,3 +955,39 @@ class TestCodexRound3Fixes:
             await pilot.pause()
             assert isinstance(app.screen, OverviewScreen)
             assert app.is_running is True
+
+
+class TestCodexRound4Fixes:
+    async def test_editing_a_rule_whose_list_field_is_a_scalar_does_not_crash(
+        self, tmp_path, work_dir
+    ):
+        """Codex round 4: the validator marks `rooms.include: 5` an ERROR
+        row and the form is how the operator is meant to repair it — but
+        composing it passed the raw int to list_to_text(), raising
+        TypeError mid-compose and taking the whole TUI down."""
+        config_path = _write_config(tmp_path, f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {work_dir}
+            watchers:
+              - name: broken-list
+                connector: rc
+                agent: default
+                rooms:
+                  include: 5
+        """)
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_rule_row(pilot, app, row=0, key="e")
+            assert app.is_running is True
+            assert isinstance(app.screen, RuleDetailScreen)
+            assert app.screen.mode == "edit"
+            # Shown verbatim as one item — visible and repairable, never
+            # silently rewritten.
+            assert app.screen.query_one("#field-rooms-include", Input).value == "5"

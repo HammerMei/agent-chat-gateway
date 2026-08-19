@@ -21,7 +21,10 @@ import unittest
 from pathlib import Path
 
 from gateway.configtool.model import EditableConfig
-from gateway.configtool.screens.form_common import find_referencing_watcher_labels
+from gateway.configtool.screens.form_common import (
+    find_referencing_watcher_labels,
+    list_to_text,
+)
 
 
 class TestFindReferencingWatcherLabels(unittest.TestCase):
@@ -252,3 +255,29 @@ class TestFindReferencingWatcherLabels(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestListToTextTolerance(unittest.TestCase):
+    """A "list"-kind field's box must render ANY on-disk value without
+    crashing and without silently rewriting it (Codex review of #129,
+    round 4 — both failures pre-existed this branch, and the same pair is
+    documented at the loader in `_resolve_paths`)."""
+
+    def test_a_real_list_is_joined(self):
+        self.assertEqual(list_to_text(["a", "b"]), "a, b")
+
+    def test_an_empty_or_absent_value_is_blank(self):
+        self.assertEqual(list_to_text([]), "")
+        self.assertEqual(list_to_text(None), "")
+
+    def test_a_truthy_non_iterable_renders_as_one_item_not_a_typeerror(self):
+        """`rooms.include: 5` used to raise TypeError mid-compose, taking
+        the TUI down on a row the validator had just invited the operator
+        to repair."""
+        self.assertEqual(list_to_text(5), "5")
+
+    def test_a_bare_string_is_one_item_not_one_item_per_character(self):
+        """`context_inject_files: notes.md` used to display
+        'n, o, t, e, s, ., m, d' — and saving that box wrote eight bogus
+        one-character paths over the operator's one real value."""
+        self.assertEqual(list_to_text("notes.md"), "notes.md")

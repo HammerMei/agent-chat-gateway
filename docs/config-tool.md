@@ -144,7 +144,11 @@ message — see [docs/user-guide.md](user-guide.md) for how matching works.
   sticky-bound to the settings it was created with — keep running with the
   *old* rule's settings; edits to the renamed rule never reach them. Idle
   ones age out through their (frozen) TTLs; to move a busy room onto the
-  new rule now, `acg reset` or `acg expire` it.
+  new rule now, `acg expire` it — the next message in that room then
+  rematches against the current rules and builds a fresh watcher. (`acg
+  reset` is *not* the lever here: it clears the session but rebuilds the
+  watcher from the same persisted record, so the room stays on the old
+  rule's frozen settings.)
 - **Deleting** a rule warns you with what it strands: how many persisted
   session records on disk still belong to it, and how many scheduled jobs
   target those sessions. The counts are read from the daemon's own files.

@@ -84,9 +84,31 @@ def get_nested(d: dict, dotted_key: str) -> object:
 
 
 def list_to_text(value: object) -> str:
+    """Render a "list"-kind field's value for its Input box.
+
+    Anything that is not a genuine list/tuple renders as ONE item, because
+    the two ways a hand-edited config gets this wrong both used to fail
+    silently or loudly on the bare `for v in value` this replaces
+    (Codex review of #129, round 4 — pre-existing, and the same failure
+    pair `gateway/config.py`'s `_resolve_paths` documents at the loader):
+
+    * A truthy non-iterable (`rooms.include: 5`, `owners: 5`) raised
+      TypeError mid-compose, taking the whole TUI down on a row the
+      validator had just marked ERROR and invited the operator to repair.
+    * A bare string (`context_inject_files: notes.md`) was iterated **per
+      character**, displaying `n, o, t, e, s, ., m, d` — and saving that
+      box wrote eight bogus one-character paths over the operator's one
+      real value.
+
+    Both now show the value verbatim as a single item: visible, repairable,
+    and never silently rewritten. `save()`'s validate-before-write gate
+    remains the backstop for whatever the operator then types.
+    """
     if not value:
         return ""
-    return ", ".join(str(v) for v in value)
+    if isinstance(value, (list, tuple)):
+        return ", ".join(str(v) for v in value)
+    return str(value)
 
 
 def text_to_list(text: str) -> list[str]:
