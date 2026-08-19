@@ -629,3 +629,156 @@ class TestEmptyPrerequisiteGuards:
             assert app.is_running is True
             assert isinstance(app.screen, RuleDetailScreen)
             assert app.screen.mode == "view"
+
+
+class TestCodexRound1Fixes:
+    async def test_an_untouched_agent_select_honors_the_configured_default_agent(
+        self, tmp_path, work_dir
+    ):
+        """Codex review of #129 (P1): the agent prefill used next(iter(agents))
+        — the FIRST agent — even when a top-level `default_agent:` named
+        another, and create mode force-writes the selection explicitly, so
+        an untouched Agent field silently bound the new rule to the wrong
+        backend."""
+        config_path = _write_config(tmp_path, f"""\
+            default_agent: zother
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              aaa-first:
+                type: claude
+                working_directory: {work_dir}
+              zother:
+                type: claude
+                working_directory: {work_dir}
+            watchers: []
+        """)
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_rules_tab(pilot, app)
+            await pilot.press("n")
+            await pilot.pause()
+            app.screen.query_one("#field-name", Input).value = "my-rule"
+            app.screen.query_one("#field-rooms-include", Input).value = "general"
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            assert isinstance(app.screen, OverviewScreen)
+            raw = yaml.safe_load(Path(config_path).read_text())
+            (entry,) = raw["watchers"]
+            assert entry["agent"] == "zother"
+
+    async def test_a_typed_name_survives_an_inherits_template_switch(
+        self, tmp_path, work_dir
+    ):
+        """Codex review of #129 (P2): `name` is a generic FieldSpec on this
+        screen, so the base recompute rebuilt its Input from the (empty)
+        entry — a typed-but-unsaved name vanished on every template switch,
+        and Save was then refused in create mode."""
+        config_path = _write_config(tmp_path, f"""\
+            watcher_templates:
+              slow:
+                session_idle_days: 30
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {work_dir}
+            watchers: []
+        """)
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_rules_tab(pilot, app)
+            await pilot.press("n")
+            await pilot.pause()
+            app.screen.query_one("#field-name", Input).value = "my-rule"
+            await pilot.pause()
+
+            # Switch templates the way the picker's confirm path does.
+            app.screen._inherits_current = "slow"
+            await app.screen._recompute_form()
+            await pilot.pause()
+
+            assert app.screen.query_one("#field-name", Input).value == "my-rule"
+
+    async def test_the_stranded_lookup_uses_the_canonical_stripped_name(
+        self, tmp_path, work_dir, monkeypatch
+    ):
+        """Codex review of #129 (P2): the loader strips a rule's name before
+        persisting it as records' rule_name — an externally-authored
+        `name: " padded "` must be stripped before the stranded lookup, or
+        the disclosure is silently suppressed."""
+        import gateway.configtool.screens.rule_detail as rule_detail_mod
+
+        seen: list[str] = []
+
+        def capture(name):
+            seen.append(name)
+            return (0, 0)
+
+        monkeypatch.setattr(rule_detail_mod, "stranded_by_rule", capture)
+        config_path = _write_config(tmp_path, f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {work_dir}
+            watchers:
+              - name: " padded "
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
+        """)
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_rule_row(pilot, app, row=0, key="enter")
+            await pilot.press("d")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmModal)
+            assert seen == ["padded"]
+
+    async def test_a_malformed_watchers_scalar_renders_zero_rows_and_move_is_a_no_op(
+        self, tmp_path, work_dir
+    ):
+        """Codex review of #129 (P2): `watchers: 5` parses as YAML but is
+        not a list — iterating it crashed the overview repaint with a
+        TypeError, and `[`/`]` crashed move_watcher_rule. Normalized to an
+        empty view everywhere (EditableConfig.watcher_entries); the banner
+        still reports the config's real error."""
+        config_path = _write_config(tmp_path, f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {work_dir}
+            watchers: 5
+        """)
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.is_running is True
+            await _open_rules_tab(pilot, app)
+            table = app.screen.query_one("#rules-table", DataTable)
+            assert table.row_count == 0
+            await pilot.press("]")
+            await pilot.pause()
+            assert app.is_running is True
+            # Nothing was written — the scalar is still on disk, untouched.
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert raw["watchers"] == 5

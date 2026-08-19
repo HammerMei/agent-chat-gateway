@@ -458,9 +458,14 @@ class OverviewScreen(Screen):
             # whose index-embedded message shifted, never a problem this
             # move created. Say so, instead of letting the gate's generic
             # "introduces a new problem" read as "your move broke something".
+            # "This or another" (Codex review of #129): ERROR rows keep the
+            # move bindings, so the broken rule under the cursor itself is a
+            # normal way to arrive here — blaming "another rule" then sends
+            # the user hunting for a culprit that is the row they're on.
             self.notify(
-                "Could not move rule — another rule is already broken (see "
-                f"its ERROR row) and blocks reordering; fix it first: {exc}",
+                "Could not move rule — a rule with a pre-existing error "
+                "(this one or another; see the ERROR rows) blocks "
+                f"reordering. Fix it first: {exc}",
                 severity="error",
             )
             return
@@ -807,7 +812,7 @@ class OverviewScreen(Screen):
         # point — the previous Watchers tab silently dropped broken entries
         # AND every rule, leaving the table contradicting the banner.
         rules_table.add_columns("#", "Name", "Connector", "Agent", "Rooms", "Status")
-        for i, raw in enumerate(cfg.document.get("watchers") or []):
+        for i, raw in enumerate(cfg.watcher_entries):
             entry = raw if isinstance(raw, dict) else {}
             try:
                 merged = cfg.merged_entry("watcher", entry)
@@ -872,7 +877,7 @@ class OverviewScreen(Screen):
         painted. None for a stale index (table painted before an external
         shrink) or a non-mapping entry (RuleDetailScreen has nothing to
         show for it; its row's Status column already explains)."""
-        watchers = cfg.document.get("watchers") or []
+        watchers = cfg.watcher_entries
         index = int(key)
         if 0 <= index < len(watchers) and isinstance(watchers[index], dict):
             return watchers[index]

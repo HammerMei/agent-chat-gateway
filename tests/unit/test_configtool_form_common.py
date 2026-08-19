@@ -139,18 +139,69 @@ class TestFindReferencingWatcherLabels(unittest.TestCase):
         )
         self.assertEqual(find_referencing_watcher_labels(cfg, connector_name="rc"), ["my-rule"])
 
-    def test_a_rule_relying_on_the_loader_fallback_is_not_matched(self):
-        """No connector anywhere on the rule (loader falls back to the
-        single connector): deliberately NOT matched — which entity the
-        fallback resolves to shifts with the config itself; save()'s own
-        validation remains the backstop for a deletion that breaks it."""
+    def test_a_rule_relying_on_the_loader_fallback_blocks_the_fallback_connector(self):
+        """Codex review of #129: a rule with no connector anywhere resolves
+        to the loader's fallback — the FIRST connector in document order —
+        and deleting that connector leaves the config VALID (the fallback
+        silently rebinds to the next connector), so save()'s gate never
+        blocks it. The pre-check must therefore resolve the same fallback
+        the loader does and block the deletion."""
         cfg = self._base(
             "              - name: my-rule\n"
             "                agent: default\n"
             "                rooms:\n"
             "                  include: [general]\n"
         )
-        self.assertEqual(find_referencing_watcher_labels(cfg, connector_name="rc"), [])
+        self.assertEqual(find_referencing_watcher_labels(cfg, connector_name="rc"), ["my-rule"])
+
+    def test_the_fallback_rule_does_not_block_a_non_first_connector(self):
+        cfg = self._cfg(f"""\
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+              - name: rc2
+                type: rocketchat
+                server: {{url: http://localhost:3001, username: bot2, password: pw2}}
+            watchers:
+              - name: my-rule
+                agent: default
+                rooms:
+                  include: [general]
+        """)
+        # The fallback is connectors[0] ('rc') — rc2 is untouched by it.
+        self.assertEqual(find_referencing_watcher_labels(cfg, connector_name="rc2"), [])
+        self.assertEqual(find_referencing_watcher_labels(cfg, connector_name="rc"), ["my-rule"])
+
+    def test_the_agent_fallback_honors_an_explicit_default_agent(self):
+        """The loader's agent fallback is `default_agent:` when set, the
+        first agent otherwise — a rule with no agent anywhere must block
+        the deletion of THAT agent, not whichever happens to be first."""
+        cfg = self._cfg(f"""\
+            default_agent: other
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+              other:
+                type: claude
+                working_directory: {self.agent_dir}
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            watchers:
+              - name: my-rule
+                connector: rc
+                rooms:
+                  include: [general]
+        """)
+        self.assertEqual(find_referencing_watcher_labels(cfg, agent_name="other"), ["my-rule"])
+        self.assertEqual(find_referencing_watcher_labels(cfg, agent_name="default"), [])
 
     def test_multiple_referencing_rules_are_all_returned(self):
         cfg = self._base(

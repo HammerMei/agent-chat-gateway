@@ -176,7 +176,13 @@ def validate_config(config_path: str, lint: bool = False) -> ValidationResult:
         )
         return result
 
-    result.entry_count = len(raw.get("watchers") or [])
+    # isinstance, not truthiness: `watchers: 5` parses fine and reaches here
+    # (collect_config tolerates it into a ConfigIssue + an empty rule list),
+    # and `len(5)` raised a TypeError out of the one function whose whole
+    # contract is collecting problems instead of raising them — crashing
+    # both `acg config validate` and the TUI's banner (Codex review of #129).
+    raw_watchers = raw.get("watchers")
+    result.entry_count = len(raw_watchers) if isinstance(raw_watchers, list) else 0
 
     _check_connectors(config, result)
     _check_state_orphans(config, result)

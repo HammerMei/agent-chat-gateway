@@ -85,6 +85,21 @@ class TestStrandedByRule(unittest.TestCase):
         ]}))
         self.assertEqual(stranded_by_rule("my-rule", states, path), (1, 1))
 
+    def test_a_completed_job_is_not_counted_as_stranded(self):
+        """Codex review of #129: jobs.json retains COMPLETED jobs until the
+        TTL purge, but they never fire again — counting one would make the
+        delete warning claim a job keeps running when nothing will. Active
+        and paused jobs both still count (resuming re-arms a paused one)."""
+        states = [self._state_file("rc", [
+            {"watcher_name": "rc:general", "rule_name": "my-rule"},
+        ])]
+        jobs = self._jobs_file([
+            {"id": "j1", "watcher": "rc:general", "status": "completed"},
+            {"id": "j2", "watcher": "rc:general", "status": "active"},
+            {"id": "j3", "watcher": "rc:general", "status": "paused"},
+        ])
+        self.assertEqual(stranded_by_rule("my-rule", states, jobs), (1, 2))
+
     def test_a_record_without_a_watcher_name_still_counts_as_a_record(self):
         states = [self._state_file("rc", [
             {"rule_name": "my-rule"},  # malformed but attributable

@@ -191,29 +191,44 @@ def find_referencing_watcher_labels(
     so a rule whose `connector:`/`agent:` comes only from a template still
     blocks that connector/agent's deletion.
 
-    A rule with NO connector/agent anywhere (relying on the loader's
-    single-connector / default-agent fallback) is deliberately not matched
-    here: which entity that fallback resolves to shifts with the config
-    itself, so `save()`'s own validate_config() remains the backstop for
-    a deletion that breaks the fallback — same division of labour every
-    pre-check in this module already has.
+    A rule with NO connector/agent anywhere references the loader's
+    FALLBACK entity (the first connector in document order;
+    `default_agent:` when set, the first agent otherwise) and blocks THAT
+    entity's deletion. Codex review of #129: an earlier version skipped
+    fallback rules on the theory that save()'s validation backstops the
+    deletion — but deleting the fallback entity leaves the config VALID
+    (the fallback silently rebinds to the next entity in line), so nothing
+    blocked and routing changed without a word. Silent rebinding is the
+    exact defect class `_resolve_watcher_connector`'s own docstring calls
+    worse than a crash.
     """
+    fallback_connector = (
+        cfg.connectors_raw[0].get("name") if cfg.connectors_raw else None
+    )
+    raw_default = cfg.document.get("default_agent")
+    fallback_agent = (
+        raw_default
+        if isinstance(raw_default, str) and raw_default in cfg.agents_raw
+        else next(iter(cfg.agents_raw), None)
+    )
     labels = []
     # The UNFILTERED document list, not `watchers_raw` — the `watchers[i]`
     # fallback label must use the same index space as every other consumer
     # of that spelling (the Rules tab's row numbers, the validator's
     # "(index i)"/"watchers[i]" attributions), and watchers_raw drops
     # non-mapping entries, shifting its indices relative to all of those.
-    for i, entry in enumerate(cfg.document.get("watchers") or []):
+    for i, entry in enumerate(cfg.watcher_entries):
         if not isinstance(entry, dict):
             continue
         try:
             merged = cfg.merged_entry("watcher", entry)
         except (ValueError, FileNotFoundError):
             merged = entry
-        if connector_name is not None and merged.get("connector") != connector_name:
+        ref_connector = merged.get("connector") or fallback_connector
+        ref_agent = merged.get("agent") or fallback_agent
+        if connector_name is not None and ref_connector != connector_name:
             continue
-        if agent_name is not None and merged.get("agent") != agent_name:
+        if agent_name is not None and ref_agent != agent_name:
             continue
         name = entry.get("name")
         labels.append(name if isinstance(name, str) and name else f"watchers[{i}]")
@@ -276,7 +291,7 @@ def find_entries_referencing_template(
         # document position — the UNFILTERED document index, matching
         # find_referencing_watcher_labels() and the validator's spellings.
         entries = []
-        for i, w in enumerate(cfg.document.get("watchers") or []):
+        for i, w in enumerate(cfg.watcher_entries):
             if not isinstance(w, dict):
                 continue
             name = w.get("name")

@@ -299,8 +299,23 @@ class EditableConfig:
         return {k: v for k, v in agents.items() if isinstance(v, dict)}
 
     @property
+    def watcher_entries(self) -> list:
+        """The raw `watchers:` document list ITSELF — the same object living
+        in `document` when it is a list (so callers can mutate it), [] when
+        it is anything else. Codex review of #129: `document.get("watchers")
+        or []` scattered across callers let a malformed scalar through —
+        `watchers: 5` crashed the overview repaint with a TypeError
+        mid-iteration, and a string produced one bogus row per character.
+        EditableConfig.load() deliberately accepts structurally invalid
+        documents (that's how the TUI can display their validation errors),
+        so the list-ness check has to live on every read — stated once,
+        here."""
+        watchers = self.document.get("watchers")
+        return watchers if isinstance(watchers, list) else []
+
+    @property
     def watchers_raw(self) -> list[dict]:
-        return [w for w in (self.document.get("watchers") or []) if isinstance(w, dict)]
+        return [w for w in self.watcher_entries if isinstance(w, dict)]
 
     @property
     def tool_presets_raw(self) -> dict[str, list]:
@@ -418,10 +433,11 @@ class EditableConfig:
         """Swap the rule at `index` with its neighbour `delta` (+1/-1) away.
 
         Returns the rule's new index, or None if the move is a no-op
-        (index out of range, or already at the edge it would move past).
+        (index out of range, already at the edge it would move past, or
+        `watchers:` is not a list at all — see `watcher_entries`).
         Calls `mark_dirty()` on an actual move; callers own `save()` —
         same contract as every other document mutation here."""
-        watchers = self.document.get("watchers") or []
+        watchers = self.watcher_entries
         target = index + delta
         if not (0 <= index < len(watchers)) or not (0 <= target < len(watchers)):
             return None

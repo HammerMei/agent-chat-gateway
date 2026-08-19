@@ -31,6 +31,7 @@ from typing import Literal
 from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, VerticalScroll
+from textual.css.query import NoMatches
 from textual.widgets import Button, Input, Select, Static
 
 from ...config import HistoryHandoffConfig
@@ -202,7 +203,7 @@ class RuleDetailScreen(FormScreen):
         # ConnectorDetailScreen._find_own_index(): two broken entries could
         # be byte-identical; identity is the only way to be sure this is
         # the exact entry this screen was opened on.
-        watchers = self.cfg.document.get("watchers") or []
+        watchers = self.cfg.watcher_entries
         return next(i for i, w in enumerate(watchers) if w is self.entry)
 
     def _remove_entry_from_document(self) -> None:
@@ -229,9 +230,13 @@ class RuleDetailScreen(FormScreen):
     def _delete_confirm_message(self) -> str:
         base = super()._delete_confirm_message()
         name = self.entry.get("name")
-        if not isinstance(name, str) or not name:
+        if not isinstance(name, str) or not name.strip():
             return base
-        records, jobs = stranded_by_rule(name)
+        # Stripped, matching _parse_one_watcher_rule's canonicalization —
+        # persisted records carry the STRIPPED name, so an externally-
+        # authored `name: " my-rule "` would otherwise count zero strands
+        # and silently suppress the disclosure (Codex review of #129).
+        records, jobs = stranded_by_rule(name.strip())
         if not records and not jobs:
             return base
         strands = [f"{records} persisted session record(s)"]
@@ -276,16 +281,26 @@ class RuleDetailScreen(FormScreen):
         return "watcher"
 
     def _dataclass_defaults(self) -> dict[str, object]:
-        # connector/agent: approximates gateway/config.py's own fallback
-        # (single connector / default agent) for display only — save()'s
-        # validate_config() remains the real backstop. name has no default:
-        # None (blank) is the honest answer for a required identity field.
+        # connector/agent mirror gateway/config.py's own fallback: first
+        # connector in document order; the explicit top-level
+        # `default_agent:` when set and valid, first agent otherwise (Codex
+        # review of #129: `next(iter(agents))` alone preselected the FIRST
+        # agent even when `default_agent:` named another — and create mode
+        # force-writes the selection explicitly, so an untouched Agent field
+        # silently bound the new rule to the wrong backend). name has no
+        # default: None (blank) is the honest answer for a required
+        # identity field.
         defaults: dict[str, object] = dict(WATCHER_TEMPLATE_DATACLASS_DEFAULTS)
         defaults["name"] = None
         defaults["connector"] = (
             self.cfg.connectors_raw[0].get("name", "") if self.cfg.connectors_raw else ""
         )
-        defaults["agent"] = next(iter(self.cfg.agents_raw), "")
+        raw_default = self.cfg.document.get("default_agent")
+        defaults["agent"] = (
+            raw_default
+            if isinstance(raw_default, str) and raw_default in self.cfg.agents_raw
+            else next(iter(self.cfg.agents_raw), "")
+        )
         defaults["rooms.include"] = []
         defaults["rooms.except_for"] = []
         defaults["rooms.direct"] = False
@@ -355,6 +370,23 @@ class RuleDetailScreen(FormScreen):
         self._inherits_current = new_value
         await self._recompute_form()
         self._form_dirty = True
+
+    async def _recompute_form(self) -> None:
+        """Codex review of #129: unlike the other forms, this screen models
+        `name` as a generic FieldSpec, so the base recompute rebuilt the
+        name Input from `self.entry` — silently discarding a typed-but-
+        unsaved name on every `inherits:` switch (in create mode it went
+        blank and Save was then refused). A watcher template can never
+        supply `name` (forbidden key), so restoring the live value can't
+        mask a template-provided one. `_name_live` is already maintained by
+        FormScreen.on_input_changed() because widget_id("name") happens to
+        be the exact "#field-name" id it tracks."""
+        await super()._recompute_form()
+        if self._name_live:
+            try:
+                self.query_one("#" + widget_id("name"), Input).value = self._name_live
+            except NoMatches:
+                pass
 
     def _on_enter_edit_mode(self) -> None:
         self._inherits_initial = self.cfg.entry_template_name(self.entry)
@@ -496,9 +528,11 @@ class RuleDetailScreen(FormScreen):
 
         inserted_index: int | None = None
         if self.mode == "create":
-            # `setdefault` alone isn't enough for a present-but-empty
-            # `watchers:` key (parses to None, which setdefault won't touch).
-            if self.cfg.document.get("watchers") is None:
+            # Normalize a `watchers:` key that is absent, null, or a
+            # malformed non-list scalar — a scalar carries no entries worth
+            # keeping, and appending to it would crash (see
+            # EditableConfig.watcher_entries).
+            if not isinstance(self.cfg.document.get("watchers"), list):
                 self.cfg.document["watchers"] = []
             watchers = self.cfg.document["watchers"]
             watchers.append(target_entry)

@@ -22,6 +22,7 @@ from pathlib import Path
 
 from ..core.job_store import JOBS_FILE
 from ..core.state import state_files
+from ..schedule_types import JobStatus
 
 
 def stranded_by_rule(
@@ -53,6 +54,15 @@ def stranded_by_rule(
     jobs = 0
     if watcher_names:
         for job in _read_list(jobs_file, "jobs"):
+            # A COMPLETED job no longer fires — it sits in jobs.json only
+            # until the TTL purge (JobStore.list_jobs excludes them by
+            # default for the same reason). Counting one here would make
+            # the delete warning claim a job is stranded and keeps running
+            # when nothing will ever run again (Codex review of #129).
+            # Active AND paused jobs both count: paused is an operator
+            # choice that resuming re-arms.
+            if job.get("status") == JobStatus.COMPLETED.value:
+                continue
             if job.get("watcher") in watcher_names:
                 jobs += 1
     return records, jobs
