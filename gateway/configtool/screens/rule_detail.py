@@ -202,12 +202,23 @@ class RuleDetailScreen(FormScreen):
         strands = [f"{records} persisted session record(s)"]
         if jobs:
             strands.append(f"{jobs} scheduled job(s)")
-        return (
+        message = (
             base
             + f"\n\nThis rule currently has {' and '.join(strands)} "
-            "on disk. They stop being claimed by any rule and will be "
-            "reclaimed by the daemon's lifecycle sweeps."
+            "on disk. They stop being claimed by any rule; idle sessions "
+            "are reclaimed by the daemon's lifecycle sweeps."
         )
+        if jobs:
+            # Not a vague caveat — the expiry sweep genuinely refuses a
+            # record with pending jobs (WatcherLifecycle.expire_idle's job
+            # exemption), so a stranded session KEEPS its jobs firing until
+            # the operator removes them.
+            message += (
+                " A session with pending scheduled jobs is exempt from "
+                "expiry — its jobs keep running until removed "
+                "('acg schedule-delete')."
+            )
+        return message
 
     def _required_field_keys(self) -> frozenset[str]:
         return _RULE_REQUIRED_FIELD_KEYS

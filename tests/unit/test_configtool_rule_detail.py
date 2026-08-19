@@ -484,6 +484,11 @@ class TestRuleDelete:
             message = str(app.screen.query_one("#confirm-message").render())
             assert "3 persisted session record(s)" in message
             assert "2 scheduled job(s)" in message
+            # The job clause must not overpromise: a session with pending
+            # jobs is EXEMPT from expiry (WatcherLifecycle.expire_idle), so
+            # the warning says its jobs keep running, not that the sweeps
+            # will clean everything up.
+            assert "exempt from expiry" in message
 
     async def test_no_strands_means_the_plain_confirm_message(
         self, tmp_path, work_dir, monkeypatch
@@ -503,3 +508,58 @@ class TestRuleDelete:
             assert isinstance(app.screen, ConfirmModal)
             message = str(app.screen.query_one("#confirm-message").render())
             assert "session record" not in message
+
+
+class TestReorderAroundABrokenRule:
+    async def test_moving_a_rule_past_a_broken_one_is_refused_and_swapped_back(
+        self, tmp_path, work_dir
+    ):
+        """Known limitation, pinned deliberately: a rule parse error embeds
+        the rule's LIST INDEX in its message ("Watcher rule at index N:
+        ..."), and the save gate compares exact (kind, name, message)
+        tuples — so moving a rule past a pre-existing broken one shifts the
+        broken rule's index, its message changes, and the gate reads the
+        old problem as a NEW one and refuses the move (loud, safe, nothing
+        written; the notify carries the broken rule's own error). This
+        contradicts the gate's "pre-existing problems never block unrelated
+        saves" intent, but the fix belongs to the gate/parser message
+        contract, not to this tab — if this test starts failing because the
+        move now SUCCEEDS, that contract changed: update the config-tool
+        docs' known-limitations note along with this test."""
+        config_path = _write_config(tmp_path, f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {work_dir}
+            watchers:
+              - name: good-rule
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
+              - name: broken-rule
+                connector: rc
+                agent: default
+                rooms:
+                  include: []
+        """)
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_rules_tab(pilot, app)
+            table = app.screen.query_one("#rules-table", DataTable)
+            table.focus()
+            table.move_cursor(row=0)
+            await pilot.press("]")
+            await pilot.pause()
+
+            # Refused and swapped back — disk and memory both untouched.
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert [w["name"] for w in raw["watchers"]] == ["good-rule", "broken-rule"]
+            assert [w["name"] for w in app.editable_config.watchers_raw] == [
+                "good-rule", "broken-rule",
+            ]
