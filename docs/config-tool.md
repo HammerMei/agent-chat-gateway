@@ -158,11 +158,14 @@ message — see [docs/user-guide.md](user-guide.md) for how matching works.
 - This tab edits `config.yaml` only. To see or act on the *live* sessions a
   rule has created, use the CLI: `acg list`, `acg pause/resume/reset/expire`.
 - Known limitation: while some rule in the file is broken (its row shows
-  ERROR), moving or deleting *other* rules positioned above it is refused,
-  quoting the broken rule's own error — a broken rule's error message is
+  ERROR), moving or deleting any row *above* it is refused, quoting that
+  broken rule's own error — a broken rule's error message is
   position-dependent, so shifting its position reads to the save safety-gate
-  as a new problem. Fix or delete the broken rule first; everything else
-  (editing rules in place, creating new ones) is unaffected.
+  as a new problem. Two practical consequences: repair a file with several
+  broken rows **bottom-up** (the lowest ERROR row first), and if that's
+  awkward, use `ctrl+e` to fix them all in one `$EDITOR` pass. Everything
+  else — editing rules in place, creating new ones, deleting a row with no
+  ERROR row below it — is unaffected.
 
 ## Templates
 

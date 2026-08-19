@@ -991,3 +991,87 @@ class TestCodexRound4Fixes:
             # Shown verbatim as one item — visible and repairable, never
             # silently rewritten.
             assert app.screen.query_one("#field-rooms-include", Input).value == "5"
+
+    async def test_deleting_a_malformed_row_above_another_broken_rule_explains_the_order(
+        self, tmp_path, work_dir
+    ):
+        """Owner-ratified as the same known limitation the reorder refusal
+        carries (2026-08-19): a removal renumbers later entries, so a broken
+        rule BELOW has its index-embedded error shift and the save gate
+        reads the pre-existing problem as new. Not fixed at the gate — the
+        refusal is loud, the row is restored, and the message states the
+        bottom-up repair order instead of just quoting the gate."""
+        config_path = _write_config(tmp_path, f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {work_dir}
+            watchers:
+              - "stray yaml, not a mapping"
+              - name: also-broken
+                connector: rc
+                agent: default
+                rooms:
+                  include: []
+        """)
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_rules_tab(pilot, app)
+            table = app.screen.query_one("#rules-table", DataTable)
+            table.focus()
+            table.move_cursor(row=0)
+            await pilot.press("d")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmModal)
+            await pilot.press("tab", "enter")  # Delete
+            await pilot.pause()
+
+            assert isinstance(app.screen, MessageModal)
+            body = str(app.screen.query_one("#message-body").render())
+            assert "LOWEST ERROR row first" in body
+            await pilot.press("enter")
+            await pilot.pause()
+            # Rolled back — the garbage row is still there, nothing written.
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert len(raw["watchers"]) == 2
+            assert raw["watchers"][0] == "stray yaml, not a mapping"
+
+    async def test_deleting_the_lowest_broken_row_succeeds(self, tmp_path, work_dir):
+        """The other half of the documented order: bottom-up works."""
+        config_path = _write_config(tmp_path, f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {work_dir}
+            watchers:
+              - name: good-rule
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
+              - "stray yaml, not a mapping"
+        """)
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_rules_tab(pilot, app)
+            table = app.screen.query_one("#rules-table", DataTable)
+            table.focus()
+            table.move_cursor(row=1)
+            await pilot.press("d")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmModal)
+            await pilot.press("tab", "enter")
+            await pilot.pause()
+
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert [w.get("name") for w in raw["watchers"]] == ["good-rule"]

@@ -452,7 +452,25 @@ class OverviewScreen(Screen):
             cfg.save()
         except (ValueError, FileNotFoundError) as exc:
             watchers.insert(index, removed)
-            await self.app.push_screen_wait(MessageModal(str(exc), title="Could not delete"))
+            # Same known limitation the reorder refusal carries, and the
+            # same owner ruling (2026-08-19): a removal renumbers every
+            # LATER entry, so another broken rule below this row has its
+            # index-embedded error message shift and the gate reads the
+            # pre-existing problem as newly introduced. Not fixed at the
+            # gate (that is the parser-message contract, out of this
+            # increment); made honest here and documented in
+            # docs/config-tool.md — repair several broken rows bottom-up,
+            # or fix them in one $EDITOR pass.
+            await self.app.push_screen_wait(
+                MessageModal(
+                    "Could not delete — another rule further down the file "
+                    "has a pre-existing error, and removing this row shifts "
+                    "its position, which the save safety-gate reads as a new "
+                    "problem. Delete the LOWEST ERROR row first, or fix them "
+                    f"together in $EDITOR (ctrl+e).\n\n{exc}",
+                    title="Could not delete",
+                )
+            )
             return
         self.notify("Deleted the malformed entry.", severity="information")
         app: "ConfigToolApp" = self.app  # type: ignore[assignment]
