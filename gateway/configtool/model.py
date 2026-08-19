@@ -490,6 +490,14 @@ class StatusIndex:
         name = raw_entry.get("name")
         if isinstance(name, str) and name:
             keys.append(name)
+            # The parser CANONICALIZES the name (strips whitespace) before
+            # attributing findings to it — an externally-authored
+            # `name: " padded "` would otherwise show OK on its row while
+            # the banner reports its warning (Codex review of #129, round 3;
+            # same canonicalization the stranded-count lookup applies).
+            stripped = name.strip()
+            if stripped and stripped != name:
+                keys.append(stripped)
         keys.append(f"(index {index})")
         keys.append(f"watchers[{index}]")
         return keys

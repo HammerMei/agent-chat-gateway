@@ -371,6 +371,16 @@ def _check_session_uniqueness(result: ValidationResult) -> None:
         # inflated the error count. Swallowed rather than re-raised so an unreadable file
         # does not abort a run that has more to say.
         return
+    except OSError:
+        # Same dedup reasoning as StateFormatError above, for the enumeration
+        # failure: check_session_uniqueness() re-enumerates via state_files(),
+        # whose ensure_runtime_dir() raises on an uncreatable/unlistable
+        # runtime dir — the exact fault `_check_state_orphans` (which runs
+        # immediately before this) already collected as its own warning.
+        # Codex review of #129, round 3: the round-2 guard covered only the
+        # orphan check's call, so this second call still crashed validation
+        # on the same broken directory.
+        return
 
 
 def _check_state_orphans(config: GatewayConfig, result: ValidationResult) -> None:

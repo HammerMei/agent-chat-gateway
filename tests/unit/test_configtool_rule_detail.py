@@ -484,6 +484,13 @@ class TestRuleDelete:
             message = str(app.screen.query_one("#confirm-message").render())
             assert "3 persisted session record(s)" in message
             assert "2 scheduled job(s)" in message
+            # The recovery instruction must be the PUBLIC CLI spelling —
+            # `acg schedule delete <job_id>` (nested subcommand), not the
+            # internal control-socket command name `schedule-delete`
+            # (Codex round 3: following the displayed instruction failed
+            # at argument parsing exactly when the operator needed it).
+            assert "schedule delete" in message
+            assert "schedule-delete" not in message
             # The job clause must not overpromise: a session with pending
             # jobs is EXEMPT from expiry (WatcherLifecycle.expire_idle), so
             # the warning says its jobs keep running, not that the sweeps
@@ -841,3 +848,110 @@ class TestCodexRound2Fixes:
             await pilot.pause()
 
             assert app.screen.query_one("#field-name", Input).value == "old-name"
+
+
+class TestCodexRound3Fixes:
+    async def test_creating_over_a_mapping_watchers_block_is_refused_not_overwritten(
+        self, tmp_path, work_dir
+    ):
+        """Codex round 3: `watchers:` as a MAPPING (an operator omitted the
+        '-' before an otherwise complete rule) holds recoverable data —
+        normalizing it to [] and appending would pass the save gate (the
+        structural error vanishes with the data) and silently delete the
+        rule the user meant to keep."""
+        config_path = _write_config(tmp_path, f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {work_dir}
+            watchers:
+              name: forgot-the-dash
+              connector: rc
+              agent: default
+              rooms:
+                include: [general]
+        """)
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_rules_tab(pilot, app)
+            await pilot.press("n")
+            await pilot.pause()
+            app.screen.query_one("#field-name", Input).value = "new-rule"
+            app.screen.query_one("#field-rooms-include", Input).value = "dev"
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            assert isinstance(app.screen, MessageModal)
+            body = str(app.screen.query_one("#message-body").render())
+            assert "not a list" in body
+            await pilot.press("enter")
+            await pilot.pause()
+            # The mapping — the user's recoverable rule — is untouched.
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert raw["watchers"]["name"] == "forgot-the-dash"
+
+    def _config_with_a_garbage_entry(self, work_dir: Path) -> str:
+        return f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {work_dir}
+            watchers:
+              - "stray yaml, not a mapping"
+              - name: good-rule
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
+        """
+
+    async def test_d_deletes_a_non_mapping_entry_by_index(self, tmp_path, work_dir):
+        """Codex round 3: the non-mapping entry renders as an ERROR row on
+        purpose — 'visible but unremovable' was half a fix. 'd' deletes it
+        by list index (there is no dict for a detail screen to open)."""
+        config_path = _write_config(tmp_path, self._config_with_a_garbage_entry(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_rules_tab(pilot, app)
+            table = app.screen.query_one("#rules-table", DataTable)
+            assert table.row_count == 2
+            table.focus()
+            table.move_cursor(row=0)
+            await pilot.press("d")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmModal)
+            await pilot.press("tab", "enter")  # Delete
+            await pilot.pause()
+
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert [w.get("name") for w in raw["watchers"]] == ["good-rule"]
+
+    async def test_enter_and_e_on_a_non_mapping_entry_notify_instead_of_dead_keys(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, self._config_with_a_garbage_entry(work_dir))
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_rules_tab(pilot, app)
+            table = app.screen.query_one("#rules-table", DataTable)
+            table.focus()
+            table.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, OverviewScreen)  # no crash, no push
+            await pilot.press("e")
+            await pilot.pause()
+            assert isinstance(app.screen, OverviewScreen)
+            assert app.is_running is True

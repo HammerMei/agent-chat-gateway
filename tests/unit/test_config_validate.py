@@ -967,7 +967,17 @@ class TestFindingsExtension(_ValidateConfigTestBase):
                 rooms:
                   include: [general]
         """)
-        with patch("gateway.config_validate.state_files", side_effect=OSError("denied")):
+        # Patched at the TRUE source — ensure_runtime_dir, inside
+        # gateway.core.state — so BOTH enumeration paths hit the failure:
+        # the orphan check's state_files() call AND
+        # check_session_uniqueness()'s own re-enumeration (Codex round 3:
+        # patching only config_validate.state_files left the second path
+        # able to succeed in the test while crashing on a real broken
+        # directory). Exactly ONE warning: the uniqueness check swallows
+        # its copy of the same fault, mirroring its StateFormatError dedup.
+        with patch(
+            "gateway.core.state.ensure_runtime_dir", side_effect=OSError("denied")
+        ):
             result = self._validate(cfg)
         enumeration_warnings = [
             w for w in result.warnings if "enumerate persisted state files" in w

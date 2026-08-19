@@ -309,6 +309,7 @@ class OverviewScreen(Screen):
                 return
             entry = self._rule_entry_for_key(cfg, key)
             if entry is None:
+                self._notify_malformed_rule_row(cfg, key)
                 return
             # Composing the edit form with zero connectors/agents would
             # crash mid-compose (empty Select) — see
@@ -396,6 +397,11 @@ class OverviewScreen(Screen):
                 return
             entry = self._rule_entry_for_key(cfg, key)
             if entry is None:
+                # A non-mapping entry has no detail screen to route the
+                # delete through, but it still deserves 'd' — it renders as
+                # an ERROR row on purpose, and "visible but unremovable" is
+                # half a fix (Codex review of #129, round 3).
+                await self._delete_malformed_rule_entry(cfg, key)
                 return
             screen = RuleDetailScreen(cfg, entry, mode="view")
         else:
@@ -418,6 +424,55 @@ class OverviewScreen(Screen):
             # strand the user on a screen they never asked to see — send
             # them back to the list instead, same as Escape would.
             self.app.pop_screen()
+
+    async def _delete_malformed_rule_entry(self, cfg, key: str) -> None:
+        """Delete a NON-MAPPING `watchers:` entry by its list index — the one
+        row shape RuleDetailScreen cannot represent (there is no dict to
+        open a form on). Inline confirm + save + rollback, same shape as
+        _delete_preset_row(). A stale index (the table shrank on disk since
+        the paint) or a row that IS a mapping falls through silently — the
+        mapping case is handled by the normal detail-screen path."""
+        watchers = cfg.watcher_entries
+        index = int(key)
+        if not (0 <= index < len(watchers)) or isinstance(watchers[index], dict):
+            return
+        confirmed = await self.app.push_screen_wait(
+            ConfirmModal(
+                f"Row #{index + 1} is not a rule at all (a malformed, "
+                "non-mapping entry — often stray YAML). Delete it? This "
+                "cannot be undone.",
+                confirm_label="Delete",
+            )
+        )
+        if not confirmed:
+            return
+        removed = watchers.pop(index)
+        cfg.mark_dirty()
+        try:
+            cfg.save()
+        except (ValueError, FileNotFoundError) as exc:
+            watchers.insert(index, removed)
+            await self.app.push_screen_wait(MessageModal(str(exc), title="Could not delete"))
+            return
+        self.notify("Deleted the malformed entry.", severity="information")
+        app: "ConfigToolApp" = self.app  # type: ignore[assignment]
+        app.reload_config()
+
+    def _notify_malformed_rule_row(self, cfg, key: str) -> bool:
+        """True (and a pointer notify) when the row under `key` is a
+        non-mapping entry — Enter/'e' have no form to open for it, and a
+        silent no-op reads as a dead key (Codex review of #129, round 3)."""
+        watchers = cfg.watcher_entries
+        index = int(key)
+        if 0 <= index < len(watchers) and not isinstance(watchers[index], dict):
+            self.notify(
+                "This entry is not a rule mapping — there is no form to "
+                "open. Press 'd' to delete it, or repair it in $EDITOR "
+                "(ctrl+e).",
+                severity="warning",
+            )
+            return True
+        return False
 
     def action_move_rule_up(self) -> None:
         self._move_rule(-1)
@@ -903,6 +958,8 @@ class OverviewScreen(Screen):
             entry = self._rule_entry_for_key(cfg, key)
             if entry is not None:
                 self.app.push_screen(RuleDetailScreen(cfg, entry, mode="view"))
+            else:
+                self._notify_malformed_rule_row(cfg, key)
         elif table_id == "templates-table":
             kind, name = key.split(":", 1)
             # raw_template(), NOT templates() — see action_edit_row()'s

@@ -874,3 +874,31 @@ class TestStatusIndexRuleBridge(_EditableConfigTestBase):
             0,
         )
         self.assertEqual(status, "ok")
+
+
+class TestStatusIndexStrippedNameSpelling(_EditableConfigTestBase):
+    def test_a_padded_rule_name_still_surfaces_parser_attributed_findings(self):
+        """Codex review of #129 (round 3): the parser canonicalizes (strips)
+        a rule's name before attributing shadowing warnings to it — a row
+        whose raw spelling is padded must still surface them."""
+        path = self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watchers:
+              - name: broad
+                rooms:
+                  include: ["*"]
+              - name: " shadowed "
+                rooms:
+                  include: [general]
+        """)
+        cfg = EditableConfig.load(path)
+        result = validate_config(str(path), lint=True)
+        status = StatusIndex(result.findings)
+        self.assertEqual(status.status_for_rule(1, cfg.document["watchers"][1]), "warning")

@@ -263,7 +263,7 @@ class RuleDetailScreen(FormScreen):
             message += (
                 " A session with pending scheduled jobs is exempt from "
                 "expiry — its jobs keep running until removed "
-                "('acg schedule-delete')."
+                "('acg schedule delete <job_id>')."
             )
         return message
 
@@ -546,11 +546,28 @@ class RuleDetailScreen(FormScreen):
 
         inserted_index: int | None = None
         if self.mode == "create":
-            # Normalize a `watchers:` key that is absent, null, or a
-            # malformed non-list scalar — a scalar carries no entries worth
-            # keeping, and appending to it would crash (see
-            # EditableConfig.watcher_entries).
-            if not isinstance(self.cfg.document.get("watchers"), list):
+            existing = self.cfg.document.get("watchers")
+            if existing is not None and not isinstance(existing, list):
+                # REFUSED, not normalized (Codex review of #129, round 3):
+                # a malformed non-list `watchers:` can hold RECOVERABLE rule
+                # data — the classic shape is a mapping from an operator
+                # omitting the '-' before an otherwise complete rule — and
+                # replacing it with [] would pass the save gate (the
+                # structural error disappears along with the data) and
+                # silently delete work the user only asked to add to.
+                # Only an absent or explicit-null key is normalized below.
+                await self.app.push_screen_wait(
+                    MessageModal(
+                        "config.yaml's 'watchers:' is not a list "
+                        f"(got {type(existing).__name__}) — often a missing "
+                        "'-' before a rule. Repair it in $EDITOR (ctrl+e on "
+                        "the list screen) first; creating a rule here would "
+                        "overwrite whatever it holds.",
+                        title="Could not save",
+                    )
+                )
+                return
+            if existing is None:
                 self.cfg.document["watchers"] = []
             watchers = self.cfg.document["watchers"]
             watchers.append(target_entry)

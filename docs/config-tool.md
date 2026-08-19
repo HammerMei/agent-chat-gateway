@@ -150,7 +150,7 @@ message — see [docs/user-guide.md](user-guide.md) for how matching works.
   target those sessions. The counts are read from the daemon's own files.
   Idle stranded sessions are cleaned up by the daemon's lifecycle sweeps —
   but a session with pending scheduled jobs is exempt from expiry, so its
-  jobs keep running until you remove them (`acg schedule-delete`).
+  jobs keep running until you remove them (`acg schedule delete <job_id>`).
 - This tab edits `config.yaml` only. To see or act on the *live* sessions a
   rule has created, use the CLI: `acg list`, `acg pause/resume/reset/expire`.
 - Known limitation: while some rule in the file is broken (its row shows
