@@ -34,7 +34,7 @@ from textual.containers import Container, Horizontal, VerticalScroll
 from textual.css.query import NoMatches
 from textual.widgets import Button, Input, Select, Static
 
-from ..formatting import mask_if_secret, provenance_label
+from ..formatting import markup_safe, mask_if_secret, provenance_label
 from ..modals import (
     ConfirmModal,
     InheritsPickerModal,
@@ -375,10 +375,15 @@ class ConnectorDetailScreen(FormScreen):
             if type_provenance
             else ""
         )
-        lines = [f"[bold]{name}[/bold]  (type: {conn_type}){type_suffix}"]
+        lines = [
+            f"[bold]{markup_safe(name)}[/bold]  "
+            f"(type: {markup_safe(conn_type)}){type_suffix}"
+        ]
         if description:
-            lines.append(f"[dim]{description}[/dim]")
-        lines.append(f"inherits: {template_name if template_name else '(none)'}")
+            lines.append(f"[dim]{markup_safe(description)}[/dim]")
+        lines.append(
+            f"inherits: {markup_safe(template_name) if template_name else '(none)'}"
+        )
         lines.append("")
 
         # 'type' itself is shown in the header above (with its own provenance
@@ -399,8 +404,8 @@ class ConnectorDetailScreen(FormScreen):
             sub = "\n".join(
                 self._render_field(k, v, indent + 1) for k, v in value.items()
             )
-            return f"{prefix}{key}:\n{sub}"
-        return f"{prefix}{key}: {mask_if_secret(key, value)}"
+            return f"{prefix}{markup_safe(key)}:\n{sub}"
+        return f"{prefix}{markup_safe(key)}: {markup_safe(mask_if_secret(key, value))}"
 
     # ── edit/create form ─────────────────────────────────────────────────────
 
@@ -411,7 +416,7 @@ class ConnectorDetailScreen(FormScreen):
         # extra Tab press to reach the first real field.
         with VerticalScroll(classes="entity-form", can_focus=False):
             if self.mode == "create":
-                yield Static(f"[bold]New {conn_type} connector[/bold]")
+                yield Static(f"[bold]New {markup_safe(conn_type)} connector[/bold]")
                 with Horizontal(classes="field-row"):
                     yield Static("Name *", classes="field-label")
                     yield Input(
@@ -419,7 +424,10 @@ class ConnectorDetailScreen(FormScreen):
                     )
             else:
                 name = self.entry.get("name", "?")
-                yield Static(f"[bold]{name}[/bold]  (type: {conn_type}, editing)")
+                yield Static(
+                    f"[bold]{markup_safe(name)}[/bold]  "
+                    f"(type: {markup_safe(conn_type)}, editing)"
+                )
 
             with Horizontal(classes="field-row"):
                 yield Static("Description", classes="field-label")
@@ -431,7 +439,10 @@ class ConnectorDetailScreen(FormScreen):
             with Horizontal(classes="field-row"):
                 yield Static("Inherits", classes="field-label")
                 yield Static(
-                    self._inherits_current or "(none)",
+                    # A template name is operator-authored and this Static
+                    # parses markup (see markup_safe()).
+                    markup_safe(self._inherits_current) if self._inherits_current
+                    else "(none)",
                     id="inherits-value",
                     classes="field-value",
                 )
@@ -439,8 +450,8 @@ class ConnectorDetailScreen(FormScreen):
 
             if not self._field_specs():
                 yield Static(
-                    f"[dim]'{conn_type}' connectors have no type-specific "
-                    "fields to configure here.[/dim]"
+                    f"[dim]'{markup_safe(conn_type)}' connectors have no "
+                    "type-specific fields to configure here.[/dim]"
                 )
 
             for spec in self._field_specs():
@@ -619,7 +630,8 @@ class ConnectorDetailScreen(FormScreen):
             if new_name in self.cfg.templates("connector"):
                 await self.app.push_screen_wait(
                     MessageModal(
-                        f"A connector template named '{new_name}' already exists.",
+                        f"A connector template named '{markup_safe(new_name)}' "
+                        "already exists.",
                         title="Could not create",
                     )
                 )
@@ -692,7 +704,8 @@ class ConnectorDetailScreen(FormScreen):
             if name in existing_names:
                 await self.app.push_screen_wait(
                     MessageModal(
-                        f"A connector named '{name}' already exists.", title="Could not save"
+                        f"A connector named '{markup_safe(name)}' already exists.",
+                        title="Could not save",
                     )
                 )
                 return

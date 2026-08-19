@@ -428,7 +428,15 @@ class RuleDetailScreen(FormScreen):
         try:
             merged = self.cfg.merged_entry("watcher", entry)
         except (ValueError, FileNotFoundError) as exc:
-            lines.append(f"[red]Could not compute effective values: {exc}[/red]")
+            # markup_safe: this message quotes the value that caused it —
+            # `inherits: "[/]"` names an unknown template, and the loader's
+            # error repeats that name, so an unescaped interpolation raised
+            # MarkupError and crashed the row instead of EXPLAINING it
+            # (Codex review of #129, round 8). The explanation path must not
+            # be the one that fails.
+            lines.append(
+                f"[red]Could not compute effective values: {markup_safe(exc)}[/red]"
+            )
             return "\n".join(lines)
 
         defaults = self._dataclass_defaults()
@@ -472,7 +480,10 @@ class RuleDetailScreen(FormScreen):
             with Horizontal(classes="field-row"):
                 yield Static("Inherits", classes="field-label")
                 yield Static(
-                    self._inherits_current or "(none)",
+                    # A template name is operator-authored and this Static
+                    # parses markup (see markup_safe()).
+                    markup_safe(self._inherits_current) if self._inherits_current
+                    else "(none)",
                     id="inherits-value",
                     classes="field-value",
                 )

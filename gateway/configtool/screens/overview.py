@@ -446,12 +446,14 @@ class OverviewScreen(Screen):
         )
         if not confirmed:
             return
+        was_dirty = cfg.dirty  # see _move_rule()'s note
         removed = watchers.pop(index)
         cfg.mark_dirty()
         try:
             cfg.save()
         except (ValueError, FileNotFoundError) as exc:
             watchers.insert(index, removed)
+            cfg.dirty = was_dirty
             # Same known limitation the reorder refusal carries, and the
             # same owner ruling (2026-08-19): a removal renumbers every
             # LATER entry, so another broken rule below this row has its
@@ -518,6 +520,12 @@ class OverviewScreen(Screen):
         if key is None:
             return
         index = int(key)
+        # Captured BEFORE the mutation: rolling the document back restores it
+        # byte-for-byte, but both the move and the counter-move call
+        # mark_dirty(), so the flag stayed True and the quit gate then asked
+        # the operator to discard changes that no longer exist (Codex review
+        # of #129, round 8).
+        was_dirty = cfg.dirty
         new_index = cfg.move_watcher_rule(index, delta)
         if new_index is None:
             return  # already at the edge — nothing to do
@@ -525,6 +533,7 @@ class OverviewScreen(Screen):
             cfg.save()
         except (ValueError, FileNotFoundError) as exc:
             cfg.move_watcher_rule(new_index, -delta)  # swap straight back
+            cfg.dirty = was_dirty
             # Honest wording (owner-ratified): a pure swap reorders the same
             # entries, and per-entry parse errors are order-independent — so
             # a refusal here is BY CONSTRUCTION a pre-existing broken rule
@@ -564,8 +573,8 @@ class OverviewScreen(Screen):
         if used_by:
             await self.app.push_screen_wait(
                 MessageModal(
-                    f"Cannot delete tool preset '{key}' — still used by agent(s): "
-                    f"{', '.join(used_by)}.",
+                    f"Cannot delete tool preset '{markup_safe(key)}' — still used "
+                    f"by agent(s): {', '.join(markup_safe(u) for u in used_by)}.",
                     title="Cannot delete",
                 )
             )
@@ -573,7 +582,7 @@ class OverviewScreen(Screen):
 
         confirmed = await self.app.push_screen_wait(
             ConfirmModal(
-                f"Delete tool preset '{key}'? This cannot be undone.",
+                f"Delete tool preset '{markup_safe(key)}'? This cannot be undone.",
                 confirm_label="Delete",
             )
         )
@@ -614,8 +623,9 @@ class OverviewScreen(Screen):
         if used_by:
             await self.app.push_screen_wait(
                 MessageModal(
-                    f"Cannot delete {kind} template '{name}' — still used by "
-                    f"{kind}(s): {', '.join(used_by)}.",
+                    f"Cannot delete {kind} template '{markup_safe(name)}' — still "
+                    f"used by {kind}(s): "
+                    f"{', '.join(markup_safe(u) for u in used_by)}.",
                     title="Cannot delete",
                 )
             )
@@ -623,7 +633,7 @@ class OverviewScreen(Screen):
 
         confirmed = await self.app.push_screen_wait(
             ConfirmModal(
-                f"Delete {kind} template '{name}'? This cannot be undone.",
+                f"Delete {kind} template '{markup_safe(name)}'? This cannot be undone.",
                 confirm_label="Delete",
             )
         )
@@ -751,19 +761,25 @@ class OverviewScreen(Screen):
             return
         app: "ConfigToolApp" = self.app  # type: ignore[assignment]
         sections: list[str] = []
+        # The section headers are this screen's own markup; the messages are
+        # NOT — they quote the operator's own entity names and values back
+        # (an unknown template, a bad pattern), so each one is escaped. This
+        # is the view whose entire job is explaining what is wrong, which
+        # makes it the worst possible place to fail on the wrongness itself.
         if result.errors:
             sections.append(
-                "[bold red]Errors:[/bold red]\n" + "\n".join(f"  • {e}" for e in result.errors)
+                "[bold red]Errors:[/bold red]\n"
+                + "\n".join(f"  • {markup_safe(e)}" for e in result.errors)
             )
         if result.warnings:
             sections.append(
                 "[bold yellow]Warnings:[/bold yellow]\n"
-                + "\n".join(f"  • {w}" for w in result.warnings)
+                + "\n".join(f"  • {markup_safe(w)}" for w in result.warnings)
             )
         if app.lint and result.lint_findings:
             sections.append(
                 "[bold cyan]Lint findings:[/bold cyan]\n"
-                + "\n".join(f"  • {lf}" for lf in result.lint_findings)
+                + "\n".join(f"  • {markup_safe(lf)}" for lf in result.lint_findings)
             )
         if not sections:
             return
@@ -857,7 +873,8 @@ class OverviewScreen(Screen):
             except (ValueError, FileNotFoundError):
                 merged = c
             connectors_table.add_row(
-                name, merged.get("type", "?"), status_badge(status.status_for("connector", name)),
+                markup_safe(name), markup_safe(merged.get("type", "?")),
+                status_badge(status.status_for("connector", name)),
                 key=str(i),
             )
 
@@ -868,9 +885,9 @@ class OverviewScreen(Screen):
             except (ValueError, FileNotFoundError):
                 merged = entry
             agents_table.add_row(
-                name,
-                merged.get("type", "claude"),
-                merged.get("command", "claude"),
+                markup_safe(name),
+                markup_safe(merged.get("type", "claude")),
+                markup_safe(merged.get("command", "claude")),
                 status_badge(status.status_for("agent", name)),
                 key=name,
             )
@@ -915,12 +932,13 @@ class OverviewScreen(Screen):
             for name, block in sorted(templates.items()):
                 used_by = [n for n, _ in find_entries_referencing_template(cfg, kind, name)]
                 templates_table.add_row(
-                    kind, name, str(len(block)), str(len(used_by)), key=f"{kind}:{name}"
+                    kind, markup_safe(name), str(len(block)), str(len(used_by)),
+                    key=f"{kind}:{name}",
                 )
 
         presets_table.add_columns("Name", "Rules")
         for name, rules in sorted(cfg.tool_presets_raw.items()):
-            presets_table.add_row(name, str(len(rules)), key=name)
+            presets_table.add_row(markup_safe(name), str(len(rules)), key=name)
 
     # ── Row selection → push detail screens ──────────────────────────────────
 

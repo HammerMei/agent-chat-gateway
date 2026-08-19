@@ -60,6 +60,7 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal, VerticalScroll
 from textual.widgets import Button, Input, Static
 
+from ..formatting import markup_safe
 from ..modals import ConfirmModal, MessageModal
 from ..model import EditableConfig
 from .agent_detail import AGENT_DATACLASS_DEFAULTS, AGENT_FORM_FIELDS
@@ -252,12 +253,19 @@ class TemplateDetailScreen(ToolListEditorMixin, FormScreen):
     def _body_text(self) -> str:
         referencing = find_entries_referencing_template(self.cfg, self.kind, self.template_name)
         used_by = ", ".join(name for name, _ in referencing) if referencing else "(none)"
-        type_suffix = f"  (type: {self._connector_type()})" if self.kind == "connector" else ""
-        lines = [f"[bold]{self.template_name}[/bold]{type_suffix}  ({self.kind} template)"]
+        type_suffix = (
+            f"  (type: {markup_safe(self._connector_type())})"
+            if self.kind == "connector"
+            else ""
+        )
+        lines = [
+            f"[bold]{markup_safe(self.template_name)}[/bold]{type_suffix}  "
+            f"({self.kind} template)"
+        ]
         description = self.entry.get("description")
         if description:
-            lines.append(f"[dim]{description}[/dim]")
-        lines.append(f"used by: {used_by}")
+            lines.append(f"[dim]{markup_safe(description)}[/dim]")
+        lines.append(f"used by: {markup_safe(used_by)}")
         lines.append("")
 
         # Raw dump of this template's own top-level fields (mirrors
@@ -276,11 +284,13 @@ class TemplateDetailScreen(ToolListEditorMixin, FormScreen):
             if key in TOOL_LIST_WIDGET_IDS:
                 # Same one-rule-per-line style AgentDetailScreen's own view
                 # mode uses (format_tool_rule()), not a raw Python list dump.
-                lines.append(f"{key}:  {blast_text}")
+                lines.append(f"{markup_safe(key)}:  {blast_text}")
                 for item in value or []:
-                    lines.append(f"  {format_tool_rule(item)}")
+                    lines.append(f"  {markup_safe(format_tool_rule(item))}")
             else:
-                lines.append(f"{key}: {value}  {blast_text}")
+                lines.append(
+                    f"{markup_safe(key)}: {markup_safe(value)}  {blast_text}"
+                )
         if not shown_any:
             lines.append("(empty — this template sets no fields yet)")
 
@@ -289,10 +299,14 @@ class TemplateDetailScreen(ToolListEditorMixin, FormScreen):
     # ── edit/create form ─────────────────────────────────────────────────────
 
     def _compose_form(self) -> ComposeResult:
-        type_suffix = f"  (type: {self._connector_type()})" if self.kind == "connector" else ""
+        type_suffix = (
+            f"  (type: {markup_safe(self._connector_type())})"
+            if self.kind == "connector"
+            else ""
+        )
         with VerticalScroll(classes="entity-form", can_focus=False):
             if self.mode == "create":
-                yield Static(f"[bold]New {self.kind} template[/bold]{type_suffix}")
+                yield Static(f"[bold]New {self.kind} template[/bold]{type_suffix}")  # kind is a literal
                 with Horizontal(classes="field-row"):
                     yield Static("Name", classes="field-label")
                     # Pre-filled with the name already chosen via the
@@ -304,7 +318,9 @@ class TemplateDetailScreen(ToolListEditorMixin, FormScreen):
                         id="field-name", value=self.template_name, placeholder="template name"
                     )
             else:
-                yield Static(f"[bold]{self.template_name}[/bold]{type_suffix}  (editing)")
+                yield Static(
+                    f"[bold]{markup_safe(self.template_name)}[/bold]{type_suffix}  (editing)"
+                )
 
             with Horizontal(classes="field-row"):
                 yield Static("Description", classes="field-label")

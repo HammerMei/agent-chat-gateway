@@ -42,6 +42,7 @@ from textual.binding import Binding
 from textual.containers import Vertical
 from textual.widgets import Footer, Header, Label, ListItem, ListView, Static
 
+from ..formatting import markup_safe
 from ..modals import InlineToolRuleModal, MessageModal
 from ..model import EditableConfig
 from .base import DetailScreen
@@ -74,9 +75,11 @@ class ToolPresetsScreen(DetailScreen):
     def _header_text(self) -> str:
         rules = self.cfg.tool_presets_raw.get(self.preset_name, [])
         used_by = find_agents_referencing_preset(self.cfg, self.preset_name)
-        lines = [f"[bold]{self.preset_name}[/bold]  ({len(rules)} rule(s))"]
+        lines = [f"[bold]{markup_safe(self.preset_name)}[/bold]  ({len(rules)} rule(s))"]
         lines.append(
-            f"used by: {', '.join(used_by)}" if used_by else "used by: (no agent references it)"
+            f"used by: {', '.join(markup_safe(u) for u in used_by)}"
+            if used_by
+            else "used by: (no agent references it)"
         )
         return "\n".join(lines)
 
@@ -112,7 +115,11 @@ class ToolPresetsScreen(DetailScreen):
         prev_index = list_view.index
         list_view.clear()
         for i, rule in enumerate(rules):
-            list_view.append(ListItem(Label(_format_tool_rule(rule)), name=str(i)))
+            # Label parses markup, and a tool rule is operator-authored
+            # (a regex may legitimately contain `[...]`).
+            list_view.append(
+                ListItem(Label(markup_safe(_format_tool_rule(rule))), name=str(i))
+            )
         self.query_one(f"#{self.BODY_ID}", Static).update(self._header_text())
         # This must be done HERE, every time — not just once in on_mount()
         # — because `list_view.clear()` above resets `.index` back to

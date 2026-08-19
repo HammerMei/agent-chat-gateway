@@ -745,7 +745,12 @@ class FormScreen(DetailScreen):
             elif spec.kind == "enum":
                 options = spec.options or ()
                 widget = Select(
-                    [(o, o) for o in options],
+                    # (label, value): the LABEL is escaped because Textual
+                    # renders it as markup inside the Select itself (a
+                    # connector/agent named `agent-[/]` raised MarkupError
+                    # from Select._watch_value, killing the form) — the VALUE
+                    # stays raw, since that is what gets written to config.
+                    [(markup_safe(o), o) for o in options],
                     value=initial if initial in options else (options or (None,))[0],
                     allow_blank=False,
                     id=widget_id(spec.key),

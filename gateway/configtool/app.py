@@ -67,6 +67,37 @@ class ConfigToolApp(App):
                 return
         self.exit()
 
+    def notify(  # type: ignore[override]
+        self,
+        message: str,
+        *,
+        title: str = "",
+        severity="information",
+        timeout: float | None = None,
+        markup: bool = False,
+    ) -> None:
+        """Notifications are PLAIN TEXT here — `markup` defaults to False.
+
+        Textual parses notification text as Rich markup by default, and every
+        notification this app raises names operator-authored data (a rule,
+        connector, agent, template or preset name, or an exception message
+        quoting a config value). Two failures follow, both verified: a name
+        like `[ab]` was swallowed whole (`Deleted rule ''.`), and one
+        spelling a closing tag (`[/]`) raised `MarkupError` from inside the
+        toast, so the notification that was supposed to report an outcome
+        killed the render instead.
+
+        Fixed here rather than at ~12 call sites (Codex review of #129,
+        round 8): `Widget.notify()` delegates to `App.notify()`, so this one
+        default covers every screen and modal in the package, and a call site
+        added later inherits it. Nothing here ever wants markup in a toast —
+        the styling comes from `severity`. A caller that genuinely needs it
+        can still pass `markup=True` explicitly.
+        """
+        super().notify(
+            message, title=title, severity=severity, timeout=timeout, markup=markup
+        )
+
     # ── Shared, non-action helpers (called from OverviewScreen's actions) ───
 
     def run_validate(self) -> ValidationResult:

@@ -1388,3 +1388,87 @@ class TestCodexRound7Fixes:
             assert isinstance(app.screen, MessageModal)
             body = str(app.screen.query_one("#message-body").render())
             assert "my,[/].md" in body              # and it names the real item
+
+
+class TestCodexRound8Fixes:
+    async def test_a_rolled_back_move_does_not_leave_the_config_dirty(
+        self, tmp_path, work_dir
+    ):
+        """Codex round 8: the move and the counter-move both call
+        mark_dirty(), so a REJECTED reorder restored the document
+        byte-for-byte but left the flag set — and the quit gate then asked
+        the operator to discard changes that no longer existed."""
+        config_path = _write_config(tmp_path, f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {work_dir}
+            watchers:
+              - name: good-rule
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
+              - name: broken-rule
+                connector: rc
+                agent: default
+                rooms:
+                  include: []
+        """)
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.editable_config.dirty is False
+            await _open_rules_tab(pilot, app)
+            table = app.screen.query_one("#rules-table", DataTable)
+            table.focus()
+            table.move_cursor(row=0)
+            await pilot.press("]")            # refused: shifts the broken rule
+            await pilot.pause()
+
+            raw = yaml.safe_load(Path(config_path).read_text())
+            assert [w["name"] for w in raw["watchers"]] == ["good-rule", "broken-rule"]
+            assert app.editable_config.dirty is False, (
+                "a rolled-back move must not leave the config looking edited"
+            )
+
+    async def test_a_rolled_back_malformed_row_delete_does_not_leave_it_dirty(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {work_dir}
+            watchers:
+              - "stray yaml, not a mapping"
+              - name: also-broken
+                connector: rc
+                agent: default
+                rooms:
+                  include: []
+        """)
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_rules_tab(pilot, app)
+            table = app.screen.query_one("#rules-table", DataTable)
+            table.focus()
+            table.move_cursor(row=0)
+            await pilot.press("d")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmModal)
+            await pilot.press("tab", "enter")   # Delete -> refused below
+            await pilot.pause()
+            assert isinstance(app.screen, MessageModal)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.editable_config.dirty is False
