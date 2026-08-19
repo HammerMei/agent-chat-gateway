@@ -53,6 +53,10 @@ from ..modals import ConfirmModal, MessageModal
 from ..model import EditableConfig, Provenance
 from .base import DetailScreen
 
+# Distinguishes "caller did not supply a provenance" from "provenance is
+# None" (a real value meaning: could not be computed) in _field_annotation().
+_UNSET = object()
+
 
 @dataclass(frozen=True)
 class FieldSpec:
@@ -637,13 +641,30 @@ class FormScreen(DetailScreen):
 
     # ── generic field snapshot / provenance / row rendering ─────────────────
 
+    def _snapshot_source(self, entry: dict) -> dict:
+        """Which mapping `_compute_initial_values()` reads field values from.
+
+        The ONE thing that differed between this class's snapshot logic and
+        `TemplateDetailScreen`'s, which used to override the whole method to
+        change it — and that fork is what made a fix to field handling land
+        in one copy only (Codex review of #129, round 7: the raw
+        delimiter-bearing display reached the entry forms and not the
+        template form). Expressed as a hook so there is one implementation of
+        the snapshot itself.
+
+        An entry resolves against its `inherits:` template; a template has
+        nothing to resolve against (no nested templates), so it overrides
+        this to return the raw entry.
+        """
+        try:
+            return self.cfg.merged_entry(self._template_kind(), entry)
+        except (ValueError, FileNotFoundError):
+            return dict(entry)
+
     def _compute_initial_values(self, entry: dict) -> None:
         self._reset_keys = {}  # fresh edit session — no lingering reset markers
         self._lossy_list_values = {}
-        try:
-            merged = self.cfg.merged_entry(self._template_kind(), entry)
-        except (ValueError, FileNotFoundError):
-            merged = dict(entry)
+        merged = self._snapshot_source(entry)
         dataclass_defaults = self._dataclass_defaults()
         for spec in self._field_specs():
             value = get_nested(merged, spec.key)
@@ -675,12 +696,33 @@ class FormScreen(DetailScreen):
         except (ValueError, FileNotFoundError):
             return None
 
-    def _compose_field_row(self, spec: FieldSpec, entry: dict) -> ComposeResult:
-        provenance = self._field_provenance(spec, entry)
+    def _field_annotation(
+        self, spec: FieldSpec, entry: dict, provenance: Provenance | None | object = _UNSET
+    ) -> str:
+        """The trailing annotation rendered beside `spec`'s widget.
+
+        The ONLY thing `TemplateDetailScreen`'s row rendering differed in,
+        which used to justify overriding the whole of `_compose_field_row()`
+        — the fork that let a field-handling fix land in one renderer only
+        (Codex review of #129, round 7). A hook instead, so there is one
+        renderer.
+
+        This class annotates with the field's PROVENANCE (explicit /
+        inherited / default); a template annotates with its BLAST RADIUS
+        instead, since its own fields have no provenance to speak of.
+        `provenance` may be passed explicitly by the live-refresh path,
+        which computes a would-be-on-Save value rather than the entry's
+        current one.
+        """
+        if provenance is _UNSET:
+            provenance = self._field_provenance(spec, entry)
+        if not provenance:
+            return ""
         template_name = self.cfg.entry_template_name(entry)
-        prov_text = (
-            f"[dim]({provenance_label(provenance, template_name)})[/dim]" if provenance else ""
-        )
+        return f"[dim]({provenance_label(provenance, template_name)})[/dim]"
+
+    def _compose_field_row(self, spec: FieldSpec, entry: dict) -> ComposeResult:
+        prov_text = self._field_annotation(spec, entry)
         initial = self._initial_values.get(spec.key)
         # A delimiter-bearing list value is DISPLAYED raw, not round-tripped:
         # the snapshot for `["my,notes.md"]` is the split `["my","notes.md"]`,
@@ -833,9 +875,11 @@ class FormScreen(DetailScreen):
             provenance = Provenance.EXPLICIT
         else:
             provenance = self._field_provenance(spec, entry)
-        template_name = self.cfg.entry_template_name(entry)
-        text = f"[dim]({provenance_label(provenance, template_name)})[/dim]" if provenance else ""
-        prov_widget.update(text)
+        # Through the same annotation hook the row was composed with, so a
+        # screen that annotates differently (a template's blast radius) has
+        # its annotation refreshed correctly instead of blanked by
+        # provenance logic that does not apply to it.
+        prov_widget.update(self._field_annotation(spec, entry, provenance))
 
     def action_reset_field(self) -> None:
         """ctrl+r: reset the FOCUSED field to its pure-template/dataclass
@@ -1077,12 +1121,23 @@ class FormScreen(DetailScreen):
                 # equals the readback, so the comparison above is False.
                 raw = self._lossy_list_values.get(spec.key)
                 if raw is not None:
+                    # markup_safe on the interpolated value: this message
+                    # reaches a markup-parsing MessageModal, and the very
+                    # values it names are operator-authored — a legal
+                    # filename like `my,[notes].md` was rendered as
+                    # `my,.md` (naming the WRONG item), and one spelling a
+                    # closing tag (`my,[/].md`) raised MarkupError, which
+                    # crashed the modal and so defeated the loud refusal
+                    # this branch exists to give (Codex review of #129,
+                    # round 7 — a fresh unescaped interpolation opened one
+                    # round after the escaping sweep).
                     self._last_field_error = (
                         f"{spec.label}: this list contains an item with a "
-                        f"comma in it ({list_to_text(raw)!r}), which this "
-                        "comma-separated box cannot represent — editing it "
-                        "here would split that item in two. Edit this field "
-                        "in $EDITOR instead (ctrl+e on the list screen)."
+                        f"comma in it ({markup_safe(repr(list_to_text(raw)))}), "
+                        "which this comma-separated box cannot represent — "
+                        "editing it here would split that item in two. Edit "
+                        "this field in $EDITOR instead (ctrl+e on the list "
+                        "screen)."
                     )
                     return None
                 updates[spec.key] = new_value

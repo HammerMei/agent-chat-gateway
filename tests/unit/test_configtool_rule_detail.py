@@ -1340,3 +1340,51 @@ class TestCodexRound6Fixes:
             assert isinstance(app.screen, OverviewScreen)
             raw = yaml.safe_load(Path(config_path).read_text())
             assert raw["watchers"][0]["rooms"]["include"] == ["general", "dev"]
+
+
+class TestCodexRound7Fixes:
+    async def test_the_refusal_names_a_bracketed_item_faithfully_and_does_not_crash(
+        self, tmp_path, work_dir
+    ):
+        """Codex round 7: the refusal message interpolated the operator's own
+        value into a markup-parsing modal. `my,[notes].md` was rendered as
+        `my,.md` (naming the WRONG item) and `my,[/].md` raised MarkupError,
+        crashing the modal and so defeating the loud refusal itself.
+
+        The value need not name a real file — the loader resolves
+        context_inject_files paths without requiring existence, and `[/]`
+        cannot appear inside a single filename anyway (it spans a path
+        separator), so this pins the hostile SPELLING rather than a real
+        file."""
+        config_path = _write_config(tmp_path, f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {work_dir}
+            watchers:
+              - name: hostile-path
+                connector: rc
+                agent: default
+                context_inject_files: ["my,[/].md"]
+                rooms:
+                  include: [general]
+        """)
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_rule_row(pilot, app, row=0, key="e")
+            box = app.screen.query_one("#field-context_inject_files", Input)
+            assert box.value == "my,[/].md"        # displayed raw, not split
+            box.value = "my,[/].md, other.md"
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            assert app.is_running is True           # the modal did not crash
+            assert isinstance(app.screen, MessageModal)
+            body = str(app.screen.query_one("#message-body").render())
+            assert "my,[/].md" in body              # and it names the real item
