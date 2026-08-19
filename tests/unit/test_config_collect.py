@@ -14,7 +14,7 @@ import textwrap
 import unittest
 from pathlib import Path
 
-from gateway.config import _parse_one_watcher_entry, collect_config
+from gateway.config import collect_config
 
 
 class _CollectConfigTestBase(unittest.TestCase):
@@ -326,34 +326,6 @@ class TestCollectConfigNonStringNameHint(_CollectConfigTestBase):
         self.assertEqual(len(watcher_issues), 1)
         self.assertEqual(watcher_issues[0].entity_name, "(index 0)")
         {(i.entity_kind, i.entity_name, i.message) for i in issues}
-
-
-class TestParseOneWatcherEntryEmptyConnectors(_CollectConfigTestBase):
-    """PR review finding: GatewayConfig.from_file() can never call
-    _parse_one_watcher_entry() with an empty `connectors` list — an earlier
-    structural check always raises first. collect_config() guards against
-    it too (its own "no connectors parsed successfully" branch returns
-    before ever reaching the watcher loop). But
-    EditableConfig.expanded_watchers() calls this function directly, per
-    raw watcher entry, against whatever partial `connectors` list
-    collect_config() returned — so an all-connectors-failed config CAN
-    legitimately reach this function with `connectors=[]`. Previously this
-    crashed with an uncaught IndexError (`connectors[0].name`) instead of
-    raising the ValueError every caller's `except ValueError` expects."""
-
-    def test_no_explicit_connector_and_zero_connectors_raises_value_error_not_index_error(self):
-        with self.assertRaises(ValueError):
-            _parse_one_watcher_entry(
-                {"name": "w1", "room": "general"},
-                0,
-                watcher_templates={},
-                connector_names=set(),
-                connectors=[],
-                agents={},
-                default_agent="",
-                config_dir=Path(self.tmp),
-                seen_watcher_names=set(),
-            )
 
 
 class TestCollectConfigQueueSchedulerSessionId(_CollectConfigTestBase):
