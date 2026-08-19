@@ -2,7 +2,7 @@
 
 Connector `raw` is deliberately type-flexible in the schema
 (gateway/schema/config.schema.json's connector definition has no
-`additionalProperties: false`) — unlike Agent/WatcherDetailScreen, there's
+`additionalProperties: false`) — unlike Agent/RuleDetailScreen, there's
 no single closed field list. The design originally called for a generic
 recursive tree editor to handle arbitrary/unknown keys; **deferred** here in
 favor of per-type fixed field lists (`FIELDS_BY_TYPE` below), one level of

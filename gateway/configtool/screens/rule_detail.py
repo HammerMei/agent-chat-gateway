@@ -1,0 +1,478 @@
+"""RuleDetailScreen — view, edit, and create a single watcher RULE.
+
+A `watchers:` entry is a rule (gateway/core/watcher_rule.py): a required
+unique `name`, a `connector`/`agent` pair, and a `rooms:` matcher
+(`include`/`except_for` globs plus the `direct`/`group_direct` DM opt-ins).
+It names no room — which rooms it claims is only known at runtime — so this
+screen is a plain one-entry-in/one-entry-out form over one element of the
+`document["watchers"]` list, using the exact trial-entry install/rollback
+pattern `ConnectorDetailScreen` already uses for the connectors list. The
+merge-on-add / split-on-edit machinery the old expanded-watcher screen
+needed does not exist here because the problem it solved (N rooms sharing
+one raw dict) no longer exists as data.
+
+`name` IS editable, unlike a connector's (which watchers reference by
+name). Nothing in config.yaml references a rule by name; persisted session
+records do (`rule_name`), but a rename is equivalent to delete+create from
+the runtime's perspective and both halves of that are legal operations —
+the delete-rule warning below is the same disclosure a rename implies.
+
+Deleting a rule warns with what it strands (design §5.5): the persisted
+session records carrying this rule's name and the scheduled jobs targeting
+those records' watchers — counted read-only off the daemon's own files
+(gateway/configtool/state_peek.py), never via the control socket (owner
+decision 2026-08-18: the config tool operates on config.yaml only).
+"""
+
+from __future__ import annotations
+
+from typing import Literal
+
+from textual import work
+from textual.app import ComposeResult
+from textual.containers import Horizontal, VerticalScroll
+from textual.widgets import Button, Input, Select, Static
+
+from ...config import HistoryHandoffConfig
+from ...core.watcher_rule import WatcherRule
+from ..formatting import format_value, provenance_label
+from ..modals import ConfirmModal, InheritsPickerModal, MessageModal, TextPromptModal
+from ..model import EditableConfig
+from ..state_peek import stranded_by_rule
+from .form_common import (
+    FieldSpec,
+    FormScreen,
+    apply_update,
+    sort_required_first,
+    widget_id,
+)
+
+# A watcher template's own field list — reused by TemplateDetailScreen.
+# gateway/config.py forbids {name, room, rooms, session_id} on a watcher
+# template, since each of those pins one SPECIFIC rule's identity (or was
+# removed outright); everything else a rule carries is legitimately
+# shareable, which now includes the two session TTLs — they became
+# first-class rule fields at the dynamic-watcher cutover.
+WATCHER_TEMPLATE_FIELDS: tuple[FieldSpec, ...] = (
+    FieldSpec("session_idle_days", "int", "Session idle days"),
+    FieldSpec("session_expire_days", "int", "Session expire days"),
+    FieldSpec("context_inject_files", "list", "Context inject files (comma-separated)"),
+    FieldSpec("history_handoff.enabled", "bool", "History handoff enabled"),
+    FieldSpec("history_handoff.fetch_count", "int", "History handoff fetch count"),
+    FieldSpec("history_handoff.verbatim_tail", "int", "History handoff verbatim tail"),
+)
+# Defaults are read live from the owning dataclasses (HistoryHandoffConfig,
+# WatcherRule) rather than re-typed as literals, so this preview can never
+# drift out of sync with the loader — the drift already happened once
+# (commit 31f966d flipped only the dataclass default and missed the loader).
+_HH_DEFAULTS = HistoryHandoffConfig()
+_RULE_FIELD_DEFAULTS = WatcherRule.__dataclass_fields__
+
+_WATCHER_TEMPLATE_DEFAULT_VALUES: dict[str, object] = {
+    "session_idle_days": _RULE_FIELD_DEFAULTS["session_idle_days"].default,
+    "session_expire_days": _RULE_FIELD_DEFAULTS["session_expire_days"].default,
+    "context_inject_files": [],
+    "history_handoff.enabled": _HH_DEFAULTS.enabled,
+    "history_handoff.fetch_count": _HH_DEFAULTS.fetch_count,
+    "history_handoff.verbatim_tail": _HH_DEFAULTS.verbatim_tail,
+}
+# The key set is derived from WATCHER_TEMPLATE_FIELDS so the two halves of
+# what is really one table cannot drift apart — a spec without a default
+# raises KeyError at import, not at some later render.
+WATCHER_TEMPLATE_DATACLASS_DEFAULTS: dict[str, object] = {
+    spec.key: _WATCHER_TEMPLATE_DEFAULT_VALUES[spec.key]
+    for spec in WATCHER_TEMPLATE_FIELDS
+}
+
+# The `rooms:` matcher fields — rule-only (a template may not carry `rooms`,
+# so these never inherit; their provenance is always explicit-or-default).
+_ROOMS_FIELDS: tuple[FieldSpec, ...] = (
+    FieldSpec("rooms.include", "list", "Rooms: include patterns (comma-separated)"),
+    FieldSpec("rooms.except_for", "list", "Rooms: except-for patterns (comma-separated)"),
+    FieldSpec("rooms.direct", "bool", "Rooms: claim 1:1 DMs (direct)"),
+    FieldSpec("rooms.group_direct", "bool", "Rooms: claim group DMs (group_direct)"),
+)
+
+_RULE_REQUIRED_FIELD_KEYS = frozenset({"name", "connector", "agent"})
+
+
+def rule_rooms_summary(entry: dict) -> str:
+    """One-line summary of a raw entry's `rooms:` matcher for table rows and
+    the view body — e.g. `general, dev-* (except: *-noise) +dm +group_dm`.
+    Defensive against a malformed entry (rooms not a mapping): shows what it
+    can, the row's own Status column carries the actual error."""
+    rooms = entry.get("rooms")
+    if not isinstance(rooms, dict):
+        return "?" if rooms is not None else "(none)"
+    parts: list[str] = []
+    include = rooms.get("include")
+    if isinstance(include, list) and include:
+        parts.append(", ".join(str(p) for p in include))
+    except_for = rooms.get("except_for")
+    if isinstance(except_for, list) and except_for:
+        parts.append(f"(except: {', '.join(str(p) for p in except_for)})")
+    if rooms.get("direct"):
+        parts.append("+dm")
+    if rooms.get("group_direct"):
+        parts.append("+group_dm")
+    return " ".join(parts) if parts else "(none)"
+
+
+class RuleDetailScreen(FormScreen):
+    BODY_ID = "rule-detail-body"
+
+    def __init__(
+        self,
+        cfg: EditableConfig,
+        entry: dict | None,
+        mode: Literal["view", "edit", "create"] = "view",
+    ):
+        super().__init__()
+        self.cfg = cfg
+        # Create mode: nothing exists yet. The entry is never installed into
+        # `cfg.document` until action_save() actually succeeds.
+        self.entry = entry if entry is not None else {}
+        self.mode = mode
+        self._inherits_initial: str | None = self.cfg.entry_template_name(self.entry)
+        self._inherits_current: str | None = self._inherits_initial
+        if self.mode != "view":
+            self._compute_initial_values(self._current_entry())
+            self._description_live = self._initial_values.get("description") or ""
+            self._populating = True
+
+    # ── FormScreen hooks ─────────────────────────────────────────────────────
+
+    def _entity_noun(self) -> str:
+        return "rule"
+
+    def _entity_label(self) -> str:
+        name = self.entry.get("name")
+        if isinstance(name, str) and name:
+            return name
+        return "(new rule)" if self.mode == "create" else "?"
+
+    def _current_entry(self) -> dict:
+        """The PROBE entry: `self.entry` with `inherits:` swapped to whatever
+        the Inherits picker currently has selected — see
+        ConnectorDetailScreen._current_entry()'s identical docstring."""
+        probe = dict(self.entry)
+        if self._inherits_current is None:
+            probe.pop("inherits", None)
+        else:
+            probe["inherits"] = self._inherits_current
+        return probe
+
+    def _find_own_index(self) -> int:
+        # By object IDENTITY, not equality — same reasoning as
+        # ConnectorDetailScreen._find_own_index(): two broken entries could
+        # be byte-identical; identity is the only way to be sure this is
+        # the exact entry this screen was opened on.
+        watchers = self.cfg.document.get("watchers") or []
+        return next(i for i, w in enumerate(watchers) if w is self.entry)
+
+    def _remove_entry_from_document(self) -> None:
+        self._deleted_index = self._find_own_index()
+        del self.cfg.document["watchers"][self._deleted_index]
+
+    def _reinsert_entry_into_document(self) -> None:
+        watchers = self.cfg.document.setdefault("watchers", [])
+        watchers.insert(self._deleted_index, self.entry)
+
+    def _install_trial_entry(self, target_entry: dict) -> None:
+        self._edit_index = self._find_own_index()
+        self.cfg.document["watchers"][self._edit_index] = target_entry
+
+    def _rollback_trial_entry(self) -> None:
+        self.cfg.document["watchers"][self._edit_index] = self.entry
+
+    def _referencing_watcher_labels(self) -> list[str]:
+        # Nothing in config.yaml references a rule by name — the delete
+        # pre-check has nothing to block on. What a deletion STRANDS at
+        # runtime is a warning, not a blocker: see _delete_confirm_message().
+        return []
+
+    def _delete_confirm_message(self) -> str:
+        base = super()._delete_confirm_message()
+        name = self.entry.get("name")
+        if not isinstance(name, str) or not name:
+            return base
+        records, jobs = stranded_by_rule(name)
+        if not records and not jobs:
+            return base
+        strands = [f"{records} persisted session record(s)"]
+        if jobs:
+            strands.append(f"{jobs} scheduled job(s)")
+        return (
+            base
+            + f"\n\nThis rule currently has {' and '.join(strands)} "
+            "on disk. They stop being claimed by any rule and will be "
+            "reclaimed by the daemon's lifecycle sweeps."
+        )
+
+    def _required_field_keys(self) -> frozenset[str]:
+        return _RULE_REQUIRED_FIELD_KEYS
+
+    def _field_specs(self) -> tuple[FieldSpec, ...]:
+        connector_names = tuple(sorted(c.get("name", "?") for c in self.cfg.connectors_raw))
+        agent_names = tuple(sorted(self.cfg.agents_raw))
+        return sort_required_first(
+            (
+                FieldSpec("name", "str", "Rule name"),
+                FieldSpec("connector", "enum", "Connector", options=connector_names),
+                FieldSpec("agent", "enum", "Agent", options=agent_names),
+                *_ROOMS_FIELDS,
+                *WATCHER_TEMPLATE_FIELDS,
+            ),
+            _RULE_REQUIRED_FIELD_KEYS,
+        )
+
+    def _template_kind(self) -> str:
+        return "watcher"
+
+    def _dataclass_defaults(self) -> dict[str, object]:
+        # connector/agent: approximates gateway/config.py's own fallback
+        # (single connector / default agent) for display only — save()'s
+        # validate_config() remains the real backstop. name has no default:
+        # None (blank) is the honest answer for a required identity field.
+        defaults: dict[str, object] = dict(WATCHER_TEMPLATE_DATACLASS_DEFAULTS)
+        defaults["name"] = None
+        defaults["connector"] = (
+            self.cfg.connectors_raw[0].get("name", "") if self.cfg.connectors_raw else ""
+        )
+        defaults["agent"] = next(iter(self.cfg.agents_raw), "")
+        defaults["rooms.include"] = []
+        defaults["rooms.except_for"] = []
+        defaults["rooms.direct"] = False
+        defaults["rooms.group_direct"] = False
+        return defaults
+
+    # ── inherits: picker (mirrors agent/connector — watchers have no 'type') ──
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if (event.button.id or "") == "inherits-change-button":
+            self._open_inherits_picker()
+
+    @work
+    async def _open_inherits_picker(self) -> None:
+        if self.mode == "view":
+            return
+        template_names = sorted(self.cfg.templates("watcher"))
+        choice = await self.app.push_screen_wait(
+            InheritsPickerModal(template_names, self._inherits_current)
+        )
+        if choice is None:
+            return
+        kind, name = choice
+
+        if kind == "template":
+            new_value = name
+        elif kind == "none":
+            new_value = None
+        elif kind == "new_template":
+            new_name = await self.app.push_screen_wait(
+                TextPromptModal("New watcher template — name")
+            )
+            if new_name is None:
+                return
+            if new_name in self.cfg.templates("watcher"):
+                await self.app.push_screen_wait(
+                    MessageModal(
+                        f"A watcher template named '{new_name}' already exists.",
+                        title="Could not create",
+                    )
+                )
+                return
+            from .template_detail import TemplateDetailScreen
+
+            self.app.push_screen(
+                TemplateDetailScreen(self.cfg, "watcher", new_name, {}, mode="create")
+            )
+            return
+        else:
+            return
+
+        if new_value == self._inherits_current:
+            return
+
+        if self._any_field_overridden():
+            confirmed = await self.app.push_screen_wait(
+                ConfirmModal(
+                    "Switching templates will reset any unsaved edits to "
+                    "the fields below back to the new template's values. "
+                    "Continue?",
+                    confirm_label="Switch",
+                )
+            )
+            if not confirmed:
+                return
+
+        self._inherits_current = new_value
+        await self._recompute_form()
+        self._form_dirty = True
+
+    def _on_enter_edit_mode(self) -> None:
+        self._inherits_initial = self.cfg.entry_template_name(self.entry)
+        self._inherits_current = self._inherits_initial
+        self._compute_initial_values(self._current_entry())
+        self._description_live = self._initial_values.get("description") or ""
+
+    # ── view mode ────────────────────────────────────────────────────────────
+
+    def _body_text(self) -> str:
+        entry = self.entry
+        description = entry.get("description")
+        template_name = self.cfg.entry_template_name(entry)
+
+        lines = [f"[bold]{self._entity_label()}[/bold]"]
+        if description:
+            lines.append(f"[dim]{description}[/dim]")
+        try:
+            merged = self.cfg.merged_entry("watcher", entry)
+        except (ValueError, FileNotFoundError) as exc:
+            lines.append(f"[red]Could not compute effective values: {exc}[/red]")
+            return "\n".join(lines)
+
+        defaults = self._dataclass_defaults()
+        lines.append(f"connector: {merged.get('connector') or defaults['connector']}")
+        lines.append(f"agent: {merged.get('agent') or defaults['agent']}")
+        lines.append(f"rooms: {rule_rooms_summary(entry)}")
+        lines.append(f"inherits: {template_name if template_name else '(none)'}")
+        lines.append("")
+
+        for spec in WATCHER_TEMPLATE_FIELDS:
+            top_key = spec.key.split(".", 1)[0]
+            provenance = self.cfg.field_provenance("watcher", entry, top_key)
+            value = merged.get(top_key)
+            if "." in spec.key and isinstance(value, dict):
+                value = value.get(spec.key.split(".", 1)[1])
+            if value is None:
+                value = WATCHER_TEMPLATE_DATACLASS_DEFAULTS.get(spec.key)
+            lines.append(
+                f"{spec.key}: {format_value(value)}  "
+                f"[dim]({provenance_label(provenance, template_name)})[/dim]"
+            )
+        return "\n".join(lines)
+
+    # ── edit/create form ─────────────────────────────────────────────────────
+
+    def _compose_form(self) -> ComposeResult:
+        with VerticalScroll(classes="entity-form", can_focus=False):
+            if self.mode == "create":
+                yield Static("[bold]New rule[/bold]")
+            else:
+                yield Static(f"[bold]{self._entity_label()}[/bold]  (editing)")
+
+            with Horizontal(classes="field-row"):
+                yield Static("Description", classes="field-label")
+                yield Input(id="field-description", value=self._description_live)
+
+            with Horizontal(classes="field-row"):
+                yield Static("Inherits", classes="field-label")
+                yield Static(
+                    self._inherits_current or "(none)",
+                    id="inherits-value",
+                    classes="field-value",
+                )
+                yield Button("Change…", id="inherits-change-button")
+
+            for spec in self._field_specs():
+                yield from self._compose_field_row(spec, self._current_entry())
+
+    # ── save ─────────────────────────────────────────────────────────────────
+
+    @work
+    async def action_save(self) -> None:
+        if self.mode == "view":
+            return
+
+        updates = self._collect_field_updates()
+        if updates is None:
+            await self.app.push_screen_wait(
+                MessageModal(self._last_field_error or "Invalid field.", title="Could not save")
+            )
+            return
+
+        # ALWAYS a trial copy, never self.entry directly — see
+        # ConnectorDetailScreen.action_save()'s identical comment.
+        target_entry = dict(self.entry)
+        for key, value in updates.items():
+            apply_update(target_entry, key, value)
+        if self._inherits_current != self._inherits_initial:
+            apply_update(target_entry, "inherits", self._inherits_current)
+
+        # connector/agent are ALWAYS written explicitly at creation
+        # (bypassing diff semantics) — they're required, and a value the
+        # user never touched must still be recorded rather than left to the
+        # loader's config-order-dependent fallback. Same rule the old
+        # create form had.
+        if self.mode == "create":
+            for key in ("connector", "agent"):
+                value = self.query_one("#" + widget_id(key), Select).value
+                if not value:
+                    await self.app.push_screen_wait(
+                        MessageModal("Connector and agent are required.", title="Could not save")
+                    )
+                    return
+                target_entry[key] = value
+
+        name = target_entry.get("name")
+        if not isinstance(name, str) or not name.strip():
+            await self.app.push_screen_wait(
+                MessageModal("Rule name is required.", title="Could not save")
+            )
+            return
+        duplicate = any(
+            w.get("name") == name
+            for w in self.cfg.watchers_raw
+            if w is not self.entry
+        )
+        if duplicate:
+            await self.app.push_screen_wait(
+                MessageModal(f"A rule named '{name}' already exists.", title="Could not save")
+            )
+            return
+
+        # A rule that can never match anything is a typo, not an intention
+        # (the loader refuses it too — this just says it in form terms
+        # before a generic parser message would).
+        rooms = target_entry.get("rooms") or {}
+        if not isinstance(rooms, dict) or not (
+            rooms.get("include") or rooms.get("direct") or rooms.get("group_direct")
+        ):
+            await self.app.push_screen_wait(
+                MessageModal(
+                    "A rule needs at least one rooms include pattern, or one "
+                    "of the DM opt-ins (direct / group_direct).",
+                    title="Could not save",
+                )
+            )
+            return
+
+        inserted_index: int | None = None
+        if self.mode == "create":
+            # `setdefault` alone isn't enough for a present-but-empty
+            # `watchers:` key (parses to None, which setdefault won't touch).
+            if self.cfg.document.get("watchers") is None:
+                self.cfg.document["watchers"] = []
+            watchers = self.cfg.document["watchers"]
+            watchers.append(target_entry)
+            inserted_index = len(watchers) - 1
+        else:
+            self._install_trial_entry(target_entry)
+        self.cfg.mark_dirty()
+
+        try:
+            self.cfg.save()
+        except (ValueError, FileNotFoundError) as exc:
+            if self.mode == "create" and inserted_index is not None:
+                del self.cfg.document["watchers"][inserted_index]
+            else:
+                self._rollback_trial_entry()
+            await self.app.push_screen_wait(MessageModal(str(exc), title="Could not save"))
+            return
+
+        self.entry = target_entry
+        self.app.pop_screen()
+        app = self.app
+        app.notify(f"Saved rule '{name}'.", severity="information")
+        app.reload_config()  # type: ignore[attr-defined]

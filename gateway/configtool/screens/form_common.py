@@ -1,10 +1,10 @@
 """Shared machinery for the config TUI's entity edit/create forms.
 
-`AgentDetailScreen` was the first (Phase 2); `ConnectorDetailScreen` is the
-second, and `WatcherDetailScreen` (Phase 3) will be the third. Extracted
-here once a second concrete user existed, rather than guessed at up front —
-code review item 10 already flagged the cost of letting screens duplicate
-this kind of machinery independently.
+`AgentDetailScreen` was the first (Phase 2); `ConnectorDetailScreen` the
+second; `RuleDetailScreen` is the third. Extracted here once a second
+concrete user existed, rather than guessed at up front — code review item 10
+already flagged the cost of letting screens duplicate this kind of machinery
+independently.
 
 Implements docs/design/config-tool.md decision 2 ("editing an inherited
 field always writes an explicit per-entry override"): nothing is written to
@@ -183,31 +183,33 @@ def sort_required_first(
 def find_referencing_watcher_labels(
     cfg: EditableConfig, *, connector_name: str | None = None, agent_name: str | None = None
 ) -> list[str]:
-    """Which EXPANDED watchers currently reference the given connector and/or
-    agent name — one label per real watcher, using `expanded_watchers()`
-    (the same real loader that names them everywhere else in the TUI, e.g.
-    the Overview's Watchers tab) rather than re-deriving names from the raw
-    entry. Two things this gets right that a raw-entry-only approach
-    wouldn't: (1) an unnamed watcher's real name is `_auto_watcher_name()`'s
-    `"<connector>-<room>"` (gateway/config.py), not the bare room string;
-    (2) a `rooms: [a, b]` group is N separate real watchers with N separate
-    names, not one joined "a, b" label. If the config doesn't currently
-    load at all, returns [] — `save()`'s own validation remains the backstop
-    for whatever's actually broken; a delete pre-check has nothing useful to
-    say about referencing watchers in a config that doesn't parse.
+    """Which watcher RULES currently reference the given connector and/or
+    agent name — one label per rule, labelled by the rule's own `name`
+    (required on a rule; a malformed entry without one falls back to its
+    document position). Checked against the MERGED view (entry resolved
+    against its own `inherits:` template) rather than the raw entry alone,
+    so a rule whose `connector:`/`agent:` comes only from a template still
+    blocks that connector/agent's deletion.
+
+    A rule with NO connector/agent anywhere (relying on the loader's
+    single-connector / default-agent fallback) is deliberately not matched
+    here: which entity that fallback resolves to shifts with the config
+    itself, so `save()`'s own validate_config() remains the backstop for
+    a deletion that breaks the fallback — same division of labour every
+    pre-check in this module already has.
     """
-    try:
-        expanded = cfg.expanded_watchers()
-    except (ValueError, FileNotFoundError):
-        return []
     labels = []
-    for ew in expanded:
-        w = ew.watcher
-        if connector_name is not None and w.connector != connector_name:
+    for i, entry in enumerate(cfg.watchers_raw):
+        try:
+            merged = cfg.merged_entry("watcher", entry)
+        except (ValueError, FileNotFoundError):
+            merged = entry
+        if connector_name is not None and merged.get("connector") != connector_name:
             continue
-        if agent_name is not None and w.agent != agent_name:
+        if agent_name is not None and merged.get("agent") != agent_name:
             continue
-        labels.append(w.name)
+        name = entry.get("name")
+        labels.append(name if isinstance(name, str) and name else f"watchers[{i}]")
     return labels
 
 
@@ -261,22 +263,14 @@ def find_entries_referencing_template(
     elif kind == "connector":
         entries = [(e.get("name", "?"), e) for e in cfg.connectors_raw]
     else:
-        # Label with the REAL expanded watcher name(s) (matching
-        # `find_referencing_watcher_labels()`'s own naming, and the
-        # Watchers tab), not a synthetic "<connector>/<room>" guess — a raw
-        # entry with a `rooms:` group expands into several real watchers,
-        # matched back to this raw entry by identity (same pattern
-        # `ConnectorDetailScreen._find_own_index()` uses). Falls back to
-        # "?" only if the config doesn't currently load at all (blast-radius
-        # display has nothing better to say in that case either).
-        try:
-            expanded = cfg.expanded_watchers()
-        except (ValueError, FileNotFoundError):
-            expanded = []
+        # A rule's own `name` is required and unique (gateway/config.py's
+        # rule parser), so it IS the label — no expanded-name derivation
+        # left to do. A malformed entry without one falls back to its
+        # document position, matching find_referencing_watcher_labels().
         entries = []
-        for w in cfg.watchers_raw:
-            names = [ew.watcher.name for ew in expanded if ew.raw_entry is w]
-            label = ", ".join(names) if names else (w.get("name") or "?")
+        for i, w in enumerate(cfg.watchers_raw):
+            name = w.get("name")
+            label = name if isinstance(name, str) and name else f"watchers[{i}]"
             entries.append((label, w))
     return [(name, entry) for name, entry in entries if entry.get("inherits") == template_name]
 
@@ -480,6 +474,16 @@ class FormScreen(DetailScreen):
         this to its own `kind` (blocked by referencing agents/connectors/
         watchers instead)."""
         return "watcher"
+
+    def _delete_confirm_message(self) -> str:
+        """The ConfirmModal text `_do_delete()` shows. Overridable so a
+        subclass can append entity-specific consequences (RuleDetailScreen
+        adds the stranded-session/orphaned-job counts design §5.5 requires)
+        without duplicating the whole delete flow."""
+        return (
+            f"Delete {self._entity_noun()} '{self._entity_label()}'? "
+            "This cannot be undone."
+        )
 
     async def action_save(self) -> None:
         raise NotImplementedError
@@ -868,11 +872,7 @@ class FormScreen(DetailScreen):
             return
 
         confirmed = await self.app.push_screen_wait(
-            ConfirmModal(
-                f"Delete {self._entity_noun()} '{self._entity_label()}'? "
-                "This cannot be undone.",
-                confirm_label="Delete",
-            )
+            ConfirmModal(self._delete_confirm_message(), confirm_label="Delete")
         )
         if not confirmed:
             return

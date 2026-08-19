@@ -215,55 +215,6 @@ class TestThroughTheFaultTolerantLoader(unittest.TestCase):
         self.assertEqual(cfg.watcher_rules, [])
 
 
-class TestTheMergeGuardTestsPresenceNotTruthiness(unittest.TestCase):
-    """`entry.get(k)` cannot tell "absent" from "present but falsy".
-
-    Present-but-falsy is exactly what a broken entry looks like, and it was the shape
-    actually shipped: the Docker example config wrote `session_id: ~` and the old docs
-    documented `session_id: null`. Both are refused by the loader, and both read as
-    absent through `.get()` — so the entry stayed eligible as a merge target,
-    `add_watcher_rooms()` would fold a new room into a config that cannot load, and
-    `save()` permits it because its gate blocks only NEWLY introduced errors.
-
-    This is the eighth instance of the truthiness-versus-presence shape in this
-    loader, and the first to appear in a guard whose comment claimed it was deliberate.
-    """
-
-    def _mergeable(self, entry_yaml: str):
-        from gateway.configtool.model import EditableConfig, _watcher_shared_fields
-
-        path = write_config(f"- {entry_yaml}\n")
-        cfg = EditableConfig.load(path)
-        return cfg.find_mergeable_watcher_entry(
-            "rc", "default", _watcher_shared_fields({"connector": "rc", "agent": "default"})
-        )
-
-    def test_a_falsy_session_id_is_not_a_merge_target(self):
-        for literal in ("null", "false", "0", "''"):
-            with self.subTest(literal=literal):
-                self.assertIsNone(
-                    self._mergeable(f"{{connector: rc, agent: default, room: general, session_id: {literal}}}")
-                )
-
-    def test_a_truthy_session_id_is_not_a_merge_target_either(self):
-        self.assertIsNone(
-            self._mergeable("{connector: rc, agent: default, room: general, session_id: ses_abc}")
-        )
-
-    def test_a_falsy_name_is_not_a_merge_target(self):
-        """Same hole, same key set: pyyaml resolves `name: no` to False, and a
-        non-string name is refused at load, so such an entry must not be written to."""
-        self.assertIsNone(
-            self._mergeable("{connector: rc, agent: default, room: general, name: no}")
-        )
-
-    def test_a_clean_entry_is_still_a_merge_target(self):
-        """The guard must not have been widened into "never merge anything"."""
-        self.assertIsNotNone(
-            self._mergeable("{connector: rc, agent: default, room: general}")
-        )
-
-
 class TestTheRuleShapeIsUnchanged(unittest.TestCase):
     """The rule parser already refused `session_id`; this PR must not disturb it."""
 

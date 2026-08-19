@@ -73,8 +73,8 @@ from .form_common import (
     set_widget_value,
     widget_id,
 )
+from .rule_detail import WATCHER_TEMPLATE_DATACLASS_DEFAULTS, WATCHER_TEMPLATE_FIELDS
 from .tool_list_editor import TOOL_LIST_WIDGET_IDS, ToolListEditorMixin, format_tool_rule
-from .watcher_detail import WATCHER_TEMPLATE_DATACLASS_DEFAULTS, WATCHER_TEMPLATE_FIELDS
 
 # kind -> (field specs, dataclass-defaults fallback). Connector is a
 # function of the template's own `type`, so it's resolved per-instance

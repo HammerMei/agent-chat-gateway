@@ -28,7 +28,7 @@ from gateway.configtool.modals import (
 )
 from gateway.configtool.screens.agent_detail import AgentDetailScreen
 from gateway.configtool.screens.overview import OverviewScreen
-from gateway.configtool.screens.watcher_detail import WatcherDetailScreen
+from gateway.configtool.screens.rule_detail import RuleDetailScreen
 
 
 def _write_config(tmp_path: Path, yaml_text: str) -> str:
@@ -124,20 +124,20 @@ class TestNewAgentEntryPoint:
             await pilot.pause()
             assert isinstance(app.screen, TypePickerModal)
 
-    async def test_n_key_on_watchers_tab_opens_the_create_form(self, tmp_path, work_dir):
-        """Config TUI Phase 3: watcher creation is now supported — 'n' opens
-        WatcherDetailScreen directly in create mode, no type picker/detour
-        (connector/agent are plain Select dropdowns in that same form)."""
+    async def test_n_key_on_rules_tab_opens_the_create_form(self, tmp_path, work_dir):
+        """'n' on the Rules tab opens RuleDetailScreen directly in create
+        mode, no type picker/detour (connector/agent are plain Select
+        dropdowns in that same form)."""
         config_path = _write_config(tmp_path, _config_with_one_agent(work_dir))
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            app.screen.query_one("TabbedContent").active = "tab-watchers"
+            app.screen.query_one("TabbedContent").active = "tab-rules"
             await pilot.pause()
 
             await pilot.press("n")
             await pilot.pause()
-            assert isinstance(app.screen, WatcherDetailScreen)
+            assert isinstance(app.screen, RuleDetailScreen)
             assert app.screen.mode == "create"
 
     async def test_cancelling_the_type_picker_returns_to_overview(self, tmp_path, work_dir):
