@@ -208,10 +208,14 @@ class MMClient:
         a test failure names the wait rather than an unpacking error.
         """
         deadline = time.monotonic() + timeout
-        seen = 0
+        # DISTINCT post ids, not a running tally of examinations: the channel is
+        # re-read every interval, so counting each pass reported "examined 60
+        # post(s)" for two posts looked at thirty times — a diagnostic that
+        # misdirects whoever reads the failure.
+        seen: set[str] = set()
         while time.monotonic() < deadline:
             for post in self.get_posts(channel_id, since_ms=after_ts_ms):
-                seen += 1
+                seen.add(post.get("id", ""))
                 # A post's own type is non-empty for system messages
                 # (system_join_channel and friends) — the same filter the
                 # connector applies, so a join notice cannot satisfy a test.
@@ -222,7 +226,7 @@ class MMClient:
             time.sleep(interval)
         raise AssertionError(
             f"No matching post in channel {channel_id} within {timeout}s "
-            f"(examined {seen} post(s) after ts={after_ts_ms})"
+            f"(saw {len(seen)} distinct post(s) after ts={after_ts_ms})"
         )
 
     # ── Readiness ────────────────────────────────────────────────────────────

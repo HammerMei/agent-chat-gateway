@@ -104,7 +104,7 @@ e2e-dump: ## Write full container logs + state to ./e2e-logs (same set CI upload
 	@docker compose -f $(E2E_COMPOSE) config > e2e-logs/resolved-compose.yml 2>&1 || true
 	@docker exec acg-e2e sh -c 'cat /root/.agent-chat-gateway/gateway.log' \
 	    > e2e-logs/acg-gateway.log 2>&1 || true
-	@docker exec acg-e2e agent-chat-gateway list > e2e-logs/acg-list.txt 2>&1 || true
+	@docker exec acg-e2e agent-chat-gateway list --all > e2e-logs/acg-list.txt 2>&1 || true
 	@echo "==> Wrote e2e-logs/ ($$(ls e2e-logs | wc -l | tr -d ' ') files)"
 
 e2e-probe: ## Re-verify the RC platform behaviour design §6 depends on, against the running stack
@@ -113,6 +113,25 @@ e2e-probe: ## Re-verify the RC platform behaviour design §6 depends on, against
 	    --probe-user test_user --probe-password test_user_e2e_2024 \
 	    --admin-user admin --admin-password admin_e2e_2024 \
 	    --member-room acg-e2e-claude --outside-room acg-e2e-outside
+
+# The probe answers a different question from the E2E test, which is why both
+# exist: this one asks what MATTERMOST does (no ACG involved), and is what to
+# reach for when a version bump makes the pin guard fail. The E2E test asks
+# whether ACG honours it. A probe pass with an E2E failure means the runtime
+# regressed; both failing means the platform changed under us.
+#
+# NOTE: this drives the acg_bot ACCOUNT — the same one the connector uses —
+# and its membership isolation case JOINS the bot to the outside channel and
+# removes it again. A clean run leaves membership as it found it; a run killed
+# partway can leave the bot inside, which is precisely the state
+# test_mm_membership_delivery.py refuses to run in. `mm_setup.py` puts it
+# back, and the test says so when it trips.
+e2e-probe-mm: ## Re-verify the Mattermost platform behaviour design §6.2/§6.3 depends on
+	uv run python scripts/probe_a2_mm.py \
+	    --url $(E2E_MM_URL) --team acg-e2e \
+	    --probe-user acg_bot --probe-password acg_bot_e2e_2024 \
+	    --admin-user mmadmin --admin-password mmadmin_e2e_2024 \
+	    --member-channel acg-e2e-mm-claude --outside-channel acg-e2e-mm-outside
 
 e2e-down: ## Stop and remove all E2E containers and volumes
 	docker compose -f $(E2E_COMPOSE) down -v
