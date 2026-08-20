@@ -1,13 +1,32 @@
 """pytest fixtures for E2E tests.
 
 Session-scoped:
-    rc_setup    — runs setup.py; verifies RC is reachable
-    acg         — waits for ACG Docker container to be ready
+    rc_setup     — runs setup.py; verifies RC is reachable
+    mm_setup     — runs mm_setup.py; verifies Mattermost is reachable
+    acg          — waits for ACG Docker container to be ready
+    mm_connected — asserts the mm-e2e CONNECTOR itself came up inside ACG
 
 Function-scoped:
     test_client  — RCClient logged in as test_user
     admin_client — RCClient logged in as admin
     e2e_room     — parameterized: "dm" (→ OpenCode) or "channel" (→ Claude Code)
+
+Both platforms live in one ACG container with one connector each, and MM's
+boot failures split in a way worth knowing before reading a red suite:
+
+* An unresolvable **team** or an unusable identity is *fatal to the whole
+  gateway* — `resolve_team` raises out of `connect()`, and the daemon treats a
+  connect-phase failure as fatal and exits 1. So this one shows up as the
+  `acg` fixture failing for every test, RC's included, not as an MM-specific
+  failure. Sharing one container buys a shared blast radius.
+* Anything after that — a socket that opens and then drops, an allow-list that
+  rejects the poster — leaves the gateway up and answering, and an MM test's
+  only symptom is a 120-second timeout indistinguishable from a slow agent.
+
+`mm_connected` covers the second class, and it is why it greps for a line
+logged *after* `resolve_team()` rather than checking the process is alive.
+Same taste as `_container_missing` below — name the real failure at second
+zero instead of inferring it from a wait that never ends.
 """
 from __future__ import annotations
 
@@ -22,6 +41,8 @@ import pytest
 
 # Allow importing rc_client and setup from the same e2e directory
 sys.path.insert(0, str(Path(__file__).parent))
+import mm_setup as _mm
+from mm_client import MMClient
 from rc_client import RCClient
 from setup import RC_URL
 from setup import setup as _run_setup
@@ -34,6 +55,14 @@ ACG_CONTAINER = "acg-e2e"
 BOT_USERNAME = "acg_bot"
 ACG_READY_TIMEOUT = 180  # seconds — includes OpenCode pre-warm (~60s)
 ACG_READY_INTERVAL = 5
+
+# Must match the connector name in tests/e2e/acg-config/config.yaml. Pinned by
+# tests/unit/test_e2e_mm_wiring.py so a rename fails without Docker.
+MM_CONNECTOR_NAME = "mm-e2e"
+ACG_LOG_PATH = "/root/.agent-chat-gateway/gateway.log"
+# Logged by MattermostConnector.connect() — and logged *after* resolve_team(),
+# so its presence also proves the configured team resolved.
+MM_CONNECTED_MARKER = "MattermostConnector connected to"
 
 
 # ── Session fixtures ──────────────────────────────────────────────────────────
@@ -201,6 +230,88 @@ def _wait_for_acg(timeout: float, interval: float) -> None:
         f"Last status output: {last_output}\n"
         f"Container logs (last 50 lines):\n{logs}"
     )
+
+
+# ── Mattermost fixtures ───────────────────────────────────────────────────────
+
+
+@pytest.fixture(scope="session")
+def mm_setup() -> dict[str, Any]:
+    """Bootstrap Mattermost and return the config dict.
+
+    Expects the container to already be running (started by Makefile / CI).
+    Re-running is harmless: `mm_setup.setup()` is idempotent.
+    """
+    mm_url = os.environ.get("E2E_MM_URL", _mm.MM_URL)
+    try:
+        return _mm.setup(mm_url)
+    except Exception as exc:
+        pytest.fail(
+            f"Mattermost E2E setup failed — is Mattermost running?\n"
+            f"  Start with: make e2e-up\n"
+            f"  Error: {type(exc).__name__}: {exc}"
+        )
+
+
+@pytest.fixture(scope="session")
+def mm_connected(acg: None, mm_setup: dict[str, Any]) -> None:
+    """Fail fast unless the mm-e2e connector actually came up inside ACG.
+
+    `acg` becoming ready means the *gateway* is answering, which it can do
+    with the MM socket down — the fatal half of MM's boot failures (see the
+    module docstring) has already taken the `acg` fixture with it by the time
+    this runs, so what is left to check is the half that does not. Depending
+    on this fixture converts that half from a 120-second timeout in whichever
+    MM test ran first into a named failure before any message is sent.
+    """
+    log = subprocess.run(
+        ["docker", "exec", ACG_CONTAINER, "sh", "-c", f"cat {ACG_LOG_PATH}"],
+        capture_output=True,
+        text=True,
+    ).stdout
+    if MM_CONNECTED_MARKER in log:
+        return
+
+    # Give the operator the lines that explain it rather than "not found".
+    mm_lines = [
+        line
+        for line in log.splitlines()
+        if "attermost" in line or MM_CONNECTOR_NAME in line
+    ]
+    pytest.fail(
+        f"The '{MM_CONNECTOR_NAME}' connector never reported connecting "
+        f"(no {MM_CONNECTED_MARKER!r} in {ACG_LOG_PATH}).\n"
+        "The gateway is up, so this is the connector specifically: a bad "
+        "account, an unresolvable team, or a websocket that could not open. "
+        "Most likely the MM bootstrap did not run before ACG started — "
+        "'make e2e-up' does both in order; starting the container by hand "
+        "does not.\n"
+        "Mattermost-related log lines:\n  "
+        + ("\n  ".join(mm_lines[-25:]) if mm_lines else "(none at all)")
+    )
+
+
+@pytest.fixture(scope="session")
+def mm_test_client(mm_setup: dict[str, Any]) -> MMClient:
+    """MM client logged in as the human test user."""
+    c = MMClient(mm_setup["mm_url"])
+    c.login(mm_setup["test_user_username"], mm_setup["test_user_password"])
+    yield c
+    c.close()
+
+
+@pytest.fixture(scope="session")
+def mm_admin_client(mm_setup: dict[str, Any]) -> MMClient:
+    """MM client logged in as the system admin.
+
+    Membership questions need this one: a non-member cannot read even its own
+    membership row (403), so establishing that the bot is NOT in a channel
+    requires admin eyes — see MMClient.is_channel_member.
+    """
+    c = MMClient(mm_setup["mm_url"])
+    c.login(mm_setup["admin_username"], mm_setup["admin_password"])
+    yield c
+    c.close()
 
 
 # ── Function-scoped fixtures ──────────────────────────────────────────────────

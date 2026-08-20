@@ -15,6 +15,27 @@ connectors:
   reply_in_thread: false
   permission_reply_in_thread: false
   context_inject_files: []
+# One ACG, one connector per platform. `server.url` uses the compose service
+# name because this resolves from INSIDE the container; the host-side test
+# clients use localhost:8065.
+- name: mm-e2e
+  type: mattermost
+  server:
+    url: http://mattermost:8065
+    team: acg-e2e
+    username: acg_bot
+    password: acg_bot_e2e_2024
+  allowed_users:
+    owners:
+    - test_user
+    guests: []
+  attachments:
+    max_file_size_mb: 10
+    download_timeout: 30
+  reply_in_thread: false
+  # Mattermost defaults this one to true, unlike Rocket.Chat. Pinned to false
+  # so a reply lands in the channel the test is polling.
+  permission_reply_in_thread: false
 agent_templates:
   e2e-default:
     new_session_args: []
@@ -64,6 +85,9 @@ watcher_templates:
   e2e-default:
     connector: rc-e2e
     context_inject_files: []
+  e2e-mm-default:
+    connector: mm-e2e
+    context_inject_files: []
 watchers:
 - name: e2e-dm
   inherits: e2e-default
@@ -88,3 +112,26 @@ watchers:
     include:
     - acg-e2e-opencode-permission
   agent: e2e-opencode-permission
+# ── Mattermost ────────────────────────────────────────────────────────────────
+# Both MM rules use the Claude agent: the MM coverage is a focused smoke plus
+# the one behaviour only E2E can show, and pointing a rule at OpenCode would
+# add its ~60s cold start for nothing.
+- name: e2e-mm-dm
+  inherits: e2e-mm-default
+  rooms:
+    direct: true
+  agent: e2e-claude
+- name: e2e-mm-channel
+  inherits: e2e-mm-default
+  rooms:
+    # The glob DELIBERATELY matches acg-e2e-mm-outside as well as
+    # acg-e2e-mm-claude. The bot can read that channel but is not a member of
+    # it, and design §6.2 is that Mattermost delivers no event at all for such
+    # a channel — so the only thing preventing a reply there is the absence of
+    # an event, not the rule declining to match.
+    #
+    # Narrowing this glob to the member channel would make
+    # test_mm_membership_delivery.py pass for the wrong reason, and silently.
+    include:
+    - acg-e2e-mm-*
+  agent: e2e-claude
