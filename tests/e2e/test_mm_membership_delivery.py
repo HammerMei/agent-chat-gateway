@@ -26,6 +26,16 @@ Three things make it a test rather than a sleep-and-hope:
    consuming events after the outside message — which is what makes this a
    causal bound instead of a magic sleep. A pure negative assertion would pass
    just as happily against a dead gateway.
+
+There is deliberately **no MM warm-up fixture**, and this test absorbs the
+Claude cold start inside its own 120s wait. Collection order puts this file
+before `test_mm_ping_pong.py`, so it pays that cost rather than avoiding it.
+That is a decision, not an oversight: the agent `_warmup_agents` exists for is
+OpenCode, which initialises its subprocess lazily and can take 60–90s, and
+both MM rules deliberately point at Claude precisely so this suite never waits
+on that. If a future MM rule uses OpenCode, the warm-up ping belongs in the
+`mm_connected` fixture — not in `_warmup_agents`, which would couple the
+Rocket.Chat path to Mattermost seeding.
 """
 from __future__ import annotations
 
