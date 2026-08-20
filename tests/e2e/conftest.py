@@ -63,6 +63,9 @@ ACG_LOG_PATH = "/root/.agent-chat-gateway/gateway.log"
 # Logged by MattermostConnector.connect() — and logged *after* resolve_team(),
 # so its presence also proves the configured team resolved.
 MM_CONNECTED_MARKER = "MattermostConnector connected to"
+# Short: the connector connects during startup, so if the gateway answers at
+# all this is a matter of the log file appearing, not of waiting for work.
+MM_CONNECTED_TIMEOUT = 30
 
 
 # ── Session fixtures ──────────────────────────────────────────────────────────
@@ -263,14 +266,25 @@ def mm_connected(acg: None, mm_setup: dict[str, Any]) -> None:
     this runs, so what is left to check is the half that does not. Depending
     on this fixture converts that half from a 120-second timeout in whichever
     MM test ran first into a named failure before any message is sent.
+
+    Polled rather than read once, because `agent-chat-gateway status` succeeds
+    before the log file exists: observed right after a container recreate, the
+    daemon answered `status` at ~5s while `cat gateway.log` still returned "No
+    such file or directory". Reading once would turn that race into a failure
+    claiming the connector never connected, which is the opposite of this
+    fixture's job.
     """
-    log = subprocess.run(
-        ["docker", "exec", ACG_CONTAINER, "sh", "-c", f"cat {ACG_LOG_PATH}"],
-        capture_output=True,
-        text=True,
-    ).stdout
-    if MM_CONNECTED_MARKER in log:
-        return
+    deadline = time.monotonic() + MM_CONNECTED_TIMEOUT
+    log = ""
+    while time.monotonic() < deadline:
+        log = subprocess.run(
+            ["docker", "exec", ACG_CONTAINER, "sh", "-c", f"cat {ACG_LOG_PATH}"],
+            capture_output=True,
+            text=True,
+        ).stdout
+        if MM_CONNECTED_MARKER in log:
+            return
+        time.sleep(2)
 
     # Give the operator the lines that explain it rather than "not found".
     mm_lines = [
@@ -279,8 +293,9 @@ def mm_connected(acg: None, mm_setup: dict[str, Any]) -> None:
         if "attermost" in line or MM_CONNECTOR_NAME in line
     ]
     pytest.fail(
-        f"The '{MM_CONNECTOR_NAME}' connector never reported connecting "
-        f"(no {MM_CONNECTED_MARKER!r} in {ACG_LOG_PATH}).\n"
+        f"The '{MM_CONNECTOR_NAME}' connector never reported connecting within "
+        f"{MM_CONNECTED_TIMEOUT}s (no {MM_CONNECTED_MARKER!r} in "
+        f"{ACG_LOG_PATH}).\n"
         "The gateway is up, so this is the connector specifically: a bad "
         "account, an unresolvable team, or a websocket that could not open. "
         "Most likely the MM bootstrap did not run before ACG started — "
