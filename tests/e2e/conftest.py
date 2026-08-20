@@ -314,6 +314,78 @@ def mm_admin_client(mm_setup: dict[str, Any]) -> MMClient:
     c.close()
 
 
+@pytest.fixture(scope="session")
+def mm_bot_client(mm_setup: dict[str, Any]) -> MMClient:
+    """MM client logged in AS THE BOT — a second session for the same account
+    the connector uses.
+
+    A test logging in as the bot is unusual enough to justify: design §6.2
+    insists that readability be established with the *probe's own* token,
+    because an admin-token read proves nothing about what the bot can see, and
+    "no event" would then be indistinguishable from "no access". This is the
+    only way to ask that question.
+
+    Safe to do concurrently with the connector, and verified against the live
+    server rather than assumed: Mattermost keeps concurrent sessions per
+    account (§6.3 observed a DM delivered to two sockets of one account), and
+    this client opens no websocket, so it consumes no events the connector
+    needs.
+    """
+    c = MMClient(mm_setup["mm_url"])
+    c.login(mm_setup["bot_username"], mm_setup["bot_password"])
+    yield c
+    c.close()
+
+
+@pytest.fixture(scope="session", params=["dm", "channel"])
+def mm_room(
+    request: pytest.FixtureRequest,
+    mm_setup: dict[str, Any],
+    mm_test_client: MMClient,
+) -> dict[str, Any]:
+    """Parameterized Mattermost room: runs each test twice.
+
+    Both rooms route to the Claude agent — unlike the RC fixture, which splits
+    DM/channel across OpenCode and Claude. The MM coverage is a focused smoke
+    plus the membership behaviour, and a second cold-starting runtime would
+    buy nothing.
+
+    `mention_prefix` is not cosmetic symmetry with the RC fixture: the MM
+    connector's `require_mention` defaults to true and the gate exempts 1:1
+    DMs only, so a channel message without the mention is filtered out and the
+    test would time out with the agent never having been asked.
+    """
+    if request.param == "dm":
+        bot = mm_test_client.get_user(mm_setup["bot_username"])
+        assert bot, f"bot user {mm_setup['bot_username']!r} not found on Mattermost"
+        return {
+            "id": mm_test_client.get_dm_channel_id(bot["id"]),
+            "type": "dm",
+            "name": f"DM with {mm_setup['bot_username']}",
+            "mention_prefix": "",
+        }
+    return {
+        "id": mm_setup["member_channel_id"],
+        "type": "channel",
+        "name": mm_setup["member_channel"],
+        "mention_prefix": f"@{mm_setup['bot_username']} ",
+    }
+
+
+def acg_watcher_list() -> str:
+    """`agent-chat-gateway list --all` as seen inside the container.
+
+    `--all` matters: idle watchers are hidden by default, so a plain `list`
+    can report "No watchers" for a room that has one.
+    """
+    result = subprocess.run(
+        ["docker", "exec", ACG_CONTAINER, "agent-chat-gateway", "list", "--all"],
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout + result.stderr
+
+
 # ── Function-scoped fixtures ──────────────────────────────────────────────────
 
 

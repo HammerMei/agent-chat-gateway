@@ -151,12 +151,22 @@ services:
     volumes:
       - acg_e2e_mm_data:/mattermost/data
       - acg_e2e_mm_config:/mattermost/config
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8065/api/v4/system/ping || exit 1"]
-      interval: 5s
-      timeout: 5s
-      retries: 40
-      start_period: 60s
+    # NO healthcheck override here on purpose — the image ships its own,
+    # `["CMD", "/mattermost/bin/mmctl", "system", "status", "--local"]`, and it
+    # is the only kind that can work: this image has NO SHELL and no curl, so
+    # every `CMD-SHELL` probe fails with `stat /bin/sh: no such file or
+    # directory` and the container sits unhealthy forever while the server is
+    # in fact serving. That is exactly how it failed here — `/system/ping`
+    # answered 200 from the host while compose refused to start ACG on an
+    # "unhealthy" dependency.
+    #
+    # The vendor probe also checks more than a port: its output reports
+    # database and filestore status, not just that HTTP is up.
+    #
+    # The retry budget is the image's too (30s interval, 10s timeout, no
+    # start_period). Boot is well inside `wait_for_mm`'s window, and the
+    # bootstrap step in `make e2e-up` is the readiness gate that actually
+    # matters — see the comment above the target.
 
   acg:
     # Build from the current branch source so that unreleased features (e.g.

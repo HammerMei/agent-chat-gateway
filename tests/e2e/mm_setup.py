@@ -14,10 +14,21 @@ Steps:
      below hangs off it.
   4. Create the bot account ACG logs in as, and the human test account.
   5. Create the member channel, with bot + test user in it.
-  6. Create an ADMIN-ONLY channel. This one exists for design §6.2: a public
-     channel is READABLE by a non-member, and the finding the MM router
-     depends on is that a post there produces no websocket event at all. A
-     channel the bot can read but has not joined is the only way to test it.
+  6. Create the "outside" channel — the human test user joins it, the bot
+     does NOT. This one exists for design §6.2: a public channel is READABLE
+     by a non-member, and the finding the MM router depends on is that a post
+     there produces no websocket event at all. A channel the bot can read but
+     has not joined is the only way to test that.
+
+     The test user has to be a member for two reasons, and both matter.
+     Mattermost refuses a post from a non-member (so somebody has to be in
+     there to post at all), and — the load-bearing one — the poster must be
+     an ALLOW-LISTED user. Posting as the admin instead would work at the
+     Mattermost level and quietly ruin the test: `mmadmin` is not in
+     `allowed_users.owners`, so a missing reply would be explained just as
+     well by the sender filter as by the missing event, and the test could
+     not tell which. With the test user posting, the only difference between
+     this channel and the member channel is the BOT's membership row.
 """
 
 from __future__ import annotations
@@ -97,15 +108,25 @@ def setup(mm_url: str = MM_URL) -> dict[str, Any]:
         for username in (BOT_USERNAME, TEST_USER_USERNAME):
             admin.add_channel_member(channel["id"], users[username])
 
-        # ── Admin-only channel, for the §6.2 membership-delivery test ───────
+        # ── The "outside" channel, for the §6.2 membership-delivery test ────
+        # test_user in, bot deliberately out — see step 6 of the module
+        # docstring for why the poster must be the allow-listed human and not
+        # the admin.
         outside = admin.get_channel(team_id, OUTSIDE_CHANNEL)
         if outside is None:
             print(
-                f"[mm-setup] Creating channel '{OUTSIDE_CHANNEL}' (admin only) ...", flush=True
+                f"[mm-setup] Creating channel '{OUTSIDE_CHANNEL}' "
+                "(test_user joins, bot stays out) ...",
+                flush=True,
             )
             outside = admin.create_channel(team_id, OUTSIDE_CHANNEL)
         else:
             print(f"[mm-setup] Channel '{OUTSIDE_CHANNEL}' exists.", flush=True)
+        admin.add_channel_member(outside["id"], users[TEST_USER_USERNAME])
+        # Belt and braces: if a previous run or a stray click put the bot in
+        # here, the membership test would fail for a reason that has nothing
+        # to do with the code under test. Take it back out.
+        admin.remove_channel_member(outside["id"], users[BOT_USERNAME])
 
     print("[mm-setup] Done.", flush=True)
     return {
