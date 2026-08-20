@@ -1,0 +1,243 @@
+"""Minimal synchronous Mattermost API client for the E2E suite.
+
+Deliberately mirrors `rc_client.RCClient`'s shape — same method names where
+the concept is the same (`login`, `create_user`, `create_channel`,
+`post_message`, `poll_for_message`) — so a test reads the same against either
+platform and the two suites stay comparable.
+
+Where the platforms genuinely differ, the difference is in the signature
+rather than hidden:
+
+* **Channels are scoped to a team.** Every channel lookup takes a `team_id`,
+  because a channel name is unique only within a team (design §6.3) — which
+  is exactly why an ACG connector is scoped to one team.
+* **DMs belong to no team** and are created from the two user ids, not from a
+  username.
+* Auth is a bearer token from the login response's ``Token`` header, not the
+  header pair Rocket.Chat uses.
+
+The async equivalents of most of these calls already existed in
+`scripts/probe_a2_mm.py`, which is where the API surface was first pinned
+down; this is the sync, test-facing version of the same knowledge.
+"""
+
+from __future__ import annotations
+
+import time
+from typing import Any, Callable
+
+import httpx
+
+_API = "/api/v4"
+
+
+class MMClient:
+    """One authenticated Mattermost session."""
+
+    def __init__(self, base_url: str, timeout: float = 30.0) -> None:
+        self.base_url = base_url.rstrip("/")
+        self._client = httpx.Client(base_url=self.base_url + _API, timeout=timeout)
+        self.token: str | None = None
+        self.user_id: str | None = None
+        self.username: str | None = None
+
+    def close(self) -> None:
+        self._client.close()
+
+    def __enter__(self) -> "MMClient":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    # ── Auth ─────────────────────────────────────────────────────────────────
+
+    def login(self, username: str, password: str) -> "MMClient":
+        resp = self._client.post(
+            "/users/login", json={"login_id": username, "password": password}
+        )
+        resp.raise_for_status()
+        # The token arrives as a RESPONSE HEADER, not in the body.
+        self.token = resp.headers["Token"]
+        self.user_id = resp.json()["id"]
+        self.username = username
+        self._client.headers.update({"Authorization": f"Bearer {self.token}"})
+        return self
+
+    # ── Users ────────────────────────────────────────────────────────────────
+
+    def create_user(self, username: str, password: str, email: str | None = None) -> dict[str, Any]:
+        """Create a user. The FIRST user created on a fresh server becomes the
+        system admin — which is how the E2E admin account comes into
+        existence, since there is no other bootstrap path over the API."""
+        resp = self._client.post(
+            "/users",
+            json={
+                "username": username,
+                "password": password,
+                "email": email or f"{username}@e2e.local",
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_user(self, username: str) -> dict[str, Any] | None:
+        resp = self._client.get(f"/users/username/{username}")
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.json()
+
+    def user_exists(self, username: str) -> bool:
+        return self.get_user(username) is not None
+
+    # ── Teams ────────────────────────────────────────────────────────────────
+
+    def create_team(self, name: str, display_name: str | None = None) -> dict[str, Any]:
+        resp = self._client.post(
+            "/teams",
+            json={"name": name, "display_name": display_name or name, "type": "O"},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_team(self, name: str) -> dict[str, Any] | None:
+        resp = self._client.get(f"/teams/name/{name}")
+        if resp.status_code in (403, 404):
+            return None
+        resp.raise_for_status()
+        return resp.json()
+
+    def add_team_member(self, team_id: str, user_id: str) -> None:
+        resp = self._client.post(
+            f"/teams/{team_id}/members", json={"team_id": team_id, "user_id": user_id}
+        )
+        # Already a member is not a failure worth raising on.
+        if resp.status_code not in (200, 201, 400, 409):
+            resp.raise_for_status()
+
+    # ── Channels ─────────────────────────────────────────────────────────────
+
+    def create_channel(
+        self, team_id: str, name: str, display_name: str | None = None
+    ) -> dict[str, Any]:
+        resp = self._client.post(
+            "/channels",
+            json={
+                "team_id": team_id,
+                "name": name,
+                "display_name": display_name or name,
+                "type": "O",
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_channel(self, team_id: str, name: str) -> dict[str, Any] | None:
+        """By NAME WITHIN A TEAM — a channel name is not a global identifier
+        on Mattermost (design §6.3)."""
+        resp = self._client.get(f"/teams/{team_id}/channels/name/{name}")
+        if resp.status_code in (403, 404):
+            return None
+        resp.raise_for_status()
+        return resp.json()
+
+    def add_channel_member(self, channel_id: str, user_id: str) -> None:
+        resp = self._client.post(f"/channels/{channel_id}/members", json={"user_id": user_id})
+        if resp.status_code not in (200, 201, 400, 409):
+            resp.raise_for_status()
+
+    def remove_channel_member(self, channel_id: str, user_id: str) -> None:
+        resp = self._client.delete(f"/channels/{channel_id}/members/{user_id}")
+        if resp.status_code not in (200, 404):
+            resp.raise_for_status()
+
+    def is_channel_member(self, channel_id: str, user_id: str) -> bool:
+        """Uses THIS session's token, so read the result carefully: a
+        non-member cannot query even its own membership row and gets 403,
+        which is why design §6.2 leans on an ADMIN-token lookup (404) to
+        establish non-membership. Call this from an admin session."""
+        resp = self._client.get(f"/channels/{channel_id}/members/{user_id}")
+        return resp.status_code == 200
+
+    def get_dm_channel_id(self, other_user_id: str) -> str:
+        """A DM channel belongs to no team and is addressed by the pair of
+        user ids (design §6.3)."""
+        assert self.user_id, "login() first"
+        resp = self._client.post("/channels/direct", json=[self.user_id, other_user_id])
+        resp.raise_for_status()
+        return resp.json()["id"]
+
+    # ── Messages ─────────────────────────────────────────────────────────────
+
+    def post_message(self, channel_id: str, message: str, root_id: str = "") -> dict[str, Any]:
+        body: dict[str, Any] = {"channel_id": channel_id, "message": message}
+        if root_id:
+            body["root_id"] = root_id
+        resp = self._client.post("/posts", json=body)
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_posts(self, channel_id: str, since_ms: int | None = None) -> list[dict[str, Any]]:
+        """Posts in the channel, oldest first.
+
+        `since` is milliseconds. Mattermost returns `{order: [...ids],
+        posts: {id: post}}` with `order` NEWEST first, so this reverses it to
+        match `rc_client.get_messages()`'s oldest-first contract.
+        """
+        params: dict[str, Any] = {}
+        if since_ms is not None:
+            params["since"] = since_ms
+        resp = self._client.get(f"/channels/{channel_id}/posts", params=params)
+        resp.raise_for_status()
+        payload = resp.json()
+        posts = payload.get("posts", {})
+        return [posts[pid] for pid in reversed(payload.get("order", [])) if pid in posts]
+
+    def poll_for_message(
+        self,
+        channel_id: str,
+        after_ts_ms: int,
+        predicate: Callable[[dict[str, Any]], bool],
+        timeout: float = 120.0,
+        interval: float = 2.0,
+    ) -> dict[str, Any]:
+        """Wait for a post created after `after_ts_ms` satisfying `predicate`.
+
+        Mirrors `rc_client.poll_for_message`, including raising on timeout so
+        a test failure names the wait rather than an unpacking error.
+        """
+        deadline = time.monotonic() + timeout
+        seen = 0
+        while time.monotonic() < deadline:
+            for post in self.get_posts(channel_id, since_ms=after_ts_ms):
+                seen += 1
+                # A post's own type is non-empty for system messages
+                # (system_join_channel and friends) — the same filter the
+                # connector applies, so a join notice cannot satisfy a test.
+                if post.get("type"):
+                    continue
+                if predicate(post):
+                    return post
+            time.sleep(interval)
+        raise AssertionError(
+            f"No matching post in channel {channel_id} within {timeout}s "
+            f"(examined {seen} post(s) after ts={after_ts_ms})"
+        )
+
+    # ── Readiness ────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def wait_for_mm(base_url: str, timeout: float = 300.0, interval: float = 3.0) -> None:
+        deadline = time.monotonic() + timeout
+        last = ""
+        while time.monotonic() < deadline:
+            try:
+                resp = httpx.get(base_url.rstrip("/") + _API + "/system/ping", timeout=5)
+                if resp.status_code == 200:
+                    return
+                last = f"HTTP {resp.status_code}"
+            except Exception as exc:  # noqa: BLE001 — any transport error means "not yet"
+                last = str(exc)
+            time.sleep(interval)
+        raise RuntimeError(f"Mattermost at {base_url} not ready within {timeout}s ({last})")

@@ -1,0 +1,138 @@
+"""Bootstrap the Mattermost side of the E2E environment (idempotent).
+
+Mirrors `setup.py`'s job for Rocket.Chat, and is separate for one structural
+reason rather than tidiness: **Mattermost has no admin-bootstrap environment
+variables.** Rocket.Chat takes `ADMIN_USERNAME`/`ADMIN_PASS` and creates the
+account on first boot; Mattermost does not, and instead makes the FIRST user
+created over the API the system admin. So the admin account has to be created
+here, in order, before anything that needs admin rights.
+
+Steps:
+  1. Wait for the server.
+  2. Create the system admin (first user wins) — or log in if it exists.
+  3. Create the team. Channels are team-scoped (design §6.3), so everything
+     below hangs off it.
+  4. Create the bot account ACG logs in as, and the human test account.
+  5. Create the member channel, with bot + test user in it.
+  6. Create an ADMIN-ONLY channel. This one exists for design §6.2: a public
+     channel is READABLE by a non-member, and the finding the MM router
+     depends on is that a post there produces no websocket event at all. A
+     channel the bot can read but has not joined is the only way to test it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from typing import Any
+
+from mm_client import MMClient
+
+MM_URL = "http://localhost:8065"
+
+TEAM_NAME = "acg-e2e"
+
+ADMIN_USERNAME = "mmadmin"
+ADMIN_PASSWORD = "mmadmin_e2e_2024"
+
+BOT_USERNAME = "acg_bot"
+BOT_PASSWORD = "acg_bot_e2e_2024"
+
+TEST_USER_USERNAME = "test_user"
+TEST_USER_PASSWORD = "test_user_e2e_2024"
+
+# Bot + test user are members here.
+MEMBER_CHANNEL = "acg-e2e-mm-claude"
+# Admin only — see the module docstring's step 6.
+OUTSIDE_CHANNEL = "acg-e2e-mm-outside"
+
+
+def setup(mm_url: str = MM_URL) -> dict[str, Any]:
+    print(f"[mm-setup] Waiting for Mattermost at {mm_url} ...", flush=True)
+    MMClient.wait_for_mm(mm_url)
+    print("[mm-setup] Mattermost is up.", flush=True)
+
+    with MMClient(mm_url) as admin:
+        # ── System admin: the first user created wins the role ───────────────
+        try:
+            admin.login(ADMIN_USERNAME, ADMIN_PASSWORD)
+            print(f"[mm-setup] Admin '{ADMIN_USERNAME}' already exists — logged in.", flush=True)
+        except Exception:
+            print(f"[mm-setup] Creating system admin '{ADMIN_USERNAME}' ...", flush=True)
+            admin.create_user(ADMIN_USERNAME, ADMIN_PASSWORD)
+            admin.login(ADMIN_USERNAME, ADMIN_PASSWORD)
+
+        # ── Team ────────────────────────────────────────────────────────────
+        team = admin.get_team(TEAM_NAME)
+        if team is None:
+            print(f"[mm-setup] Creating team '{TEAM_NAME}' ...", flush=True)
+            team = admin.create_team(TEAM_NAME)
+        else:
+            print(f"[mm-setup] Team '{TEAM_NAME}' exists.", flush=True)
+        team_id = team["id"]
+
+        # ── Accounts ────────────────────────────────────────────────────────
+        users: dict[str, str] = {}
+        for username, password in (
+            (BOT_USERNAME, BOT_PASSWORD),
+            (TEST_USER_USERNAME, TEST_USER_PASSWORD),
+        ):
+            existing = admin.get_user(username)
+            if existing is None:
+                print(f"[mm-setup] Creating user '{username}' ...", flush=True)
+                existing = admin.create_user(username, password)
+            else:
+                print(f"[mm-setup] User '{username}' exists.", flush=True)
+            users[username] = existing["id"]
+            admin.add_team_member(team_id, existing["id"])
+
+        # ── Member channel: bot + test user ─────────────────────────────────
+        channel = admin.get_channel(team_id, MEMBER_CHANNEL)
+        if channel is None:
+            print(f"[mm-setup] Creating channel '{MEMBER_CHANNEL}' ...", flush=True)
+            channel = admin.create_channel(team_id, MEMBER_CHANNEL)
+        else:
+            print(f"[mm-setup] Channel '{MEMBER_CHANNEL}' exists — ensuring members.", flush=True)
+        for username in (BOT_USERNAME, TEST_USER_USERNAME):
+            admin.add_channel_member(channel["id"], users[username])
+
+        # ── Admin-only channel, for the §6.2 membership-delivery test ───────
+        outside = admin.get_channel(team_id, OUTSIDE_CHANNEL)
+        if outside is None:
+            print(
+                f"[mm-setup] Creating channel '{OUTSIDE_CHANNEL}' (admin only) ...", flush=True
+            )
+            outside = admin.create_channel(team_id, OUTSIDE_CHANNEL)
+        else:
+            print(f"[mm-setup] Channel '{OUTSIDE_CHANNEL}' exists.", flush=True)
+
+    print("[mm-setup] Done.", flush=True)
+    return {
+        "mm_url": mm_url,
+        "team": TEAM_NAME,
+        "team_id": team_id,
+        "admin_username": ADMIN_USERNAME,
+        "admin_password": ADMIN_PASSWORD,
+        "bot_username": BOT_USERNAME,
+        "bot_password": BOT_PASSWORD,
+        "test_user_username": TEST_USER_USERNAME,
+        "test_user_password": TEST_USER_PASSWORD,
+        "member_channel": MEMBER_CHANNEL,
+        "member_channel_id": channel["id"],
+        "outside_channel": OUTSIDE_CHANNEL,
+        "outside_channel_id": outside["id"],
+        "bot_user_id": users[BOT_USERNAME],
+        "test_user_id": users[TEST_USER_USERNAME],
+    }
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mm-url", default=MM_URL)
+    args = parser.parse_args()
+    try:
+        print(json.dumps(setup(args.mm_url), indent=2))
+    except Exception as exc:  # noqa: BLE001 — surface the reason, not a traceback wall
+        print(f"[mm-setup] FAILED: {type(exc).__name__}: {exc}", file=sys.stderr)
+        raise

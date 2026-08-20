@@ -101,6 +101,63 @@ services:
   # ── ACG ─────────────────────────────────────────────────────────────────────
   # Started separately (after setup.py creates RC accounts).
   # Config is pre-written in tests/e2e/acg-config/.
+  # ── Mattermost (+ its Postgres) ──────────────────────────────────────────────
+  # Pinned to the version §6 of docs/design/dynamic-watcher-design.md was
+  # verified against ("Versions tested: ... Mattermost 11.7.0"), for the same
+  # reason Rocket.Chat is: §6.2's finding that DELIVERY TRACKS MEMBERSHIP —
+  # a post in a readable-but-not-joined channel produces no event at all — is
+  # what the MM router relies on instead of a membership gate, and it is only
+  # meaningful against the version it was observed on.
+  postgres:
+    image: postgres:16-alpine
+    container_name: acg-e2e-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mmuser
+      POSTGRES_PASSWORD: mmuser_e2e_2024
+      POSTGRES_DB: mattermost
+    volumes:
+      - acg_e2e_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mmuser -d mattermost"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  mattermost:
+    image: mattermost/mattermost-team-edition:11.7.0
+    platform: linux/amd64   # amd64-only, like Rocket.Chat; Rosetta 2 on Apple Silicon
+    container_name: acg-e2e-mattermost
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MM_SQLSETTINGS_DRIVERNAME: postgres
+      MM_SQLSETTINGS_DATASOURCE: "postgres://mmuser:mmuser_e2e_2024@postgres:5432/mattermost?sslmode=disable&connect_timeout=10"
+      MM_SERVICESETTINGS_SITEURL: http://localhost:8065
+      MM_SERVICESETTINGS_LISTENADDRESS: ":8065"
+      # E2E conveniences, all of them reasons a real deployment would NOT set
+      # these: create accounts over the API with no invite, no email
+      # verification, and personal access tokens available if a test ever
+      # needs the connector's token auth mode instead of username/password.
+      MM_TEAMSETTINGS_ENABLEOPENSERVER: "true"
+      MM_EMAILSETTINGS_REQUIREEMAILVERIFICATION: "false"
+      MM_EMAILSETTINGS_SENDEMAILNOTIFICATIONS: "false"
+      MM_SERVICESETTINGS_ENABLEUSERACCESSTOKENS: "true"
+      MM_LOGSETTINGS_CONSOLELEVEL: INFO
+    ports:
+      - "8065:8065"
+    volumes:
+      - acg_e2e_mm_data:/mattermost/data
+      - acg_e2e_mm_config:/mattermost/config
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8065/api/v4/system/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 60s
+
   acg:
     # Build from the current branch source so that unreleased features (e.g.
     # the scheduling CLI) are available during E2E tests.  The published
@@ -113,6 +170,8 @@ services:
     restart: unless-stopped
     depends_on:
       rocketchat:
+        condition: service_healthy
+      mattermost:
         condition: service_healthy
     environment:
       # Claude Code auth — pick ONE (same env vars as the production ACG image).
@@ -138,5 +197,8 @@ services:
 volumes:
   acg_e2e_mongodb:
   acg_e2e_rc_uploads:
+  acg_e2e_postgres:
+  acg_e2e_mm_data:
+  acg_e2e_mm_config:
   acg_e2e_work:
   acg_e2e_contexts:

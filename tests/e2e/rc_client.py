@@ -213,7 +213,7 @@ class RCClient:
         operator points it at, while this client only ever talks to the server
         this repo's compose pins, so the pin is the contract. If that pin ever
         drops below 8.0, the legacy flow has to come back here — which
-        tests/unit/test_e2e_rc_version_pin.py is what notices.
+        tests/unit/test_e2e_platform_pins.py is what notices.
         """
         file_path = Path(file_path)
         content = file_path.read_bytes()

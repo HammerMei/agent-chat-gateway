@@ -52,12 +52,24 @@ clean: ## Remove __pycache__, .coverage, dist/
 
 E2E_COMPOSE := tests/e2e/docker-compose.yml
 E2E_RC_URL  := http://localhost:3100
+E2E_MM_URL  := http://localhost:8065
 
-e2e-up: ## Start RC + ACG for E2E tests (idempotent)
+# Both platforms must be bootstrapped BEFORE ACG starts, and the ordering is
+# not something compose can express. `depends_on: service_healthy` orders
+# CONTAINERS; it says nothing about whether the `acg_bot` ACCOUNT exists yet.
+# Each connector logs in as that account at startup, so ACG started against a
+# fresh, unseeded platform fails to authenticate on the connector that lost
+# the race — which surfaces as every test on that platform timing out, not as
+# a login error.
+e2e-up: ## Start RC + Mattermost + ACG for E2E tests (idempotent)
 	@echo "==> Starting MongoDB + Rocket.Chat ..."
 	docker compose -f $(E2E_COMPOSE) up -d mongodb rocketchat
-	@echo "==> Running E2E setup (creating RC accounts) ..."
+	@echo "==> Starting Postgres + Mattermost ..."
+	docker compose -f $(E2E_COMPOSE) up -d postgres mattermost
+	@echo "==> Running RC setup (creating RC accounts) ..."
 	uv run python tests/e2e/setup.py --rc-url $(E2E_RC_URL)
+	@echo "==> Running MM setup (creating MM team + accounts) ..."
+	uv run python tests/e2e/mm_setup.py --mm-url $(E2E_MM_URL)
 	@echo "==> Starting ACG ..."
 	docker compose -f $(E2E_COMPOSE) up -d acg
 	@echo "==> Done. Run 'make e2e-test' to execute the test suite."
@@ -75,7 +87,7 @@ e2e-test: ## Run E2E tests (requires e2e-up first, needs CLAUDE_CODE_OAUTH_TOKEN
 e2e-logs: ## Tail logs for all E2E containers
 	docker compose -f $(E2E_COMPOSE) logs -f
 
-e2e-shell: ## Shell into a running E2E container (S=acg|rocketchat|mongodb, default acg)
+e2e-shell: ## Shell into a running E2E container (S=acg|rocketchat|mongodb|mattermost|postgres, default acg)
 	docker compose -f $(E2E_COMPOSE) exec $(or $(S),acg) bash
 
 e2e-acg: ## Run an ACG command inside the container (e.g. make e2e-acg C="list")
@@ -84,7 +96,8 @@ e2e-acg: ## Run an ACG command inside the container (e.g. make e2e-acg C="list")
 
 e2e-dump: ## Write full container logs + state to ./e2e-logs (same set CI uploads)
 	@mkdir -p e2e-logs
-	@for c in acg-e2e acg-e2e-rocketchat acg-e2e-mongodb; do \
+	@for c in acg-e2e acg-e2e-rocketchat acg-e2e-mongodb \
+	          acg-e2e-mattermost acg-e2e-postgres; do \
 	    docker logs $$c > e2e-logs/$$c.log 2>&1 || true; \
 	done
 	@docker compose -f $(E2E_COMPOSE) ps > e2e-logs/ps.txt 2>&1 || true
