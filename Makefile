@@ -63,6 +63,12 @@ e2e-up: ## Start RC + ACG for E2E tests (idempotent)
 	@echo "==> Done. Run 'make e2e-test' to execute the test suite."
 
 e2e-test: ## Run E2E tests (requires e2e-up first, needs CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY)
+	@docker container inspect acg-e2e >/dev/null 2>&1 || { \
+	    echo "ERROR: container 'acg-e2e' is not up — run 'make e2e-up' first."; \
+	    echo "       'make e2e-test' only runs the suite; it starts nothing."; \
+	    exit 1; }
+	@test -n "$(CLAUDE_CODE_OAUTH_TOKEN)$(ANTHROPIC_API_KEY)" || \
+	    echo "WARNING: neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY is set — the Claude tests will fail."
 	uv run pytest tests/e2e/ -v -s --timeout=180 \
 	    --ignore=tests/unit --ignore=tests/integration
 
@@ -83,6 +89,9 @@ e2e-dump: ## Write full container logs + state to ./e2e-logs (same set CI upload
 	done
 	@docker compose -f $(E2E_COMPOSE) ps > e2e-logs/ps.txt 2>&1 || true
 	@docker compose -f $(E2E_COMPOSE) config > e2e-logs/resolved-compose.yml 2>&1 || true
+	@docker exec acg-e2e sh -c 'cat /root/.agent-chat-gateway/gateway.log' \
+	    > e2e-logs/acg-gateway.log 2>&1 || true
+	@docker exec acg-e2e agent-chat-gateway list > e2e-logs/acg-list.txt 2>&1 || true
 	@echo "==> Wrote e2e-logs/ ($$(ls e2e-logs | wc -l | tr -d ' ') files)"
 
 e2e-probe: ## Re-verify the RC platform behaviour design §6 depends on, against the running stack

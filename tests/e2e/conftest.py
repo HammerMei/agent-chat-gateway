@@ -136,8 +136,39 @@ def _warmup_agents(rc_setup: dict[str, Any]) -> None:
             print(f"[acg] WARNING: Claude Code warm-up failed: {exc}", flush=True)
 
 
+def _container_missing(name: str) -> bool:
+    """Is there no container by this name at all (as opposed to one that is
+    merely not ready yet)?"""
+    result = subprocess.run(
+        ["docker", "container", "inspect", name],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode != 0
+
+
 def _wait_for_acg(timeout: float, interval: float) -> None:
-    """Poll docker exec until agent-chat-gateway status returns 0."""
+    """Poll docker exec until agent-chat-gateway status returns 0.
+
+    "Not there at all" and "there but still starting" get different
+    treatment. Waiting the full timeout for a container that does not exist
+    is pure loss — and worse than loss, because the eventual failure reads
+    like a readiness problem when the real answer is "you never brought the
+    stack up". That cost a real debugging session: the suite was run against
+    a stack where only MongoDB and Rocket.Chat had been started, so this
+    polled a nonexistent container for three minutes and then errored every
+    single test.
+    """
+    if _container_missing(ACG_CONTAINER):
+        pytest.fail(
+            f"Container '{ACG_CONTAINER}' does not exist — the stack is not up.\n"
+            "Run 'make e2e-up' first (it starts MongoDB + Rocket.Chat, creates "
+            "the RC accounts, then starts ACG). 'make e2e-test' only runs the "
+            "suite; it does not bring anything up.\n"
+            "If e2e-up itself failed partway, 'make e2e-dump' writes the full "
+            "container logs to ./e2e-logs."
+        )
+
     deadline = time.monotonic() + timeout
     last_output = ""
     while time.monotonic() < deadline:
@@ -149,6 +180,14 @@ def _wait_for_acg(timeout: float, interval: float) -> None:
         if result.returncode == 0:
             return
         last_output = (result.stdout + result.stderr).strip()
+        # A container that vanishes mid-wait (crash-looping, or torn down)
+        # is the same actionable case as never having existed.
+        if _container_missing(ACG_CONTAINER):
+            pytest.fail(
+                f"Container '{ACG_CONTAINER}' disappeared while waiting for it "
+                "to become ready — it likely crashed on startup. "
+                "'make e2e-dump' writes the full logs to ./e2e-logs."
+            )
         time.sleep(interval)
 
     # On timeout, dump ACG logs for debugging

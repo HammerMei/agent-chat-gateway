@@ -74,6 +74,12 @@ jobs:
           done
           docker compose -f tests/e2e/docker-compose.yml ps > e2e-logs/ps.txt 2>&1 || true
           docker compose -f tests/e2e/docker-compose.yml config > e2e-logs/resolved-compose.yml 2>&1 || true
+          # The gateway's OWN log inside the container is where connector,
+          # watcher and agent detail lives — the container's stdout only
+          # carries entrypoint output plus whatever escapes the logger.
+          docker exec acg-e2e sh -c 'cat /root/.agent-chat-gateway/gateway.log' \
+            > e2e-logs/acg-gateway.log 2>&1 || true
+          docker exec acg-e2e agent-chat-gateway list > e2e-logs/acg-list.txt 2>&1 || true
           # Keep a short tail inline too, so an obvious failure is readable
           # without downloading anything.
           echo "=== ACG (last 50) ==="
