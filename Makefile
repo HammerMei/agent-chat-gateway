@@ -89,10 +89,15 @@ e2e-test: ## Run E2E tests (requires e2e-up first, needs CLAUDE_CODE_OAUTH_TOKEN
 	    echo "ERROR: the running acg-e2e container has NO Claude credentials."; \
 	    echo "       Exporting them now does not help: the container was created"; \
 	    echo "       without them, and compose fixes environment at creation."; \
-	    echo "       Recreate it:"; \
-	    echo "         make e2e-down && CLAUDE_CODE_OAUTH_TOKEN=... make e2e-up"; \
-	    echo "       (or ANTHROPIC_API_KEY=...). Every Claude test fails as a"; \
-	    echo "       120s timeout otherwise, which reads like a delivery bug."; \
+	    echo "       Recreate just this container — the platforms and their"; \
+	    echo "       seeded accounts survive, so this costs seconds, not a"; \
+	    echo "       Rocket.Chat boot:"; \
+	    echo "         CLAUDE_CODE_OAUTH_TOKEN=... docker compose -f $(E2E_COMPOSE) \\"; \
+	    echo "             up -d --force-recreate acg"; \
+	    echo "       (or ANTHROPIC_API_KEY=...). Reach for 'make e2e-down' only"; \
+	    echo "       if you also want the platform data gone — it takes -v."; \
+	    echo "       Every Claude test fails as a 120s timeout otherwise, which"; \
+	    echo "       reads like a delivery bug."; \
 	    exit 1; }
 	uv run pytest tests/e2e/ -v -s --timeout=180 \
 	    --ignore=tests/unit --ignore=tests/integration
