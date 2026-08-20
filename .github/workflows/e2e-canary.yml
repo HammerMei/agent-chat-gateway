@@ -69,13 +69,32 @@ jobs:
           uv run pytest tests/e2e/ -v -s --timeout=180 \
             --ignore=tests/unit --ignore=tests/integration
 
-      - name: Dump container logs on failure
+      - name: Collect container logs on failure
         if: failure()
         run: |
-          echo "=== ACG logs ==="
-          docker logs acg-e2e --tail 100 || true
-          echo "=== RC logs ==="
-          docker logs acg-e2e-rocketchat --tail 50 || true
+          mkdir -p e2e-logs
+          # FULL logs to files — a tail is the wrong tool for the failures
+          # that actually happen here, which are startup/subscription
+          # problems whose cause is at the TOP of the log, not the bottom.
+          for c in acg-e2e acg-e2e-rocketchat acg-e2e-mongodb; do
+            docker logs "$c" > "e2e-logs/$c.log" 2>&1 || true
+          done
+          docker compose -f tests/e2e/docker-compose.yml ps > e2e-logs/ps.txt 2>&1 || true
+          docker compose -f tests/e2e/docker-compose.yml config > e2e-logs/resolved-compose.yml 2>&1 || true
+          # Keep a short tail inline too, so an obvious failure is readable
+          # without downloading anything.
+          echo "=== ACG (last 50) ==="
+          tail -50 e2e-logs/acg-e2e.log || true
+          echo "=== Rocket.Chat (last 30) ==="
+          tail -30 e2e-logs/acg-e2e-rocketchat.log || true
+
+      - name: Upload E2E logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs-${{ github.job }}-${{ github.run_attempt }}
+          path: e2e-logs/
+          retention-days: 14
 
       - name: Teardown
         if: always()

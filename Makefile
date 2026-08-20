@@ -6,7 +6,7 @@ CONFIG      := $(RUNTIME_DIR)/config.yaml
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n\nTargets:\n"} \
-	     /^[a-zA-Z_-]+:.*?##/ { printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+	     /^[a-zA-Z0-9_-]+:.*?##/ { printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 
 install: ## Install dependencies (uv sync)
 	uv sync
@@ -68,6 +68,28 @@ e2e-test: ## Run E2E tests (requires e2e-up first, needs CLAUDE_CODE_OAUTH_TOKEN
 
 e2e-logs: ## Tail logs for all E2E containers
 	docker compose -f $(E2E_COMPOSE) logs -f
+
+e2e-shell: ## Shell into a running E2E container (S=acg|rocketchat|mongodb, default acg)
+	docker compose -f $(E2E_COMPOSE) exec $(or $(S),acg) bash
+
+e2e-acg: ## Run an ACG command inside the container (e.g. make e2e-acg C="list")
+	@test -n "$(C)" || (echo "usage: make e2e-acg C=\"list\"" && exit 1)
+	docker compose -f $(E2E_COMPOSE) exec acg agent-chat-gateway $(C)
+
+e2e-dump: ## Write full container logs + state to ./e2e-logs (same set CI uploads)
+	@mkdir -p e2e-logs
+	@for c in acg-e2e acg-e2e-rocketchat acg-e2e-mongodb; do \
+	    docker logs $$c > e2e-logs/$$c.log 2>&1 || true; \
+	done
+	@docker compose -f $(E2E_COMPOSE) ps > e2e-logs/ps.txt 2>&1 || true
+	@docker compose -f $(E2E_COMPOSE) config > e2e-logs/resolved-compose.yml 2>&1 || true
+	@echo "==> Wrote e2e-logs/ ($$(ls e2e-logs | wc -l | tr -d ' ') files)"
+
+e2e-probe: ## Re-verify the RC platform behaviour design §6 depends on, against the running stack
+	uv run python scripts/probe_a1_rc.py \
+	    --url $(E2E_RC_URL) \
+	    --probe-user test_user --probe-password test_user_e2e_2024 \
+	    --admin-user admin --admin-password admin_e2e_2024
 
 e2e-down: ## Stop and remove all E2E containers and volumes
 	docker compose -f $(E2E_COMPOSE) down -v
