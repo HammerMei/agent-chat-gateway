@@ -79,8 +79,21 @@ e2e-test: ## Run E2E tests (requires e2e-up first, needs CLAUDE_CODE_OAUTH_TOKEN
 	    echo "ERROR: container 'acg-e2e' is not up — run 'make e2e-up' first."; \
 	    echo "       'make e2e-test' only runs the suite; it starts nothing."; \
 	    exit 1; }
-	@test -n "$(CLAUDE_CODE_OAUTH_TOKEN)$(ANTHROPIC_API_KEY)" || \
-	    echo "WARNING: neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY is set — the Claude tests will fail."
+	@# The token that matters is the one INSIDE the container, not the one in
+	@# this shell. Compose bakes environment in at container CREATION, so a
+	@# stack brought up without a token stays without one however the test run
+	@# is invoked — and the old check, which read this shell, said nothing
+	@# while every Claude test timed out for eight minutes and reported
+	@# "no matching post", as if delivery were broken.
+	@docker exec acg-e2e sh -c 'test -n "$$CLAUDE_CODE_OAUTH_TOKEN$$ANTHROPIC_API_KEY"' 2>/dev/null || { \
+	    echo "ERROR: the running acg-e2e container has NO Claude credentials."; \
+	    echo "       Exporting them now does not help: the container was created"; \
+	    echo "       without them, and compose fixes environment at creation."; \
+	    echo "       Recreate it:"; \
+	    echo "         make e2e-down && CLAUDE_CODE_OAUTH_TOKEN=... make e2e-up"; \
+	    echo "       (or ANTHROPIC_API_KEY=...). Every Claude test fails as a"; \
+	    echo "       120s timeout otherwise, which reads like a delivery bug."; \
+	    exit 1; }
 	uv run pytest tests/e2e/ -v -s --timeout=180 \
 	    --ignore=tests/unit --ignore=tests/integration
 

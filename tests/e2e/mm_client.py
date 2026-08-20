@@ -179,15 +179,28 @@ class MMClient:
         return resp.json()
 
     def get_posts(self, channel_id: str, since_ms: int | None = None) -> list[dict[str, Any]]:
-        """Posts in the channel, oldest first.
+        """Posts in the channel, oldest first, from `since_ms` INCLUSIVE.
 
-        `since` is milliseconds. Mattermost returns `{order: [...ids],
-        posts: {id: post}}` with `order` NEWEST first, so this reverses it to
-        match `rc_client.get_messages()`'s oldest-first contract.
+        Mattermost returns `{order: [...ids], posts: {id: post}}` with `order`
+        NEWEST first, so this reverses it to match `rc_client.get_messages()`'s
+        oldest-first contract.
+
+        **The boundary is shifted by one millisecond on purpose.** Mattermost's
+        `since` is exclusive — it selects posts modified *after* the value — and
+        `int(time.time() * 1000)` immediately followed by a post routinely lands
+        in the same millisecond. Measured against 11.7.0: a post whose
+        `create_at` equalled the timestamp was returned for `since=t-5000` and
+        NOT for `since=t`, with the raw `order` array empty.
+
+        Callers pass "the moment before I acted" and mean at-or-after. Left
+        exclusive, `poll_for_message` merely under-counts, but the leak check in
+        test_mm_membership_delivery.py gets worse than that: a bot post landing
+        on the boundary millisecond would be invisible and the negative
+        assertion would pass while the thing it forbids had happened.
         """
         params: dict[str, Any] = {}
         if since_ms is not None:
-            params["since"] = since_ms
+            params["since"] = since_ms - 1
         resp = self._client.get(f"/channels/{channel_id}/posts", params=params)
         resp.raise_for_status()
         payload = resp.json()

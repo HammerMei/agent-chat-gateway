@@ -176,6 +176,51 @@ class TestTheHandleFormatsTheMMTestsAssertOn(unittest.TestCase):
         )
 
 
+class TestGetPostsAsksForAnInclusiveWindow(unittest.TestCase):
+    """Mattermost's `since` is exclusive; the client's contract is inclusive.
+
+    Worth a guard rather than a comment because of how it fails. Measured on
+    11.7.0, `int(time.time() * 1000)` followed immediately by a post landed in
+    the SAME millisecond on 6 of 6 attempts — so an exclusive boundary drops
+    the boundary post essentially always, not rarely. In `poll_for_message`
+    that only skews a count, but `test_mm_membership_delivery.py` asks "did
+    the bot post in the channel it never joined, since this moment?" and a
+    dropped boundary post turns that into a pass while the forbidden thing
+    happened. Silently, and in the direction that reports success.
+    """
+
+    def _captured_since(self, since_ms: int | None) -> str | None:
+        import httpx
+        from mm_client import MMClient
+
+        seen: list[httpx.URL] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request.url)
+            return httpx.Response(200, json={"order": [], "posts": {}})
+
+        client = MMClient("http://mm.invalid")
+        client._client = httpx.Client(
+            base_url="http://mm.invalid/api/v4", transport=httpx.MockTransport(handler)
+        )
+        client.get_posts("chan-id", since_ms=since_ms)
+        client.close()
+        self.assertEqual(1, len(seen))
+        return seen[0].params.get("since")
+
+    def test_the_requested_since_is_one_millisecond_earlier(self):
+        self.assertEqual(
+            "999",
+            self._captured_since(1000),
+            "get_posts must ask for since-1: Mattermost selects posts modified "
+            "AFTER the value, so passing the caller's timestamp straight "
+            "through hides a post created in that same millisecond",
+        )
+
+    def test_no_since_parameter_when_the_caller_gives_none(self):
+        self.assertIsNone(self._captured_since(None))
+
+
 # The other half of the membership setup — the human in that channel, the bot
 # out of it — is deliberately NOT pinned here. Asserting it would mean matching
 # mm_setup.py's source text, which breaks on a reformat and passes on a rename;
