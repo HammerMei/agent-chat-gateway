@@ -2495,7 +2495,7 @@ rules out a channel-specific quirk.
 | No event for a readable-but-not-joined public channel | Delivery **is** the membership signal. No additional membership gate is needed, and the creation path does not need a REST membership check. |
 | `data.channel_name`, `data.channel_type` and `data.team_id` are all populated for channel posts | Routing can resolve name, type and team **from the event**, skipping a REST call — which matters for keeping work off the semaphore-held handler path. |
 | `data.team_id` is empty for DMs; `broadcast.team_id` is empty always | Use `data.team_id`, and treat empty as "not a team channel" rather than a lookup failure. |
-| DM `channel_name` is the opaque `<userid>__<userid>` form, but `channel_display_name` is the counterpart handle | Mattermost supplies a usable DM display name where Rocket.Chat does not. |
+| DM `channel_name` is the opaque `<userid>__<userid>` form, but `channel_display_name` is the counterpart handle — **`@`-prefixed**, e.g. `@alice` | Mattermost supplies a usable DM display name where Rocket.Chat does not. Note the prefix is carried into `participants` verbatim, so a Mattermost DM's watcher handle is `<connector>:dm:%40alice` where Rocket.Chat's is `<connector>:dm:alice` (`@` is outside `_LABEL_SAFE`). Only the event path has this: REST's `display_name` for the same DM channel is the empty string. |
 | Own messages and system messages (`system_join_channel`, `system_leave_channel`) are delivered | Both filters are required; the existing non-empty-`type` check covers the system case. |
 
 **Re-verified 2026-08-20** against the E2E stack, which now runs Mattermost

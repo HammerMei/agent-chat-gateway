@@ -161,16 +161,39 @@ class TestTheHandleFormatsTheMMTestsAssertOn(unittest.TestCase):
             ),
         )
 
-    def test_a_dm_handle_is_connector_colon_dm_colon_counterpart(self):
+    def test_a_dm_handle_carries_the_at_prefixed_counterpart_percent_encoded(self):
+        """On Mattermost — unlike Rocket.Chat — the counterpart arrives WITH an
+        `@`, and the handle therefore contains `%40`.
+
+        This test asserted `mm-e2e:dm:test_user` when it was written, which is
+        a form that never occurs. `watcher_label` was fed a bare username
+        because that is what Rocket.Chat supplies, and the assertion passed
+        while describing nothing real. Observed in `list --all` against the
+        live stack:
+
+            rc-e2e:dm:test_user       ...  test_user
+            mm-e2e:dm:%40test_user    ...  @test_user
+
+        The `@` is Mattermost's, not ACG's: the connector fills a DM's
+        `participants` from the websocket event's `channel_display_name`, which
+        is viewer-specific and `@`-prefixed. (REST's `display_name` for the
+        same DM channel is the empty string, so this is only visible on the
+        event path.) The `%40` is deliberate downstream of that — `_LABEL_SAFE`
+        is a whitelist of alphanumerics plus `._-`, and the percent-encoding is
+        what makes the `dm:` prefix unforgeable.
+
+        Whether an operator should have to type `%40` for a Mattermost DM is a
+        separate question about the connector, not about this suite.
+        """
         self.assertEqual(
-            f"mm-e2e:dm:{mm_setup.TEST_USER_USERNAME}",
+            "mm-e2e:dm:%40test_user",
             watcher_label(
                 "mm-e2e",
                 RoomRef(
                     id="whatever",
                     kind=RoomKind.DM,
                     name="",
-                    participants=(mm_setup.TEST_USER_USERNAME,),
+                    participants=(f"@{mm_setup.TEST_USER_USERNAME}",),
                 ),
             ),
         )
