@@ -66,6 +66,13 @@ asyncio_mode = "auto"
 markers = [
     "integration: multi-component tests with real I/O or multiple subsystems",
     "e2e: end-to-end tests requiring Docker + ANTHROPIC_API_KEY (run via make e2e-test)",
+    # Documented in tests/e2e/test_schedule_e2e.py's own module docstring as
+    # the way to skip the scheduler tests (`-m "not slow"`), which cannot cost
+    # less than a minute each because the scheduler ticks every 60s. It was
+    # never registered, so the documented switch emitted an
+    # PytestUnknownMarkWarning on every run and would fail outright under
+    # --strict-markers.
+    "slow: takes a minute or more by construction (e.g. waits on a scheduler tick)",
 ]
 
 [tool.coverage.run]
