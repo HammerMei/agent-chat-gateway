@@ -2498,6 +2498,20 @@ rules out a channel-specific quirk.
 | DM `channel_name` is the opaque `<userid>__<userid>` form, but `channel_display_name` is the counterpart handle | Mattermost supplies a usable DM display name where Rocket.Chat does not. |
 | Own messages and system messages (`system_join_channel`, `system_leave_channel`) are delivered | Both filters are required; the existing non-empty-`type` check covers the system case. |
 
+**Re-verified 2026-08-20** against the E2E stack, which now runs Mattermost
+11.7.0 — the same version this section was probed on (`make e2e-probe-mm`
+reruns `probe_a2_mm.py` against it). Every row above still held, including the
+isolation case: no event for the readable-but-not-joined channel, delivery
+within milliseconds once the membership row was added.
+
+This is now also covered **through the runtime**, not only at the platform
+level, by `tests/e2e/test_mm_membership_delivery.py`. The distinction is worth
+keeping: the probe establishes what Mattermost does, while the E2E test
+establishes that ACG honours it — with a rule that matches the unjoined
+channel, an allow-listed poster and a mentioned bot, so that none of those
+can account for the silence. A probe that passes while the test fails locates
+the regression in ACG; both failing locates it in the platform.
+
 ### 6.3 Mattermost: channel names are per-team, DMs are per-account
 
 Two further observations, both with design consequences:
