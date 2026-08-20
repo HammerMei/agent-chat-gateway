@@ -53,8 +53,22 @@ services:
 
   # ── Rocket.Chat ──────────────────────────────────────────────────────────────
   rocketchat:
-    image: rocket.chat:6.12
-    platform: linux/amd64   # no arm64 image; runs via Rosetta 2 on Apple Silicon
+    # Pinned to the version the dynamic-watcher design was actually verified
+    # against (docs/design/dynamic-watcher-design.md §6: "Versions tested:
+    # Rocket.Chat 8.5.1"). This pin was 6.12, chosen when the E2E suite was
+    # first written and never revisited when delivery switched to the
+    # subscribe-all `__my_messages__` stream — so every §6.1 finding the
+    # runtime now depends on (the stream being accepted, args[1] carrying
+    # roomParticipant/roomType/roomName, system messages arriving) was
+    # unverified on the version E2E actually ran.
+    #
+    # MongoDB stays at 8.2 deliberately. RC's own notes contradict each
+    # other here (8.0.0's notes say "must upgrade to MongoDB 8.2"; the 8.5.1
+    # release page lists engine MongoDB 8.0 — see RocketChat/Rocket.Chat
+    # issue #41022, which is exactly about that inconsistency), and 8.2 is
+    # the version reported working on RC 8.x in practice.
+    image: rocket.chat:8.5.1
+    platform: linux/amd64   # still amd64-only at 8.5.1; runs via Rosetta 2 on Apple Silicon
     container_name: acg-e2e-rocketchat
     restart: unless-stopped
     depends_on:

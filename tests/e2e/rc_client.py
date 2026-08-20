@@ -166,26 +166,49 @@ class RCClient:
         description: str = "",
         tmid: str | None = None,
     ) -> dict[str, Any]:
-        """Upload a file to a room. Returns the file message dict."""
+        """Upload a file to a room. Returns the file message dict.
+
+        Two steps, because the one-step upload endpoint was **removed in
+        Rocket.Chat 8.0.0** and the compose stack now pins 8.5.1:
+        ``rooms.media/{rid}`` uploads the bytes, then
+        ``rooms.mediaConfirm/{rid}/{fileId}`` sends it into the room. Both are
+        required — a file left unconfirmed never appears in the room.
+
+        Deliberately NOT version-dispatching the way the product connector
+        does (``gateway/connectors/rocketchat/rest.py`` picks a flow from the
+        server's detected major version): that code serves whatever server an
+        operator points it at, while this client only ever talks to the server
+        this repo's compose pins, so the pin is the contract. If that pin ever
+        drops below 8.0, the legacy flow has to come back here — which
+        tests/unit/test_e2e_rc_version_pin.py is what notices.
+        """
         file_path = Path(file_path)
         content = file_path.read_bytes()
         files = {
             "file": (file_path.name, io.BytesIO(content), "application/octet-stream")
         }
-        form_data: dict[str, str] = {}
+        media = self._client.post(f"/api/v1/rooms.media/{room_id}", files=files)
+        media.raise_for_status()
+        media_result = media.json()
+        if not media_result.get("success"):
+            raise RuntimeError(f"rooms.media failed: {media_result}")
+        file_id = (media_result.get("file") or {}).get("_id")
+        if not file_id:
+            raise RuntimeError(f"rooms.media response missing file._id: {media_result}")
+
+        confirm_body: dict[str, str] = {}
         if description:
-            form_data["description"] = description
+            confirm_body["description"] = description
         if tmid:
-            form_data["tmid"] = tmid
-        resp = self._client.post(
-            f"/api/v1/rooms.upload/{room_id}",
-            files=files,
-            data=form_data,
+            confirm_body["tmid"] = tmid
+        confirm = self._client.post(
+            f"/api/v1/rooms.mediaConfirm/{room_id}/{file_id}",
+            json=confirm_body,
         )
-        resp.raise_for_status()
-        result = resp.json()
+        confirm.raise_for_status()
+        result = confirm.json()
         if not result.get("success"):
-            raise RuntimeError(f"rooms.upload failed: {result}")
+            raise RuntimeError(f"rooms.mediaConfirm failed: {result}")
         return result.get("message", result)
 
     # ── Message retrieval ─────────────────────────────────────────────────────
