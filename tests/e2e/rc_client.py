@@ -47,10 +47,43 @@ class RCClient:
         self.auth_token = data["data"]["authToken"]
         self.user_id = data["data"]["userId"]
         self.username = username
+        # Kept for set_setting()'s 2FA password fallback — see there.
+        self._password = password
         self._client.headers.update(
             {"X-Auth-Token": self.auth_token, "X-User-Id": self.user_id}
         )
         return self
+
+    def set_setting(self, setting_id: str, value: object) -> None:
+        """Change an admin setting, satisfying Rocket.Chat's 2FA gate.
+
+        From RC 8.x, writing a protected setting requires two-factor
+        confirmation even when 2FA is off — verified against 8.5, which
+        answers a bare POST with
+        ``{"error": "TOTP Required [totp-required]", "details":
+        {"method": "password", "availableMethods": []}}``. Since no TOTP or
+        email method is available on a fresh workspace, the only usable
+        route is the password fallback, and the code must be the **SHA-256
+        digest** of the password, not the password itself (plaintext returns
+        ``totp-invalid``, which is how this was pinned down).
+
+        This is what broke `make e2e-up` on the 6.12 → 8.5.1 move: the
+        settings write is the first thing setup.py does after logging in.
+        """
+        import hashlib
+
+        response = self._client.post(
+            f"/api/v1/settings/{setting_id}",
+            json={"value": value},
+            headers={
+                "x-2fa-code": hashlib.sha256(self._password.encode()).hexdigest(),
+                "x-2fa-method": "password",
+            },
+        )
+        response.raise_for_status()
+        body = response.json()
+        if not body.get("success"):
+            raise RuntimeError(f"settings/{setting_id} failed: {body}")
 
     # ── Users ────────────────────────────────────────────────────────────────
 

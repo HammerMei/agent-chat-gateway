@@ -2244,6 +2244,25 @@ against a different server version rather than trusted indefinitely.
 
 Versions tested: **Rocket.Chat 8.5.1** and **Mattermost 11.7.0**.
 
+**Re-verified 2026-08-20** against the E2E stack, which now pins the same
+8.5.1 rather than the 6.12 it had been running (`make e2e-probe` reruns
+`probe_a1_rc.py` against it, so this is a command rather than an
+archaeology exercise). Every §6.1 row below still held: the literal
+`__my_messages__` eventName, `len(args) == 2`, the access object carrying
+`roomParticipant`/`roomType`/`roomName`, `roomParticipant: false` for a
+readable non-member room, own messages delivered, and raw `roomType`
+letters.
+
+One refinement the original probe did not separate: **system messages are
+delivered for rooms the account is a MEMBER of, and were not observed for a
+non-member room.** Confirmed by kicking and re-adding a user in a member
+room, which produced `t: "ru"` then `t: "au"` frames, while the same event
+in a non-member room produced none (with `Hide_System_Messages` empty, so
+nothing was being suppressed). This does not change what the runtime must
+do — the `t`-field filter is still required, because the member-room case
+is the one that reaches a live watcher — it only narrows where the traffic
+comes from.
+
 ### 6.1 Rocket.Chat: `__my_messages__` works, and carries what routing needs
 
 The subscription is accepted (`ready`, never `nosub`) and delivers messages

@@ -89,7 +89,8 @@ e2e-probe: ## Re-verify the RC platform behaviour design §6 depends on, against
 	uv run python scripts/probe_a1_rc.py \
 	    --url $(E2E_RC_URL) \
 	    --probe-user test_user --probe-password test_user_e2e_2024 \
-	    --admin-user admin --admin-password admin_e2e_2024
+	    --admin-user admin --admin-password admin_e2e_2024 \
+	    --member-room acg-e2e-claude --outside-room acg-e2e-outside
 
 e2e-down: ## Stop and remove all E2E containers and volumes
 	docker compose -f $(E2E_COMPOSE) down -v
