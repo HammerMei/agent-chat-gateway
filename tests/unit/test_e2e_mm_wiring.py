@@ -179,9 +179,13 @@ class TestTheHandleFormatsTheMMTestsAssertOn(unittest.TestCase):
         input. The connector now strips the prefix at the source, so one person
         has one handle on both platforms.
 
-        Feeding the WIRE value through `bare_handle` here means removing that
-        strip fails this test, where asserting `watcher_label`'s output alone
-        would not notice.
+        Scope, stated honestly because an earlier version of this docstring
+        overclaimed: this pins `bare_handle` composed with `watcher_label`, so
+        it does NOT catch the connector forgetting to CALL `bare_handle` — it
+        never invokes the connector. That mutation is covered next door, by
+        `test_mattermost_connector.py`'s DM case driving `_on_posted_event`
+        with the real prefixed wire value. The two together close the chain;
+        neither does alone.
         """
         wire_value = f"@{mm_setup.TEST_USER_USERNAME}"
         self.assertEqual(
@@ -264,3 +268,58 @@ class TestGetPostsAsksForAnInclusiveWindow(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBootScopingOfTheConnectedMarker(unittest.TestCase):
+    """`mm_connected` must not accept a marker from a PREVIOUS boot.
+
+    The daemon opens `gateway.log` in append mode and the runtime directory is
+    not a mounted volume, so the file survives every restart of a container
+    declared `restart: unless-stopped`. An unscoped search answers "did an MM
+    connector ever connect in this container's lifetime", which would pass for
+    a gateway that came back with a dead Mattermost socket — the precise
+    failure the fixture exists to name.
+
+    Pure string work, so it is testable here rather than only against a live
+    stack.
+    """
+
+    def setUp(self):
+        sys.path.insert(0, str(_E2E))
+        import conftest as e2e_conftest
+
+        self.current_boot = e2e_conftest._current_boot
+        self.marker = e2e_conftest.MM_CONNECTED_MARKER
+        self.anchor = e2e_conftest._BOOT_ANCHOR
+
+    def test_a_marker_from_an_earlier_boot_is_excluded(self):
+        log = (
+            f"01-01 00:00:00 [daemon] INFO: {self.anchor}pid=1)\n"
+            f"01-01 00:00:01 [mattermost] INFO: {self.marker} http://mm:8065\n"
+            f"01-02 00:00:00 [daemon] INFO: {self.anchor}pid=2)\n"
+            "01-02 00:00:01 [mattermost] ERROR: websocket refused\n"
+        )
+        self.assertNotIn(
+            self.marker,
+            self.current_boot(log),
+            "a marker written before the last 'Daemon started' line is stale — "
+            "accepting it lets a gateway that restarted with a dead Mattermost "
+            "socket pass this fixture",
+        )
+
+    def test_the_current_boots_marker_is_kept(self):
+        """Guard on the guard: the anchor must not cut off the line being
+        searched for. The MM marker is logged BEFORE 'GatewayService running',
+        so anchoring on that line instead would break this."""
+        log = (
+            f"01-02 00:00:00 [daemon] INFO: {self.anchor}pid=2)\n"
+            f"01-02 00:00:01 [mattermost] INFO: {self.marker} http://mm:8065\n"
+            "01-02 00:00:02 [service] INFO: GatewayService running with connector(s): mm-e2e\n"
+        )
+        self.assertIn(self.marker, self.current_boot(log))
+
+    def test_a_log_without_the_anchor_is_used_whole(self):
+        """Documented fallback: a format change must not become a failure
+        claiming the connector never connected."""
+        log = f"no anchor here\n[mattermost] INFO: {self.marker} http://mm:8065\n"
+        self.assertIn(self.marker, self.current_boot(log))

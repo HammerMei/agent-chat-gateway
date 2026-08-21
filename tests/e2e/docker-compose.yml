@@ -98,9 +98,6 @@ services:
       retries: 40
       start_period: 90s
 
-  # ── ACG ─────────────────────────────────────────────────────────────────────
-  # Started separately (after setup.py creates RC accounts).
-  # Config is pre-written in tests/e2e/acg-config/.
   # ── Mattermost (+ its Postgres) ──────────────────────────────────────────────
   # Pinned to the version §6 of docs/design/dynamic-watcher-design.md was
   # verified against ("Versions tested: ... Mattermost 11.7.0"), for the same
@@ -151,23 +148,38 @@ services:
     volumes:
       - acg_e2e_mm_data:/mattermost/data
       - acg_e2e_mm_config:/mattermost/config
-    # NO healthcheck override here on purpose — the image ships its own,
-    # `["CMD", "/mattermost/bin/mmctl", "system", "status", "--local"]`, and it
-    # is the only kind that can work: this image has NO SHELL and no curl, so
-    # every `CMD-SHELL` probe fails with `stat /bin/sh: no such file or
-    # directory` and the container sits unhealthy forever while the server is
-    # in fact serving. That is exactly how it failed here — `/system/ping`
+    # The TEST is the image's own, restated verbatim rather than replaced. It
+    # is the only kind that can work here: this image has NO SHELL and no
+    # curl, so every `CMD-SHELL` probe fails with `stat /bin/sh: no such file
+    # or directory` and the container sits unhealthy forever while the server
+    # is in fact serving. That is exactly how it failed here — `/system/ping`
     # answered 200 from the host while compose refused to start ACG on an
-    # "unhealthy" dependency.
+    # "unhealthy" dependency. The vendor probe also checks more than a port:
+    # it reports database and filestore status. `--local` needs local mode,
+    # which this image enables by ENV default (nothing in this repo sets it),
+    # so a tag bump can break the probe with no change here to blame.
     #
-    # The vendor probe also checks more than a port: its output reports
-    # database and filestore status, not just that HTTP is up.
-    #
-    # The retry budget is the image's too (30s interval, 10s timeout, no
-    # start_period). Boot is well inside `wait_for_mm`'s window, and the
-    # bootstrap step in `make e2e-up` is the readiness gate that actually
-    # matters — see the comment above the target.
+    # What IS overridden is the budget. The image ships 30s interval, 10s
+    # timeout and no `start_period`, so Docker's default of 3 retries marks
+    # Mattermost unhealthy at ~90s — and compose does not wait out an
+    # `unhealthy` dependency, it aborts immediately, even though the probe
+    # would recover 30s later. On a cold CI runner booting Mongo, Rocket.Chat,
+    # Postgres and Mattermost concurrently, with MM running first-boot
+    # migrations against an empty database, 90s is not a margin. The main path
+    # is protected by ordering (the bootstraps and an image build run first),
+    # but `up -d --force-recreate acg` — the recovery this repo's own Makefile
+    # prescribes — re-evaluates `depends_on` and would abort naming Mattermost.
+    healthcheck:
+      test: ["CMD", "/mattermost/bin/mmctl", "system", "status", "--local"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
 
+  # ── ACG ─────────────────────────────────────────────────────────────────────
+  # Started last, after BOTH platforms have been bootstrapped: each connector
+  # logs in as acg_bot at boot, and on Mattermost an unresolvable team is fatal
+  # to the whole gateway. Config is pre-written in tests/e2e/acg-config/.
   acg:
     # Build from the current branch source so that unreleased features (e.g.
     # the scheduling CLI) are available during E2E tests.  The published

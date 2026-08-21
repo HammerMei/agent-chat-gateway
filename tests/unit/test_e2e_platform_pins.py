@@ -50,6 +50,10 @@ _PLATFORMS = (
         "label": "Mattermost",
         "image_pattern": r"^\s*image:\s*mattermost/mattermost-team-edition:(\S+)\s*$",
         "design_pattern": r"Versions tested:.*?Mattermost\s+([0-9]+(?:\.[0-9]+)*)",
+        # Unlike Rocket.Chat's, this floor guards no known code assumption —
+        # nothing in the Mattermost connector is written against 11.x
+        # specifically. It is here as a tripwire on a large downgrade, so say
+        # so rather than implying a dependency that does not exist.
         "floor": 11,
     },
 )

@@ -55,7 +55,8 @@ TEST_USER_PASSWORD = "test_user_e2e_2024"
 
 # Bot + test user are members here.
 MEMBER_CHANNEL = "acg-e2e-mm-claude"
-# Admin only — see the module docstring's step 6.
+# The human test user joins this one; the bot deliberately does not.
+# See the module docstring's step 6 — who is in here IS the test's premise.
 OUTSIDE_CHANNEL = "acg-e2e-mm-outside"
 
 
@@ -73,6 +74,25 @@ def setup(mm_url: str = MM_URL) -> dict[str, Any]:
             print(f"[mm-setup] Creating system admin '{ADMIN_USERNAME}' ...", flush=True)
             admin.create_user(ADMIN_USERNAME, ADMIN_PASSWORD)
             admin.login(ADMIN_USERNAME, ADMIN_PASSWORD)
+
+        # Assert the role rather than trust the ordering that grants it.
+        # `system_admin` goes to the FIRST user created on a fresh server, and
+        # the branch above SKIPS creation when the account exists — so on a
+        # warm database where something else was created first, this account is
+        # a plain member and every later step degrades instead of failing:
+        # `get_team` maps 403 to None and would try to create the team, and
+        # every membership question comes back 403. The membership E2E test
+        # asserts a NON-membership as a precondition, so a 403-as-no would let
+        # it pass without establishing its premise.
+        roles = admin.roles or ""
+        if "system_admin" not in roles.split():
+            raise RuntimeError(
+                f"'{ADMIN_USERNAME}' is not a system admin (roles: {roles!r}). "
+                "Mattermost grants that only to the first user created on a "
+                "fresh server, so something else was created first. Reset the "
+                "platform data — 'make e2e-down' takes -v — and re-run, or "
+                "promote the account by hand with mmctl."
+            )
 
         # ── Team ────────────────────────────────────────────────────────────
         team = admin.get_team(TEAM_NAME)

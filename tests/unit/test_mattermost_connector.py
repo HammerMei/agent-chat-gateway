@@ -1012,24 +1012,43 @@ class TestRoutingUntrackedChannels(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(room.participants, ("alice",))
         self.assertEqual(room.name, "", "a DM has no usable platform name")
 
-    async def test_a_dm_counterpart_already_bare_is_left_alone(self):
-        """Not every path is the websocket. The membership-add path feeds this helper a
-        REST `get_channel()` response, where the same field has no prefix — so stripping
-        has to be idempotent rather than assume the `@` is always there."""
+    async def test_a_dm_with_no_display_name_has_no_counterpart(self):
+        """The case the membership-add path really produces.
+
+        An earlier version of this test fed `channel_display_name="alice"` and
+        justified it as what REST supplies — but REST's `display_name` for a direct
+        channel is the EMPTY string, so a bare name on a DM has no producer at all.
+        Empty is the value to cover, and it must yield no participant rather than one
+        empty participant: `("",)` would make `room_label` emit a nameless `dm:`
+        instead of falling back to the room-id digest.
+        """
         connector = await self._connector()
         await connector._on_posted_event(
             self._event(channel_type="D", channel_name="u1__u2",
-                        channel_display_name="alice", team_id=""))
+                        channel_display_name="", team_id=""))
         await self._drain(connector)
-        self.assertEqual(self.offered[0].participants, ("alice",))
+        self.assertEqual(self.offered[0].participants, ())
+
+    async def test_a_dm_whose_display_name_is_only_the_prefix_has_no_counterpart(self):
+        """Guarding the pre-strip value would pass `"@"` through as `("",)`. Unreachable
+        for a real username, but it is the difference between testing the transformed
+        value and the raw one."""
+        connector = await self._connector()
+        await connector._on_posted_event(
+            self._event(channel_type="D", channel_name="u1__u2",
+                        channel_display_name="@", team_id=""))
+        await self._drain(connector)
+        self.assertEqual(self.offered[0].participants, ())
 
     async def test_a_group_dm_carries_its_members(self):
-        """Every entry in the list carries its own `@`, so the split has to strip per
-        member rather than once at the front."""
+        """Group DM display names are NOT `@`-prefixed, unlike DMs — Mattermost is
+        inconsistent between the two kinds, and this is the form observed on 11.7.0
+        (§6.4). A previous version of this test asserted the prefixed form, which no
+        group DM event has ever sent."""
         connector = await self._connector()
         await connector._on_posted_event(
             self._event(channel_type="G", channel_name="1b4c4b32",
-                        channel_display_name="@glin, @probe-bot, @alice", team_id=""))
+                        channel_display_name="glin, probe-bot, alice", team_id=""))
         await self._drain(connector)
 
         room = self.offered[0]

@@ -50,19 +50,31 @@ logger = logging.getLogger("agent-chat-gateway.connectors.mattermost.normalize")
 def bare_handle(display: str) -> str:
     """A Mattermost display handle with its leading `@` removed, if it has one.
 
-    A DM's `channel_display_name` on the websocket event is the counterpart
-    **`@`-prefixed** — `@alice`, not `alice` — and a group DM's is a
-    comma-separated list of the same. Rocket.Chat supplies bare usernames, so
-    carrying the prefix through left the same person addressable by two
+    A **DM's** `channel_display_name` on the websocket event is the counterpart
+    `@`-prefixed — `@alice`, not `alice`. Rocket.Chat supplies bare usernames,
+    so carrying the prefix through left the same person addressable by two
     different watcher handles depending on the platform, and the Mattermost one
     needed percent-encoding to type: `mm:dm:%40alice` against `rc:dm:alice`
     (`@` is outside `_LABEL_SAFE`).
 
-    Exactly one leading `@` is removed and nothing else is touched. That is
-    lossless here: Mattermost usernames are restricted to letters, digits and
-    `.-_`, so a name cannot itself begin with `@`, and stripping is idempotent
-    for the paths that already supply a bare name (REST lookups, and the
-    connector's own membership-add path).
+    **A group DM's is not prefixed.** Verified on 11.7.0 against a live server,
+    because assuming otherwise is what put a fictional value into this
+    function's first set of tests: a DM event carries `'@mmadmin'` while a group
+    DM event carries `'acg_bot, mmadmin, probe-extra'` (§6.4). So this is
+    applied to both kinds and is simply a no-op for one of them — two branches
+    treating one wire field by different rules is what let the DM prefix go
+    unnoticed in the first place.
+
+    Exactly one leading `@` is removed and nothing else is touched, which is
+    lossless for a username: Mattermost restricts those to letters, digits and
+    `.-_`, so a name cannot itself begin with `@`.
+
+    Idempotence is a property of the implementation, not a requirement any
+    caller currently exercises — and the earlier claim that the membership-add
+    path "supplies a bare name" was wrong. That path reads REST's
+    `display_name`, which for a direct channel is the **empty string** (see
+    `rest.py`'s `channel_member_usernames` docstring), so it never reaches here
+    with a name at all.
     """
     return display[1:] if display.startswith("@") else display
 

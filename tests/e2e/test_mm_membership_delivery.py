@@ -30,12 +30,13 @@ Three things make it a test rather than a sleep-and-hope:
 There is deliberately **no MM warm-up fixture**, and this test absorbs the
 Claude cold start inside its own 120s wait. Collection order puts this file
 before `test_mm_ping_pong.py`, so it pays that cost rather than avoiding it.
-That is a decision, not an oversight: the agent `_warmup_agents` exists for is
-OpenCode, which initialises its subprocess lazily and can take 60–90s, and
-both MM rules deliberately point at Claude precisely so this suite never waits
-on that. If a future MM rule uses OpenCode, the warm-up ping belongs in the
-`mm_connected` fixture — not in `_warmup_agents`, which would couple the
-Rocket.Chat path to Mattermost seeding.
+That is a decision, not an oversight. `_warmup_agents` warms both runtimes,
+but the one it exists for is OpenCode, which initialises its subprocess lazily
+and can take 60–90s; Claude's cold start is a fraction of that and fits inside
+the 120s wait with room. Both MM rules deliberately point at Claude, so this
+suite never waits on the slow one. If a future MM rule uses OpenCode, the
+warm-up ping belongs in the `mm_connected` fixture — not in `_warmup_agents`,
+which would couple the Rocket.Chat path to Mattermost seeding.
 """
 from __future__ import annotations
 
@@ -72,18 +73,34 @@ def test_a_post_in_a_readable_unjoined_channel_produces_nothing(
         f"the bot is not in #{mm_setup['member_channel']}, so the liveness "
         "control below cannot work"
     )
-    # Readability from the BOT's own token — the half §6.2 insists on, because
-    # an admin-token read would prove nothing about what the bot can see.
-    readable = mm_bot_client.get_posts(outside_id)
-    assert isinstance(readable, list), (
-        f"the bot cannot read #{mm_setup['outside_channel']}, so silence would "
-        "be explained by access rather than by delivery"
+    # No stale watcher for the outside channel BEFORE anything is posted. This
+    # is a precondition, not a duplicate of the assertion at the end: without
+    # it, a record left behind by an interrupted `make e2e-probe-mm` — which
+    # drives the same bot account and joins it to this channel — surfaces at
+    # the end of the test as "a watcher materialized for a channel the bot
+    # never joined", blaming this run's delivery for last run's residue, and
+    # the claim would be false as well as misdirected.
+    outside_handle = f"{MM_CONNECTOR_NAME}:{mm_setup['outside_channel']}"
+    assert outside_handle not in acg_watcher_list(), (
+        f"a watcher for {outside_handle!r} already exists before this test "
+        "posted anything — most likely an interrupted 'make e2e-probe-mm' left "
+        f"it behind. Expire it: agent-chat-gateway expire '{outside_handle}'"
     )
 
     before_ts = int(time.time() * 1000)
 
     # ── 1. The message that must vanish ───────────────────────────────────────
-    mm_test_client.post_message(
+    # `bait` doubles as the positive control for the read at step 3. §6.2
+    # insists readability be established with the BOT's own token, and the
+    # obvious way to write that — `assert isinstance(get_posts(...), list)` —
+    # cannot fail: `get_posts` raises on a bad status and otherwise always
+    # returns a list, so its carefully worded message was unreachable. Instead
+    # this post, made by the human after `before_ts` in the channel under test,
+    # MUST come back from the very query the negative assertion depends on.
+    # That validates the channel id, the bot token's view of this channel, and
+    # the `since - 1` boundary arithmetic in one shot — the three ways the
+    # negative could otherwise pass while the bot really had posted.
+    bait = mm_test_client.post_message(
         outside_id,
         f"@{mm_setup['bot_username']} respond with exactly the single word 'leak'",
     )
@@ -104,11 +121,15 @@ def test_a_post_in_a_readable_unjoined_channel_produces_nothing(
     assert "pong" in reply["message"].lower()
 
     # ── 3. Now the negatives mean something ───────────────────────────────────
-    leaked = [
-        p
-        for p in mm_bot_client.get_posts(outside_id, since_ms=before_ts)
-        if p.get("user_id") == bot_id
-    ]
+    outside_posts = mm_bot_client.get_posts(outside_id, since_ms=before_ts)
+    assert any(p.get("id") == bait["id"] for p in outside_posts), (
+        "the bot's own read of "
+        f"#{mm_setup['outside_channel']} did not return the message this test "
+        "just posted there, so it cannot be trusted to reveal a message from "
+        "the bot either — the assertion below would pass for the wrong reason. "
+        f"Read {len(outside_posts)} post(s) since ts={before_ts}."
+    )
+    leaked = [p for p in outside_posts if p.get("user_id") == bot_id]
     assert leaked == [], (
         f"the bot posted in #{mm_setup['outside_channel']}, a channel it is "
         f"not a member of: {[p.get('message') for p in leaked]!r}"
@@ -117,8 +138,11 @@ def test_a_post_in_a_readable_unjoined_channel_produces_nothing(
     # A watcher for the outside channel would mean the event arrived even if
     # the reply did not — a different and worse failure than a missing reply,
     # because the room would then be tracked, persisted and woken on schedule.
+    # It is also the check that makes the post read above need no margin for
+    # reply latency: a watcher record is created when the event is received,
+    # before any agent work, so an event that arrived at all is visible here
+    # by the time the pong lands, whatever the outside turn was doing.
     watchers = acg_watcher_list()
-    outside_handle = f"{MM_CONNECTOR_NAME}:{mm_setup['outside_channel']}"
     member_handle = f"{MM_CONNECTOR_NAME}:{mm_setup['member_channel']}"
     # Guard on the guard: if the member watcher is missing, the listing is not
     # telling us what we think it is, and the absence below proves nothing.

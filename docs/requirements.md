@@ -124,7 +124,7 @@ The gateway SHALL:
 When multiple connectors are configured, the gateway SHALL:
 1. Allow the `list` command to show watchers across all connectors
 2. Allow selective listing by connector with the `--connector` flag
-3. For commands targeting a specific watcher, accept an optional `--connector` flag to disambiguate (default: first configured connector)
+3. For commands targeting a specific watcher, accept a `--connector` flag to disambiguate — optional when exactly one connector is configured, required when there are several (the daemon refuses to guess rather than picking one)
 4. Return partial results with per-connector errors when some connectors fail during aggregated operations
 
 ---

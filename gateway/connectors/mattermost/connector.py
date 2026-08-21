@@ -1172,16 +1172,30 @@ class MattermostConnector(Connector):
 
         display = decoded.get("channel_display_name") or ""
         if kind is RoomKind.DM:
-            # `channel_name` is `<userid>__<userid>`; the display name is the counterpart —
-            # `@`-prefixed on the wire, which `bare_handle` drops so that one person has one
-            # handle on both platforms (Rocket.Chat supplies the name bare).
-            participants = (bare_handle(display),) if display else ()
+            # `channel_name` is `<userid>__<userid>`; the display name is the counterpart,
+            # and on the wire it is `@`-PREFIXED (`@alice`). `bare_handle` drops the prefix
+            # so one person has one handle on both platforms — Rocket.Chat supplies the name
+            # bare, and `@` is outside `_LABEL_SAFE`, so keeping it produced `dm:%40alice`.
+            #
+            # Stripped BEFORE the emptiness test, not after: a display of `"@"` alone would
+            # otherwise pass the guard and yield `("",)`, and an empty participant makes
+            # `room_label` produce a nameless `dm:` instead of falling back to the room-id
+            # digest.
+            counterpart = bare_handle(display)
+            participants = (counterpart,) if counterpart else ()
         elif kind is RoomKind.GROUP_DM:
-            # The display name is the member list, including the bot itself, and each entry
-            # carries the same `@`. Split for the participants column; never used as a label,
-            # which must not move when membership does (§2.3).
+            # The display name is the member list, including the bot itself. Split for the
+            # participants column; never used as a label, which must not move when membership
+            # does (§2.3).
+            #
+            # **Group DMs are NOT prefixed** — Mattermost is inconsistent between the two
+            # kinds, verified on 11.7.0 (§6.4): a DM event carries `'@mmadmin'` while a group
+            # DM event carries `'acg_bot, mmadmin, probe-extra'`. `bare_handle` is applied
+            # anyway, and is a no-op here: the alternative is two branches that treat the
+            # same field by different rules, which is how the prefix went unnoticed on the
+            # DM side for as long as it did.
             participants = tuple(
-                bare_handle(p.strip()) for p in display.split(",") if p.strip()
+                h for p in display.split(",") if (h := bare_handle(p.strip()))
             )
         else:
             participants = ()

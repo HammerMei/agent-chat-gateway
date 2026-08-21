@@ -29,12 +29,11 @@ connectors:
     owners:
     - test_user
     guests: []
-  attachments:
-    max_file_size_mb: 10
-    download_timeout: 30
-  reply_in_thread: false
-  # Mattermost defaults this one to true, unlike Rocket.Chat. Pinned to false
-  # so a reply lands in the channel the test is polling.
+  # Only ONE override here, so it is worth saying which and why: both
+  # connectors default permission_reply_in_thread to true, so this has to be
+  # pinned for a reply to land in the channel the test polls. Everything else
+  # (attachments, reply_in_thread) takes the connector default deliberately —
+  # restating a default disguises which line is doing the work.
   permission_reply_in_thread: false
 agent_templates:
   e2e-default:

@@ -2495,14 +2495,25 @@ rules out a channel-specific quirk.
 | No event for a readable-but-not-joined public channel | Delivery **is** the membership signal. No additional membership gate is needed, and the creation path does not need a REST membership check. |
 | `data.channel_name`, `data.channel_type` and `data.team_id` are all populated for channel posts | Routing can resolve name, type and team **from the event**, skipping a REST call — which matters for keeping work off the semaphore-held handler path. |
 | `data.team_id` is empty for DMs; `broadcast.team_id` is empty always | Use `data.team_id`, and treat empty as "not a team channel" rather than a lookup failure. |
-| DM `channel_name` is the opaque `<userid>__<userid>` form, but `channel_display_name` is the counterpart handle — **`@`-prefixed**, e.g. `@alice` | Mattermost supplies a usable DM display name where Rocket.Chat does not. The prefix must be **stripped** on the way into `participants` (`normalize.bare_handle`), or one person ends up with two handles: `<connector>:dm:%40alice` on Mattermost against `<connector>:dm:alice` on Rocket.Chat, since `@` is outside `_LABEL_SAFE` and gets percent-encoded. Only the event path carries the prefix — REST's `display_name` for the same DM channel is the empty string, so the strip has to be idempotent for the paths that supply a bare name. |
+| DM `channel_name` is the opaque `<userid>__<userid>` form, but `channel_display_name` is the counterpart handle — **`@`-prefixed**, e.g. `@alice`. A **group** DM's is the member list and is **not** prefixed (`acg_bot, mmadmin, probe-extra`, §6.4) | Mattermost supplies a usable DM display name where Rocket.Chat does not, and is inconsistent between the two direct kinds. The prefix must be **stripped** on the way into `participants` (`normalize.bare_handle`), or one person ends up with two handles: `<connector>:dm:%40alice` on Mattermost against `<connector>:dm:alice` on Rocket.Chat, since `@` is outside `_LABEL_SAFE` and gets percent-encoded. Strip before testing for emptiness — a display of `"@"` alone would otherwise yield one empty participant and a nameless `dm:` label instead of the room-id digest fallback. Only the event path carries any name at all: REST's `display_name` for a direct channel is the empty string, which is why the membership-add path produces no counterpart rather than a bare one. |
 | Own messages and system messages (`system_join_channel`, `system_leave_channel`) are delivered | Both filters are required; the existing non-empty-`type` check covers the system case. |
 
 **Re-verified 2026-08-20** against the E2E stack, which now runs Mattermost
 11.7.0 — the same version this section was probed on (`make e2e-probe-mm`
-reruns `probe_a2_mm.py` against it). Every row above still held, including the
-isolation case: no event for the readable-but-not-joined channel, delivery
+reruns `probe_a2_mm.py` against it). Every row above held as stated, including
+the isolation case: no event for the readable-but-not-joined channel, delivery
 within milliseconds once the membership row was added.
+
+**But the probe did not catch everything, and that is worth recording.** The
+`@` prefix on a DM's `channel_display_name` — now the subject of the row above
+— was missed by both the original probe and this re-verification, and was
+found afterwards by reading a populated `agent-chat-gateway list --all` and
+seeing a watcher called `mm-e2e:dm:%40test_user`. The probe prints the raw
+event and so contained the evidence all along; nothing asserted anything about
+it. The group-DM half of the same field was then confirmed bare (§6.4) by
+`probe_group_dm_and_teams.py` on 2026-08-21, after a comment in the connector
+had already claimed the opposite. A probe answers the questions it was written
+to ask; a field it merely prints is not thereby verified.
 
 This is now also covered **through the runtime**, not only at the platform
 level, by `tests/e2e/test_mm_membership_delivery.py`. The distinction is worth

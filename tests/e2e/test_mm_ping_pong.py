@@ -38,9 +38,11 @@ def test_mm_ping_pong(
     # `user_id` and no username at all, so resolving it once above is cheaper
     # and less brittle than a per-post lookup.
     #
-    # The "pong" substring is load-bearing for the same reason as in the RC
-    # twin — it stops a stale reply from an earlier test in the same session
-    # from satisfying the wait.
+    # `before_ts` is what excludes a reply from an earlier test; the "pong"
+    # substring cannot, since test_mm_membership_delivery.py asks for the same
+    # word in the same channel. What the substring does buy is that a bot
+    # message which is NOT the answer — a permission prompt, an error notice —
+    # does not satisfy the wait.
     reply = mm_test_client.poll_for_message(
         mm_room["id"],
         before_ts,

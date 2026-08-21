@@ -40,6 +40,10 @@ class MMClient:
         self.token: str | None = None
         self.user_id: str | None = None
         self.username: str | None = None
+        # Space-separated, from the login response body — `mm_setup` asserts
+        # `system_admin` is in here rather than trusting the first-user-wins
+        # ordering that grants it.
+        self.roles: str | None = None
 
     def close(self) -> None:
         self._client.close()
@@ -59,7 +63,9 @@ class MMClient:
         resp.raise_for_status()
         # The token arrives as a RESPONSE HEADER, not in the body.
         self.token = resp.headers["Token"]
-        self.user_id = resp.json()["id"]
+        body = resp.json()
+        self.user_id = body["id"]
+        self.roles = body.get("roles", "")
         self.username = username
         self._client.headers.update({"Authorization": f"Bearer {self.token}"})
         return self
@@ -153,12 +159,27 @@ class MMClient:
             resp.raise_for_status()
 
     def is_channel_member(self, channel_id: str, user_id: str) -> bool:
-        """Uses THIS session's token, so read the result carefully: a
-        non-member cannot query even its own membership row and gets 403,
-        which is why design §6.2 leans on an ADMIN-token lookup (404) to
-        establish non-membership. Call this from an admin session."""
+        """True/False only when the server actually answered the question.
+
+        Call this from an ADMIN session. A non-member cannot query even its own
+        membership row and gets **403**, which is why design §6.2 makes the
+        admin-token lookup (**404** for a genuine non-member) the load-bearing
+        one.
+
+        Anything other than 200/404 raises rather than returning False. A
+        `status_code == 200` test reads 403 as "not a member", so a caller
+        whose token is not really an admin — Mattermost only grants
+        `system_admin` to the FIRST user created, and `mm_setup` skips creation
+        when the account already exists — would see every membership question
+        answered "no". `test_mm_membership_delivery.py` asserts a non-membership
+        as a precondition, so failing open there means the test passes without
+        establishing the thing it is built on.
+        """
         resp = self._client.get(f"/channels/{channel_id}/members/{user_id}")
-        return resp.status_code == 200
+        if resp.status_code == 404:
+            return False
+        resp.raise_for_status()
+        return True
 
     def get_dm_channel_id(self, other_user_id: str) -> str:
         """A DM channel belongs to no team and is addressed by the pair of

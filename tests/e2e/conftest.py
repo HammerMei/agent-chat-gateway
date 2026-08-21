@@ -63,9 +63,14 @@ ACG_LOG_PATH = "/root/.agent-chat-gateway/gateway.log"
 # Logged by MattermostConnector.connect() — and logged *after* resolve_team(),
 # so its presence also proves the configured team resolved.
 MM_CONNECTED_MARKER = "MattermostConnector connected to"
-# Short: the connector connects during startup, so if the gateway answers at
-# all this is a matter of the log file appearing, not of waiting for work.
+# Short, and it has to stay short: this fixture runs inside the per-test
+# pytest-timeout budget (--timeout=180 in the Makefile and both workflows),
+# alongside a 120s poll_for_message in the first MM test. The connector
+# connects during startup, so if the gateway answers at all this is a matter of
+# the log file appearing, not of waiting for work.
 MM_CONNECTED_TIMEOUT = 30
+# The daemon's own first log line, one per boot — see `_current_boot`.
+_BOOT_ANCHOR = "Daemon started ("
 
 
 # ── Session fixtures ──────────────────────────────────────────────────────────
@@ -258,14 +263,30 @@ def mm_setup() -> dict[str, Any]:
 
 @pytest.fixture(scope="session")
 def mm_connected(acg: None, mm_setup: dict[str, Any]) -> None:
-    """Fail fast unless the mm-e2e connector actually came up inside ACG.
+    """Fail fast unless the mm-e2e connector came up in THIS boot of ACG.
 
-    `acg` becoming ready means the *gateway* is answering, which it can do
-    with the MM socket down — the fatal half of MM's boot failures (see the
-    module docstring) has already taken the `acg` fixture with it by the time
-    this runs, so what is left to check is the half that does not. Depending
-    on this fixture converts that half from a 120-second timeout in whichever
-    MM test ran first into a named failure before any message is sent.
+    Be precise about what this can and cannot catch, because the first version
+    of this docstring overclaimed. `connect()` authenticates, calls `get_me()`,
+    resolves the team and opens the socket all *before* the marker is logged,
+    and any failure there is fatal to the daemon — while the control socket
+    only starts after both settle phases. So a gateway that answers `status`
+    at all has already logged the marker, and this fixture can NOT detect a
+    socket that opened and later dropped: a marker is a one-time event and no
+    later failure removes it.
+
+    What it does catch, all of it observed at least once:
+
+    * a marker that belongs to a PREVIOUS boot (see below) — the case that
+      makes an unscoped grep useless;
+    * the connector missing or renamed in config, where the gateway is happily
+      up serving the other platform;
+    * a stack where nothing is running at all, which used to be reported here
+      as a Mattermost fault;
+    * the log-file race, by polling.
+
+    In every one of those the alternative is a 120-second timeout in whichever
+    MM test ran first, reported as "No matching post" — indistinguishable from
+    a delivery bug.
 
     Polled rather than read once, because `agent-chat-gateway status` succeeds
     before the log file exists: observed right after a container recreate, the
@@ -273,35 +294,60 @@ def mm_connected(acg: None, mm_setup: dict[str, Any]) -> None:
     such file or directory". Reading once would turn that race into a failure
     claiming the connector never connected, which is the opposite of this
     fixture's job.
+
+    **Scoped to the current boot, and it has to be.** The daemon opens its log
+    in append mode and `~/.agent-chat-gateway` is not a mounted volume, so the
+    file survives every restart of a container declared `restart:
+    unless-stopped`. An unscoped search answers "did an MM connector ever
+    connect in this container's lifetime" — so a gateway that restarted with a
+    dead Mattermost socket would find the first boot's marker, pass, and hand
+    the MM tests the 120-second timeout this fixture exists to replace.
+
+    **It also refuses to say the gateway is up unless it checked.** The earlier
+    version asserted that in its failure message on the strength of the `acg`
+    fixture having passed, and that was observed to be false: `agent-chat-gateway
+    status` exits 0 while printing "Gateway: not running", so `_wait_for_acg`'s
+    returncode gate lets a dead daemon through. This fixture then blamed the
+    Mattermost connector for a stack where nothing was running at all.
     """
     deadline = time.monotonic() + MM_CONNECTED_TIMEOUT
     log = ""
     while time.monotonic() < deadline:
-        log = subprocess.run(
+        result = subprocess.run(
             ["docker", "exec", ACG_CONTAINER, "sh", "-c", f"cat {ACG_LOG_PATH}"],
             capture_output=True,
             text=True,
-        ).stdout
-        if MM_CONNECTED_MARKER in log:
+        )
+        log = result.stdout
+        if MM_CONNECTED_MARKER in _current_boot(log):
             return
         time.sleep(2)
 
+    running = _gateway_is_running()
     # Give the operator the lines that explain it rather than "not found".
     mm_lines = [
         line
-        for line in log.splitlines()
+        for line in _current_boot(log).splitlines()
         if "attermost" in line or MM_CONNECTOR_NAME in line
     ]
     pytest.fail(
         f"The '{MM_CONNECTOR_NAME}' connector never reported connecting within "
-        f"{MM_CONNECTED_TIMEOUT}s (no {MM_CONNECTED_MARKER!r} in "
-        f"{ACG_LOG_PATH}).\n"
-        "The gateway is up, so this is the connector specifically: a bad "
-        "account, an unresolvable team, or a websocket that could not open. "
-        "Most likely the MM bootstrap did not run before ACG started — "
-        "'make e2e-up' does both in order; starting the container by hand "
-        "does not.\n"
-        "Mattermost-related log lines:\n  "
+        f"{MM_CONNECTED_TIMEOUT}s (no {MM_CONNECTED_MARKER!r} in this boot's "
+        f"portion of {ACG_LOG_PATH}).\n"
+        + (
+            "The gateway IS running, so this is the connector specifically: a "
+            "bad account, an unresolvable team, or a websocket that could not "
+            "open. Most likely the MM bootstrap did not run before ACG "
+            "started — 'make e2e-up' does both in order; starting the "
+            "container by hand does not.\n"
+            if running
+            else "The gateway is NOT running — this is not a Mattermost "
+            "problem. Note that 'agent-chat-gateway status' exits 0 even when "
+            "it reports 'not running', so the readiness wait does not catch "
+            "this. Check 'docker logs " + ACG_CONTAINER + "' for a startup "
+            "that never finished.\n"
+        )
+        + "Mattermost-related log lines from this boot:\n  "
         + ("\n  ".join(mm_lines[-25:]) if mm_lines else "(none at all)")
     )
 
@@ -385,6 +431,39 @@ def mm_room(
         "name": mm_setup["member_channel"],
         "mention_prefix": f"@{mm_setup['bot_username']} ",
     }
+
+
+def _current_boot(log: str) -> str:
+    """The tail of `gateway.log` written by the CURRENT daemon process.
+
+    Anchored on the daemon's own first line rather than on a connector or
+    service line, because the Mattermost marker is logged *before*
+    "GatewayService running with connector(s)" — anchoring there would cut off
+    the very line being searched for.
+
+    Falls back to the whole log when the anchor is absent. That reintroduces
+    the stale-marker risk, but the alternative — treating a missing anchor as
+    an empty boot — turns a log-format change into a failure claiming the
+    connector never connected, and a false alarm is the more expensive
+    mistake for a fail-fast check.
+    """
+    index = log.rfind(_BOOT_ANCHOR)
+    return log if index < 0 else log[index:]
+
+
+def _gateway_is_running() -> bool:
+    """Whether the daemon is actually up, read from `status`' TEXT.
+
+    Not from its exit code: `agent-chat-gateway status` exits 0 while printing
+    "Gateway: not running", which is why `_wait_for_acg`'s returncode gate
+    admits a dead daemon in the first place.
+    """
+    result = subprocess.run(
+        ["docker", "exec", ACG_CONTAINER, "agent-chat-gateway", "status"],
+        capture_output=True,
+        text=True,
+    )
+    return "running (pid=" in result.stdout
 
 
 def acg_watcher_list() -> str:

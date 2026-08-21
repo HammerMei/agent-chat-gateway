@@ -79,25 +79,45 @@ e2e-test: ## Run E2E tests (requires e2e-up first, needs CLAUDE_CODE_OAUTH_TOKEN
 	    echo "ERROR: container 'acg-e2e' is not up — run 'make e2e-up' first."; \
 	    echo "       'make e2e-test' only runs the suite; it starts nothing."; \
 	    exit 1; }
-	@# The token that matters is the one INSIDE the container, not the one in
-	@# this shell. Compose bakes environment in at container CREATION, so a
-	@# stack brought up without a token stays without one however the test run
-	@# is invoked — and the old check, which read this shell, said nothing
-	@# while every Claude test timed out for eight minutes and reported
-	@# "no matching post", as if delivery were broken.
-	@docker exec acg-e2e sh -c 'test -n "$$CLAUDE_CODE_OAUTH_TOKEN$$ANTHROPIC_API_KEY"' 2>/dev/null || { \
-	    echo "ERROR: the running acg-e2e container has NO Claude credentials."; \
+	@# "Exists" is not "running": `docker container inspect` succeeds for an
+	@# exited or restarting container, and `acg` carries restart:
+	@# unless-stopped — so a crash-loop (an unseeded Mattermost makes connect()
+	@# fatal) would sail past the check above and be reported below as a
+	@# credentials problem, sending the operator to fix the wrong thing.
+	@test "$$(docker container inspect -f '{{.State.Running}}' acg-e2e 2>/dev/null)" = "true" || { \
+	    echo "ERROR: container 'acg-e2e' exists but is not running."; \
+	    echo "       This is a startup failure, not a config or token problem."; \
+	    echo "       'docker logs acg-e2e' has the reason; 'make e2e-dump'"; \
+	    echo "       writes everything to ./e2e-logs."; \
+	    exit 1; }
+	@# The credentials that matter are the ones INSIDE the container, not the
+	@# ones in this shell: compose bakes environment in at container CREATION,
+	@# so a stack brought up without a token stays without one however the run
+	@# is invoked. The previous check read THIS shell, found a token there and
+	@# said nothing, while every Claude test timed out for eight minutes and
+	@# reported "no matching post" as if delivery were broken.
+	@#
+	@# Stated as what it observed, not as a verdict: the compose also mounts
+	@# ~/.claude, so a host with a logged-in CLI may supply credentials by a
+	@# path this cannot see. Hence the override — a check that blocks a working
+	@# setup is worse than the silence it replaced.
+	@test -n "$(E2E_SKIP_CRED_CHECK)" || \
+	docker exec acg-e2e sh -c 'test -n "$$CLAUDE_CODE_OAUTH_TOKEN$$ANTHROPIC_API_KEY"' || { \
+	    echo "ERROR: neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY is"; \
+	    echo "       set inside the running acg-e2e container."; \
 	    echo "       Exporting them now does not help: the container was created"; \
 	    echo "       without them, and compose fixes environment at creation."; \
 	    echo "       Recreate just this container — the platforms and their"; \
 	    echo "       seeded accounts survive, so this costs seconds, not a"; \
 	    echo "       Rocket.Chat boot:"; \
 	    echo "         CLAUDE_CODE_OAUTH_TOKEN=... docker compose -f $(E2E_COMPOSE) \\"; \
-	    echo "             up -d --force-recreate acg"; \
+	    echo "             up -d --build --force-recreate acg"; \
 	    echo "       (or ANTHROPIC_API_KEY=...). Reach for 'make e2e-down' only"; \
 	    echo "       if you also want the platform data gone — it takes -v."; \
-	    echo "       Every Claude test fails as a 120s timeout otherwise, which"; \
-	    echo "       reads like a delivery bug."; \
+	    echo "       Without credentials every Claude test fails as a 120s"; \
+	    echo "       timeout, which reads like a delivery bug."; \
+	    echo "       If your credentials come from the ~/.claude mount instead,"; \
+	    echo "       re-run with E2E_SKIP_CRED_CHECK=1."; \
 	    exit 1; }
 	uv run pytest tests/e2e/ -v -s --timeout=180 \
 	    --ignore=tests/unit --ignore=tests/integration
@@ -140,10 +160,15 @@ e2e-probe: ## Re-verify the RC platform behaviour design §6 depends on, against
 #
 # NOTE: this drives the acg_bot ACCOUNT — the same one the connector uses —
 # and its membership isolation case JOINS the bot to the outside channel and
-# removes it again. A clean run leaves membership as it found it; a run killed
-# partway can leave the bot inside, which is precisely the state
-# test_mm_membership_delivery.py refuses to run in. `mm_setup.py` puts it
-# back, and the test says so when it trips.
+# removes it again. Two residues are possible if it is killed partway, and
+# `mm_setup.py` only clears the first:
+#   * the bot left inside the outside channel — mm_setup removes it;
+#   * a watcher RECORD for that channel, created because the join made the
+#     channel deliver events and the deliberately-broad `acg-e2e-mm-*` glob
+#     claims it. mm_setup does not touch records, so clear it by hand:
+#     agent-chat-gateway expire 'mm-e2e:acg-e2e-mm-outside'
+# test_mm_membership_delivery.py checks both up front and names the remedy,
+# rather than reporting the residue as this run's leak.
 e2e-probe-mm: ## Re-verify the Mattermost platform behaviour design §6.2/§6.3 depends on
 	uv run python scripts/probe_a2_mm.py \
 	    --url $(E2E_MM_URL) --team acg-e2e \

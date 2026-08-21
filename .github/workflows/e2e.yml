@@ -55,6 +55,24 @@ jobs:
             --build-arg OPENCODE_VERSION=${{ env.OPENCODE_VERSION }} \
             acg
 
+      # Fail before the 40-minute version of this failure. Without credentials
+      # ACG starts fine, both connectors log in fine, mm_connected passes — and
+      # then every agent test burns its full --timeout=180 and reports "No
+      # matching post", which reads as a delivery bug. `make e2e-test` has a
+      # container-side check for exactly this, and neither workflow calls it.
+      - name: Require Claude credentials before starting ACG
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "$CLAUDE_CODE_OAUTH_TOKEN$ANTHROPIC_API_KEY" ]; then
+            echo "::error::Neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY is set."
+            echo "Set one as a repository secret. Compose bakes the value in at"
+            echo "container creation, so every agent test would otherwise fail as a"
+            echo "120s timeout that looks like a delivery or routing bug."
+            exit 1
+          fi
+
       - name: Start ACG (phase 2)
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}

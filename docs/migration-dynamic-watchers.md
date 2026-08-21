@@ -146,9 +146,12 @@ agent-chat-gateway expire 'mm-e2e:dm:%40test_user'   # quote it — % and : are 
 ```
 
 Accepted losses, the same ones the rest of this document takes: the session is
-fresh (history handoff refetches recent messages), the watermark resets once,
-and the old watcher's durable-instructions prompt file is left behind — prompt
-files are keyed partly on the watcher name, so a rename orphans one.
+fresh (history handoff refetches recent messages) and the watermark resets
+once. The durable-instructions prompt file is **not** left behind — `expire`
+reclaims the room, and reclamation deletes that file under the name the record
+still holds. (A prompt file is keyed partly on the watcher name, so a rename
+performed any other way would orphan one; going through `expire` is what
+avoids it.)
 
 Leaving the encoded name in place is also a legitimate choice. It is ugly in
 `list` and awkward to type, and that is the whole of the cost.
