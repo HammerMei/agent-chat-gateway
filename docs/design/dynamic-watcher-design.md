@@ -2558,11 +2558,13 @@ by §4.5.
 |---|---|---|
 | type on the wire | `channel_type: "G"` — distinct from `"D"` | `roomType: "d"` — **identical to a 1:1** |
 | stable identifier | `channel_name` is a stable opaque hash (e.g. `1b4c4b32…`) | none in the frame |
-| human-readable name | `channel_display_name` is the member list, e.g. `"glin, probe-bot, probe-extra"` | absent |
+| human-readable name | `channel_display_name` is the member list, e.g. `"glin, probe-bot, probe-extra"` — **not `@`-prefixed**, unlike a 1:1 DM's counterpart (§6.2). Re-observed 2026-08-21 on 11.7.0 as `"acg_bot, mmadmin, probe-extra"` with `scripts/probe_group_dm_and_teams.py` | absent |
 | team | empty, as for a 1:1 | n/a |
 
 Two corrections to earlier wording follow. Mattermost group DMs *do* have a
-stable identifier — it is `channel_name`, which is opaque but does not move;
+stable identifier — it is `channel_name`, which is opaque and does not move
+within an observed session (whether it survives a membership change is still
+open, §6.5 — do not rely on it as a durable key until that is confirmed);
 what is unstable is `channel_display_name`, since it is derived from the member
 list and includes the bot itself. And on Rocket.Chat a group DM is
 indistinguishable from a 1:1 **from the frame alone**: the participant list

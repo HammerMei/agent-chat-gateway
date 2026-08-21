@@ -104,13 +104,13 @@ class TestE2EClientDoesNotUseRemovedEndpoints(unittest.TestCase):
     def setUp(self):
         self.source = _RC_CLIENT.read_text()
 
-    def test_rooms_upload_is_not_called(self):
-        """Checked against the actual request CALLS, not the file's text.
+    def _requested_urls(self) -> list[str]:
+        """Every URL expression actually passed to a `.post`/`.get` call.
 
-        The docstring explaining why this endpoint is avoided necessarily
-        names it — twice, including the URL form — and a guard that tripped
-        on its own explanation would only teach the next person to delete
-        the explanation."""
+        Both tests below go through this, and neither reads the file's raw
+        text. The docstring explaining why `rooms.upload` is avoided
+        necessarily names it — twice, including the URL form — so a guard that
+        matched text would trip on its own explanation, or worse, pass on it."""
         requested: list[str] = []
         for node in ast.walk(ast.parse(self.source)):
             if not isinstance(node, ast.Call):
@@ -122,6 +122,10 @@ class TestE2EClientDoesNotUseRemovedEndpoints(unittest.TestCase):
                 segment = ast.get_source_segment(self.source, arg) or ""
                 requested.append(segment)
         self.assertTrue(requested, "no HTTP calls found — did the client move?")
+        return requested
+
+    def test_rooms_upload_is_not_called(self):
+        requested = self._requested_urls()
         offenders = [r for r in requested if "rooms.upload" in r]
         self.assertEqual(
             [],
@@ -132,10 +136,20 @@ class TestE2EClientDoesNotUseRemovedEndpoints(unittest.TestCase):
 
     def test_both_halves_of_the_two_step_upload_are_present(self):
         """A file uploaded via rooms.media alone sits unconfirmed and never
-        appears in the room, so the confirm call is not optional."""
+        appears in the room, so the confirm call is not optional.
+
+        Checked against the CALLS for the same reason as the test above — and
+        this one used to check the file's text, where both endpoint names
+        appear in `upload_file`'s docstring. Deleting the entire two-step
+        implementation left it green."""
+        requested = self._requested_urls()
         for endpoint in ("rooms.media/", "rooms.mediaConfirm/"):
             with self.subTest(endpoint=endpoint):
-                self.assertIn(endpoint, self.source)
+                self.assertTrue(
+                    any(endpoint in r for r in requested),
+                    f"no HTTP call requests {endpoint!r} — an upload that "
+                    "never confirms leaves the file invisible in the room",
+                )
 
 
 if __name__ == "__main__":

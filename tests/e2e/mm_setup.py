@@ -10,11 +10,16 @@ here, in order, before anything that needs admin rights.
 Steps:
   1. Wait for the server.
   2. Create the system admin (first user wins) — or log in if it exists.
-  3. Create the team. Channels are team-scoped (design §6.3), so everything
+  3. Assert the admin really holds `system_admin`. Separate from step 2 on
+     purpose: the role goes to the FIRST user created, and step 2 skips
+     creation when the account already exists, so on a warm database this is
+     the only thing standing between a plain-member "admin" and a suite whose
+     membership preconditions all pass vacuously.
+  4. Create the team. Channels are team-scoped (design §6.3), so everything
      below hangs off it.
-  4. Create the bot account ACG logs in as, and the human test account.
-  5. Create the member channel, with bot + test user in it.
-  6. Create the "outside" channel — the human test user joins it, the bot
+  5. Create the bot account ACG logs in as, and the human test account.
+  6. Create the member channel, with bot + test user in it.
+  7. Create the "outside" channel — the human test user joins it, the bot
      does NOT. This one exists for design §6.2: a public channel is READABLE
      by a non-member, and the finding the MM router depends on is that a post
      there produces no websocket event at all. A channel the bot can read but
@@ -129,7 +134,7 @@ def setup(mm_url: str = MM_URL) -> dict[str, Any]:
             admin.add_channel_member(channel["id"], users[username])
 
         # ── The "outside" channel, for the §6.2 membership-delivery test ────
-        # test_user in, bot deliberately out — see step 6 of the module
+        # test_user in, bot deliberately out — see step 7 of the module
         # docstring for why the poster must be the allow-listed human and not
         # the admin.
         outside = admin.get_channel(team_id, OUTSIDE_CHANNEL)

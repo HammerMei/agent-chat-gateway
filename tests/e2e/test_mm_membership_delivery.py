@@ -84,7 +84,8 @@ def test_a_post_in_a_readable_unjoined_channel_produces_nothing(
     assert outside_handle not in acg_watcher_list(), (
         f"a watcher for {outside_handle!r} already exists before this test "
         "posted anything — most likely an interrupted 'make e2e-probe-mm' left "
-        f"it behind. Expire it: agent-chat-gateway expire '{outside_handle}'"
+        f"""it behind. Clear it inside the container:
+    make e2e-acg C="expire '{outside_handle}'\""""
     )
 
     before_ts = int(time.time() * 1000)
@@ -121,7 +122,15 @@ def test_a_post_in_a_readable_unjoined_channel_produces_nothing(
     assert "pong" in reply["message"].lower()
 
     # ── 3. Now the negatives mean something ───────────────────────────────────
-    outside_posts = mm_bot_client.get_posts(outside_id, since_ms=before_ts)
+    # Windowed on the BAIT POST'S OWN server timestamp, not on `before_ts`.
+    # `before_ts` is the pytest runner's clock and `create_at` is the
+    # container's, and `get_posts` filters with `since - 1`: if the Mattermost
+    # container's clock trails the host's by more than a millisecond — Docker
+    # Desktop's VM clock drifts across sleep/resume — the bait post falls
+    # outside the window and this control fails while accusing the read of
+    # being untrustworthy. Every other use of `before_ts` in this file absorbs
+    # skew in tens of seconds of agent latency; this one had no margin at all.
+    outside_posts = mm_bot_client.get_posts(outside_id, since_ms=bait["create_at"])
     assert any(p.get("id") == bait["id"] for p in outside_posts), (
         "the bot's own read of "
         f"#{mm_setup['outside_channel']} did not return the message this test "

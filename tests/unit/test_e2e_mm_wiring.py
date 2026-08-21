@@ -44,14 +44,6 @@ def _config() -> dict:
     return yaml.safe_load(_E2E_CONFIG.read_text())
 
 
-def _rules() -> dict[str, dict]:
-    return {
-        entry["name"]: entry
-        for entry in (_config().get("watchers") or [])
-        if isinstance(entry, dict) and isinstance(entry.get("name"), str)
-    }
-
-
 def _conftest_constant(name: str) -> str:
     match = re.search(rf'^{name}\s*=\s*"([^"]+)"', _CONFTEST.read_text(), re.M)
     assert match, f"{name} not found in {_CONFTEST.name}"
@@ -144,15 +136,24 @@ class TestTheGlobStillClaimsTheOutsideChannel(unittest.TestCase):
 class TestTheHandleFormatsTheMMTestsAssertOn(unittest.TestCase):
     """`test_mm_membership_delivery.py` builds `<connector>:<channel>` by hand
     to check `list --all`, the same coupling `test_e2e_watcher_names.py` pins
-    for the schedule test."""
+    for the schedule test.
+
+    The connector name comes from conftest rather than a literal: hardcoding
+    `"mm-e2e"` here would leave this class green while pinning a form the
+    renamed connector no longer produces — which is the failure mode the class
+    exists to prevent, one level up.
+    """
+
+    def setUp(self):
+        self.connector = _conftest_constant("MM_CONNECTOR_NAME")
 
     def test_a_channel_handle_is_connector_colon_the_channel_slug(self):
         """The slug, not the display name: the MM connector fills RoomRef.name
         from the event's `channel_name`."""
         self.assertEqual(
-            f"mm-e2e:{mm_setup.MEMBER_CHANNEL}",
+            f"{self.connector}:{mm_setup.MEMBER_CHANNEL}",
             watcher_label(
-                "mm-e2e",
+                self.connector,
                 RoomRef(
                     id="whatever",
                     kind=RoomKind.CHANNEL,
@@ -189,9 +190,9 @@ class TestTheHandleFormatsTheMMTestsAssertOn(unittest.TestCase):
         """
         wire_value = f"@{mm_setup.TEST_USER_USERNAME}"
         self.assertEqual(
-            f"mm-e2e:dm:{mm_setup.TEST_USER_USERNAME}",
+            f"{self.connector}:dm:{mm_setup.TEST_USER_USERNAME}",
             watcher_label(
-                "mm-e2e",
+                self.connector,
                 RoomRef(
                     id="whatever",
                     kind=RoomKind.DM,
@@ -205,9 +206,9 @@ class TestTheHandleFormatsTheMMTestsAssertOn(unittest.TestCase):
         """The cost of regressing the line above, stated so it is concrete: an
         operator would have to type `%40` to address a Mattermost DM."""
         self.assertEqual(
-            "mm-e2e:dm:%40test_user",
+            f"{self.connector}:dm:%40test_user",
             watcher_label(
-                "mm-e2e",
+                self.connector,
                 RoomRef(id="x", kind=RoomKind.DM, name="", participants=("@test_user",)),
             ),
         )
@@ -266,60 +267,91 @@ class TestGetPostsAsksForAnInclusiveWindow(unittest.TestCase):
 # server and with a message naming the fix.
 
 
-if __name__ == "__main__":
-    unittest.main()
+class TestBootScopingOfTheReadyMarker(unittest.TestCase):
+    """`mm_connected` must read only the CURRENT boot, and the anchor must be
+    specific enough that chat traffic cannot forge it.
 
+    Two review rounds each found a defect in the previous version of this, so
+    the risks are named rather than implied:
 
-class TestBootScopingOfTheConnectedMarker(unittest.TestCase):
-    """`mm_connected` must not accept a marker from a PREVIOUS boot.
+    * the daemon appends to `gateway.log` and the runtime dir is not a volume,
+      so under `restart: unless-stopped` the file holds every boot — an
+      unscoped search answers "did this ever connect", which passes for a
+      gateway that came back broken;
+    * every inbound message's first 120 characters are logged, so anchoring on
+      the bare `Daemon started (` prefix let a chat message become the last
+      anchor and hide the real boot. The pid closes that.
 
-    The daemon opens `gateway.log` in append mode and the runtime directory is
-    not a mounted volume, so the file survives every restart of a container
-    declared `restart: unless-stopped`. An unscoped search answers "did an MM
-    connector ever connect in this container's lifetime", which would pass for
-    a gateway that came back with a dead Mattermost socket — the precise
-    failure the fixture exists to name.
-
-    Pure string work, so it is testable here rather than only against a live
-    stack.
+    The anchor format is checked against the DAEMON's own logging call below,
+    so a reworded log line fails here rather than degrading silently.
     """
 
     def setUp(self):
         sys.path.insert(0, str(_E2E))
         import conftest as e2e_conftest
 
+        self.conftest = e2e_conftest
         self.current_boot = e2e_conftest._current_boot
-        self.marker = e2e_conftest.MM_CONNECTED_MARKER
-        self.anchor = e2e_conftest._BOOT_ANCHOR
 
-    def test_a_marker_from_an_earlier_boot_is_excluded(self):
+    def _log(self, pid: int, tail: str) -> str:
+        return (
+            f"01-01 00:00:00 [daemon] INFO: Daemon started (pid={pid})\n" + tail
+        )
+
+    def test_the_anchor_format_matches_the_daemon_call_that_emits_it(self):
+        """The one assertion that is NOT built from the constant.
+
+        Everything else here composes `_BOOT_ANCHOR_FMT` with itself, so a
+        rename of the daemon's log text would move input and expectation
+        together and go unnoticed — while `_current_boot` silently fell back to
+        the whole log, i.e. back to the bug this class exists to prevent. Tie
+        the constant to its producer instead.
+        """
+        source = (_REPO / "gateway" / "daemon.py").read_text()
+        rendered = self.conftest._BOOT_ANCHOR_FMT.format(pid="%d")
+        self.assertIn(
+            rendered,
+            source,
+            "conftest._BOOT_ANCHOR_FMT no longer matches the string "
+            "gateway/daemon.py logs at startup, so mm_connected's boot "
+            "scoping silently degrades to searching the whole log",
+        )
+
+    def test_an_earlier_boots_marker_is_excluded(self):
         log = (
-            f"01-01 00:00:00 [daemon] INFO: {self.anchor}pid=1)\n"
-            f"01-01 00:00:01 [mattermost] INFO: {self.marker} http://mm:8065\n"
-            f"01-02 00:00:00 [daemon] INFO: {self.anchor}pid=2)\n"
-            "01-02 00:00:01 [mattermost] ERROR: websocket refused\n"
+            self._log(1, "01-01 00:00:01 [service] INFO: ready connector(s): mm-e2e\n")
+            + self._log(2, "01-02 00:00:01 [mattermost] ERROR: websocket refused\n")
         )
-        self.assertNotIn(
-            self.marker,
-            self.current_boot(log),
-            "a marker written before the last 'Daemon started' line is stale — "
-            "accepting it lets a gateway that restarted with a dead Mattermost "
-            "socket pass this fixture",
-        )
+        self.assertNotIn("mm-e2e", self.current_boot(log, 2))
 
     def test_the_current_boots_marker_is_kept(self):
-        """Guard on the guard: the anchor must not cut off the line being
-        searched for. The MM marker is logged BEFORE 'GatewayService running',
-        so anchoring on that line instead would break this."""
+        marker = self.conftest.CONNECTORS_READY_MARKER
+        log = self._log(7, f"01-02 00:00:01 [service] INFO: {marker} rc-e2e, mm-e2e\n")
+        self.assertIn(marker, self.current_boot(log, 7))
+
+    def test_a_chat_message_quoting_the_prefix_cannot_hide_the_boot(self):
+        """The poisoning case. Inbound message text is logged, so this line is
+        something a user can put in the file — after the real banner."""
+        marker = self.conftest.CONNECTORS_READY_MARKER
         log = (
-            f"01-02 00:00:00 [daemon] INFO: {self.anchor}pid=2)\n"
-            f"01-02 00:00:01 [mattermost] INFO: {self.marker} http://mm:8065\n"
-            "01-02 00:00:02 [service] INFO: GatewayService running with connector(s): mm-e2e\n"
+            self._log(263, f"01-02 00:00:01 [service] INFO: {marker} rc-e2e, mm-e2e\n")
+            + "01-02 00:00:02 [processor] INFO: Processing [general] Daemon started (pid=1)\n"
         )
-        self.assertIn(self.marker, self.current_boot(log))
+        self.assertIn(
+            marker,
+            self.current_boot(log, 263),
+            "a chat message quoting the boot banner became the anchor, hiding "
+            "the current boot — the pid in the anchor is what prevents this",
+        )
 
     def test_a_log_without_the_anchor_is_used_whole(self):
         """Documented fallback: a format change must not become a failure
-        claiming the connector never connected."""
-        log = f"no anchor here\n[mattermost] INFO: {self.marker} http://mm:8065\n"
-        self.assertIn(self.marker, self.current_boot(log))
+        claiming the connector never connected. The test above is what makes
+        this fallback safe to keep."""
+        marker = self.conftest.CONNECTORS_READY_MARKER
+        log = f"no anchor here\n[service] INFO: {marker} mm-e2e\n"
+        self.assertIn(marker, self.current_boot(log, 99))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,19 +1,24 @@
 # =============================================================================
-# E2E Test Infrastructure — Rocket.Chat + MongoDB + ACG
+# E2E Test Infrastructure — Rocket.Chat + MongoDB, Mattermost + Postgres, ACG
 #
-# Usage (via Makefile):
-#   Phase 1 — infrastructure only:
-#     docker compose -f tests/e2e/docker-compose.yml up -d mongodb rocketchat
-#   Phase 2 — accounts created, then start ACG:
-#     docker compose -f tests/e2e/docker-compose.yml up -d acg
-#   Teardown:
-#     docker compose -f tests/e2e/docker-compose.yml down -v
+# Four phases, and the ORDER is load-bearing — `make e2e-up` is the authority:
+#   1. platforms:  up -d mongodb rocketchat postgres mattermost
+#   2. RC accounts:  python tests/e2e/setup.py
+#   3. MM team + accounts:  python tests/e2e/mm_setup.py
+#   4. up -d acg
+# Steps 2-3 must precede 4: each connector logs in as acg_bot at startup, and a
+# connector that cannot connect is fatal to the whole daemon.
+# Teardown: docker compose -f tests/e2e/docker-compose.yml down -v
+#   (or `make e2e-down` — it passes -v, so platform data goes with it)
 #
 # Port layout:
 #   RC:  host:3100  (avoids conflict with dev RC on port 3000)
+#   MM:  host:8065
 #
-# ACG internal URL to RC: http://rocketchat:3100  (Docker network)
-# Test runner URL to RC:  http://localhost:3100   (host-mapped port)
+# From INSIDE the network (what acg-config/config.yaml uses):
+#   http://rocketchat:3100   http://mattermost:8065
+# From the HOST (what the pytest clients use):
+#   http://localhost:3100    http://localhost:8065
 # =============================================================================
 
 services:
@@ -134,14 +139,13 @@ services:
       MM_SQLSETTINGS_DATASOURCE: "postgres://mmuser:mmuser_e2e_2024@postgres:5432/mattermost?sslmode=disable&connect_timeout=10"
       MM_SERVICESETTINGS_SITEURL: http://localhost:8065
       MM_SERVICESETTINGS_LISTENADDRESS: ":8065"
-      # E2E conveniences, all of them reasons a real deployment would NOT set
-      # these: create accounts over the API with no invite, no email
-      # verification, and personal access tokens available if a test ever
-      # needs the connector's token auth mode instead of username/password.
+      # E2E conveniences, both of them reasons a real deployment would NOT set
+      # them: create accounts over the API with no invite, and no email
+      # verification. The connector authenticates with username+password here,
+      # so nothing enables personal access tokens.
       MM_TEAMSETTINGS_ENABLEOPENSERVER: "true"
       MM_EMAILSETTINGS_REQUIREEMAILVERIFICATION: "false"
       MM_EMAILSETTINGS_SENDEMAILNOTIFICATIONS: "false"
-      MM_SERVICESETTINGS_ENABLEUSERACCESSTOKENS: "true"
       MM_LOGSETTINGS_CONSOLELEVEL: INFO
     ports:
       - "8065:8065"

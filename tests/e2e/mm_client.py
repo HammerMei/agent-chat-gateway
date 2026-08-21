@@ -238,8 +238,13 @@ class MMClient:
     ) -> dict[str, Any]:
         """Wait for a post created after `after_ts_ms` satisfying `predicate`.
 
-        Mirrors `rc_client.poll_for_message`, including raising on timeout so
-        a test failure names the wait rather than an unpacking error.
+        Like `rc_client.poll_for_message`, it raises on timeout so a failure
+        names the wait rather than surfacing as an unpacking error later. Two
+        differences from the Rocket.Chat version, neither of them a platform
+        difference — they are simply divergences worth knowing before reading a
+        traceback: this raises `AssertionError` where RC raises `TimeoutError`,
+        and RC additionally takes a `room_type` (it needs different endpoints
+        for a DM and a channel; Mattermost does not).
         """
         deadline = time.monotonic() + timeout
         # DISTINCT post ids, not a running tally of examinations: the channel is

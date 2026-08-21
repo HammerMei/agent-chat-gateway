@@ -1,12 +1,13 @@
 .PHONY: install setup test coverage lint start stop status clean help \
-        e2e-up e2e-down e2e-test e2e-logs e2e-reset
+        e2e-up e2e-down e2e-test e2e-logs e2e-reset e2e-shell e2e-acg \
+        e2e-dump e2e-probe e2e-probe-mm
 
 RUNTIME_DIR := $(HOME)/.agent-chat-gateway
 CONFIG      := $(RUNTIME_DIR)/config.yaml
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n\nTargets:\n"} \
-	     /^[a-zA-Z0-9_-]+:.*?##/ { printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+	     /^[a-zA-Z0-9_-]+:.*?##/ { printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 
 install: ## Install dependencies (uv sync)
 	uv sync
@@ -57,10 +58,12 @@ E2E_MM_URL  := http://localhost:8065
 # Both platforms must be bootstrapped BEFORE ACG starts, and the ordering is
 # not something compose can express. `depends_on: service_healthy` orders
 # CONTAINERS; it says nothing about whether the `acg_bot` ACCOUNT exists yet.
-# Each connector logs in as that account at startup, so ACG started against a
-# fresh, unseeded platform fails to authenticate on the connector that lost
-# the race — which surfaces as every test on that platform timing out, not as
-# a login error.
+# Each connector logs in as that account at startup, and a connector that
+# cannot connect is FATAL to the whole daemon — the failure is re-raised out
+# of the settle phase and the process exits 1. So an unseeded platform does not
+# degrade to "that platform's tests time out": it takes the gateway down,
+# every test with it, and under `restart: unless-stopped` it becomes a crash
+# loop. That is what the running-state guard in e2e-test reports.
 e2e-up: ## Start RC + Mattermost + ACG for E2E tests (idempotent)
 	@echo "==> Starting MongoDB + Rocket.Chat ..."
 	docker compose -f $(E2E_COMPOSE) up -d mongodb rocketchat
@@ -82,10 +85,16 @@ e2e-test: ## Run E2E tests (requires e2e-up first, needs CLAUDE_CODE_OAUTH_TOKEN
 	@# "Exists" is not "running": `docker container inspect` succeeds for an
 	@# exited or restarting container, and `acg` carries restart:
 	@# unless-stopped — so a crash-loop (an unseeded Mattermost makes connect()
-	@# fatal) would sail past the check above and be reported below as a
-	@# credentials problem, sending the operator to fix the wrong thing.
-	@test "$$(docker container inspect -f '{{.State.Running}}' acg-e2e 2>/dev/null)" = "true" || { \
-	    echo "ERROR: container 'acg-e2e' exists but is not running."; \
+	@# fatal) would otherwise be reported below as a credentials problem,
+	@# sending the operator to fix the wrong thing.
+	@#
+	@# `.State.Status`, not `.State.Running`: a crash-looping container is
+	@# INTERMITTENTLY Running=true — the restart backoff starts at 100ms and
+	@# each doomed boot spends seconds up while it tries to log in — so a
+	@# Running check races the very case this guard is for. Status reads
+	@# `restarting` throughout.
+	@test "$$(docker container inspect -f '{{.State.Status}}' acg-e2e 2>/dev/null)" = "running" || { \
+	    echo "ERROR: container 'acg-e2e' exists but is not running (state: $$(docker container inspect -f '{{.State.Status}}' acg-e2e 2>/dev/null))."; \
 	    echo "       This is a startup failure, not a config or token problem."; \
 	    echo "       'docker logs acg-e2e' has the reason; 'make e2e-dump'"; \
 	    echo "       writes everything to ./e2e-logs."; \
@@ -101,7 +110,11 @@ e2e-test: ## Run E2E tests (requires e2e-up first, needs CLAUDE_CODE_OAUTH_TOKEN
 	@# ~/.claude, so a host with a logged-in CLI may supply credentials by a
 	@# path this cannot see. Hence the override — a check that blocks a working
 	@# setup is worse than the silence it replaced.
-	@test -n "$(E2E_SKIP_CRED_CHECK)" || \
+	@# Truthy values only. `test -n` accepted ANY non-empty value, so
+	@# E2E_SKIP_CRED_CHECK=0 silently skipped the check — and the message below
+	@# advertises the flag as 0/1, which is exactly what makes "=0" a natural
+	@# thing to type when turning it back on.
+	@case "$(E2E_SKIP_CRED_CHECK)" in 1|true|yes|on) exit 0;; esac; \
 	docker exec acg-e2e sh -c 'test -n "$$CLAUDE_CODE_OAUTH_TOKEN$$ANTHROPIC_API_KEY"' || { \
 	    echo "ERROR: neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY is"; \
 	    echo "       set inside the running acg-e2e container."; \
@@ -166,7 +179,7 @@ e2e-probe: ## Re-verify the RC platform behaviour design §6 depends on, against
 #   * a watcher RECORD for that channel, created because the join made the
 #     channel deliver events and the deliberately-broad `acg-e2e-mm-*` glob
 #     claims it. mm_setup does not touch records, so clear it by hand:
-#     agent-chat-gateway expire 'mm-e2e:acg-e2e-mm-outside'
+#     make e2e-acg C="expire 'mm-e2e:acg-e2e-mm-outside'"
 # test_mm_membership_delivery.py checks both up front and names the remedy,
 # rather than reporting the residue as this run's leak.
 e2e-probe-mm: ## Re-verify the Mattermost platform behaviour design §6.2/§6.3 depends on

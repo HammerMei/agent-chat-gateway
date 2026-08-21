@@ -16,6 +16,7 @@ import time
 from typing import Any
 
 import pytest
+from conftest import MM_CONNECTOR_NAME, acg_watcher_list
 from mm_client import MMClient
 
 
@@ -55,3 +56,25 @@ def test_mm_ping_pong(
     assert "pong" in reply["message"].lower(), (
         f"Expected 'pong' in bot reply, got: {reply['message']!r}"
     )
+
+    # Close the loop where the `%40` bug was actually found: by reading a
+    # populated `list --all` by hand. Nothing in the suite asserted a DM
+    # watcher's HANDLE, and this test creates exactly the room whose handle had
+    # regressed to `mm-e2e:dm:%40test_user` — so the one observable that would
+    # have caught it is checked here, against the real runtime rather than
+    # against a helper the test calls itself.
+    #
+    # Only for the DM leg: a channel watcher's handle is already asserted by
+    # test_mm_membership_delivery.py.
+    if mm_room["type"] == "dm":
+        expected = f"{MM_CONNECTOR_NAME}:dm:{mm_setup['test_user_username']}"
+        watchers = acg_watcher_list()
+        assert expected in watchers, (
+            f"expected a watcher {expected!r} after this round trip.\n"
+            "If the handle shows `%40` the connector is carrying Mattermost's "
+            "`@` prefix into the DM counterpart again. If it is missing "
+            "entirely, note that `participants` is frozen at creation — a "
+            "record created before that fix keeps the old spelling until it is "
+            f"expired: make e2e-acg C=\"expire '<old name>'\"\n"
+            f"'list --all' says:\n{watchers}"
+        )

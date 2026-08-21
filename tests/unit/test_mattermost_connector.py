@@ -1040,6 +1040,59 @@ class TestRoutingUntrackedChannels(unittest.IsolatedAsyncioTestCase):
         await self._drain(connector)
         self.assertEqual(self.offered[0].participants, ())
 
+    async def test_a_dm_joined_by_membership_event_has_no_counterpart(self):
+        """`_room_ref_from_event` has TWO callers and every other DM test here
+        drives only the websocket one.
+
+        `_handle_membership_add` builds its own `decoded` dict from a REST
+        `get_channel()` response, mapping `channel_display_name` from the
+        channel's `display_name` — which is the EMPTY string for a direct
+        channel. Swap that mapping to `chan["name"]` and a DM joined this way
+        registers as `dm:<userid>__<userid>`, an opaque id pair standing in for
+        a person, persisted and operable. Nothing caught that: the membership
+        tests mock `get_channel` as a public channel only.
+        """
+        connector = await self._connector()
+        room = connector._room_ref_from_event(
+            "dm-chan-id",
+            {
+                "channel_type": "D",
+                "channel_name": "u1__u2",
+                "channel_display_name": "",
+                "team_id": "",
+            },
+        )
+        self.assertIsNotNone(room)
+        self.assertEqual(room.kind, RoomKind.DM)
+        self.assertEqual(
+            room.participants, (),
+            "the opaque channel_name must not become the counterpart",
+        )
+        self.assertEqual(room.name, "", "a DM has no usable platform name")
+
+    async def test_a_prefixed_group_dm_entry_would_still_be_stripped(self):
+        """Defensive, and labelled as such: real group DM events are NOT
+        prefixed (verified on 11.7.0, §6.4), so `bare_handle` is a no-op on
+        that branch and its removal is invisible to every other test. This pins
+        the intent — if Mattermost ever changes its mind, or a future edit
+        'simplifies' the comprehension, the two branches must not diverge.
+
+        The input here is hypothetical. That is stated rather than implied,
+        because asserting it as an observation is the mistake this whole area
+        already made once.
+        """
+        connector = await self._connector()
+        room = connector._room_ref_from_event(
+            "gdm-id",
+            {
+                "channel_type": "G",
+                "channel_name": "1b4c4b32",
+                "channel_display_name": "@glin, @alice",
+                "team_id": "",
+            },
+        )
+        self.assertEqual(room.participants, ("glin", "alice"))
+
     async def test_a_group_dm_carries_its_members(self):
         """Group DM display names are NOT `@`-prefixed, unlike DMs — Mattermost is
         inconsistent between the two kinds, and this is the form observed on 11.7.0
