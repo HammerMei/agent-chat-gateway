@@ -50,6 +50,7 @@ import pytest
 # Allow importing rc_client and setup from the same e2e directory
 sys.path.insert(0, str(Path(__file__).parent))
 import mm_setup as _mm
+from gateway_log import CONNECTORS_READY_MARKER, current_boot
 from mm_client import MMClient
 from rc_client import RCClient
 from setup import RC_URL
@@ -71,24 +72,12 @@ ACG_READY_INTERVAL = 5
 # tests/unit/test_e2e_mm_wiring.py so a rename fails without Docker.
 MM_CONNECTOR_NAME = "mm-e2e"
 ACG_LOG_PATH = "/root/.agent-chat-gateway/gateway.log"
-# Logged by GatewayService once per boot, AFTER both settle phases — and a
-# connector that fails to connect is fatal to the daemon, so this line
-# appearing means every connector it lists connected. Unlike the
-# connector's own "MattermostConnector connected to", it NAMES them, which is
-# what lets `mm_connected` detect a connector missing or renamed in config.
-CONNECTORS_READY_MARKER = "GatewayService running with connector(s):"
 # Short, and it has to stay short: this fixture runs inside the per-test
 # pytest-timeout budget (--timeout=180 in the Makefile and both workflows),
 # alongside a 120s poll_for_message in the first MM test. The connectors settle
 # during startup, so if the gateway answers at all this is a matter of the log
 # file appearing, not of waiting for work.
 MM_CONNECTED_TIMEOUT = 30
-# The daemon's first log line of a boot, formatted with the pid so the anchor
-# can be made specific — see `_current_boot`. The generic prefix alone is
-# user-controllable: every inbound message's first 120 characters are logged,
-# so a chat message reading "Daemon started (pid=1)" would otherwise become
-# the last anchor in the file.
-_BOOT_ANCHOR_FMT = "Daemon started (pid={pid})"
 
 
 # ── Session fixtures ──────────────────────────────────────────────────────────
@@ -332,7 +321,7 @@ def mm_connected(acg: None, mm_setup: dict[str, Any]) -> None:
     deadline = time.monotonic() + MM_CONNECTED_TIMEOUT
     boot = ""
     while time.monotonic() < deadline:
-        boot = _current_boot(_read_gateway_log(), pid)
+        boot = current_boot(_read_gateway_log(), pid)
         for line in boot.splitlines():
             if CONNECTORS_READY_MARKER in line and MM_CONNECTOR_NAME in line:
                 return
@@ -441,24 +430,6 @@ def mm_room(
         "name": mm_setup["member_channel"],
         "mention_prefix": f"@{mm_setup['bot_username']} ",
     }
-
-
-def _current_boot(log: str, pid: int) -> str:
-    """The tail of `gateway.log` written by the daemon running as `pid`.
-
-    Anchored on the daemon's own first line, because the marker being searched
-    for is logged later in the same boot — anchoring on a service line would
-    cut off the very text it looks for. The pid makes the anchor specific: the
-    generic prefix is user-controllable, since every inbound message's first
-    120 characters are logged, and `rfind` takes the LAST occurrence.
-
-    Returns the whole log when the anchor is absent, which happens on a log
-    format change. That is the safe direction: treating a missing anchor as an
-    empty boot would turn a reworded log line into a failure claiming the
-    connector never connected.
-    """
-    index = log.rfind(_BOOT_ANCHOR_FMT.format(pid=pid))
-    return log if index < 0 else log[index:]
 
 
 def _read_gateway_log() -> str:

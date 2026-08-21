@@ -34,6 +34,7 @@ _CONFTEST = _E2E / "conftest.py"
 
 # The E2E helpers import each other as top-level modules.
 sys.path.insert(0, str(_E2E))
+import gateway_log  # noqa: E402
 import mm_setup  # noqa: E402
 
 MM_CHANNEL_RULE = "e2e-mm-channel"
@@ -286,12 +287,12 @@ class TestBootScopingOfTheReadyMarker(unittest.TestCase):
     so a reworded log line fails here rather than degrading silently.
     """
 
-    def setUp(self):
-        sys.path.insert(0, str(_E2E))
-        import conftest as e2e_conftest
-
-        self.conftest = e2e_conftest
-        self.current_boot = e2e_conftest._current_boot
+    # Imported at module scope below, from `gateway_log` rather than from
+    # `conftest`. Importing the E2E conftest by that name is what made these
+    # three tests order-dependent: `tests/conftest.py` is importable under the
+    # same top-level name, whichever reaches `sys.modules["conftest"]` first
+    # wins for the process, and the loser's attributes simply are not there.
+    # They passed alone and failed in the full suite.
 
     def _log(self, pid: int, tail: str) -> str:
         return (
@@ -308,7 +309,7 @@ class TestBootScopingOfTheReadyMarker(unittest.TestCase):
         the constant to its producer instead.
         """
         source = (_REPO / "gateway" / "daemon.py").read_text()
-        rendered = self.conftest._BOOT_ANCHOR_FMT.format(pid="%d")
+        rendered = gateway_log.BOOT_ANCHOR_FMT.format(pid="%d")
         self.assertIn(
             rendered,
             source,
@@ -322,24 +323,24 @@ class TestBootScopingOfTheReadyMarker(unittest.TestCase):
             self._log(1, "01-01 00:00:01 [service] INFO: ready connector(s): mm-e2e\n")
             + self._log(2, "01-02 00:00:01 [mattermost] ERROR: websocket refused\n")
         )
-        self.assertNotIn("mm-e2e", self.current_boot(log, 2))
+        self.assertNotIn("mm-e2e", gateway_log.current_boot(log, 2))
 
     def test_the_current_boots_marker_is_kept(self):
-        marker = self.conftest.CONNECTORS_READY_MARKER
+        marker = gateway_log.CONNECTORS_READY_MARKER
         log = self._log(7, f"01-02 00:00:01 [service] INFO: {marker} rc-e2e, mm-e2e\n")
-        self.assertIn(marker, self.current_boot(log, 7))
+        self.assertIn(marker, gateway_log.current_boot(log, 7))
 
     def test_a_chat_message_quoting_the_prefix_cannot_hide_the_boot(self):
         """The poisoning case. Inbound message text is logged, so this line is
         something a user can put in the file — after the real banner."""
-        marker = self.conftest.CONNECTORS_READY_MARKER
+        marker = gateway_log.CONNECTORS_READY_MARKER
         log = (
             self._log(263, f"01-02 00:00:01 [service] INFO: {marker} rc-e2e, mm-e2e\n")
             + "01-02 00:00:02 [processor] INFO: Processing [general] Daemon started (pid=1)\n"
         )
         self.assertIn(
             marker,
-            self.current_boot(log, 263),
+            gateway_log.current_boot(log, 263),
             "a chat message quoting the boot banner became the anchor, hiding "
             "the current boot — the pid in the anchor is what prevents this",
         )
@@ -348,9 +349,9 @@ class TestBootScopingOfTheReadyMarker(unittest.TestCase):
         """Documented fallback: a format change must not become a failure
         claiming the connector never connected. The test above is what makes
         this fallback safe to keep."""
-        marker = self.conftest.CONNECTORS_READY_MARKER
+        marker = gateway_log.CONNECTORS_READY_MARKER
         log = f"no anchor here\n[service] INFO: {marker} mm-e2e\n"
-        self.assertIn(marker, self.current_boot(log, 99))
+        self.assertIn(marker, gateway_log.current_boot(log, 99))
 
 
 if __name__ == "__main__":
