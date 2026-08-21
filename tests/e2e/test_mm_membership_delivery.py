@@ -44,7 +44,7 @@ import time
 from typing import Any
 
 import pytest
-from conftest import MM_CONNECTOR_NAME, acg_watcher_list
+from acg_container import MM_CONNECTOR_NAME, watcher_list
 from mm_client import MMClient
 
 
@@ -81,7 +81,7 @@ def test_a_post_in_a_readable_unjoined_channel_produces_nothing(
     # never joined", blaming this run's delivery for last run's residue, and
     # the claim would be false as well as misdirected.
     outside_handle = f"{MM_CONNECTOR_NAME}:{mm_setup['outside_channel']}"
-    assert outside_handle not in acg_watcher_list(), (
+    assert outside_handle not in watcher_list(), (
         f"a watcher for {outside_handle!r} already exists before this test "
         "posted anything — most likely an interrupted 'make e2e-probe-mm' left "
         f"""it behind. Clear it inside the container:
@@ -151,7 +151,7 @@ def test_a_post_in_a_readable_unjoined_channel_produces_nothing(
     # reply latency: a watcher record is created when the event is received,
     # before any agent work, so an event that arrived at all is visible here
     # by the time the pong lands, whatever the outside turn was doing.
-    watchers = acg_watcher_list()
+    watchers = watcher_list()
     member_handle = f"{MM_CONNECTOR_NAME}:{mm_setup['member_channel']}"
     # Guard on the guard: if the member watcher is missing, the listing is not
     # telling us what we think it is, and the absence below proves nothing.

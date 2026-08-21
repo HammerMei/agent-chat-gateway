@@ -32,13 +32,12 @@ boot failures split in a way worth knowing before reading a red suite:
 so: the lines it reads are one-time events and nothing removes them. What it
 covers is a boot-scoped ABSENCE — the connector missing or renamed in the
 config the container is running, or a gateway that is not running at all.
-Same taste as `_container_missing` below: name the real failure at second zero
+Same taste as `acg_container.container_missing`: name the real failure at second zero
 instead of inferring it from a wait that never ends.
 """
 from __future__ import annotations
 
 import os
-import re
 import subprocess
 import sys
 import time
@@ -50,6 +49,15 @@ import pytest
 # Allow importing rc_client and setup from the same e2e directory
 sys.path.insert(0, str(Path(__file__).parent))
 import mm_setup as _mm
+from acg_container import (
+    CONTAINER as ACG_CONTAINER,
+)
+from acg_container import (
+    MM_CONNECTOR_NAME,
+    container_missing,
+    gateway_pid,
+    read_gateway_log,
+)
 from gateway_log import CONNECTORS_READY_MARKER, current_boot
 from mm_client import MMClient
 from rc_client import RCClient
@@ -60,7 +68,6 @@ from setup import setup as _run_setup
 
 E2E_DIR = Path(__file__).parent
 COMPOSE_FILE = str(E2E_DIR / "docker-compose.yml")
-ACG_CONTAINER = "acg-e2e"
 BOT_USERNAME = "acg_bot"
 # Seconds to wait for the daemon to answer `status`. It does NOT cover the
 # agent warm-up, which runs afterwards on its own 120s-per-agent budget in
@@ -68,10 +75,6 @@ BOT_USERNAME = "acg_bot"
 ACG_READY_TIMEOUT = 180
 ACG_READY_INTERVAL = 5
 
-# Must match the connector name in tests/e2e/acg-config/config.yaml. Pinned by
-# tests/unit/test_e2e_mm_wiring.py so a rename fails without Docker.
-MM_CONNECTOR_NAME = "mm-e2e"
-ACG_LOG_PATH = "/root/.agent-chat-gateway/gateway.log"
 # Short, and it has to stay short: this fixture runs inside the per-test
 # pytest-timeout budget (--timeout=180 in the Makefile and both workflows),
 # alongside a 120s poll_for_message in the first MM test. The connectors settle
@@ -180,16 +183,6 @@ def _warmup_agents(rc_setup: dict[str, Any]) -> None:
             print(f"[acg] WARNING: Claude Code warm-up failed: {exc}", flush=True)
 
 
-def _container_missing(name: str) -> bool:
-    """Is there no container by this name at all (as opposed to one that is
-    merely not ready yet)?"""
-    result = subprocess.run(
-        ["docker", "container", "inspect", name],
-        capture_output=True,
-        text=True,
-    )
-    return result.returncode != 0
-
 
 def _wait_for_acg(timeout: float, interval: float) -> None:
     """Poll docker exec until agent-chat-gateway status returns 0.
@@ -203,7 +196,7 @@ def _wait_for_acg(timeout: float, interval: float) -> None:
     polled a nonexistent container for three minutes and then errored every
     single test.
     """
-    if _container_missing(ACG_CONTAINER):
+    if container_missing():
         pytest.fail(
             f"Container '{ACG_CONTAINER}' does not exist — the stack is not up.\n"
             "Run 'make e2e-up' first (it starts MongoDB + Rocket.Chat and "
@@ -227,7 +220,7 @@ def _wait_for_acg(timeout: float, interval: float) -> None:
         last_output = (result.stdout + result.stderr).strip()
         # A container that vanishes mid-wait (crash-looping, or torn down)
         # is the same actionable case as never having existed.
-        if _container_missing(ACG_CONTAINER):
+        if container_missing():
             pytest.fail(
                 f"Container '{ACG_CONTAINER}' disappeared while waiting for it "
                 "to become ready — it likely crashed on startup. "
@@ -307,7 +300,7 @@ def mm_connected(acg: None, mm_setup: dict[str, Any]) -> None:
     nothing removes them. The gateway being up and the connector being listed
     is the whole of the claim.
     """
-    pid = _gateway_pid()
+    pid = gateway_pid()
     if pid is None:
         pytest.fail(
             "The gateway is not running inside "
@@ -321,7 +314,7 @@ def mm_connected(acg: None, mm_setup: dict[str, Any]) -> None:
     deadline = time.monotonic() + MM_CONNECTED_TIMEOUT
     boot = ""
     while time.monotonic() < deadline:
-        boot = current_boot(_read_gateway_log(), pid)
+        boot = current_boot(read_gateway_log(), pid)
         for line in boot.splitlines():
             if CONNECTORS_READY_MARKER in line and MM_CONNECTOR_NAME in line:
                 return
@@ -355,9 +348,21 @@ def mm_connected(acg: None, mm_setup: dict[str, Any]) -> None:
 def mm_test_client(mm_setup: dict[str, Any]) -> MMClient:
     """MM client logged in as the human test user."""
     c = MMClient(mm_setup["mm_url"])
-    c.login(mm_setup["test_user_username"], mm_setup["test_user_password"])
-    yield c
-    c.close()
+    try:
+        c.login(mm_setup["test_user_username"], mm_setup["test_user_password"])
+    except Exception:
+        # login() issues a POST, so the connection pool is live by the
+        # time any of its failure points can fire — and a generator that
+        # raises before `yield` never runs its teardown. Reachable on a
+        # warm platform volume where the account exists with a different
+        # password, which is exactly when a leaked socket is least
+        # welcome.
+        c.close()
+        raise
+    try:
+        yield c
+    finally:
+        c.close()
 
 
 @pytest.fixture(scope="session")
@@ -369,9 +374,21 @@ def mm_admin_client(mm_setup: dict[str, Any]) -> MMClient:
     requires admin eyes — see MMClient.is_channel_member.
     """
     c = MMClient(mm_setup["mm_url"])
-    c.login(mm_setup["admin_username"], mm_setup["admin_password"])
-    yield c
-    c.close()
+    try:
+        c.login(mm_setup["admin_username"], mm_setup["admin_password"])
+    except Exception:
+        # login() issues a POST, so the connection pool is live by the
+        # time any of its failure points can fire — and a generator that
+        # raises before `yield` never runs its teardown. Reachable on a
+        # warm platform volume where the account exists with a different
+        # password, which is exactly when a leaked socket is least
+        # welcome.
+        c.close()
+        raise
+    try:
+        yield c
+    finally:
+        c.close()
 
 
 @pytest.fixture(scope="session")
@@ -392,9 +409,21 @@ def mm_bot_client(mm_setup: dict[str, Any]) -> MMClient:
     needs.
     """
     c = MMClient(mm_setup["mm_url"])
-    c.login(mm_setup["bot_username"], mm_setup["bot_password"])
-    yield c
-    c.close()
+    try:
+        c.login(mm_setup["bot_username"], mm_setup["bot_password"])
+    except Exception:
+        # login() issues a POST, so the connection pool is live by the
+        # time any of its failure points can fire — and a generator that
+        # raises before `yield` never runs its teardown. Reachable on a
+        # warm platform volume where the account exists with a different
+        # password, which is exactly when a leaked socket is least
+        # welcome.
+        c.close()
+        raise
+    try:
+        yield c
+    finally:
+        c.close()
 
 
 @pytest.fixture(scope="session", params=["dm", "channel"])
@@ -432,43 +461,7 @@ def mm_room(
     }
 
 
-def _read_gateway_log() -> str:
-    result = subprocess.run(
-        ["docker", "exec", ACG_CONTAINER, "sh", "-c", f"cat {ACG_LOG_PATH}"],
-        capture_output=True,
-        text=True,
-    )
-    return result.stdout
 
-
-def _gateway_pid() -> int | None:
-    """The running daemon's pid, or None if it is not running.
-
-    Read from `status`' TEXT, not its exit code: `agent-chat-gateway status`
-    exits 0 while printing "Gateway: not running" (issue #134), which is why
-    `_wait_for_acg`'s returncode gate admits a dead daemon.
-    """
-    result = subprocess.run(
-        ["docker", "exec", ACG_CONTAINER, "agent-chat-gateway", "status"],
-        capture_output=True,
-        text=True,
-    )
-    match = re.search(r"running \(pid=(\d+)\)", result.stdout)
-    return int(match.group(1)) if match else None
-
-
-def acg_watcher_list() -> str:
-    """`agent-chat-gateway list --all` as seen inside the container.
-
-    `--all` matters: idle watchers are hidden by default, so a plain `list`
-    can report "No watchers" for a room that has one.
-    """
-    result = subprocess.run(
-        ["docker", "exec", ACG_CONTAINER, "agent-chat-gateway", "list", "--all"],
-        capture_output=True,
-        text=True,
-    )
-    return result.stdout + result.stderr
 
 
 # ── Rocket.Chat client fixtures ───────────────────────────────────────────────

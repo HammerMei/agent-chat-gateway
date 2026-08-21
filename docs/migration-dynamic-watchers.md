@@ -142,7 +142,7 @@ If you want the clean name, expire the old record and let the room's next
 message recreate it:
 
 ```bash
-agent-chat-gateway expire 'mm-e2e:dm:%40test_user'   # quote it — % and : are shell-relevant
+agent-chat-gateway expire 'mm-e2e:dm:%40test_user'   # quoted for legibility, not necessity
 ```
 
 Accepted losses, the same ones the rest of this document takes: the session is

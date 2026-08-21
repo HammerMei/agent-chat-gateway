@@ -115,12 +115,27 @@ class MMClient:
         return resp.json()
 
     def add_team_member(self, team_id: str, user_id: str) -> None:
+        """Idempotent — but only for the reason it claims.
+
+        Mattermost answers 201 on success and 400 when the user is already a
+        member. It ALSO answers 400 for a malformed or unknown id, so treating
+        the status alone as "fine" made a genuinely failed seeding
+        indistinguishable from a no-op. The membership is confirmed instead.
+        """
         resp = self._client.post(
             f"/teams/{team_id}/members", json={"team_id": team_id, "user_id": user_id}
         )
-        # Already a member is not a failure worth raising on.
-        if resp.status_code not in (200, 201, 400, 409):
-            resp.raise_for_status()
+        if resp.status_code in (200, 201):
+            return
+        if resp.status_code in (400, 409):
+            check = self._client.get(f"/teams/{team_id}/members/{user_id}")
+            if check.status_code == 200:
+                return  # already a member — the case the tolerance is for
+            raise RuntimeError(
+                f"adding user {user_id} to team {team_id} failed "
+                f"({resp.status_code}) and they are not a member: {resp.text}"
+            )
+        resp.raise_for_status()
 
     # ── Channels ─────────────────────────────────────────────────────────────
 
@@ -149,9 +164,27 @@ class MMClient:
         return resp.json()
 
     def add_channel_member(self, channel_id: str, user_id: str) -> None:
+        """Idempotent, and verified rather than assumed — same reasoning as
+        `add_team_member`.
+
+        This one matters more: a silently failed add here leaves
+        `test_mm_ping_pong[channel]` with a 120s timeout reported as "No
+        matching post", i.e. a delivery-shaped symptom for a setup fault. The
+        membership test asserts its memberships up front and would have caught
+        it; the ping-pong has no such precondition.
+        """
         resp = self._client.post(f"/channels/{channel_id}/members", json={"user_id": user_id})
-        if resp.status_code not in (200, 201, 400, 409):
-            resp.raise_for_status()
+        if resp.status_code in (200, 201):
+            return
+        if resp.status_code in (400, 409):
+            check = self._client.get(f"/channels/{channel_id}/members/{user_id}")
+            if check.status_code == 200:
+                return
+            raise RuntimeError(
+                f"adding user {user_id} to channel {channel_id} failed "
+                f"({resp.status_code}) and they are not a member: {resp.text}"
+            )
+        resp.raise_for_status()
 
     def remove_channel_member(self, channel_id: str, user_id: str) -> None:
         resp = self._client.delete(f"/channels/{channel_id}/members/{user_id}")

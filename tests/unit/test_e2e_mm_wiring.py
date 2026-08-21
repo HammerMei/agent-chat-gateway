@@ -16,7 +16,6 @@ can have, and one no E2E run would report.
 
 from __future__ import annotations
 
-import re
 import sys
 import unittest
 from pathlib import Path
@@ -30,10 +29,10 @@ from gateway.core.watcher_rule import RoomKind, RuleMatch
 _REPO = Path(__file__).resolve().parents[2]
 _E2E = _REPO / "tests" / "e2e"
 _E2E_CONFIG = _E2E / "acg-config" / "config.yaml"
-_CONFTEST = _E2E / "conftest.py"
 
 # The E2E helpers import each other as top-level modules.
 sys.path.insert(0, str(_E2E))
+import acg_container  # noqa: E402
 import gateway_log  # noqa: E402
 import mm_setup  # noqa: E402
 
@@ -45,11 +44,6 @@ def _config() -> dict:
     return yaml.safe_load(_E2E_CONFIG.read_text())
 
 
-def _conftest_constant(name: str) -> str:
-    match = re.search(rf'^{name}\s*=\s*"([^"]+)"', _CONFTEST.read_text(), re.M)
-    assert match, f"{name} not found in {_CONFTEST.name}"
-    return match.group(1)
-
 
 class TestTheMMConnectorIsDeclaredUnderTheNameTheTestsUse(unittest.TestCase):
     def test_the_conftest_connector_name_is_declared_in_the_config(self):
@@ -58,7 +52,7 @@ class TestTheMMConnectorIsDeclaredUnderTheNameTheTestsUse(unittest.TestCase):
             for c in (_config().get("connectors") or [])
             if isinstance(c, dict) and isinstance(c.get("name"), str)
         }
-        name = _conftest_constant("MM_CONNECTOR_NAME")
+        name = acg_container.MM_CONNECTOR_NAME
         self.assertIn(name, declared)
         self.assertEqual(
             "mattermost",
@@ -73,7 +67,7 @@ class TestTheMMConnectorIsDeclaredUnderTheNameTheTestsUse(unittest.TestCase):
         rule that forgot `inherits: e2e-mm-default` would land on Rocket.Chat
         and match nothing."""
         by_name = {r.name: r for r in _loaded_config().watcher_rules}
-        name = _conftest_constant("MM_CONNECTOR_NAME")
+        name = acg_container.MM_CONNECTOR_NAME
         for rule in (MM_CHANNEL_RULE, MM_DM_RULE):
             with self.subTest(rule=rule):
                 self.assertIn(rule, by_name)
@@ -95,9 +89,12 @@ def _loaded_config():
     patched = _E2E_CONFIG.read_text().replace(
         "/root/.agent-chat-gateway/work", tempfile.gettempdir()
     )
-    path = Path(tempfile.mkdtemp()) / "config.yaml"
-    path.write_text(patched)
-    return GatewayConfig.from_file(str(path))
+    # Cleaned up: `mkdtemp` here leaked one directory per call, four per unit
+    # run, forever. The loader only needs the file to exist while it reads.
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "config.yaml"
+        path.write_text(patched)
+        return GatewayConfig.from_file(str(path))
 
 
 class TestTheGlobStillClaimsTheOutsideChannel(unittest.TestCase):
@@ -146,7 +143,7 @@ class TestTheHandleFormatsTheMMTestsAssertOn(unittest.TestCase):
     """
 
     def setUp(self):
-        self.connector = _conftest_constant("MM_CONNECTOR_NAME")
+        self.connector = acg_container.MM_CONNECTOR_NAME
 
     def test_a_channel_handle_is_connector_colon_the_channel_slug(self):
         """The slug, not the display name: the MM connector fills RoomRef.name
@@ -238,12 +235,16 @@ class TestGetPostsAsksForAnInclusiveWindow(unittest.TestCase):
             seen.append(request.url)
             return httpx.Response(200, json={"order": [], "posts": {}})
 
-        client = MMClient("http://mm.invalid")
-        client._client = httpx.Client(
-            base_url="http://mm.invalid/api/v4", transport=httpx.MockTransport(handler)
-        )
-        client.get_posts("chan-id", since_ms=since_ms)
-        client.close()
+        with MMClient("http://mm.invalid") as client:
+            # The real client built by __init__ is replaced, so close it rather
+            # than orphan it; the `with` also covers a raise from get_posts or
+            # from the assertion below, which a bare close() at the end did not.
+            client._client.close()
+            client._client = httpx.Client(
+                base_url="http://mm.invalid/api/v4",
+                transport=httpx.MockTransport(handler),
+            )
+            client.get_posts("chan-id", since_ms=since_ms)
         self.assertEqual(1, len(seen))
         return seen[0].params.get("since")
 

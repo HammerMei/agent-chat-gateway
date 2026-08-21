@@ -124,8 +124,9 @@ The gateway SHALL:
 When multiple connectors are configured, the gateway SHALL:
 1. Allow the `list` command to show watchers across all connectors
 2. Allow selective listing by connector with the `--connector` flag
-3. For commands targeting a specific watcher, accept a `--connector` flag to disambiguate — optional when exactly one connector is configured, required when there are several (the daemon refuses to guess rather than picking one)
-4. Return partial results with per-connector errors when some connectors fail during aggregated operations
+3. Resolve commands that name a **watcher** without needing `--connector` at all — watcher names are unique across connectors, so `pause`/`resume`/`reset`/`expire` find their connector from the name
+4. For commands that name a **room** rather than a watcher (`send`), accept a `--connector` flag to disambiguate — optional when exactly one connector is configured, **required** when there are several, since the room name alone does not identify one and the daemon refuses to guess
+5. Return partial results with per-connector errors when some connectors fail during aggregated operations
 
 ---
 

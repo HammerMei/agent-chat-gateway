@@ -42,6 +42,7 @@ import argparse
 import json
 import sys
 from typing import Any
+from urllib.parse import urlparse
 
 from mm_client import MMClient
 
@@ -75,8 +76,17 @@ def setup(mm_url: str = MM_URL) -> dict[str, Any]:
         try:
             admin.login(ADMIN_USERNAME, ADMIN_PASSWORD)
             print(f"[mm-setup] Admin '{ADMIN_USERNAME}' already exists — logged in.", flush=True)
-        except Exception:
-            print(f"[mm-setup] Creating system admin '{ADMIN_USERNAME}' ...", flush=True)
+        except Exception as exc:
+            # Keep the reason. On a warm platform volume where the account
+            # exists with a DIFFERENT password, swallowing this 401 sends the
+            # run into create_user, which then fails with "username already
+            # exists" — an error about account creation for a problem that is
+            # about the password.
+            print(
+                f"[mm-setup] Admin login failed ({type(exc).__name__}: {exc}) — "
+                "treating the account as absent and creating it.",
+                flush=True,
+            )
             admin.create_user(ADMIN_USERNAME, ADMIN_PASSWORD)
             admin.login(ADMIN_USERNAME, ADMIN_PASSWORD)
 
@@ -173,10 +183,43 @@ def setup(mm_url: str = MM_URL) -> dict[str, Any]:
     }
 
 
+_LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1", "mattermost", "host.docker.internal")
+
+
+def _refuse_non_local(mm_url: str, force: bool) -> None:
+    """Refuse to seed a server that does not look like the E2E stack.
+
+    This script creates accounts, a team and channels, and it runs `POST /users`
+    against whatever URL it is handed — Mattermost allows that unauthenticated
+    when open signup is on. The `system_admin` assertion aborts the run early
+    on a foreign server, but only AFTER `mmadmin` has been created there, so the
+    guard has to come before the first request rather than rely on that.
+    """
+    if force:
+        return
+    host = urlparse(mm_url).hostname or ""
+    if host in _LOCAL_HOSTS:
+        return
+    raise SystemExit(
+        f"[mm-setup] Refusing to seed {mm_url!r}: host {host!r} is not one of "
+        f"{_LOCAL_HOSTS}.\n"
+        "This script CREATES accounts, a team and channels with hardcoded "
+        "credentials — it is for the disposable E2E stack, not for a server "
+        "anyone relies on. If you really mean it, pass --i-know-this-is-not-the-e2e-stack."
+    )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mm-url", default=MM_URL)
+    parser.add_argument(
+        "--i-know-this-is-not-the-e2e-stack",
+        action="store_true",
+        dest="force",
+        help="Allow seeding a non-local Mattermost (creates accounts — see _refuse_non_local)",
+    )
     args = parser.parse_args()
+    _refuse_non_local(args.mm_url, args.force)
     try:
         print(json.dumps(setup(args.mm_url), indent=2))
     except Exception as exc:  # noqa: BLE001 — surface the reason, not a traceback wall

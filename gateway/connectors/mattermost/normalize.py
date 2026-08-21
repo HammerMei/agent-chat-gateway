@@ -69,6 +69,15 @@ def bare_handle(display: str) -> str:
     lossless for a username: Mattermost restricts those to letters, digits and
     `.-_`, so a name cannot itself begin with `@`.
 
+    **The prefix is unconditional, not a display preference.** Worth recording
+    because it was the one assumption here nothing in this repo could settle:
+    mattermost-server builds the event's field with
+    `GetChannelName(model.ShowUsername, "")` in `notification.go`, hardcoding
+    the format — `GetDisplayNameWithPrefix` only drops the `@` under
+    `ShowNicknameFullName`/`ShowFullName`, which that call never passes. So a
+    server whose `TeammateNameDisplay` is set to full name still sends
+    `@alice` on the wire, and the strip is not silently doing nothing there.
+
     Idempotence is a property of the implementation, not a requirement any
     caller currently exercises — and the earlier claim that the membership-add
     path "supplies a bare name" was wrong. That path reads REST's

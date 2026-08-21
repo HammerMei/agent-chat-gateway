@@ -16,7 +16,7 @@ import time
 from typing import Any
 
 import pytest
-from conftest import MM_CONNECTOR_NAME, acg_watcher_list
+from acg_container import MM_CONNECTOR_NAME, watcher_list
 from mm_client import MMClient
 
 
@@ -68,7 +68,7 @@ def test_mm_ping_pong(
     # test_mm_membership_delivery.py.
     if mm_room["type"] == "dm":
         expected = f"{MM_CONNECTOR_NAME}:dm:{mm_setup['test_user_username']}"
-        watchers = acg_watcher_list()
+        watchers = watcher_list()
         assert expected in watchers, (
             f"expected a watcher {expected!r} after this round trip.\n"
             "If the handle shows `%40` the connector is carrying Mattermost's "
