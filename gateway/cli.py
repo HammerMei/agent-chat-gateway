@@ -139,7 +139,11 @@ def main():
         "--connector",
         default=None,
         metavar="NAME",
-        help="Connector to send through (default: first configured connector)",
+        help=(
+            "Connector to send through. Optional when exactly one is "
+            "configured; REQUIRED when there are several — the daemon refuses "
+            "to guess rather than picking one"
+        ),
     )
 
     # fetch-history
