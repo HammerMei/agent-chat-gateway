@@ -23,6 +23,7 @@ from pathlib import Path
 
 import yaml
 
+from gateway.connectors.mattermost.normalize import bare_handle
 from gateway.core.watcher_manager import RoomRef, watcher_label
 from gateway.core.watcher_rule import RoomKind, RuleMatch
 
@@ -161,40 +162,49 @@ class TestTheHandleFormatsTheMMTestsAssertOn(unittest.TestCase):
             ),
         )
 
-    def test_a_dm_handle_carries_the_at_prefixed_counterpart_percent_encoded(self):
-        """On Mattermost — unlike Rocket.Chat — the counterpart arrives WITH an
-        `@`, and the handle therefore contains `%40`.
+    def test_a_dm_handle_is_bare_because_the_wire_prefix_is_stripped(self):
+        """Pins the whole chain from wire value to handle, not `watcher_label`
+        in isolation — which is how this test was wrong twice over.
 
-        This test asserted `mm-e2e:dm:test_user` when it was written, which is
-        a form that never occurs. `watcher_label` was fed a bare username
-        because that is what Rocket.Chat supplies, and the assertion passed
-        while describing nothing real. Observed in `list --all` against the
-        live stack:
+        Mattermost sends a DM's counterpart `@`-prefixed on the websocket
+        event. First this test fed `watcher_label` a bare username, because
+        that is what Rocket.Chat supplies, and passed while describing a form
+        that never occurred. A live `list --all` then showed the truth:
 
             rc-e2e:dm:test_user       ...  test_user
             mm-e2e:dm:%40test_user    ...  @test_user
 
-        The `@` is Mattermost's, not ACG's: the connector fills a DM's
-        `participants` from the websocket event's `channel_display_name`, which
-        is viewer-specific and `@`-prefixed. (REST's `display_name` for the
-        same DM channel is the empty string, so this is only visible on the
-        event path.) The `%40` is deliberate downstream of that — `_LABEL_SAFE`
-        is a whitelist of alphanumerics plus `._-`, and the percent-encoding is
-        what makes the `dm:` prefix unforgeable.
+        `%40` because `@` is outside `_LABEL_SAFE`, whose percent-encoding is
+        what makes the `dm:` prefix unforgeable — correct downstream of a wrong
+        input. The connector now strips the prefix at the source, so one person
+        has one handle on both platforms.
 
-        Whether an operator should have to type `%40` for a Mattermost DM is a
-        separate question about the connector, not about this suite.
+        Feeding the WIRE value through `bare_handle` here means removing that
+        strip fails this test, where asserting `watcher_label`'s output alone
+        would not notice.
         """
+        wire_value = f"@{mm_setup.TEST_USER_USERNAME}"
         self.assertEqual(
-            "mm-e2e:dm:%40test_user",
+            f"mm-e2e:dm:{mm_setup.TEST_USER_USERNAME}",
             watcher_label(
                 "mm-e2e",
                 RoomRef(
                     id="whatever",
                     kind=RoomKind.DM,
                     name="",
-                    participants=(f"@{mm_setup.TEST_USER_USERNAME}",),
+                    participants=(bare_handle(wire_value),),
                 ),
+            ),
+        )
+
+    def test_without_the_strip_the_handle_needs_percent_encoding(self):
+        """The cost of regressing the line above, stated so it is concrete: an
+        operator would have to type `%40` to address a Mattermost DM."""
+        self.assertEqual(
+            "mm-e2e:dm:%40test_user",
+            watcher_label(
+                "mm-e2e",
+                RoomRef(id="x", kind=RoomKind.DM, name="", participants=("@test_user",)),
             ),
         )
 

@@ -117,6 +117,42 @@ When you migrate servers, do one of:
 Session content does not survive a server move either way; export anything
 that matters first (checklist step 3).
 
+## Mattermost DM watchers created before the `@` strip
+
+Mattermost sends a DM's counterpart `@`-prefixed on the websocket event, and the
+connector used to carry that through. Since `@` is not label-safe it was
+percent-encoded, so the same person had two handles depending on the platform:
+
+```
+rc-e2e:dm:test_user        ← Rocket.Chat
+mm-e2e:dm:%40test_user     ← Mattermost, before the strip
+```
+
+The connector now drops the prefix, and **there is nothing to migrate.**
+Records resolve by room id, not by name, so an existing DM watcher keeps
+serving its room under the old name with its session and watermark intact — no
+duplicate watcher, no orphan, nothing in `failed`.
+
+What does break is anything that **types** the new handle. `schedule create
+mm-e2e:dm:test_user` is rejected with "Watcher … not found in any connector"
+while the record still holds the encoded name, because every operator verb is
+name-addressed with no room-id fallback.
+
+If you want the clean name, expire the old record and let the room's next
+message recreate it:
+
+```bash
+agent-chat-gateway expire 'mm-e2e:dm:%40test_user'   # quote it — % and : are shell-relevant
+```
+
+Accepted losses, the same ones the rest of this document takes: the session is
+fresh (history handoff refetches recent messages), the watermark resets once,
+and the old watcher's durable-instructions prompt file is left behind — prompt
+files are keyed partly on the watcher name, so a rename orphans one.
+
+Leaving the encoded name in place is also a legitimate choice. It is ugly in
+`list` and awkward to type, and that is the whole of the cost.
+
 ## `online_notification` / `offline_notification` are removed
 
 The fields are gone from rules and templates — a config still carrying them

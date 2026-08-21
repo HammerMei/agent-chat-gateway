@@ -994,11 +994,17 @@ class TestRoutingUntrackedChannels(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_dm_is_described_by_its_display_name(self):
         """`channel_name` is the opaque `<userid>__<userid>` form; the display name is the
-        counterpart (§6.2)."""
+        counterpart (§6.2) — and it arrives `@`-prefixed, which is dropped.
+
+        This test fed `channel_display_name="alice"` until a live `list --all` showed the
+        watcher was really called `mm-e2e:dm:%40test_user`. Mattermost sends `@alice` here;
+        the bare form the test used never comes off the wire, so both the assertion and the
+        code it guarded described something that does not happen.
+        """
         connector = await self._connector()
         await connector._on_posted_event(
             self._event(channel_type="D", channel_name="u1__u2",
-                        channel_display_name="alice", team_id=""))
+                        channel_display_name="@alice", team_id=""))
         await self._drain(connector)
 
         room = self.offered[0]
@@ -1006,11 +1012,24 @@ class TestRoutingUntrackedChannels(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(room.participants, ("alice",))
         self.assertEqual(room.name, "", "a DM has no usable platform name")
 
+    async def test_a_dm_counterpart_already_bare_is_left_alone(self):
+        """Not every path is the websocket. The membership-add path feeds this helper a
+        REST `get_channel()` response, where the same field has no prefix — so stripping
+        has to be idempotent rather than assume the `@` is always there."""
+        connector = await self._connector()
+        await connector._on_posted_event(
+            self._event(channel_type="D", channel_name="u1__u2",
+                        channel_display_name="alice", team_id=""))
+        await self._drain(connector)
+        self.assertEqual(self.offered[0].participants, ("alice",))
+
     async def test_a_group_dm_carries_its_members(self):
+        """Every entry in the list carries its own `@`, so the split has to strip per
+        member rather than once at the front."""
         connector = await self._connector()
         await connector._on_posted_event(
             self._event(channel_type="G", channel_name="1b4c4b32",
-                        channel_display_name="glin, probe-bot, alice", team_id=""))
+                        channel_display_name="@glin, @probe-bot, @alice", team_id=""))
         await self._drain(connector)
 
         room = self.offered[0]

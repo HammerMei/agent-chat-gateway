@@ -156,8 +156,16 @@ class WatcherState:
     # require_mention applies (§2.7). Distinct from `room_type` above, which is the
     # connector's own three-way type and predates the group-DM distinction.
     room_kind: str = ""
-    # DM counterparts, for the `list` column. Refreshed, and never part of a key:
-    # a member set is not an identity (§6.4).
+    # DM counterparts, for the `list` column. Never part of a key: a member set is
+    # not an identity (§6.4).
+    #
+    # **Frozen at creation, NOT refreshed** — it is in FROZEN_AT_CREATION_FIELDS
+    # below, and the only writes are creation-time provenance plus carry-through
+    # on recreation. This comment claimed "Refreshed" and was wrong: when the
+    # Mattermost connector stopped carrying the `@` prefix into a DM's
+    # counterpart, every existing record went on showing `@alice` in the column,
+    # and nothing self-healed. That is the honest behaviour to expect here, so a
+    # value that must track the room is not safe to keep in this field.
     participants: list[str] = field(default_factory=list)
     # So a rule edit cannot silently re-point a dormant session at another
     # connector or agent.

@@ -59,6 +59,7 @@ from .config import MattermostConfig
 from .mentions import is_room_wide_mention
 from .normalize import (
     FilterResult,
+    bare_handle,
     filter_mm_message,
     normalize_mm_message,
     sender_allowed,
@@ -1171,13 +1172,17 @@ class MattermostConnector(Connector):
 
         display = decoded.get("channel_display_name") or ""
         if kind is RoomKind.DM:
-            # `channel_name` is `<userid>__<userid>`; the display name is the counterpart.
-            participants = (display,) if display else ()
+            # `channel_name` is `<userid>__<userid>`; the display name is the counterpart —
+            # `@`-prefixed on the wire, which `bare_handle` drops so that one person has one
+            # handle on both platforms (Rocket.Chat supplies the name bare).
+            participants = (bare_handle(display),) if display else ()
         elif kind is RoomKind.GROUP_DM:
-            # The display name is the member list, including the bot itself. Split for the
-            # participants column; never used as a label, which must not move when
-            # membership does (§2.3).
-            participants = tuple(p.strip() for p in display.split(",") if p.strip())
+            # The display name is the member list, including the bot itself, and each entry
+            # carries the same `@`. Split for the participants column; never used as a label,
+            # which must not move when membership does (§2.3).
+            participants = tuple(
+                bare_handle(p.strip()) for p in display.split(",") if p.strip()
+            )
         else:
             participants = ()
 
