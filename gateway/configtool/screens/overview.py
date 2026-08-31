@@ -1,6 +1,6 @@
 """OverviewScreen — the config TUI's root screen.
 
-Five tabs: Connectors, Agents, Rules, Templates, Tool Presets — the
+Five tabs: Connectors, Agents, Watcher Rules, Templates, Tool Presets — the
 latter two are first-class per docs/design/config-tool.md (shared
 resources, not footnotes). Selecting a row (Enter) pushes a *DetailScreen in
 view mode. 'e'/'d' act directly on the row under the cursor — edit opens
@@ -16,7 +16,7 @@ the cursor on the Templates tab (same reasoning — a template has no
 separate "edit mode" distinct from "edit this named entity," see
 template_detail.py).
 
-The Rules tab (design §5.5) shows one row per `watchers:` RULE, keyed and
+The Watcher Rules tab (design §5.5) shows one row per `watcher_rules:` RULE, keyed and
 displayed by LIST INDEX — order is load-bearing (first match wins, §2.1),
 which is why this is the one tab NOT sorted by name, and why '['/']' move
 the rule under the cursor up/down (persisted immediately, like every other
@@ -426,7 +426,7 @@ class OverviewScreen(Screen):
             self.app.pop_screen()
 
     async def _delete_malformed_rule_entry(self, cfg, key: str) -> None:
-        """Delete a NON-MAPPING `watchers:` entry by its list index — the one
+        """Delete a NON-MAPPING `watcher_rules:` entry by its list index — the one
         row shape RuleDetailScreen cannot represent (there is no dict to
         open a form on). Inline confirm + save + rollback, same shape as
         _delete_preset_row(). A stale index (the table shrank on disk since
@@ -937,7 +937,10 @@ class OverviewScreen(Screen):
                 markup_safe(name) if isinstance(name, str) and name else "?",
                 markup_safe(merged.get("connector") or "(default)"),
                 markup_safe(merged.get("agent") or "(default)"),
-                markup_safe(rule_rooms_summary(entry)),
+                # MERGED, like connector/agent above it: a rule taking its
+                # matcher from a template has no `rooms` of its own, and reading
+                # the raw entry showed "(none)" for a rule that serves rooms.
+                markup_safe(rule_rooms_summary(merged)),
                 status_badge(status.status_for_rule(i, entry)),
                 key=str(i),
             )

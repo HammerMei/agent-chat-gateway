@@ -175,6 +175,14 @@ field. The Templates tab lists all of them, across all three kinds, in one
 flat list. The kind is shown — and offered when you press `n` — under its
 display name, so `watcher_templates` appears as **watcher rule**.
 
+A watcher-rule template's form includes the `rooms:` matcher fields, so a
+policy every rule should carry can be written once. Sharing a matcher has a
+few rules of its own — a rule's list replaces the template's rather than
+extending it, and a shared `direct: true` leaves every rule but the first with
+no DMs — see [Templates and `rooms` inheritance](user-guide.md#templates-and-rooms-inheritance).
+On the Watcher Rules tab, the Rooms column shows each rule's **effective**
+matcher, inherited parts included.
+
 Editing a field on a template shows a confirm dialog naming every entry
 that would be affected (scoped to entries that actually inherit *this*
 template and don't already override the field) before saving — so you know

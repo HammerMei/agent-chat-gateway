@@ -11,14 +11,22 @@ are still visible:
      an explicit ``null`` suppressing a template's value.
      ``GatewayConfig.from_file`` already applied the merge by the time it
      returns; the distinction is gone.
-  2. Raw ``rooms:`` groupings — by the time ``GatewayConfig.from_file``
-     returns, one raw watcher entry with ``rooms: [a, b, c]`` has already
-     been expanded into three independent ``WatcherConfig`` objects; the
-     group itself no longer exists as data.
+  2. Which entry each value was WRITTEN on. A rule and the template it
+     inherits from are one merged mapping by the time ``from_file`` returns,
+     so the editor could no longer tell which of the two to write an edit
+     back to — and ``rooms:`` is inheritable, which makes that true of the
+     matcher as well as of the scalar fields.
+
+     (This slot used to describe raw ``rooms: [a, b, c]`` groupings being
+     expanded into one ``WatcherConfig`` per room. That data shape is gone:
+     a ``watcher_rules:`` entry is a rule, a list-shaped ``rooms:`` is a load
+     error, and nothing is expanded at load time any more.)
 
 ``EditableConfig`` loads via plain ``yaml.safe_load`` — never via
-``GatewayConfig.from_file`` — for the two structural reasons above
-(provenance, raw ``rooms:`` groupings). Historically this also mattered for
+``GatewayConfig.from_file`` — for the two structural reasons above. Note that
+the raw document is what the editor WRITES; where a value came from is still
+computed on demand, and ``merged_entry()`` below is what screens use when they
+need the effective value to DISPLAY. Historically this also mattered for
 a third reason: ``from_file()`` used to expand ``$VAR``/``${VAR}``
 environment references, and loading through it would have written a
 resolved secret in plain text on save. That's no longer a live concern —
@@ -300,7 +308,7 @@ class EditableConfig:
 
     @property
     def watcher_entries(self) -> list:
-        """The raw `watchers:` document list ITSELF — the same object living
+        """The raw `watcher_rules:` document list ITSELF — the same object living
         in `document` when it is a list (so callers can mutate it), [] when
         it is anything else. Codex review of #129: `document.get("watcher_rules")
         or []` scattered across callers let a malformed scalar through —
@@ -419,7 +427,7 @@ class EditableConfig:
     #
     # A `watcher_rules:` entry is a RULE (name + connector + agent + a `rooms:`
     # matcher), not a room — which rooms it claims is only known at runtime,
-    # so there is nothing to "expand" here any more. The Rules tab shows one
+    # so there is nothing to "expand" here any more. The Watcher Rules tab shows one
     # row per raw entry, keyed by LIST INDEX: order within `watcher_rules:` is
     # load-bearing (first match wins, design §2.1), which is also why rules
     # are displayed in document order and why reordering is a first-class

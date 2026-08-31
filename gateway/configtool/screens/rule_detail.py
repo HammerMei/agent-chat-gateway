@@ -1,6 +1,6 @@
 """RuleDetailScreen — view, edit, and create a single watcher RULE.
 
-A `watchers:` entry is a rule (gateway/core/watcher_rule.py): a required
+A `watcher_rules:` entry is a rule (gateway/core/watcher_rule.py): a required
 unique `name`, a `connector`/`agent` pair, and a `rooms:` matcher
 (`include`/`except_for` globs plus the `direct`/`group_direct` DM opt-ins).
 It names no room — which rooms it claims is only known at runtime — so this
@@ -35,7 +35,7 @@ from textual.css.query import NoMatches
 from textual.widgets import Button, Input, Select, Static
 
 from ...config import HistoryHandoffConfig
-from ...core.watcher_rule import WatcherRule
+from ...core.watcher_rule import RoomMatcher, WatcherRule
 from ..formatting import format_value, markup_safe, provenance_label
 from ..modals import ConfirmModal, InheritsPickerModal, MessageModal, TextPromptModal
 from ..model import EditableConfig
@@ -48,13 +48,31 @@ from .form_common import (
     widget_id,
 )
 
-# A watcher template's own field list — reused by TemplateDetailScreen.
-# gateway/config.py forbids {name, room, rooms} on a watcher template, since
-# each of those pins one SPECIFIC rule's identity; everything else a rule
-# carries is legitimately
-# shareable, which now includes the two session TTLs — they became
-# first-class rule fields at the dynamic-watcher cutover.
+# The `rooms:` matcher fields. Shared with a watcher-rule TEMPLATE, not
+# rule-only: `gateway/config.py` used to forbid `rooms` on a template, but that
+# restriction existed only because the loader decided whether an entry was a
+# rule by looking for a `rooms:` mapping on the RAW entry, before templates were
+# merged (see TEMPLATE_FORBIDDEN_KEYS there). The `watcher_rules:` rename
+# removed that test and the restriction with it, so `rooms` is now inheritable
+# and belongs in the template form — an exclusion every rule should carry is
+# exactly the kind of thing a template is for. What sharing it does and does
+# not do is documented under "Templates and `rooms` inheritance" in
+# docs/user-guide.md.
+_ROOMS_FIELDS: tuple[FieldSpec, ...] = (
+    FieldSpec("rooms.include", "list", "Rooms: include patterns (comma-separated)"),
+    FieldSpec("rooms.except_for", "list", "Rooms: except-for patterns (comma-separated)"),
+    FieldSpec("rooms.direct", "bool", "Rooms: claim 1:1 DMs (direct)"),
+    FieldSpec("rooms.group_direct", "bool", "Rooms: claim group DMs (group_direct)"),
+)
+
+# A watcher template's own field list — reused by TemplateDetailScreen, and by
+# the rule form below, which adds only its three identity fields on top.
+# `name` is the one key a template may not carry: it pins one SPECIFIC rule.
+# Everything else a rule has is legitimately shareable, including the two
+# session TTLs (first-class rule fields since the dynamic-watcher cutover) and
+# the `rooms:` matcher above.
 WATCHER_TEMPLATE_FIELDS: tuple[FieldSpec, ...] = (
+    *_ROOMS_FIELDS,
     FieldSpec("session_idle_days", "int", "Session idle days"),
     FieldSpec("session_expire_days", "int", "Session expire days"),
     FieldSpec("context_inject_files", "list", "Context inject files (comma-separated)"),
@@ -68,8 +86,16 @@ WATCHER_TEMPLATE_FIELDS: tuple[FieldSpec, ...] = (
 # (commit 31f966d flipped only the dataclass default and missed the loader).
 _HH_DEFAULTS = HistoryHandoffConfig()
 _RULE_FIELD_DEFAULTS = WatcherRule.__dataclass_fields__
+# Same rule for the matcher: `RoomMatcher`'s own field defaults, so "no
+# patterns, no DM opt-in" cannot be asserted here while the loader means
+# something else.
+_ROOM_DEFAULTS = RoomMatcher()
 
 _WATCHER_TEMPLATE_DEFAULT_VALUES: dict[str, object] = {
+    "rooms.include": list(_ROOM_DEFAULTS.include),
+    "rooms.except_for": list(_ROOM_DEFAULTS.except_for),
+    "rooms.direct": _ROOM_DEFAULTS.direct,
+    "rooms.group_direct": _ROOM_DEFAULTS.group_direct,
     "session_idle_days": _RULE_FIELD_DEFAULTS["session_idle_days"].default,
     "session_expire_days": _RULE_FIELD_DEFAULTS["session_expire_days"].default,
     "context_inject_files": [],
@@ -85,21 +111,18 @@ WATCHER_TEMPLATE_DATACLASS_DEFAULTS: dict[str, object] = {
     for spec in WATCHER_TEMPLATE_FIELDS
 }
 
-# The `rooms:` matcher fields — rule-only (a template may not carry `rooms`,
-# so these never inherit; their provenance is always explicit-or-default).
-_ROOMS_FIELDS: tuple[FieldSpec, ...] = (
-    FieldSpec("rooms.include", "list", "Rooms: include patterns (comma-separated)"),
-    FieldSpec("rooms.except_for", "list", "Rooms: except-for patterns (comma-separated)"),
-    FieldSpec("rooms.direct", "bool", "Rooms: claim 1:1 DMs (direct)"),
-    FieldSpec("rooms.group_direct", "bool", "Rooms: claim group DMs (group_direct)"),
-)
-
 _RULE_REQUIRED_FIELD_KEYS = frozenset({"name", "connector", "agent"})
 
 
 def rule_rooms_summary(entry: dict) -> str:
-    """One-line summary of a raw entry's `rooms:` matcher for table rows and
-    the view body — e.g. `general, dev-* (except: *-noise) +dm +group_dm`.
+    """One-line summary of an entry's `rooms:` matcher for table rows and the
+    view body — e.g. `general, dev-* (except: *-noise) +dm +group_dm`.
+
+    **Both callers pass the MERGED entry**, not the raw one: `rooms` is
+    inheritable, so a rule that takes its matcher from a template has no `rooms`
+    key of its own and the raw entry summarises as "(none)" — a rule serving
+    `eng-*` and every 1:1 DM displayed as serving nothing.
+
     Defensive against a malformed entry (rooms not a mapping): shows what it
     can, the row's own Status column carries the actual error."""
     rooms = entry.get("rooms")
@@ -280,7 +303,9 @@ class RuleDetailScreen(FormScreen):
                 FieldSpec("name", "str", "Watcher rule name"),
                 FieldSpec("connector", "enum", "Connector", options=connector_names),
                 FieldSpec("agent", "enum", "Agent", options=agent_names),
-                *_ROOMS_FIELDS,
+                # rooms + TTLs + history_handoff all come from
+                # WATCHER_TEMPLATE_FIELDS — listing rooms here too would render
+                # every matcher field twice.
                 *WATCHER_TEMPLATE_FIELDS,
             ),
             _RULE_REQUIRED_FIELD_KEYS,
@@ -447,7 +472,11 @@ class RuleDetailScreen(FormScreen):
             f"connector: {markup_safe(merged.get('connector') or defaults['connector'])}"
         )
         lines.append(f"agent: {markup_safe(merged.get('agent') or defaults['agent'])}")
-        lines.append(f"rooms: {markup_safe(rule_rooms_summary(entry))}")
+        # `merged`, not `entry` — same reason as connector/agent above: an
+        # inherited matcher is absent from the raw entry, and summarising the raw
+        # entry reported "(none)" for a rule that claims rooms. The per-field
+        # lines below carry where each part came from.
+        lines.append(f"rooms: {markup_safe(rule_rooms_summary(merged))}")
         lines.append(
             f"inherits: {markup_safe(template_name) if template_name else '(none)'}"
         )
@@ -583,7 +612,7 @@ class RuleDetailScreen(FormScreen):
             existing = self.cfg.document.get("watcher_rules")
             if existing is not None and not isinstance(existing, list):
                 # REFUSED, not normalized (Codex review of #129, round 3):
-                # a malformed non-list `watchers:` can hold RECOVERABLE rule
+                # a malformed non-list `watcher_rules:` can hold RECOVERABLE rule
                 # data — the classic shape is a mapping from an operator
                 # omitting the '-' before an otherwise complete rule — and
                 # replacing it with [] would pass the save gate (the
@@ -592,7 +621,7 @@ class RuleDetailScreen(FormScreen):
                 # Only an absent or explicit-null key is normalized below.
                 await self.app.push_screen_wait(
                     MessageModal(
-                        "config.yaml's 'watchers:' is not a list "
+                        "config.yaml's 'watcher_rules:' is not a list "
                         f"(got {type(existing).__name__}) — often a missing "
                         "'-' before a rule. Repair it in $EDITOR (ctrl+e on "
                         "the list screen) first; creating a rule here would "
@@ -603,7 +632,7 @@ class RuleDetailScreen(FormScreen):
                 return
             # KEY MEMBERSHIP, not the value: `document.get("watcher_rules")`
             # returns None both for an absent key and for an explicit
-            # `watchers:` (null), so round 10's `existing is None` popped a
+            # `watcher_rules:` (null), so round 10's `existing is None` popped a
             # key the operator had actually written — and a later unrelated
             # successful save then wrote the file without it (Codex review of
             # #129, round 11). Both the presence and the original value are
