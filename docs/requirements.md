@@ -69,8 +69,10 @@ A watcher SHALL:
 The gateway SHALL:
 1. Assign every watcher's session identity itself — from the agent backend on first
    start, or by reusing the persisted one. Session IDs SHALL NOT be configurable:
-   `watchers[].session_id` is removed, and setting it SHALL be a load error naming
-   the replacement (see 8.3.7a)
+   `session_id` is removed from a watcher rule, and setting it SHALL be a load
+   error. It needs no message of its own: a rule accepts a closed set of keys, so
+   an unrecognised one is already refused and the error lists the keys that are
+   valid (see 8.4)
 2. Persist that session identity across daemon restarts so the same agent
    conversation continues
 3. When a watcher is reset, clear the stored session identity and create a fresh
@@ -248,16 +250,16 @@ The gateway SHALL:
 2. If permission timeouts are enabled, require that the overall agent timeout is greater than the permission timeout
 3. Prevent two watchers from sharing one session identity in a way that would create ambiguous routing. Since session IDs are no longer configurable (3.2.1), this is now satisfied by construction at the configuration layer rather than by a cross-watcher check, and remains a runtime requirement on assignment
 
-### 8.4 Templates, Tool Presets, and Watcher Room Expansion
+### 8.4 Templates, Tool Presets, and Watcher Rule Keys
 
 The gateway SHALL:
 1. Support top-level `connector_templates`, `agent_templates`, and `watcher_templates` blocks — each a mapping of template name to a partial field block — referenced from an individual connector/agent/watcher entry via that entry's own `inherits: <template-name>` field, deep-merged with the entry's own fields taking precedence over the template's on conflict. An entry that omits `inherits:` is entirely unaffected by any template (v0.3; supersedes the v0.2 `connector_defaults`/`agent_defaults`/`watcher_defaults` blocks, which deep-merged unconditionally into every entry of a kind regardless of type — removed entirely, see requirement 9 below)
-2. Reject a named template that sets an identity field belonging to a specific entry (`name` for `connector_templates`; `name`, `room`, `rooms`, or `session_id` for `watcher_templates`)
+2. Reject a named template that sets an identity field belonging to a specific entry — `name`, for both `connector_templates` and `watcher_templates`. `rooms` is deliberately NOT an identity field: a `watcher_templates:` entry MAY supply it, and a rule's own `rooms` deep-merges over it, so a template can set `direct: true` for every rule that inherits it while each rule adds its own `include`
 3. Support a top-level `tool_presets` block of named, reusable tool-rule lists, referenced by name from `owner_allowed_tools`/`guest_allowed_tools`, freely mixable with inline tool-rule entries
 4. Validate every defined tool preset's rules at configuration load time, regardless of whether any agent references it
 5. Reject a tool preset whose rule list itself references another preset by name (presets SHALL be flat)
-6. Support a watcher `rooms` list as an alias that expands one watcher entry into one watcher per listed room, each with an automatically derived name of the form `<connector>-<sanitized-room>`
-7. Reject a watcher entry that sets both `room` and `rooms`, or that sets `name` while `rooms` contains more than one room
+6. Accept a closed set of keys on a `watcher_rules:` entry and reject any other, listing the valid ones. Removed fields — `room`, `rooms:` as a list, `session_id` — therefore need no rule of their own: each is simply not a key. (This supersedes the v0.5 requirements for expanding a `rooms` list into one watcher per room with a derived name, and for rejecting `room` alongside `rooms`; both belonged to the static watcher shape, which no longer exists)
+7. Reject any unrecognised **top-level** key in config.yaml, listing the valid ones and naming a likely intended key when one is close. This is what reports a config still using the pre-rename `watchers:` block, so the rename needs no check of its own
 7a. Reject a watcher entry that sets `session_id` at all — the field is removed, and the error SHALL name the handoff replacement rather than being silently ignored (a watcher entry's unknown keys are otherwise dropped, and this field was documented in v0.5.1)
 8. Apply the same watcher-name uniqueness requirement to names produced by room expansion as to explicitly configured names
 9. Reject a leftover top-level `connector_defaults`, `agent_defaults`, or `watcher_defaults` key immediately, with an error naming the replacement (`connector_templates`/`agent_templates`/`watcher_templates`) — never silently ignore it, since a silent no-op would silently drop whatever settings an operator still believes are shared

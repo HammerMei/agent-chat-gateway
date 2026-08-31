@@ -47,7 +47,7 @@ counts) — press `v` when it says "press 'v' to view details" to see the
 actual messages, not just a count.
 
 Every list is sorted by name — except **Rules**, which always shows your
-`watchers:` rules in file order, because that order is meaningful: the
+`watcher_rules:` rules in file order, because that order is meaningful: the
 first rule that matches a room wins. A newly created entry on the other
 tabs is always easy to find regardless of where it landed in the
 underlying file.
@@ -125,7 +125,7 @@ it and add a different preset reference instead).
 
 ## Rules
 
-Each `watchers:` entry is a *rule*: a required unique name, a connector, an
+Each `watcher_rules:` entry is a *rule*: a required unique name, a connector, an
 agent, and a `rooms:` matcher (`include`/`except_for` glob patterns over
 room names, plus `direct`/`group_direct` opt-ins for the two kinds of DMs).
 Which rooms a rule actually claims is decided at runtime, per incoming

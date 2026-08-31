@@ -107,7 +107,7 @@ connectors:
     port: 8765
     secret: "$VOICE_SECRET"
 
-watchers:
+watcher_rules:
   - name: siri-watcher
     connector: siri-voice
     rooms:
@@ -173,8 +173,9 @@ watchers:
 #### Persistence & Recovery
 - ✅ Persistent watcher state across daemon restarts (`state.json`)
 - ✅ Auto-created session IDs retained across restarts
-- ❌ Pinning a session ID from config (`watchers[].session_id`) — removed; setting it
-  is a load error. Carry context into a session with a handoff file instead
+- ❌ Pinning a session ID from config (`session_id` on a watcher rule) — removed;
+  setting it is a load error, reported as an unrecognised key like any other.
+  Carry context into a session with a handoff file instead
   (`context_inject_files`), which also survives the backend expiring the session
 - ✅ Graceful recovery from corrupted state files
 

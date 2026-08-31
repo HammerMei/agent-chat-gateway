@@ -14,7 +14,7 @@ A watcher is a 1:1 binding between one room and one agent session, declared
 in `config.yaml` and started at gateway boot:
 
 ```yaml
-watchers:
+watcher_rules:
   - name: rc-nest
     connector: rc-home
     room: nest
@@ -59,11 +59,33 @@ add-watcher path.
 
 ### 2.1 Watcher rules
 
-A `watchers:` entry stops naming a room and starts describing how to build a
+**The block is `watcher_rules:`, and the name is load-bearing.** It began as
+`watchers:` — the same key the static shape used — so that one block could carry
+both shapes while the cutover landed. Keeping it afterwards cost more than it
+looked:
+
+* it read as a list of watchers when an entry is not one. The config tool calls
+  them rules, the parsed attribute is `GatewayConfig.watcher_rules`, and the
+  sibling block is `watcher_templates:` — the config key was the only place
+  still saying "watchers";
+* the loader had to *guess* which shape an entry used, and it guessed by looking
+  for a `rooms:` **mapping** on the raw entry. That guess ran BEFORE templates
+  were merged, so an entry taking its rooms from a `watcher_templates:` entry
+  did not read as a rule at all — which is why `rooms` was forbidden in a
+  template. A restriction on a feature, to support a shape that no longer
+  exists.
+
+Renaming the block removed both. Every entry under `watcher_rules:` is a rule by
+virtue of the block it is in, so the shape test is gone and `rooms` is
+inheritable; a config still using `watchers:` is reported by the general
+unknown-top-level-key check, which names `watcher_rules` as the likely
+intention. No migration-specific code was added for it.
+
+A `watcher_rules:` entry stops naming a room and starts describing how to build a
 watcher for whatever rooms match it:
 
 ```yaml
-watchers:
+watcher_rules:
   - name: eng                    # rule identity, operator-supplied, unique
     connector: mm-home
     agent: claude-eng
@@ -122,7 +144,7 @@ claims the room, declines it, and `DECLINED` does not fall through, so no later
 rule sees it:
 
 ```yaml
-watchers:
+watcher_rules:
   - name: never-here                  # a deny rule
     connector: mm-home
     rooms:
@@ -352,7 +374,7 @@ Two consequences that are not obvious and were each got wrong once:
   room has a gap and to trigger the recreation that covers it — the recreation
   is what replays. A room in the startup scan that is already resident got that
   way through `_recreate` (its record rules out `_create`, and a rule-derived
-  record is not in `watchers:` so the static path never starts it), so its
+  record is not in `watcher_rules:` so nothing starts it), so its
   interval has already been replayed and a second pass is pure duplication:
   replay hands the filter its own boundary rather than the live watermark, so
   the ts filter suppresses nothing and only the bounded id window separates the
@@ -1214,7 +1236,7 @@ connectors:
     team: sales
     username: acg-bot
 
-watchers:
+watcher_rules:
   - name: eng-channels
     connector: mm-eng
     agent: claude-eng

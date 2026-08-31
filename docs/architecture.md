@@ -539,10 +539,12 @@ opencode run -s <session-id> --format json [-f <file> ...]
 config.yaml (user-editable)
     ├─ tool_presets: {name: [ToolRule, ...]}              # named, reusable tool-rule lists
     ├─ connector_templates / agent_templates / watcher_templates  # named; opted into per-entry via inherits:
-    ├─ connectors: [ConnectorConfig, ...]                 # room="a" | rooms=[a,b,...] on watchers
+    ├─ connectors: [ConnectorConfig, ...]
     ├─ agents: {name: AgentConfig, ...}
     ├─ default_agent: "my-agent"
-    ├─ watchers: [WatcherConfig, ...]
+    ├─ watcher_rules: [WatcherRule, ...]                  # which rooms an agent may serve;
+    │                                                     # one WatcherConfig is materialized
+    │                                                     # per room as rooms turn up
     ├─ max_queue_depth: 100
     └─ scheduler: {completed_job_ttl_days: 7}
          → GatewayConfig.from_file()

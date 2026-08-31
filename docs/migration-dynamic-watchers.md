@@ -1,19 +1,32 @@
 # Migrating to watcher rules (dynamic watchers)
 
 The static watcher shape — a `room:` key, or `rooms:` as a list — has been
-removed. `watchers:` entries are now **rules**: they declare which rooms an
+removed. `watcher_rules:` entries are now **rules**: they declare which rooms an
 agent serves, and the gateway creates each room's watcher on demand — on the
 room's first message (Rocket.Chat, Mattermost), or eagerly at startup for
-connectors with no inbound stream (voice, script). A config still carrying the
-old shape fails at load with a pointer at this document, and `acg config
-validate` lists every entry that needs rewriting in one pass.
+connectors with no inbound stream (voice, script).
+
+**The block is called `watcher_rules:` now, not `watchers:`.** A config still
+using the old name fails at load, because an unrecognised top-level key is an
+error rather than something quietly skipped:
+
+```
+config.yaml sets 'watchers', which this gateway does not use. Valid top-level
+keys are: ... 'watcher_rules', 'watcher_templates'.
+'watchers' — did you mean 'watcher_rules'?
+```
+
+Renaming the key is not the whole job, though — the entries under it changed
+shape as well, and a leftover `room:` inside one is reported the same way
+(`unknown key(s) 'room'`, with `rooms` in the list of valid keys). `acg config
+validate` reports every entry that needs rewriting in one pass.
 
 **This is not a 1:1 rename.** Read *What changes underneath* before editing —
 some of the old shape's guarantees are deliberately not carried over.
 
 ## The rewrite
 
-Old:
+Old — note the block name, which changed too:
 
 ```yaml
 watchers:
@@ -29,7 +42,7 @@ watchers:
 New:
 
 ```yaml
-watchers:
+watcher_rules:
   - name: my-rooms            # required — rules are not auto-named
     connector: rc-home
     rooms:
@@ -42,6 +55,36 @@ Field notes:
 - **`name:` is required** and names the *rule*, not a watcher. Each created
   watcher gets a derived name like `rc-home:general`, which is what
   `list`/`pause`/`resume`/`reset`/`expire` act on.
+- **`rooms:` can come from a template.** A `watcher_templates:` entry may set
+  it, and a rule's own `rooms:` merges over the template's key by key. The use
+  this fits best is a shared policy every rule should carry — an exclusion, for
+  instance, so no rule can pick up a room you want left alone:
+
+  ```yaml
+  watcher_templates:
+    channels:
+      connector: rc-home
+      rooms: {except_for: ['*-secret']}   # no inheriting rule serves these
+  watcher_rules:
+    - {name: eng, inherits: channels, rooms: {include: ['eng-*']}}
+    - {name: ops, inherits: channels, rooms: {include: ['ops-*']}}
+    - {name: dms, connector: rc-home, rooms: {direct: true}}
+  ```
+
+  Two things not to do with it, both of which follow from `rooms` being a
+  matcher rather than a setting, and both found by running them:
+
+  * **Do not put `direct: true` in a shared template.** Only the first rule that
+    matches a room serves it, so the first rule inheriting the template takes
+    every DM and the later ones are dead — `acg config validate` warns, naming
+    the pair.
+  * **Do not let a DM-only rule inherit `except_for`.** `except_for` subtracts
+    from `include`, and a DM opt-in is not name-matched, so the merged rule is
+    refused: *"'rooms.except_for' has no effect without 'rooms.include'"*. Keep
+    DM rules out of that template, as `dms` is above.
+
+  To turn off an inherited flag on one rule, write `false` — not `null`. The
+  field is checked as a boolean.
 - **`rooms:` is a mapping**: `include:` takes glob patterns over room names
   (`eng-*`, `general`, `*`), `except_for:` subtracts from this rule's own
   include, and `direct:` / `group_direct:` opt into the two DM kinds.
@@ -87,12 +130,13 @@ Field notes:
 
 ## Checklist
 
-1. Rewrite each `watchers:` entry as a rule (above).
-2. `acg config validate` — fix every error; read the shadowing warnings.
-3. If any old session's content matters, export it via a summary file first.
-4. Restart the gateway. Expect one `Pruning static-era watcher record`
+1. Rename the block from `watchers:` to `watcher_rules:`.
+2. Rewrite each entry under it as a rule (above).
+3. `acg config validate` — fix every error; read the shadowing warnings.
+4. If any old session's content matters, export it via a summary file first.
+5. Restart the gateway. Expect one `Pruning static-era watcher record`
    log line per old record — that is the clean break, not a fault.
-5. Delete every scheduled job that targeted an old static watcher name
+6. Delete every scheduled job that targeted an old static watcher name
    (`schedule list`, then `schedule delete <id>` for each) — the prune
    removes the records, NOT the jobs, and an orphaned job re-fires forever
    against a watcher that no longer exists. Then recreate the jobs against

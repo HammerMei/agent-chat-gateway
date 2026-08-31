@@ -1,5 +1,11 @@
 # Migrating to the v0.3 config format
 
+> **Later change:** the top-level `watchers:` block shown below was renamed to
+> `watcher_rules:` in a later version, and its entries changed shape. The examples
+> here are kept as they were at the time — see `migration-dynamic-watchers.md` for
+> the current form.
+
+
 v0.3 removes the global `connector_defaults:` / `agent_defaults:` /
 `watcher_defaults:` blocks introduced in v0.2 and replaces them with named,
 reusable `connector_templates:` / `agent_templates:` / `watcher_templates:`

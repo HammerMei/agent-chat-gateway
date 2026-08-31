@@ -77,7 +77,7 @@ agents:
       enabled: true
       timeout: 300
 
-watchers:
+watcher_rules:
   - name: general
     connector: rc-home
     rooms:
@@ -164,7 +164,7 @@ agents:
       enabled: true
       timeout: 300
 
-watchers:
+watcher_rules:
   - name: general
     connector: rc-company
     rooms:
@@ -229,7 +229,7 @@ agents:
     permissions:
       enabled: false     # Skip approval prompts for personal use
 
-watchers:
+watcher_rules:
   - name: my-assistant
     connector: rc-personal
     rooms:
@@ -298,7 +298,7 @@ wc -l /Users/me/project/HANDOFF.md && head -5 /Users/me/project/HANDOFF.md
 ```yaml
 # 2. Point the watcher at that file. Context files are read and sent to the agent
 #    on session start, so it begins with the context rather than discovering it.
-watchers:
+watcher_rules:
   - name: my-project
     connector: rc-home
     rooms:
@@ -340,7 +340,7 @@ agent-chat-gateway start
 | `tool_presets` | dict | No | `{}` | Named, reusable tool-rule lists — see [Tool Allow-Lists](#tool-allow-lists) |
 | `connector_templates` | dict | No | `{}` | Named, reusable field blocks for connectors — each entry opts in via its own `inherits: <name>` |
 | `agent_templates` | dict | No | `{}` | Named, reusable field blocks for agents — each entry opts in via its own `inherits: <name>` |
-| `watcher_templates` | dict | No | `{}` | Named, reusable field blocks for watchers — each entry opts in via its own `inherits: <name>` |
+| `watcher_templates` | dict | No | `{}` | Named, reusable field blocks for watcher rules — each entry opts in via its own `inherits: <name>`. May set `rooms:`; a rule's own `rooms:` merges over it key by key, so a template can set `direct: true` once while each rule adds its own `include`. Cannot set `name` |
 
 None of the four templates/preset fields above are required — a single
 connector/agent/watcher setup rarely needs them. They exist to avoid
@@ -491,13 +491,13 @@ agents:
 
 ### Watchers
 
-A `watchers:` entry is a **rule**: it declares which rooms an agent serves,
+A `watcher_rules:` entry is a **rule**: it declares which rooms an agent serves,
 and the gateway creates each room's watcher on demand — on the room's first
 message for Rocket.Chat and Mattermost, or eagerly at startup for connectors
 with no inbound stream (voice, script — their rules must name literal rooms).
 
 ```yaml
-watchers:
+watcher_rules:
   - name: general-assistant     # the RULE's name — required
     connector: rc-main
     rooms:
@@ -874,7 +874,7 @@ connectors:
     context_inject_files:
       - contexts/rc-gateway-context.md   # Gateway behavior rules — shared across all rooms
 
-watchers:
+watcher_rules:
   - name: general
     connector: rc-main
     rooms:
@@ -1023,7 +1023,7 @@ agents:
     context_inject_files:
       - docs/system-prompt.txt       # Layer 2: agent instructions
 
-watchers:
+watcher_rules:
   - name: general
     context_inject_files:
       - docs/domain-context.txt      # Layer 3: room-specific context
@@ -1066,7 +1066,7 @@ connectors:
   - name: rc-main
     ...
 
-watchers:
+watcher_rules:
   - name: general
     connector: rc-main
     rooms:
@@ -1291,7 +1291,7 @@ agents:
       enabled: true
       timeout: 300
 
-watchers:
+watcher_rules:
   - name: general
     agent: claude          # General discussions
   - name: development
@@ -1329,7 +1329,7 @@ connectors:
       owners:
         - charlie
 
-watchers:
+watcher_rules:
   - name: company-general
     connector: rc-company
     rooms:
@@ -1366,7 +1366,7 @@ connectors:
     allowed_users:
       owners: [bob]
 
-watchers:
+watcher_rules:
   - name: rc-general
     connector: rc-main
     rooms:

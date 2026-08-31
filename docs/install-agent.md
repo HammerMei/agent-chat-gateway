@@ -166,7 +166,7 @@ agents:
       enabled: true
       timeout: 300
 
-watchers:
+watcher_rules:
   - name: dm-me
     connector: rc-home
     room: "@your-username"
@@ -174,7 +174,7 @@ watchers:
 EOF
 ```
 
-**Mattermost** (same `agents:`/`watchers:` shape — only the `connectors:` block and the
+**Mattermost** (same `agents:`/`watcher_rules:` shape — only the `connectors:` block and the
 watcher's `connector:`/`room:` values differ from the Rocket.Chat example above):
 ```bash
 cat > ~/.agent-chat-gateway/config.yaml << 'EOF'
@@ -242,7 +242,7 @@ agents:
       enabled: true
       timeout: 300
 
-watchers:
+watcher_rules:
   - name: dm-me
     connector: mm-home
     room: "@your-username"
@@ -342,7 +342,7 @@ To monitor additional rooms/channels:
    watcher itself is created automatically on the room's first message, named
    `<connector>:<room>`:
    ```yaml
-   watchers:
+   watcher_rules:
      - name: my-rooms
        connector: rc-home   # or mm-home
        agent: my-agent

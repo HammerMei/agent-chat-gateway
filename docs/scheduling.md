@@ -157,7 +157,7 @@ agents:
     type: claude
     working_directory: /path/to/project
 
-watchers:
+watcher_rules:
   - connector: headless
     agent: worker
     room: cron   # never a real room — the script connector has nowhere to post
