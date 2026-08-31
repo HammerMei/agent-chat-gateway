@@ -372,7 +372,9 @@ class TestConfigRefusesARoomTwice(unittest.TestCase):
 
         self.assertEqual(result.errors, [])
         self.assertTrue(
-            any("can never fire" in w for w in result.warnings),
+            # Contract: the shadowed rule is named and told it is unused.
+            # "can never fire" was the old phrasing.
+            any("will never be used" in w for w in result.warnings),
             f"expected a shadowing warning, got {result.warnings}",
         )
 

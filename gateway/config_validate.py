@@ -196,11 +196,17 @@ def validate_config(config_path: str, lint: bool = False) -> ValidationResult:
     return result
 
 
+# Plain-language halves of the sentence built below. The old wording leaned on
+# "reach" as a noun and on "first-match precedence", which asked the reader to
+# know the matching model before they could act on the warning.
+# Each phrase carries its own verb so the sentence below needs none — the first
+# attempt left "every room it would serve ARE already taken" for one scope and
+# correct grammar for the others.
 _SHADOW_SCOPE_WORDING = {
-    "rule": "can never fire: every way it reaches a room",
-    "named": "will never match a named room: that pattern set",
-    "direct": "will never see a 1:1 DM: that reach",
-    "group_direct": "will never see a group DM: that reach",
+    "rule": "will never be used, because every room it would serve is already handled by",
+    "named": "will never match a room by name, because the names it lists are already handled by",
+    "direct": "will never see one-to-one direct messages, because those are already handled by",
+    "group_direct": "will never see group direct messages, because those are already handled by",
 }
 
 
@@ -223,12 +229,15 @@ def _check_shadowed_rules(config: GatewayConfig, result: ValidationResult) -> No
     nothing consumes rules, so there is no behaviour for a shadowed rule to affect.
     """
     for finding in find_shadowed_rules(config.watcher_rules):
-        detail = _SHADOW_SCOPE_WORDING.get(finding.scope, f"reach '{finding.scope}'")
+        detail = _SHADOW_SCOPE_WORDING.get(
+            finding.scope, f"overlaps '{finding.scope}' with"
+        )
         msg = (
-            f"Watcher rule '{finding.rule.name}' {detail} is already claimed by "
-            f"the earlier rule '{finding.shadowed_by.name}'. Under first-match "
-            "precedence a rule only sees rooms no earlier rule stopped — reorder "
-            "them, or narrow the earlier rule."
+            f"Watcher rule '{finding.rule.name}' {detail} "
+            f"'{finding.shadowed_by.name}', which is listed above it. Entries are "
+            "checked in order and the first one that matches a room handles it — "
+            f"so move '{finding.rule.name}' above '{finding.shadowed_by.name}', or "
+            f"narrow '{finding.shadowed_by.name}' so it leaves those rooms alone."
         )
         result.warnings.append(msg)
         result.findings.append(
@@ -471,10 +480,12 @@ def _check_state_orphans(config: GatewayConfig, result: ValidationResult) -> Non
             # reported; an empty leftover file is noise.
             msg = (
                 f"State file '{path.name}' belongs to connector "
-                f"'{file_connector}', which is not in config.yaml — its "
-                f"{len(states)} record(s) will never be loaded and their "
-                "sessions stay abandoned. Restore the connector name to "
-                "reclaim them, or delete the file if they are unwanted."
+                f"'{file_connector}', which is not in config.yaml. Its "
+                f"{len(states)} saved watcher(s) are being ignored — nothing "
+                "reads that file, and nothing deletes it either, so their "
+                f"sessions are left unused. Add '{file_connector}' back to "
+                "config.yaml to use them again, or delete the file yourself "
+                "if you do not want them."
             )
             result.warnings.append(msg)
             result.findings.append(
@@ -506,10 +517,10 @@ def _check_state_orphans(config: GatewayConfig, result: ValidationResult) -> Non
                 if st.agent and st.agent not in config.agents:
                     msg = (
                         f"Connector '{connector.name}': watcher "
-                        f"'{st.watcher_name}' is bound to agent '{st.agent}', "
-                        f"which is not in config.yaml — it will read 'failed' "
-                        f"at the next boot and refuse every start. Restore "
-                        f"the agent, or release the room with "
+                        f"'{st.watcher_name}' uses agent '{st.agent}', which "
+                        f"is not in config.yaml. This watcher will not start "
+                        f"and will show as failed. Either add '{st.agent}' "
+                        f"back to config.yaml, or give up the room with "
                         f"'expire {st.watcher_name}'."
                     )
                     result.warnings.append(msg)
@@ -523,13 +534,14 @@ def _check_state_orphans(config: GatewayConfig, result: ValidationResult) -> Non
                     if st.backend_identity != current:
                         msg = (
                             f"Connector '{connector.name}': watcher "
-                            f"'{st.watcher_name}' carries session "
-                            f"{st.session_id} created against backend "
-                            f"identity '{st.backend_identity}', but agent "
-                            f"'{st.agent}' now resolves to '{current}' — the "
-                            f"next start will abandon that session and mint "
-                            f"a fresh one. Expected after changing the "
-                            f"agent's type or working_directory."
+                            f"'{st.watcher_name}' has a saved session "
+                            f"({st.session_id}) that was started when agent "
+                            f"'{st.agent}' was set up "
+                            f"as '{st.backend_identity}'. It is now "
+                            f"'{current}', so that session cannot be reused "
+                            f"and the next start will begin a new one. "
+                            f"Nothing to do if you meant to change the "
+                            f"agent's 'type' or 'working_directory'."
                         )
                         result.warnings.append(msg)
                         result.findings.append(
@@ -538,11 +550,13 @@ def _check_state_orphans(config: GatewayConfig, result: ValidationResult) -> Non
                         )
                 continue
             msg = (
-                f"Connector '{connector.name}': state.json has static-era "
-                f"watcher '{st.watcher_name}' — the static shape was removed, "
-                "so its session/pause state will be pruned on the next start. "
-                "To keep the room, add a rule that matches it (a fresh session "
-                "starts on its first message); see "
+                f"Connector '{connector.name}': the saved watcher "
+                f"'{st.watcher_name}' was written by an older version of this "
+                "gateway, which used a config format that no longer exists. "
+                "The next start will discard it, including its paused setting "
+                "and its session. To keep serving that room, add an entry "
+                "under 'watchers:' that matches it — it will start a new "
+                "session on the room's next message. See "
                 "docs/migration-dynamic-watchers.md."
             )
             result.warnings.append(msg)

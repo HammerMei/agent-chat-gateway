@@ -239,7 +239,8 @@ class TestParserHardErrors(unittest.TestCase):
 
     def test_session_id_is_rejected_and_names_the_replacement(self):
         msg = self._err({**MINIMAL, "session_id": "abc"}, "no longer supported")
-        self.assertIn("summarise the session to a file", msg)
+        # Contract, not phrasing — see test_session_id_removed.py.
+        self.assertIn("write a summary to a file", msg)
 
     def test_unknown_key_inside_rooms(self):
         msg = self._err({**MINIMAL, "rooms": {"include": ["a"], "directt": True}}, "unknown key")
@@ -278,15 +279,19 @@ class TestParserHardErrors(unittest.TestCase):
         misses is NO_MATCH and falls through to the next rule."""
         msg = self._err(
             {**MINIMAL, "rooms": {"include": ["eng-*"], "except_for": ["ops-secret"]}},
-            "can never match any room this rule includes",
+            "does nothing here",
         )
         # The message has to teach three things, or the operator fixes the
         # pattern and still does not get what they wanted: that except_for is
         # relative to this rule's include, that it does not protect a room from
         # later rules, and what does.
-        self.assertIn("subtracts from this rule's own 'include'", msg)
-        self.assertIn("does not stop a *later* rule", msg)
-        self.assertIn("name it in 'include' and in 'except_for'", msg)
+        # Pinned as MEANING, not as sentences: the wording was rewritten for
+        # plain language and these assertions held it to the old phrasing —
+        # including the `*later*` asterisks. What must survive a rewrite is that
+        # all three points are still made.
+        self.assertIn("this rule's own 'include'", msg)
+        self.assertIn("later rule", msg)
+        self.assertIn("BOTH 'include' and 'except_for'", msg)
 
     def test_a_partially_overlapping_except_for_is_fine(self):
         r = parse({**MINIMAL, "rooms": {"include": ["eng-*"], "except_for": ["eng-archive"]}})

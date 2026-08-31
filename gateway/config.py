@@ -464,11 +464,11 @@ def _parse_templates_block(
                 # the operator will never see is worse than saying nothing.
                 verb = "does" if len(removed) == 1 else "do"
                 parts.append(
-                    f"{_key_list(removed)} {verb} not exist at all any more. "
-                    "Sessions are no longer pinned from config; to carry context "
-                    "into a new session, have the agent summarise its session to a "
-                    "file and read that file back in the new one (see "
-                    "docs/user-guide.md)"
+                    f"{_key_list(removed)} {verb} not exist at all any more — "
+                    "you cannot pick which conversation an entry uses. To carry "
+                    "work forward instead, have the agent write a summary to a "
+                    "file at the end of a conversation and read it back at the "
+                    "start of the next one (see docs/user-guide.md)"
                 )
             raise ValueError(
                 f"{key}['{name}'] must not set {_key_list(bad)} — " + "; ".join(parts) + "."
@@ -898,10 +898,10 @@ def _parse_one_agent(
     for moved_key in _MOVED_TO_RULE_KEYS:
         if moved_key in agent_raw:
             raise ValueError(
-                f"Agent '{agent_name}': '{moved_key}' is no longer set on an agent — "
-                f"it moved to the watcher rule that uses the agent, so two rules "
-                f"sharing one agent can have different lifecycles. Move it into the "
-                f"'watchers:' entry. See docs/design/dynamic-watcher-design.md."
+                f"Agent '{agent_name}': '{moved_key}' is not an agent setting any "
+                f"more — move it to the 'watchers:' entry that uses this agent. "
+                f"It lives there now so that two entries sharing one agent can "
+                f"have different session timeouts."
             )
 
     agent_cfg = AgentConfig(
@@ -1154,14 +1154,15 @@ def _static_shape_error(entry: object, index: int) -> str:
         )
     label = entry.get("name") or entry.get("room") or f"index {index}"
     return (
-        f"Watcher entry '{label}': the static watcher shape (a 'room:' key, or "
-        f"'rooms:' as a list) has been removed — watchers are now created from "
-        f"rules, where 'rooms:' is a mapping ('rooms: {{include: [...]}}'). "
-        f"Rewrite this entry as a rule, and note the upgrade RESETS every "
-        f"existing watcher session: the old records are reclaimed at the next "
-        f"start, each room begins a fresh session on its first message, and a "
-        f"paused room must be re-expressed as 'rooms.except_for'. It is not a "
-        f"1:1 rename — see docs/migration-dynamic-watchers.md before rewriting."
+        f"Watcher entry '{label}': this is the old format and is no longer "
+        f"supported. Instead of naming one room with 'room:' (or listing rooms "
+        f"under 'rooms:'), describe which rooms this entry should serve: "
+        f"'rooms: {{include: [general, eng-support]}}'.\n"
+        f"Read docs/migration-dynamic-watchers.md before you rewrite it — this "
+        f"is not a simple rename. Two things change: every existing "
+        f"conversation is discarded, so each room starts fresh on its next "
+        f"message; and a room you had paused comes back active unless you list "
+        f"it under 'rooms.except_for'."
     )
 
 
@@ -1408,10 +1409,12 @@ def _parse_one_watcher_rule(
     if "session_id" in wc:
         raise ValueError(
             f"Watcher rule at index {index}: 'session_id' is no longer "
-            "supported. To carry context into a new session, have the agent "
-            "summarise the session to a file and read it back — a handoff "
-            "survives the backend expiring a session, which pinning never "
-            "did. See docs/user-guide.md."
+            "supported — you cannot pick which conversation an entry uses. "
+            "To carry work forward instead, have the agent write a summary to "
+            "a file at the end of a conversation and read that file back at "
+            "the start of the next one. That keeps working even when the "
+            "conversation itself is gone, which naming one never did. See "
+            "docs/user-guide.md."
         )
 
     # entry_is_watcher_rule() guarantees this for entries routed here by the
@@ -1477,11 +1480,13 @@ def _parse_one_watcher_rule(
         if not union_intersects([pattern], matcher.include):
             raise ValueError(
                 f"Watcher rule at index {index} ('{rule_name}'): "
-                f"'rooms.except_for' entry '{pattern.raw}' does nothing, because "
-                "this rule never includes a room it would match. 'except_for' "
-                "only removes rooms from this rule's own 'include' list. If you "
-                "want no rule at all to serve a room, add it to BOTH 'include' "
-                "and 'except_for' here."
+                f"'rooms.except_for' entry '{pattern.raw}' does nothing here, "
+                "because this rule's 'include' never matches a room by that "
+                "name. 'except_for' only removes rooms from this rule's own "
+                "'include' — it does not keep a room away from a later rule, "
+                "which picks up whatever this one leaves. To keep a room away "
+                "from every rule, list it in BOTH 'include' and 'except_for' "
+                "here."
             )
 
     resolved_connector = _resolve_watcher_connector(

@@ -262,8 +262,14 @@ class TestValidateConfigStateOrphans(_ValidateConfigTestBase):
         result = self._validate(cfg)
         self.assertTrue(result.ok)  # orphans are warnings, not errors
         self.assertEqual(len(result.warnings), 1)
+        # Contract, not phrasing — the wording was rewritten to drop
+        # "static-era", which meant nothing to a reader who had not seen the
+        # old config format. What must survive: the watcher is named, the
+        # consequence is stated, and the migration doc is offered.
         self.assertIn("stale", result.warnings[0])
-        self.assertIn("static-era", result.warnings[0])
+        self.assertIn("older version", result.warnings[0])
+        self.assertIn("discard", result.warnings[0])
+        self.assertIn("migration-dynamic-watchers.md", result.warnings[0])
 
     def test_a_record_bound_to_a_removed_agent_is_reported(self):
         """Matrix sweep after Codex round 6: the runtime is fail-closed and
@@ -330,7 +336,9 @@ class TestValidateConfigStateOrphans(_ValidateConfigTestBase):
         self.assertEqual(len(result.warnings), 1)
         self.assertIn("sess-1", result.warnings[0])
         self.assertIn("claude:/the/old/workdir", result.warnings[0])
-        self.assertIn("abandon", result.warnings[0])
+        # Contract: says a new session will start. "abandon that session and
+        # mint a fresh one" was the old phrasing.
+        self.assertIn("begin a new one", result.warnings[0])
 
     def test_a_state_file_of_a_removed_connector_is_reported(self):
         """Codex round 4: a connector renamed or removed in config.yaml leaves

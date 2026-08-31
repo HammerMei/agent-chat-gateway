@@ -454,7 +454,12 @@ class TestCollectConfigOnTheFlyWatcherFields(_CollectConfigTestBase):
         self.assertEqual(config.agents, {})
         agent_issues = [i for i in issues if i.entity_kind == "agent"]
         self.assertEqual(len(agent_issues), 1, [i.message for i in issues])
-        self.assertIn("moved to the watcher rule", agent_issues[0].message)
+        # Contract, not phrasing: the message was reworded for plain language.
+        # What must survive is that it names the key, says where the setting
+        # lives now, and does so as an attributed agent issue.
+        msg = agent_issues[0].message
+        self.assertIn("session_idle_days", msg)
+        self.assertIn("'watchers:'", msg)
 
     def test_wildcard_room_is_a_collected_watcher_issue(self):
         config_path = self._write(f"""\

@@ -1715,7 +1715,7 @@ class TestAgentSessionLifecycleKeysAreRejected(unittest.TestCase):
                     GatewayConfig.from_file(path)
                 msg = str(ctx.exception)
                 self.assertIn(key, msg)
-                self.assertIn("moved to the watcher rule", msg)
+                self.assertIn("'watchers:'", msg)  # contract: says where it goes now
 
     def test_an_explicit_null_is_rejected_too(self):
         """`null` is not a way to keep the key: the field is gone, so writing it at
@@ -1723,7 +1723,7 @@ class TestAgentSessionLifecycleKeysAreRejected(unittest.TestCase):
         path = self._write_config("session_idle_days: null\n")
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(path)
-        self.assertIn("moved to the watcher rule", str(ctx.exception))
+        self.assertIn("'watchers:'", str(ctx.exception))
 
     def test_a_value_inherited_from_an_agent_template_is_rejected(self):
         """The check reads the already-merged entry, so a template cannot smuggle
@@ -1750,7 +1750,7 @@ class TestAgentSessionLifecycleKeysAreRejected(unittest.TestCase):
             path = f.name
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(path)
-        self.assertIn("moved to the watcher rule", str(ctx.exception))
+        self.assertIn("'watchers:'", str(ctx.exception))
 
     def test_collect_config_attributes_it_to_the_agent_and_keeps_going(self):
         """A second, healthy agent isolates the attribution from the pre-existing
@@ -1791,7 +1791,7 @@ class TestAgentSessionLifecycleKeysAreRejected(unittest.TestCase):
         the whole story: the "at least one agent" global issue follows it."""
         _, issues = collect_config(self._write_config("session_expire_days: 30\n"))
         self.assertEqual([i.entity_kind for i in issues], ["agent", "global"])
-        self.assertIn("moved to the watcher rule", issues[0].message)
+        self.assertIn("'watchers:'", issues[0].message)
 
 
 class TestWatcherTemplates(unittest.TestCase):
@@ -2345,19 +2345,24 @@ class TestStaticShapeIsAHardError(unittest.TestCase):
 
     def test_a_room_key_is_a_hard_error_naming_the_migration(self):
         msg = self._msg("- name: w1\n  room: general\n")
-        self.assertIn("static watcher shape", msg)
+        self.assertIn("old format", msg)
         self.assertIn("'w1'", msg, "the error names the entry")
         self.assertIn("docs/migration-dynamic-watchers.md", msg)
-        self.assertIn("not a 1:1 rename", msg,
-                      "the sharp edges are stated, not discovered")
         # This error is the upgrade's guaranteed touchpoint: anyone with
         # static records had static config, so they read this BEFORE the
         # first post-rewrite boot prunes those records (owner, 2026-08-17).
-        self.assertIn("RESETS every existing watcher session", msg)
+        # Those two decisions are pinned as MEANING, because the message was
+        # rewritten for plain language: "not a 1:1 rename" became "not a
+        # simple rename" and the shouted "RESETS every existing watcher
+        # session" became "every existing conversation is discarded".
+        self.assertIn("not a simple rename", msg,
+                      "the sharp edges are stated, not discovered")
+        self.assertIn("discarded", msg, "the reset must be stated up front")
+        self.assertIn("except_for", msg, "a paused room needs re-expressing")
 
     def test_a_rooms_list_is_the_same_hard_error(self):
         msg = self._msg("- rooms: [general, dev]\n")
-        self.assertIn("static watcher shape", msg)
+        self.assertIn("old format", msg)
 
     def test_a_nameless_entry_is_named_by_its_room(self):
         msg = self._msg("- room: ops\n")
@@ -2377,7 +2382,7 @@ class TestStaticShapeIsAHardError(unittest.TestCase):
             "- name: b\n  room: ops\n"
         )
         config, issues = collect_config(path)
-        static_issues = [i for i in issues if "static watcher shape" in i.message]
+        static_issues = [i for i in issues if "old format" in i.message]
         self.assertEqual(len(static_issues), 2)
         self.assertEqual([r.name for r in config.watcher_rules], ["ok"])
 

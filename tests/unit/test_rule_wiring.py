@@ -203,7 +203,8 @@ class TestShadowingIsReportedAsAWarning(unittest.TestCase):
         self.assertTrue(result.ok)
         warnings = [w for w in result.warnings if "eng-plus-dms" in w]
         self.assertEqual(len(warnings), 1, result.warnings)
-        self.assertIn("1:1 DM", warnings[0])
+        # Contract: names the DM kind in words a reader will recognise.
+        self.assertIn("one-to-one direct message", warnings[0])
 
     def test_no_warning_when_rules_do_not_overlap(self):
         result = validate_config(write_config("""\

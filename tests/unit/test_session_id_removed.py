@@ -72,7 +72,8 @@ class TestTheKeyIsRefusedNotIgnored(unittest.TestCase):
         with self.assertRaises(ValueError) as cm:
             GatewayConfig.from_file(write_config('- {name: w1, rooms: {include: [general]}, session_id: "x"}\n'))
         msg = str(cm.exception)
-        self.assertIn("summarise", msg)
+        # Contract, not phrasing: says to write state to a file and read it back.
+        self.assertIn("write a summary to a file", msg)
         self.assertIn("docs/user-guide.md", msg)
 
     def test_every_value_shape_is_refused_including_null(self):
@@ -135,7 +136,8 @@ class TestItCannotArriveByInheritance(unittest.TestCase):
                 extra="watcher_templates:\n  standard:\n    session_id: sticky\n",
             ))
         msg = str(cm.exception)
-        self.assertIn("summarise", msg)
+        # Contract, not phrasing: says to write state to a file and read it back.
+        self.assertIn("write a summary to a file", msg)
         self.assertIn("docs/user-guide.md", msg)
         self.assertNotIn("per-entry error", msg)
 
