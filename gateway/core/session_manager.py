@@ -66,7 +66,6 @@ class SessionManager:
         self,
         connector: Connector,
         agents: dict[str, AgentBackend],
-        default_agent: str,
         config: CoreConfig,
         state_name: str = "default",
         permission_registry: PermissionRegistry | None = None,
@@ -89,7 +88,6 @@ class SessionManager:
         self._lifecycle = WatcherLifecycle(
             connector=connector,
             agents=agents,
-            default_agent=default_agent,
             config=config,
             state_store=self._state_store,
             dispatcher=self._dispatcher,

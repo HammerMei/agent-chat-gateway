@@ -133,7 +133,6 @@ class TestSessionReuseRequiresMatchingIdentity(unittest.IsolatedAsyncioTestCase)
         lifecycle = WatcherLifecycle(
             connector=connector,
             agents={"claude": agent},
-            default_agent="claude",
             config=config,
             state_store=state_store,
             # `holder()` on a bare MagicMock answers with a truthy mock, which now

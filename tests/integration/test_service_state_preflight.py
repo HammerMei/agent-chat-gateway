@@ -65,6 +65,7 @@ class TestServiceStatePreflight(unittest.TestCase):
                 working_directory: {self.tmp}
             watcher_rules:
               - name: w1
+                agent: default
                 connector: {connector_name}
                 rooms:
                   include: [script]
@@ -245,6 +246,7 @@ class TestBackendSignaturePreflight(unittest.TestCase):
                 working_directory: {root}
             watcher_rules:
               - name: w1
+                agent: default
                 connector: script
                 rooms:
                   include: [script]

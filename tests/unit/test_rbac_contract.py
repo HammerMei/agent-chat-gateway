@@ -44,7 +44,7 @@ class _EnvAwareBackend(AgentBackend):
 
 def _make_processor(agent: AgentBackend) -> MessageProcessor:
     agent_cfg = AgentConfig(timeout=10)
-    config = CoreConfig(agents={"default": agent_cfg}, default_agent="default")
+    config = CoreConfig(agents={"default": agent_cfg})
     connector = MagicMock()
     connector.send_text = AsyncMock()
     connector.format_prompt_prefix = MagicMock(return_value="")

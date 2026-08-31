@@ -177,6 +177,7 @@ class TestCollectConfigNonStringScalarFields(_CollectConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
                 connector: [rc]
@@ -218,6 +219,7 @@ class TestCollectConfigNonStringScalarFields(_CollectConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [12345]
                 connector: rc
@@ -238,6 +240,7 @@ class TestCollectConfigNonStringScalarFields(_CollectConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
                 connector: rc
@@ -256,22 +259,6 @@ class TestCollectConfigNonStringScalarFields(_CollectConfigTestBase):
         # as an attributed issue rather than an exception that aborts the pass.
         self.assertIn("session_id", watcher_issues[0].message)
         self.assertIn("unknown key(s)", watcher_issues[0].message)
-
-    def test_non_string_default_agent_is_a_collected_issue(self):
-        config_path = self._write(f"""\
-            connectors:
-              - name: rc
-                type: rocketchat
-                server: {{url: "http://localhost:3000", username: bot, password: pw}}
-            agents:
-              default:
-                type: claude
-                working_directory: {self.agent_dir}
-            default_agent: [prod]
-        """)
-        config, issues = collect_config(config_path)
-        self.assertIsNotNone(config)
-        self.assertTrue(any("'default_agent' must be a string" in i.message for i in issues))
 
 
 class TestCollectConfigNonStringNameHint(_CollectConfigTestBase):
@@ -297,6 +284,7 @@ class TestCollectConfigNonStringNameHint(_CollectConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -321,6 +309,7 @@ class TestCollectConfigNonStringNameHint(_CollectConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: [a, b]
+                agent: default
                 connector: rc
         """)
         config, issues = collect_config(config_path)

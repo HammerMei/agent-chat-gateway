@@ -292,9 +292,8 @@ class TestListRowContents(IsolatedTestCase):
         manager = SessionManager(
             ScriptConnector(),
             {"default": MockAgentBackend()},
-            "default",
             CoreConfig(
-                agents={"default": AgentConfig(timeout=10)}, default_agent="default"
+                agents={"default": AgentConfig(timeout=10)}
             ),
             state_name="rc-home",
         )

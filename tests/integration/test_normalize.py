@@ -402,8 +402,8 @@ class TestAttachmentWarningPromptInjection(IsolatedTestCase):
         agent = MockAgent()
         from tests.helpers import make_rule
         agent_cfg = AgentConfig(timeout=10)
-        config = CoreConfig(agents={"default": agent_cfg}, default_agent="default")
-        manager = SessionManager(connector, {"default": agent}, "default", config,
+        config = CoreConfig(agents={"default": agent_cfg})
+        manager = SessionManager(connector, {"default": agent}, config,
                                  watcher_rules=[make_rule("script")])
         await manager.run_once()
 
@@ -464,8 +464,8 @@ class TestAttachmentWarningPromptInjection(IsolatedTestCase):
         agent = MockAgent()
         from tests.helpers import make_rule
         agent_cfg = AgentConfig(timeout=10)
-        config = CoreConfig(agents={"default": agent_cfg}, default_agent="default")
-        manager = SessionManager(connector, {"default": agent}, "default", config,
+        config = CoreConfig(agents={"default": agent_cfg})
+        manager = SessionManager(connector, {"default": agent}, config,
                                  watcher_rules=[make_rule("script")])
         await manager.run_once()
 
@@ -528,9 +528,9 @@ class TestAttachmentSymlink(IsolatedTestCase):
             agent = MockAgent()
             from tests.helpers import make_rule
             agent_cfg = AgentConfig(timeout=10, working_directory=tmpdir)
-            config = CoreConfig(agents={"default": agent_cfg}, default_agent="default")
+            config = CoreConfig(agents={"default": agent_cfg})
 
-            manager = SessionManager(connector, {"default": agent}, "default", config,
+            manager = SessionManager(connector, {"default": agent}, config,
                                      watcher_rules=[make_rule("script")])
             await manager.run_once()
 
@@ -591,11 +591,11 @@ class TestAttachmentSymlink(IsolatedTestCase):
 
             agent = MockAgent()
             agent_cfg = AgentConfig(timeout=10, working_directory=tmpdir)
-            config = CoreConfig(agents={"default": agent_cfg}, default_agent="default")
+            config = CoreConfig(agents={"default": agent_cfg})
 
             from tests.helpers import make_rule
 
-            manager = SessionManager(connector, {"default": agent}, "default", config,
+            manager = SessionManager(connector, {"default": agent}, config,
                                      watcher_rules=[make_rule("room-a"),
                                                     make_rule("room-b")])
             await manager.run_once()
@@ -660,10 +660,10 @@ class TestAttachmentSymlink(IsolatedTestCase):
 
             agent = MockAgent()
             agent_cfg = AgentConfig(timeout=10, working_directory=tmpdir)
-            config = CoreConfig(agents={"default": agent_cfg}, default_agent="default")
+            config = CoreConfig(agents={"default": agent_cfg})
 
             from tests.helpers import make_rule
-            manager = SessionManager(connector, {"default": agent}, "default", config,
+            manager = SessionManager(connector, {"default": agent}, config,
                                      watcher_rules=[make_rule("script")])
             await manager.run_once()
 
@@ -746,9 +746,9 @@ class TestAttachmentSymlink(IsolatedTestCase):
             agent = MockAgent()
             from tests.helpers import make_rule
             agent_cfg = AgentConfig(timeout=10, working_directory=tmpdir)
-            config = CoreConfig(agents={"default": agent_cfg}, default_agent="default")
+            config = CoreConfig(agents={"default": agent_cfg})
 
-            manager = SessionManager(connector, {"default": agent}, "default", config,
+            manager = SessionManager(connector, {"default": agent}, config,
                                      watcher_rules=[make_rule("script")])
             await manager.run_once()
 

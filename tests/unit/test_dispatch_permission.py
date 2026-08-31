@@ -518,11 +518,10 @@ def _make_manager_cr(connector, agent, watcher_rules=None, permission_registry=N
     from gateway.core.session_manager import SessionManager
 
     agent_cfg = AgentConfig(timeout=10)
-    config = CoreConfig(agents={"default": agent_cfg}, default_agent="default")
+    config = CoreConfig(agents={"default": agent_cfg})
     return SessionManager(
         connector,
         {"default": agent},
-        "default",
         config,
         # The name rules bind to: _make_rule_cr's rules say connector="script",
         # and the manager keys its matches on state_name.

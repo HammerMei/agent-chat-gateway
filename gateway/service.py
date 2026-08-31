@@ -310,7 +310,6 @@ class GatewayService:
             sm = SessionManager(
                 connector=connector,
                 agents=agents,
-                default_agent=config.default_agent,
                 config=core_config,
                 state_name=cc.name,
                 permission_registry=self._registry,

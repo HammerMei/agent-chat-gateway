@@ -75,7 +75,6 @@ def _make_runner(agent: AgentBackend) -> tuple[AgentTurnRunner, MagicMock]:
     connector.notify_agent_event = AsyncMock()
     config = CoreConfig(
         agents={"default": AgentConfig(timeout=10)},
-        default_agent="default",
     )
     runner = AgentTurnRunner(
         agent=agent,
@@ -234,7 +233,6 @@ class TestAgentTurnRunner(unittest.IsolatedAsyncioTestCase):
         connector.notify_agent_event = AsyncMock()
         config = CoreConfig(
             agents={"default": AgentConfig(timeout=10)},
-            default_agent="default",
         )
         runner = AgentTurnRunner(agent, connector, config, "default", "room")
 
@@ -574,7 +572,6 @@ class TestAgentTurnRunner(unittest.IsolatedAsyncioTestCase):
         connector.notify_agent_event = AsyncMock()
         config = CoreConfig(
             agents={"default": AgentConfig(timeout=10)},
-            default_agent="default",
         )
         runner = AgentTurnRunner(agent, connector, config, "default", "room")
 
@@ -613,7 +610,6 @@ class TestAgentTurnRunner(unittest.IsolatedAsyncioTestCase):
         connector.notify_agent_event = AsyncMock()
         config = CoreConfig(
             agents={"default": AgentConfig(timeout=10)},
-            default_agent="default",
         )
         runner = AgentTurnRunner(agent, connector, config, "default", "room")
 

@@ -200,12 +200,11 @@ class TestRoleHandling(IsolatedTestCase):
             guest_allowed_tools=["Read", "Grep"],
             timeout=10,
         )
-        config = CoreConfig(agents={"default": agent_cfg}, default_agent="default")
+        config = CoreConfig(agents={"default": agent_cfg})
 
         self.manager = SessionManager(
             self.connector,
             {"default": self.agent},
-            "default",
             config,
             watcher_rules=[make_rule()],
         )
@@ -1136,12 +1135,11 @@ class TestStartupRaceRollback(IsolatedTestCase):
         from gateway.core.session_maps import SessionMaps
 
         agent_cfg = AgentConfig(timeout=10)
-        config = CoreConfig(agents={"default": agent_cfg}, default_agent="default")
+        config = CoreConfig(agents={"default": agent_cfg})
         maps = SessionMaps()
         manager = SessionManager(
             connector,
             {"default": agent},
-            "default",
             config,
             watcher_rules=watcher_rules,
             session_maps=maps,
@@ -1312,10 +1310,12 @@ class TestDuplicateSessionIdValidation(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
                 session_id: shared-session-id
               - name: w2
+                agent: default
                 rooms:
                   include: [lobby]
                 session_id: shared-session-id
@@ -1355,10 +1355,12 @@ class TestDuplicateSessionIdValidation(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
                 session_id: session-aaa
               - name: w2
+                agent: default
                 rooms:
                   include: [lobby]
                 session_id: session-bbb
@@ -1396,9 +1398,11 @@ class TestDuplicateSessionIdValidation(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
               - name: w2
+                agent: default
                 rooms:
                   include: [lobby]
         """)

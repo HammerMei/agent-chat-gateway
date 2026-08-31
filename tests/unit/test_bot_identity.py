@@ -679,10 +679,12 @@ class TestStaticDmWatchersReachTheCheck(unittest.TestCase):
                 working_directory: {root}
             watcher_rules:
               - name: w1
+                agent: default
                 connector: mm-eng
                 rooms:
                   direct: true
               - name: w2
+                agent: default
                 connector: mm-sales
                 rooms:
 {second_rooms_block}

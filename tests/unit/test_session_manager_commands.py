@@ -343,7 +343,7 @@ class TestTheRouterWiring(unittest.IsolatedAsyncioTestCase):
         connector.trigger_history_bound = MagicMock(
             return_value="2026-08-16T10:00:00+00:00")
         return SessionManager(
-            connector, {"default": MagicMock()}, "default", make_core_config(),
+            connector, {"default": MagicMock()}, make_core_config(),
             state_name="rc", watcher_rules=rules,
         ), connector
 
@@ -480,11 +480,10 @@ def _make_manager_sm(connector, agent, watcher_configs=None):
     from gateway.core.session_manager import SessionManager
 
     agent_cfg = AgentConfig(timeout=10)
-    config = CoreConfig(agents={"default": agent_cfg}, default_agent="default")
+    config = CoreConfig(agents={"default": agent_cfg})
     return SessionManager(
         connector,
         {"default": agent},
-        "default",
         config,
     )
 

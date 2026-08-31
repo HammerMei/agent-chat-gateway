@@ -73,7 +73,7 @@ class TestTwoWatchersOneRoom(unittest.IsolatedAsyncioTestCase):
             agent = _RecordingAgent(root)
             agent_cfg = AgentConfig(timeout=10, working_directory=str(root))
             config = CoreConfig(
-                agents={"a1": agent_cfg, "a2": agent_cfg}, default_agent="a1"
+                agents={"a1": agent_cfg, "a2": agent_cfg}
             )
             # Two rules on one room cannot both fire (first-match precedence
             # decides at the rule layer, with a shadowing warning at load) —
@@ -123,7 +123,7 @@ class TestTwoWatchersOneRoom(unittest.IsolatedAsyncioTestCase):
             agent = _RecordingAgent(root)
             agent_cfg = AgentConfig(timeout=10, working_directory=str(root))
             config = CoreConfig(
-                agents={"a1": agent_cfg, "a2": agent_cfg}, default_agent="a1"
+                agents={"a1": agent_cfg, "a2": agent_cfg}
             )
             manager = SessionManager(
                 connector, {"a1": agent, "a2": agent}, "a1", config,
@@ -159,7 +159,7 @@ class TestTwoWatchersOneRoom(unittest.IsolatedAsyncioTestCase):
             connector = ScriptConnector()
             agent = _RecordingAgent(root)
             agent_cfg = AgentConfig(timeout=10, working_directory=str(root))
-            config = CoreConfig(agents={"a1": agent_cfg}, default_agent="a1")
+            config = CoreConfig(agents={"a1": agent_cfg})
             manager = SessionManager(
                 connector, {"a1": agent}, "a1", config,
             )

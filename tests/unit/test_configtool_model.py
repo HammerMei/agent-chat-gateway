@@ -46,6 +46,7 @@ class TestEditableConfigLoad(_EditableConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -76,6 +77,7 @@ class TestEditableConfigLoad(_EditableConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -114,6 +116,7 @@ class TestEditableConfigLoad(_EditableConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -145,6 +148,7 @@ class TestEditableConfigTemplates(_EditableConfigTestBase):
                 inherits: standard
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -168,6 +172,7 @@ class TestEditableConfigTemplates(_EditableConfigTestBase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -198,6 +203,7 @@ class TestEditableConfigTemplatesCaching(_EditableConfigTestBase):
                 inherits: standard
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -237,6 +243,7 @@ class TestEditableConfigTemplatesCaching(_EditableConfigTestBase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -276,6 +283,7 @@ class TestEditableConfigProvenance(_EditableConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: inherits-everything
                 rooms:
                   include: [general]
         """)
@@ -351,6 +359,7 @@ class TestEditableConfigValidatedView(_EditableConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -371,6 +380,7 @@ class TestEditableConfigValidatedView(_EditableConfigTestBase):
                 type: claude
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -392,6 +402,7 @@ class TestEditableConfigDirtyTracking(_EditableConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -448,6 +459,7 @@ class TestEditableConfigSave(_EditableConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """
@@ -673,6 +685,7 @@ class TestEditableConfigScopedSaveGate(_EditableConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: [a, b]
+                agent: default
                 connector: rc
         """)
         cfg = EditableConfig.load(path)
@@ -727,6 +740,7 @@ class TestStatusIndexNonStringEntityName(_EditableConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: [a, b]
+                agent: default
                 connector: rc
                 rooms:
                   include: [general]
@@ -756,12 +770,15 @@ class TestMoveWatcherRule(_EditableConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: first
+                agent: default
                 rooms:
                   include: [general]
               - name: second
+                agent: default
                 rooms:
                   include: [dev]
               - name: third
+                agent: default
                 rooms:
                   include: [ops]
         """)
@@ -838,9 +855,11 @@ class TestStatusIndexRuleBridge(_EditableConfigTestBase):
         with a shadowing warning must NOT display OK."""
         status = self._status_for(
             "              - name: broad\n"
+            "                agent: default\n"
             "                rooms:\n"
             "                  include: [\"*\"]\n"
             "              - name: shadowed\n"
+            "                agent: default\n"
             "                rooms:\n"
             "                  include: [general]\n",
             1,
@@ -869,6 +888,7 @@ class TestStatusIndexRuleBridge(_EditableConfigTestBase):
     def test_a_clean_rule_is_ok(self):
         status = self._status_for(
             "              - name: w1\n"
+            "                agent: default\n"
             "                rooms:\n"
             "                  include: [general]\n",
             0,
@@ -892,9 +912,11 @@ class TestStatusIndexStrippedNameSpelling(_EditableConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: broad
+                agent: default
                 rooms:
                   include: ["*"]
               - name: " shadowed "
+                agent: default
                 rooms:
                   include: [general]
         """)

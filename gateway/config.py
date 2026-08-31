@@ -105,7 +105,6 @@ TOP_LEVEL_KEYS: frozenset[str] = frozenset({
     "agents",
     "agent_templates",
     "tool_presets",
-    "default_agent",
     "watcher_rules",
     "watcher_templates",
     "max_queue_depth",
@@ -218,7 +217,6 @@ class SchedulerConfig:
 class GatewayConfig:
     connectors: list[ConnectorConfig]
     agents: dict[str, AgentConfig]
-    default_agent: str
     # The parsed `watcher_rules:` block. A rule names no room: it describes which
     # rooms an agent may be drawn into, and the watcher manager materializes one
     # watcher per room as rooms turn up.
@@ -232,22 +230,6 @@ class GatewayConfig:
     watcher_rules: list[WatcherRule] = field(default_factory=list)
     max_queue_depth: int = 100  # max pending messages per room queue; 0 = unbounded
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
-
-    @property
-    def agent(self) -> AgentConfig:
-        """Return the default agent config (convenience accessor).
-
-        Raises KeyError when default_agent is not present in agents — the config
-        loader validates this invariant at load time, so this should never trigger
-        in production.  Raising here is safer than silently falling back to the
-        first agent, which would mask misconfiguration.
-        """
-        if self.default_agent not in self.agents:
-            raise KeyError(
-                f"default_agent '{self.default_agent}' not found in agents: "
-                f"{list(self.agents)}"
-            )
-        return self.agents[self.default_agent]
 
     @staticmethod
     def from_file(path: str | Path) -> "GatewayConfig":
@@ -332,8 +314,6 @@ class GatewayConfig:
                 f"config.yaml 'agents:' must be a mapping (got {type(agents_raw).__name__}). "
                 f"Expected a dict of agent names to config blocks."
             )
-        default_agent = raw.get("default_agent", "")
-
         agent_templates = _parse_templates_block(raw, "agent_templates", TEMPLATE_FORBIDDEN_KEYS["agent"])
         tool_presets = _parse_tool_presets(raw)
 
@@ -346,23 +326,6 @@ class GatewayConfig:
         if not agents:
             raise ValueError(
                 "config.yaml must define at least one agent under 'agents:'"
-            )
-
-        if not default_agent:
-            default_agent = next(iter(agents))
-        elif not isinstance(default_agent, str):
-            # PR review finding: same class of bug as the per-entity 'name'/
-            # 'type'/'connector'/'agent' checks elsewhere in
-            # this module — a truthy-but-non-string top-level
-            # 'default_agent:' (e.g. a YAML list) reached
-            # `default_agent not in agents` (a dict) unchecked, crashing
-            # with an uncaught TypeError instead of a clean ValueError.
-            raise ValueError(
-                f"config.yaml 'default_agent' must be a string (got {type(default_agent).__name__})."
-            )
-        elif default_agent not in agents:
-            raise ValueError(
-                f"default_agent '{default_agent}' not found in agents: {list(agents)}"
             )
 
         # ── Watchers ──────────────────────────────────────────────────────────
@@ -413,7 +376,6 @@ class GatewayConfig:
                     connectors=connectors,
                     connector_names=connector_names,
                     agents=agents,
-                    default_agent=default_agent,
                     config_dir=config_dir,
                     templates=watcher_templates,
                     seen_rule_names=seen_rule_names,
@@ -437,7 +399,6 @@ class GatewayConfig:
         return GatewayConfig(
             connectors=connectors,
             agents=agents,
-            default_agent=default_agent,
             watcher_rules=watcher_rules,
             max_queue_depth=max_queue_depth,
             scheduler=scheduler_cfg,
@@ -1167,17 +1128,33 @@ def _resolve_watcher_connector(
     return watcher_connector or connectors[0].name
 
 
-def _validated_watcher_agent(
-    wc: Mapping, where: str, agents: dict, default_agent: str
-) -> str:
-    """Resolve a watcher entry's or rule's `agent:`, defaulting to `default_agent`.
+def _validated_watcher_agent(wc: Mapping, where: str, agents: dict) -> str:
+    """The rule's `agent:`, which it must state — there is no implicit default.
+
+    A rule used to fall back to the top-level `default_agent:`, which itself fell
+    back to whichever agent came first in the file. That is a silent binding
+    decided by document order, and the same objection the connector fallback's
+    own docstring raises above: the canonical multi-agent setup gives every agent
+    its own account, so guessing picks the wrong one without saying so.
+
+    Shared with a template: a rule may take `agent` from its `inherits:` block,
+    which is merged in before this runs — so "the rule must state it" means the
+    MERGED rule, and one shared template still expresses "these rules all use
+    this agent" without any implicit rule.
 
     Same shape as the connector check above and shared for the same reason: a
     truthy-but-non-string `agent` (e.g. a YAML list) reached `watcher_agent not in
     agents` — a dict — unchecked, crashing with an uncaught TypeError instead of
     the clean ValueError every caller expects.
     """
-    watcher_agent = wc.get("agent", default_agent)
+    if "agent" not in wc or wc.get("agent") is None:
+        raise ValueError(
+            f"{where}: 'agent' is required — name the agent this rule's rooms "
+            f"run on. Available: {', '.join(sorted(agents))}. "
+            f"To share one across rules, set it on a watcher template and give "
+            f"each rule 'inherits:'."
+        )
+    watcher_agent = wc["agent"]
     if not isinstance(watcher_agent, str):
         raise ValueError(
             f"{where}: 'agent' must be a string "
@@ -1382,7 +1359,6 @@ def _parse_one_watcher_rule(
     connectors: list[ConnectorConfig],
     connector_names: set[str],
     agents: dict,
-    default_agent: str,
     config_dir: Path,
     templates: dict,
     seen_rule_names: set[str],
@@ -1500,7 +1476,7 @@ def _parse_one_watcher_rule(
     resolved_connector = _resolve_watcher_connector(
         wc, where, connectors, connector_names
     )
-    watcher_agent = _validated_watcher_agent(wc, where, agents, default_agent)
+    watcher_agent = _validated_watcher_agent(wc, where, agents)
     _enforce_literal_rooms(matcher, where, rule_name, resolved_connector, connectors)
 
     idle_days = _parse_rule_ttl(wc, index, "session_idle_days")
@@ -1757,8 +1733,8 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
 
     Only the three per-entity for-loops (connectors/agents/watchers) get
     this fault-tolerant treatment. Every STRUCTURAL check — is `connectors:`
-    even a list, is there at least one agent, does `default_agent` resolve,
-    is `watchers:` a list, `tool_presets:`/`*_templates:` blocks themselves
+    even a list, is there at least one agent, is `watcher_rules:` a list,
+    `tool_presets:`/`*_templates:` blocks themselves
     well-formed, `max_queue_depth`/`scheduler:` shape — stays a hard,
     immediate stop: there's no meaningful "keep going with the other 9
     connectors" fallback when the document's basic shape is broken (e.g.
@@ -1774,12 +1750,11 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
     `connectors:` itself not a list, etc.) — nothing usable to build yet.
     Returns `(config, [])` when everything succeeds — identical to what
     `from_file()` would return. Every OTHER structural check (agents:
-    malformed, zero agents, `default_agent` invalid, watchers: malformed)
-    still returns as much of a partial `GatewayConfig` as had already parsed
-    successfully BEFORE that check — e.g. a broken `default_agent` still
-    returns every connector and agent that parsed fine (with no rules,
-    since expansion can't proceed safely without a valid default) rather
-    than discarding them too. This matters: `_check_connectors()` and
+    malformed, zero agents, `watcher_rules:` malformed) still returns as much
+    of a partial `GatewayConfig` as had already parsed successfully BEFORE
+    that check — e.g. a config with no usable connectors still returns every
+    agent that parsed fine (with no rules, since a rule cannot be resolved
+    without one) rather than discarding them too. This matters: `_check_connectors()` and
     friends (`gateway/config_validate.py`) run against whatever this
     returns, and an unrelated, already-successful entity's OWN problems
     must never be hidden behind a completely different structural issue
@@ -1897,12 +1872,11 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
         mqd, sched = _max_queue_depth_and_scheduler_or_defaults(raw, issues)
         return (
             GatewayConfig(
-                connectors=connectors, agents={}, default_agent="",
+                connectors=connectors, agents={},
                 max_queue_depth=mqd, scheduler=sched,
             ),
             issues,
         )
-    default_agent = raw.get("default_agent", "")
 
     try:
         agent_templates = _parse_templates_block(raw, "agent_templates", TEMPLATE_FORBIDDEN_KEYS["agent"])
@@ -1912,7 +1886,7 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
         mqd, sched = _max_queue_depth_and_scheduler_or_defaults(raw, issues)
         return (
             GatewayConfig(
-                connectors=connectors, agents={}, default_agent="",
+                connectors=connectors, agents={},
                 max_queue_depth=mqd, scheduler=sched,
             ),
             issues,
@@ -1941,61 +1915,12 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
         mqd, sched = _max_queue_depth_and_scheduler_or_defaults(raw, issues)
         return (
             GatewayConfig(
-                connectors=connectors, agents={}, default_agent="",
+                connectors=connectors, agents={},
                 max_queue_depth=mqd, scheduler=sched,
             ),
             issues,
         )
 
-    if not default_agent:
-        default_agent = next(iter(agents))
-    elif not isinstance(default_agent, str) or default_agent not in agents:
-        # PR review finding: this used to `return None, issues` here,
-        # discarding every connector/agent that DID parse successfully —
-        # meaning validate_config()'s _check_connectors()/_check_state_orphans()
-        # never ran on them, silently hiding a real, unrelated connector
-        # credential problem behind this equally-real but UNRELATED
-        # default_agent problem (and, via EditableConfig.save()'s before/
-        # after comparison, that hidden problem could then reappear later
-        # and be misclassified as "a new problem this save introduced").
-        # Watcher expansion genuinely can't proceed safely without a valid
-        # default_agent to fall back an entry's implicit `agent:` field to,
-        # so watchers are skipped (empty) — but every connector/agent that
-        # DID parse is still returned, so their own checks keep running.
-        #
-        # PR review finding (round 6): a truthy-but-non-string
-        # default_agent (e.g. a YAML list) reached `default_agent not in
-        # agents` (a dict) unchecked, crashing with an uncaught TypeError
-        # instead of a clean, collected ConfigIssue — same class of bug as
-        # the per-entity 'name'/'type'/'connector'/'agent' checks elsewhere
-        # in this module, folded into the same branch here rather than
-        # duplicating the partial-config return a third time.
-        if not isinstance(default_agent, str):
-            issues.append(
-                ConfigIssue(
-                    "global", None,
-                    f"config.yaml 'default_agent' must be a string "
-                    f"(got {type(default_agent).__name__}).",
-                )
-            )
-        else:
-            issues.append(
-                ConfigIssue(
-                    "global", None,
-                    f"default_agent '{default_agent}' not found in agents: {list(agents)}",
-                )
-            )
-        mqd, sched = _max_queue_depth_and_scheduler_or_defaults(raw, issues)
-        return (
-            GatewayConfig(
-                connectors=connectors,
-                agents=agents,
-                default_agent=next(iter(agents)),
-                max_queue_depth=mqd,
-                scheduler=sched,
-            ),
-            issues,
-        )
 
     # ── Watchers ──────────────────────────────────────────────────────────
     connector_names = {c.name for c in connectors}
@@ -2003,10 +1928,10 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
         # Every connector independently failed — from_file() could never
         # reach this point (an earlier raise would have stopped it first),
         # but collect_config() can legitimately get here. Nothing to
-        # meaningfully resolve an implicit `connector:` against, so watchers
-        # are skipped (empty) — but see the default_agent branch above for
-        # why every AGENT that DID parse must still be returned rather than
-        # discarded wholesale.
+        # meaningfully resolve an implicit `connector:` against, so rules
+        # are skipped (empty) — every AGENT that DID parse is still returned
+        # rather than discarded wholesale, so its own checks keep running
+        # against an unrelated, already-successful entity.
         issues.append(
             ConfigIssue(
                 "global", None,
@@ -2018,8 +1943,7 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
             GatewayConfig(
                 connectors=[],
                 agents=agents,
-                default_agent=default_agent,
-                max_queue_depth=mqd,
+                    max_queue_depth=mqd,
                 scheduler=sched,
             ),
             issues,
@@ -2046,7 +1970,7 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
         mqd, sched = _max_queue_depth_and_scheduler_or_defaults(raw, issues)
         return (
             GatewayConfig(
-                connectors=connectors, agents=agents, default_agent=default_agent,
+                connectors=connectors, agents=agents,
                 max_queue_depth=mqd, scheduler=sched,
             ),
             issues,
@@ -2061,7 +1985,7 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
         mqd, sched = _max_queue_depth_and_scheduler_or_defaults(raw, issues)
         return (
             GatewayConfig(
-                connectors=connectors, agents=agents, default_agent=default_agent,
+                connectors=connectors, agents=agents,
                 max_queue_depth=mqd, scheduler=sched,
             ),
             issues,
@@ -2092,7 +2016,6 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
                     connectors=connectors,
                     connector_names=connector_names,
                     agents=agents,
-                    default_agent=default_agent,
                     config_dir=config_dir,
                     templates=watcher_templates,
                     seen_rule_names=seen_rule_names,
@@ -2117,7 +2040,6 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
     config = GatewayConfig(
         connectors=connectors,
         agents=agents,
-        default_agent=default_agent,
         watcher_rules=watcher_rules,
         max_queue_depth=max_queue_depth,
         scheduler=scheduler_cfg,

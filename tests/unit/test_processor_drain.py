@@ -50,7 +50,6 @@ class _SlowAgent(AgentBackend):
 def _make_processor(agent: AgentBackend) -> MessageProcessor:
     config = CoreConfig(
         agents={"default": AgentConfig(timeout=10)},
-        default_agent="default",
     )
     connector = MagicMock()
     connector.send_text = AsyncMock()
@@ -73,7 +72,6 @@ def _make_processor_with_prompt_file(
 ) -> MessageProcessor:
     config = CoreConfig(
         agents={"default": AgentConfig(timeout=10)},
-        default_agent="default",
     )
     connector = MagicMock()
     connector.send_text = AsyncMock()
@@ -212,7 +210,6 @@ class TestGracefulDrain(unittest.IsolatedAsyncioTestCase):
         agent = _SlowAgent(delay=0.01)
         config = CoreConfig(
             agents={"default": AgentConfig(timeout=10)},
-            default_agent="default",
             max_queue_depth=2,  # small queue
         )
         connector = MagicMock()
@@ -326,7 +323,6 @@ class TestEnsureContextInjectedRetryOnMessage(unittest.IsolatedAsyncioTestCase):
     def _make_processor_with_injector(self, agent, injector, ws, wc):
         config = CoreConfig(
             agents={"default": AgentConfig(timeout=10)},
-            default_agent="default",
         )
         connector = MagicMock()
         connector.send_text = AsyncMock()
@@ -354,7 +350,7 @@ class TestEnsureContextInjectedRetryOnMessage(unittest.IsolatedAsyncioTestCase):
         from gateway.core.state import WatcherState
 
         injector = InjectedContextBuilder(
-            CoreConfig(agents={"default": AgentConfig(timeout=10)}, default_agent="default")
+            CoreConfig(agents={"default": AgentConfig(timeout=10)})
         )
         ws = WatcherState(
             watcher_name="w1", session_id="ses_retry", room_id="room_1",
@@ -413,7 +409,7 @@ class TestEnsureContextInjectedRetryOnMessage(unittest.IsolatedAsyncioTestCase):
         from gateway.core.state import WatcherState
 
         injector = InjectedContextBuilder(
-            CoreConfig(agents={"default": AgentConfig(timeout=10)}, default_agent="default")
+            CoreConfig(agents={"default": AgentConfig(timeout=10)})
         )
         ws = WatcherState(
             watcher_name="w1", session_id="ses_degraded", room_id="room_1",
@@ -475,7 +471,7 @@ class TestProcessorStoppingFlag(_IsolatedTestCase3):
 
     def _make_processor(self, connector, agent):
         agent_cfg = AgentConfig(timeout=10)
-        config = CoreConfig(agents={"default": agent_cfg}, default_agent="default")
+        config = CoreConfig(agents={"default": agent_cfg})
         room = Room(id="room-1", name="general", type="channel")
         return MessageProcessor(
             session_id="test-session",

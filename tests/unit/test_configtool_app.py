@@ -191,6 +191,7 @@ class TestOverviewRender:
                 working_directory: {work_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 room: general
         """)
         app = ConfigToolApp(config_path)
@@ -222,6 +223,7 @@ class TestOverviewRender:
                 working_directory: {work_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 room: general
         """)
         app = ConfigToolApp(config_path)
@@ -273,6 +275,7 @@ class TestOverviewRender:
                 working_directory: {work_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 room: general
         """)
         app = ConfigToolApp(config_path)
@@ -317,6 +320,7 @@ class TestOverviewRender:
                 timeout: 360
             watcher_rules:
               - name: w1
+                agent: default
                 room: general
         """)
         app_no_lint = ConfigToolApp(config_path, lint=False)

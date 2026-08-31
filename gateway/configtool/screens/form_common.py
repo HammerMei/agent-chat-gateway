@@ -301,26 +301,25 @@ def find_referencing_watcher_labels(
     so a rule whose `connector:`/`agent:` comes only from a template still
     blocks that connector/agent's deletion.
 
-    A rule with NO connector/agent anywhere references the loader's
-    FALLBACK entity (the first connector in document order;
-    `default_agent:` when set, the first agent otherwise) and blocks THAT
-    entity's deletion. Codex review of #129: an earlier version skipped
-    fallback rules on the theory that save()'s validation backstops the
-    deletion — but deleting the fallback entity leaves the config VALID
-    (the fallback silently rebinds to the next entity in line), so nothing
-    blocked and routing changed without a word. Silent rebinding is the
-    exact defect class `_resolve_watcher_connector`'s own docstring calls
-    worse than a crash.
+    A rule with no `connector:` anywhere references the loader's FALLBACK
+    connector (the first in document order) and blocks THAT connector's
+    deletion. Codex review of #129: an earlier version skipped fallback rules
+    on the theory that save()'s validation backstops the deletion — but
+    deleting the fallback entity leaves the config VALID (the fallback silently
+    rebinds to the next entity in line), so nothing blocked and routing changed
+    without a word. Silent rebinding is the exact defect class
+    `_resolve_watcher_connector`'s own docstring calls worse than a crash.
+
+    There is no equivalent for `agent:`, because there is no agent fallback any
+    more — a rule states its agent or inherits one, and one that does neither is
+    a load error. So a rule with no agent anywhere blocks no agent's deletion:
+    it already fails on its own, loudly, which is the outcome the connector
+    paragraph above had to engineer.
     """
     fallback_connector = (
         cfg.connectors_raw[0].get("name") if cfg.connectors_raw else None
     )
-    raw_default = cfg.document.get("default_agent")
-    fallback_agent = (
-        raw_default
-        if isinstance(raw_default, str) and raw_default in cfg.agents_raw
-        else next(iter(cfg.agents_raw), None)
-    )
+    fallback_agent = None
     labels = []
     # The UNFILTERED document list, not `watchers_raw` — the `watchers[i]`
     # fallback label must use the same index space as every other consumer

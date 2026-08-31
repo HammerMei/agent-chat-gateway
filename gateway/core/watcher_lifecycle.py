@@ -83,7 +83,6 @@ class WatcherLifecycle:
         self,
         connector: Connector,
         agents: dict[str, AgentBackend],
-        default_agent: str,
         config: CoreConfig,
         state_store: StateStore,
         dispatcher: MessageDispatcher,
@@ -93,7 +92,6 @@ class WatcherLifecycle:
     ) -> None:
         self._connector = connector
         self._agents = agents
-        self._default_agent = default_agent
         self._config = config
         self._state_store = state_store
         self._dispatcher = dispatcher
@@ -1226,7 +1224,7 @@ class WatcherLifecycle:
             raise RuntimeError(
                 f"Watcher '{wc.name}' is bound to agent '{wc.agent}', which "
                 f"no longer exists in config — refusing to substitute "
-                f"'{self._default_agent}'. Restore the agent, or expire the "
+                f"another. Restore the agent, or expire the "
                 f"watcher to re-create it under the current rules."
             )
         self._ensure_agent_available(wc)
@@ -1812,15 +1810,26 @@ class WatcherLifecycle:
             )
 
     def _resolve_agent_name(self, name: str | None) -> str:
+        """The agent a watcher runs on. There is nothing to substitute.
+
+        This used to fall back to a top-level `default_agent:`, which itself fell
+        back to whichever agent came first in the file. Both are gone: a rule
+        must state its `agent:` (or inherit one), so `name` is always a concrete
+        agent by the time a watcher exists, and a record's frozen `agent` is
+        written from that same resolved value (`creation_provenance`).
+
+        An empty or unknown name therefore means the config and the record
+        disagree, which the caller above already refuses loudly for a NAMED
+        agent (sticky binding, §2.4). Refusing here too keeps the empty case
+        from being the one path that still guesses."""
         if name and name in self._agents:
             return name
-        if name and name not in self._agents:
-            logger.warning(
-                "Agent '%s' not found in config, using default '%s'",
-                name,
-                self._default_agent,
-            )
-        return self._default_agent
+        raise RuntimeError(
+            f"Cannot resolve agent {name!r} — it is not in this config's agents "
+            f"({', '.join(sorted(self._agents))}). A watcher's agent comes from "
+            f"its rule or its own frozen record; there is no default to fall "
+            f"back to."
+        )
 
     # Attachment symlink management has been extracted to
     # gateway.core.attachment_workspace.AttachmentWorkspace.

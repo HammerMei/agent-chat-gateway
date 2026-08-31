@@ -221,11 +221,10 @@ def make_rule_derived_record(
     return WatcherState(**defaults)
 
 
-def make_core_config(timeout: int = 10, agents=None, default_agent="default", **kw):
+def make_core_config(timeout: int = 10, agents=None, **kw):
     """A `CoreConfig` with one agent, which is what most tests need."""
     return CoreConfig(
-        agents=agents or {default_agent: AgentConfig(timeout=timeout)},
-        default_agent=default_agent,
+        agents=agents or {"default": AgentConfig(timeout=timeout)},
         **kw,
     )
 
@@ -238,7 +237,10 @@ def make_manager(
     permission_registry=None,
     state_name: str = "default",
     agents=None,
-    default_agent: str = "default",
+    # The name the single default agent is registered under. Not a
+    # `default_agent:` fallback — that config key is gone; this only decides the
+    # key in the `agents` dict a rule would have to name explicitly.
+    agent_name: str = "default",
     config=None,
     **kw,
 ) -> SessionManager:
@@ -253,9 +255,8 @@ def make_manager(
     agent = MockAgentBackend() if agent is None else agent
     return SessionManager(
         connector,
-        agents or {default_agent: agent},
-        default_agent,
-        config or make_core_config(timeout=timeout, default_agent=default_agent),
+        agents or {agent_name: agent},
+        config or make_core_config(timeout=timeout),
         state_name=state_name,
         permission_registry=permission_registry,
         **kw,
@@ -368,7 +369,6 @@ def make_lifecycle(**overrides):
     defaults = {
         "connector": MagicMock(),
         "agents": {},
-        "default_agent": "default",
         "config": make_core_config(),
         # `load()` must return a real empty mapping, not a MagicMock. A bare
         # mock's `.get(name)` is truthy, so `sync_watchers` reads every watcher

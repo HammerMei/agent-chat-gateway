@@ -49,6 +49,7 @@ class TestValidateConfigBasics(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -74,6 +75,7 @@ class TestValidateConfigBasics(_ValidateConfigTestBase):
                 type: claude
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -95,6 +97,7 @@ class TestValidateConfigConnectorChecks(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -119,6 +122,7 @@ class TestValidateConfigConnectorChecks(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -138,6 +142,7 @@ class TestValidateConfigConnectorChecks(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -159,6 +164,7 @@ class TestValidateConfigConnectorChecks(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -182,6 +188,7 @@ class TestValidateConfigConnectorChecks(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -202,6 +209,7 @@ class TestValidateConfigConnectorChecks(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -222,6 +230,7 @@ class TestValidateConfigConnectorChecks(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -242,6 +251,7 @@ class TestValidateConfigStateOrphans(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -286,6 +296,7 @@ class TestValidateConfigStateOrphans(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -319,6 +330,7 @@ class TestValidateConfigStateOrphans(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -358,6 +370,7 @@ class TestValidateConfigStateOrphans(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -389,6 +402,7 @@ class TestValidateConfigStateOrphans(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -420,6 +434,7 @@ class TestValidateConfigStateOrphans(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -459,6 +474,7 @@ class TestValidateConfigStateOrphans(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -486,6 +502,7 @@ class TestValidateConfigStateOrphans(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -506,6 +523,7 @@ class TestValidateConfigStateOrphans(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -527,6 +545,7 @@ class TestValidateConfigLint(_ValidateConfigTestBase):
                 timeout: 360
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -546,6 +565,7 @@ class TestValidateConfigLint(_ValidateConfigTestBase):
                 timeout: 360
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -571,6 +591,7 @@ class TestValidateConfigLint(_ValidateConfigTestBase):
                 timeout: 500
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -599,6 +620,7 @@ class TestValidateConfigLint(_ValidateConfigTestBase):
                 timeout: 999
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -622,6 +644,7 @@ class TestValidateConfigLint(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -646,6 +669,7 @@ class TestValidateConfigLint(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
                 description: "General channel"
@@ -675,6 +699,7 @@ class TestValidateConfigLint(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -725,6 +750,7 @@ class TestValidateConfigLint(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: [a, b]
+                agent: default
                 connector: rc
                 rooms:
                   include: [general]
@@ -799,6 +825,7 @@ class TestFindingsExtension(_ValidateConfigTestBase):
                 type: claude
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -893,6 +920,7 @@ class TestFindingsExtension(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -915,6 +943,7 @@ class TestFindingsExtension(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -938,6 +967,7 @@ class TestFindingsExtension(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -972,6 +1002,7 @@ class TestFindingsExtension(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -1005,6 +1036,7 @@ class TestFindingsExtension(_ValidateConfigTestBase):
                 timeout: 360
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -1029,6 +1061,7 @@ class TestFindingsExtension(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -1053,6 +1086,7 @@ class TestFindingsExtension(_ValidateConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)

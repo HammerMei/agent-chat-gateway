@@ -41,14 +41,16 @@ BASE = """\
       claude:
         type: claude
         working_directory: /tmp
-    default_agent: claude
 """
 
 
 def write_config(template_rooms: str | None, rules: str) -> str:
     """A config whose one template carries `rooms: <template_rooms>`."""
     body = textwrap.dedent(BASE)
-    body += "watcher_templates:\n  channels:\n    connector: rc-main\n"
+    # The template carries `agent`, which is now the ONLY way several rules can
+    # share one: a rule states its agent or inherits it, with no implicit
+    # `default_agent:` fallback left to pick one by document order.
+    body += "watcher_templates:\n  channels:\n    connector: rc-main\n    agent: claude\n"
     if template_rooms is not None:
         body += f"    rooms: {template_rooms}\n"
     body += "watcher_rules:\n" + textwrap.indent(textwrap.dedent(rules), "  ")
@@ -199,7 +201,10 @@ class TestASharedDmOptInStarvesEveryRuleButTheFirst(unittest.TestCase):
         does not pick up an `except_for` it has no `include` to subtract from."""
         rules = (
             textwrap.dedent(self.TWO_RULES)
-            + "- {name: dms, connector: rc-main, rooms: {direct: true}}\n"
+            # Its own `agent:`, because it inherits nothing — the price of
+            # staying out of the template, and cheaper than the DM starvation
+            # inheriting it would cause.
+            + "- {name: dms, connector: rc-main, agent: claude, rooms: {direct: true}}\n"
         )
         result = validate_config(write_config("{except_for: ['*-secret']}", rules))
         self.assertTrue(result.ok, result.errors)

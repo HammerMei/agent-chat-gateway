@@ -45,13 +45,15 @@ AGENTS = {"a1": AgentConfig(name="a1"), "a2": AgentConfig(name="a2")}
 
 
 def parse(entry, *, connectors, index=0):
+    # `agent` is required on every rule now, and none of these cases are about
+    # it — supplied here so each entry below stays about the room matcher.
+    entry = {"agent": "a1", **entry}
     return _parse_one_watcher_rule(
         entry,
         index,
         connectors=connectors,
         connector_names={c.name for c in connectors},
         agents=AGENTS,
-        default_agent="a1",
         config_dir=Path("/tmp"),
         templates={},
         seen_rule_names=set(),
@@ -295,7 +297,6 @@ class TestWhatMustKeepWorking(unittest.TestCase):
                 connectors=connectors,
                 connector_names={"voice"},
                 agents=AGENTS,
-                default_agent="a1",
                 config_dir=Path("/tmp"),
                 templates={},
                 seen_rule_names=seen,
@@ -323,6 +324,7 @@ class TestWhatMustKeepWorking(unittest.TestCase):
         what materializes it at boot."""
         cfg = GatewayConfig.from_file(_write_config("""\
             - name: hotline
+              agent: default
               connector: voice
               rooms: {include: [hotline]}
             """))
@@ -333,9 +335,11 @@ def _write_config(watchers_block: str) -> str:
     body = textwrap.dedent("""\
         connectors:
           - name: voice
+            agent: default
             type: voice
             server: {port: 8099}
           - name: mm
+            agent: default
             type: mattermost
             server: {url: http://localhost:8065, token: t, team: lab}
         agents:
@@ -354,6 +358,7 @@ class TestThroughBothLoaders(unittest.TestCase):
 
     BAD = """\
     - name: everything
+      agent: default
       connector: voice
       rooms: {include: ["*"]}
     """
@@ -368,9 +373,11 @@ class TestThroughBothLoaders(unittest.TestCase):
     def test_collect_config_attributes_it_and_keeps_going(self):
         cfg, issues = collect_config(_write_config("""\
             - name: everything
+              agent: default
               connector: voice
               rooms: {include: ["*"]}
             - name: fine
+              agent: default
               connector: mm
               rooms: {include: ["eng-*"]}
             """))
@@ -382,6 +389,7 @@ class TestThroughBothLoaders(unittest.TestCase):
     def test_a_literal_voice_rule_loads_through_from_file(self):
         cfg = GatewayConfig.from_file(_write_config("""\
             - name: hotline
+              agent: default
               connector: voice
               rooms: {include: [hotline]}
             """))

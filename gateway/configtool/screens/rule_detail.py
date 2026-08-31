@@ -315,26 +315,24 @@ class RuleDetailScreen(FormScreen):
         return "watcher"
 
     def _dataclass_defaults(self) -> dict[str, object]:
-        # connector/agent mirror gateway/config.py's own fallback: first
-        # connector in document order; the explicit top-level
-        # `default_agent:` when set and valid, first agent otherwise (Codex
-        # review of #129: `next(iter(agents))` alone preselected the FIRST
-        # agent even when `default_agent:` named another — and create mode
-        # force-writes the selection explicitly, so an untouched Agent field
-        # silently bound the new rule to the wrong backend). name has no
-        # default: None (blank) is the honest answer for a required
-        # identity field.
+        # `connector` mirrors gateway/config.py's own remaining fallback: the
+        # first connector in document order.
+        #
+        # `agent` has NO fallback to mirror any more — a rule states its agent
+        # or inherits one, and the top-level `default_agent:` is gone. The
+        # preselection is still the first agent, because a Select cannot render
+        # blank, but it is now a PRESELECTION rather than a claim about what an
+        # untouched field would evaluate to: create mode writes the selection
+        # explicitly, which is what stops it binding silently.
+        #
+        # `name` has no default: None (blank) is the honest answer for a
+        # required identity field.
         defaults: dict[str, object] = dict(WATCHER_TEMPLATE_DATACLASS_DEFAULTS)
         defaults["name"] = None
         defaults["connector"] = (
             self.cfg.connectors_raw[0].get("name", "") if self.cfg.connectors_raw else ""
         )
-        raw_default = self.cfg.document.get("default_agent")
-        defaults["agent"] = (
-            raw_default
-            if isinstance(raw_default, str) and raw_default in self.cfg.agents_raw
-            else next(iter(self.cfg.agents_raw), "")
-        )
+        defaults["agent"] = next(iter(self.cfg.agents_raw), "")
         defaults["rooms.include"] = []
         defaults["rooms.except_for"] = []
         defaults["rooms.direct"] = False

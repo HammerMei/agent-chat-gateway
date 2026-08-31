@@ -229,19 +229,22 @@ class CoreConfig:
     """Platform-agnostic gateway configuration consumed by SessionManager and MessageProcessor."""
 
     agents: dict[str, AgentConfig] = field(default_factory=dict)
-    default_agent: str = ""
     connector_configs: dict[str, ConnectorConfig] = field(default_factory=dict)
     max_queue_depth: int = 100  # max pending messages per room; 0 = unbounded (not recommended)
 
     def agent_config(self, name: str) -> AgentConfig:
-        """Return the AgentConfig for the given agent name, falling back to default."""
+        """The AgentConfig for `name`, or an empty one if there is no such agent.
+
+        No longer falls back to a `default_agent` or to "whichever agent came
+        first": a rule must state its agent, so every caller passes a name that
+        was resolved against this same dict. An empty `AgentConfig()` is kept as
+        the answer for an unknown name rather than a raise, because the callers
+        here read single fields off it (`timeout`, `working_directory`) on paths
+        where the loud refusal already happened upstream — `WatcherLifecycle`
+        raises before it gets this far.
+        """
         if name and name in self.agents:
             return self.agents[name]
-        if self.default_agent and self.default_agent in self.agents:
-            return self.agents[self.default_agent]
-        # Last resort: return first available config
-        if self.agents:
-            return next(iter(self.agents.values()))
         return AgentConfig()
 
     def env_for_role(self, role: UserRole, agent_name: str = "") -> dict[str, str]:
@@ -320,7 +323,6 @@ class CoreConfig:
         """Derive a CoreConfig from a GatewayConfig (transition helper)."""
         return cls(
             agents=cfg.agents,
-            default_agent=cfg.default_agent,
             connector_configs={c.name: c for c in cfg.connectors},
             max_queue_depth=cfg.max_queue_depth,
         )

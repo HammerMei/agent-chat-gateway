@@ -37,7 +37,6 @@ def parse(entry, *, index=0, templates=None, seen=None) -> WatcherRule:
         connectors=CONNECTORS,
         connector_names=CONNECTOR_NAMES,
         agents=AGENTS,
-        default_agent="claude-eng",
         config_dir=Path("/tmp"),
         templates=templates or {},
         seen_rule_names=seen if seen is not None else set(),
@@ -58,7 +57,8 @@ def rule(name="r", connector="mm-home", **rooms) -> WatcherRule:
     )
 
 
-MINIMAL = {"name": "eng", "connector": "mm-home", "rooms": {"include": ["eng-*"]}}
+MINIMAL = {"name": "eng", "connector": "mm-home", "agent": "claude-eng",
+           "rooms": {"include": ["eng-*"]}}
 
 
 
@@ -144,14 +144,15 @@ class TestParserHappyPath(unittest.TestCase):
         self.assertEqual(parse({**MINIMAL, "name": "  eng  "}).name, "eng")
 
     def test_connector_defaults_to_the_first(self):
-        entry = {"name": "eng", "rooms": {"include": ["eng-*"]}}
+        entry = {"name": "eng", "agent": "claude-eng", "rooms": {"include": ["eng-*"]}}
         self.assertEqual(parse(entry).connector, "mm-home")
 
     def test_explicit_agent(self):
         self.assertEqual(parse({**MINIMAL, "agent": "claude-ops"}).agent, "claude-ops")
 
     def test_dm_only_rule_needs_no_include(self):
-        r = parse({"name": "dms", "connector": "mm-home", "rooms": {"direct": True}})
+        r = parse({"name": "dms", "connector": "mm-home", "agent": "claude-eng",
+                   "rooms": {"direct": True}})
         self.assertIs(r.match("", RoomKind.DM), RuleMatch.CLAIMED)
 
     def test_ttls_are_read_and_live_on_the_rule(self):
@@ -184,8 +185,12 @@ class TestParserHappyPath(unittest.TestCase):
                 self.assertIn("unknown key", str(cm.exception))
 
     def test_inherits_supplies_shared_fields(self):
+        """A template is how several rules share one agent — the only way, now
+        that the implicit `default_agent:` fallback is gone. The entry omits
+        `agent` entirely, which would be a hard error without the template."""
+        entry = {k: v for k, v in MINIMAL.items() if k != "agent"}
         templates = {"base": {"agent": "claude-ops", "session_idle_days": 3}}
-        r = parse({**MINIMAL, "inherits": "base"}, templates=templates)
+        r = parse({**entry, "inherits": "base"}, templates=templates)
         self.assertEqual(r.agent, "claude-ops")
         self.assertEqual(r.session_idle_days, 3)
 
@@ -560,15 +565,18 @@ class TestTheDenyIdiom(unittest.TestCase):
     contradiction someone should "fix"."""
 
     def test_the_same_pattern_in_both_lists_is_accepted(self):
-        r = parse({"name": "block", "rooms": {"include": ["eng-old"], "except_for": ["eng-old"]}})
+        r = parse({"name": "block", "agent": "claude-eng",
+                   "rooms": {"include": ["eng-old"], "except_for": ["eng-old"]}})
         self.assertIs(r.match("eng-old", RoomKind.CHANNEL), RuleMatch.DECLINED)
 
     def test_it_blocks_later_rules_which_a_plain_omission_would_not(self):
         blocker = parse(
-            {"name": "block", "rooms": {"include": ["eng-old"], "except_for": ["eng-old"]}},
+            {"name": "block", "agent": "claude-eng",
+             "rooms": {"include": ["eng-old"], "except_for": ["eng-old"]}},
             seen=set(),
         )
-        catchall = parse({"name": "all", "rooms": {"include": ["eng-*"]}}, seen=set())
+        catchall = parse({"name": "all", "agent": "claude-eng",
+                          "rooms": {"include": ["eng-*"]}}, seen=set())
 
         def route(room: str) -> str:
             for rule_ in (blocker, catchall):
@@ -581,7 +589,8 @@ class TestTheDenyIdiom(unittest.TestCase):
         self.assertEqual(route("eng-new"), "all:CLAIMED")
 
     def test_a_broader_deny_pattern_works_the_same_way(self):
-        r = parse({"name": "block", "rooms": {"include": ["tmp-*"], "except_for": ["tmp-*"]}})
+        r = parse({"name": "block", "agent": "claude-eng",
+                   "rooms": {"include": ["tmp-*"], "except_for": ["tmp-*"]}})
         self.assertIs(r.match("tmp-anything", RoomKind.CHANNEL), RuleMatch.DECLINED)
 
 
@@ -815,7 +824,7 @@ class TestOmittedTtlsGetTheDefaults(unittest.TestCase):
         return GatewayConfig.from_file(f.name).watcher_rules[0]
 
     def test_omitted_ttls_are_15_15(self):
-        rule = self._load("- name: w1\n  rooms: {include: [general]}\n")
+        rule = self._load("- name: w1\n  agent: default\n  rooms: {include: [general]}\n")
         self.assertEqual(rule.session_idle_days, 15)
         self.assertEqual(rule.session_expire_days, 15)
         # And the frozen snapshot — what the runtime actually judges against —
@@ -828,7 +837,7 @@ class TestOmittedTtlsGetTheDefaults(unittest.TestCase):
 
     def test_explicit_ttls_still_win(self):
         rule = self._load(
-            "- name: w1\n  rooms: {include: [general]}\n"
+            "- name: w1\n  agent: default\n  rooms: {include: [general]}\n"
             "  session_idle_days: 3\n  session_expire_days: 40\n")
         self.assertEqual(rule.session_idle_days, 3)
         self.assertEqual(rule.session_expire_days, 40)

@@ -380,7 +380,6 @@ class TestHistoryHandoffSentSeparatelyFromHeader(unittest.IsolatedAsyncioTestCas
         lifecycle = WatcherLifecycle(
             connector=connector,
             agents={"claude": agent},
-            default_agent="claude",
             config=config,
             state_store=state_store,
             dispatcher=dispatcher,
@@ -484,7 +483,6 @@ class TestWatcherLifecycleHistoryHandoff(unittest.IsolatedAsyncioTestCase):
         lifecycle = WatcherLifecycle(
             connector=connector,
             agents={"claude": agent},
-            default_agent="claude",
             config=config,
             state_store=state_store,
             dispatcher=dispatcher,

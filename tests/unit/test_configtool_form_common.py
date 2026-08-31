@@ -184,12 +184,19 @@ class TestFindReferencingWatcherLabels(unittest.TestCase):
         self.assertEqual(find_referencing_watcher_labels(cfg, connector_name="rc2"), [])
         self.assertEqual(find_referencing_watcher_labels(cfg, connector_name="rc"), ["my-rule"])
 
-    def test_the_agent_fallback_honors_an_explicit_default_agent(self):
-        """The loader's agent fallback is `default_agent:` when set, the
-        first agent otherwise — a rule with no agent anywhere must block
-        the deletion of THAT agent, not whichever happens to be first."""
+    def test_a_rule_with_no_agent_blocks_nobody(self):
+        """There is no agent fallback left to blame.
+
+        This test used to assert the opposite: a rule with no `agent:` anywhere
+        referenced the loader's FALLBACK agent (`default_agent:` when set, the
+        first agent otherwise) and blocked THAT agent's deletion — because
+        deleting it left the config valid while silently rebinding the rule.
+        `default_agent:` is gone and `agent:` is required, so such a rule is a
+        load error in its own right; there is nothing to rebind to and nothing
+        to protect. The connector half of this rule still has its fallback, and
+        `test_a_rule_with_no_connector_blocks_the_first_one` still covers it.
+        """
         cfg = self._cfg(f"""\
-            default_agent: other
             agents:
               default:
                 type: claude
@@ -207,7 +214,7 @@ class TestFindReferencingWatcherLabels(unittest.TestCase):
                 rooms:
                   include: [general]
         """)
-        self.assertEqual(find_referencing_watcher_labels(cfg, agent_name="other"), ["my-rule"])
+        self.assertEqual(find_referencing_watcher_labels(cfg, agent_name="other"), [])
         self.assertEqual(find_referencing_watcher_labels(cfg, agent_name="default"), [])
 
     def test_multiple_referencing_rules_are_all_returned(self):

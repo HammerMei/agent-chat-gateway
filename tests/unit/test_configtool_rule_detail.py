@@ -639,16 +639,22 @@ class TestEmptyPrerequisiteGuards:
 
 
 class TestCodexRound1Fixes:
-    async def test_an_untouched_agent_select_honors_the_configured_default_agent(
+    async def test_an_untouched_agent_select_is_still_written_explicitly(
         self, tmp_path, work_dir
     ):
         """Codex review of #129 (P1): the agent prefill used next(iter(agents))
         — the FIRST agent — even when a top-level `default_agent:` named
-        another, and create mode force-writes the selection explicitly, so
-        an untouched Agent field silently bound the new rule to the wrong
-        backend."""
+        another, and create mode force-writes the selection explicitly, so an
+        untouched Agent field silently bound the new rule to the wrong backend.
+
+        `default_agent:` is gone, so there is no configured default for the
+        prefill to honour and this asserts what remains, which is the half that
+        was always doing the work: create mode WRITES the selection. An
+        untouched Select is a preselection, not a guess the loader would later
+        repeat — and since the loader now refuses a rule with no agent at all,
+        the value in the file is the only thing that decides.
+        """
         config_path = _write_config(tmp_path, f"""\
-            default_agent: zother
             connectors:
               - name: rc
                 type: rocketchat
@@ -677,7 +683,11 @@ class TestCodexRound1Fixes:
             assert isinstance(app.screen, OverviewScreen)
             raw = yaml.safe_load(Path(config_path).read_text())
             (entry,) = raw["watcher_rules"]
-            assert entry["agent"] == "zother"
+            assert entry["agent"] == "aaa-first", "the preselection, written down"
+            # And the file it produced actually loads — the point of writing it.
+            from gateway.config import GatewayConfig
+
+            assert GatewayConfig.from_file(config_path).watcher_rules[0].agent == "aaa-first"
 
     async def test_a_typed_name_survives_an_inherits_template_switch(
         self, tmp_path, work_dir

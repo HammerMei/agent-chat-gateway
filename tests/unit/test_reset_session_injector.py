@@ -28,7 +28,6 @@ from gateway.state import WatcherState
 def _make_injector() -> InjectedContextBuilder:
     config = CoreConfig(
         agents={"default": AgentConfig(timeout=10)},
-        default_agent="default",
     )
     return InjectedContextBuilder(config)
 

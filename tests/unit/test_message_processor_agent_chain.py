@@ -38,7 +38,6 @@ def _make_processor() -> tuple[MessageProcessor, MagicMock]:
 
     config = CoreConfig(
         agents={"default": AgentConfig(timeout=10)},
-        default_agent="default",
     )
     room = Room(id="room_1", name="test-room", type="channel")
     processor = MessageProcessor(

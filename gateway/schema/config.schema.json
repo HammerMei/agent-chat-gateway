@@ -111,10 +111,6 @@
         "$ref": "#/$defs/agent"
       }
     },
-    "default_agent": {
-      "type": "string",
-      "description": "Name of the agent used when a watcher omits 'agent:'. Defaults to the first agent defined."
-    },
     "max_queue_depth": {
       "type": "integer",
       "minimum": 0,

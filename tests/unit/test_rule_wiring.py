@@ -33,9 +33,11 @@ from gateway.config_validate import validate_config
 HEADER = """\
 connectors:
   - name: rc-first
+    agent: default
     type: rocketchat
     server: {url: http://localhost:3000, username: bot, password: pw}
   - name: mm-second
+    agent: default
     type: mattermost
     server: {url: http://localhost:8065, token: t, team: lab}
 agents:
@@ -59,6 +61,7 @@ def write_config(watchers_block: str, extra: str = "") -> str:
 
 ONE_RULE = """\
 - name: eng-rooms
+  agent: default
   connector: mm-second
   rooms:
     include: ["eng-*"]
@@ -75,8 +78,10 @@ class TestRuleEntries(unittest.TestCase):
         with self.assertRaises(ValueError) as cm:
             GatewayConfig.from_file(write_config("""\
                 - name: dup
+                  agent: default
                   rooms: {include: ["a-*"]}
                 - name: dup
+                  agent: default
                   rooms: {include: ["b-*"]}
                 """))
         self.assertIn("dup", str(cm.exception))
@@ -101,6 +106,7 @@ class TestRuleErrorsAreAttributedAndSurvivable(unittest.TestCase):
         with self.assertRaises(ValueError) as cm:
             GatewayConfig.from_file(write_config("""\
                 - name: bad
+                  agent: default
                   rooms: {include: ["a-*"], nonsense: true}
                 """))
         self.assertIn("Watcher rule at index 0", str(cm.exception))
@@ -108,10 +114,13 @@ class TestRuleErrorsAreAttributedAndSurvivable(unittest.TestCase):
     def test_collect_config_attributes_the_rule_and_keeps_going(self):
         cfg, issues = collect_config(write_config("""\
             - name: fine
+              agent: default
               rooms: {include: ["ok-*"]}
             - name: broken
+              agent: default
               rooms: {include: ["a-*"], nonsense: true}
             - name: also-fine
+              agent: default
               rooms: {include: ["b-*"]}
             """))
         self.assertEqual(len(issues), 1)
@@ -135,6 +144,7 @@ class TestRuleErrorsAreAttributedAndSurvivable(unittest.TestCase):
         Path(path).write_text(HEADER + textwrap.dedent("""\
             watcher_rules:
               - name: odd
+                agent: default
                 rooms: {include: ["a-*"]}
                 1: value
             """))
@@ -149,8 +159,10 @@ class TestRuleErrorsAreAttributedAndSurvivable(unittest.TestCase):
         one `seen_rule_names` set for the whole loop so the staging is observable."""
         cfg, issues = collect_config(write_config("""\
             - name: eng
+              agent: default
               rooms: {include: ["a-*"], nonsense: true}
             - name: eng
+              agent: default
               rooms: {include: ["b-*"]}
             """))
         self.assertEqual(len(issues), 1, f"the second 'eng' was rejected too: {issues}")
@@ -163,9 +175,11 @@ class TestShadowingIsReportedAsAWarning(unittest.TestCase):
 
     SHADOWED = """\
     - name: everything
+      agent: default
       connector: mm-second
       rooms: {include: ["*"]}
     - name: never-fires
+      agent: default
       connector: mm-second
       rooms: {include: ["eng-*"]}
     """
@@ -193,9 +207,11 @@ class TestShadowingIsReportedAsAWarning(unittest.TestCase):
         why ShadowFinding carries a scope rather than being a pair."""
         result = validate_config(write_config("""\
             - name: dms
+              agent: default
               connector: mm-second
               rooms: {direct: true}
             - name: eng-plus-dms
+              agent: default
               connector: mm-second
               rooms: {include: ["eng-*"], direct: true}
             """))
@@ -208,9 +224,11 @@ class TestShadowingIsReportedAsAWarning(unittest.TestCase):
     def test_no_warning_when_rules_do_not_overlap(self):
         result = validate_config(write_config("""\
             - name: a
+              agent: default
               connector: mm-second
               rooms: {include: ["a-*"]}
             - name: b
+              agent: default
               connector: mm-second
               rooms: {include: ["b-*"]}
             """))
@@ -221,9 +239,11 @@ class TestShadowingIsReportedAsAWarning(unittest.TestCase):
         the normal multi-account setup, not a shadow."""
         result = validate_config(write_config("""\
             - name: on-rc
+              agent: default
               connector: rc-first
               rooms: {include: ["*"]}
             - name: on-mm
+              agent: default
               connector: mm-second
               rooms: {include: ["*"]}
             """))

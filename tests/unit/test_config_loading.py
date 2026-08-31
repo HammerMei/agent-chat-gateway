@@ -40,6 +40,7 @@ class TestWorkingDirectoryValidation(unittest.TestCase):
 {textwrap.indent(agents_block, "              ")}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -152,6 +153,7 @@ class TestConfigValidationHardening(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -174,6 +176,7 @@ class TestConfigValidationHardening(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -194,9 +197,11 @@ class TestConfigValidationHardening(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: same
+                agent: default
                 rooms:
                   include: [general]
               - name: same
+                agent: default
                 rooms:
                   include: [lobby]
         """)
@@ -216,6 +221,7 @@ class TestConfigValidationHardening(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [""]
         """)
@@ -236,6 +242,7 @@ class TestConfigValidationHardening(unittest.TestCase):
             max_queue_depth: -1
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -253,6 +260,7 @@ class TestConfigValidationHardening(unittest.TestCase):
               default: claude
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -295,6 +303,7 @@ class TestConfigValidationHardening(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -313,6 +322,7 @@ class TestConfigValidationHardening(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
                 connector: [rc]
@@ -357,6 +367,7 @@ class TestConfigValidationHardening(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [12345]
                 connector: rc
@@ -385,6 +396,7 @@ class TestConfigValidationHardening(unittest.TestCase):
                         working_directory: /tmp
                     watcher_rules:
                       - name: w1
+                        agent: default
                         rooms:
                           include: [general]
                         connector: rc
@@ -392,28 +404,6 @@ class TestConfigValidationHardening(unittest.TestCase):
                 """)
                 with self.assertRaisesRegex(ValueError, "unknown key\\(s\\).*session_id"):
                     GatewayConfig.from_file(path)
-
-    def test_non_string_default_agent_raises_value_error_not_type_error(self):
-        path = self._write_config("""\
-            connectors:
-              - name: rc
-                type: rocketchat
-                server: {url: http://localhost:3000, username: bot, password: pw}
-            agents:
-              default:
-                type: claude
-                working_directory: /tmp
-            default_agent: [prod]
-            watcher_rules:
-              - name: w1
-                rooms:
-                  include: [general]
-        """)
-        with self.assertRaisesRegex(ValueError, "'default_agent' must be a string"):
-            GatewayConfig.from_file(path)
-
-
-# ── Tests: cache_dir_global path resolution ───────────────────────────────────
 
 
 class TestCacheDirGlobalResolution(unittest.TestCase):
@@ -436,6 +426,7 @@ class TestCacheDirGlobalResolution(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -493,6 +484,7 @@ class TestDollarVarIsALiteralString(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -564,6 +556,7 @@ class TestToolRuleRegexValidation(unittest.TestCase):
 {textwrap.indent(rule_block, "                  ")}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -601,49 +594,6 @@ class TestToolRuleRegexValidation(unittest.TestCase):
 # ── Tests: GatewayConfig.agent raises KeyError on misconfiguration (Q2) ──────
 
 
-class TestGatewayConfigAgentProperty(unittest.TestCase):
-    """Q2: GatewayConfig.agent must raise KeyError instead of silently
-    falling back to the first agent when default_agent is mismatched."""
-
-    def test_agent_returns_correct_default(self):
-        """When default_agent is valid, .agent returns the right config."""
-        from gateway.core.config import AgentConfig
-        cfg = GatewayConfig(
-            connectors=[],
-            agents={"main": AgentConfig(name="main"), "other": AgentConfig(name="other")},
-            default_agent="main",
-        )
-        self.assertEqual(cfg.agent.name, "main")
-
-    def test_agent_raises_on_missing_default(self):
-        """When default_agent is not in agents, .agent must raise KeyError."""
-        from gateway.core.config import AgentConfig
-        cfg = GatewayConfig(
-            connectors=[],
-            agents={"main": AgentConfig(name="main")},
-            default_agent="nonexistent",
-        )
-        with self.assertRaises(KeyError) as ctx:
-            _ = cfg.agent
-        self.assertIn("nonexistent", str(ctx.exception))
-
-    def test_agent_error_message_lists_available_agents(self):
-        """KeyError message must include available agent names for diagnosis."""
-        from gateway.core.config import AgentConfig
-        cfg = GatewayConfig(
-            connectors=[],
-            agents={"alpha": AgentConfig(name="alpha"), "beta": AgentConfig(name="beta")},
-            default_agent="gamma",
-        )
-        with self.assertRaises(KeyError) as ctx:
-            _ = cfg.agent
-        error_str = str(ctx.exception)
-        self.assertIn("gamma", error_str)
-
-
-# ── Tests: built-in context auto-injection ────────────────────────────────────
-
-
 class TestBuiltinContextAutoInjection(unittest.TestCase):
     """Built-in system context files are auto-prepended in context_inject_files_for().
 
@@ -664,7 +614,6 @@ class TestBuiltinContextAutoInjection(unittest.TestCase):
         return CoreConfig(
             connector_configs={"rc": connector},
             agents={"default": agent},
-            default_agent="default",
         )
 
     def test_rc_connector_gets_core_and_tool_index_by_default(self):
@@ -729,6 +678,7 @@ class TestBuiltinContextAutoInjection(unittest.TestCase):
                 lazy_instruction_loading: false
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -774,7 +724,7 @@ class TestBuiltinContextAutoInjection(unittest.TestCase):
     def test_no_connector_config_skips_builtin_injection(self):
         """When ConnectorConfig is absent (e.g. tests), no built-in files are prepended."""
         from gateway.core.config import AgentConfig, CoreConfig
-        config = CoreConfig(agents={"default": AgentConfig(timeout=10)}, default_agent="default")
+        config = CoreConfig(agents={"default": AgentConfig(timeout=10)})
         files = config.context_inject_files_for("unknown-connector", "default", [])
         basenames = [Path(f).name for f in files]
         self.assertNotIn("rc-gateway-context.md", basenames)
@@ -1225,6 +1175,7 @@ class TestConnectorTemplates(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -1252,6 +1203,7 @@ class TestConnectorTemplates(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -1273,6 +1225,7 @@ class TestConnectorTemplates(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -1303,6 +1256,7 @@ class TestConnectorTemplates(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -1330,6 +1284,7 @@ class TestConnectorTemplates(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -1359,6 +1314,7 @@ class TestConnectorTemplates(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -1395,6 +1351,7 @@ class TestAgentTemplates(unittest.TestCase):
                 timeout: 42
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -1583,6 +1540,7 @@ class TestAgentTemplates(unittest.TestCase):
                 permissions: {timeout: 100}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -1612,6 +1570,7 @@ class TestAgentTemplates(unittest.TestCase):
                   - tool: Write
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -1633,6 +1592,7 @@ class TestAgentTemplates(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -1660,6 +1620,7 @@ class TestAgentTemplates(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -1696,6 +1657,7 @@ class TestAgentSessionLifecycleKeysAreRejected(unittest.TestCase):
 {textwrap.indent(textwrap.dedent(agent_block), "                ")}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -1744,6 +1706,7 @@ class TestAgentSessionLifecycleKeysAreRejected(unittest.TestCase):
               default: {inherits: standard}
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -1774,6 +1737,7 @@ class TestAgentSessionLifecycleKeysAreRejected(unittest.TestCase):
                 session_expire_days: 30
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -1851,6 +1815,7 @@ class TestWatcherTemplates(unittest.TestCase):
                         {key}: {value!r}
                     watcher_rules:
                       - name: w1
+                        agent: default
                         rooms:
                           include: [general]
                 """)
@@ -1951,6 +1916,7 @@ class TestRemovedDefaultsKeysRejected(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -1974,6 +1940,7 @@ class TestRemovedDefaultsKeysRejected(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -1997,6 +1964,7 @@ class TestRemovedDefaultsKeysRejected(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -2035,6 +2003,7 @@ class TestToolPresets(unittest.TestCase):
                   - readonly
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -2062,6 +2031,7 @@ class TestToolPresets(unittest.TestCase):
                   - tool: Write
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -2083,6 +2053,7 @@ class TestToolPresets(unittest.TestCase):
                   - nonexistent
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -2107,6 +2078,7 @@ class TestToolPresets(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -2130,6 +2102,7 @@ class TestToolPresets(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -2151,6 +2124,7 @@ class TestToolPresets(unittest.TestCase):
                   - tool: '[invalid'
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -2182,6 +2156,7 @@ class TestNotificationFieldsAreRemoved(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
 {textwrap.indent(textwrap.dedent(watcher_extra), "                ")}
@@ -2240,6 +2215,7 @@ class TestDescriptionField(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -2265,6 +2241,7 @@ class TestDescriptionField(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
         """)
@@ -2298,6 +2275,7 @@ class TestDescriptionField(unittest.TestCase):
                 description: "Shared watcher settings"
             watcher_rules:
               - name: w1
+                agent: default
                 rooms:
                   include: [general]
                 description: "General channel watcher"
@@ -2389,9 +2367,9 @@ class TestTheOldShapeIsReportedPerKey(unittest.TestCase):
         """A half-migrated config lists all its remaining old entries at once,
         and the rule entries beside them still parse."""
         path = self._write(
-            "- name: a\n  room: general\n"
-            "- name: ok\n  rooms:\n    include: [dev]\n"
-            "- name: b\n  room: ops\n"
+            "- name: a\n  agent: default\n  room: general\n"
+            "- name: ok\n  agent: default\n  rooms:\n    include: [dev]\n"
+            "- name: b\n  agent: default\n  room: ops\n"
         )
         config, issues = collect_config(path)
         leftover = [i for i in issues if "unknown key(s)" in i.message]
@@ -2421,6 +2399,7 @@ class TestContextInjectFileListValidation(unittest.TestCase):
         {agent}
         watcher_rules:
           - name: w1
+            agent: default
             rooms:
               include: [general]
         {watcher}

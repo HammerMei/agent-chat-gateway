@@ -245,6 +245,7 @@ class TestValidateReportsWhatBlocksTheBoot(unittest.TestCase):
                 working_directory: {self.root}
             watcher_rules:
               - name: w1
+                agent: default
                 connector: rc
                 rooms:
                   include: [general]
@@ -318,10 +319,12 @@ class TestConfigRefusesARoomTwice(unittest.TestCase):
                 working_directory: {{root}}
             watcher_rules:
               - name: w1
+                agent: default
                 connector: rc
                 rooms:
                   include: [general]
               - name: w2
+                agent: default
                 connector: {second_connector}
                 rooms:
                   include: [{second_room}]
@@ -409,10 +412,8 @@ class TestARefusedBindingLeavesNothingBehind(unittest.IsolatedAsyncioTestCase):
         lc = make_lifecycle(
             connector=connector,
             agents={"a1": agent},
-            default_agent="a1",
             config=CoreConfig(
                 agents={"a1": AgentConfig(name="a1", working_directory="/tmp")},
-                default_agent="a1",
             ),
             dispatcher=MagicMock(holder=MagicMock(return_value=None)),
             permission_registry=MagicMock(),

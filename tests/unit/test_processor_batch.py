@@ -51,7 +51,6 @@ class _RecordingAgent(AgentBackend):
 def _make_processor(agent: AgentBackend) -> MessageProcessor:
     config = CoreConfig(
         agents={"default": AgentConfig(timeout=10)},
-        default_agent="default",
     )
     connector = MagicMock()
     connector.send_text = AsyncMock()

@@ -49,7 +49,6 @@ pytestmark = pytest.mark.integration
 def _make_injector() -> InjectedContextBuilder:
     config = CoreConfig(
         agents={"default": AgentConfig(timeout=10)},
-        default_agent="default",
     )
     return InjectedContextBuilder(config)
 
@@ -618,9 +617,9 @@ class TestContextInjectionOrdering(unittest.IsolatedAsyncioTestCase):
             agent = MockAgent()
             maps = SessionMaps()
             agent_cfg = AgentConfig(timeout=10, context_inject_files=[])
-            config = CoreConfig(agents={"default": agent_cfg}, default_agent="default")
+            config = CoreConfig(agents={"default": agent_cfg})
             manager = SessionManager(
-                connector, {"default": agent}, "default", config,
+                connector, {"default": agent}, config,
                 watcher_rules=watcher_rules, session_maps=maps,
             )
             await check_fn(manager, connector, agent, maps)
@@ -695,9 +694,9 @@ class TestContextInjectionOrdering(unittest.IsolatedAsyncioTestCase):
             rule = make_rule("script",
                              context_inject_files=["/nonexistent/context.md"])
             agent_cfg = AgentConfig(timeout=10, context_inject_files=[])
-            config = CoreConfig(agents={"default": agent_cfg}, default_agent="default")
+            config = CoreConfig(agents={"default": agent_cfg})
             manager = SessionManager(
-                connector, {"default": agent}, "default", config,
+                connector, {"default": agent}, config,
                 watcher_rules=[rule], session_maps=maps,
             )
 
@@ -757,12 +756,12 @@ class TestAsyncFileIOInContextInjection(unittest.IsolatedAsyncioTestCase):
                 context_inject_files=[ctx_file],
             )
             agent_cfg = AgentConfig(timeout=10)
-            config = CoreConfig(agents={"default": agent_cfg}, default_agent="default")
+            config = CoreConfig(agents={"default": agent_cfg})
 
             from tests.helpers import make_rule
             rule = make_rule("script", context_inject_files=[ctx_file])
             manager = SessionManager(
-                connector, {"default": agent}, "default", config, watcher_rules=[rule]
+                connector, {"default": agent}, config, watcher_rules=[rule]
             )
 
             to_thread_calls = []
