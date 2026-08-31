@@ -291,11 +291,13 @@ class TestNotificationsArePlainText:
             app.screen.query_one(TabbedContent).active = "tab-templates"
             await pilot.pause()
             table = app.screen.query_one("#templates-table", DataTable)
-            # The watcher template named `[/]` is referenced by no rule, so
-            # its delete is not blocked.
+            # The watcher-rule template named `[/]` is referenced by no rule, so
+            # its delete is not blocked. The Kind column shows the DISPLAY label
+            # (`kind_label()`), not the `watcher` that names the config key —
+            # see test_configtool_watcher_rule_naming.py.
             target = next(
                 r for r in range(table.row_count)
-                if str(table.get_row_at(r)[0]) == "watcher"
+                if str(table.get_row_at(r)[0]) == "watcher rule"
             )
             table.focus()
             table.move_cursor(row=target)

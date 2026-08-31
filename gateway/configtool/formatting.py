@@ -31,6 +31,24 @@ def markup_safe(value: object) -> str:
     """
     return _rich_escape("" if value is None else str(value))
 
+# Template kinds whose display name differs from their internal one. The kind
+# strings are config-key fragments — every writer builds `f"{kind}_templates"`
+# from one — so the name shown to an operator cannot simply BE the kind, and a
+# screen that interpolates a bare `kind` into a sentence shows the internal
+# spelling by accident. That is how the Templates tab came to offer "watcher"
+# next to a "Watcher Rules" tab and a config key called `watcher_rules`.
+_KIND_LABELS = {"watcher": "watcher rule"}
+
+
+def kind_label(kind: str) -> str:
+    """The display name for a template kind (`agent`/`connector`/`watcher`).
+
+    Lowercase, so it reads correctly mid-sentence ("Delete watcher rule
+    template 'x'?"); capitalise at the call site when it starts one.
+    """
+    return _KIND_LABELS.get(kind, kind)
+
+
 # Key names whose values are masked when rendered — mirrors the fields the
 # onboard wizard already treats as secrets (gateway/onboard.py's _write_env:
 # only credentials, never url/host/team/username).

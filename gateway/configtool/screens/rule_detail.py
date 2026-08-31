@@ -144,8 +144,8 @@ class RuleDetailScreen(FormScreen):
         if not missing:
             return None
         return (
-            f"Rules need at least one {' and one '.join(missing)} to exist "
-            "first — create those before editing rules."
+            f"Watcher rules need at least one {' and one '.join(missing)} to exist "
+            "first — create those before editing watcher rules."
         )
 
     async def action_edit(self) -> None:
@@ -186,7 +186,9 @@ class RuleDetailScreen(FormScreen):
     # ── FormScreen hooks ─────────────────────────────────────────────────────
 
     def _entity_noun(self) -> str:
-        return "rule"
+        # "watcher rule", not "rule": the Tool Presets tab has rules too, and a
+        # bare "Delete rule 'x'?" does not say which kind is about to go.
+        return "watcher rule"
 
     def _entity_label(self) -> str:
         name = self.entry.get("name")
@@ -275,7 +277,7 @@ class RuleDetailScreen(FormScreen):
         agent_names = tuple(sorted(self.cfg.agents_raw))
         return sort_required_first(
             (
-                FieldSpec("name", "str", "Rule name"),
+                FieldSpec("name", "str", "Watcher rule name"),
                 FieldSpec("connector", "enum", "Connector", options=connector_names),
                 FieldSpec("agent", "enum", "Agent", options=agent_names),
                 *_ROOMS_FIELDS,
@@ -338,14 +340,14 @@ class RuleDetailScreen(FormScreen):
             new_value = None
         elif kind == "new_template":
             new_name = await self.app.push_screen_wait(
-                TextPromptModal("New watcher template — name")
+                TextPromptModal("New watcher rule template — name")
             )
             if new_name is None:
                 return
             if new_name in self.cfg.templates("watcher"):
                 await self.app.push_screen_wait(
                     MessageModal(
-                        f"A watcher template named '{markup_safe(new_name)}' "
+                        f"A watcher rule template named '{markup_safe(new_name)}' "
                         "already exists.",
                         title="Could not create",
                     )
@@ -470,7 +472,7 @@ class RuleDetailScreen(FormScreen):
     def _compose_form(self) -> ComposeResult:
         with VerticalScroll(classes="entity-form", can_focus=False):
             if self.mode == "create":
-                yield Static("[bold]New rule[/bold]")
+                yield Static("[bold]New watcher rule[/bold]")
             else:
                 yield Static(f"[bold]{markup_safe(self._entity_label())}[/bold]  (editing)")
 
@@ -540,7 +542,7 @@ class RuleDetailScreen(FormScreen):
         name = target_entry.get("name")
         if not isinstance(name, str) or not name.strip():
             await self.app.push_screen_wait(
-                MessageModal("Rule name is required.", title="Could not save")
+                MessageModal("Watcher rule name is required.", title="Could not save")
             )
             return
         duplicate = any(
@@ -644,5 +646,5 @@ class RuleDetailScreen(FormScreen):
         self.entry = target_entry
         self.app.pop_screen()
         app = self.app
-        app.notify(f"Saved rule '{name}'.", severity="information")
+        app.notify(f"Saved watcher rule '{name}'.", severity="information")
         app.reload_config()  # type: ignore[attr-defined]

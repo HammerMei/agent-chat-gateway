@@ -60,7 +60,7 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal, VerticalScroll
 from textual.widgets import Button, Input, Static
 
-from ..formatting import markup_safe
+from ..formatting import kind_label, markup_safe
 from ..modals import ConfirmModal, MessageModal
 from ..model import EditableConfig
 from .agent_detail import AGENT_DATACLASS_DEFAULTS, AGENT_FORM_FIELDS
@@ -126,7 +126,7 @@ class TemplateDetailScreen(ToolListEditorMixin, FormScreen):
         self._tool_list_ever_selected = dict.fromkeys(TOOL_LIST_WIDGET_IDS, False)
 
     def _entity_noun(self) -> str:
-        return f"{self.kind} template"
+        return f"{kind_label(self.kind)} template"
 
     def _entity_label(self) -> str:
         return self.template_name
@@ -246,7 +246,7 @@ class TemplateDetailScreen(ToolListEditorMixin, FormScreen):
         ]
 
     def _delete_blocker_noun(self) -> str:
-        return self.kind
+        return kind_label(self.kind)
 
     # ── view mode ────────────────────────────────────────────────────────────
 
@@ -260,7 +260,7 @@ class TemplateDetailScreen(ToolListEditorMixin, FormScreen):
         )
         lines = [
             f"[bold]{markup_safe(self.template_name)}[/bold]{type_suffix}  "
-            f"({self.kind} template)"
+            f"({kind_label(self.kind)} template)"
         ]
         description = self.entry.get("description")
         if description:
@@ -306,7 +306,8 @@ class TemplateDetailScreen(ToolListEditorMixin, FormScreen):
         )
         with VerticalScroll(classes="entity-form", can_focus=False):
             if self.mode == "create":
-                yield Static(f"[bold]New {self.kind} template[/bold]{type_suffix}")  # kind is a literal
+                # kind_label() of a literal kind — no operator data, so no escaping needed.
+                yield Static(f"[bold]New {kind_label(self.kind)} template[/bold]{type_suffix}")
                 with Horizontal(classes="field-row"):
                     yield Static("Name", classes="field-label")
                     # Pre-filled with the name already chosen via the
@@ -331,7 +332,7 @@ class TemplateDetailScreen(ToolListEditorMixin, FormScreen):
 
             if not self._field_specs():
                 yield Static(
-                    f"[dim]'{self.kind}' templates have no fields to configure here.[/dim]"
+                    f"[dim]'{kind_label(self.kind)}' templates have no fields to configure here.[/dim]"
                 )
 
             for spec in self._field_specs():
@@ -388,7 +389,7 @@ class TemplateDetailScreen(ToolListEditorMixin, FormScreen):
             if name in self.cfg.templates(self.kind):
                 await self.app.push_screen_wait(
                     MessageModal(
-                        f"A {self.kind} template named '{markup_safe(name)}' "
+                        f"A {kind_label(self.kind)} template named '{markup_safe(name)}' "
                         "already exists.",
                         title="Could not save",
                     )
@@ -476,5 +477,5 @@ class TemplateDetailScreen(ToolListEditorMixin, FormScreen):
         self.template_name = name
         self.app.pop_screen()
         app = self.app
-        app.notify(f"Saved {self.kind} template '{name}'.", severity="information")
+        app.notify(f"Saved {kind_label(self.kind)} template '{name}'.", severity="information")
         app.reload_config()  # type: ignore[attr-defined]

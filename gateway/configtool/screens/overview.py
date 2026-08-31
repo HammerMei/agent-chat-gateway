@@ -46,7 +46,7 @@ from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Static, TabbedContent, TabPane
 
 from ...config_validate import ValidationResult
-from ..formatting import markup_safe, status_badge
+from ..formatting import kind_label, markup_safe, status_badge
 from ..modals import ConfirmModal, MessageModal, TextPromptModal, TypePickerModal
 from ..model import StatusIndex
 from .agent_detail import AgentDetailScreen
@@ -157,7 +157,7 @@ class OverviewScreen(Screen):
                     yield DataTable(id="connectors-table", cursor_type="row")
                 with TabPane("Agents", id="tab-agents"):
                     yield DataTable(id="agents-table", cursor_type="row")
-                with TabPane("Rules", id="tab-rules"):
+                with TabPane("Watcher Rules", id="tab-rules"):
                     yield DataTable(id="rules-table", cursor_type="row")
                 with TabPane("Templates", id="tab-templates"):
                     yield DataTable(id="templates-table", cursor_type="row")
@@ -623,8 +623,8 @@ class OverviewScreen(Screen):
         if used_by:
             await self.app.push_screen_wait(
                 MessageModal(
-                    f"Cannot delete {kind} template '{markup_safe(name)}' — still "
-                    f"used by {kind}(s): "
+                    f"Cannot delete {kind_label(kind)} template '{markup_safe(name)}' — still "
+                    f"used by {kind_label(kind)}(s): "
                     f"{', '.join(markup_safe(u) for u in used_by)}.",
                     title="Cannot delete",
                 )
@@ -633,7 +633,7 @@ class OverviewScreen(Screen):
 
         confirmed = await self.app.push_screen_wait(
             ConfirmModal(
-                f"Delete {kind} template '{markup_safe(name)}'? This cannot be undone.",
+                f"Delete {kind_label(kind)} template '{markup_safe(name)}'? This cannot be undone.",
                 confirm_label="Delete",
             )
         )
@@ -651,7 +651,7 @@ class OverviewScreen(Screen):
             await self.app.push_screen_wait(MessageModal(markup_safe(exc), title="Could not delete"))
             return
 
-        self.notify(f"Deleted {kind} template '{name}'.", severity="information")
+        self.notify(f"Deleted {kind_label(kind)} template '{name}'.", severity="information")
         app: "ConfigToolApp" = self.app  # type: ignore[assignment]
         app.reload_config()
 
@@ -710,7 +710,13 @@ class OverviewScreen(Screen):
             self.app.push_screen(ToolPresetsScreen(app.editable_config, name))
         elif active_tab == "tab-templates":
             kind = await self.app.push_screen_wait(
-                TypePickerModal("New template — pick a kind", list(TEMPLATE_KINDS))
+                # (value, label) pairs, not bare strings: the picker must offer
+                # "watcher rule" while still dismissing the `watcher` that names
+                # the `watcher_templates:` key.
+                TypePickerModal(
+                    "New template — pick a kind",
+                    [(k, kind_label(k)) for k in TEMPLATE_KINDS],
+                )
             )
             if kind is None:
                 return
@@ -724,11 +730,16 @@ class OverviewScreen(Screen):
                 if connector_type is None:
                     return
                 entry = {"type": connector_type}
-            name = await self.app.push_screen_wait(TextPromptModal(f"New {kind} template — name"))
+            name = await self.app.push_screen_wait(
+                TextPromptModal(f"New {kind_label(kind)} template — name")
+            )
             if name is None:
                 return
             if name in app.editable_config.templates(kind):
-                self.notify(f"A {kind} template named '{name}' already exists.", severity="error")
+                self.notify(
+                    f"A {kind_label(kind)} template named '{name}' already exists.",
+                    severity="error",
+                )
                 return
             # No document/disk write here either — same precedent as Agent/
             # ConnectorDetailScreen's own create mode: nothing materializes
@@ -940,7 +951,9 @@ class OverviewScreen(Screen):
             for name, block in sorted(templates.items()):
                 used_by = [n for n, _ in find_entries_referencing_template(cfg, kind, name)]
                 templates_table.add_row(
-                    kind, markup_safe(name), str(len(block)), str(len(used_by)),
+                    # Displayed label; the ROW KEY keeps the internal kind, which
+                    # is what edit/delete split back out to reach the document.
+                    kind_label(kind), markup_safe(name), str(len(block)), str(len(used_by)),
                     key=f"{kind}:{name}",
                 )
 

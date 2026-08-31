@@ -40,13 +40,13 @@ agent-chat-gateway config migrate-env
 
 ## Layout
 
-Five tabs across the top: **Connectors**, **Agents**, **Rules**,
+Five tabs across the top: **Connectors**, **Agents**, **Watcher Rules**,
 **Templates**, **Tool Presets**. A banner above them shows the config's
 current validation status (`✓ valid` or `✗ N error(s)`, plus warning/lint
 counts) — press `v` when it says "press 'v' to view details" to see the
 actual messages, not just a count.
 
-Every list is sorted by name — except **Rules**, which always shows your
+Every list is sorted by name — except **Watcher Rules**, which always shows your
 `watcher_rules:` rules in file order, because that order is meaningful: the
 first rule that matches a room wins. A newly created entry on the other
 tabs is always easy to find regardless of where it landed in the
@@ -64,7 +64,7 @@ On the list (Overview) screen:
 | `e` | Edit the selected entry directly (skips the view-only step) |
 | `d` | Delete the selected entry |
 | `n` | Create a new entry on the current tab |
-| `[` / `]` | *(Rules tab only)* Move the selected rule up / down — rule order decides which rule claims a room, see [Rules](#rules) below |
+| `[` / `]` | *(Watcher Rules tab only)* Move the selected rule up / down — rule order decides which rule claims a room, see [Watcher Rules](#watcher-rules) below |
 | `r` | Refresh from disk (picks up changes made outside the TUI) |
 | `v` | View the full text of any validation errors/warnings/lint findings |
 | `ctrl+e` | Open `$EDITOR` on the whole `config.yaml` file, then reload when you exit |
@@ -123,9 +123,9 @@ and **Edit** to change a selected *inline* rule in place (grayed out until
 you select an inline rule — a preset reference isn't editable here; remove
 it and add a different preset reference instead).
 
-## Rules
+## Watcher Rules
 
-Each `watcher_rules:` entry is a *rule*: a required unique name, a connector, an
+Each `watcher_rules:` entry is a *watcher rule*: a required unique name, a connector, an
 agent, and a `rooms:` matcher (`include`/`except_for` glob patterns over
 room names, plus `direct`/`group_direct` opt-ins for the two kinds of DMs).
 Which rooms a rule actually claims is decided at runtime, per incoming
@@ -172,7 +172,8 @@ message — see [docs/user-guide.md](user-guide.md) for how matching works.
 `agent_templates`, `connector_templates`, and `watcher_templates` are named,
 reusable field sets — any entry can opt in via its own `inherits: <name>`
 field. The Templates tab lists all of them, across all three kinds, in one
-flat list.
+flat list. The kind is shown — and offered when you press `n` — under its
+display name, so `watcher_templates` appears as **watcher rule**.
 
 Editing a field on a template shows a confirm dialog naming every entry
 that would be affected (scoped to entries that actually inherit *this*

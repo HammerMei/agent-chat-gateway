@@ -611,10 +611,10 @@ class FormScreen(DetailScreen):
     def _delete_blocker_noun(self) -> str:
         """The noun used in the delete-blocked message ("still used by
         {noun}(s): ..."). Unchanged default for Agent/ConnectorDetailScreen
-        (blocked by referencing watchers); `TemplateDetailScreen` overrides
-        this to its own `kind` (blocked by referencing agents/connectors/
-        watchers instead)."""
-        return "watcher"
+        (blocked by referencing watcher rules — `_referencing_watcher_labels()`
+        returns RULE names); `TemplateDetailScreen` overrides this to its own
+        `kind` (blocked by referencing agents/connectors/rules instead)."""
+        return "watcher rule"
 
     def _delete_confirm_message(self) -> str:
         """The ConfirmModal text `_do_delete()` shows. Overridable so a

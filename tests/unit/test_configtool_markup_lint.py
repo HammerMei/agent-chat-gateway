@@ -55,6 +55,13 @@ _NOT_OPERATOR_DATA = frozenset(
         "self.kind",
         "self._entity_noun()",
         "self._delete_blocker_noun()",
+        # The DISPLAY name for one of those kinds. Strictly narrower than the
+        # bare `kind` above it: `kind_label()` returns either its argument or a
+        # literal from `_KIND_LABELS`, so no operator value can reach a sink
+        # through it. Present as its own entries because the lint matches on
+        # exact expression source, not on what the expression resolves to.
+        "kind_label(kind)",
+        "kind_label(self.kind)",
         # Counts and positions computed here, never read from config.
         "index + 1",
         "len(rules)",
