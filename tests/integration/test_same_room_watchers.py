@@ -80,7 +80,7 @@ class TestTwoWatchersOneRoom(unittest.IsolatedAsyncioTestCase):
             # so the dispatcher's occupancy refusal is exercised where it
             # still lives: the start path itself, entered directly.
             manager = SessionManager(
-                connector, {"a1": agent, "a2": agent}, "a1", config,
+                connector, {"a1": agent, "a2": agent}, config,
             )
             await manager.run_once()
             from gateway.core.dispatch import RoomAlreadyRoutedError
@@ -126,7 +126,7 @@ class TestTwoWatchersOneRoom(unittest.IsolatedAsyncioTestCase):
                 agents={"a1": agent_cfg, "a2": agent_cfg}
             )
             manager = SessionManager(
-                connector, {"a1": agent, "a2": agent}, "a1", config,
+                connector, {"a1": agent, "a2": agent}, config,
             )
             await manager.run_once()
             from gateway.core.dispatch import RoomAlreadyRoutedError
@@ -161,7 +161,7 @@ class TestTwoWatchersOneRoom(unittest.IsolatedAsyncioTestCase):
             agent_cfg = AgentConfig(timeout=10, working_directory=str(root))
             config = CoreConfig(agents={"a1": agent_cfg})
             manager = SessionManager(
-                connector, {"a1": agent}, "a1", config,
+                connector, {"a1": agent}, config,
             )
             await manager.run_once()
             from tests.helpers import make_watcher, start_watcher

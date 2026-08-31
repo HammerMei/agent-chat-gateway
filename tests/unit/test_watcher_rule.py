@@ -137,7 +137,7 @@ class TestParserHappyPath(unittest.TestCase):
         r = parse(MINIMAL)
         self.assertEqual(r.name, "eng")
         self.assertEqual(r.connector, "mm-home")
-        self.assertEqual(r.agent, "claude-eng")  # default_agent
+        self.assertEqual(r.agent, "claude-eng")  # the entry's own
         self.assertIs(r.match("eng-x", RoomKind.CHANNEL), RuleMatch.CLAIMED)
 
     def test_name_is_stripped(self):

@@ -6,9 +6,10 @@ agent serves, and the gateway creates each room's watcher on demand — on the
 room's first message (Rocket.Chat, Mattermost), or eagerly at startup for
 connectors with no inbound stream (voice, script).
 
-**The block is called `watcher_rules:` now, not `watchers:`.** A config still
-using the old name fails at load, because an unrecognised top-level key is an
-error rather than something quietly skipped:
+**Two top-level keys changed.** The block is called `watcher_rules:` now, not
+`watchers:`, and `default_agent:` is gone — each rule names its own agent (or
+inherits one). A config still using either fails at load, because an
+unrecognised top-level key is an error rather than something quietly skipped:
 
 ```
 config.yaml sets 'watchers', which this gateway does not use. Valid top-level
@@ -123,12 +124,16 @@ Field notes:
 ## Checklist
 
 1. Rename the block from `watchers:` to `watcher_rules:`.
-2. Rewrite each entry under it as a rule (above).
-3. `acg config validate` — fix every error; read the shadowing warnings.
-4. If any old session's content matters, export it via a summary file first.
-5. Restart the gateway. Expect one `Pruning static-era watcher record`
+2. Delete `default_agent:`, and make sure every rule states an `agent:` — or
+   takes one from its `inherits:` template. There is no implicit default any
+   more: the old one resolved to whichever agent came first in the file, which
+   is a binding nobody wrote down.
+3. Rewrite each entry under it as a rule (above).
+4. `acg config validate` — fix every error; read the shadowing warnings.
+5. If any old session's content matters, export it via a summary file first.
+6. Restart the gateway. Expect one `Pruning static-era watcher record`
    log line per old record — that is the clean break, not a fault.
-6. Delete every scheduled job that targeted an old static watcher name
+7. Delete every scheduled job that targeted an old static watcher name
    (`schedule list`, then `schedule delete <id>` for each) — the prune
    removes the records, NOT the jobs, and an orphaned job re-fires forever
    against a watcher that no longer exists. Then recreate the jobs against

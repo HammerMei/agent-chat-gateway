@@ -36,7 +36,14 @@ class TestCollectConfigPartialProgressPreserved(_CollectConfigTestBase):
     already-real problem (e.g. a connector's empty credentials) behind a
     completely different structural issue elsewhere in the file."""
 
-    def test_invalid_default_agent_still_returns_the_good_connectors(self):
+    def test_an_unknown_top_level_key_still_returns_the_good_connectors(self):
+        """Renamed with its subject. This used to write an invalid
+        `default_agent:` and assert the connectors survived it. That key no
+        longer exists, so the same config now trips the UNKNOWN-top-level-key
+        check instead — the assertion kept passing while testing something else,
+        which is worse than failing. The structural point is the same and is
+        what the name says now: a global-scope issue must not discard the
+        per-entity parsing that already succeeded."""
         config_path = self._write(f"""\
             connectors:
               - name: rc1
@@ -59,7 +66,8 @@ class TestCollectConfigPartialProgressPreserved(_CollectConfigTestBase):
         self.assertIsNotNone(config)
         self.assertEqual([c.name for c in config.connectors], ["rc1"])
         self.assertTrue(
-            any("default_agent" in i.message and i.entity_kind == "global" for i in issues)
+            any("does not use" in i.message and i.entity_kind == "global" for i in issues),
+            [i.message for i in issues],
         )
 
     def test_all_connectors_failing_still_returns_the_good_agents(self):
@@ -141,9 +149,9 @@ class TestCollectConfigNonStringScalarFields(_CollectConfigTestBase):
     """PR review finding (round 6): the same class of bug round 5 fixed for
     a non-string 'name'/'inherits' (a truthy-but-wrong-type raw value
     slipping past a bare `if not x` check into a hash-based `in`/`.get()`,
-    or a string method) was also live on five other raw scalar reference
-    fields — connector 'type', watcher 'connector'/'agent'/'room'/
-    and the top-level 'default_agent' — reachable via BOTH
+    or a string method) was also live on the other raw scalar reference
+    fields — connector 'type', watcher 'connector'/'agent' — reachable via
+    BOTH
     from_file() (see test_config_loading.py's
     TestConfigValidationHardening for the strict-path pins) and
     collect_config(). Each must surface as a collected, per-entity/global
