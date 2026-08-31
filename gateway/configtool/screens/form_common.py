@@ -938,6 +938,13 @@ class FormScreen(DetailScreen):
         set_widget_value(spec, widget, value)
         self._reset_keys[spec.key] = read_widget_value(spec, widget)
         self._form_dirty = True
+        # Called directly, NOT left to the widget's own Changed event. When the
+        # reset value equals what the field already displayed — a template that
+        # sets the same `direct: true` the entry sets explicitly, say — Textual
+        # fires no Changed event, so the label kept reading "(explicit)" next to
+        # a toast promising it would revert. Reset is the one path where the
+        # label must change while the value does not.
+        self._refresh_provenance_display(spec.key)
         self.notify(f"{spec.label}: will revert to inherited on Save.", severity="information")
 
     def action_toggle_password_visibility(self) -> None:

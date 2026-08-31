@@ -277,3 +277,151 @@ class TestSavingRoomsOnATemplateWritesThem:
 
         document = yaml.safe_load(Path(path).read_text())
         assert document["watcher_templates"]["channels"]["rooms"]["direct"] is True
+
+
+class TestRevertingAFieldToInheritedActuallyWorks:
+    """Owner-reported: "there is no way for me to change explicit to inherited?
+    I press Ctrl-r, but it is still showing (explicit)".
+
+    Two independent defects were behind that, both fallout from `rooms` becoming
+    inheritable, and the visible one was not the blocking one.
+    """
+
+    async def _open_rule_form(self, app, pilot):
+        app.screen.query_one(TabbedContent).active = "tab-rules"
+        await pilot.pause()
+        table = app.screen.query_one("#rules-table", DataTable)
+        table.focus()
+        table.move_cursor(row=0)
+        await pilot.press("e")
+        await pilot.pause()
+
+    async def test_the_save_gate_judges_the_merged_rule_not_the_raw_entry(
+        self, tmp_path, work_dir
+    ):
+        """THE BLOCKER. The gate refuses a rule that can never match anything,
+        and it read the raw entry — so a rule whose `include` lives in its
+        template was refused the moment its own DM flags reverted, with
+        "A rule needs at least one rooms include pattern...". The loader judges
+        the merged rule; the form was stricter than the thing it speaks for."""
+        path = _write(tmp_path, _config(
+            work_dir,
+            "{include: ['*'], direct: true}",
+            "- {name: r1, inherits: channels, rooms: {direct: true, group_direct: true}}",
+        ))
+        app = ConfigToolApp(path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._open_rule_form(app, pilot)
+            for key in ("field-rooms-direct", "field-rooms-group_direct"):
+                app.screen.query_one("#" + key, Checkbox).focus()
+                await pilot.pause()
+                await pilot.press("ctrl+r")
+                await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+            assert not isinstance(app.screen, TemplateDetailScreen)
+            assert app.screen.__class__.__name__ == "OverviewScreen", (
+                f"save was refused: {app.screen.__class__.__name__}"
+            )
+
+        entry = yaml.safe_load(Path(path).read_text())["watcher_rules"][0]
+        assert "rooms" not in entry, "both reverted keys emptied the block, so it is gone"
+        rooms = GatewayConfig.from_file(path).watcher_rules[0].rooms
+        assert [p.raw for p in rooms.include] == ["*"], "the rule now inherits the matcher"
+        assert rooms.direct is True
+
+    async def test_a_rule_with_no_matcher_and_no_template_is_still_refused(
+        self, tmp_path, work_dir
+    ):
+        """The case the gate exists for. Merging must not weaken it: with no
+        template supplying a matcher, merged == raw and the refusal stands."""
+        path = _write(tmp_path, f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            agents:
+              a:
+                type: claude
+                working_directory: {work_dir}
+            watcher_rules:
+              - {{name: r1, connector: rc, agent: a, rooms: {{direct: true}}}}
+        """)
+        app = ConfigToolApp(path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._open_rule_form(app, pilot)
+            app.screen.query_one("#field-rooms-direct", Checkbox).focus()
+            await pilot.pause()
+            await pilot.press("ctrl+r")
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+            assert app.screen.__class__.__name__ == "MessageModal", "must be refused"
+            body = str(app.screen.query_one("#message-body").render())
+            assert "include pattern" in body
+
+        entry = yaml.safe_load(Path(path).read_text())["watcher_rules"][0]
+        assert entry["rooms"] == {"direct": True}, "the rejected save wrote nothing"
+
+    async def test_the_label_updates_even_when_the_value_does_not_change(
+        self, tmp_path, work_dir
+    ):
+        """THE VISIBLE ONE, and the reason the blocker was misdiagnosed.
+
+        `action_reset_field()` used to leave the provenance label to the
+        widget's own Changed event. Here the entry's only `rooms` key is
+        `direct` and the template sets the same value, so ctrl+r changes no
+        widget value, fires no event — and the label kept saying "(explicit)"
+        beside a toast promising it would revert.
+        """
+        path = _write(tmp_path, _config(
+            work_dir, "{include: ['*'], direct: true}",
+            "- {name: r1, inherits: channels, rooms: {direct: true}}",
+        ))
+        app = ConfigToolApp(path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._open_rule_form(app, pilot)
+            checkbox = app.screen.query_one("#field-rooms-direct", Checkbox)
+            checkbox.focus()
+            await pilot.pause()
+
+            def label() -> str:
+                return str(
+                    app.screen.query_one("#prov-field-rooms-direct", Static).render()
+                )
+
+            before_value, before_label = checkbox.value, label()
+            assert "explicit" in before_label
+
+            await pilot.press("ctrl+r")
+            await pilot.pause()
+
+            assert checkbox.value == before_value, "the premise: no value change"
+            assert "channels" in label(), (
+                f"label did not follow the reset: {label()!r}"
+            )
+
+    async def test_the_normal_value_changing_reset_still_updates(self, tmp_path, work_dir):
+        """The path that already worked, kept working — the direct call must not
+        depend on the event no longer firing."""
+        path = _write(tmp_path, _config(
+            work_dir, "{include: ['*']}",
+            "- {name: r1, inherits: channels, rooms: {direct: true}}",
+        ))
+        app = ConfigToolApp(path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._open_rule_form(app, pilot)
+            checkbox = app.screen.query_one("#field-rooms-direct", Checkbox)
+            checkbox.focus()
+            await pilot.pause()
+            await pilot.press("ctrl+r")
+            await pilot.pause()
+            assert checkbox.value is False, "the template does not set direct"
+            assert "channels" in str(
+                app.screen.query_one("#prov-field-rooms-direct", Static).render()
+            )

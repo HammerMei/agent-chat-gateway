@@ -591,7 +591,20 @@ class RuleDetailScreen(FormScreen):
         # A rule that can never match anything is a typo, not an intention
         # (the loader refuses it too — this just says it in form terms
         # before a generic parser message would).
-        rooms = target_entry.get("rooms") or {}
+        #
+        # Checked on the MERGED entry, which is the whole point: this gate's job
+        # is to say what the loader would refuse, and the loader judges the rule
+        # AFTER its template is merged in. Reading the raw entry made the form
+        # stricter than the loader once `rooms` became inheritable — a rule whose
+        # `include` lives in its template could not be saved at all after
+        # reverting its own DM flags to inherited, which is exactly the operation
+        # someone adopting a shared matcher performs. Only the check is merged;
+        # `target_entry` is still what gets written to the document.
+        try:
+            merged_target = self.cfg.merged_entry(self._template_kind(), target_entry)
+        except (ValueError, FileNotFoundError):
+            merged_target = target_entry
+        rooms = merged_target.get("rooms") or {}
         if not isinstance(rooms, dict) or not (
             rooms.get("include") or rooms.get("direct") or rooms.get("group_direct")
         ):
