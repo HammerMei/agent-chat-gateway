@@ -336,11 +336,11 @@ agent-chat-gateway start
 | `max_queue_depth` | integer | No | 100 | Per-room message queue size; 0 = unlimited |
 | `connectors` | list | Yes | (none) | Chat platform connections |
 | `agents` | dict | Yes | (none) | AI agent backend definitions |
-| `watchers` | list | Yes | (none) | Room→agent mappings |
+| `watcher_rules` | list | Yes | (none) | Rules declaring which rooms an agent serves — see [Watchers](#watchers) |
 | `tool_presets` | dict | No | `{}` | Named, reusable tool-rule lists — see [Tool Allow-Lists](#tool-allow-lists) |
 | `connector_templates` | dict | No | `{}` | Named, reusable field blocks for connectors — each entry opts in via its own `inherits: <name>` |
 | `agent_templates` | dict | No | `{}` | Named, reusable field blocks for agents — each entry opts in via its own `inherits: <name>` |
-| `watcher_templates` | dict | No | `{}` | Named, reusable field blocks for watcher rules — each entry opts in via its own `inherits: <name>`. May set `rooms:`; a rule's own `rooms:` merges over it key by key, so a template can set `direct: true` once while each rule adds its own `include`. Cannot set `name` |
+| `watcher_templates` | dict | No | `{}` | Named, reusable field blocks for watcher rules — each entry opts in via its own `inherits: <name>`. May set `rooms:`, with rules that are easy to get wrong — see [Templates and `rooms` inheritance](#templates-and-rooms-inheritance). Cannot set `name` |
 
 None of the four templates/preset fields above are required — a single
 connector/agent/watcher setup rarely needs them. They exist to avoid
@@ -516,8 +516,23 @@ validate` warns when an earlier rule shadows a later one completely.
 A quiet room is dropped after `session_idle_days` (default 15 — the session
 is kept and the next message resumes it) and reclaimed entirely after a
 further `session_expire_days` (default 15). Pause a watcher to exempt it from
-both timers. Configs written for the old static shape (`room:`, or `rooms:`
-as a list) fail at load — see docs/migration-dynamic-watchers.md.
+both timers.
+
+**A config written for the old static watchers fails at load, and the first
+error is the key name.** The list used to be called `watchers:`, which this
+gateway no longer has a use for, so it is reported the way any unrecognised
+top-level key is:
+
+```
+config.yaml sets 'watchers', which this gateway does not use.
+Valid top-level keys are: ... 'watcher_rules', 'watcher_templates'.
+```
+
+Rename the key first; only then do the per-entry errors become visible
+(`room: general` is refused as an unknown key of a rule, and a list-shaped
+`rooms:` is refused as the wrong type). See
+[docs/migration-dynamic-watchers.md](migration-dynamic-watchers.md) for the
+rest of the rewrite.
 
 > ⚠️ **One watcher per room, per connector.** Two rules cannot both serve a
 > room — first-match precedence gives it to the earlier rule, and validate
@@ -552,8 +567,79 @@ as a list) fail at load — see docs/migration-dynamic-watchers.md.
 | `session_expire_days` | int | No | Days idle before the record and session are reclaimed entirely; default 15 |
 | `context_inject_files` | list | No | Rule-specific context files (frozen into each created watcher) |
 
-The old static fields (`room:`, list-shaped `rooms:`) are refused at load —
-see `docs/migration-dynamic-watchers.md`.
+#### Templates and `rooms` inheritance
+
+A `watcher_templates:` entry can carry `rooms:`, and every subkey of it is
+inheritable — `include`, `except_for`, `direct` and `group_direct`. What makes
+this worth its own section is that `rooms:` is a **matcher**, not a settings
+block, so two rules inheriting the same matcher can end up fighting over the
+same room. Each rule below behaves the way it does for that reason.
+
+**A rule's own `rooms:` merges over the template's, key by key.** Keys the rule
+does not mention are inherited as-is:
+
+```yaml
+watcher_templates:
+  channels:
+    connector: rc-main
+    rooms: {direct: true}
+watcher_rules:
+  - {name: eng, inherits: channels, rooms: {include: ['eng-*']}}
+  # -> include: [eng-*]  AND  direct: true — both survive
+```
+
+**A list the rule sets replaces the template's list outright; the two are not
+concatenated.** A template `include: [a-*]` under a rule that sets
+`include: [b-*]` yields `[b-*]` only. Same for `except_for`. If you want both
+patterns, list both in the rule.
+
+**To switch off an inherited flag, write `false` — not `null`.** The field is
+read as a boolean, and `null` is a load error (*"'rooms.direct' must be true or
+false"*), not a way to unset it.
+
+**A template cannot supply `except_for` on its own.** `except_for` subtracts
+from `include`, so a rule that inherits only an exclusion matches nothing and
+is refused:
+
+```
+Watcher rule at index 0 ('r1') can never match any room: 'rooms.include'
+is empty and neither 'rooms.direct' nor 'rooms.group_direct' is set.
+```
+
+**An inherited `except_for` pattern must be able to match something the
+inheriting rule includes.** An exclusion that cannot overlap the rule's
+`include` looks like protection but removes nothing, so it is a hard error
+rather than a silent no-op:
+
+```yaml
+watcher_templates:
+  channels: {connector: rc-main, rooms: {except_for: ['*-secret']}}
+watcher_rules:
+  - {name: eng, inherits: channels, rooms: {include: ['eng-*']}}   # ok: eng-secret overlaps
+  - {name: ops, inherits: channels, rooms: {include: ['ops-*']}}   # ok: ops-secret overlaps
+```
+
+Written as `except_for: ['ops-secret']` instead, the same template would break
+the `eng` rule — no room named `eng-*` can ever be called `ops-secret`:
+
+```
+'rooms.except_for' entry 'ops-secret' does nothing here, because this rule's
+'include' never matches a room by that name.
+```
+
+So a shared exclusion has to be phrased broadly enough (a suffix like
+`*-secret`) to bite on every rule that inherits it.
+
+**Do not put `direct: true` or `group_direct: true` in a template several rules
+inherit.** Only the first rule that matches a room serves it, and the DM classes
+are not name-matched, so the first inheriting rule takes every DM and the DM half
+of the later ones is dead. It loads, and `config validate` warns:
+
+> Watcher rule 'ops' will never see one-to-one direct messages, because those
+> are already handled by 'eng', which is listed above it.
+
+Give DMs their own rule that does not inherit the template, as in the
+[migration guide's example](migration-dynamic-watchers.md#the-rewrite).
 
 ### Tool Allow-Lists
 
@@ -1303,7 +1389,7 @@ watcher_rules:
 ### Multi-Connector Setup
 
 Connectors are independent — run several instances of the same platform, or mix
-platforms entirely, in one daemon. `connector` names in `watchers` are what tie a
+platforms entirely, in one daemon. `connector` names in `watcher_rules` are what tie a
 room/channel to a specific connector instance.
 
 For teams using multiple Rocket.Chat servers or workspaces:

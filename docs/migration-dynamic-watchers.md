@@ -56,9 +56,7 @@ Field notes:
   watcher gets a derived name like `rc-home:general`, which is what
   `list`/`pause`/`resume`/`reset`/`expire` act on.
 - **`rooms:` can come from a template.** A `watcher_templates:` entry may set
-  it, and a rule's own `rooms:` merges over the template's key by key. The use
-  this fits best is a shared policy every rule should carry — an exclusion, for
-  instance, so no rule can pick up a room you want left alone:
+  it, so a policy every rule should carry — an exclusion, say — is written once:
 
   ```yaml
   watcher_templates:
@@ -71,20 +69,13 @@ Field notes:
     - {name: dms, connector: rc-home, rooms: {direct: true}}
   ```
 
-  Two things not to do with it, both of which follow from `rooms` being a
-  matcher rather than a setting, and both found by running them:
-
-  * **Do not put `direct: true` in a shared template.** Only the first rule that
-    matches a room serves it, so the first rule inheriting the template takes
-    every DM and the later ones are dead — `acg config validate` warns, naming
-    the pair.
-  * **Do not let a DM-only rule inherit `except_for`.** `except_for` subtracts
-    from `include`, and a DM opt-in is not name-matched, so the merged rule is
-    refused: *"'rooms.except_for' has no effect without 'rooms.include'"*. Keep
-    DM rules out of that template, as `dms` is above.
-
-  To turn off an inherited flag on one rule, write `false` — not `null`. The
-  field is checked as a boolean.
+  All four `rooms` subkeys inherit, and a rule's own `rooms:` merges over the
+  template's key by key. **There are several ways to get this wrong that this
+  example is arranged to avoid** — a shared `direct: true` leaves every rule
+  but the first with no DMs, a rule's list replaces the template's rather than
+  adding to it, and an inherited exclusion that cannot match anything the rule
+  includes is a hard error. Each is spelled out with its message in
+  [Templates and `rooms` inheritance](user-guide.md#templates-and-rooms-inheritance).
 - **`rooms:` is a mapping**: `include:` takes glob patterns over room names
   (`eng-*`, `general`, `*`), `except_for:` subtracts from this rule's own
   include, and `direct:` / `group_direct:` opt into the two DM kinds.
