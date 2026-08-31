@@ -52,7 +52,7 @@ class TestSingleSource(unittest.TestCase):
         one specific watcher, so a shared block cannot carry them."""
         self.assertEqual(
             TEMPLATE_FORBIDDEN_KEYS["watcher"],
-            frozenset({"name", "room", "rooms", "session_id"}),
+            frozenset({"name", "room", "rooms"}),
         )
 
     def test_a_connector_template_may_not_set_its_name(self):

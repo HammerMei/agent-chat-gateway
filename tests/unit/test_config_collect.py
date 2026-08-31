@@ -145,7 +145,7 @@ class TestCollectConfigNonStringScalarFields(_CollectConfigTestBase):
     slipping past a bare `if not x` check into a hash-based `in`/`.get()`,
     or a string method) was also live on five other raw scalar reference
     fields — connector 'type', watcher 'connector'/'agent'/'room'/
-    'session_id', and the top-level 'default_agent' — reachable via BOTH
+    and the top-level 'default_agent' — reachable via BOTH
     from_file() (see test_config_loading.py's
     TestConfigValidationHardening for the strict-path pins) and
     collect_config(). Each must surface as a collected, per-entity/global
@@ -252,7 +252,12 @@ class TestCollectConfigNonStringScalarFields(_CollectConfigTestBase):
         # exception that aborts the pass.
         watcher_issues = [i for i in issues if i.entity_kind == "watcher"]
         self.assertEqual(len(watcher_issues), 1, [i.message for i in issues])
-        self.assertIn("'session_id' is no longer supported", watcher_issues[0].message)
+        # `session_id` no longer has a rejection path of its own — it is simply
+        # not a key, so the closed rule shape reports it like any other. What the
+        # test is really about survives: refused whatever its value, and arriving
+        # as an attributed issue rather than an exception that aborts the pass.
+        self.assertIn("session_id", watcher_issues[0].message)
+        self.assertIn("unknown key(s)", watcher_issues[0].message)
 
     def test_non_string_default_agent_is_a_collected_issue(self):
         config_path = self._write(f"""\
@@ -419,7 +424,8 @@ class TestCollectConfigQueueSchedulerSessionId(_CollectConfigTestBase):
             [("watcher", "w1"), ("watcher", "w2")],
         )
         for issue in issues:
-            self.assertIn("'session_id' is no longer supported", issue.message)
+            self.assertIn("session_id", issue.message)
+            self.assertIn("unknown key(s)", issue.message)
         # The clean entry either side still parses — the "not a discard" half.
         self.assertEqual([r.name for r in config.watcher_rules], ["w3"])
 

@@ -367,9 +367,11 @@ class TestConfigValidationHardening(unittest.TestCase):
             GatewayConfig.from_file(path)
 
     def test_any_watcher_session_id_is_refused_since_the_field_is_removed(self):
-        """It used to be type-checked; now the key itself is refused, whatever its
-        value. Inverted rather than deleted: a plain deletion would have made a
-        released, load-bearing key silently ignored, which is why the check exists."""
+        """Still refused whatever its value — but by the rule shape's closed key
+        set, not by a branch of its own. The dedicated check existed because the
+        OLD static parser ignored unknown keys, so a plain deletion would have
+        made a released key silently ineffective. A closed key set removes that
+        risk, so the special case went (see test_session_id_removed.py)."""
         for value in ("[abc]", "'ses_abc123'", "null", "false", "0"):
             with self.subTest(value=value):
                 path = self._write_config(f"""\
@@ -388,7 +390,7 @@ class TestConfigValidationHardening(unittest.TestCase):
                         connector: rc
                         session_id: {value}
                 """)
-                with self.assertRaisesRegex(ValueError, "'session_id' is no longer supported"):
+                with self.assertRaisesRegex(ValueError, "unknown key\\(s\\).*session_id"):
                     GatewayConfig.from_file(path)
 
     def test_non_string_default_agent_raises_value_error_not_type_error(self):
@@ -1830,7 +1832,10 @@ class TestWatcherTemplates(unittest.TestCase):
             ("name", "shared-name"),
             ("room", "general"),
             ("rooms", ["general"]),
-            ("session_id", "sticky-1"),
+            # `session_id` was here until it stopped being a key at all — a
+            # removed field is reported by the closed rule shape instead, which
+            # names the entry rather than the template. See
+            # test_session_id_removed.py.
         ):
             with self.subTest(key=key):
                 path = self._write_config(f"""\

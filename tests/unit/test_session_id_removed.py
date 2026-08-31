@@ -1,4 +1,4 @@
-"""`watchers[].session_id` is removed, and refused rather than ignored.
+"""`watchers[].session_id` is removed, and refused — as an unknown key, not by name.
 
 Pinning a session from config is gone for two reasons, neither of them a rename:
 
@@ -8,21 +8,22 @@ Pinning a session from config is gone for two reasons, neither of them a rename:
 * With a watcher created per discovered room, a single id in config cannot say which
   room it belongs to.
 
-**Why refusing matters more here than for the fields #97 moved.** Every field on a
-watcher entry is read with `.get()`, and unknown keys are deliberately ignored so
-`description:` and friends need no handling — pinned by
-`test_agent_and_watcher_description_do_not_break_loading`. So deleting this field
-quietly would not have raised anything: the config would still load, the session
-would simply stop being pinned, and the operator would discover it from the agent's
-missing memory. And unlike the TTLs, `session_id` **shipped** — it is documented in
-`v0.5.1`'s own `config.example.yaml`, so silence would have landed on real
-deployments. The JSON schema does not cover this either: it is not enforced at load.
+**Why this file no longer pins a dedicated message.** It used to, and the reason
+it gave was sound at the time: the static watcher parser read every field with
+`.get()` and ignored what it did not recognise, so removing `session_id` quietly
+would have loaded a config that silently stopped pinning anything. That premise
+expired when the rule shape became a **closed key set** — every key a rule does
+not declare is already a load error, which is what `test_an_unknown_key_is_refused`
+below asserts. Once that was true, a removed field earned nothing from its own
+rejection path, so the special case is gone and `session_id` is reported the way
+`sesion_id` or any other non-key is.
 
-Landed in two PRs. The first refused the key while keeping
-`WatcherConfig.session_id` as a field that could only ever be `None`, which made the
-runtime's pinned-session branches unreachable; the second removed those branches and
-the field. Splitting it that way is what let the runtime removal be argued as dead
-code rather than as a behaviour change.
+One thing was traded away deliberately, and it is worth knowing rather than
+rediscovering: a `session_id` inside a `watcher_templates:` entry is now reported
+against the ENTRY that inherits it rather than against the template that carries
+it, because templates are merged before an entry is parsed. That is how every
+other unknown key already behaved; the previous behaviour was one field's
+exception to it.
 
 Run with:
     uv run python -m pytest tests/unit/test_session_id_removed.py -v
@@ -58,41 +59,48 @@ def write_config(watchers_block: str, extra: str = "") -> str:
 
 
 class TestTheKeyIsRefusedNotIgnored(unittest.TestCase):
-    """The whole point of the change: silence was the available failure mode."""
+    """Loud, still — just by the general rule rather than a special case."""
 
     def test_a_pinned_id_is_a_load_error(self):
         with self.assertRaises(ValueError) as cm:
-            GatewayConfig.from_file(write_config('- {name: w1, rooms: {include: [general]}, session_id: "ses_abc123"}\n'))
+            GatewayConfig.from_file(
+                write_config('- {name: w1, rooms: {include: [general]}, session_id: "x"}\n')
+            )
         msg = str(cm.exception)
-        self.assertIn("'session_id' is no longer supported", msg)
+        self.assertIn("Watcher rule at index 0", msg, "the entry is named")
+        self.assertIn("session_id", msg, "the offending key is named")
+        self.assertIn("unknown key(s)", msg)
 
-    def test_the_error_names_the_handoff_replacement(self):
-        """There is no replacement *field*, so the error has to describe the
-        replacement *mechanism* or it reads as an arbitrary removal."""
+    def test_the_error_lists_the_keys_a_rule_does_accept(self):
+        """What replaced the hand-written message: the closed key set prints
+        itself, so a reader sees `rooms`, `agent`, `history_handoff` and the rest
+        without anyone maintaining a sentence about it."""
         with self.assertRaises(ValueError) as cm:
-            GatewayConfig.from_file(write_config('- {name: w1, rooms: {include: [general]}, session_id: "x"}\n'))
+            GatewayConfig.from_file(
+                write_config('- {name: w1, rooms: {include: [general]}, session_id: "x"}\n')
+            )
         msg = str(cm.exception)
-        # Contract, not phrasing: says to write state to a file and read it back.
-        self.assertIn("write a summary to a file", msg)
-        self.assertIn("docs/user-guide.md", msg)
+        self.assertIn("Valid keys are", msg)
+        self.assertIn("'rooms'", msg)
+        self.assertNotIn("'session_id'", msg.split("Valid keys are", 1)[1])
 
     def test_every_value_shape_is_refused_including_null(self):
-        """`null` used to mean "auto-create", i.e. the default — so it is the one
-        value an operator might expect to keep working. It does not: writing the key
-        at all means they believe pinning exists."""
-        for value in ('"ses_abc"', "null", "false", "0", "[]", "{}"):
+        """`null` is not a way to keep the key: writing it at all means the
+        operator believes an entry can choose its conversation."""
+        for value in ('"x"', "null", "123", "[a]", "{a: b}"):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError) as cm:
                     GatewayConfig.from_file(
-                        write_config(f"- {{name: w1, rooms: {{include: [general]}}, session_id: {value}}}\n")
+                        write_config(
+                            f"- {{name: w1, rooms: {{include: [general]}}, session_id: {value}}}\n"
+                        )
                     )
-                self.assertIn("no longer supported", str(cm.exception))
+                self.assertIn("session_id", str(cm.exception))
 
-    def test_an_unknown_key_is_refused_because_rules_are_closed(self):
-        """The static parser ignored unknown keys, which is why session_id
-        needed its own refusal. The rule shape is a closed key set — every
-        unknown key raises — so the dedicated message above is kept only
-        because it names the replacement mechanism, not to make the key loud."""
+    def test_an_unknown_key_is_refused(self):
+        """The mechanism this file now rests on. The static parser ignored
+        unknown keys, which is why `session_id` once needed its own refusal; the
+        rule shape is a closed key set, so it does not."""
         with self.assertRaises(ValueError) as cm:
             GatewayConfig.from_file(
                 write_config("- {name: w1, rooms: {include: [general]}, some_future_key: 7}\n")
@@ -105,87 +113,39 @@ class TestTheKeyIsRefusedNotIgnored(unittest.TestCase):
 
     def test_a_materialized_watcher_has_no_such_attribute(self):
         """The field is gone from `WatcherConfig`, not merely always None — so the
-        runtime cannot read it even by accident. The config half of this change kept
-        it as an always-None field so the runtime branches could be removed
-        separately; this asserts the second half landed."""
+        runtime cannot read it even by accident."""
         cfg = GatewayConfig.from_file(write_config("- {name: w1, rooms: {include: [general]}}\n"))
         self.assertFalse(hasattr(cfg.watcher_rules[0], "session_id"))
 
 
 class TestItCannotArriveByInheritance(unittest.TestCase):
-    """A template is merged into the entry before the entry is parsed, so a template
-    is the one place a removed key could still slip through."""
+    """A template cannot smuggle it in — the merged entry is what gets parsed."""
 
-    def test_a_template_setting_it_is_refused_and_the_template_is_named(self):
+    def test_a_template_setting_it_is_still_refused(self):
         with self.assertRaises(ValueError) as cm:
-            GatewayConfig.from_file(write_config(
-                "- {name: w1, rooms: {include: [general]}, inherits: standard}\n",
-                extra="watcher_templates:\n  standard:\n    session_id: sticky\n",
-            ))
+            GatewayConfig.from_file(
+                write_config(
+                    "- {name: w1, inherits: shared, rooms: {include: [general]}}\n",
+                    extra='watcher_templates:\n  shared:\n    session_id: "x"\n',
+                )
+            )
+        self.assertIn("session_id", str(cm.exception))
+        self.assertIn("unknown key(s)", str(cm.exception))
+
+    def test_an_identity_key_in_a_template_is_a_different_error(self):
+        """`rooms` and `name` are still rejected by the template loader itself,
+        and that error names the TEMPLATE — the distinction `session_id` used to
+        share and no longer does."""
+        with self.assertRaises(ValueError) as cm:
+            GatewayConfig.from_file(
+                write_config(
+                    "- {name: w1, inherits: shared, rooms: {include: [general]}}\n",
+                    extra="watcher_templates:\n  shared:\n    rooms: {include: [x]}\n",
+                )
+            )
         msg = str(cm.exception)
-        self.assertIn("watcher_templates['standard']", msg)
-        self.assertIn("session_id", msg)
-
-    def test_the_template_error_states_the_replacement_itself(self):
-        """It must not defer to "the per-entry error": this branch raises BEFORE
-        inheritance, so that error never runs for a template-supplied key. Pointing at
-        an error the operator will never see is worse than saying nothing."""
-        with self.assertRaises(ValueError) as cm:
-            GatewayConfig.from_file(write_config(
-                "- {name: w1, rooms: {include: [general]}, inherits: standard}\n",
-                extra="watcher_templates:\n  standard:\n    session_id: sticky\n",
-            ))
-        msg = str(cm.exception)
-        # Contract, not phrasing: says to write state to a file and read it back.
-        self.assertIn("write a summary to a file", msg)
-        self.assertIn("docs/user-guide.md", msg)
-        self.assertNotIn("per-entry error", msg)
-
-    def test_the_template_error_does_not_tell_you_to_move_it_per_entry(self):
-        """`session_id` stays in TEMPLATE_FORBIDDEN_KEYS so the template is named
-        rather than every entry inheriting it — but the generic wording there ("set it
-        per-entry") is *wrong* for a field nothing accepts, and a correct attribution
-        carrying a wrong instruction is worse than no detail. So the removed keys are
-        described separately."""
-        with self.assertRaises(ValueError) as cm:
-            GatewayConfig.from_file(write_config(
-                "- {name: w1, rooms: {include: [general]}, inherits: standard}\n",
-                extra="watcher_templates:\n  standard:\n    session_id: sticky\n",
-            ))
-        msg = str(cm.exception)
-        self.assertIn("does not exist at all any more", msg)
-        self.assertNotIn("must be set per-entry", msg)
-
-    def test_an_identity_key_still_gets_the_per_entry_wording(self):
-        """The other keys in that set are not removed, so their advice must survive."""
-        with self.assertRaises(ValueError) as cm:
-            GatewayConfig.from_file(write_config(
-                "- {name: w1, rooms: {include: [general]}, inherits: standard}\n",
-                extra="watcher_templates:\n  standard:\n    name: shared\n",
-            ))
-        msg = str(cm.exception)
-        self.assertIn("must be set per-entry", msg)
-        self.assertNotIn("does not exist at all", msg)
-
-    def test_a_template_setting_both_kinds_explains_each(self):
-        with self.assertRaises(ValueError) as cm:
-            GatewayConfig.from_file(write_config(
-                "- {name: w1, rooms: {include: [general]}, inherits: standard}\n",
-                extra="watcher_templates:\n  standard:\n    name: shared\n    session_id: sticky\n",
-            ))
-        msg = str(cm.exception)
-        self.assertIn("must be set per-entry", msg)
-        self.assertIn("does not exist at all any more", msg)
-
-
-class TestTheRoomCountNoLongerEntersIntoIt(unittest.TestCase):
-    def test_it_is_refused_however_many_rooms_the_rule_names(self):
-        """The old rule was "only settable with exactly one room"; a rule names
-        any number of rooms and the key is refused regardless."""
-        with self.assertRaises(ValueError) as cm:
-            GatewayConfig.from_file(write_config(
-                '- {name: w1, rooms: {include: [a, b]}, session_id: "x"}\n'))
-        self.assertIn("no longer supported", str(cm.exception))
+        self.assertIn("watcher_templates['shared']", msg, "the template is named")
+        self.assertIn("names one specific entry", msg)
 
 
 class TestThroughTheFaultTolerantLoader(unittest.TestCase):
@@ -202,34 +162,20 @@ class TestThroughTheFaultTolerantLoader(unittest.TestCase):
         result = validate_config(write_config('- {name: w1, rooms: {include: [general]}, session_id: "x"}\n'))
         self.assertFalse(result.ok)
         self.assertTrue(
-            any("no longer supported" in e for e in result.errors), result.errors
+            any("unknown key(s)" in e and "session_id" in e for e in result.errors),
+            result.errors,
         )
 
-    def test_the_duplicate_pass_is_gone_rather_than_silently_passing(self):
-        """Two watchers sharing one id used to be a dedicated cross-watcher check.
-        Both entries are now refused individually, which is strictly stronger — and
-        this asserts the old hazard cannot reappear as "no issues at all"."""
+    def test_two_entries_sharing_one_id_are_both_reported(self):
+        """There used to be a dedicated cross-watcher duplicate check. Both
+        entries being refused individually is strictly stronger, and this asserts
+        the old hazard cannot reappear as "no issues at all"."""
         cfg, issues = collect_config(write_config("""\
             - {name: w1, rooms: {include: [general]}, session_id: same}
             - {name: w2, rooms: {include: [dev]}, session_id: same}
             """))
         self.assertEqual(len(issues), 2, [i.message for i in issues])
         self.assertEqual(cfg.watcher_rules, [])
-
-
-class TestTheRuleShapeIsUnchanged(unittest.TestCase):
-    """The rule parser already refused `session_id`; this PR must not disturb it."""
-
-    def test_a_rule_still_gets_the_handoff_error(self):
-        with self.assertRaises(ValueError) as cm:
-            GatewayConfig.from_file(write_config("""\
-                - name: eng
-                  rooms: {include: [eng-x]}
-                  session_id: "x"
-                """))
-        msg = str(cm.exception)
-        self.assertIn("Watcher rule at index 0", msg)
-        self.assertIn("session_id", msg)
 
 
 if __name__ == "__main__":

@@ -49,9 +49,9 @@ from .form_common import (
 )
 
 # A watcher template's own field list — reused by TemplateDetailScreen.
-# gateway/config.py forbids {name, room, rooms, session_id} on a watcher
-# template, since each of those pins one SPECIFIC rule's identity (or was
-# removed outright); everything else a rule carries is legitimately
+# gateway/config.py forbids {name, room, rooms} on a watcher template, since
+# each of those pins one SPECIFIC rule's identity; everything else a rule
+# carries is legitimately
 # shareable, which now includes the two session TTLs — they became
 # first-class rule fields at the dynamic-watcher cutover.
 WATCHER_TEMPLATE_FIELDS: tuple[FieldSpec, ...] = (

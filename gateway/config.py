@@ -71,8 +71,8 @@ _REMOVED_DEFAULTS_KEYS: dict[str, str] = {
 # not set — the keys that identify one specific entry, and so cannot be shared
 # by everything inheriting the template.  Passed to _parse_templates_block().
 #
-# This existed as four byte-identical `frozenset({"name", "room", "rooms",
-# "session_id"})` literals (two here, one in config_validate, one inline in the
+# This existed as four byte-identical `frozenset({"name", "room", "rooms"})`
+# literals (two here, one in config_validate, one inline in the
 # config tool) plus a fifth copy in a dict there, with a comment claiming unit
 # tests kept them in sync.  No such test existed, and nothing imported anything
 # — they were four hand-maintained copies of one rule.  The connector and agent
@@ -81,20 +81,17 @@ _REMOVED_DEFAULTS_KEYS: dict[str, str] = {
 # Kind strings are plain ("agent"/"connector"/"watcher"), not the
 # `<kind>_templates` block names, and not the retired `*_defaults` names above.
 #
-# `session_id` stays listed although the field is removed. A template is resolved
-# into each entry before the entry is parsed, so dropping it would report the
-# removal error against every entry that inherits the template and never against the
-# template that actually carries it. Keeping it here reports the template.
+# Every key here is one that names a specific entry. Removed fields are NOT
+# listed: `session_id` used to be, so that a template carrying it was named in
+# the error rather than each entry inheriting it, but a removed field does not
+# earn its own rejection path — it is simply not a key, and the unknown-key
+# check says so. One behaviour for every key nothing accepts, rather than one
+# per field we used to have.
 TEMPLATE_FORBIDDEN_KEYS: dict[str, frozenset[str]] = {
     "connector": frozenset({"name"}),
     "agent": frozenset(),
-    "watcher": frozenset({"name", "room", "rooms", "session_id"}),
+    "watcher": frozenset({"name", "room", "rooms"}),
 }
-
-# Of the keys above, the ones that are removed rather than merely per-entry. The
-# template error distinguishes them, because "set it per-entry" is wrong advice for a
-# field nothing accepts any more.
-REMOVED_ENTRY_KEYS: frozenset[str] = frozenset({"session_id"})
 
 # Single source of truth for history_handoff's per-field defaults: read from
 # HistoryHandoffConfig's OWN dataclass field defaults below, not re-typed as
@@ -273,7 +270,7 @@ class GatewayConfig:
             default_agent = next(iter(agents))
         elif not isinstance(default_agent, str):
             # PR review finding: same class of bug as the per-entity 'name'/
-            # 'type'/'connector'/'agent'/'session_id' checks elsewhere in
+            # 'type'/'connector'/'agent' checks elsewhere in
             # this module — a truthy-but-non-string top-level
             # 'default_agent:' (e.g. a YAML list) reached
             # `default_agent not in agents` (a dict) unchecked, crashing
@@ -338,7 +335,7 @@ class GatewayConfig:
             )
 
         # The cross-watcher duplicate-session_id pass that used to sit here is gone
-        # with the field: `session_id:` is refused per entry above, so no watcher can
+        # with the field: `session_id:` is not a key at all now, so no watcher can
         # carry one and a duplicate cannot exist. The hazard it guarded — two
         # watchers sharing one id, silently overwriting the session→room and
         # session→connector routing maps so permission notifications land in the
@@ -443,35 +440,17 @@ def _parse_templates_block(
             )
         bad = sorted(forbidden_keys & block.keys())
         if bad:
-            # "set it per-entry" is the right advice for name/room/rooms and the
-            # wrong advice for a key that has been removed outright, so the removed
-            # ones are named separately rather than swept into one sentence. A
-            # correct attribution carrying a wrong instruction is worse than no
-            # detail: it sends the operator to move a field that nothing accepts.
-            removed = sorted(k for k in bad if k in REMOVED_ENTRY_KEYS)
-            identity = [k for k in bad if k not in REMOVED_ENTRY_KEYS]
-            parts = []
-            if identity:
-                verb = "identifies" if len(identity) == 1 else "identify"
-                parts.append(
-                    f"{_key_list(identity)} {verb} an individual entry and must "
-                    "be set per-entry, not inherited"
-                )
-            if removed:
-                # The replacement is spelled out here rather than deferred to "the
-                # per-entry error": this branch raises BEFORE inheritance, so that
-                # error never runs for a template-supplied key. Pointing at an error
-                # the operator will never see is worse than saying nothing.
-                verb = "does" if len(removed) == 1 else "do"
-                parts.append(
-                    f"{_key_list(removed)} {verb} not exist at all any more — "
-                    "you cannot pick which conversation an entry uses. To carry "
-                    "work forward instead, have the agent write a summary to a "
-                    "file at the end of a conversation and read it back at the "
-                    "start of the next one (see docs/user-guide.md)"
-                )
+            # One sentence now that removed fields are not listed here: every key
+            # this can report names a specific entry, so the advice is always the
+            # same. The two-branch version existed only to avoid telling someone
+            # to "set it per-entry" for a field nothing accepts.
+            names, supply = (
+                ("those name", "them") if len(bad) > 1 else ("that names", "it")
+            )
             raise ValueError(
-                f"{key}['{name}'] must not set {_key_list(bad)} — " + "; ".join(parts) + "."
+                f"{key}['{name}'] must not set {_key_list(bad)} — {names} one "
+                f"specific entry, so a shared template cannot supply {supply}. "
+                f"Set {supply} on each entry that needs {supply} instead."
             )
         result = dict(block)
         result.pop("description", None)
@@ -1405,16 +1384,6 @@ def _parse_one_watcher_rule(
         raise ValueError(
             f"Watcher rule at index {index}: 'room' cannot be combined with a "
             "'rooms:' block. Move the room into 'rooms.include'."
-        )
-    if "session_id" in wc:
-        raise ValueError(
-            f"Watcher rule at index {index}: 'session_id' is no longer "
-            "supported — you cannot pick which conversation an entry uses. "
-            "To carry work forward instead, have the agent write a summary to "
-            "a file at the end of a conversation and read that file back at "
-            "the start of the next one. That keeps working even when the "
-            "conversation itself is gone, which naming one never did. See "
-            "docs/user-guide.md."
         )
 
     # entry_is_watcher_rule() guarantees this for entries routed here by the

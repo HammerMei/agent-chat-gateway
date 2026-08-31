@@ -456,7 +456,10 @@ class TestCLIConfigValidate(_CLITestBase):
 
         self.assertEqual(code, 0)
         self.assertIn("stale-watcher", stdout)
-        self.assertIn("pruned on the next start", stdout)
+        # Contract, not phrasing: the warning was rewritten in plain language
+        # ("pruned" meant nothing to a reader who had not seen the old format).
+        self.assertIn("older version", stdout)
+        self.assertIn("discard", stdout)
 
 
 class TestCLIConfigMigrateEnv(_CLITestBase):

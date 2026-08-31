@@ -161,7 +161,7 @@ class TestEditableConfigTemplates(_EditableConfigTestBase):
                 server: {url: "$RC_URL", username: bot, password: pw}
             watcher_templates:
               standard:
-                session_id: not-allowed
+                name: not-allowed
             agents:
               default:
                 type: claude
@@ -230,7 +230,7 @@ class TestEditableConfigTemplatesCaching(_EditableConfigTestBase):
                 server: {url: "$RC_URL", username: bot, password: pw}
             watcher_templates:
               standard:
-                session_id: not-allowed
+                name: not-allowed
             agents:
               default:
                 type: claude

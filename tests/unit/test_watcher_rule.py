@@ -237,10 +237,12 @@ class TestParserHardErrors(unittest.TestCase):
     def test_room_cannot_be_combined_with_a_rooms_block(self):
         self._err({**MINIMAL, "room": "eng"}, "cannot be combined")
 
-    def test_session_id_is_rejected_and_names_the_replacement(self):
-        msg = self._err({**MINIMAL, "session_id": "abc"}, "no longer supported")
-        # Contract, not phrasing — see test_session_id_removed.py.
-        self.assertIn("write a summary to a file", msg)
+    def test_session_id_is_rejected_as_an_unknown_key(self):
+        """No dedicated branch any more: the rule shape is a closed key set, so a
+        removed field is reported the same way a typo is. See
+        test_session_id_removed.py for why that replaced a hand-written message."""
+        msg = self._err({**MINIMAL, "session_id": "abc"}, "unknown key(s)")
+        self.assertIn("session_id", msg)
 
     def test_unknown_key_inside_rooms(self):
         msg = self._err({**MINIMAL, "rooms": {"include": ["a"], "directt": True}}, "unknown key")

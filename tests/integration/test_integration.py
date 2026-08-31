@@ -1328,7 +1328,10 @@ class TestDuplicateSessionIdValidation(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(tmp_path)
 
-        self.assertIn("'session_id' is no longer supported", str(ctx.exception))
+        # `session_id` has no dedicated rejection path any more — the closed
+        # rule key set reports it like any other non-key.
+        self.assertIn("session_id", str(ctx.exception))
+        self.assertIn("unknown key(s)", str(ctx.exception))
 
     def test_unique_sticky_session_ids_are_now_refused_too(self):
         """Inverted: uniqueness used to make them legal. The field is gone, so being
@@ -1367,7 +1370,10 @@ class TestDuplicateSessionIdValidation(unittest.TestCase):
 
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(tmp_path)
-        self.assertIn("'session_id' is no longer supported", str(ctx.exception))
+        # `session_id` has no dedicated rejection path any more — the closed
+        # rule key set reports it like any other non-key.
+        self.assertIn("session_id", str(ctx.exception))
+        self.assertIn("unknown key(s)", str(ctx.exception))
 
     def test_no_session_id_watchers_do_not_raise(self):
         """Watchers without sticky session_ids (auto-create) must never trigger the check."""
