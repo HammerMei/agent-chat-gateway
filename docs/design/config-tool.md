@@ -122,7 +122,10 @@ EditableConfig
 ├── entry_template_name(entry) -> str | None   (the entry's own `inherits:` value)
 ├── field_provenance(kind, entry, field) -> EXPLICIT | INHERITED |
 │     EXPLICIT_SUPPRESSING | DEFAULT — resolved against the entry's OWN
-│     `inherits:` template (v0.3 templates/inherits; see docs/migration-0.3.md)
+│     `inherits:` template (v0.3 templates/inherits; see docs/migration-0.3.md).
+│     `field` may be dotted (`rooms.direct`), answered PER SUB-KEY, since
+│     _deep_merge recurses into nested dicts — decided by membership, so an
+│     absent sub-key and one set to `null` stay distinguishable
 ├── merged_entry(kind, entry) -> dict
 │     replays the REAL _resolve_inherits (never reimplemented; the effective value)
 ├── expanded_watchers() -> list[ExpandedWatcher]

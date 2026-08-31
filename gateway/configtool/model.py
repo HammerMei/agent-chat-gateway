@@ -75,15 +75,22 @@ _TEMPLATES_FORBIDDEN_KEYS = TEMPLATE_FORBIDDEN_KEYS
 
 
 class Provenance(Enum):
-    """Where a top-level field's value on an entry actually comes from.
+    """Where one field's value on an entry actually comes from.
 
-    Computed at whole-field granularity (not per-nested-sub-key) — matches
-    how ``_resolve_inherits``/``_deep_merge`` treat nested dicts as a single
-    mergeable unit and lists/scalars as replaced wholesale. A field that is
-    itself a dict (e.g. ``permissions``) is EXPLICIT or INHERITED as a
-    whole; this does not (yet) distinguish "this one sub-key of permissions
-    is overridden while the rest is inherited" — that finer grain isn't
-    needed until a phase that edits nested fields individually exists.
+    Computed at the granularity the MERGE actually has, which for a nested
+    field is per-sub-key: ``_deep_merge`` recurses whenever both sides hold a
+    dict (``gateway/config.py``), so an entry setting ``rooms.direct`` over a
+    template's ``rooms.include`` leaves the include INHERITED and makes only
+    the flag EXPLICIT. Lists and scalars are still replaced wholesale, so
+    ``rooms.include`` is binary — a rule's list does not extend a template's.
+
+    This used to be computed per whole top-level field, justified as matching
+    "``_deep_merge`` treating nested dicts as a single mergeable unit" — which
+    was never true of the merge, and became visible once the nested sub-keys
+    became individually editable and resettable: every field under a `rooms:`
+    block an entry partly set read ``(explicit)``, including the sub-keys the
+    template supplied, and a ctrl+r on one of them could not change that while
+    any sibling remained.
 
     DEFAULT collapses two distinct cases into one enum member: the entry has
     no ``inherits:`` at all, and the entry has ``inherits:`` set but the
@@ -403,16 +410,49 @@ class EditableConfig:
 
         kind: 'connector' | 'agent' | 'watcher' (selects which `*_templates:`
         block the entry's own `inherits:` name is looked up against).
+
+        `field` may be a one-level-nested dotted key (`rooms.direct`,
+        `server.team`, `permissions.timeout`), answered per sub-key because
+        that is how `_deep_merge` merges it — see `Provenance`. Decided by
+        MEMBERSHIP, not by reading the value: a sub-key present with the value
+        `null` suppresses the template's, and a sub-key that is simply absent
+        inherits it, and both read as `None`.
         """
         template_name = self.entry_template_name(entry_raw)
         template = self.templates(kind).get(template_name, {}) if template_name else {}
-        if field in entry_raw:
-            if entry_raw[field] is None and field in template:
+        if "." not in field:
+            if field in entry_raw:
+                if entry_raw[field] is None and field in template:
+                    return Provenance.EXPLICIT_SUPPRESSING
+                return Provenance.EXPLICIT
+            if field in template:
+                return Provenance.INHERITED
+            return Provenance.DEFAULT
+
+        parent_key, sub_key = field.split(".", 1)
+        entry_parent = entry_raw.get(parent_key)
+        template_parent = template.get(parent_key)
+        # `isinstance` on both sides: a hand-edited config (or template) can
+        # hold anything here, and this runs while rendering it.
+        template_has = isinstance(template_parent, dict) and sub_key in template_parent
+
+        if parent_key in entry_raw and not isinstance(entry_parent, dict):
+            # The entry states a non-dict for the whole block — `null`, or a
+            # malformed list. `_deep_merge` only recurses when BOTH sides are
+            # dicts, so this replaces the template's block verbatim and every
+            # sub-key under it is the entry's doing.
+            if entry_parent is None and template_has:
+                return Provenance.EXPLICIT_SUPPRESSING
+            # An explicit `null` over a block the template never set suppresses
+            # nothing, but the entry did write it — reported EXPLICIT, matching
+            # how a top-level `null` with no template value is reported.
+            return Provenance.EXPLICIT
+
+        if isinstance(entry_parent, dict) and sub_key in entry_parent:
+            if entry_parent[sub_key] is None and template_has:
                 return Provenance.EXPLICIT_SUPPRESSING
             return Provenance.EXPLICIT
-        if field in template:
-            return Provenance.INHERITED
-        return Provenance.DEFAULT
+        return Provenance.INHERITED if template_has else Provenance.DEFAULT
 
     # ── Read-only validated view ─────────────────────────────────────────────
 

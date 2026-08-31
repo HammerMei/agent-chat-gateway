@@ -483,8 +483,10 @@ class RuleDetailScreen(FormScreen):
         lines.append("")
 
         for spec in WATCHER_TEMPLATE_FIELDS:
+            # spec.key, not its top half: a nested field's provenance is its
+            # own, since the merge is per sub-key.
+            provenance = self.cfg.field_provenance("watcher", entry, spec.key)
             top_key = spec.key.split(".", 1)[0]
-            provenance = self.cfg.field_provenance("watcher", entry, top_key)
             value = merged.get(top_key)
             if "." in spec.key and isinstance(value, dict):
                 value = value.get(spec.key.split(".", 1)[1])

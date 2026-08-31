@@ -92,6 +92,12 @@ entry sets it directly, `(from '<template>')` if it comes from an
 built-in fallback. Clearing an explicit value back to blank (or `ctrl+r`)
 reverts it to inherited/default — it does **not** write an explicit `null`.
 
+**A nested field answers for itself.** `rooms:`, `server:`, `permissions:`
+and `history_handoff:` are merged sub-key by sub-key, so a rule that sets
+only `rooms.direct` over a template's `rooms.include` shows the flag as
+`(explicit)` and the include as `(from '<template>')` — one block, different
+labels. `ctrl+r` on one sub-key leaves its siblings alone.
+
 Nothing is written to `config.yaml` until you press `ctrl+s`. Save
 validates the whole file first; if your change would introduce a **new**
 problem, it's rejected with the exact error message and nothing is written.

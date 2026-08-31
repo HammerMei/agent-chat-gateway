@@ -706,9 +706,13 @@ class FormScreen(DetailScreen):
         )
 
     def _field_provenance(self, spec: FieldSpec, entry: dict) -> Provenance | None:
-        top_key = spec.key.split(".", 1)[0]
+        # The FULL key, dots included — `field_provenance()` answers a nested
+        # field per sub-key, because that is how the merge treats it. Passing
+        # only the top key reported one verdict for every sub-key of a block,
+        # so a template-supplied `rooms.include` read "(explicit)" next to the
+        # `rooms.direct` the entry had actually set.
         try:
-            return self.cfg.field_provenance(self._template_kind(), entry, top_key)
+            return self.cfg.field_provenance(self._template_kind(), entry, spec.key)
         except (ValueError, FileNotFoundError):
             return None
 
