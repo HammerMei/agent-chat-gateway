@@ -268,7 +268,7 @@ agents:
 
 watcher_rules:
   # ── Watcher rules ─────────────────────────────────────────────────────────
-  # A `watchers:` entry is a RULE: it declares which rooms an agent serves, and
+  # A `watcher_rules:` entry is a RULE: it declares which rooms an agent serves, and
   # the gateway creates each room's watcher on demand — on the room's first
   # message (Rocket.Chat / Mattermost), or eagerly at startup for connectors
   # with no inbound stream (voice / script, whose rules must name literal
@@ -368,22 +368,23 @@ watcher_rules:
 #     inherits: standard
 #     server: {url: "https://chat.example.com", username: "bot-b", password: "bot-b-password"}
 #
-# watchers:
+# watcher_rules:
 #   - {name: bot-a, connector: rc-bot-a, agent: bot-a-agent, rooms: {include: [nest, hammer], direct: true}}
 #   - {name: bot-b, connector: rc-bot-b, agent: bot-b-agent, rooms: {include: [nest, wave], direct: true}}
 #
-# A `watcher_templates:` entry cannot set name/room/rooms (those identify a specific
-# watcher; session_id stays in that list so a template setting the removed field is
-# reported against the template rather than against every entry inheriting it), but
-# can set shared fields like `agent:` or per-rule session TTLs — opted into
-# the same way, via `inherits:` on each watcher:
+# A `watcher_templates:` entry cannot set `name` — that identifies one specific
+# rule — but can set any other rule field, including `rooms:`, opted into the
+# same way, via `inherits:` on each rule. Sharing `rooms:` has a few rules of
+# its own worth reading before you rely on it (a rule's list REPLACES the
+# template's, and a shared `direct: true` leaves every rule but the first with
+# no DMs): see "Templates and `rooms` inheritance" in docs/user-guide.md.
 #
 # watcher_templates:
 #   standard:
 #     agent: my-agent
 #     session_expire_days: 30
 #
-# watchers:
+# watcher_rules:
 #   - {name: bot-a, connector: rc-bot-a, agent: bot-a-agent, rooms: {include: [nest, hammer], direct: true}, inherits: standard}
 #
 # A named template can never itself set `inherits:` (no nested templates),
