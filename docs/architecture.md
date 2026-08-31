@@ -541,7 +541,6 @@ config.yaml (user-editable)
     ├─ connector_templates / agent_templates / watcher_templates  # named; opted into per-entry via inherits:
     ├─ connectors: [ConnectorConfig, ...]
     ├─ agents: {name: AgentConfig, ...}
-    ├─ default_agent: "my-agent"
     ├─ watcher_rules: [WatcherRule, ...]                  # which rooms an agent may serve;
     │                                                     # one WatcherConfig is materialized
     │                                                     # per room as rooms turn up
@@ -911,8 +910,8 @@ agent = ClaudeBackend(command="claude", new_session_args=[], timeout=60)
 agents = {"default": agent}
 
 # Create session manager
-config = CoreConfig(timeout=60, agents=agents, default_agent="default")
-manager = SessionManager(connector, agents, "default", config)
+config = CoreConfig(timeout=60, agents=agents)
+manager = SessionManager(connector, agents, config)
 
 # Simulate conversation
 async def test_agent():

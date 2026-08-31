@@ -134,8 +134,6 @@ connectors:
         - charlie
         - dan
 
-default_agent: claude
-
 agents:
   claude:
     type: claude
@@ -217,8 +215,6 @@ connectors:
     allowed_users:
       owners:
         - alice          # Only you — no guests
-
-default_agent: claude
 
 agents:
   claude:
@@ -332,7 +328,6 @@ agent-chat-gateway start
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `default_agent` | string | No | (none) | Default agent for watchers that don't specify one |
 | `max_queue_depth` | integer | No | 100 | Per-room message queue size; 0 = unlimited |
 | `connectors` | list | Yes | (none) | Chat platform connections |
 | `agents` | dict | Yes | (none) | AI agent backend definitions |
@@ -562,7 +557,7 @@ rest of the rewrite.
 | `rooms.except_for` | list[string] | No | Globs subtracted from this rule's `include` |
 | `rooms.direct` | bool | No | Also serve 1:1 DMs (whole class) |
 | `rooms.group_direct` | bool | No | Also serve group DMs (whole class; mentions required) |
-| `agent` | string | No | Agent backend to use; falls back to `default_agent` if omitted |
+| `agent` | string | **Yes*** | Agent backend this rule's rooms run on. *Required on the rule as it is finally resolved — a rule may take it from its `inherits:` template instead of stating it. There is no implicit default |
 | `session_idle_days` | int | No | Days without a message before the room's runtime is dropped (session kept); default 15 |
 | `session_expire_days` | int | No | Days idle before the record and session are reclaimed entirely; default 15 |
 | `context_inject_files` | list | No | Rule-specific context files (frozen into each created watcher) |
@@ -1111,6 +1106,7 @@ agents:
 
 watcher_rules:
   - name: general
+    agent: claude
     context_inject_files:
       - docs/domain-context.txt      # Layer 3: room-specific context
 ```

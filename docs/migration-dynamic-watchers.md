@@ -44,6 +44,7 @@ New:
 ```yaml
 watcher_rules:
   - name: my-rooms            # required — rules are not auto-named
+    agent: my-agent           # required too — there is no default_agent: any more
     connector: rc-home
     rooms:
       include: [general, dev, ops]
@@ -66,7 +67,7 @@ Field notes:
   watcher_rules:
     - {name: eng, inherits: channels, rooms: {include: ['eng-*']}}
     - {name: ops, inherits: channels, rooms: {include: ['ops-*']}}
-    - {name: dms, connector: rc-home, rooms: {direct: true}}
+    - {name: dms, connector: rc-home, agent: my-agent, rooms: {direct: true}}
   ```
 
   All four `rooms` subkeys inherit, and a rule's own `rooms:` merges over the

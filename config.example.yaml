@@ -322,7 +322,9 @@ watcher_rules:
 
   - name: my-rooms
     connector: rc-home              # must match a connector name above
-    agent: my-agent                 # must match an agent name above
+    agent: my-agent                 # REQUIRED — must match an agent name above
+                                    # (or come from a template via 'inherits:');
+                                    # there is no implicit default agent
     description: "General channel + the admin's DMs"
     rooms:
       include: [general]            # -> creates watcher "rc-home:general" on first message

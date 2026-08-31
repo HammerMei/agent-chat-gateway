@@ -158,9 +158,11 @@ agents:
     working_directory: /path/to/project
 
 watcher_rules:
-  - connector: headless
+  - name: cron
+    connector: headless
     agent: worker
-    room: cron   # never a real room — the script connector has nowhere to post
+    rooms:
+      include: [cron]   # never a real room — the script connector has nowhere to post
 ```
 
 ```bash
