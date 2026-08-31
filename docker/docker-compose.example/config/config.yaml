@@ -95,7 +95,7 @@ agents:
       enabled: true
       timeout: 300
 
-watchers:
+watcher_rules:
   # DM rule — OpenCode agent. DMs have no room name for a pattern to match,
   # so `direct: true` is how a rule claims 1:1 direct messages.
   - name: dm

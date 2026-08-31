@@ -402,7 +402,7 @@ agents:
   default:
     type: claude
     working_directory: /tmp
-watchers: []
+watcher_rules: []
 """
 
     def test_two_connectors_declaring_one_account_are_rejected(self):
@@ -677,7 +677,7 @@ class TestStaticDmWatchersReachTheCheck(unittest.TestCase):
               default:
                 type: claude
                 working_directory: {root}
-            watchers:
+            watcher_rules:
               - name: w1
                 connector: mm-eng
                 rooms:

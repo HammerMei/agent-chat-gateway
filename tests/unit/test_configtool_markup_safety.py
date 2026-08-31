@@ -87,7 +87,7 @@ def _hostile_config(work_dir: Path) -> str:
             description: "desc {SWALLOWED}"
             working_directory: {work_dir}
             context_inject_files: ["ctx-{RAISES}.md"]
-        watchers:
+        watcher_rules:
           - name: "{RAISES}"
             connector: "conn-{SWALLOWED}"
             agent: "agent-{RAISES}"
@@ -358,7 +358,7 @@ class TestNonStringValuesDoNotReachWidgets:
                 type: claude
                 description: {literal}
                 working_directory: {work_dir}
-            watchers:
+            watcher_rules:
               - name: r1
                 connector: rc
                 agent: a1
@@ -418,7 +418,7 @@ class TestNonStringValuesDoNotReachWidgets:
             await pilot.press("ctrl+s")
             await pilot.pause()
             raw = yaml.safe_load(Path(config_path).read_text())
-            entry = raw["watchers"][0]
+            entry = raw["watcher_rules"][0]
             assert entry["rooms"]["include"] == ["general", "dev"]
             assert entry["description"] == ["note"], "the odd value was rewritten"
 

@@ -50,7 +50,7 @@ def write_config(watchers_block: str, extra: str = "") -> str:
         "    type: claude\n"
         "    working_directory: /tmp\n"
         + extra
-        + "watchers:\n"
+        + "watcher_rules:\n"
         + textwrap.indent(textwrap.dedent(watchers_block), "  ")
     )
     with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
@@ -133,14 +133,15 @@ class TestItCannotArriveByInheritance(unittest.TestCase):
         self.assertIn("unknown key(s)", str(cm.exception))
 
     def test_an_identity_key_in_a_template_is_a_different_error(self):
-        """`rooms` and `name` are still rejected by the template loader itself,
-        and that error names the TEMPLATE — the distinction `session_id` used to
-        share and no longer does."""
+        """`name` is still rejected by the template loader itself, and that error
+        names the TEMPLATE — the distinction `session_id` used to share and no
+        longer does. (`rooms` was the other example here until it became
+        inheritable.)"""
         with self.assertRaises(ValueError) as cm:
             GatewayConfig.from_file(
                 write_config(
                     "- {name: w1, inherits: shared, rooms: {include: [general]}}\n",
-                    extra="watcher_templates:\n  shared:\n    rooms: {include: [x]}\n",
+                    extra="watcher_templates:\n  shared:\n    name: nope\n",
                 )
             )
         msg = str(cm.exception)

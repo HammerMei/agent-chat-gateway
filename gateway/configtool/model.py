@@ -97,7 +97,7 @@ class EditableConfig:
     """The raw config.yaml document, kept in its pre-merge, as-authored form.
 
     ``document`` is the literal top-level mapping from ``yaml.safe_load`` —
-    keys like ``connectors``, ``agents``, ``watchers``, ``connector_templates``,
+    keys like ``connectors``, ``agents``, ``watcher_rules``, ``connector_templates``,
     ``tool_presets``, etc. Phase 1 only reads it; later phases mutate it and
     call ``save()``.
     """
@@ -302,15 +302,15 @@ class EditableConfig:
     def watcher_entries(self) -> list:
         """The raw `watchers:` document list ITSELF — the same object living
         in `document` when it is a list (so callers can mutate it), [] when
-        it is anything else. Codex review of #129: `document.get("watchers")
+        it is anything else. Codex review of #129: `document.get("watcher_rules")
         or []` scattered across callers let a malformed scalar through —
-        `watchers: 5` crashed the overview repaint with a TypeError
+        `watcher_rules: 5` crashed the overview repaint with a TypeError
         mid-iteration, and a string produced one bogus row per character.
         EditableConfig.load() deliberately accepts structurally invalid
         documents (that's how the TUI can display their validation errors),
         so the list-ness check has to live on every read — stated once,
         here."""
-        watchers = self.document.get("watchers")
+        watchers = self.document.get("watcher_rules")
         return watchers if isinstance(watchers, list) else []
 
     @property
@@ -417,10 +417,10 @@ class EditableConfig:
 
     # ── Watcher rules (design §5.5's Rules tab) ──────────────────────────────
     #
-    # A `watchers:` entry is a RULE (name + connector + agent + a `rooms:`
+    # A `watcher_rules:` entry is a RULE (name + connector + agent + a `rooms:`
     # matcher), not a room — which rooms it claims is only known at runtime,
     # so there is nothing to "expand" here any more. The Rules tab shows one
-    # row per raw entry, keyed by LIST INDEX: order within `watchers:` is
+    # row per raw entry, keyed by LIST INDEX: order within `watcher_rules:` is
     # load-bearing (first match wins, design §2.1), which is also why rules
     # are displayed in document order and why reordering is a first-class
     # mutation (`move_watcher_rule()` below) rather than an $EDITOR-only
@@ -434,7 +434,7 @@ class EditableConfig:
 
         Returns the rule's new index, or None if the move is a no-op
         (index out of range, already at the edge it would move past, or
-        `watchers:` is not a list at all — see `watcher_entries`).
+        `watcher_rules:` is not a list at all — see `watcher_entries`).
         Calls `mark_dirty()` on an actual move; callers own `save()` —
         same contract as every other document mutation here."""
         watchers = self.watcher_entries

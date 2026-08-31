@@ -306,7 +306,7 @@ class TestCLIConfigValidate(_CLITestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -327,7 +327,7 @@ class TestCLIConfigValidate(_CLITestBase):
             agents:
               default:
                 type: claude
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -349,7 +349,7 @@ class TestCLIConfigValidate(_CLITestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -372,7 +372,7 @@ class TestCLIConfigValidate(_CLITestBase):
                 type: claude
                 working_directory: {self.agent_dir}
                 timeout: 360
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -393,7 +393,7 @@ class TestCLIConfigValidate(_CLITestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -413,7 +413,7 @@ class TestCLIConfigValidate(_CLITestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: two-rooms
                 connector: rc
                 rooms:
@@ -437,7 +437,7 @@ class TestCLIConfigValidate(_CLITestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -504,7 +504,7 @@ class TestCLIConfigMigrateEnv(_CLITestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -524,7 +524,7 @@ class TestCLIConfigMigrateEnv(_CLITestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -549,7 +549,7 @@ class TestCLIConfigMigrateEnv(_CLITestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -576,7 +576,7 @@ class TestCLIConfigMigrateEnv(_CLITestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]

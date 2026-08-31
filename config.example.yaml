@@ -266,7 +266,7 @@ agents:
   #     enabled: true
   #     timeout: 300
 
-watchers:
+watcher_rules:
   # ── Watcher rules ─────────────────────────────────────────────────────────
   # A `watchers:` entry is a RULE: it declares which rooms an agent serves, and
   # the gateway creates each room's watcher on demand — on the room's first

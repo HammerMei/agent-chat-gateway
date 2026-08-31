@@ -69,7 +69,7 @@ class TestExampleAndFixtureConfigsMatchSchema:
         doc = copy.deepcopy(doc)
         doc["connectors"][0]["description"] = "Primary bot"
         doc["agents"]["my-agent"]["description"] = "The main agent"
-        doc["watchers"][0]["description"] = "General channel"
+        doc["watcher_rules"][0]["description"] = "General channel"
         doc["connector_templates"] = {"x": {"description": "Shared connector settings"}}
         doc["agent_templates"] = {"x": {"description": "Shared agent settings"}}
         doc["watcher_templates"] = {"x": {"description": "Shared watcher settings"}}
@@ -92,7 +92,7 @@ class TestRuleShapedWatchersValidate:
 
     def _with_watcher(self, base_doc: dict, entry: dict) -> dict:
         doc = copy.deepcopy(base_doc)
-        doc["watchers"] = [entry]
+        doc["watcher_rules"] = [entry]
         return doc
 
     def _ok(self, validator, base_doc, entry):
@@ -177,12 +177,12 @@ class TestSchemaCatchesKnownMistakes:
 
     def test_typo_top_level_key_is_rejected(self, validator, base_doc):
         bad = copy.deepcopy(base_doc)
-        bad["watchres"] = bad.pop("watchers")
+        bad["watchres"] = bad.pop("watcher_rules")
         assert list(validator.iter_errors(bad))
 
     def test_room_and_rooms_both_set_is_rejected(self, validator, base_doc):
         bad = copy.deepcopy(base_doc)
-        bad["watchers"][0]["room"] = "oops"
+        bad["watcher_rules"][0]["room"] = "oops"
         assert list(validator.iter_errors(bad))
 
     def test_typo_in_tool_rule_key_is_rejected(self, validator, base_doc):
@@ -200,10 +200,23 @@ class TestSchemaCatchesKnownMistakes:
         bad["connector_templates"] = {"x": {"name": "not-allowed"}}
         assert list(validator.iter_errors(bad))
 
-    def test_watcher_template_setting_session_id_is_rejected(self, validator, base_doc):
+    def test_a_rule_entry_setting_session_id_is_rejected(self, validator, base_doc):
+        """`session_id` is not a rule key, so the entry's closed property set
+        catches it. The equivalent check on a `watcher_templates:` entry moved to
+        the loader when `session_id` lost its dedicated rejection path: a
+        template is merged into the entry, and the merged entry is what has a
+        closed key set. See tests/unit/test_session_id_removed.py."""
         bad = copy.deepcopy(base_doc)
-        bad["watcher_templates"] = {"x": {"session_id": "not-allowed"}}
+        bad["watcher_rules"][0]["session_id"] = "not-allowed"
         assert list(validator.iter_errors(bad))
+
+    def test_a_watcher_template_may_supply_rooms(self, validator, base_doc):
+        """The point of the `watcher_rules:` rename: `rooms` is inheritable, so a
+        rule need not carry it and the schema must not require it."""
+        ok = copy.deepcopy(base_doc)
+        ok["watcher_templates"] = {"shared": {"rooms": {"direct": True}}}
+        ok["watcher_rules"] = [{"name": "dms", "inherits": "shared"}]
+        assert not list(validator.iter_errors(ok))
 
     def test_template_setting_inherits_is_rejected(self, validator, base_doc):
         """No nested templates — a template cannot itself set 'inherits'."""
@@ -239,7 +252,7 @@ class TestNullableTTLFields:
     @pytest.mark.parametrize("field", ["session_idle_days", "session_expire_days"])
     def test_explicit_null_on_a_rule_is_schema_valid(self, validator, base_doc, field):
         doc = copy.deepcopy(base_doc)
-        doc["watchers"] = [
+        doc["watcher_rules"] = [
             {"name": "eng", "rooms": {"include": ["eng-*"]}, field: None}
         ]
         errors = list(validator.iter_errors(doc))
@@ -248,7 +261,7 @@ class TestNullableTTLFields:
     @pytest.mark.parametrize("field", ["session_idle_days", "session_expire_days"])
     def test_a_positive_integer_on_a_rule_is_schema_valid(self, validator, base_doc, field):
         doc = copy.deepcopy(base_doc)
-        doc["watchers"] = [
+        doc["watcher_rules"] = [
             {"name": "eng", "rooms": {"include": ["eng-*"]}, field: 7}
         ]
         errors = list(validator.iter_errors(doc))

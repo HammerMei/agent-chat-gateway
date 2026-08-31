@@ -47,7 +47,7 @@ class TestValidateConfigBasics(_ValidateConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -72,7 +72,7 @@ class TestValidateConfigBasics(_ValidateConfigTestBase):
             agents:
               default:
                 type: claude
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -93,7 +93,7 @@ class TestValidateConfigConnectorChecks(_ValidateConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -117,7 +117,7 @@ class TestValidateConfigConnectorChecks(_ValidateConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -136,7 +136,7 @@ class TestValidateConfigConnectorChecks(_ValidateConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -157,7 +157,7 @@ class TestValidateConfigConnectorChecks(_ValidateConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -180,7 +180,7 @@ class TestValidateConfigConnectorChecks(_ValidateConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -200,7 +200,7 @@ class TestValidateConfigConnectorChecks(_ValidateConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -220,7 +220,7 @@ class TestValidateConfigConnectorChecks(_ValidateConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -240,7 +240,7 @@ class TestValidateConfigStateOrphans(_ValidateConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -284,7 +284,7 @@ class TestValidateConfigStateOrphans(_ValidateConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -317,7 +317,7 @@ class TestValidateConfigStateOrphans(_ValidateConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -356,7 +356,7 @@ class TestValidateConfigStateOrphans(_ValidateConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -387,7 +387,7 @@ class TestValidateConfigStateOrphans(_ValidateConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -418,7 +418,7 @@ class TestValidateConfigStateOrphans(_ValidateConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -457,7 +457,7 @@ class TestValidateConfigStateOrphans(_ValidateConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -484,7 +484,7 @@ class TestValidateConfigStateOrphans(_ValidateConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -504,7 +504,7 @@ class TestValidateConfigStateOrphans(_ValidateConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -525,7 +525,7 @@ class TestValidateConfigLint(_ValidateConfigTestBase):
                 type: claude
                 working_directory: {self.agent_dir}
                 timeout: 360
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -544,7 +544,7 @@ class TestValidateConfigLint(_ValidateConfigTestBase):
                 type: claude
                 working_directory: {self.agent_dir}
                 timeout: 360
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -569,7 +569,7 @@ class TestValidateConfigLint(_ValidateConfigTestBase):
               default:
                 inherits: standard
                 timeout: 500
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -597,7 +597,7 @@ class TestValidateConfigLint(_ValidateConfigTestBase):
               default:
                 inherits: standard
                 timeout: 999
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -620,7 +620,7 @@ class TestValidateConfigLint(_ValidateConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -644,7 +644,7 @@ class TestValidateConfigLint(_ValidateConfigTestBase):
                 type: claude
                 description: "The main agent"
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -673,7 +673,7 @@ class TestValidateConfigLint(_ValidateConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -723,7 +723,7 @@ class TestValidateConfigLint(_ValidateConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: [a, b]
                 connector: rc
                 rooms:
@@ -797,7 +797,7 @@ class TestFindingsExtension(_ValidateConfigTestBase):
             agents:
               default:
                 type: claude
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -827,7 +827,7 @@ class TestFindingsExtension(_ValidateConfigTestBase):
                 type: claude
               agent2:
                 type: claude
-            watchers:
+            watcher_rules:
               - connector: rc
                 agent: agent1
                 rooms:
@@ -891,7 +891,7 @@ class TestFindingsExtension(_ValidateConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -913,7 +913,7 @@ class TestFindingsExtension(_ValidateConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -936,7 +936,7 @@ class TestFindingsExtension(_ValidateConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -970,7 +970,7 @@ class TestFindingsExtension(_ValidateConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -1003,7 +1003,7 @@ class TestFindingsExtension(_ValidateConfigTestBase):
                 type: claude
                 working_directory: {self.agent_dir}
                 timeout: 360
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -1027,7 +1027,7 @@ class TestFindingsExtension(_ValidateConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -1051,7 +1051,7 @@ class TestFindingsExtension(_ValidateConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]

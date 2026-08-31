@@ -64,7 +64,7 @@ def _config_with_two_templates(work_dir: Path) -> str:
           - name: rc
             type: rocketchat
             server: {{url: "http://localhost:3000", username: bot, password: pw}}
-        watchers:
+        watcher_rules:
           - connector: rc
             agent: existing-agent
             room: general
@@ -94,7 +94,7 @@ def _config_with_one_agent(work_dir: Path, agent_extra: str = "") -> str:
           - name: rc
             type: rocketchat
             server: {{url: "http://localhost:3000", username: bot, password: pw}}
-        watchers:
+        watcher_rules:
           - connector: rc
             agent: existing-agent
             room: general
@@ -844,7 +844,7 @@ def _config_with_two_agents(work_dir: Path) -> str:
           - name: rc
             type: rocketchat
             server: {{url: "http://localhost:3000", username: bot, password: pw}}
-        watchers:
+        watcher_rules:
           - connector: rc
             agent: existing-agent
             room: general
@@ -1206,7 +1206,7 @@ class TestInheritsPicker:
               - name: rc
                 type: rocketchat
                 server: {{url: "http://localhost:3000", username: bot, password: pw}}
-            watchers:
+            watcher_rules:
               - connector: rc
                 agent: existing-agent
                 room: general

@@ -57,7 +57,7 @@ def _config_with_rules(work_dir: Path) -> str:
           other:
             type: claude
             working_directory: {work_dir}
-        watchers:
+        watcher_rules:
           - name: eng-rooms
             connector: rc
             agent: default
@@ -82,7 +82,7 @@ def _config_with_no_rules(work_dir: Path) -> str:
           default:
             type: claude
             working_directory: {work_dir}
-        watchers: []
+        watcher_rules: []
     """
 
 
@@ -131,7 +131,7 @@ class TestRulesTable:
               default:
                 type: claude
                 working_directory: {work_dir}
-            watchers:
+            watcher_rules:
               - name: good-rule
                 connector: rc
                 agent: default
@@ -179,14 +179,14 @@ class TestRuleReorder:
             await pilot.pause()
 
             raw = yaml.safe_load(Path(config_path).read_text())
-            assert [w["name"] for w in raw["watchers"]] == ["catch-all", "eng-rooms"]
+            assert [w["name"] for w in raw["watcher_rules"]] == ["catch-all", "eng-rooms"]
             # The cursor follows the moved rule to its new position.
             assert table.cursor_row == 1
 
             await pilot.press("[")
             await pilot.pause()
             raw = yaml.safe_load(Path(config_path).read_text())
-            assert [w["name"] for w in raw["watchers"]] == ["eng-rooms", "catch-all"]
+            assert [w["name"] for w in raw["watcher_rules"]] == ["eng-rooms", "catch-all"]
 
     async def test_moving_past_the_edge_is_a_no_op(self, tmp_path, work_dir):
         config_path = _write_config(tmp_path, _config_with_rules(work_dir))
@@ -200,7 +200,7 @@ class TestRuleReorder:
             await pilot.press("[")
             await pilot.pause()
             raw = yaml.safe_load(Path(config_path).read_text())
-            assert [w["name"] for w in raw["watchers"]] == ["eng-rooms", "catch-all"]
+            assert [w["name"] for w in raw["watcher_rules"]] == ["eng-rooms", "catch-all"]
 
 
 class TestRuleCreate:
@@ -225,7 +225,7 @@ class TestRuleCreate:
 
             assert isinstance(app.screen, OverviewScreen)
             raw = yaml.safe_load(Path(config_path).read_text())
-            (entry,) = raw["watchers"]
+            (entry,) = raw["watcher_rules"]
             assert entry["name"] == "my-rule"
             # connector/agent are written EXPLICITLY even untouched — never
             # left to the loader's config-order-dependent fallback.
@@ -250,7 +250,7 @@ class TestRuleCreate:
 
             assert isinstance(app.screen, OverviewScreen)
             raw = yaml.safe_load(Path(config_path).read_text())
-            (entry,) = raw["watchers"]
+            (entry,) = raw["watcher_rules"]
             assert entry["rooms"] == {"direct": True}
 
     async def test_a_rule_with_no_name_is_refused_with_a_message(self, tmp_path, work_dir):
@@ -272,7 +272,7 @@ class TestRuleCreate:
             await pilot.pause()
             assert isinstance(app.screen, RuleDetailScreen)
             raw = yaml.safe_load(Path(config_path).read_text())
-            assert raw["watchers"] == []
+            assert raw["watcher_rules"] == []
 
     async def test_a_rule_that_can_never_match_is_refused_before_the_generic_gate(
         self, tmp_path, work_dir
@@ -314,7 +314,7 @@ class TestRuleCreate:
             await pilot.press("enter")
             await pilot.pause()
             raw = yaml.safe_load(Path(config_path).read_text())
-            assert len(raw["watchers"]) == 2  # nothing phantom appended
+            assert len(raw["watcher_rules"]) == 2  # nothing phantom appended
 
 
 class TestRuleEdit:
@@ -336,9 +336,9 @@ class TestRuleEdit:
 
             assert isinstance(app.screen, OverviewScreen)
             raw = yaml.safe_load(Path(config_path).read_text())
-            assert raw["watchers"][0]["rooms"]["include"] == ["eng-*", "ops-*"]
+            assert raw["watcher_rules"][0]["rooms"]["include"] == ["eng-*", "ops-*"]
             # Still exactly two entries, order untouched.
-            assert [w["name"] for w in raw["watchers"]] == ["eng-rooms", "catch-all"]
+            assert [w["name"] for w in raw["watcher_rules"]] == ["eng-rooms", "catch-all"]
 
     async def test_renaming_a_rule_keeps_its_position_and_other_fields(
         self, tmp_path, work_dir
@@ -356,8 +356,8 @@ class TestRuleEdit:
 
             assert isinstance(app.screen, OverviewScreen)
             raw = yaml.safe_load(Path(config_path).read_text())
-            assert [w["name"] for w in raw["watchers"]] == ["engineering", "catch-all"]
-            assert raw["watchers"][0]["rooms"] == {"include": ["eng-*"]}
+            assert [w["name"] for w in raw["watcher_rules"]] == ["engineering", "catch-all"]
+            assert raw["watcher_rules"][0]["rooms"] == {"include": ["eng-*"]}
 
     async def test_renaming_onto_an_existing_name_is_refused_and_rolls_back(
         self, tmp_path, work_dir
@@ -380,7 +380,7 @@ class TestRuleEdit:
             # Nothing reached memory or disk.
             assert app.editable_config.watchers_raw[0]["name"] == "eng-rooms"
             raw = yaml.safe_load(Path(config_path).read_text())
-            assert raw["watchers"][0]["name"] == "eng-rooms"
+            assert raw["watcher_rules"][0]["name"] == "eng-rooms"
 
     async def test_a_rejected_save_leaves_the_document_clean_for_a_retry(
         self, tmp_path, work_dir
@@ -411,7 +411,7 @@ class TestRuleEdit:
             await pilot.pause()
             assert isinstance(app.screen, OverviewScreen)
             raw = yaml.safe_load(Path(config_path).read_text())
-            assert raw["watchers"][0]["rooms"]["except_for"] == ["eng-noise"]
+            assert raw["watcher_rules"][0]["rooms"]["except_for"] == ["eng-noise"]
 
     async def test_the_session_ttls_are_editable_rule_fields(self, tmp_path, work_dir):
         config_path = _write_config(tmp_path, _config_with_rules(work_dir))
@@ -427,7 +427,7 @@ class TestRuleEdit:
 
             assert isinstance(app.screen, OverviewScreen)
             raw = yaml.safe_load(Path(config_path).read_text())
-            assert raw["watchers"][0]["session_idle_days"] == 30
+            assert raw["watcher_rules"][0]["session_idle_days"] == 30
 
 
 class TestRuleView:
@@ -460,7 +460,7 @@ class TestRuleDelete:
 
             assert isinstance(app.screen, OverviewScreen)
             raw = yaml.safe_load(Path(config_path).read_text())
-            assert [w["name"] for w in raw["watchers"]] == ["catch-all"]
+            assert [w["name"] for w in raw["watcher_rules"]] == ["catch-all"]
 
     async def test_the_delete_confirm_warns_with_the_stranded_counts(
         self, tmp_path, work_dir, monkeypatch
@@ -545,7 +545,7 @@ class TestReorderAroundABrokenRule:
               default:
                 type: claude
                 working_directory: {work_dir}
-            watchers:
+            watcher_rules:
               - name: good-rule
                 connector: rc
                 agent: default
@@ -569,7 +569,7 @@ class TestReorderAroundABrokenRule:
 
             # Refused and swapped back — disk and memory both untouched.
             raw = yaml.safe_load(Path(config_path).read_text())
-            assert [w["name"] for w in raw["watchers"]] == ["good-rule", "broken-rule"]
+            assert [w["name"] for w in raw["watcher_rules"]] == ["good-rule", "broken-rule"]
             assert [w["name"] for w in app.editable_config.watchers_raw] == [
                 "good-rule", "broken-rule",
             ]
@@ -589,7 +589,7 @@ class TestEmptyPrerequisiteGuards:
               default:
                 type: claude
                 working_directory: {work_dir}
-            watchers:
+            watcher_rules:
               - name: orphan-rule
                 connector: rc-gone
                 agent: default
@@ -660,7 +660,7 @@ class TestCodexRound1Fixes:
               zother:
                 type: claude
                 working_directory: {work_dir}
-            watchers: []
+            watcher_rules: []
         """)
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
@@ -676,7 +676,7 @@ class TestCodexRound1Fixes:
 
             assert isinstance(app.screen, OverviewScreen)
             raw = yaml.safe_load(Path(config_path).read_text())
-            (entry,) = raw["watchers"]
+            (entry,) = raw["watcher_rules"]
             assert entry["agent"] == "zother"
 
     async def test_a_typed_name_survives_an_inherits_template_switch(
@@ -698,7 +698,7 @@ class TestCodexRound1Fixes:
               default:
                 type: claude
                 working_directory: {work_dir}
-            watchers: []
+            watcher_rules: []
         """)
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
@@ -741,7 +741,7 @@ class TestCodexRound1Fixes:
               default:
                 type: claude
                 working_directory: {work_dir}
-            watchers:
+            watcher_rules:
               - name: " padded "
                 connector: rc
                 agent: default
@@ -760,7 +760,7 @@ class TestCodexRound1Fixes:
     async def test_a_malformed_watchers_scalar_renders_zero_rows_and_move_is_a_no_op(
         self, tmp_path, work_dir
     ):
-        """Codex review of #129 (P2): `watchers: 5` parses as YAML but is
+        """Codex review of #129 (P2): `watcher_rules: 5` parses as YAML but is
         not a list — iterating it crashed the overview repaint with a
         TypeError, and `[`/`]` crashed move_watcher_rule. Normalized to an
         empty view everywhere (EditableConfig.watcher_entries); the banner
@@ -774,7 +774,7 @@ class TestCodexRound1Fixes:
               default:
                 type: claude
                 working_directory: {work_dir}
-            watchers: 5
+            watcher_rules: 5
         """)
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
@@ -788,7 +788,7 @@ class TestCodexRound1Fixes:
             assert app.is_running is True
             # Nothing was written — the scalar is still on disk, untouched.
             raw = yaml.safe_load(Path(config_path).read_text())
-            assert raw["watchers"] == 5
+            assert raw["watcher_rules"] == 5
 
 
 class TestCodexRound2Fixes:
@@ -805,7 +805,7 @@ class TestCodexRound2Fixes:
               default:
                 type: claude
                 working_directory: {work_dir}
-            watchers:
+            watcher_rules:
               - name: old-name
                 connector: rc
                 agent: default
@@ -854,7 +854,7 @@ class TestCodexRound3Fixes:
     async def test_creating_over_a_mapping_watchers_block_is_refused_not_overwritten(
         self, tmp_path, work_dir
     ):
-        """Codex round 3: `watchers:` as a MAPPING (an operator omitted the
+        """Codex round 3: `watcher_rules:` as a MAPPING (an operator omitted the
         '-' before an otherwise complete rule) holds recoverable data —
         normalizing it to [] and appending would pass the save gate (the
         structural error vanishes with the data) and silently delete the
@@ -868,7 +868,7 @@ class TestCodexRound3Fixes:
               default:
                 type: claude
                 working_directory: {work_dir}
-            watchers:
+            watcher_rules:
               name: forgot-the-dash
               connector: rc
               agent: default
@@ -894,7 +894,7 @@ class TestCodexRound3Fixes:
             await pilot.pause()
             # The mapping — the user's recoverable rule — is untouched.
             raw = yaml.safe_load(Path(config_path).read_text())
-            assert raw["watchers"]["name"] == "forgot-the-dash"
+            assert raw["watcher_rules"]["name"] == "forgot-the-dash"
 
     def _config_with_a_garbage_entry(self, work_dir: Path) -> str:
         return f"""\
@@ -906,7 +906,7 @@ class TestCodexRound3Fixes:
               default:
                 type: claude
                 working_directory: {work_dir}
-            watchers:
+            watcher_rules:
               - "stray yaml, not a mapping"
               - name: good-rule
                 connector: rc
@@ -935,7 +935,7 @@ class TestCodexRound3Fixes:
             await pilot.pause()
 
             raw = yaml.safe_load(Path(config_path).read_text())
-            assert [w.get("name") for w in raw["watchers"]] == ["good-rule"]
+            assert [w.get("name") for w in raw["watcher_rules"]] == ["good-rule"]
 
     async def test_enter_and_e_on_a_non_mapping_entry_notify_instead_of_dead_keys(
         self, tmp_path, work_dir
@@ -974,7 +974,7 @@ class TestCodexRound4Fixes:
               default:
                 type: claude
                 working_directory: {work_dir}
-            watchers:
+            watcher_rules:
               - name: broken-list
                 connector: rc
                 agent: default
@@ -1010,7 +1010,7 @@ class TestCodexRound4Fixes:
               default:
                 type: claude
                 working_directory: {work_dir}
-            watchers:
+            watcher_rules:
               - "stray yaml, not a mapping"
               - name: also-broken
                 connector: rc
@@ -1038,8 +1038,8 @@ class TestCodexRound4Fixes:
             await pilot.pause()
             # Rolled back — the garbage row is still there, nothing written.
             raw = yaml.safe_load(Path(config_path).read_text())
-            assert len(raw["watchers"]) == 2
-            assert raw["watchers"][0] == "stray yaml, not a mapping"
+            assert len(raw["watcher_rules"]) == 2
+            assert raw["watcher_rules"][0] == "stray yaml, not a mapping"
 
     async def test_deleting_the_lowest_broken_row_succeeds(self, tmp_path, work_dir):
         """The other half of the documented order: bottom-up works."""
@@ -1052,7 +1052,7 @@ class TestCodexRound4Fixes:
               default:
                 type: claude
                 working_directory: {work_dir}
-            watchers:
+            watcher_rules:
               - name: good-rule
                 connector: rc
                 agent: default
@@ -1074,7 +1074,7 @@ class TestCodexRound4Fixes:
             await pilot.pause()
 
             raw = yaml.safe_load(Path(config_path).read_text())
-            assert [w.get("name") for w in raw["watchers"]] == ["good-rule"]
+            assert [w.get("name") for w in raw["watcher_rules"]] == ["good-rule"]
 
 
 class TestCodexRound5Fixes:
@@ -1097,7 +1097,7 @@ class TestCodexRound5Fixes:
               default:
                 type: claude
                 working_directory: {work_dir}
-            watchers:
+            watcher_rules:
               - name: inert-rule
                 connector: rc
                 agent: default
@@ -1117,7 +1117,7 @@ class TestCodexRound5Fixes:
             await pilot.pause()
 
             raw = yaml.safe_load(Path(config_path).read_text())
-            entry = raw["watchers"][0]
+            entry = raw["watcher_rules"][0]
             assert entry["description"] == "a note"       # the real edit landed
             assert entry["session_idle_days"] == "15"     # still quoted, still inert
             # And it is still reported as broken, not silently repaired.
@@ -1142,7 +1142,7 @@ class TestCodexRound5Fixes:
               default:
                 type: claude
                 working_directory: {work_dir}
-            watchers:
+            watcher_rules:
               - name: comma-rule
                 connector: rc
                 agent: default
@@ -1159,7 +1159,7 @@ class TestCodexRound5Fixes:
             await pilot.pause()
 
             raw = yaml.safe_load(Path(config_path).read_text())
-            entry = raw["watchers"][0]
+            entry = raw["watcher_rules"][0]
             assert entry["description"] == "a note"
             assert entry["rooms"]["include"] == ["team,one"]  # NOT split
 
@@ -1178,7 +1178,7 @@ class TestCodexRound5Fixes:
               default:
                 type: claude
                 working_directory: {work_dir}
-            watchers:
+            watcher_rules:
               - name: "[/]"
                 connector: rc
                 agent: default
@@ -1214,7 +1214,7 @@ class TestCodexRound5Fixes:
               default:
                 type: claude
                 working_directory: {work_dir}
-            watchers:
+            watcher_rules:
               - name: class-rule
                 connector: rc
                 agent: default
@@ -1254,7 +1254,7 @@ class TestCodexRound6Fixes:
               default:
                 type: claude
                 working_directory: {work_dir}
-            watchers:
+            watcher_rules:
               - name: comma-rule
                 connector: rc
                 agent: default
@@ -1286,7 +1286,7 @@ class TestCodexRound6Fixes:
             await pilot.pause()
             # Nothing written — the original single pattern survives intact.
             raw = yaml.safe_load(Path(config_path).read_text())
-            assert raw["watchers"][0]["rooms"]["include"] == ["team,one"]
+            assert raw["watcher_rules"][0]["rooms"]["include"] == ["team,one"]
 
     async def test_editing_a_comma_bearing_context_file_is_refused(
         self, tmp_path, work_dir
@@ -1317,7 +1317,7 @@ class TestCodexRound6Fixes:
             await pilot.press("enter")
             await pilot.pause()
             raw = yaml.safe_load(Path(config_path).read_text())
-            assert raw["watchers"][0]["context_inject_files"] == ["my,notes.md"]
+            assert raw["watcher_rules"][0]["context_inject_files"] == ["my,notes.md"]
 
     async def test_an_ordinary_list_field_still_edits_normally(
         self, tmp_path, work_dir
@@ -1339,7 +1339,7 @@ class TestCodexRound6Fixes:
 
             assert isinstance(app.screen, OverviewScreen)
             raw = yaml.safe_load(Path(config_path).read_text())
-            assert raw["watchers"][0]["rooms"]["include"] == ["general", "dev"]
+            assert raw["watcher_rules"][0]["rooms"]["include"] == ["general", "dev"]
 
 
 class TestCodexRound7Fixes:
@@ -1365,7 +1365,7 @@ class TestCodexRound7Fixes:
               default:
                 type: claude
                 working_directory: {work_dir}
-            watchers:
+            watcher_rules:
               - name: hostile-path
                 connector: rc
                 agent: default
@@ -1407,7 +1407,7 @@ class TestCodexRound8Fixes:
               default:
                 type: claude
                 working_directory: {work_dir}
-            watchers:
+            watcher_rules:
               - name: good-rule
                 connector: rc
                 agent: default
@@ -1431,7 +1431,7 @@ class TestCodexRound8Fixes:
             await pilot.pause()
 
             raw = yaml.safe_load(Path(config_path).read_text())
-            assert [w["name"] for w in raw["watchers"]] == ["good-rule", "broken-rule"]
+            assert [w["name"] for w in raw["watcher_rules"]] == ["good-rule", "broken-rule"]
             assert app.editable_config.dirty is False, (
                 "a rolled-back move must not leave the config looking edited"
             )
@@ -1448,7 +1448,7 @@ class TestCodexRound8Fixes:
               default:
                 type: claude
                 working_directory: {work_dir}
-            watchers:
+            watcher_rules:
               - "stray yaml, not a mapping"
               - name: also-broken
                 connector: rc
@@ -1482,7 +1482,7 @@ class TestCodexRound10Fixes:
         `cfg.dirty` set, so quitting offered to discard changes that no
         longer existed. This site is MINE and I missed it when scoping
         round 8's fix (the pre-existing siblings are issue #131). A
-        rejected CREATE also left an empty `watchers: []` where the key had
+        rejected CREATE also left an empty `watcher_rules: []` where the key had
         been absent."""
         config_path = _write_config(tmp_path, f"""\
             connectors:
@@ -1497,7 +1497,7 @@ class TestCodexRound10Fixes:
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            assert "watchers" not in app.editable_config.document
+            assert "watcher_rules" not in app.editable_config.document
             await _open_rules_tab(pilot, app)
             await pilot.press("n")
             await pilot.pause()
@@ -1515,7 +1515,7 @@ class TestCodexRound10Fixes:
             assert app.editable_config.dirty is False, (
                 "a rejected save must not leave the config looking edited"
             )
-            assert "watchers" not in app.editable_config.document, (
+            assert "watcher_rules" not in app.editable_config.document, (
                 "a rejected create must not leave an empty watchers list behind"
             )
 
@@ -1536,7 +1536,7 @@ class TestCodexRound10Fixes:
               default:
                 type: claude
                 working_directory: {work_dir}
-            watchers:
+            watcher_rules:
               - name: r1
                 connector: rc
                 agent: default
@@ -1560,8 +1560,8 @@ class TestCodexRound10Fixes:
 
 class TestCodexRound11Fixes:
     """A rejected create must restore the document EXACTLY as loaded —
-    including the difference between an absent `watchers:` key and an
-    explicit `watchers:` (null), which `.get()` cannot tell apart."""
+    including the difference between an absent `watcher_rules:` key and an
+    explicit `watcher_rules:` (null), which `.get()` cannot tell apart."""
 
     def _config(self, work_dir: Path, watchers_line: str) -> str:
         return f"""\
@@ -1596,19 +1596,19 @@ class TestCodexRound11Fixes:
     ):
         """Round 10 popped the key here, because `.get()` reports None for
         an explicit null exactly as it does for an absent key — so the
-        operator's own `watchers:` line would have vanished from the file on
+        operator's own `watcher_rules:` line would have vanished from the file on
         the next unrelated successful save."""
-        config_path = _write_config(tmp_path, self._config(work_dir, "            watchers:"))
+        config_path = _write_config(tmp_path, self._config(work_dir, "            watcher_rules:"))
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            assert "watchers" in app.editable_config.document
-            assert app.editable_config.document["watchers"] is None
+            assert "watcher_rules" in app.editable_config.document
+            assert app.editable_config.document["watcher_rules"] is None
             await self._reject_a_create(pilot, app)
 
             doc = app.editable_config.document
-            assert "watchers" in doc, "the explicit key was popped"
-            assert doc["watchers"] is None, "the explicit null was replaced"
+            assert "watcher_rules" in doc, "the explicit key was popped"
+            assert doc["watcher_rules"] is None, "the explicit null was replaced"
             assert app.editable_config.dirty is False
 
     async def test_an_absent_watchers_key_stays_absent_after_a_rejected_create(
@@ -1620,7 +1620,7 @@ class TestCodexRound11Fixes:
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            assert "watchers" not in app.editable_config.document
+            assert "watcher_rules" not in app.editable_config.document
             await self._reject_a_create(pilot, app)
-            assert "watchers" not in app.editable_config.document
+            assert "watcher_rules" not in app.editable_config.document
             assert app.editable_config.dirty is False

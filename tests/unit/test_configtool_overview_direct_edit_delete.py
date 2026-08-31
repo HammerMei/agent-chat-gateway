@@ -52,7 +52,7 @@ def _config_with_two_connectors(work_dir: Path) -> str:
           - name: rc-orphan
             type: rocketchat
             server: {{url: "http://localhost:3001", username: bot2, password: pw2}}
-        watchers:
+        watcher_rules:
           - name: main-rule
             connector: rc-referenced
             agent: default
@@ -75,7 +75,7 @@ def _config_with_two_agents(work_dir: Path) -> str:
           - name: rc
             type: rocketchat
             server: {{url: "http://localhost:3000", username: bot, password: pw}}
-        watchers:
+        watcher_rules:
           - connector: rc
             agent: existing-agent
             room: general
@@ -95,7 +95,7 @@ def _config_with_a_preset(work_dir: Path) -> str:
           - name: rc
             type: rocketchat
             server: {{url: "http://localhost:3000", username: bot, password: pw}}
-        watchers:
+        watcher_rules:
           - connector: rc
             agent: default
             room: general

@@ -143,7 +143,7 @@ class TestGenerateConfigYaml:
 
         assert "connectors" in config
         assert "agents" in config
-        assert "watchers" in config
+        assert "watcher_rules" in config
 
         connector = config["connectors"][0]
         assert connector["type"] == "rocketchat"
@@ -158,7 +158,7 @@ class TestGenerateConfigYaml:
 
         # A single watcher RULE: an @username room becomes the 1:1-DM opt-in,
         # since DMs have no name for a pattern to match (§2.6).
-        watcher = config["watchers"][0]
+        watcher = config["watcher_rules"][0]
         assert watcher["connector"] == "rc-home"
         assert watcher["agent"] == "my-agent"
         assert watcher["rooms"] == {"direct": True}
@@ -217,8 +217,8 @@ class TestGenerateConfigYaml:
         result = generate_config_yaml("claude", "rocketchat", connector_data, watchers)
         config = self._parse(result)
 
-        assert len(config["watchers"]) == 1
-        assert config["watchers"][0]["rooms"] == {
+        assert len(config["watcher_rules"]) == 1
+        assert config["watcher_rules"][0]["rooms"] == {
             "include": ["general", "dev"], "direct": True}
 
     def test_generate_config_yaml_multiple_owners(self):
@@ -263,7 +263,7 @@ class TestGenerateConfigYaml:
         watchers = [{"name": "dm-alice", "room": "@alice"}]
         result = generate_config_yaml("claude", "rocketchat", connector_data, watchers)
         config = self._parse(result)
-        w = config["watchers"][0]
+        w = config["watcher_rules"][0]
         # A rule REQUIRES a name (rules are not auto-named), so it is the one
         # identity field the generator must write.
         assert w["name"] == "my-rooms"
@@ -620,7 +620,7 @@ class TestRunOnboard:
         config = yaml.safe_load(config_file.read_text())
         assert "connectors" in config
         assert "agents" in config
-        assert "watchers" in config
+        assert "watcher_rules" in config
 
         # config.yaml is chmod'd 0600 immediately — it holds the plaintext
         # credentials directly now.

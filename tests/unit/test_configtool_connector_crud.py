@@ -51,7 +51,7 @@ def _config_with_one_rocketchat_connector(work_dir: Path, password: str = "pw") 
           - name: rc-existing
             type: rocketchat
             server: {{url: "http://localhost:3000", username: bot, password: "{password}"}}
-        watchers:
+        watcher_rules:
           - connector: rc-existing
             agent: default
             room: general
@@ -252,7 +252,7 @@ class TestCreateConnector:
                 type: mattermost
                 server: {{url: "http://mm.local", team: t, username: glin, password: pw}}
                 allowed_users: {{owners: [glin, josie]}}
-            watchers:
+            watcher_rules:
               - connector: mm
                 agent: default
                 room: general
@@ -341,7 +341,7 @@ class TestCreateConnector:
                 type: mattermost
                 server: {{url: "http://mm.local", team: t, token: "old-stale-token",
                           username: bob, password: pw123}}
-            watchers:
+            watcher_rules:
               - connector: mm-both
                 agent: default
                 room: general
@@ -513,7 +513,7 @@ class TestEditConnector:
                     inherits: standard
                     type: rocketchat
                     server: {{url: "http://localhost:3000", username: bot, password: pw}}
-                watchers:
+                watcher_rules:
                   - connector: rc-existing
                     agent: default
                     room: general
@@ -560,7 +560,7 @@ class TestEditConnector:
                   - name: mm-existing
                     inherits: standard
                     server: {{url: "http://localhost:3000", team: t, username: bot, password: pw}}
-                watchers:
+                watcher_rules:
                   - connector: mm-existing
                     agent: default
                     room: general
@@ -673,7 +673,7 @@ def _config_with_two_connectors(work_dir: Path) -> str:
           - name: rc-orphan
             type: rocketchat
             server: {{url: "http://localhost:3001", username: bot2, password: pw2}}
-        watchers:
+        watcher_rules:
           - connector: rc-referenced
             agent: default
             room: general
@@ -833,7 +833,7 @@ def _config_with_two_connector_templates(work_dir: Path) -> str:
           - name: rc-existing
             inherits: standard
             server: {{url: "http://localhost:3000", username: bot, password: pw}}
-        watchers:
+        watcher_rules:
           - connector: rc-existing
             agent: default
             room: general
@@ -949,7 +949,7 @@ class TestConnectorInheritsPicker:
                 type: rocketchat
                 inherits: standard
                 server: {{url: "http://localhost:3000", username: bot, password: pw}}
-            watchers:
+            watcher_rules:
               - connector: rc-existing
                 agent: default
                 room: general

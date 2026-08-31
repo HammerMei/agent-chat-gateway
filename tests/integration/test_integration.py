@@ -1310,7 +1310,7 @@ class TestDuplicateSessionIdValidation(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -1353,7 +1353,7 @@ class TestDuplicateSessionIdValidation(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -1394,7 +1394,7 @@ class TestDuplicateSessionIdValidation(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]

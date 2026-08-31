@@ -243,7 +243,7 @@ class TestValidateReportsWhatBlocksTheBoot(unittest.TestCase):
               default:
                 type: claude
                 working_directory: {self.root}
-            watchers:
+            watcher_rules:
               - name: w1
                 connector: rc
                 rooms:
@@ -316,7 +316,7 @@ class TestConfigRefusesARoomTwice(unittest.TestCase):
               default:
                 type: claude
                 working_directory: {{root}}
-            watchers:
+            watcher_rules:
               - name: w1
                 connector: rc
                 rooms:

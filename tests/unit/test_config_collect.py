@@ -49,7 +49,7 @@ class TestCollectConfigPartialProgressPreserved(_CollectConfigTestBase):
                 type: claude
                 working_directory: {self.agent_dir}
             default_agent: broken_default
-            watchers:
+            watcher_rules:
               - connector: rc1
                 agent: other_agent
                 rooms:
@@ -58,7 +58,6 @@ class TestCollectConfigPartialProgressPreserved(_CollectConfigTestBase):
         config, issues = collect_config(config_path)
         self.assertIsNotNone(config)
         self.assertEqual([c.name for c in config.connectors], ["rc1"])
-        self.assertEqual(config.watchers, [])  # can't safely expand without a valid default_agent
         self.assertTrue(
             any("default_agent" in i.message and i.entity_kind == "global" for i in issues)
         )
@@ -102,13 +101,12 @@ class TestCollectConfigPartialProgressPreserved(_CollectConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers: {{not: a-list}}
+            watcher_rules: {{not: a-list}}
         """)
         config, issues = collect_config(config_path)
         self.assertIsNotNone(config)
         self.assertEqual([c.name for c in config.connectors], ["rc1"])
         self.assertEqual(list(config.agents), ["default"])
-        self.assertEqual(config.watchers, [])
 
     def test_malformed_watchers_block_still_keeps_a_valid_max_queue_depth_and_scheduler(self):
         """PR review finding: every structural early-return branch above
@@ -128,7 +126,7 @@ class TestCollectConfigPartialProgressPreserved(_CollectConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers: {{not: a-list}}
+            watcher_rules: {{not: a-list}}
             max_queue_depth: 42
             scheduler:
               completed_job_ttl_days: 30
@@ -177,7 +175,7 @@ class TestCollectConfigNonStringScalarFields(_CollectConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -197,7 +195,7 @@ class TestCollectConfigNonStringScalarFields(_CollectConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -218,7 +216,7 @@ class TestCollectConfigNonStringScalarFields(_CollectConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [12345]
@@ -238,7 +236,7 @@ class TestCollectConfigNonStringScalarFields(_CollectConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -297,7 +295,7 @@ class TestCollectConfigNonStringNameHint(_CollectConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -321,7 +319,7 @@ class TestCollectConfigNonStringNameHint(_CollectConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: [a, b]
                 connector: rc
         """)
@@ -357,7 +355,7 @@ class TestCollectConfigQueueSchedulerSessionId(_CollectConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 connector: rc
                 agent: default
@@ -398,7 +396,7 @@ class TestCollectConfigQueueSchedulerSessionId(_CollectConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 connector: rc
                 agent: default
@@ -451,7 +449,7 @@ class TestCollectConfigOnTheFlyWatcherFields(_CollectConfigTestBase):
                 type: claude
                 working_directory: {self.agent_dir}
                 session_idle_days: 30
-            watchers:
+            watcher_rules:
               - rooms:
                   include: [general]
         """)
@@ -465,7 +463,7 @@ class TestCollectConfigOnTheFlyWatcherFields(_CollectConfigTestBase):
         # lives now, and does so as an attributed agent issue.
         msg = agent_issues[0].message
         self.assertIn("session_idle_days", msg)
-        self.assertIn("'watchers:'", msg)
+        self.assertIn("'watcher_rules:'", msg)
 
     def test_wildcard_room_is_a_collected_watcher_issue(self):
         config_path = self._write(f"""\
@@ -477,7 +475,7 @@ class TestCollectConfigOnTheFlyWatcherFields(_CollectConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - connector: rc
                 agent: default
                 rooms:
@@ -516,7 +514,7 @@ class TestExplicitNullWatchersBlock(_CollectConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:{literal}
+            watcher_rules:{literal}
         """)
 
     def test_an_explicit_null_is_treated_as_no_watchers(self):
@@ -536,10 +534,10 @@ class TestExplicitNullWatchersBlock(_CollectConfigTestBase):
             with self.subTest(literal=literal):
                 config, issues = collect_config(self._with_watchers(literal))
                 self.assertTrue(
-                    any("'watchers:' must be a list" in i.message for i in issues),
+                    any("'watcher_rules:' must be a list" in i.message for i in issues),
                     [i.message for i in issues],
                 )
 
     def test_a_truthy_non_list_is_unchanged(self):
         config, issues = collect_config(self._with_watchers(" 5"))
-        self.assertTrue(any("'watchers:' must be a list" in i.message for i in issues))
+        self.assertTrue(any("'watcher_rules:' must be a list" in i.message for i in issues))

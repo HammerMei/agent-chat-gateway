@@ -16,7 +16,6 @@ from pathlib import Path
 
 from gateway.config import (
     _parse_one_watcher_rule,
-    entry_is_watcher_rule,
     find_shadowed_rules,
 )
 from gateway.core.config import AgentConfig, ConnectorConfig
@@ -62,26 +61,14 @@ def rule(name="r", connector="mm-home", **rooms) -> WatcherRule:
 MINIMAL = {"name": "eng", "connector": "mm-home", "rooms": {"include": ["eng-*"]}}
 
 
-class TestShapeDiscrimination(unittest.TestCase):
-    """The two shapes must be distinguishable without heuristics."""
 
-    def test_mapping_rooms_is_a_rule(self):
-        self.assertTrue(entry_is_watcher_rule({"rooms": {"include": ["a"]}}))
-
-    def test_list_rooms_is_the_old_shorthand(self):
-        self.assertFalse(entry_is_watcher_rule({"rooms": ["a", "b"]}))
-
-    def test_single_room_is_static(self):
-        self.assertFalse(entry_is_watcher_rule({"room": "a"}))
-
-    def test_an_empty_rooms_mapping_still_reads_as_a_rule(self):
-        """So it gets the rule parser's error message, not the static one's."""
-        self.assertTrue(entry_is_watcher_rule({"rooms": {}}))
-
-    def test_non_mappings_are_not_rules(self):
-        for entry in ([], "x", None, 3):
-            with self.subTest(entry=entry):
-                self.assertFalse(entry_is_watcher_rule(entry))
+# `TestShapeDiscrimination` lived here and tested `entry_is_watcher_rule`, which
+# decided whether a `watchers:` entry was a rule or the removed static shape by
+# looking for a `rooms:` MAPPING. Both are gone: entries live under
+# `watcher_rules:` now, so the block they are in settles the question, and an old
+# `watchers:` key is reported as an unknown top-level key. Removing that test is
+# the point of the change rather than collateral — the sniffing is what stopped
+# `rooms` being inheritable from a template.
 
 
 class TestMatcherSemantics(unittest.TestCase):
@@ -234,8 +221,12 @@ class TestParserHardErrors(unittest.TestCase):
         parse(MINIMAL, seen=seen)
         self.assertEqual(seen, {"eng"})
 
-    def test_room_cannot_be_combined_with_a_rooms_block(self):
-        self._err({**MINIMAL, "room": "eng"}, "cannot be combined")
+    def test_a_leftover_room_key_is_an_unknown_key(self):
+        """`room` had a dedicated message until it stopped being a key at all.
+        That message also claimed the key "cannot be combined with a 'rooms:'
+        block" even for an entry that had no such block."""
+        msg = self._err({**MINIMAL, "room": "general"}, "unknown key(s)")
+        self.assertIn("'room'", msg)
 
     def test_session_id_is_rejected_as_an_unknown_key(self):
         """No dedicated branch any more: the rule shape is a closed key set, so a
@@ -816,7 +807,7 @@ class TestOmittedTtlsGetTheDefaults(unittest.TestCase):
             "    server: {url: https://x.com, username: b, password: s}\n"
             "agents:\n"
             "  default: {type: claude, working_directory: /tmp}\n"
-            "watchers:\n"
+            "watcher_rules:\n"
             + textwrap.indent(textwrap.dedent(watcher_block), "  ")
         )
         with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:

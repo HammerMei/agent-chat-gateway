@@ -65,7 +65,7 @@ def _valid_config_text(work_dir: Path) -> str:
           my-agent:
             inherits: standard
             working_directory: {work_dir}
-        watchers:
+        watcher_rules:
           - name: my-rooms
             connector: rc-home
             agent: my-agent
@@ -189,7 +189,7 @@ class TestOverviewRender:
               default:
                 type: claude
                 working_directory: {work_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 room: general
         """)
@@ -220,7 +220,7 @@ class TestOverviewRender:
               default:
                 type: claude
                 working_directory: {work_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 room: general
         """)
@@ -271,7 +271,7 @@ class TestOverviewRender:
               default:
                 type: claude
                 working_directory: {work_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 room: general
         """)
@@ -315,7 +315,7 @@ class TestOverviewRender:
                 type: claude
                 working_directory: {work_dir}
                 timeout: 360
-            watchers:
+            watcher_rules:
               - name: w1
                 room: general
         """)
@@ -358,7 +358,7 @@ class TestStatusColumnPerEntity:
               working-agent:
                 type: claude
                 working_directory: {work_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 connector: rc
                 agent: working-agent
@@ -393,7 +393,7 @@ class TestStatusColumnPerEntity:
               default:
                 type: claude
                 working_directory: {work_dir}
-            watchers:
+            watcher_rules:
               - name: good-rule
                 connector: rc
                 agent: default
@@ -436,7 +436,7 @@ class TestStatusColumnPerEntity:
               agent2:
                 type: claude
                 working_directory: {broken_dir_2}
-            watchers:
+            watcher_rules:
               - connector: rc
                 agent: agent1
                 room: general
@@ -480,7 +480,7 @@ class TestValidationDetailsModal:
               - name: rc
                 type: rocketchat
                 server: {{url: "http://localhost:3000", username: bot, password: pw}}
-            watchers:
+            watcher_rules:
               - name: w1
                 connector: rc
                 agent: working-agent
@@ -524,7 +524,7 @@ class TestValidationDetailsModal:
               - name: view-details-hint-test-conn-9f3a1c
                 type: rocketchat
                 server: {{url: "http://localhost:3000", username: bot, password: pw}}
-            watchers:
+            watcher_rules:
               - name: w1
                 connector: view-details-hint-test-conn-9f3a1c
                 agent: clean-agent
@@ -737,7 +737,7 @@ class TestDetailScreenNavigation:
               default:
                 type: claude
                 working_directory: {work_dir}
-            watchers:
+            watcher_rules:
               - name: standalone
                 connector: rc
                 agent: default

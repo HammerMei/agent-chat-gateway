@@ -39,7 +39,7 @@ class TestMigrateEnvToConfig(unittest.TestCase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 connector: rc
                 agent: default
@@ -141,7 +141,7 @@ class TestMigrateEnvToConfig(unittest.TestCase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 connector: rc
                 agent: default

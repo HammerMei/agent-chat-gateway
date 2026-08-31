@@ -182,7 +182,7 @@ def validate_config(config_path: str, lint: bool = False) -> ValidationResult:
     # and `len(5)` raised a TypeError out of the one function whose whole
     # contract is collecting problems instead of raising them — crashing
     # both `acg config validate` and the TUI's banner (Codex review of #129).
-    raw_watchers = raw.get("watchers")
+    raw_watchers = raw.get("watcher_rules")
     result.entry_count = len(raw_watchers) if isinstance(raw_watchers, list) else 0
 
     _check_connectors(config, result)
@@ -609,7 +609,7 @@ def _lint_config(raw: dict, result: ValidationResult) -> None:
                     _AGENT_LINT_DEFAULTS, result,
                 )
 
-    for i, wc in enumerate(raw.get("watchers") or []):
+    for i, wc in enumerate(raw.get("watcher_rules") or []):
         if isinstance(wc, dict):
             name_hint = wc.get("name")
             label = name_hint if isinstance(name_hint, str) and name_hint else f"watchers[{i}]"

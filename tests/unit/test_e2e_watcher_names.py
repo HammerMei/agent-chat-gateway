@@ -71,7 +71,7 @@ class TestE2EScheduleTestTargetsWatchersNotRules(unittest.TestCase):
         self.source = _SCHEDULE_TEST.read_text()
         self.rule_names = {
             entry["name"]
-            for entry in (yaml.safe_load(_E2E_CONFIG.read_text()).get("watchers") or [])
+            for entry in (yaml.safe_load(_E2E_CONFIG.read_text()).get("watcher_rules") or [])
             if isinstance(entry, dict) and isinstance(entry.get("name"), str)
         }
 

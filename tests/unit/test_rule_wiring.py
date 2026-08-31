@@ -49,7 +49,7 @@ agents:
 
 
 def write_config(watchers_block: str, extra: str = "") -> str:
-    body = HEADER + extra + "watchers:\n" + textwrap.indent(
+    body = HEADER + extra + "watcher_rules:\n" + textwrap.indent(
         textwrap.dedent(watchers_block), "  "
     )
     with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
@@ -68,7 +68,6 @@ ONE_RULE = """\
 class TestRuleEntries(unittest.TestCase):
     def test_a_rule_entry_reaches_the_rule_parser(self):
         cfg = GatewayConfig.from_file(write_config(ONE_RULE))
-        self.assertEqual(cfg.watchers, [])
         self.assertEqual([r.name for r in cfg.watcher_rules], ["eng-rooms"])
         self.assertEqual(cfg.watcher_rules[0].connector, "mm-second")
 
@@ -134,7 +133,7 @@ class TestRuleErrorsAreAttributedAndSurvivable(unittest.TestCase):
         ValueError` would abort the whole pass rather than flag one entry."""
         path = write_config("")
         Path(path).write_text(HEADER + textwrap.dedent("""\
-            watchers:
+            watcher_rules:
               - name: odd
                 rooms: {include: ["a-*"]}
                 1: value

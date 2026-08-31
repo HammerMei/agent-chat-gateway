@@ -85,7 +85,7 @@ def _config_text(work_dir: Path) -> str:
           - name: rc
             type: rocketchat
             server: {{url: "http://localhost:3000", username: bot, password: pw}}
-        watchers:
+        watcher_rules:
           - name: w1
             connector: rc
             agent: agent-a
@@ -236,7 +236,7 @@ class TestTemplateSaveDiffing:
               - name: rc
                 type: rocketchat
                 server: {{url: "http://localhost:3000", username: bot, password: pw}}
-            watchers:
+            watcher_rules:
               - connector: rc
                 agent: agent-a
                 room: general
@@ -668,7 +668,7 @@ def _config_with_agent_template_tools(work_dir: Path) -> str:
           - name: rc
             type: rocketchat
             server: {{url: "http://localhost:3000", username: bot, password: pw}}
-        watchers:
+        watcher_rules:
           - connector: rc
             agent: agent-a
             room: general
@@ -900,7 +900,7 @@ class TestTemplateFormSharesTheEntryFormRenderer:
               default:
                 type: claude
                 working_directory: {work_dir}
-            watchers: []
+            watcher_rules: []
         """)
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
@@ -939,7 +939,7 @@ class TestTemplateFormSharesTheEntryFormRenderer:
               - name: rc
                 type: rocketchat
                 server: {{url: "http://localhost:3000", username: bot, password: pw}}
-            watchers: []
+            watcher_rules: []
         """)
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:

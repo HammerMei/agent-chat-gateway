@@ -38,7 +38,7 @@ class TestWorkingDirectoryValidation(unittest.TestCase):
                   password: pw
             agents:
 {textwrap.indent(agents_block, "              ")}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -150,7 +150,7 @@ class TestConfigValidationHardening(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -172,7 +172,7 @@ class TestConfigValidationHardening(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -192,7 +192,7 @@ class TestConfigValidationHardening(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: same
                 rooms:
                   include: [general]
@@ -214,7 +214,7 @@ class TestConfigValidationHardening(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [""]
@@ -234,7 +234,7 @@ class TestConfigValidationHardening(unittest.TestCase):
                 type: claude
                 working_directory: /tmp
             max_queue_depth: -1
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -251,7 +251,7 @@ class TestConfigValidationHardening(unittest.TestCase):
                 server: {url: http://localhost:3000, username: bot, password: pw}
             agents:
               default: claude
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -270,12 +270,12 @@ class TestConfigValidationHardening(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - just-a-string
         """)
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(path)
-        self.assertIn("Watcher entry at index 0 must be a mapping", str(ctx.exception))
+        self.assertIn("watcher_rules[0] must be a mapping", str(ctx.exception))
 
     def test_non_string_connector_type_raises_value_error_not_type_error(self):
         """PR review finding: a truthy-but-non-string 'type' (e.g. a YAML
@@ -293,7 +293,7 @@ class TestConfigValidationHardening(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -311,7 +311,7 @@ class TestConfigValidationHardening(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -330,7 +330,7 @@ class TestConfigValidationHardening(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -355,7 +355,7 @@ class TestConfigValidationHardening(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [12345]
@@ -383,7 +383,7 @@ class TestConfigValidationHardening(unittest.TestCase):
                       default:
                         type: claude
                         working_directory: /tmp
-                    watchers:
+                    watcher_rules:
                       - name: w1
                         rooms:
                           include: [general]
@@ -404,7 +404,7 @@ class TestConfigValidationHardening(unittest.TestCase):
                 type: claude
                 working_directory: /tmp
             default_agent: [prod]
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -434,7 +434,7 @@ class TestCacheDirGlobalResolution(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -491,7 +491,7 @@ class TestDollarVarIsALiteralString(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -562,7 +562,7 @@ class TestToolRuleRegexValidation(unittest.TestCase):
                 working_directory: /tmp
                 owner_allowed_tools:
 {textwrap.indent(rule_block, "                  ")}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -727,7 +727,7 @@ class TestBuiltinContextAutoInjection(unittest.TestCase):
                 type: claude
                 working_directory: /tmp
                 lazy_instruction_loading: false
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -1223,7 +1223,7 @@ class TestConnectorTemplates(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -1250,7 +1250,7 @@ class TestConnectorTemplates(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -1271,7 +1271,7 @@ class TestConnectorTemplates(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -1301,7 +1301,7 @@ class TestConnectorTemplates(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -1328,7 +1328,7 @@ class TestConnectorTemplates(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -1357,7 +1357,7 @@ class TestConnectorTemplates(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -1393,7 +1393,7 @@ class TestAgentTemplates(unittest.TestCase):
               other:
                 inherits: standard
                 timeout: 42
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -1426,7 +1426,7 @@ class TestAgentTemplates(unittest.TestCase):
                 type: claude
                 inherits: opencode-standard
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
                 agent: agent-a
                 rooms:
@@ -1465,7 +1465,7 @@ class TestAgentTemplates(unittest.TestCase):
               agent-b:
                 inherits: opencode-standard
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
                 agent: agent-a
                 rooms:
@@ -1496,7 +1496,7 @@ class TestAgentTemplates(unittest.TestCase):
             agents:
               forgot-inherits:
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -1524,7 +1524,7 @@ class TestAgentTemplates(unittest.TestCase):
               bad-agent:
                 type: [claude]
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -1555,7 +1555,7 @@ class TestAgentTemplates(unittest.TestCase):
               opencode-agent:
                 type: opencode
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -1581,7 +1581,7 @@ class TestAgentTemplates(unittest.TestCase):
               default:
                 inherits: standard
                 permissions: {timeout: 100}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -1610,7 +1610,7 @@ class TestAgentTemplates(unittest.TestCase):
                 inherits: standard
                 owner_allowed_tools:
                   - tool: Write
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -1631,7 +1631,7 @@ class TestAgentTemplates(unittest.TestCase):
               default:
                 inherits: nope
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -1658,7 +1658,7 @@ class TestAgentTemplates(unittest.TestCase):
               default:
                 inherits: bad
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -1694,7 +1694,7 @@ class TestAgentSessionLifecycleKeysAreRejected(unittest.TestCase):
                 type: claude
                 working_directory: /tmp
 {textwrap.indent(textwrap.dedent(agent_block), "                ")}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -1717,7 +1717,7 @@ class TestAgentSessionLifecycleKeysAreRejected(unittest.TestCase):
                     GatewayConfig.from_file(path)
                 msg = str(ctx.exception)
                 self.assertIn(key, msg)
-                self.assertIn("'watchers:'", msg)  # contract: says where it goes now
+                self.assertIn("'watcher_rules:'", msg)  # contract: says where it goes now
 
     def test_an_explicit_null_is_rejected_too(self):
         """`null` is not a way to keep the key: the field is gone, so writing it at
@@ -1725,7 +1725,7 @@ class TestAgentSessionLifecycleKeysAreRejected(unittest.TestCase):
         path = self._write_config("session_idle_days: null\n")
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(path)
-        self.assertIn("'watchers:'", str(ctx.exception))
+        self.assertIn("'watcher_rules:'", str(ctx.exception))
 
     def test_a_value_inherited_from_an_agent_template_is_rejected(self):
         """The check reads the already-merged entry, so a template cannot smuggle
@@ -1742,7 +1742,7 @@ class TestAgentSessionLifecycleKeysAreRejected(unittest.TestCase):
                 session_idle_days: 7
             agents:
               default: {inherits: standard}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -1752,7 +1752,7 @@ class TestAgentSessionLifecycleKeysAreRejected(unittest.TestCase):
             path = f.name
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(path)
-        self.assertIn("'watchers:'", str(ctx.exception))
+        self.assertIn("'watcher_rules:'", str(ctx.exception))
 
     def test_collect_config_attributes_it_to_the_agent_and_keeps_going(self):
         """A second, healthy agent isolates the attribution from the pre-existing
@@ -1772,7 +1772,7 @@ class TestAgentSessionLifecycleKeysAreRejected(unittest.TestCase):
                 type: claude
                 working_directory: /tmp
                 session_expire_days: 30
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -1793,7 +1793,7 @@ class TestAgentSessionLifecycleKeysAreRejected(unittest.TestCase):
         the whole story: the "at least one agent" global issue follows it."""
         _, issues = collect_config(self._write_config("session_expire_days: 30\n"))
         self.assertEqual([i.entity_kind for i in issues], ["agent", "global"])
-        self.assertIn("'watchers:'", issues[0].message)
+        self.assertIn("'watcher_rules:'", issues[0].message)
 
 
 class TestWatcherTemplates(unittest.TestCase):
@@ -1816,7 +1816,7 @@ class TestWatcherTemplates(unittest.TestCase):
               standard:
                 connector: rc
                 agent: default
-            watchers:
+            watcher_rules:
               - name: w1
                 inherits: standard
                 rooms:
@@ -1828,14 +1828,13 @@ class TestWatcherTemplates(unittest.TestCase):
         self.assertEqual(wc.agent, "default")
 
     def test_watcher_template_forbids_identity_fields(self):
+        # Only `name` is left. `session_id`, `room` and `rooms` all used to be
+        # here: the first two stopped being keys at all (the closed rule shape
+        # reports them, naming the entry rather than the template), and `rooms`
+        # became inheritable when the `watcher_rules:` rename removed the shape
+        # sniffing that depended on it.
         for key, value in (
             ("name", "shared-name"),
-            ("room", "general"),
-            ("rooms", ["general"]),
-            # `session_id` was here until it stopped being a key at all — a
-            # removed field is reported by the closed rule shape instead, which
-            # names the entry rather than the template. See
-            # test_session_id_removed.py.
         ):
             with self.subTest(key=key):
                 path = self._write_config(f"""\
@@ -1850,7 +1849,7 @@ class TestWatcherTemplates(unittest.TestCase):
                     watcher_templates:
                       standard:
                         {key}: {value!r}
-                    watchers:
+                    watcher_rules:
                       - name: w1
                         rooms:
                           include: [general]
@@ -1887,7 +1886,7 @@ class TestWatcherTemplates(unittest.TestCase):
                 connector: rc
                 agent: default
                 type: bar
-            watchers:
+            watcher_rules:
               - name: w1
                 inherits: standard
                 type: foo
@@ -1916,7 +1915,7 @@ class TestWatcherTemplates(unittest.TestCase):
             watcher_templates:
               standard:
                 session_expire_days: 30
-            watchers:
+            watcher_rules:
               - name: w1
                 connector: rc
                 agent: default
@@ -1950,7 +1949,7 @@ class TestRemovedDefaultsKeysRejected(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -1973,7 +1972,7 @@ class TestRemovedDefaultsKeysRejected(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -1996,7 +1995,7 @@ class TestRemovedDefaultsKeysRejected(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -2034,7 +2033,7 @@ class TestToolPresets(unittest.TestCase):
                 working_directory: /tmp
                 owner_allowed_tools:
                   - readonly
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -2061,7 +2060,7 @@ class TestToolPresets(unittest.TestCase):
                     params: "git .*"
                   - readonly
                   - tool: Write
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -2082,7 +2081,7 @@ class TestToolPresets(unittest.TestCase):
                 working_directory: /tmp
                 owner_allowed_tools:
                   - nonexistent
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -2106,7 +2105,7 @@ class TestToolPresets(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -2129,7 +2128,7 @@ class TestToolPresets(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -2150,7 +2149,7 @@ class TestToolPresets(unittest.TestCase):
                 working_directory: /tmp
                 guest_allowed_tools:
                   - tool: '[invalid'
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -2181,7 +2180,7 @@ class TestNotificationFieldsAreRemoved(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -2239,7 +2238,7 @@ class TestDescriptionField(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -2264,7 +2263,7 @@ class TestDescriptionField(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -2297,7 +2296,7 @@ class TestDescriptionField(unittest.TestCase):
             watcher_templates:
               standard:
                 description: "Shared watcher settings"
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -2316,12 +2315,21 @@ if __name__ == "__main__":
 # ── Tests: the static watcher shape is a hard load error (cutover, §5.4) ─────
 
 
-class TestStaticShapeIsAHardError(unittest.TestCase):
-    """The cutover contract: a removed shape is a hard load error naming its
-    replacement, never a silently ignored key — a config that used to mean
-    something must not load meaning nothing. These replace the whole static
-    parsing suite (expansion, auto-naming, per-field validation): the parser
-    survives only as a configtool dependency and no loader reaches it.
+class TestTheOldShapeIsReportedPerKey(unittest.TestCase):
+    """A half-migrated config is reported key by key, not by shape.
+
+    This class used to assert that an entry with `room:` (or `rooms:` as a list)
+    produced a dedicated "old format" error, because the loader decided which
+    parser an entry belonged to by looking for a `rooms:` MAPPING on the raw
+    entry. That test is gone with the mechanism: the shape sniffing is exactly
+    what stopped `rooms` being inheritable from a template, since a template is
+    merged only AFTER the shape has been decided.
+
+    What replaces it is narrower and general. The block name settles what an
+    entry is — everything under `watcher_rules:` is a rule — so a leftover
+    `room:` is just a key a rule does not have, and the old top-level
+    `watchers:` is just a key config.yaml does not have. Both are already loud,
+    by rules that were not written for this migration.
     """
 
     BASE = """\
@@ -2333,62 +2341,61 @@ class TestStaticShapeIsAHardError(unittest.TestCase):
           default:
             type: claude
             working_directory: /tmp
-        watchers:
+        watcher_rules:
     """
-
     def _write(self, watchers_block: str) -> str:
         body = textwrap.dedent(self.BASE) + textwrap.indent(
             textwrap.dedent(watchers_block), "  ")
         with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
             f.write(body)
             return f.name
-
     def _msg(self, watchers_block: str) -> str:
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(self._write(watchers_block))
         return str(ctx.exception)
 
-    def test_a_room_key_is_a_hard_error_naming_the_migration(self):
+    def test_a_leftover_room_key_is_an_unknown_key(self):
         msg = self._msg("- name: w1\n  room: general\n")
-        self.assertIn("old format", msg)
-        self.assertIn("'w1'", msg, "the error names the entry")
-        self.assertIn("docs/migration-dynamic-watchers.md", msg)
-        # This error is the upgrade's guaranteed touchpoint: anyone with
-        # static records had static config, so they read this BEFORE the
-        # first post-rewrite boot prunes those records (owner, 2026-08-17).
-        # Those two decisions are pinned as MEANING, because the message was
-        # rewritten for plain language: "not a 1:1 rename" became "not a
-        # simple rename" and the shouted "RESETS every existing watcher
-        # session" became "every existing conversation is discarded".
-        self.assertIn("not a simple rename", msg,
-                      "the sharp edges are stated, not discovered")
-        self.assertIn("discarded", msg, "the reset must be stated up front")
-        self.assertIn("except_for", msg, "a paused room needs re-expressing")
+        self.assertIn("unknown key(s)", msg)
+        self.assertIn("'room'", msg)
+        self.assertIn("'rooms'", msg, "the valid-key list shows the replacement")
 
-    def test_a_rooms_list_is_the_same_hard_error(self):
-        msg = self._msg("- rooms: [general, dev]\n")
-        self.assertIn("old format", msg)
+    def test_a_rooms_list_is_refused_by_the_rooms_parser(self):
+        msg = self._msg("- name: w1\n  rooms: [general, dev]\n")
+        self.assertIn("'rooms' must be a mapping", msg)
 
-    def test_a_nameless_entry_is_named_by_its_room(self):
-        msg = self._msg("- room: ops\n")
-        self.assertIn("'ops'", msg)
-
-    def test_a_non_mapping_entry_still_reads_as_malformed_not_as_static(self):
+    def test_a_non_mapping_entry_is_malformed(self):
         msg = self._msg("- just-a-string\n")
         self.assertIn("must be a mapping", msg)
 
-    def test_collect_config_reports_every_static_entry_in_one_pass(self):
-        """A half-migrated config lists all its remaining static entries at
-        once, rather than one per run — and the rule entries beside them
-        still parse."""
+    def test_the_old_top_level_key_names_its_replacement(self):
+        """The whole migration signal now, and it comes from the general
+        unknown-top-level-key check rather than a case written for it."""
+        path = self._write("- name: w1\n  rooms:\n    include: [general]\n").replace(
+            "watcher_rules:", "watchers:"
+        )
+        # _write returns a path; rewrite the file itself with the old key.
+        import pathlib as _p
+        f = _p.Path(self._write("- name: w1\n  rooms:\n    include: [general]\n"))
+        f.write_text(f.read_text().replace("watcher_rules:", "watchers:"))
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(str(f))
+        msg = str(ctx.exception)
+        self.assertIn("'watchers'", msg)
+        self.assertIn("did you mean 'watcher_rules'?", msg)
+        del path
+
+    def test_collect_config_reports_every_leftover_entry_in_one_pass(self):
+        """A half-migrated config lists all its remaining old entries at once,
+        and the rule entries beside them still parse."""
         path = self._write(
             "- name: a\n  room: general\n"
             "- name: ok\n  rooms:\n    include: [dev]\n"
             "- name: b\n  room: ops\n"
         )
         config, issues = collect_config(path)
-        static_issues = [i for i in issues if "old format" in i.message]
-        self.assertEqual(len(static_issues), 2)
+        leftover = [i for i in issues if "unknown key(s)" in i.message]
+        self.assertEqual(len(leftover), 2, [i.message for i in issues])
         self.assertEqual([r.name for r in config.watcher_rules], ["ok"])
 
 
@@ -2412,7 +2419,7 @@ class TestContextInjectFileListValidation(unittest.TestCase):
             type: claude
             working_directory: /tmp
         {agent}
-        watchers:
+        watcher_rules:
           - name: w1
             rooms:
               include: [general]

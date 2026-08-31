@@ -5,7 +5,7 @@ unique `name`, a `connector`/`agent` pair, and a `rooms:` matcher
 (`include`/`except_for` globs plus the `direct`/`group_direct` DM opt-ins).
 It names no room — which rooms it claims is only known at runtime — so this
 screen is a plain one-entry-in/one-entry-out form over one element of the
-`document["watchers"]` list, using the exact trial-entry install/rollback
+`document["watcher_rules"]` list, using the exact trial-entry install/rollback
 pattern `ConnectorDetailScreen` already uses for the connectors list. The
 merge-on-add / split-on-edit machinery the old expanded-watcher screen
 needed does not exist here because the problem it solved (N rooms sharing
@@ -215,18 +215,18 @@ class RuleDetailScreen(FormScreen):
 
     def _remove_entry_from_document(self) -> None:
         self._deleted_index = self._find_own_index()
-        del self.cfg.document["watchers"][self._deleted_index]
+        del self.cfg.document["watcher_rules"][self._deleted_index]
 
     def _reinsert_entry_into_document(self) -> None:
-        watchers = self.cfg.document.setdefault("watchers", [])
+        watchers = self.cfg.document.setdefault("watcher_rules", [])
         watchers.insert(self._deleted_index, self.entry)
 
     def _install_trial_entry(self, target_entry: dict) -> None:
         self._edit_index = self._find_own_index()
-        self.cfg.document["watchers"][self._edit_index] = target_entry
+        self.cfg.document["watcher_rules"][self._edit_index] = target_entry
 
     def _rollback_trial_entry(self) -> None:
-        self.cfg.document["watchers"][self._edit_index] = self.entry
+        self.cfg.document["watcher_rules"][self._edit_index] = self.entry
 
     def _referencing_watcher_labels(self) -> list[str]:
         # Nothing in config.yaml references a rule by name — the delete
@@ -578,7 +578,7 @@ class RuleDetailScreen(FormScreen):
         watchers_key_was_absent = False
         watchers_original_value: object = None
         if self.mode == "create":
-            existing = self.cfg.document.get("watchers")
+            existing = self.cfg.document.get("watcher_rules")
             if existing is not None and not isinstance(existing, list):
                 # REFUSED, not normalized (Codex review of #129, round 3):
                 # a malformed non-list `watchers:` can hold RECOVERABLE rule
@@ -599,7 +599,7 @@ class RuleDetailScreen(FormScreen):
                     )
                 )
                 return
-            # KEY MEMBERSHIP, not the value: `document.get("watchers")`
+            # KEY MEMBERSHIP, not the value: `document.get("watcher_rules")`
             # returns None both for an absent key and for an explicit
             # `watchers:` (null), so round 10's `existing is None` popped a
             # key the operator had actually written — and a later unrelated
@@ -607,11 +607,11 @@ class RuleDetailScreen(FormScreen):
             # #129, round 11). Both the presence and the original value are
             # captured so a rejected create restores the document exactly as
             # loaded.
-            watchers_key_was_absent = "watchers" not in self.cfg.document
-            watchers_original_value = self.cfg.document.get("watchers")
+            watchers_key_was_absent = "watcher_rules" not in self.cfg.document
+            watchers_original_value = self.cfg.document.get("watcher_rules")
             if not isinstance(existing, list):
-                self.cfg.document["watchers"] = []
-            watchers = self.cfg.document["watchers"]
+                self.cfg.document["watcher_rules"] = []
+            watchers = self.cfg.document["watcher_rules"]
             watchers.append(target_entry)
             inserted_index = len(watchers) - 1
         else:
@@ -622,14 +622,14 @@ class RuleDetailScreen(FormScreen):
             self.cfg.save()
         except (ValueError, FileNotFoundError) as exc:
             if self.mode == "create" and inserted_index is not None:
-                del self.cfg.document["watchers"][inserted_index]
+                del self.cfg.document["watcher_rules"][inserted_index]
                 if watchers_key_was_absent:
-                    self.cfg.document.pop("watchers", None)
+                    self.cfg.document.pop("watcher_rules", None)
                 elif not isinstance(watchers_original_value, list):
                     # It was there, holding something this form replaced with
                     # a list (an explicit null). Put that value back rather
                     # than the empty list standing in for it.
-                    self.cfg.document["watchers"] = watchers_original_value
+                    self.cfg.document["watcher_rules"] = watchers_original_value
             else:
                 self._rollback_trial_entry()
             # Same rollback contract the reorder and malformed-row delete

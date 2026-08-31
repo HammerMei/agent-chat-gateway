@@ -67,7 +67,7 @@
     },
     "watcher_templates": {
       "type": "object",
-      "description": "Named, reusable field blocks for watchers. Reference one by name via a watcher's 'inherits:' field. Must not set 'name', 'room', or 'rooms' \u2014 those identify a specific watcher \u2014 nor 'session_id', which is removed entirely (sessions are no longer pinned from config; use a handoff file via context_inject_files). No nested templates.",
+      "description": "Named, reusable field blocks for watcher rules. Reference one by name via a rule's 'inherits:' field. Must not set 'name' or 'room' \u2014 those identify a specific entry. 'rooms' MAY be set here: a rule's own 'rooms' deep-merges over it, so a template can supply 'direct: true' while each entry adds its own 'include'. No nested templates.",
       "additionalProperties": {
         "type": "object",
         "properties": {
@@ -86,16 +86,6 @@
             {
               "required": [
                 "room"
-              ]
-            },
-            {
-              "required": [
-                "rooms"
-              ]
-            },
-            {
-              "required": [
-                "session_id"
               ]
             },
             {
@@ -125,12 +115,6 @@
       "type": "string",
       "description": "Name of the agent used when a watcher omits 'agent:'. Defaults to the first agent defined."
     },
-    "watchers": {
-      "type": "array",
-      "items": {
-        "$ref": "#/$defs/watcher"
-      }
-    },
     "max_queue_depth": {
       "type": "integer",
       "minimum": 0,
@@ -144,6 +128,12 @@
           "type": "integer",
           "minimum": 0
         }
+      }
+    },
+    "watcher_rules": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/watcher"
       }
     }
   },
@@ -347,8 +337,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "name",
-        "rooms"
+        "name"
       ],
       "properties": {
         "description": {
@@ -422,7 +411,8 @@
         "history_handoff": {
           "$ref": "#/$defs/historyHandoff"
         }
-      }
+      },
+      "description": "'rooms' is not required here: a rule may take it from a 'watcher_templates:' entry via 'inherits:', and the loader reports an entry that ends up with no rooms at all."
     }
   }
 }

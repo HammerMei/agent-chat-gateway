@@ -44,7 +44,7 @@ class TestEditableConfigLoad(_EditableConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -74,7 +74,7 @@ class TestEditableConfigLoad(_EditableConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -112,7 +112,7 @@ class TestEditableConfigLoad(_EditableConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -143,7 +143,7 @@ class TestEditableConfigTemplates(_EditableConfigTestBase):
             agents:
               default:
                 inherits: standard
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -166,7 +166,7 @@ class TestEditableConfigTemplates(_EditableConfigTestBase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -196,7 +196,7 @@ class TestEditableConfigTemplatesCaching(_EditableConfigTestBase):
             agents:
               default:
                 inherits: standard
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -235,7 +235,7 @@ class TestEditableConfigTemplatesCaching(_EditableConfigTestBase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -274,7 +274,7 @@ class TestEditableConfigProvenance(_EditableConfigTestBase):
               no-template-at-all:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -349,7 +349,7 @@ class TestEditableConfigValidatedView(_EditableConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -369,7 +369,7 @@ class TestEditableConfigValidatedView(_EditableConfigTestBase):
             agents:
               default:
                 type: claude
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -390,7 +390,7 @@ class TestEditableConfigDirtyTracking(_EditableConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -446,7 +446,7 @@ class TestEditableConfigSave(_EditableConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 rooms:
                   include: [general]
@@ -545,7 +545,7 @@ class TestEditableConfigScopedSaveGate(_EditableConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w-conn1
                 connector: conn1
                 agent: default
@@ -582,8 +582,8 @@ class TestEditableConfigScopedSaveGate(_EditableConfigTestBase):
         cfg.document["connectors"] = [
             c for c in cfg.document["connectors"] if c["name"] != "conn1"
         ]
-        cfg.document["watchers"] = [
-            w for w in cfg.document["watchers"] if w["connector"] != "conn1"
+        cfg.document["watcher_rules"] = [
+            w for w in cfg.document["watcher_rules"] if w["connector"] != "conn1"
         ]
         cfg.mark_dirty()
 
@@ -632,7 +632,7 @@ class TestEditableConfigScopedSaveGate(_EditableConfigTestBase):
                 type: claude
                 working_directory: {self.agent_dir}
             default_agent: broken_default
-            watchers:
+            watcher_rules:
               - name: w1
                 connector: rc1
                 agent: other_agent
@@ -671,7 +671,7 @@ class TestEditableConfigScopedSaveGate(_EditableConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: [a, b]
                 connector: rc
         """)
@@ -725,7 +725,7 @@ class TestStatusIndexNonStringEntityName(_EditableConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: [a, b]
                 connector: rc
                 rooms:
@@ -754,7 +754,7 @@ class TestMoveWatcherRule(_EditableConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: first
                 rooms:
                   include: [general]
@@ -768,7 +768,7 @@ class TestMoveWatcherRule(_EditableConfigTestBase):
         return EditableConfig.load(path)
 
     def _names(self, cfg: EditableConfig) -> list[str]:
-        return [w["name"] for w in cfg.document["watchers"]]
+        return [w["name"] for w in cfg.document["watcher_rules"]]
 
     def test_move_down_swaps_with_the_next_rule_and_returns_the_new_index(self):
         cfg = self._cfg()
@@ -822,13 +822,13 @@ class TestStatusIndexRuleBridge(_EditableConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
 {watchers_yaml}
         """)
         cfg = EditableConfig.load(path)
         result = validate_config(str(path), lint=True)
         status = StatusIndex(result.findings)
-        raw = cfg.document["watchers"][index]
+        raw = cfg.document["watcher_rules"][index]
         entry = raw if isinstance(raw, dict) else {}
         return status.status_for_rule(index, entry)
 
@@ -890,7 +890,7 @@ class TestStatusIndexStrippedNameSpelling(_EditableConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: broad
                 rooms:
                   include: ["*"]
@@ -901,4 +901,4 @@ class TestStatusIndexStrippedNameSpelling(_EditableConfigTestBase):
         cfg = EditableConfig.load(path)
         result = validate_config(str(path), lint=True)
         status = StatusIndex(result.findings)
-        self.assertEqual(status.status_for_rule(1, cfg.document["watchers"][1]), "warning")
+        self.assertEqual(status.status_for_rule(1, cfg.document["watcher_rules"][1]), "warning")

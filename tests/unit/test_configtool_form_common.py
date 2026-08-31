@@ -53,7 +53,7 @@ class TestFindReferencingWatcherLabels(unittest.TestCase):
               - name: rc
                 type: rocketchat
                 server: {{url: http://localhost:3000, username: bot, password: pw}}
-            watchers:
+            watcher_rules:
 {watchers_yaml}
         """)
 
@@ -174,7 +174,7 @@ class TestFindReferencingWatcherLabels(unittest.TestCase):
               - name: rc2
                 type: rocketchat
                 server: {{url: http://localhost:3001, username: bot2, password: pw2}}
-            watchers:
+            watcher_rules:
               - name: my-rule
                 agent: default
                 rooms:
@@ -201,7 +201,7 @@ class TestFindReferencingWatcherLabels(unittest.TestCase):
               - name: rc
                 type: rocketchat
                 server: {{url: http://localhost:3000, username: bot, password: pw}}
-            watchers:
+            watcher_rules:
               - name: my-rule
                 connector: rc
                 rooms:
@@ -240,7 +240,7 @@ class TestFindReferencingWatcherLabels(unittest.TestCase):
               - name: rc
                 type: rocketchat
                 server: {{url: http://localhost:3000, username: bot, password: pw}}
-            watchers:
+            watcher_rules:
               - name: rule-a
                 connector: rc
                 agent: other

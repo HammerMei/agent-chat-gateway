@@ -87,7 +87,7 @@ watcher_templates:
   e2e-mm-default:
     connector: mm-e2e
     context_inject_files: []
-watchers:
+watcher_rules:
 - name: e2e-dm
   inherits: e2e-default
   rooms:

@@ -149,7 +149,7 @@ def generate_config_yaml(
     config = {
         "connectors": [connector],
         "agents": {"my-agent": agent},
-        "watchers": [watcher_entry],
+        "watcher_rules": [watcher_entry],
     }
 
     return yaml.dump(config, default_flow_style=False, allow_unicode=True, sort_keys=False)

@@ -342,7 +342,7 @@ def _write_config(watchers_block: str) -> str:
           default:
             type: claude
             working_directory: /tmp
-        watchers:
+        watcher_rules:
         """) + textwrap.indent(textwrap.dedent(watchers_block), "  ")
     with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
         f.write(body)

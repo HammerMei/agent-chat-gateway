@@ -63,7 +63,7 @@ class TestServiceStatePreflight(unittest.TestCase):
               default:
                 type: claude
                 working_directory: {self.tmp}
-            watchers:
+            watcher_rules:
               - name: w1
                 connector: {connector_name}
                 rooms:
@@ -243,7 +243,7 @@ class TestBackendSignaturePreflight(unittest.TestCase):
               default:
                 type: claude
                 working_directory: {root}
-            watchers:
+            watcher_rules:
               - name: w1
                 connector: script
                 rooms:
