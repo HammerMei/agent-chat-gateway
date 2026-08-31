@@ -204,6 +204,21 @@ class MembershipHook:
 # asserts the set agrees with the class — rather than a comment asking the next
 # person to remember. Membership (not absence) is the test, so an unrecognised type
 # is restricted, matching the method's fail-closed default.
+# Every connector type `connector_factory` knows how to build. Lives here rather
+# than beside the factory because `gateway.config` needs it and
+# `gateway.connectors` imports `gateway.config` — the other direction would be a
+# cycle.
+#
+# The factory's error message is built from this tuple, and a test binds the two
+# so a fifth connector type cannot be added to one and forgotten in the other.
+# Order is the order a human should read them in, not alphabetical.
+SUPPORTED_CONNECTOR_TYPES: tuple[str, ...] = (
+    "rocketchat",
+    "mattermost",
+    "voice",
+    "script",
+)
+
 TYPES_WITH_UNSOLICITED_INBOUND: frozenset[str] = frozenset({
     "rocketchat",
     "mattermost",

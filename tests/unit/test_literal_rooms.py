@@ -27,14 +27,19 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from gateway import config as config_module
 from gateway.config import (
     GatewayConfig,
     _parse_one_watcher_rule,
     collect_config,
 )
 from gateway.core.config import AgentConfig, ConnectorConfig
-from gateway.core.connector import TYPES_WITH_UNSOLICITED_INBOUND
+from gateway.core.connector import (
+    SUPPORTED_CONNECTOR_TYPES,
+    TYPES_WITH_UNSOLICITED_INBOUND,
+)
 
 AGENTS = {"a1": AgentConfig(name="a1"), "a2": AgentConfig(name="a2")}
 
@@ -133,9 +138,18 @@ class TestRulesOnAConnectorWithoutInbound(unittest.TestCase):
         return str(cm.exception)
 
     def test_a_wildcard_include_is_rejected(self):
+        """Asserts the message's CONTRACT, not its prose.
+
+        The previous version pinned the phrase "no unsolicited inbound stream",
+        which is exactly the wording the message was rewritten to remove — so it
+        locked the error into explaining the gateway's internals. What a reader
+        actually needs is: which connector, which value is wrong, and which field
+        to edit. Pin that instead; the sentence is then free to improve.
+        """
         msg = self._err({"name": "r", "connector": "voice", "rooms": {"include": ["*"]}})
-        self.assertIn("no unsolicited inbound stream", msg)
-        self.assertIn("'*'", msg)
+        self.assertIn("voice", msg, "must name the connector type")
+        self.assertIn("'*'", msg, "must quote the offending value")
+        self.assertIn("rooms.include", msg, "must name the field to edit")
 
     def test_every_non_literal_form_is_rejected(self):
         for pattern in ("eng-*", "eng-?", "eng-[ab]", "*"):
@@ -157,7 +171,11 @@ class TestRulesOnAConnectorWithoutInbound(unittest.TestCase):
         for flag in ("direct", "group_direct"):
             with self.subTest(flag=flag):
                 msg = self._err({"name": "r", "connector": "voice", "rooms": {flag: True}})
-                self.assertIn("rooms.direct", msg)
+                # Names the flag actually written, so a group_direct mistake is
+                # not reported as a 'rooms.direct' one — the old assertion passed
+                # only because it matched a substring of the generic wording.
+                self.assertIn(f"rooms.{flag}", msg)
+                self.assertIn("rooms.include", msg, "must say where to put them")
 
     def test_a_dm_opt_in_alongside_literal_rooms_is_still_rejected(self):
         msg = self._err({
@@ -177,25 +195,57 @@ class TestRulesOnAConnectorWithoutInbound(unittest.TestCase):
         )
         self.assertIn("'script'", msg)
 
-    def test_an_unknown_connector_type_is_restricted_fail_closed(self):
-        """`config_validate` lets an unknown type through — its validator map skips
-        what it does not recognise — so an unrecognised transport must inherit the
-        restriction rather than the exemption. Deliberate, not incidental."""
+    def test_a_type_the_factory_knows_but_the_set_does_not_is_restricted(self):
+        """Fail-closed, and this is the case it protects: someone adds a fifth
+        connector to the factory and forgets to declare whether it has a stream.
+
+        Simulated by adding a name to the factory's supported list without adding
+        it to the inbound set — which is exactly the state that mistake produces.
+        The completeness test in this file catches the omission separately; this
+        asserts what the loader does in the meantime, which is to restrict.
+        """
         connectors = [
             ConnectorConfig(name="mm", type="mattermost", raw={}),
             ConnectorConfig(name="mystery", type="carrier-pigeon", raw={}),
         ]
-        msg = self._err(
-            {"name": "r", "connector": "mystery", "rooms": {"include": ["eng-*"]}},
+        with mock.patch.object(
+            config_module,
+            "SUPPORTED_CONNECTOR_TYPES",
+            (*SUPPORTED_CONNECTOR_TYPES, "carrier-pigeon"),
+        ):
+            msg = self._err(
+                {"name": "r", "connector": "mystery", "rooms": {"include": ["eng-*"]}},
+                connectors=connectors,
+            )
+        self.assertIn("carrier-pigeon", msg)
+
+    def test_a_type_that_exists_nowhere_is_left_to_the_type_check(self):
+        """The other half of the split, and the reason it exists.
+
+        A misspelling is not a connector without a stream — it is not a connector
+        at all. This check used to answer it with a lecture about `rooms.direct`
+        that never mentioned the missing letter, and whose suggested remedy (use
+        literal `rooms.include`) silenced the complaint while leaving the type
+        wrong. `config validate` now reports the type itself, so this stays quiet.
+        """
+        connectors = [
+            ConnectorConfig(name="mm", type="mattermost", raw={}),
+            ConnectorConfig(name="oops", type="mattrmost", raw={}),
+        ]
+        rule = parse(
+            {"name": "r", "connector": "oops", "rooms": {"direct": True}},
             connectors=connectors,
         )
-        self.assertIn("no unsolicited inbound stream", msg)
+        self.assertEqual(rule.connector, "oops", "the rule must still load")
 
     def test_the_error_names_the_rule_and_the_connector(self):
         msg = self._err({"name": "hotline", "connector": "voice", "rooms": {"include": ["*"]}})
         self.assertIn("hotline", msg)
         self.assertIn("voice", msg)
-        self.assertIn("2.6", msg)
+        # No design-doc section number: a §-reference sends a reader who just
+        # wanted their config to work into an architecture document.
+        self.assertNotIn("§", msg)
+        self.assertNotIn("2.6", msg)
 
 
 class TestTheResolvedConnectorIsWhatCounts(unittest.TestCase):
@@ -311,7 +361,9 @@ class TestThroughBothLoaders(unittest.TestCase):
     def test_from_file_fails_fast(self):
         with self.assertRaises(ValueError) as cm:
             GatewayConfig.from_file(_write_config(self.BAD))
-        self.assertIn("no unsolicited inbound stream", str(cm.exception))
+        # Contract, not prose — see test_a_wildcard_include_is_rejected.
+        self.assertIn("cannot discover rooms", str(cm.exception))
+        self.assertIn("rooms.include", str(cm.exception))
 
     def test_collect_config_attributes_it_and_keeps_going(self):
         cfg, issues = collect_config(_write_config("""\

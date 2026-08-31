@@ -51,6 +51,7 @@ from .core.bot_identity import (
     dm_claims,
     find_identity_conflicts,
 )
+from .core.connector import SUPPORTED_CONNECTOR_TYPES
 from .core.state import (
     DuplicateSessionError,
     StateFormatError,
@@ -293,11 +294,46 @@ def _looks_like_url(value: str) -> bool:
     return bool(parsed.scheme) and bool(parsed.netloc)
 
 
+
+def _closest_type(written: str) -> str | None:
+    """The supported type a misspelling most likely meant, or None.
+
+    Deliberately crude — `difflib` with a high cutoff. It exists to turn "not a
+    known type" into "you dropped a letter", which is the difference between a
+    reader checking the docs and a reader fixing the line. A wrong guess costs
+    nothing: the valid list is printed either way.
+    """
+    import difflib
+
+    matches = difflib.get_close_matches(
+        written.lower(), SUPPORTED_CONNECTOR_TYPES, n=1, cutoff=0.7
+    )
+    return matches[0] if matches else None
+
+
 def _check_connectors(config: GatewayConfig, result: ValidationResult) -> None:
     """Instantiate each connector's own config dataclass and flag empty
     credentials — fields from_connector_config defaults to "" rather than
     validating."""
     for connector in config.connectors:
+        # An unrecognised type used to be skipped in silence here, so a
+        # misspelling like 'mattrmost' either passed validation outright or
+        # surfaced as an unrelated complaint about 'rooms.direct' from the
+        # literal-rooms check. Name the real problem instead: the type.
+        if connector.type not in SUPPORTED_CONNECTOR_TYPES:
+            supported = ", ".join(f"'{t}'" for t in SUPPORTED_CONNECTOR_TYPES)
+            hint = _closest_type(connector.type)
+            msg = (
+                f"Connector '{connector.name}': '{connector.type}' is not a chat "
+                f"platform this gateway knows. Change 'type' to one of: {supported}."
+                + (f" Did you mean '{hint}'?" if hint else "")
+            )
+            result.errors.append(msg)
+            result.findings.append(
+                Finding("error", "connector", connector.name, "type", msg)
+            )
+            continue
+
         validator = _CONNECTOR_VALIDATORS.get(connector.type)
         if validator is None:
             continue

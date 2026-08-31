@@ -41,7 +41,10 @@ from .core.config import (  # noqa: F401 — re-exports
     ToolRule,
     WatcherConfig,
 )
-from .core.connector import TYPES_WITH_UNSOLICITED_INBOUND
+from .core.connector import (
+    SUPPORTED_CONNECTOR_TYPES,
+    TYPES_WITH_UNSOLICITED_INBOUND,
+)
 from .core.room_pattern import (
     InvalidRoomPattern,
     RoomPattern,
@@ -1253,34 +1256,43 @@ def _enforce_literal_rooms(
     a voice connector must be caught even though the rule names nothing.
 
     An unrecognised connector type is treated as *not* having unsolicited inbound —
-    `config_validate` lets unknown types through (its validator map skips them), so
-    fail-closed here matches `Connector.supports_unsolicited_inbound()`'s default and
-    keeps the restriction on anything that has not declared otherwise.
+    A type this build does not recognise at all is a different matter and is left
+    alone here: `config validate` reports the type itself, and saying anything about
+    room patterns on top of that only buries the real problem. That was not
+    theoretical — a config reading `mattrmost` produced a lecture about
+    `rooms.direct` and never mentioned the missing letter, and the remedy the
+    lecture suggested (use literal `rooms.include`) silenced the complaint while
+    leaving the type wrong.
     """
     connector_type = next(
         (c.type for c in connectors if c.name == resolved_connector), None
     )
     if connector_type in TYPES_WITH_UNSOLICITED_INBOUND:
         return
+    if connector_type is not None and connector_type not in SUPPORTED_CONNECTOR_TYPES:
+        return  # the type is the error; something that can say so reports it
 
     kind = f"'{connector_type}'" if connector_type else "of unknown type"
+    # One plain sentence, reused by all three cases below. The old wording led
+    # with the mechanism ("has no unsolicited inbound stream — it never reports a
+    # room the gateway did not already name"), which told the reader how the
+    # gateway works instead of what to change.
     reason = (
-        f"{where} ('{rule_name}'): connector '{resolved_connector}' is {kind}, which "
-        "has no unsolicited inbound stream — it never reports a room the gateway did "
-        "not already name, so there is nothing for a pattern to match."
+        f"{where} ('{rule_name}'): the {kind} connector '{resolved_connector}' "
+        "cannot discover rooms by itself, so it needs each room listed by name."
     )
     for pattern in matcher.include:
         if not pattern.is_literal:
             raise ValueError(
-                f"{reason} Replace the pattern '{pattern.raw}' in 'rooms.include' "
-                "with the literal room name(s) it was meant to cover. See "
-                "docs/design/dynamic-watcher-design.md §2.6."
+                f"{reason} '{pattern.raw}' is a wildcard, so it will never match "
+                "anything here — replace it in 'rooms.include' with the actual "
+                "room names you meant."
             )
     if matcher.direct or matcher.group_direct:
+        flag = "rooms.direct" if matcher.direct else "rooms.group_direct"
         raise ValueError(
-            f"{reason} 'rooms.direct' / 'rooms.group_direct' ask for rooms that only "
-            "an inbound stream can announce, so they cannot be used here — name the "
-            "rooms literally in 'rooms.include' instead."
+            f"{reason} Remove '{flag}' and list the rooms in 'rooms.include' "
+            "instead."
         )
     if not matcher.include:
         raise ValueError(
@@ -1465,14 +1477,11 @@ def _parse_one_watcher_rule(
         if not union_intersects([pattern], matcher.include):
             raise ValueError(
                 f"Watcher rule at index {index} ('{rule_name}'): "
-                f"'rooms.except_for' pattern '{pattern.raw}' can never match any "
-                "room this rule includes, so it does nothing. 'except_for' "
-                "subtracts from this rule's own 'include' — it does not stop a "
-                "*later* rule from claiming a room, because a room this rule "
-                "does not include simply falls through to the next one. To keep "
-                "a room away from every rule, name it in 'include' and in "
-                "'except_for': this rule then claims it and declines it, and no "
-                "later rule sees it."
+                f"'rooms.except_for' entry '{pattern.raw}' does nothing, because "
+                "this rule never includes a room it would match. 'except_for' "
+                "only removes rooms from this rule's own 'include' list. If you "
+                "want no rule at all to serve a room, add it to BOTH 'include' "
+                "and 'except_for' here."
             )
 
     resolved_connector = _resolve_watcher_connector(

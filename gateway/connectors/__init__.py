@@ -1,7 +1,7 @@
 """Platform connector implementations."""
 
 from ..config import ConnectorConfig
-from ..core.connector import Connector
+from ..core.connector import SUPPORTED_CONNECTOR_TYPES, Connector
 
 
 def connector_factory(cc: ConnectorConfig) -> Connector:
@@ -28,7 +28,7 @@ def connector_factory(cc: ConnectorConfig) -> Connector:
         from .mattermost import MattermostConnector
         from .mattermost.config import MattermostConfig
         return MattermostConnector(MattermostConfig.from_connector_config(cc))
-    raise ValueError(
-        f"Unknown connector type: {cc.type!r} "
-        f"(supported: 'rocketchat', 'script', 'voice', 'mattermost')"
-    )
+    # Built from SUPPORTED_CONNECTOR_TYPES so this message and the list
+    # `config validate` checks against cannot drift apart.
+    supported = ", ".join(repr(t) for t in SUPPORTED_CONNECTOR_TYPES)
+    raise ValueError(f"Unknown connector type: {cc.type!r} (supported: {supported})")
