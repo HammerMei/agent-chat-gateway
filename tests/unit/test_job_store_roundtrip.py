@@ -36,6 +36,7 @@ FULLY_POPULATED = dict(
     id="acg-deadbeef",
     watcher="rc:general",
     connector="rc",
+    room_id="room-abc123",
     message="the scheduled message",
     cron="0 9 * * 1-5",
     timezone="Asia/Taipei",

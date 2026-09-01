@@ -39,8 +39,27 @@ class ScheduledJob:
     Fields
     ------
     id               : Unique job identifier (``acg-<8hex>``).
-    watcher          : Watcher name as defined in config.yaml.
+    watcher          : The watcher's derived handle (`<connector>:<room label>`).
+                       NOT a config.yaml name — rule-derived watchers are not named
+                       in config at all. It is the display and CLI identity, and it
+                       is a pure function of (connector, room), so it changes when
+                       the room is renamed. `room_id` is the identity.
     connector        : Connector name the watcher belongs to.
+    room_id          : The platform room this job targets — the identity half, and
+                       the only field here that never changes under the room's feet.
+                       A fire resolves through it, so the job survives both a rename
+                       (which moves the handle) and an `expire` (which deletes the
+                       watcher record the handle used to resolve against).
+
+                       Empty on a job written before schema version 2. Such a job
+                       falls back to resolving by handle, exactly as it did before
+                       the field existed, and `agent-chat-gateway schedule migrate`
+                       fills it in. That is deliberately an operator step rather
+                       than a lazy backfill at fire time: a handle only maps to the
+                       right room while nobody has renamed it, and the operator is
+                       the one who can choose a moment when that is true. A job
+                       firing once a year would otherwise wait a year to migrate,
+                       through a window in which anything could have happened.
     message          : Text injected directly into the agent session when fired.
     cron             : 5-field POSIX cron expression (e.g. ``"0 9 * * 1-5"``).
     timezone         : IANA timezone name used when interpreting the cron expression
@@ -67,6 +86,7 @@ class ScheduledJob:
     id: str = field(default_factory=_new_job_id)
     watcher: str = ""
     connector: str = ""
+    room_id: str = ""
     message: str = ""
     cron: str = ""
     timezone: str = "UTC"
@@ -95,6 +115,7 @@ class ScheduledJob:
             "id": self.id,
             "watcher": self.watcher,
             "connector": self.connector,
+            "room_id": self.room_id,
             "message": self.message,
             "cron": self.cron,
             "timezone": self.timezone,
@@ -123,6 +144,10 @@ class ScheduledJob:
             id=job_id,
             watcher=data.get("watcher", ""),
             connector=data.get("connector", ""),
+            # Absent on a schema-1 file. `""` is the honest reading — it means
+            # "this job has no recorded room", which is exactly what
+            # `schedule migrate` is for — not a value to invent here.
+            room_id=data.get("room_id", ""),
             message=data.get("message", ""),
             cron=data.get("cron", ""),
             timezone=data.get("timezone", "UTC"),
