@@ -438,14 +438,9 @@ class ControlServer:
             except Exception as e:
                 return {"ok": False, "error": f"Failed to compute next run time: {e}"}
 
-        # The record is already in hand — `_find_entry_for_watcher` above refuses
-        # the create unless one exists — so the room's identity costs nothing to
-        # capture here, and capturing it is what lets the job outlive the record.
-        record = entry.session_manager.get_watcher_state(watcher)
         job = ScheduledJob(
             watcher=watcher,
             connector=entry.name,
-            room_id=(record.room_id if record is not None else ""),
             message=message,
             cron=cron,
             timezone=timezone,

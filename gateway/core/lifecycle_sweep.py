@@ -76,12 +76,18 @@ class LifecycleSweep:
         *,
         now: Callable[[], datetime] | None = None,
         interval_seconds: float = _SWEEP_INTERVAL_SECONDS,
+        pending_jobs: Callable[[str], bool] | None = None,
         reconcile: Callable[[], Awaitable[None]] | None = None,
         reconcile_every: int = _RECONCILE_EVERY_PASSES,
     ) -> None:
         self._lifecycle = lifecycle
         self._now = now or _local_now
         self._interval = interval_seconds
+        # Answers "does this watcher have a pending scheduled job" — the expiry
+        # exemption's oracle, injected because the job store lives with the
+        # scheduler, not the lifecycle. None means no scheduler: nothing to
+        # exempt.
+        self._pending_jobs = pending_jobs
         # The membership reconciliation (§2.7), injected because it needs the
         # connector and the removal path, which live with the SessionManager.
         # Rides this loop rather than owning one so it inherits the
@@ -113,16 +119,19 @@ class LifecycleSweep:
                 # and even a re-read would find a stamp aged zero.
                 if not past_expire_ttl(record, now):
                     continue
-                # A pending scheduled job used to exempt a room from expiry,
-                # because "the job's injection wakes an idle room, but it cannot
-                # wake a deleted record". A job now carries its room's id and
-                # resurrects the room through the ordinary rule path, so the
-                # premise is gone and the exemption with it (owner, 2026-08-31):
-                # a 9am job on an expired room recreates its watcher at 9am,
-                # which is the feature working rather than a case to guard. One
-                # less condition on the destructive leg, and one less place for
-                # the sweep and the operator verb to disagree.
-                if await self._lifecycle.expire_idle(record.watcher_name, now=now):
+                if self._pending_jobs is not None and self._pending_jobs(
+                        record.watcher_name):
+                    # Exempt from expiry, never from idling: the job's
+                    # injection wakes an idle room, but it cannot wake a
+                    # deleted record.
+                    logger.debug(
+                        "Watcher '%s' is past its expiry TTL but has a pending "
+                        "scheduled job — not expiring", record.watcher_name,
+                    )
+                    continue
+                if await self._lifecycle.expire_idle(
+                        record.watcher_name, now=now,
+                        pending_jobs=self._pending_jobs):
                     transitioned.append(record.watcher_name)
                 continue
             # The idle leg.

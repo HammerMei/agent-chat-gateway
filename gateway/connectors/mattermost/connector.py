@@ -578,37 +578,6 @@ class MattermostConnector(Connector):
 
         return Room(id=info["id"], name=name, type=kind)
 
-    async def room_ref_by_id(self, room_id: str) -> "RoomRef | None":
-        """See `Connector.room_ref_by_id`.
-
-        Shares `resolve_room_by_id`'s fetch, team-scope check and member lookup
-        — the difference is only what is kept. That method flattens the members
-        into a display `name` because a `Room` has nowhere else to put them;
-        this keeps them as `participants`, which is what a watcher handle for a
-        1:1 DM is built from.
-
-        A channel outside this connector's team raises there, and that is left
-        alone: a caller resurrecting a room the connector was reconfigured away
-        from wants the error, not a quiet `None`.
-        """
-        room = await self.resolve_room_by_id(room_id)
-        # `RoomKind`'s values ARE these strings, and `resolve_room_by_id` has
-        # already normalised the wire letter into one — so this is a lookup, not
-        # a third mapping to keep in step with the two above.
-        try:
-            kind = RoomKind(room.type)
-        except ValueError:
-            logger.warning(
-                "Channel %s has room type %r, which is not a routable kind — "
-                "not resurrecting it", room_id, room.type,
-            )
-            return None
-        if kind in (RoomKind.DM, RoomKind.GROUP_DM):
-            members = await self._rest.channel_member_usernames(
-                room_id, exclude=self._rest.bot_user_id or "")
-            return RoomRef(id=room.id, kind=kind, participants=tuple(members))
-        return RoomRef(id=room.id, kind=kind, name=room.name)
-
     # ── Per-channel local bookkeeping (no wire protocol — see websocket.py) ────
 
     async def subscribe_room(

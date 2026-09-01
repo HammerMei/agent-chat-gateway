@@ -393,7 +393,7 @@ class WatcherLifecycle:
             )
             return True
 
-    async def expire_idle(self, name: str, *, now) -> bool:
+    async def expire_idle(self, name: str, *, now, pending_jobs=None) -> bool:
         """The expiry (§2.5): reclaim everything an idle record points at.
 
         The destructive leg — after this the room has no record, no watermark
@@ -419,6 +419,19 @@ class WatcherLifecycle:
             if self._processors.get(name) is not None:
                 return False
             if not past_expire_ttl(state, now):
+                return False
+            if pending_jobs is not None and pending_jobs(name):
+                # Re-checked UNDER the lock (Codex review of #121): the
+                # sweep's own check ran before this coroutine was scheduled,
+                # and a schedule-create landing in that gap would have its
+                # job orphaned by the reclamation below. The residual window
+                # — a create between this line and the pop — is accepted:
+                # closing it would couple the job store's writes to the
+                # watcher lock, and the job store lives a layer up.
+                logger.info(
+                    "Watcher '%s' gained a pending job while its expiry "
+                    "waited — not expiring", name,
+                )
                 return False
 
             await self._reclaim_record_locked(name, state)
