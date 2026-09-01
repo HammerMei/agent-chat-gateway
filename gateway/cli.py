@@ -103,8 +103,10 @@ def main():
     # expire
     expire_p = sub.add_parser(
         "expire",
-        help="Expire a rule-derived watcher now: reclaim its record, session "
-             "and files, and cancel its scheduled jobs (overrides pause, audibly)",
+        help="Expire a rule-derived watcher now: clear its session and reclaim "
+             "its record and files (overrides pause, audibly). Scheduled jobs "
+             "are KEPT — the room's next message, or the job itself, recreates "
+             "the watcher",
     )
     expire_p.add_argument("watcher_name", help="Watcher name as shown by 'list'")
 
@@ -289,6 +291,21 @@ def main():
     # schedule resume
     sched_resume_p = schedule_sub.add_parser("resume", help="Resume a paused scheduled task")
     sched_resume_p.add_argument("job_id", help="Job ID")
+
+    # schedule migrate
+    schedule_sub.add_parser(
+        "migrate",
+        help="Bring jobs.json up to the current schema (run after upgrading)",
+        description=(
+            "Records what each scheduled job needs to keep working after an "
+            "upgrade. Safe to re-run: a job that is already up to date is left "
+            "alone, and nothing is ever guessed — a job whose room cannot be "
+            "identified is reported and left exactly as it was.\n\n"
+            "Run it BEFORE renaming any rooms. The migration finds each job's "
+            "room through its watcher name, and a name that has moved to a "
+            "different room would point the job at the wrong one."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -718,7 +735,10 @@ def _run_send(args) -> None:
 def _run_schedule(args) -> None:
     """Handle 'schedule' subcommands."""
     if not hasattr(args, "schedule_cmd") or not args.schedule_cmd:
-        print("Usage: agent-chat-gateway schedule {create,list,delete,pause,resume}")
+        print(
+            "Usage: agent-chat-gateway schedule "
+            "{create,list,delete,pause,resume,migrate}"
+        )
         sys.exit(1)
 
     if args.schedule_cmd == "create":
@@ -731,6 +751,8 @@ def _run_schedule(args) -> None:
         _run_schedule_pause(args)
     elif args.schedule_cmd == "resume":
         _run_schedule_resume(args)
+    elif args.schedule_cmd == "migrate":
+        _run_schedule_migrate(args)
     else:
         print(f"Unknown schedule subcommand: {args.schedule_cmd}", file=sys.stderr)
         sys.exit(1)
@@ -932,6 +954,41 @@ def _run_schedule_delete(args) -> None:
     else:
         print(f"Error: {result.get('error')}", file=sys.stderr)
         sys.exit(1)
+
+
+def _run_schedule_migrate(args) -> None:
+    """Print what the migration did, per job. Silence would be the failure mode."""
+    result = _send_command({"cmd": "schedule-migrate"})
+    if not result["ok"]:
+        print(f"Error: {result.get('error')}", file=sys.stderr)
+        sys.exit(1)
+
+    if result["from_version"] == result["to_version"]:
+        print(f"jobs.json is already at schema version {result['to_version']} "
+              f"— nothing to do.")
+        return
+
+    for step in result.get("steps", []):
+        print(f"  {step}")
+    if result.get("steps"):
+        print()
+
+    outcomes = result.get("outcomes", [])
+    for outcome in outcomes:
+        mark = "✓" if outcome["changed"] else "·"
+        print(f"  {mark} {outcome['job_id']}  {outcome['watcher']}")
+        print(f"      {outcome['detail']}")
+
+    unresolved = [o for o in outcomes if not o["changed"]
+                  and "already has" not in o["detail"]]
+    print()
+    print(f"jobs.json migrated {result['from_version']} → {result['to_version']}: "
+          f"{result['changed']} of {len(outcomes)} job(s) changed.")
+    if unresolved:
+        # Named rather than summarised: each of these needs a decision, and the
+        # migration deliberately made none of them.
+        print(f"{len(unresolved)} job(s) need attention — see the lines above. "
+              f"Nothing was guessed for them; they work exactly as before.")
 
 
 def _run_schedule_pause(args) -> None:

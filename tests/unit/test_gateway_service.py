@@ -164,75 +164,98 @@ class TestGatewayServiceRun(unittest.IsolatedAsyncioTestCase):
         )
 
 
-class TestTheExpiryExemptionOracle(unittest.IsolatedAsyncioTestCase):
-    """Codex round 10: the scheduler explicitly delivers a job whose
-    `connector` field is empty or stale by falling back to a watcher-record
-    scan — so the exemption oracle must honor the same claim, or expiry
-    deletes the record that makes the fallback deliverable."""
+class TestTheExpiryExemptionOracleIsGone(unittest.TestCase):
+    """What was removed, and why nothing replaced it.
+
+    `_has_pending_jobs` answered "does a pending scheduled job target this
+    watcher", and the sweep used it to exempt that room from expiry. Codex round
+    10 had made it honour the scheduler's own connector fallback, so the two
+    agreed about which jobs claimed a watcher.
+
+    Both are gone (owner, 2026-08-31). The exemption existed because "expiry
+    deletes the record the recreation reads from, leaving the job pointing at
+    nothing" — and a job now records the room it targets and resurrects it, so
+    there is no record to protect. The cancel-side rule the oracle's fallback
+    logic was shared with is still live and still tested (see
+    `test_cancellation_applies_the_same_fallback_rule`).
+    """
+
+    def test_the_service_no_longer_answers_it(self):
+        from gateway.service import GatewayService
+
+        self.assertFalse(hasattr(GatewayService, "_has_pending_jobs"))
+
+
+class TestTheCancellationClaimRule(unittest.TestCase):
+    """`_cancel_jobs_for` — the cancel side, which is STILL LIVE.
+
+    Restored after a review found it had lost its only test: the previous attempt
+    deleted five tests when the exemption oracle went, and one of them covered
+    this. `_cancel_jobs_for` is production code, wired to the membership-remove
+    handler, and it carries Codex round 11's claim rule — a job with an empty or
+    stale `connector` is DELIVERABLE to this watcher through the scheduler's
+    fallback scan, so it must also be CANCELLABLE through it, or a reclaim leaves
+    it orphaned: failing resolution forever if active, listed permanently if
+    paused.
+    """
 
     def _service_with_jobs(self, jobs):
+        from gateway.schedule_types import JobStatus, ScheduledJob
+
         service = _make_service()
-        service._entries = [
-            SimpleNamespace(name="rc", session_manager=MagicMock(),
-                            connector=_accountless()),
-        ]
+        entry = MagicMock()
+        entry.name = "rc"
+        service._entries = [entry]
         service._job_store = MagicMock()
-        service._job_store.list_jobs = MagicMock(return_value=jobs)
+        service._job_store.list_jobs = MagicMock(return_value=[
+            ScheduledJob(id=jid, watcher=w, connector=c,
+                         status=JobStatus.ACTIVE)
+            for jid, w, c in jobs
+        ])
+        service._job_store.remove = MagicMock(return_value=True)
         return service
 
-    def _job(self, watcher, connector):
-        return SimpleNamespace(watcher=watcher, connector=connector)
+    def test_a_job_on_this_connector_is_cancelled(self):
+        service = self._service_with_jobs([("acg-1", "rc:general", "rc")])
 
-    def test_a_matching_connector_job_exempts(self):
-        service = self._service_with_jobs([self._job("w1", "rc")])
-        self.assertTrue(service._has_pending_jobs("rc", "w1"))
+        service._cancel_jobs_for("rc", "rc:general")
 
-    def test_a_fallback_owned_job_exempts_too(self):
-        """Empty or stale connector = exactly when the scheduler falls back."""
-        for stale in ("", "renamed-away"):
-            with self.subTest(connector=stale):
-                service = self._service_with_jobs([self._job("w1", stale)])
-                self.assertTrue(service._has_pending_jobs("rc", "w1"))
+        service._job_store.remove.assert_called_once_with("acg-1")
 
-    def test_another_connectors_job_does_not_exempt(self):
-        """A job firmly owned by a DIFFERENT configured connector never
-        exempts this one's watcher — names are unique per connector."""
-        service = self._service_with_jobs([self._job("w1", "mm")])
-        service._entries.append(
-            SimpleNamespace(name="mm", session_manager=MagicMock(),
-                            connector=_accountless()))
-        self.assertFalse(service._has_pending_jobs("rc", "w1"))
+    def test_a_job_with_no_connector_is_cancelled_too(self):
+        """The fallback claim: the scheduler would deliver it here, so a reclaim
+        must be able to cancel it here."""
+        service = self._service_with_jobs([("acg-1", "rc:general", "")])
 
-    def test_an_unanswerable_store_fails_exempt(self):
-        service = self._service_with_jobs([])
-        service._job_store.list_jobs = MagicMock(
-            side_effect=RuntimeError("not loaded"))
-        self.assertTrue(service._has_pending_jobs("rc", "w1"))
+        service._cancel_jobs_for("rc", "rc:general")
 
-    def test_cancellation_applies_the_same_fallback_rule(self):
-        """Codex round 11, the cancel side of the same claim rule: a job
-        deliverable via the fallback scan must be cancellable through it —
-        or the reclaim leaves it orphaned forever."""
-        jobs = [self._job("w1", ""), self._job("w1", "renamed-away"),
-                self._job("w1", "rc"), self._job("w1", "mm"),
-                self._job("other", "rc")]
-        for j, jid in zip(jobs, ["j-empty", "j-stale", "j-mine",
-                                 "j-other-conn", "j-other-watcher"]):
-            j.id = jid
-        service = self._service_with_jobs(jobs)
-        service._entries.append(
-            SimpleNamespace(name="mm", session_manager=MagicMock(),
-                            connector=_accountless()))
-        removed = []
-        service._job_store.remove = MagicMock(side_effect=removed.append)
+        service._job_store.remove.assert_called_once_with("acg-1")
 
-        service._cancel_jobs_for("rc", "w1")
+    def test_a_job_naming_a_connector_that_no_longer_exists_is_cancelled(self):
+        service = self._service_with_jobs([("acg-1", "rc:general", "retired")])
 
-        self.assertEqual(sorted(removed), ["j-empty", "j-mine", "j-stale"],
-                         "fallback-owned jobs cancel; another configured "
-                         "connector's job and another watcher's do not")
+        service._cancel_jobs_for("rc", "rc:general")
 
+        service._job_store.remove.assert_called_once_with("acg-1")
 
+    def test_another_configured_connectors_job_is_left_alone(self):
+        """The one case the fallback must NOT swallow: `mm` is configured, so its
+        job is deliverable there and is not this reclaim's business."""
+        service = self._service_with_jobs([("acg-1", "rc:general", "mm")])
+        other = MagicMock()
+        other.name = "mm"
+        service._entries.append(other)
+
+        service._cancel_jobs_for("rc", "rc:general")
+
+        service._job_store.remove.assert_not_called()
+
+    def test_another_watchers_job_is_left_alone(self):
+        service = self._service_with_jobs([("acg-1", "rc:dev", "rc")])
+
+        service._cancel_jobs_for("rc", "rc:general")
+
+        service._job_store.remove.assert_not_called()
 class TestIdentityBarrier(unittest.IsolatedAsyncioTestCase):
     """The barrier's value is its *position*, so these assert ordering, not just refusal.
 

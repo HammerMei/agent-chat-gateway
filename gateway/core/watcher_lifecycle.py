@@ -393,7 +393,7 @@ class WatcherLifecycle:
             )
             return True
 
-    async def expire_idle(self, name: str, *, now, pending_jobs=None) -> bool:
+    async def expire_idle(self, name: str, *, now) -> bool:
         """The expiry (§2.5): reclaim everything an idle record points at.
 
         The destructive leg — after this the room has no record, no watermark
@@ -420,19 +420,6 @@ class WatcherLifecycle:
                 return False
             if not past_expire_ttl(state, now):
                 return False
-            if pending_jobs is not None and pending_jobs(name):
-                # Re-checked UNDER the lock (Codex review of #121): the
-                # sweep's own check ran before this coroutine was scheduled,
-                # and a schedule-create landing in that gap would have its
-                # job orphaned by the reclamation below. The residual window
-                # — a create between this line and the pop — is accepted:
-                # closing it would couple the job store's writes to the
-                # watcher lock, and the job store lives a layer up.
-                logger.info(
-                    "Watcher '%s' gained a pending job while its expiry "
-                    "waited — not expiring", name,
-                )
-                return False
 
             await self._reclaim_record_locked(name, state)
             logger.info(
@@ -446,7 +433,7 @@ class WatcherLifecycle:
         """Reclaim everything a record points at, record popped last (§2.5).
 
         The shared destructive body: expiry calls it after its gates
-        (TTL, residency, pause, the job exemption), membership removal after
+        (TTL, residency, pause), membership removal after
         its own (stop a resident processor, cancel jobs, audit the pause
         override). The gates stay with the callers on purpose — they are what
         differ; the reclamation order is what must not.
@@ -645,9 +632,11 @@ class WatcherLifecycle:
           access to. The override is the one case an operator's explicit
           setting is discarded, so it is logged as an audit event, never
           silent.
-        * **No TTL, no job exemption.** The caller cancels this room's pending
-          jobs with a stated reason — an exemption would keep a record alive
-          for a job that can never deliver.
+        * **No TTL.** Its membership-removal caller also cancels this room's
+          pending jobs, with a stated reason: the bot has left, so they could
+          never deliver again. The operator's `expire` deliberately does not —
+          the room is still there, and a job records its id and can bring the
+          watcher back.
 
         One gate is *stronger*: a record with no materialized config is the
         static path's (config.yaml recreates it at every boot regardless of

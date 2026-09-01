@@ -444,12 +444,27 @@ class JobScheduler:
         sm = self._session_managers.get(job.connector)
         if sm is not None:
             return sm
+
+        # A job whose `connector` is empty or names a connector that is no longer
+        # configured. Two fallbacks, in order of how much they can be trusted.
         for manager in self._session_managers.values():
-            # Record-based identity (§2.8): `get_watcher_config` was removed
-            # with the static path, and calling it here raised AttributeError
-            # before the fire's failure accounting could run (Codex round 4).
+            # By ROOM first: the room id is the job's identity, and a record
+            # bound to it identifies the owning manager even when the room has
+            # been renamed and the handle no longer matches anything.
+            if job.room_id and manager.record_for_room(job.room_id) is not None:
+                return manager
+        for manager in self._session_managers.values():
+            # By handle, last: `get_watcher_config` was removed with the static
+            # path, and calling it here raised AttributeError before the fire's
+            # failure accounting could run (Codex round 4). Kept because a job
+            # written before `room_id` existed has nothing else — and it is the
+            # weaker signal, since a handle can have been taken over by another
+            # room (§2.3).
             if manager.get_watcher_state(job.watcher) is not None:
                 return manager
+        # Neither field can name a manager: an old job whose connector was
+        # renamed away and whose room has no live record. `schedule migrate`
+        # records both, which is what makes such a job resolvable again.
         return None
 
     async def _notify_injection_failure(

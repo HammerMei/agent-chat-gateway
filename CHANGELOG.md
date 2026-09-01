@@ -45,14 +45,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   there is **no ordering constraint between them** — they are sequential legs
   measured from different origins (last activity; the drop). An hourly sweep
   runs both legs, advancing a watcher at most one state per pass, so an outage
-  of any length cannot cascade `active → expired`; a pending scheduled job
-  exempts a room from expiry (never from idling); **pause exempts from both**.
+  of any length cannot cascade `active → expired`; **pause exempts from both**,
+  and a pending scheduled job exempts a room from neither — each job records the
+  room it targets, so its next run recreates the watcher a sweep reclaimed.
   Boot runs the same evaluation over was-active records, so a fleet reads
   honestly after a restart instead of `failed`.
 - **Operator verbs act on records, and there is a new one**:
-  `acg expire <watcher>` reclaims a room's record, session and files now,
-  cancelling its scheduled jobs (it overrides pause, audibly — the audit line
-  names the room). `pause` on a room the gateway has never seen is rejected
+  `acg expire <watcher>` clears a room's session and reclaims its record and
+  files now (it overrides pause, audibly — the audit line names the room). It
+  does NOT cancel the room's scheduled jobs: expire does not stop a rule
+  watching a room, so the job records the room's id and brings the watcher back
+  on its next run. Being removed from a room does cancel them, because there
+  the room can no longer answer. `pause` on a room the gateway has never seen is rejected
   with a pointer at `rooms.except_for` (the old path fabricated a blank record
   that then *overwrote the real one on disk* — #118). `reset` refuses a paused
   watcher instead of silently clearing the pause; `resume` restarts the idle

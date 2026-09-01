@@ -240,6 +240,12 @@ class ControlServer:
         if cmd == "instructions":
             return self._handle_instructions(request)
 
+        # schedule-migrate is the one that has to await: it asks connectors to
+        # resolve room names. Handled here rather than inside the sync
+        # `_handle_schedule` below, whose whole point is that it needs no await.
+        if cmd == "schedule-migrate":
+            return await self._handle_schedule_migrate()
+
         # schedule-*: managed by JobStore (no connector routing needed)
         if cmd and cmd.startswith("schedule-"):
             return self._handle_schedule(cmd, request)
@@ -339,6 +345,31 @@ class ControlServer:
         if cmd == "schedule-resume":
             return self._handle_schedule_resume(request)
         return {"ok": False, "error": f"Unknown schedule command: {cmd!r}"}
+
+    async def _handle_schedule_migrate(self) -> dict:
+        """`schedule migrate`: bring jobs.json up to the current schema.
+
+        Runs in the daemon because resolving a room name needs the connectors.
+        Reports every job it looked at, changed or not — the output IS the record
+        of what happened, which is the reason this is a command rather than
+        something done invisibly at fire time.
+        """
+        if self._job_store is None:
+            return {
+                "ok": False,
+                "error": "Scheduler is not enabled (JobStore not configured)",
+            }
+        from .core.job_migrate import migrate
+
+        try:
+            report = await migrate(self._job_store, self._entries)
+        except ValueError as exc:
+            # The file is newer than this code — there is nothing safe to do.
+            return {"ok": False, "error": str(exc)}
+        except Exception as exc:
+            logger.exception("schedule migrate failed")
+            return {"ok": False, "error": f"Migration failed: {exc}"}
+        return {"ok": True, **report.to_dict()}
 
     def _handle_schedule_create(self, request: dict) -> dict:
         from datetime import UTC, datetime

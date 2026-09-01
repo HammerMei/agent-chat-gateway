@@ -39,7 +39,25 @@ logger = logging.getLogger("agent-chat-gateway.core.job_store")
 RUNTIME_DIR = Path.home() / ".agent-chat-gateway"
 DATA_DIR = RUNTIME_DIR / "data"
 JOBS_FILE = DATA_DIR / "jobs.json"
-_SCHEMA_VERSION = 1
+# Bump when a change to jobs.json needs an operator step. Written on every
+# save, and — since version 2 — actually READ, so a file older than this code
+# announces itself instead of being silently misinterpreted.
+#
+#   1 → 2  each job records the room it targets (`room_id`), so it survives a
+#          room rename and an `expire`. Filled in by
+#          `agent-chat-gateway schedule migrate`.
+_SCHEMA_VERSION = 2
+
+
+def _coerce_version(raw: object) -> int:
+    """A file's declared version, defaulting to 1 for anything unreadable.
+
+    1 rather than 0 or a raise: the field was written from the first release, so
+    a missing or corrupt value means "old", and treating it as old only ever
+    costs a migration run that finds nothing to do. Guessing NEW would skip a
+    migration silently.
+    """
+    return raw if isinstance(raw, int) and raw > 0 else 1
 
 
 class JobStore:
@@ -59,6 +77,61 @@ class JobStore:
         # handlers).  The lock is held only during dict operations, never during
         # disk I/O, to avoid blocking the event loop longer than necessary.
         self._lock = threading.Lock()
+        # Assume current until a file says otherwise: no file means
+        # nothing to migrate.
+        self._file_version = _SCHEMA_VERSION
+
+    # ── Schema version ────────────────────────────────────────────────────────
+
+    @property
+    def file_version(self) -> int:
+        """The schema version the loaded file declared.
+
+        `_SCHEMA_VERSION` for a file this code wrote or for no file at all
+        (nothing to migrate), and lower for one an older ACG wrote.
+        """
+        return self._file_version
+
+    def needs_migration(self) -> bool:
+        return self._file_version < _SCHEMA_VERSION
+
+    def stamp_version(self, version: int) -> None:
+        """Record that the file is now at `version`, and write it out.
+
+        Separate from `save()` because saving happens constantly and must not
+        silently claim a migration that did not run: every save writes
+        `_SCHEMA_VERSION` into the file, so a store that has NOT migrated would
+        otherwise stamp itself current the first time a job fired. This is the
+        one place that moves the in-memory version, and only the migration calls
+        it — after all of its steps have finished.
+        """
+        self._file_version = version
+        self.save()
+
+    def _announce_version(self) -> None:
+        """Say something at startup, because a migration nobody knows about is
+        a migration nobody runs.
+
+        A file NEWER than this code is the more dangerous direction and gets a
+        warning of its own: an older ACG reading it will drop whatever fields it
+        does not know on the next save.
+        """
+        if self._file_version > _SCHEMA_VERSION:
+            logger.warning(
+                "%s declares schema version %d but this ACG understands %d — it "
+                "was written by a newer version. Saving from here will DROP any "
+                "field this version does not know. Upgrade, or move the file "
+                "aside.", self._file, self._file_version, _SCHEMA_VERSION,
+            )
+        elif self.needs_migration():
+            logger.warning(
+                "%s is at schema version %d; this ACG uses %d. Scheduled jobs "
+                "keep working, with the behaviour of the older version. Run "
+                "'agent-chat-gateway schedule migrate' to bring them up to date "
+                "— do it before renaming any rooms, since the migration reads "
+                "each job's watcher name to find its room.",
+                self._file, self._file_version, _SCHEMA_VERSION,
+            )
 
     # ── Load / save ───────────────────────────────────────────────────────────
 
@@ -71,6 +144,7 @@ class JobStore:
             return
         try:
             data = json.loads(self._file.read_text())
+            self._file_version = _coerce_version(data.get("version"))
             raw_jobs = data.get("jobs", [])
             self._jobs = {}
             for raw in raw_jobs:
@@ -80,6 +154,7 @@ class JobStore:
                 except Exception as e:
                     logger.warning("Skipping malformed job entry: %s — %s", raw, e)
             logger.info("Loaded %d scheduled job(s) from %s", len(self._jobs), self._file)
+            self._announce_version()
         except Exception as e:
             logger.warning("Failed to load jobs file %s — starting with empty list: %s", self._file, e)
         self._loaded = True

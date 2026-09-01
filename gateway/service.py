@@ -320,19 +320,10 @@ class GatewayService:
                 watcher_rules=[
                     r for r in config.watcher_rules if r.connector == cc.name
                 ],
-                # The expiry exemption's oracle (§2.5): a room with a pending
-                # scheduled job must not have its record deleted — the job's
-                # injection can wake an idle room, never a reclaimed one. The
-                # closure binds this connector's name (jobs are unique per
-                # connector, not globally) and reads the store lazily — it is
-                # loaded later in startup, and the sweep's first pass is an
-                # hour away. Fails EXEMPT: if the store cannot answer, keeping
-                # a record one more pass beats deleting one a job points at.
-                pending_jobs=(
-                    lambda name, _cn=cc.name: self._has_pending_jobs(_cn, name)
-                ),
-                # The membership-remove handler's job cancellation (§2.7):
-                # same closure shape and same key as the oracle above.
+                # The membership-remove handler's job cancellation (§2.7).
+                # The expiry-exemption oracle that used to sit here is gone with
+                # the exemption itself: a job records the room it targets and can
+                # resurrect it, so there is no record to protect on its behalf.
                 cancel_jobs=(
                     lambda name, _cn=cc.name: self._cancel_jobs_for(_cn, name)
                 ),
@@ -354,41 +345,6 @@ class GatewayService:
             self._entries,
             job_store=self._job_store,
         )
-
-    def _has_pending_jobs(self, connector_name: str, watcher_name: str) -> bool:
-        """Whether any non-completed scheduled job targets this watcher.
-
-        The expiry exemption's oracle (§2.5). ACTIVE **and PAUSED** jobs both
-        exempt: deleting a record under a paused job orphans it the moment an
-        operator resumes it. Jobs key by watcher name and connector — names
-        are unique only per connector, so both halves matter.
-
-        Fails EXEMPT: a store that cannot answer (not yet loaded, corrupt
-        file) keeps the record one more pass, which costs a state-file entry;
-        answering False would delete a record a job points at, permanently.
-        """
-        try:
-            # Fallback-owned jobs count too (Codex round 10): the scheduler
-            # explicitly supports a job whose `connector` field is empty or
-            # stale by scanning managers for the watcher — so the exemption
-            # must honor the same claim, or expiry deletes the record that
-            # makes the fallback deliverable. A job claims this watcher when
-            # its connector matches, OR when its connector matches no
-            # configured connector (exactly when the scheduler would fall
-            # back) and the name matches here.
-            configured = {e.name for e in self._entries}
-            return any(
-                j.watcher == watcher_name
-                and (j.connector == connector_name
-                     or j.connector not in configured)
-                for j in self._job_store.list_jobs()
-            )
-        except Exception as e:
-            logger.warning(
-                "Could not read the job store for the expiry exemption "
-                "(keeping watcher '%s' one more pass): %s", watcher_name, e,
-            )
-            return True
 
     def _cancel_jobs_for(self, connector_name: str, watcher_name: str) -> None:
         """Cancel every scheduled job targeting a reclaimed watcher (§2.7).

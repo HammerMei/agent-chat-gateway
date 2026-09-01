@@ -71,7 +71,6 @@ class SessionManager:
         permission_registry: PermissionRegistry | None = None,
         session_maps: SessionMaps | None = None,
         watcher_rules: list | None = None,
-        pending_jobs=None,
         cancel_jobs=None,
     ) -> None:
         self._connector = connector
@@ -120,14 +119,14 @@ class SessionManager:
         # idle-eligible — no message can ever arrive to wake an idled room
         # there, so a timer that dropped one would be muting it permanently.
         self._sweep = (
-            LifecycleSweep(self._lifecycle, pending_jobs=pending_jobs,
+            LifecycleSweep(self._lifecycle,
                            reconcile=self._reconcile_membership)
             if connector.supports_unsolicited_inbound()
             else None
         )
         # Fired by the membership-remove handler for the reclaimed watcher's
         # name: its pending jobs are cancelled with a stated reason rather
-        # than left pointing at nothing (§2.7). Injected like `pending_jobs`,
+        # than left pointing at nothing (§2.7). Injected as a closure,
         # because the job store lives above this layer.
         self._cancel_jobs = cancel_jobs
         # Kept for the eager-start loop (§2.6): a connector with no
@@ -802,6 +801,15 @@ class SessionManager:
     def get_watcher_state(self, name: str):
         """Return the WatcherState for a watcher, or None if not found."""
         return self._lifecycle.get_watcher_state(name)
+
+    def record_for_room(self, room_id: str):
+        """The record bound to a room, or None (§2.4 sticky binding).
+
+        The by-room counterpart to `get_watcher_state`, exposed for the same
+        reason the scheduler needs it: a room id identifies a watcher even after
+        the room has been renamed and its handle no longer matches.
+        """
+        return self._lifecycle.record_for_room(room_id)
 
     def get_processor(self, name: str):
         """Return the running MessageProcessor for a watcher, or None.

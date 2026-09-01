@@ -18,10 +18,12 @@ Three rules, all owner rulings recorded in §2.5:
   `config.yaml`. `past_idle_ttl`/`past_expire_ttl` (state.py) own that
   arithmetic; boot calls the same idle function (one function, two callers).
 
-And one exemption: **a room with a pending scheduled job is exempt from
-expiry, not from idling.** Idling it is harmless — the job's injection wakes
-it through `get_or_create` — but expiry deletes the record the recreation
-reads from, leaving the job pointing at nothing.
+**A pending scheduled job earns a room no exemption.** It used to be exempt
+from expiry — never from idling — because expiry deleted the record the
+recreation read from, leaving the job pointing at nothing. A job now records
+the room it targets and resurrects it through `get_or_create` like any message,
+so that premise is gone and the exemption with it (owner, 2026-08-31): a 9am job
+on an expired room recreates its watcher at 9am.
 
 Mechanically: `run_once` is the whole sweep and the only thing tests need —
 they inject `now` and never sleep. The free-running loop is a thin shell over
@@ -76,18 +78,12 @@ class LifecycleSweep:
         *,
         now: Callable[[], datetime] | None = None,
         interval_seconds: float = _SWEEP_INTERVAL_SECONDS,
-        pending_jobs: Callable[[str], bool] | None = None,
         reconcile: Callable[[], Awaitable[None]] | None = None,
         reconcile_every: int = _RECONCILE_EVERY_PASSES,
     ) -> None:
         self._lifecycle = lifecycle
         self._now = now or _local_now
         self._interval = interval_seconds
-        # Answers "does this watcher have a pending scheduled job" — the expiry
-        # exemption's oracle, injected because the job store lives with the
-        # scheduler, not the lifecycle. None means no scheduler: nothing to
-        # exempt.
-        self._pending_jobs = pending_jobs
         # The membership reconciliation (§2.7), injected because it needs the
         # connector and the removal path, which live with the SessionManager.
         # Rides this loop rather than owning one so it inherits the
@@ -119,19 +115,16 @@ class LifecycleSweep:
                 # and even a re-read would find a stamp aged zero.
                 if not past_expire_ttl(record, now):
                     continue
-                if self._pending_jobs is not None and self._pending_jobs(
-                        record.watcher_name):
-                    # Exempt from expiry, never from idling: the job's
-                    # injection wakes an idle room, but it cannot wake a
-                    # deleted record.
-                    logger.debug(
-                        "Watcher '%s' is past its expiry TTL but has a pending "
-                        "scheduled job — not expiring", record.watcher_name,
-                    )
-                    continue
-                if await self._lifecycle.expire_idle(
-                        record.watcher_name, now=now,
-                        pending_jobs=self._pending_jobs):
+                # A pending scheduled job used to exempt a room from expiry —
+                # never from idling — because "the job's injection wakes an idle
+                # room, but it cannot wake a deleted record". A job now records
+                # the room it targets and resurrects it through the ordinary rule
+                # path, so the premise is gone and the exemption with it (owner,
+                # 2026-08-31): a 9am job on an expired room recreates its watcher
+                # at 9am, which is the feature working rather than a case to
+                # guard. One condition fewer on the destructive leg, and one less
+                # place for the sweep and the operator verb to disagree.
+                if await self._lifecycle.expire_idle(record.watcher_name, now=now):
                     transitioned.append(record.watcher_name)
                 continue
             # The idle leg.

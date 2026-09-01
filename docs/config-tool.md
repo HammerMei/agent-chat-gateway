@@ -158,9 +158,10 @@ message — see [docs/user-guide.md](user-guide.md) for how matching works.
 - **Deleting** a rule warns you with what it strands: how many persisted
   session records on disk still belong to it, and how many scheduled jobs
   target those sessions. The counts are read from the daemon's own files.
-  Idle stranded sessions are cleaned up by the daemon's lifecycle sweeps —
-  but a session with pending scheduled jobs is exempt from expiry, so its
-  jobs keep running until you remove them (`acg schedule delete <job_id>`).
+  Idle stranded sessions are cleaned up by the daemon's lifecycle sweeps. The
+  scheduled jobs are **not** deleted with the rule, but they stop delivering
+  once no rule claims those rooms — each run then fails and is logged, while the
+  job still lists as active. Remove them with `acg schedule delete <job_id>`.
 - This tab edits `config.yaml` only. To see or act on the *live* sessions a
   rule has created, use the CLI: `acg list`, `acg pause/resume/reset/expire`.
 - Known limitation: while some rule in the file is broken (its row shows

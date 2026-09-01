@@ -282,14 +282,19 @@ class RuleDetailScreen(FormScreen):
             "are reclaimed by the daemon's lifecycle sweeps."
         )
         if jobs:
-            # Not a vague caveat — the expiry sweep genuinely refuses a
-            # record with pending jobs (WatcherLifecycle.expire_idle's job
-            # exemption), so a stranded session KEEPS its jobs firing until
-            # the operator removes them.
+            # Rewritten with the behaviour (owner, 2026-08-31). This used to say
+            # a session with pending jobs was "exempt from expiry — its jobs keep
+            # running until removed", which was true of the sweep's old job
+            # exemption. That exemption is gone, and the outcome is now the
+            # opposite: the record is expired like any other, and each fire then
+            # resolves the room, finds no rule claiming it, and delivers nothing.
+            # The jobs are not deleted — they just stop working, while still
+            # listing as active, which is the part worth saying out loud.
             message += (
-                " A session with pending scheduled jobs is exempt from "
-                "expiry — its jobs keep running until removed "
-                "('acg schedule delete <job_id>')."
+                " Its scheduled jobs are NOT deleted, but they stop delivering "
+                "once no rule claims those rooms — each run then fails and is "
+                "logged, and the job still shows as active. Remove them with "
+                "'acg schedule delete <job_id>'."
             )
         return message
 

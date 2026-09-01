@@ -514,7 +514,12 @@ class TestRuleDelete:
             # jobs is EXEMPT from expiry (WatcherLifecycle.expire_idle), so
             # the warning says its jobs keep running, not that the sweeps
             # will clean everything up.
-            assert "exempt from expiry" in message
+            # The clause the operator reads before deleting. It used to promise
+            # the jobs kept running (the sweep's old exemption); the truth is
+            # now that they stop delivering while still listing as active.
+            assert "NOT deleted" in message
+            assert "stop delivering" in message
+            assert "exempt from expiry" not in message
 
     async def test_no_strands_means_the_plain_confirm_message(
         self, tmp_path, work_dir, monkeypatch

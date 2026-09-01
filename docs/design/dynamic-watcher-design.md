@@ -1582,28 +1582,75 @@ by rooms nobody has ever spoken in, burying the handful being worked on.
 Idle is one flag away when the question is "what does the bot know about"
 rather than "what is it doing".
 
-**A scheduled job keys on `(connector, room_id)`, not on the label.** Jobs
-persist a watcher *name* today, which under this design is cosmetic and free to
-change (§2.3) — so a rename would orphan every job on that room, a label
-collision would make lookup ambiguous, and the expiry-exemption check below
-would consult the wrong room. The label is kept alongside as display metadata
-only. Jobs created before the upgrade are not converted; they are re-created by
-the operator (§5.3), which is why the job schema can change to the correct key
-without a compatibility path.
+**A scheduled job keys on `(connector, room_id)`, not on the label.** A watcher
+name is cosmetic and free to change (§2.3), so keying on it means a rename
+orphans every job on that room. The label is kept alongside as display metadata —
+it is what `list`, `pause` and `expire` speak — and `room_id` is what a fire
+resolves through.
 
-**Rooms with pending scheduled jobs are exempt from expiry, not from
-idling.** Idling such a room is harmless: the job fires, `get` recreates the
-watcher, the injection proceeds. Exempting it from *idling* would be actively
-wrong — a job scheduled a year out would hold a session resident for a year
-for nothing. Expiry is the destructive step, because it deletes the record
-the recreation reads from, leaving the job pointing at nothing. So expiry
-skips any room with a pending job.
+Implemented (owner, 2026-09-01), after a first attempt was reverted for three
+defects worth naming, because each is a way this can be got wrong again:
 
-"Pending" includes **paused** jobs, not only active ones (owner, 2026-08-17):
-a pause is "not now", not "never" — deleting the record under a paused job
-would orphan it the moment an operator resumes it, and the operator's next
-move after resuming would be wondering why the job fires at nothing. Only a
-completed job stops holding its room.
+* the id must reach `jobs.json`. It did not, so the whole thing was a no-op
+  after a restart — and the expiry exemption below had already been removed on
+  the strength of it. `tests/unit/test_job_store_roundtrip.py` walks
+  `dataclasses.fields()` so the next field cannot be dropped silently;
+* the id must address the REPLY as well as the wake. Resolving the room by id
+  and then re-reading the record by handle produced an empty room id for a
+  watcher resurrected under a new label: the agent ran a full turn and the reply
+  went nowhere, while the fire counted as a success;
+* the id must be consulted BEFORE the handle. Consulted after, a job holding a
+  correct id delivered into whichever room had taken its handle over.
+
+`Connector.room_ref_by_id()` is the mechanism: the inverse of `resolve_room`, and
+the direction that survives a rename. It returns a `RoomRef` rather than a `Room`
+because creation needs the kind and, for the DM kinds, the participants. `None`
+means answered-and-absent — no such room, another team, or this account is no
+longer a member — and only a transport failure raises, so a caller can tell
+"give up on this room" from "ask again later". Each connector answers through the
+classifier its message path already uses, so the `d`-covers-both-DM-kinds problem
+(§6.4) keeps one implementation. Rocket.Chat gets membership free (its
+subscription record IS membership); Mattermost asks, because a channel the bot
+was removed from still resolves by id there.
+
+The wake stays where it was: `inject_message` resolves the room once — from the
+record when one is bound to that room, from the connector by id when not — and
+both the creation and the injected message's address come from that one
+resolution. Pause, the creation cap and the rule match are all decided inside
+`get_or_create`, so a job cannot reach a room a message could not, and pause
+still outranks a schedule (§4.4). A room that cannot be resolved injects nothing,
+rather than injecting a message with nowhere to reply.
+
+**Old jobs migrate on an operator's command, not at fire time.**
+`agent-chat-gateway schedule migrate` fills in `room_id` for jobs written before
+schema 2. Deliberately not lazy: the step finds a job's room through its watcher
+handle, and a handle only names the right room while nobody has renamed it — the
+operator can choose a moment when that holds, right after an upgrade and before
+touching room names. A job firing once a year would otherwise wait a year to
+migrate, through a window in which anything could have happened (owner,
+2026-09-01). The command is version-aware, so a deployment jumping two versions
+runs both steps and one jumping one runs only the second; each step is also
+idempotent, so a wrong version cannot corrupt anything. Nothing is guessed: a job
+whose room cannot be identified is reported and left exactly as it was, and a
+group DM — whose label is a digest of its room id, not a name — is told to be
+recreated rather than resolved.
+
+**A pending scheduled job earns a room no exemption from the sweep.** It used to
+be exempt from expiry, never from idling, and the reason held while it did:
+idling such a room is harmless because the job wakes it, but expiry deleted the
+record the recreation read from. With the id on the job, an expired room is one a
+job can bring back — a 9am job on an expired room recreates its watcher at 9am,
+which is the feature working rather than a case to guard. The oracle that
+answered the exemption, `GatewayService._has_pending_jobs`, is removed rather
+than left accepted-and-ignored: an argument a caller still passes is an argument
+it still believes in. The cancel-side rule it shared its fallback logic with is
+still live, and still tested.
+
+Expiry and membership removal now differ deliberately, and the difference is what
+the two verbs MEAN. `expire` clears a session and reclaims a record; it does not
+stop a rule watching a room (that is a rules edit, or removing the bot), so its
+jobs are kept and one of them may bring the watcher back. Membership removal
+cancels them, because the bot has left and the room can no longer answer.
 
 **The operator's `expire` does not cancel a room's jobs** (owner, 2026-08-31).
 It once did, borrowed from the membership-removal path, whose reason was that a
