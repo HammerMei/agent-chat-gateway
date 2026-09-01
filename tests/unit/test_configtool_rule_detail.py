@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 import yaml
-from textual.widgets import Checkbox, DataTable, Input, Static
+from textual.widgets import Checkbox, DataTable, Input, Select, Static
 
 from gateway.configtool.app import ConfigToolApp
 from gateway.configtool.modals import ConfirmModal, MessageModal
@@ -89,6 +89,19 @@ def _config_with_no_rules(work_dir: Path) -> str:
 async def _open_rules_tab(pilot, app) -> None:
     app.screen.query_one("TabbedContent").active = "tab-rules"
     await pilot.pause()
+
+async def _choose_connector_and_agent(pilot, app, connector: str, agent: str) -> None:
+    """Pick both required Selects in a CREATE form.
+
+    They compose blank now: neither has a loader default, so preselecting the
+    first option would be the document-order binding the loader stopped making —
+    and a preselection the diff cannot see is what let a rule save without an
+    agent at all. Every create test therefore chooses, the way an operator does.
+    """
+    app.screen.query_one("#field-connector", Select).value = connector
+    app.screen.query_one("#field-agent", Select).value = agent
+    await pilot.pause()
+
 
 
 async def _open_rule_row(pilot, app, row: int, key: str) -> None:
@@ -218,6 +231,7 @@ class TestRuleCreate:
             assert app.screen.mode == "create"
 
             app.screen.query_one("#field-name", Input).value = "my-rule"
+            await _choose_connector_and_agent(pilot, app, "rc", "default")
             app.screen.query_one("#field-rooms-include", Input).value = "general, eng-*"
             await pilot.pause()
             await pilot.press("ctrl+s")
@@ -243,6 +257,7 @@ class TestRuleCreate:
             await pilot.pause()
 
             app.screen.query_one("#field-name", Input).value = "dm-rule"
+            await _choose_connector_and_agent(pilot, app, "rc", "default")
             app.screen.query_one("#field-rooms-direct", Checkbox).value = True
             await pilot.pause()
             await pilot.press("ctrl+s")
@@ -287,6 +302,7 @@ class TestRuleCreate:
             await pilot.press("n")
             await pilot.pause()
             app.screen.query_one("#field-name", Input).value = "matchless"
+            await _choose_connector_and_agent(pilot, app, "rc", "default")
             await pilot.pause()
             await pilot.press("ctrl+s")
             await pilot.pause()
@@ -304,6 +320,7 @@ class TestRuleCreate:
             await pilot.press("n")
             await pilot.pause()
             app.screen.query_one("#field-name", Input).value = "eng-rooms"
+            await _choose_connector_and_agent(pilot, app, "rc", "default")
             app.screen.query_one("#field-rooms-include", Input).value = "general"
             await pilot.pause()
             await pilot.press("ctrl+s")
@@ -350,6 +367,7 @@ class TestRuleEdit:
             await _open_rule_row(pilot, app, row=0, key="e")
 
             app.screen.query_one("#field-name", Input).value = "engineering"
+            await _choose_connector_and_agent(pilot, app, "rc", "default")
             await pilot.pause()
             await pilot.press("ctrl+s")
             await pilot.pause()
@@ -369,6 +387,7 @@ class TestRuleEdit:
             await _open_rule_row(pilot, app, row=0, key="e")
 
             app.screen.query_one("#field-name", Input).value = "catch-all"
+            await _choose_connector_and_agent(pilot, app, "rc", "default")
             await pilot.pause()
             await pilot.press("ctrl+s")
             await pilot.pause()
@@ -639,20 +658,18 @@ class TestEmptyPrerequisiteGuards:
 
 
 class TestCodexRound1Fixes:
-    async def test_an_untouched_agent_select_is_still_written_explicitly(
+    async def test_an_untouched_agent_select_is_refused_not_guessed(
         self, tmp_path, work_dir
     ):
-        """Codex review of #129 (P1): the agent prefill used next(iter(agents))
-        — the FIRST agent — even when a top-level `default_agent:` named
-        another, and create mode force-writes the selection explicitly, so an
-        untouched Agent field silently bound the new rule to the wrong backend.
+        """Codex review of #129 (P1) found that the agent prefill used
+        `next(iter(agents))` — the FIRST agent — while create mode force-wrote
+        the selection, so an untouched Agent field silently bound a new rule to
+        the wrong backend. That fix made the prefill honour `default_agent:`.
 
-        `default_agent:` is gone, so there is no configured default for the
-        prefill to honour and this asserts what remains, which is the half that
-        was always doing the work: create mode WRITES the selection. An
-        untouched Select is a preselection, not a guess the loader would later
-        repeat — and since the loader now refuses a rule with no agent at all,
-        the value in the file is the only thing that decides.
+        Both the fallback and the prefill are gone now, and this asserts what
+        replaced them: an untouched required Select is BLANK, and Save says so
+        rather than choosing. The earlier fix picked a better guess; this stops
+        guessing, which is the same objection one level up.
         """
         config_path = _write_config(tmp_path, f"""\
             connectors:
@@ -674,20 +691,38 @@ class TestCodexRound1Fixes:
             await _open_rules_tab(pilot, app)
             await pilot.press("n")
             await pilot.pause()
+            agent_select = app.screen.query_one("#field-agent", Select)
+            assert agent_select.value is Select.NULL, (
+                f"an untouched required Select must be blank, got {agent_select.value!r}"
+            )
+
             app.screen.query_one("#field-name", Input).value = "my-rule"
             app.screen.query_one("#field-rooms-include", Input).value = "general"
+            app.screen.query_one("#field-connector", Select).value = "rc"
             await pilot.pause()
             await pilot.press("ctrl+s")
             await pilot.pause()
 
-            assert isinstance(app.screen, OverviewScreen)
-            raw = yaml.safe_load(Path(config_path).read_text())
-            (entry,) = raw["watcher_rules"]
-            assert entry["agent"] == "aaa-first", "the preselection, written down"
-            # And the file it produced actually loads — the point of writing it.
-            from gateway.config import GatewayConfig
+            assert app.screen.__class__.__name__ == "MessageModal", "must be refused"
+            body = str(app.screen.query_one("#message-body").render())
+            assert "needs an agent" in body, body
+            await pilot.press("enter")
+            await pilot.pause()
 
-            assert GatewayConfig.from_file(config_path).watcher_rules[0].agent == "aaa-first"
+            # Choosing is what writes it — and the second agent, so the
+            # assertion cannot pass by accident of document order.
+            app.screen.query_one("#field-agent", Select).value = "zother"
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+            assert isinstance(app.screen, OverviewScreen)
+
+        raw = yaml.safe_load(Path(config_path).read_text())
+        (entry,) = raw["watcher_rules"]
+        assert entry["agent"] == "zother"
+        from gateway.config import GatewayConfig
+
+        assert GatewayConfig.from_file(config_path).watcher_rules[0].agent == "zother"
 
     async def test_a_typed_name_survives_an_inherits_template_switch(
         self, tmp_path, work_dir
@@ -717,6 +752,7 @@ class TestCodexRound1Fixes:
             await pilot.press("n")
             await pilot.pause()
             app.screen.query_one("#field-name", Input).value = "my-rule"
+            await _choose_connector_and_agent(pilot, app, "rc", "default")
             await pilot.pause()
 
             # Switch templates the way the picker's confirm path does.
@@ -833,6 +869,7 @@ class TestCodexRound2Fixes:
             await pilot.pause()
             await _open_rule_row(pilot, app, row=0, key="e")
             app.screen.query_one("#field-name", Input).value = ""
+            await _choose_connector_and_agent(pilot, app, "rc", "default")
             await pilot.pause()
 
             app.screen._inherits_current = "slow"
@@ -892,6 +929,7 @@ class TestCodexRound3Fixes:
             await pilot.press("n")
             await pilot.pause()
             app.screen.query_one("#field-name", Input).value = "new-rule"
+            await _choose_connector_and_agent(pilot, app, "rc", "default")
             app.screen.query_one("#field-rooms-include", Input).value = "dev"
             await pilot.pause()
             await pilot.press("ctrl+s")
@@ -1512,6 +1550,7 @@ class TestCodexRound10Fixes:
             await pilot.press("n")
             await pilot.pause()
             app.screen.query_one("#field-name", Input).value = "new-rule"
+            await _choose_connector_and_agent(pilot, app, "rc", "default")
             # An except_for with no overlapping include is refused by the loader.
             app.screen.query_one("#field-rooms-include", Input).value = "general"
             app.screen.query_one("#field-rooms-except_for", Input).value = "zzz-nothing"

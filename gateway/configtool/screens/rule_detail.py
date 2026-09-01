@@ -44,6 +44,7 @@ from .form_common import (
     FieldSpec,
     FormScreen,
     apply_update,
+    read_widget_value,
     sort_required_first,
     widget_id,
 )
@@ -315,21 +316,23 @@ class RuleDetailScreen(FormScreen):
         return "watcher"
 
     def _dataclass_defaults(self) -> dict[str, object]:
-        # Neither `connector` nor `agent` has a loader fallback to mirror any
-        # more — a rule states both, or inherits them. What these values are is
-        # a PRESELECTION, because a Select cannot render blank: they are not a
-        # claim about what an untouched field would evaluate to (nothing would;
-        # the load would fail). Create mode writes the selection explicitly,
-        # which is what turns the preselection into a decision on the record.
+        # `name`, `connector` and `agent` have NO default — None is the honest
+        # answer for all three, and for the same reason: there is no value a
+        # rule that omits them would evaluate to. It would not evaluate to
+        # anything; the config would fail to load.
         #
-        # `name` has no default: None (blank) is the honest answer for a
-        # required identity field.
+        # This dict feeds `_compute_initial_values()`, which uses it as the
+        # SNAPSHOT for a field the entry and its template both leave unset. A
+        # made-up value there is not a harmless preselection — the snapshot is
+        # what Save diffs against, so the form showed "agent-opencode" for a
+        # rule that had no agent, the diff saw no change, and Save wrote
+        # nothing while the rule stayed unloadable (user-reported). Worse, the
+        # value it invented was the FIRST agent in the file: exactly the
+        # document-order binding that was just removed from the loader.
         defaults: dict[str, object] = dict(WATCHER_TEMPLATE_DATACLASS_DEFAULTS)
         defaults["name"] = None
-        defaults["connector"] = (
-            self.cfg.connectors_raw[0].get("name", "") if self.cfg.connectors_raw else ""
-        )
-        defaults["agent"] = next(iter(self.cfg.agents_raw), "")
+        defaults["connector"] = None
+        defaults["agent"] = None
         defaults["rooms.include"] = []
         defaults["rooms.except_for"] = []
         defaults["rooms.direct"] = False
@@ -550,20 +553,17 @@ class RuleDetailScreen(FormScreen):
         if self._inherits_current != self._inherits_initial:
             apply_update(target_entry, "inherits", self._inherits_current)
 
-        # connector/agent are ALWAYS written explicitly at creation
-        # (bypassing diff semantics) — they're required, and a value the
-        # user never touched must still be recorded rather than left to the
-        # loader's config-order-dependent fallback. Same rule the old
-        # create form had.
+        # connector/agent are ALWAYS written explicitly at creation (bypassing
+        # diff semantics): a new rule has no template to fall back on unless the
+        # operator chose one, and there is no loader default behind it either.
         if self.mode == "create":
             for key in ("connector", "agent"):
-                value = self.query_one("#" + widget_id(key), Select).value
-                if not value:
-                    await self.app.push_screen_wait(
-                        MessageModal("Connector and agent are required.", title="Could not save")
-                    )
-                    return
-                target_entry[key] = value
+                value = read_widget_value(
+                    next(spec for spec in self._field_specs() if spec.key == key),
+                    self.query_one("#" + widget_id(key), Select),
+                )
+                if value:
+                    target_entry[key] = value
 
         name = target_entry.get("name")
         if not isinstance(name, str) or not name.strip():
@@ -580,6 +580,41 @@ class RuleDetailScreen(FormScreen):
             await self.app.push_screen_wait(
                 MessageModal(
                     f"A rule named '{markup_safe(name)}' already exists.",
+                    title="Could not save",
+                )
+            )
+            return
+
+        # Required on the MERGED rule, in every mode — the same rule the rooms
+        # gate below uses, and for the same reason: the loader judges the rule
+        # after its template is merged in, so a rule that inherits `agent` must
+        # save, and one that inherits nothing must not.
+        #
+        # Edit mode used to skip this entirely. Combined with a form that
+        # invented a value for an unset field, that is how a rule with no
+        # `agent:` could be opened, saved, and left exactly as broken as it was
+        # found (user-reported).
+        try:
+            merged_required = self.cfg.merged_entry(self._template_kind(), target_entry)
+        except (ValueError, FileNotFoundError):
+            merged_required = target_entry
+        missing = [k for k in ("connector", "agent") if not merged_required.get(k)]
+        if missing:
+            # Assembled here, from the literal tuple above — the modal then
+            # interpolates one already-safe local rather than three expressions
+            # (the markup lint matches on expression source, and a sentence
+            # built out of conditionals is three separate things to justify).
+            # "an agent", "a connector" — the article is per word, and getting
+            # it wrong reads as a bug in the tool rather than a problem with the
+            # config.
+            def _with_article(field: str) -> str:
+                return f"{'an' if field[0] in 'aeiou' else 'a'} {field}"
+
+            missing_text = " and ".join(_with_article(k) for k in missing)
+            await self.app.push_screen_wait(
+                MessageModal(
+                    f"This rule needs {missing_text}. Choose above, or give the "
+                    f"rule an 'inherits:' template that sets it.",
                     title="Could not save",
                 )
             )

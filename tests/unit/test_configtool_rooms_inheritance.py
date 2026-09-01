@@ -29,7 +29,9 @@ from pathlib import Path
 
 import pytest
 import yaml
-from textual.widgets import Checkbox, DataTable, Input, Static, TabbedContent
+from textual.widgets import (
+    Checkbox, DataTable, Input, Select, Static, TabbedContent,
+)
 
 from gateway.config import GatewayConfig
 from gateway.configtool.app import ConfigToolApp
@@ -425,3 +427,106 @@ class TestRevertingAFieldToInheritedActuallyWorks:
             assert "channels" in str(
                 app.screen.query_one("#prov-field-rooms-direct", Static).render()
             )
+
+
+class TestARequiredFieldWithNoValueIsBlankNotGuessed:
+    """Owner-reported: a rule missing `agent:` opened in the config tool showing
+    `agent-opencode` already selected, Save reported success, and the rule was
+    left exactly as unloadable as it was found. The only way through was to pick
+    a different agent and then pick the original one back.
+
+    Three places snapped an unset enum to `options[0]`, and the one that caused
+    this was the SNAPSHOT (`round_trip_value`): the form displayed a value the
+    config did not have, Save diffed the widget against that same invented
+    value, saw no change, and wrote nothing. The label said `(default)`, which
+    named a fallback the loader no longer has for these fields.
+
+    Blank is the honest state, and Save asks. Guessing here would have been the
+    same document-order binding that was just removed from the loader — the
+    first agent in the file.
+    """
+
+    def _config(self, tmp_path: Path, work_dir: Path, rule: str, templates: str = "") -> str:
+        return _write(tmp_path, f"""\
+            connectors:
+              - name: mm-home
+                type: mattermost
+                server: {{url: http://localhost:8065, token: t, team: lab}}
+            agents:
+              agent-claude: {{type: claude, working_directory: {work_dir}}}
+              agent-opencode: {{type: opencode, working_directory: {work_dir}}}
+            {templates}watcher_rules:
+              {rule}
+        """)
+
+    async def _open_first_rule(self, app, pilot):
+        app.screen.query_one(TabbedContent).active = "tab-rules"
+        await pilot.pause()
+        table = app.screen.query_one("#rules-table", DataTable)
+        table.focus()
+        table.move_cursor(row=0)
+        await pilot.press("e")
+        await pilot.pause()
+
+    async def test_the_reported_case_end_to_end(self, tmp_path, work_dir):
+        path = self._config(
+            tmp_path,
+            work_dir,
+            "- {name: mm-opencode-rule, connector: mm-home, rooms: {include: [general]}}",
+        )
+        app = ConfigToolApp(path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._open_first_rule(app, pilot)
+
+            agent = app.screen.query_one("#field-agent", Select)
+            assert agent.value is Select.NULL, (
+                f"an unset required field must show blank, got {agent.value!r}"
+            )
+            label = str(app.screen.query_one("#prov-field-agent", Static).render())
+            assert "default" not in label, f"there is no default for this field: {label}"
+
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+            assert app.screen.__class__.__name__ == "MessageModal", "save must be refused"
+            await pilot.press("enter")
+            await pilot.pause()
+
+            app.screen.query_one("#field-agent", Select).value = "agent-opencode"
+            await pilot.pause()
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+        entry = yaml.safe_load(Path(path).read_text())["watcher_rules"][0]
+        assert entry["agent"] == "agent-opencode"
+        # The whole point: the file the tool produced now loads.
+        assert GatewayConfig.from_file(path).watcher_rules[0].agent == "agent-opencode"
+
+    async def test_an_inherited_agent_is_shown_and_left_alone(self, tmp_path, work_dir):
+        """The invariant a "just force-write it on save" fix would have broken:
+        an untouched INHERITED field must not become an explicit override
+        (docs/design/config-tool.md decision 2). It has a value, so it is not
+        blank, and saving without touching it writes nothing."""
+        path = self._config(
+            tmp_path,
+            work_dir,
+            "- {name: r1, inherits: shared, rooms: {include: [general]}}",
+            templates="watcher_templates:\n              shared: "
+                      "{connector: mm-home, agent: agent-claude}\n            ",
+        )
+        app = ConfigToolApp(path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._open_first_rule(app, pilot)
+
+            agent = app.screen.query_one("#field-agent", Select)
+            assert agent.value == "agent-claude", "the inherited value is displayed"
+            label = str(app.screen.query_one("#prov-field-agent", Static).render())
+            assert "shared" in label, f"shown as inherited, got {label}"
+
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+        entry = yaml.safe_load(Path(path).read_text())["watcher_rules"][0]
+        assert "agent" not in entry, "an untouched inherited field stays inherited"
+        assert GatewayConfig.from_file(path).watcher_rules[0].agent == "agent-claude"

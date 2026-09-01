@@ -62,6 +62,10 @@ _NOT_OPERATOR_DATA = frozenset(
         # exact expression source, not on what the expression resolves to.
         "kind_label(kind)",
         "kind_label(self.kind)",
+        # Built one line above its sink out of the literal field names
+        # ("connector"/"agent") the rule form requires — no config value can
+        # reach it.
+        "missing_text",
         # Counts and positions computed here, never read from config.
         "index + 1",
         "len(rules)",

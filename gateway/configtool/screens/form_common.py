@@ -180,7 +180,10 @@ def read_widget_value(spec: FieldSpec, widget: object) -> object:
     if spec.kind == "bool":
         return widget.value
     if spec.kind == "enum":
-        return widget.value
+        # `Select.BLANK` is a sentinel, not a config value — "nothing chosen"
+        # has to read back as None so the diff, the provenance refresh and the
+        # save gate all see an unset field rather than an opaque object.
+        return None if widget.value is Select.NULL else widget.value
     if spec.kind == "list":
         return text_to_list(widget.value) or None
     if spec.kind == "int":
@@ -247,8 +250,13 @@ def round_trip_value(spec: FieldSpec, value: object) -> object:
     if spec.kind == "bool":
         return bool(value)
     if spec.kind == "enum":
+        # The third site that snapped an unset enum to `options[0]`, and the one
+        # that mattered most: this is the SNAPSHOT Save diffs against, so a rule
+        # with no `agent:` snapshotted as the first agent in the file, the widget
+        # showed it, nothing compared unequal, and Save wrote nothing. None in,
+        # None out — a composed widget renders BLANK for it and reads BLANK back.
         options = spec.options or ()
-        return value if value in options else (options or (None,))[0]
+        return value if value in options else None
     if spec.kind == "list":
         text = list_to_text(value)
     else:
@@ -270,7 +278,14 @@ def set_widget_value(spec: FieldSpec, widget: object, value: object) -> None:
         widget.value = bool(value)
     elif spec.kind == "enum":
         options = spec.options or ()
-        widget.value = value if value in options else (options or (None,))[0]
+        # Same rule as composition: no value means blank, not the first option.
+        if value in options:
+            widget.value = value
+        elif widget._allow_blank:
+            widget.clear()
+        # A Select composed with a real value has allow_blank=False and cannot be
+        # cleared; leaving it as-is is right, because "reset to no value" is not
+        # a state the loader accepts for a required field anyway.
     elif spec.kind == "list":
         widget.value = list_to_text(value)
     else:
@@ -730,6 +745,13 @@ class FormScreen(DetailScreen):
             provenance = self._field_provenance(spec, entry)
         if not provenance:
             return ""
+        if provenance is Provenance.DEFAULT and spec.key in self._required_field_keys():
+            # "(default)" names a fallback value this field does not have: a
+            # required field left unset does not evaluate to anything, the config
+            # simply fails to load. Saying "default" told the operator the form
+            # was showing them a working value — which is how a rule with no
+            # `agent:` read as fine while being unloadable (user-reported).
+            return "[dim](not set — required)[/dim]"
         template_name = self.cfg.entry_template_name(entry)
         return f"[dim]({provenance_label(provenance, template_name)})[/dim]"
 
@@ -756,6 +778,15 @@ class FormScreen(DetailScreen):
                 widget = Checkbox(value=bool(initial), id=widget_id(spec.key))
             elif spec.kind == "enum":
                 options = spec.options or ()
+                # A field with no value anywhere renders BLANK, and only then is
+                # blank offered. Snapping to `options[0]` instead is what let a
+                # rule with no `agent:` display the first agent in the file:
+                # the snapshot took that invented value, Save diffed against it,
+                # saw no change, and wrote nothing — leaving a rule that still
+                # would not load (user-reported). A field that HAS a value keeps
+                # `allow_blank=False`, since clearing one to blank would only
+                # produce a config the loader refuses.
+                has_value = initial in options
                 widget = Select(
                     # (label, value): the LABEL is escaped because Textual
                     # renders it as markup inside the Select itself (a
@@ -763,8 +794,11 @@ class FormScreen(DetailScreen):
                     # from Select._watch_value, killing the form) — the VALUE
                     # stays raw, since that is what gets written to config.
                     [(markup_safe(o), o) for o in options],
-                    value=initial if initial in options else (options or (None,))[0],
-                    allow_blank=False,
+                    # `Select.NULL`, NOT `Select.BLANK` — the latter is a
+                    # deprecated alias equal to `False` in Textual 8.x, which
+                    # the widget then rejects as an illegal value.
+                    value=initial if has_value else Select.NULL,
+                    allow_blank=not has_value,
                     id=widget_id(spec.key),
                 )
             elif spec.kind == "list":
