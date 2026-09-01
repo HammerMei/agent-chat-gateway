@@ -596,7 +596,10 @@ class TestTheExpireVerb(unittest.IsolatedAsyncioTestCase):
         from tests.helpers import make_bare_session_manager
 
         mgr = make_bare_session_manager(
-            _cancel_jobs=cancelled.append if cancelled is not None else None)
+            # Two args now: the handle AND the room. Cancellation matches by
+            # room when a job records one, because a handle can be taken over.
+            _cancel_jobs=((lambda n, r: cancelled.append(n))
+                          if cancelled is not None else None))
         mgr._lifecycle.get_watcher_state = MagicMock(return_value=record)
         mgr._lifecycle.reclaim_room = AsyncMock(return_value=reclaimed)
         return mgr

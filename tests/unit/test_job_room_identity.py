@@ -57,12 +57,18 @@ def _manager(*, record=None, resolved=None, record_for_room=None,
              resident=None):
     """A manager wired for `inject_message` only.
 
-    `get_watcher_state` and `get_processor` both HONOUR their name argument, so a
-    lookup by the wrong handle misses the way it really would. `resident` maps a
-    watcher name to an already-running processor — without it every test reaches
-    `get_or_create`, which is how a guard further down the function went unpinned
-    (review: the "no resolvable room" test was being satisfied by the PROCESSOR
-    guard above it, and passed with the room guard deleted).
+    **Every lookup honours its argument.** `get_watcher_state` and
+    `get_processor` are keyed by watcher name and `record_for_room` by the given
+    record's OWN `room_id`, so asking for the wrong handle or the wrong room
+    misses the way it really would. A `return_value` mock that answers the same
+    for any argument cannot fail the test it exists for — the whole defect class
+    this file covers is production reading the right value from the wrong key.
+
+    `resident` maps a watcher name to an already-running processor — without it
+    every test reaches `get_or_create`, which is how a guard further down the
+    function went unpinned (review: the "no resolvable room" test was being
+    satisfied by the PROCESSOR guard above it, and passed with the room guard
+    deleted).
     """
     manager = make_bare_session_manager()
     processor = MagicMock()
@@ -71,8 +77,9 @@ def _manager(*, record=None, resolved=None, record_for_room=None,
 
     by_name = {record.watcher_name: record} if record is not None else {}
     manager._lifecycle.get_watcher_state = MagicMock(side_effect=by_name.get)
-    manager._lifecycle.record_for_room = MagicMock(
-        return_value=record_for_room)
+    by_room = ({record_for_room.room_id: record_for_room}
+               if record_for_room is not None else {})
+    manager._lifecycle.record_for_room = MagicMock(side_effect=by_room.get)
     manager._lifecycle.get_processor = MagicMock(
         side_effect=(resident or {}).get)
     manager._watcher_manager = MagicMock()
@@ -156,9 +163,15 @@ class TestTheReplyIsAddressedFromTheSameResolution(unittest.IsolatedAsyncioTestC
         manager._connector.room_ref_by_id.assert_not_awaited()
         self.assertEqual(_enqueued_room(manager).id, "room-1")
 
-    async def test_nothing_is_injected_when_no_room_can_be_resolved(self):
-        """Refused rather than sent to an empty address. The reverted version
-        injected anyway, with a warning that said the reply might be dropped."""
+    async def test_a_wake_for_an_unknown_watcher_and_unresolvable_room_is_refused(self):
+        """Renamed to name the guard it actually reaches.
+
+        It was called `test_nothing_is_injected_when_no_room_can_be_resolved` and
+        claimed to pin the room guard. Measured: it passes with that guard
+        DELETED, because with no resident processor the PROCESSOR guard above it
+        returns first. Both guards are real; this one covers the processor guard,
+        and `TestTheRoomGuardIsReachedOnItsOwn` covers the other.
+        """
         manager = _manager(record=None, resolved=None)
 
         result = await manager.inject_message(

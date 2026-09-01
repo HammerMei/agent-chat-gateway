@@ -358,7 +358,7 @@ class JobScheduler:
         success = await self._inject(job)
         if not success:
             sm = self._get_sm_for_watcher(job)
-            watcher_state = sm.get_watcher_state(job.watcher) if sm is not None else None
+            watcher_state = self._record_for(sm, job)
             is_paused = watcher_state is not None and bool(watcher_state.paused)
 
             if is_paused:
@@ -491,11 +491,38 @@ class JobScheduler:
             f"(watcher `{job.watcher}` is not accepting messages). {retry_note}"
         )
         try:
-            await sm.notify_watcher_room(job.watcher, text)
+            # Addressed by the job's own room, not by its handle.
+            await sm.notify_watcher_room(
+                job.watcher, text, room_id=job.room_id,
+            )
         except Exception as e:
             logger.warning(
                 "Job %s: failed to send injection-failure notification: %s", job.id, e
             )
+
+    @staticmethod
+    def _record_for(sm, job: "ScheduledJob"):
+        """The record for THIS job's room, or None.
+
+        By room id when the job has one, and only then by handle. The handle is
+        the weaker key — another room can take it over once the original's record
+        is reclaimed, which this branch made routine by removing the expiry
+        exemption for job-bearing rooms.
+
+        Reading it by handle had two silent outcomes, both found by a sweep after
+        the same defect appeared three times elsewhere:
+
+        * the PAUSE check read the other room's flag, so a job whose own room was
+          gone logged "watcher is paused — skipping fire (expected)" and sent no
+          failure notice. Forever, every slot, self-labelled as normal.
+        * the failure NOTICE was addressed from it, so the warning went to the
+          room that had taken the handle.
+        """
+        if sm is None:
+            return None
+        if job.room_id:
+            return sm.record_for_room(job.room_id)
+        return sm.get_watcher_state(job.watcher)
 
     async def _inject(self, job: ScheduledJob) -> bool:
         """Inject the job message into the target watcher via SessionManager.

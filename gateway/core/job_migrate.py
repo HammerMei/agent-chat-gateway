@@ -52,10 +52,20 @@ class JobOutcome:
 
 @dataclass
 class MigrationReport:
+    """What the run did. `to_version` is what it AIMED at; `stamped` is whether
+    the file is now actually there.
+
+    The two are separate because the run can legitimately finish without moving
+    the version — any job needing attention holds it back — and reporting
+    `to_version` as if it had landed told the operator "jobs.json migrated 1 → 2"
+    about a file still on 1, which the next startup warning then contradicted.
+    """
+
     from_version: int
     to_version: int
     steps: list[str] = field(default_factory=list)
     outcomes: list[JobOutcome] = field(default_factory=list)
+    stamped: bool = False
 
     @property
     def changed(self) -> int:
@@ -76,6 +86,7 @@ class MigrationReport:
         return {
             "from_version": self.from_version,
             "to_version": self.to_version,
+            "stamped": self.stamped,
             "steps": list(self.steps),
             "changed": self.changed,
             "outcomes": [
@@ -228,9 +239,11 @@ async def _migrate_1_to_2(store: JobStore, entries) -> list[JobOutcome]:
                 job.id, job.watcher, False, detail, needs_attention=True))
             continue
 
-        # Targeted, not `store.update(job)`: this object was read before the
-        # `resolve_room` await, and a fire that completed during it would be
-        # erased by writing the whole thing back.
+        # Targeted, not `store.update(job)`: this job was read before the
+        # `resolve_room` await, and `update` raises `KeyError` if a
+        # `schedule delete` removed it during that await — aborting the run and
+        # losing the report for every job already migrated. See
+        # `JobStore.set_room_id`.
         if not store.set_room_id(job.id, room_id, connector=entry.name):
             # NOT attention-worthy: the job is gone, so there is nothing left
             # to fix and nothing to hold the schema version back for. Reported
@@ -270,6 +283,7 @@ async def migrate(store: JobStore, entries) -> MigrationReport:
 
     report = MigrationReport(from_version=from_version, to_version=_SCHEMA_VERSION)
     if from_version == _SCHEMA_VERSION:
+        report.stamped = True  # already there; nothing to write
         return report
 
     for start, end, description, step in _MIGRATIONS:
@@ -298,6 +312,7 @@ async def migrate(store: JobStore, entries) -> MigrationReport:
         )
         return report
     store.stamp_version(_SCHEMA_VERSION)
+    report.stamped = True
     logger.info(
         "jobs.json migrated %d → %d (%d job(s) changed)",
         from_version, _SCHEMA_VERSION, report.changed,

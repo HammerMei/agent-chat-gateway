@@ -132,5 +132,94 @@ class TestEveryFieldSurvivesTheStore(unittest.TestCase):
         self.assertEqual(reloaded.message, "changed after creation")
 
 
+class TestSetRoomId(unittest.TestCase):
+    """`set_room_id` exists so the migration can write two fields without
+    replacing the whole job. It had no direct test — found by mutation testing:
+    changing `if connector and not job.connector` to `if connector` survived the
+    entire 3969-test suite.
+
+    Its contract is three claims, and each gets a case here rather than being
+    exercised incidentally through the migration:
+
+    1. it writes `room_id`, and persists;
+    2. it fills `connector` in ONLY when the job has none — an operator's value
+       is not overwritten by a handle-derived guess;
+    3. it returns `False`, rather than raising, for a job deleted mid-run.
+    """
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.path = self.dir / "jobs.json"
+
+    def _store_with(self, **overrides) -> JobStore:
+        job = ScheduledJob(**{**FULLY_POPULATED, "room_id": "", **overrides})
+        self.path.write_text(json.dumps({"version": 1, "jobs": [job.to_dict()]}))
+        store = JobStore(self.path)
+        store.load()
+        return store
+
+    def _on_disk(self) -> dict:
+        return json.loads(self.path.read_text())["jobs"][0]
+
+    def test_it_writes_the_room_id_and_persists_it(self):
+        store = self._store_with()
+
+        self.assertTrue(store.set_room_id("acg-deadbeef", "room-new"))
+
+        self.assertEqual(store.get("acg-deadbeef").room_id, "room-new")
+        self.assertEqual(self._on_disk()["room_id"], "room-new",
+                         "an in-memory-only write is lost at the next restart")
+
+    def test_an_existing_connector_is_not_overwritten(self):
+        """The migration falls back to the connector name derived from the
+        watcher HANDLE when the job's own value names nothing configured. If that
+        fallback then overwrote the operator's value, a command whose entire
+        product is a report of what it changed would silently rebind the job to a
+        different connector and not mention it."""
+        store = self._store_with(connector="mm")
+
+        store.set_room_id("acg-deadbeef", "room-new", connector="rc")
+
+        self.assertEqual(store.get("acg-deadbeef").connector, "mm")
+        self.assertEqual(self._on_disk()["connector"], "mm")
+
+    def test_an_empty_connector_is_filled_in(self):
+        """The other direction: a job with neither field cannot be routed to a
+        session manager at all, so the migration supplies one."""
+        store = self._store_with(connector="")
+
+        store.set_room_id("acg-deadbeef", "room-new", connector="rc")
+
+        self.assertEqual(store.get("acg-deadbeef").connector, "rc")
+
+    def test_no_connector_argument_leaves_the_field_alone(self):
+        store = self._store_with(connector="")
+
+        store.set_room_id("acg-deadbeef", "room-new")
+
+        self.assertEqual(store.get("acg-deadbeef").connector, "")
+
+    def test_a_job_that_is_gone_returns_false_instead_of_raising(self):
+        """`update` raises `KeyError` here, which aborts the whole migration and
+        loses the report for every job already done."""
+        store = self._store_with()
+        store.remove("acg-deadbeef")
+
+        self.assertFalse(store.set_room_id("acg-deadbeef", "room-new"))
+        self.assertIsNone(store.get("acg-deadbeef"), "and stays gone")
+
+    def test_it_does_not_stamp_the_schema_version(self):
+        """It saves, and a save must not claim a migration that has not finished
+        — the version moves only in `stamp_version`."""
+        store = self._store_with()
+
+        store.set_room_id("acg-deadbeef", "room-new")
+
+        self.assertEqual(self._on_disk_version(), 1)
+
+    def _on_disk_version(self) -> int:
+        return json.loads(self.path.read_text())["version"]
+
+
 if __name__ == "__main__":
     unittest.main()

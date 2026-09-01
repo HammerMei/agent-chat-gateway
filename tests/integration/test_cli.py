@@ -886,6 +886,18 @@ class TestCLIPauseResumeReset(_CLITestBase):
         self.assertEqual(code, 0)
         self.assertIn("expired", stdout.lower())
 
+    def test_expire_does_not_claim_to_have_reclaimed_the_jobs(self):
+        """The success line said "record, session and scheduled jobs reclaimed"
+        after the jobs stopped being cancelled — contradicting its own `--help`,
+        which was corrected in the same commit that claimed to have swept every
+        operator-facing mention. An operator who believes this line stops looking
+        for the job that is about to recreate the watcher."""
+        self._start_daemon({"expire": {"ok": True}})
+        stdout, _, code = self._run(["expire", "rc-eng"])
+        self.assertEqual(code, 0)
+        self.assertNotIn("scheduled jobs reclaimed", stdout)
+        self.assertIn("scheduled jobs are kept", stdout)
+
     def test_expire_failure_exits_1(self):
         self._start_daemon({"expire": {"ok": False, "error": "no expirable record"}})
         _, stderr, code = self._run(["expire", "ghost"])
@@ -1022,6 +1034,88 @@ class TestCLISend(_CLITestBase):
 # ---------------------------------------------------------------------------
 # Tests: daemon-not-running path
 # ---------------------------------------------------------------------------
+
+class TestCLIScheduleMigrateReporting(_CLITestBase):
+    """`schedule migrate`'s output IS its product — the whole reason the
+    migration is a command rather than something done invisibly at fire time.
+    It had no test, which is how it came to report a migration that did not run.
+    """
+
+    _OUTCOME_OK = {"job_id": "acg-1", "watcher": "rc:general",
+                   "changed": True, "detail": "room room-1 (resolved 'general')",
+                   "needs_attention": False}
+    _OUTCOME_STUCK = {"job_id": "acg-2", "watcher": "rc:gone",
+                      "changed": False, "detail": "there is no room named 'gone'",
+                      "needs_attention": True}
+
+    def _migrate(self, **report) -> tuple[str, str, int]:
+        self._start_daemon({"schedule-migrate": {"ok": True, **report}})
+        return self._run(["schedule", "migrate"])
+
+    def test_a_run_held_back_by_an_unresolved_job_does_not_claim_to_have_migrated(self):
+        """The version does not move while any job needs attention, so saying
+        "migrated 1 → 2" here is contradicted by the next startup warning. The
+        report carries `stamped` for exactly this: `to_version` is the target,
+        not the outcome."""
+        stdout, _, code = self._migrate(
+            from_version=1, to_version=2, stamped=False, changed=1,
+            steps=["1 → 2: record each job's room id"],
+            outcomes=[self._OUTCOME_OK, self._OUTCOME_STUCK])
+
+        self.assertEqual(code, 0)
+        self.assertNotIn("migrated 1 → 2", stdout)
+        self.assertIn("STILL at schema version 1", stdout)
+        # And it says what to do next, since the command is worth re-running.
+        self.assertIn("run 'schedule migrate' again", stdout)
+        self.assertIn("1 job(s) need attention", stdout)
+
+    def test_a_clean_run_reports_the_version_it_reached(self):
+        stdout, _, code = self._migrate(
+            from_version=1, to_version=2, stamped=True, changed=1,
+            steps=["1 → 2: record each job's room id"],
+            outcomes=[self._OUTCOME_OK])
+
+        self.assertEqual(code, 0)
+        self.assertIn("migrated 1 → 2", stdout)
+        self.assertNotIn("STILL", stdout)
+        self.assertNotIn("need attention", stdout)
+
+    def test_an_already_current_file_says_so_without_a_job_list(self):
+        stdout, _, code = self._migrate(
+            from_version=2, to_version=2, stamped=True, changed=0, outcomes=[])
+
+        self.assertEqual(code, 0)
+        self.assertIn("already at schema version 2", stdout)
+
+    def test_a_newer_file_is_an_error_not_a_downgrade(self):
+        """`migrate` refuses rather than writing the file down to this version;
+        the CLI has to surface that as a failure, not a quiet success."""
+        self._start_daemon({"schedule-migrate": {
+            "ok": False,
+            "error": "jobs.json declares schema version 3, but this ACG "
+                     "understands 2. It was written by a newer version — "
+                     "upgrade ACG rather than migrating down."}})
+        stdout, stderr, code = self._run(["schedule", "migrate"])
+
+        self.assertEqual(code, 1)
+        self.assertIn("newer version", stderr)
+        self.assertNotIn("migrated", stdout)
+
+    def test_the_marks_distinguish_changed_from_already_fine_from_stuck(self):
+        """Three states, three marks. Collapsing "already had a room id" into
+        the attention list would hold the schema version back forever, because a
+        clean re-run reports every job as unchanged."""
+        already = {"job_id": "acg-3", "watcher": "rc:ops", "changed": False,
+                   "detail": "already has a room id", "needs_attention": False}
+        stdout, _, _ = self._migrate(
+            from_version=1, to_version=2, stamped=False, changed=1,
+            outcomes=[self._OUTCOME_OK, already, self._OUTCOME_STUCK])
+
+        self.assertIn("✓ acg-1", stdout)
+        self.assertIn("· acg-3", stdout)
+        self.assertIn("✗ acg-2", stdout)
+        self.assertIn("1 job(s) need attention", stdout)
+
 
 class TestCLIDaemonNotRunning(unittest.TestCase):
     """Commands that require the daemon print an error when it's not running."""

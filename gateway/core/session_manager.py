@@ -683,7 +683,13 @@ class SessionManager:
             return
         if name is not None and self._cancel_jobs is not None:
             try:
-                self._cancel_jobs(name)
+                # The ROOM, not just the handle. Matching jobs by handle was
+                # wrong in both directions once another room could take a
+                # handle over: it cancelled a live room's jobs under the audit
+                # line "the bot was removed from the room" — false for that
+                # room — and left this room's own jobs firing at a room the bot
+                # had left. Found by the sweep.
+                self._cancel_jobs(name, room_id)
             except Exception:
                 logger.exception(
                     "Could not cancel scheduled jobs for reclaimed watcher "
@@ -1047,7 +1053,9 @@ class SessionManager:
             )
         return accepted
 
-    async def notify_watcher_room(self, watcher_name: str, text: str) -> bool:
+    async def notify_watcher_room(
+        self, watcher_name: str, text: str, *, room_id: str = ""
+    ) -> bool:
         """Send a notification directly to the watcher's room via the connector.
 
         Bypasses the watcher queue entirely — used for system notifications
@@ -1058,15 +1066,24 @@ class SessionManager:
         """
         from ..agents.response import AgentResponse  # local import avoids circular dependency
 
-        state = self._lifecycle.get_watcher_state(watcher_name)
-        if state is None or not state.room_id:
+        # `room_id`, when the caller has one, IS the address. Resolving by handle
+        # instead put a scheduled job's failure notice into whichever room had
+        # taken the handle over — so the room that missed its job got nothing and
+        # an unrelated room got a warning about a job it cannot see, reported as
+        # sent. Found by the sweep; it is the same defect as the job message's,
+        # one frame over.
+        target = room_id
+        if not target:
+            state = self._lifecycle.get_watcher_state(watcher_name)
+            target = state.room_id if state is not None else ""
+        if not target:
             logger.warning(
-                "notify_watcher_room: no room_id for watcher %r — cannot send notification",
-                watcher_name,
+                "notify_watcher_room: no room for watcher %r — cannot send "
+                "notification", watcher_name,
             )
             return False
         try:
-            await self._connector.send_text(state.room_id, AgentResponse(text=text))
+            await self._connector.send_text(target, AgentResponse(text=text))
             return True
         except Exception as e:
             logger.warning(

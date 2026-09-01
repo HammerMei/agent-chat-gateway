@@ -254,7 +254,12 @@ A group DM's watcher name contains a digest of its room id rather than a name â€
 nothing can resolve that, so those jobs are named in the output and have to be
 deleted and recreated.
 
-The daemon warns at startup while there is anything to migrate.
+The daemon warns at startup while there is anything to migrate, and the warning
+stays until the last job is resolved â€” the schema version deliberately does not
+move while any job still needs attention, which is what keeps `schedule migrate`
+worth running again. So a run that reports some jobs changed and others needing
+attention says `jobs.json is STILL at schema version 1`, not that it migrated:
+the jobs it fixed keep their room ids, and the ones it could not are unchanged.
 
 ### Delete a job
 

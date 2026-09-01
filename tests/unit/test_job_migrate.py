@@ -148,43 +148,6 @@ class TestVersionAwareness(_MigrateCase):
         self.assertEqual(store.file_version, 1)
         self.assertTrue(store.needs_migration())
 
-    async def test_a_save_does_not_stamp_a_migration_that_did_not_run(self):
-        """`save()` used to write the CODE's version unconditionally, so one
-        ordinary fire marked an unmigrated file as current — silencing both the
-        startup warning and the migration itself.
-
-        The file is asserted, not just the in-memory value: the original bug was
-        that `stamp_version` moved only the in-memory version while every save
-        rewrote the file's, and a test looking only at `file_version` passed
-        against it (review).
-        """
-        self._write_file(1, [self._job()])
-        store = self._store()
-
-        store.update(ScheduledJob.from_dict(self._job()))  # an ordinary save
-
-        self.assertEqual(
-            json.loads(self.path.read_text())["version"], 1,
-            "the FILE was stamped by an ordinary save",
-        )
-        self.assertEqual(store.file_version, 1)
-        self.assertTrue(self._store().needs_migration(), "a restart would skip it")
-
-    async def test_a_save_does_not_stamp_a_newer_file_with_its_own_version(self):
-        """The other direction, and the one the first fix introduced: writing
-        `self._file_version` would claim version N while `to_dict` had already
-        dropped the fields version N carries — a future ACG would then skip the
-        migrations that restore them."""
-        self._write_file(_SCHEMA_VERSION + 5, [self._job()])
-        store = self._store()
-
-        store.update(ScheduledJob.from_dict(self._job()))
-
-        self.assertEqual(
-            json.loads(self.path.read_text())["version"], _SCHEMA_VERSION,
-            "never claim more than this code wrote",
-        )
-
 
 class TestTheOneToTwoStep(_MigrateCase):
     async def test_a_record_supplies_the_room_id(self):
@@ -352,6 +315,21 @@ class TestTheVersionOnlyMovesWhenAMigrationRuns(_MigrateCase):
                          "a restart would see the file as migrated")
         self.assertTrue(self._store().needs_migration())
 
+    async def test_a_save_does_not_stamp_a_newer_file_with_its_own_version(self):
+        """The other direction, and the one the first fix introduced: writing
+        `self._file_version` would claim version N while `to_dict` had already
+        dropped the fields version N carries — a future ACG would then skip the
+        migrations that restore them."""
+        self._write_file(_SCHEMA_VERSION + 5, [self._job()])
+        store = self._store()
+
+        store.update(ScheduledJob.from_dict(self._job()))
+
+        self.assertEqual(
+            json.loads(self.path.read_text())["version"], _SCHEMA_VERSION,
+            "never claim more than this code wrote",
+        )
+
     async def test_a_removal_leaves_it_alone_too(self):
         """`add`/`update`/`remove`/`remove_expired_completed` all save."""
         self._write_file(1, [self._job()])
@@ -421,21 +399,75 @@ class TestAnUnfinishedMigrationStaysRunnable(_MigrateCase):
                          _SCHEMA_VERSION)
 
 
+class TestTheReportSaysWhetherTheVersionActuallyMoved(_MigrateCase):
+    """`to_version` is the version the run AIMED at, and it is set before any
+    decision — so the CLI, reading it alone, told the operator "jobs.json
+    migrated 1 → 2" about a file the very same run had deliberately left on 1.
+    The next startup then warned that a migration was still owed.
+
+    `stamped` is the answer to the question the operator is actually asking.
+    """
+
+    async def test_it_is_false_when_a_job_held_the_version_back(self):
+        self._write_file(1, [self._job("acg-1"), self._job("acg-2", "rc:dev")])
+        store = self._store()
+
+        report = await migrate(store, [_entry(resolves={"general": _room("room-1")})])
+
+        self.assertFalse(report.stamped)
+        self.assertEqual(report.to_version, _SCHEMA_VERSION, "still the target")
+        self.assertEqual(json.loads(self.path.read_text())["version"], 1,
+                         "and the flag agrees with the file")
+
+    async def test_it_is_true_when_the_run_finished_clean(self):
+        self._write_file(1, [self._job("acg-1")])
+        store = self._store()
+
+        report = await migrate(store, [_entry(resolves={"general": _room("room-1")})])
+
+        self.assertTrue(report.stamped)
+        self.assertEqual(json.loads(self.path.read_text())["version"],
+                         _SCHEMA_VERSION)
+
+    async def test_an_already_current_file_counts_as_stamped(self):
+        """Nothing was written, but the file IS at `to_version` — which is what
+        the flag reports. Saying otherwise would have the CLI announce a problem
+        on the happiest path there is."""
+        self._write_file(_SCHEMA_VERSION, [self._job(room_id="room-1")])
+        store = self._store()
+
+        report = await migrate(store, [_entry()])
+
+        self.assertTrue(report.stamped)
+        self.assertEqual(report.from_version, report.to_version)
+
+    async def test_the_flag_crosses_the_control_socket(self):
+        """It is only useful if the CLI can see it — `to_dict` is the boundary,
+        and the handler spreads it into the response."""
+        self._write_file(1, [self._job("acg-1"), self._job("acg-2", "rc:dev")])
+        report = await migrate(
+            self._store(), [_entry(resolves={"general": _room("room-1")})])
+
+        self.assertIn("stamped", report.to_dict())
+        self.assertFalse(report.to_dict()["stamped"])
+
+
 class TestAConcurrentFireCannotUndoTheMigration(_MigrateCase):
-    """Found by review, reproduced both ways.
+    """`_migrate_1_to_2` reads a job, awaits `resolve_room` (a network round
+    trip), then writes. These pin what may land in that window.
 
-    `_migrate_1_to_2` reads a job, awaits `resolve_room` (a network round trip),
-    then writes. With `store.update(job)` — a whole-object replace — a fire that
-    completed during that await was silently reverted:
+    **Only the third test discriminates.** Reverting the production call to
+    `store.update(job)` fails `test_a_deletion_mid_run_costs_only_that_job` and
+    nothing else — measured, after an earlier version of this docstring claimed
+    the other two caught lost updates. They cannot: `JobStore.get` hands out the
+    stored object itself, so a fire and the migration mutate one instance and
+    neither holds a stale copy.
 
-    * the fire's stale copy erased the `room_id` the migration had just written,
-      while the report said `✓`. The command's output IS its contract, and the
-      job could never be migrated again;
-    * or the migration's stale object resurrected a job the fire had just
-      COMPLETED, with `next_run` back in the past — one duplicate delivery.
-
-    `set_room_id` touches only the two fields the migration owns, under the
-    store's lock, on the object the store currently holds.
+    The first two are therefore invariant tests, not regression tests, and they
+    are kept as such: they pin that a fire's progress and the migration's write
+    coexist, which is the property a future change to copy-on-read would break.
+    Anything claiming to have prevented a lost update here has to name the read
+    that produced the stale copy.
     """
 
     async def _migrate_with_a_fire_in_the_middle(self, store, entry, mutate):

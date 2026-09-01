@@ -325,7 +325,8 @@ class GatewayService:
                 # the exemption itself: a job records the room it targets and can
                 # resurrect it, so there is no record to protect on its behalf.
                 cancel_jobs=(
-                    lambda name, _cn=cc.name: self._cancel_jobs_for(_cn, name)
+                    lambda name, room_id, _cn=cc.name: self._cancel_jobs_for(
+                        _cn, name, room_id)
                 ),
             )
             self._entries.append(
@@ -346,7 +347,9 @@ class GatewayService:
             job_store=self._job_store,
         )
 
-    def _cancel_jobs_for(self, connector_name: str, watcher_name: str) -> None:
+    def _cancel_jobs_for(
+        self, connector_name: str, watcher_name: str, room_id: str = ""
+    ) -> None:
         """Cancel every scheduled job targeting a reclaimed watcher (§2.7).
 
         Fired by the membership-remove handler after `reclaim_room` succeeds:
@@ -366,9 +369,23 @@ class GatewayService:
             # orphaned, failing resolution forever (active) or listed
             # permanently (paused).
             configured = {e.name for e in self._entries}
+
+            def _claims_this_room(job) -> bool:
+                # By ROOM when the job records one — a handle can have been taken
+                # over by a different room, and cancelling by it would delete a
+                # live room's jobs while leaving this room's own firing at a room
+                # the bot has left. Both directions were reachable (sweep).
+                #
+                # By handle only for a job written before `room_id` existed,
+                # where it is the only key there is. `schedule migrate` records
+                # the id and moves such a job onto the first branch.
+                if job.room_id:
+                    return job.room_id == room_id
+                return job.watcher == watcher_name
+
             doomed = [
                 j for j in self._job_store.list_jobs()
-                if j.watcher == watcher_name
+                if _claims_this_room(j)
                 and (j.connector == connector_name
                      or j.connector not in configured)
             ]

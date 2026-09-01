@@ -200,6 +200,9 @@ class TestTheCancellationClaimRule(unittest.TestCase):
     """
 
     def _service_with_jobs(self, jobs):
+        """`jobs` items are `(id, watcher, connector)` or `(id, watcher,
+        connector, room_id)`. A job with no room id is a pre-schema-2 one, which
+        is matched by handle."""
         from gateway.schedule_types import JobStatus, ScheduledJob
 
         service = _make_service()
@@ -208,9 +211,10 @@ class TestTheCancellationClaimRule(unittest.TestCase):
         service._entries = [entry]
         service._job_store = MagicMock()
         service._job_store.list_jobs = MagicMock(return_value=[
-            ScheduledJob(id=jid, watcher=w, connector=c,
+            ScheduledJob(id=spec[0], watcher=spec[1], connector=spec[2],
+                         room_id=(spec[3] if len(spec) > 3 else ""),
                          status=JobStatus.ACTIVE)
-            for jid, w, c in jobs
+            for spec in jobs
         ])
         service._job_store.remove = MagicMock(return_value=True)
         return service
@@ -218,7 +222,7 @@ class TestTheCancellationClaimRule(unittest.TestCase):
     def test_a_job_on_this_connector_is_cancelled(self):
         service = self._service_with_jobs([("acg-1", "rc:general", "rc")])
 
-        service._cancel_jobs_for("rc", "rc:general")
+        service._cancel_jobs_for("rc", "rc:general", "room-1")
 
         service._job_store.remove.assert_called_once_with("acg-1")
 
@@ -227,14 +231,14 @@ class TestTheCancellationClaimRule(unittest.TestCase):
         must be able to cancel it here."""
         service = self._service_with_jobs([("acg-1", "rc:general", "")])
 
-        service._cancel_jobs_for("rc", "rc:general")
+        service._cancel_jobs_for("rc", "rc:general", "room-1")
 
         service._job_store.remove.assert_called_once_with("acg-1")
 
     def test_a_job_naming_a_connector_that_no_longer_exists_is_cancelled(self):
         service = self._service_with_jobs([("acg-1", "rc:general", "retired")])
 
-        service._cancel_jobs_for("rc", "rc:general")
+        service._cancel_jobs_for("rc", "rc:general", "room-1")
 
         service._job_store.remove.assert_called_once_with("acg-1")
 
@@ -246,14 +250,14 @@ class TestTheCancellationClaimRule(unittest.TestCase):
         other.name = "mm"
         service._entries.append(other)
 
-        service._cancel_jobs_for("rc", "rc:general")
+        service._cancel_jobs_for("rc", "rc:general", "room-1")
 
         service._job_store.remove.assert_not_called()
 
     def test_another_watchers_job_is_left_alone(self):
         service = self._service_with_jobs([("acg-1", "rc:dev", "rc")])
 
-        service._cancel_jobs_for("rc", "rc:general")
+        service._cancel_jobs_for("rc", "rc:general", "room-1")
 
         service._job_store.remove.assert_not_called()
 class TestIdentityBarrier(unittest.IsolatedAsyncioTestCase):
@@ -786,6 +790,63 @@ class TestStartupFdOnCancel(unittest.IsolatedAsyncioTestCase):
 
         fds_written = [fd for fd, _ in write_signal_calls]
         self.assertIn(5, fds_written, "startup_fd must be written/closed in finally on CancelledError")
+
+class TestCancellationMatchesByRoomNotByHandle(unittest.TestCase):
+    """Found by the sweep, after the same defect class appeared three times.
+
+    A handle can be taken over by another room once the original's record is
+    reclaimed — which this branch made routine by removing the expiry exemption
+    for job-bearing rooms. Matching jobs by handle was then wrong in BOTH
+    directions, and both were silent:
+
+    * a live room's job was deleted under the audit line "the bot was removed
+      from the room", which is false for that room;
+    * this room's own job, if its handle had since moved, was left firing at a
+      room the bot had left.
+    """
+
+    def _service(self, jobs):
+        from gateway.schedule_types import JobStatus, ScheduledJob
+
+        service = _make_service()
+        entry = MagicMock()
+        entry.name = "rc"
+        service._entries = [entry]
+        service._job_store = MagicMock()
+        service._job_store.list_jobs = MagicMock(return_value=[
+            ScheduledJob(id=jid, watcher=w, connector="rc", room_id=r,
+                         status=JobStatus.ACTIVE)
+            for jid, w, r in jobs
+        ])
+        service._job_store.remove = MagicMock(return_value=True)
+        return service
+
+    def test_another_rooms_job_under_the_same_handle_survives(self):
+        """Room B holds the handle and is alive; the bot was removed from A."""
+        service = self._service([("acg-b", "rc:general", "room-B")])
+
+        service._cancel_jobs_for("rc", "rc:general", "room-A")
+
+        service._job_store.remove.assert_not_called()
+
+    def test_this_rooms_job_is_cancelled_even_under_a_moved_handle(self):
+        """A's job was created when A held `rc:general`; A has since been
+        renamed, so its record's handle differs. The room id still matches."""
+        service = self._service([("acg-a", "rc:general", "room-A")])
+
+        service._cancel_jobs_for("rc", "rc:daily-standup", "room-A")
+
+        service._job_store.remove.assert_called_once_with("acg-a")
+
+    def test_a_pre_schema_2_job_still_matches_by_handle(self):
+        """It has no id, so the handle is the only key it has."""
+        service = self._service([("acg-old", "rc:general", "")])
+
+        service._cancel_jobs_for("rc", "rc:general", "room-A")
+
+        service._job_store.remove.assert_called_once_with("acg-old")
+
+
 
 if __name__ == "__main__":
     unittest.main()

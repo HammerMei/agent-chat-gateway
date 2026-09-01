@@ -420,8 +420,15 @@ def main():
         cmd_data = {"cmd": "expire", "watcher_name": args.watcher_name}
         result = _send_command(cmd_data)
         if result["ok"]:
+            # NOT "scheduled jobs reclaimed" — expire does not touch them, and
+            # this is the success line an operator actually reads. It said the
+            # opposite of the `--help` two hundred lines up, which was fixed in
+            # the same commit that claimed to have swept "all of it
+            # operator-facing". Found by review.
             print(f"Watcher '{args.watcher_name}' expired — record, session and "
-                  f"scheduled jobs reclaimed")
+                  f"files reclaimed. Its scheduled jobs are kept; the room's "
+                  f"next message, or a job's own next run, recreates the "
+                  f"watcher.")
         else:
             print(f"Error: {result.get('error')}", file=sys.stderr)
             sys.exit(1)
@@ -985,13 +992,23 @@ def _run_schedule_migrate(args) -> None:
     # count.
     unresolved = [o for o in outcomes if o.get("needs_attention")]
     print()
-    print(f"jobs.json migrated {result['from_version']} → {result['to_version']}: "
-          f"{result['changed']} of {len(outcomes)} job(s) changed.")
+    # `stamped`, not `to_version`: the version only moves when nothing was left
+    # needing attention, so claiming the file reached `to_version` here would be
+    # contradicted by the next startup warning.
+    if result.get("stamped"):
+        print(f"jobs.json migrated {result['from_version']} → "
+              f"{result['to_version']}: {result['changed']} of {len(outcomes)} "
+              f"job(s) changed.")
+    else:
+        print(f"jobs.json is STILL at schema version {result['from_version']}: "
+              f"{result['changed']} of {len(outcomes)} job(s) changed, but the "
+              f"version does not move while any job needs attention.")
     if unresolved:
         # Named rather than summarised: each of these needs a decision, and the
         # migration deliberately made none of them.
         print(f"{len(unresolved)} job(s) need attention — see the lines above. "
               f"Nothing was guessed for them; they work exactly as before.")
+        print("Fix those, then run 'schedule migrate' again.")
 
 
 def _run_schedule_pause(args) -> None:

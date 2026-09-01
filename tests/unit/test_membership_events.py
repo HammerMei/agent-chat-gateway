@@ -499,7 +499,7 @@ class TestTheMembershipHandlers(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_remove_reclaims_and_cancels_the_jobs(self):
         cancelled = []
-        mgr = _bare_manager_with_membership(_cancel_jobs=cancelled.append)
+        mgr = _bare_manager_with_membership(_cancel_jobs=lambda n, r: cancelled.append(n))
 
         await mgr._on_membership_removed("room-w1")
 
@@ -513,7 +513,7 @@ class TestTheMembershipHandlers(unittest.IsolatedAsyncioTestCase):
         static record, or no record at all — and the jobs of a watcher that
         still exists must not be cancelled."""
         cancelled = []
-        mgr = _bare_manager_with_membership(_cancel_jobs=cancelled.append)
+        mgr = _bare_manager_with_membership(_cancel_jobs=lambda n, r: cancelled.append(n))
         mgr._lifecycle.reclaim_room = AsyncMock(return_value=None)
 
         await mgr._on_membership_removed("room-w1")
@@ -586,7 +586,7 @@ class TestTheMembershipReconciliation(unittest.IsolatedAsyncioTestCase):
 
     def _mgr(self, records, *, snapshot, cancelled=None):
         mgr = _bare_manager_with_membership(
-            _cancel_jobs=cancelled.append if cancelled is not None else None)
+            _cancel_jobs=lambda n, r: cancelled.append(n) if cancelled is not None else None)
         mgr._lifecycle.states = MagicMock(
             return_value={r.watcher_name: r for r in records})
         # The pre-reclaim re-read (stale-snapshot guard) resolves by room —

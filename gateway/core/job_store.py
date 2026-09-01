@@ -88,7 +88,15 @@ class JobStore:
         """The schema version the loaded file declared.
 
         `_SCHEMA_VERSION` for a file this code wrote or for no file at all
-        (nothing to migrate), and lower for one an older ACG wrote.
+        (nothing to migrate), lower for one an older ACG wrote, and HIGHER for
+        one a newer ACG wrote — that direction is not an error here; it is what
+        `_announce_version` warns about and what `migrate` refuses.
+
+        It is what the file said when it was LOADED. A save does not move it (see
+        `save`, which writes `min(...)` and leaves this alone), so after this code
+        has written a newer file down to its own version, this still reports the
+        version that file arrived with. Deliberate: that is the version whose
+        fields were dropped, which is what the operator needs to be told.
         """
         return self._file_version
 
@@ -99,11 +107,15 @@ class JobStore:
         """Record that the file is now at `version`, and write it out.
 
         Separate from `save()` because saving happens constantly and must not
-        silently claim a migration that did not run: every save writes
-        `_SCHEMA_VERSION` into the file, so a store that has NOT migrated would
-        otherwise stamp itself current the first time a job fired. This is the
-        one place that moves the in-memory version, and only the migration calls
-        it — after all of its steps have finished.
+        silently claim a migration that did not run. `save` therefore writes the
+        version the file already had, and this is the ONE place that moves it —
+        called only by the migration, only after every step finished with nothing
+        left needing attention.
+
+        An earlier version of `save` wrote `_SCHEMA_VERSION` unconditionally,
+        which is what makes the separation load-bearing: one ordinary fire
+        stamped an unmigrated file current, silencing both the startup warning
+        and `schedule migrate` while no job had a room id.
         """
         self._file_version = version
         self.save()
@@ -235,18 +247,23 @@ class JobStore:
     def set_room_id(self, job_id: str, room_id: str, *, connector: str = "") -> bool:
         """Record a job's room (and connector, if it had none). `False` if gone.
 
-        A targeted mutation instead of `update(job)`, because the migration reads
-        a job, awaits a network round trip to resolve its room, and only then
-        writes. `update` replaces the whole object, so a fire that completed
-        during that await was silently reverted — verified both ways: the fire's
-        stale copy erasing the migration's `room_id` while the report said it had
-        been written, and the migration's stale object resurrecting a job the fire
-        had just COMPLETED, with `next_run` back in the past.
+        One defect, measured. The migration reads a job, awaits a network round
+        trip to resolve its room, and only then writes. If a `schedule delete`
+        lands during that await, `update(job)` raises `KeyError` — which aborts
+        the whole migration and loses the report for every job already done, and
+        the report IS this command's product. Returning `False` reports that one
+        job as gone and carries on.
 
-        This touches only the fields the migration owns, under `_lock`, on the
-        object the store currently holds. `False` rather than a raise for a job
-        deleted mid-run, so one `schedule delete` cannot abort the whole
-        migration and lose the report for every job already done.
+        It does NOT protect a concurrent fire's progress from being overwritten,
+        because there is nothing to protect: `get`/`list_jobs` hand out the
+        stored object itself, so the migration and a fire mutate one instance and
+        neither can hold a stale copy of the other's fields. (An earlier version
+        of this docstring claimed both hazards. Reverting to `update(job)` fails
+        exactly one of the three tests below — the deletion one.)
+
+        That aliasing is the current behaviour, not a guarantee this method leans
+        on: it writes only the two fields the migration owns, under `_lock`, so
+        it stays correct if the store ever starts handing out copies.
         """
         self._assert_loaded()
         with self._lock:
