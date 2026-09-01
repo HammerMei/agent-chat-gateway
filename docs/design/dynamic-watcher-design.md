@@ -1662,13 +1662,15 @@ the same handle back and the job resumes. Cancelling destroyed something
 self-healing, and destroyed it silently, for an operator who asked about a
 watcher and said nothing about their schedules.
 
-Until the job carries the room's identity itself, a job whose room has not
-spoken since the expire fails audibly on each fire — logged, `next_run`
-advanced, and a finite job's `run_count` deliberately not consumed. Note the
-asymmetry this leaves with the exemption above: the TTL sweep refuses to expire
-a job-bearing room, while the operator verb expires it and lets the jobs fail
-until the room speaks. That is deliberate — the operator asked, the timer did
-not — but it is the seam the room-id keying above closes.
+A job DOES carry the room's identity, so an expire is not the end of it: the
+next fire re-resolves the room by id and recreates the watcher through the
+ordinary rule path. A fire that genuinely cannot — the room is gone, the
+connector disowns it, or no rule claims it any more — fails audibly: logged,
+`next_run` advanced, and a finite job's `run_count` deliberately not consumed.
+
+There is no longer an asymmetry with the sweep to note. Both the timer and the
+operator verb reclaim a job-bearing room, and in both cases a job can bring it
+back.
 
 One interaction worth stating: a room idle for a long time will have had its
 session deleted by the agent backend regardless of what ACG persisted
@@ -1730,10 +1732,18 @@ on-disk records persist, and boot then eagerly starts every room ever seen.
   in the transport layer and reintroduces per-room subscribe management,
   which is the coupling this design removes. The pre-routing work audit in
   §2.2 exists to keep the dropped case cheap.
-- **The upgrade is a clean break, not a migration.** Config, runtime state and
-  scheduled jobs all change shape, and **none of them is converted**. A
+- **The STATIC-era upgrade is a clean break, not a migration.** Config, runtime
+  state and scheduled jobs all change shape, and **none of them is converted**. A
   leftover old config field is a hard load error naming its replacement;
-  legacy state files cause a refusal to start; jobs are re-created. The
+  legacy state files cause a refusal to start; jobs are re-created.
+
+  This is about jobs keyed on a **static watcher name from config.yaml**: those
+  names do not exist after the cutover and nothing can resolve them, so the guide
+  has the operator delete and recreate every one. It is NOT the same population
+  as a schema-1 `jobs.json`, whose jobs are already keyed on a derived handle —
+  those DO convert, through `schedule migrate` (§ above). A deployment upgrading
+  across the cutover does both: recreate the static-era jobs per the guide, then
+  run `schedule migrate` for anything created since. The
   release ships one guide covering the procedure and stating the losses —
   chiefly that every room starts a fresh agent session, and that a paused
   room must be re-expressed as an `except_for:` entry or it becomes active
@@ -2183,7 +2193,7 @@ should the answer.
 | Agent sessions | Every room starts a fresh session. Conversational memory inside the agent is gone; history handoff refetches recent room messages, so there is partial continuity from the room's own transcript |
 | `last_processed_ts` watermarks | A one-off boundary effect per room: a message either side of the cut may be reprocessed or skipped once |
 | Paused state | A paused room becomes active again unless the operator decides what it was for. Pause is an operational verb — mute this watcher for now — and it is not a way to express "this room is not ours", so it does not translate into config. See "not a 1:1 rewrite" below |
-| Scheduled jobs | Jobs key on a watcher name that no longer exists; they are re-created in step 6 |
+| Scheduled jobs | A job keyed on a STATIC watcher name resolves to nothing after the cutover; those are re-created in step 6. A job already keyed on a derived handle converts instead — `schedule migrate` records its room id |
 | Pinned `session_id` | The field is gone (§2.4). A config that sets it fails to load, naming the replacement: have the agent summarise its session to a file and read that back in the new one — which also survives the backend expiring a session, as pinning never did |
 
 **One guard is worth the ten lines**: if the gateway finds legacy-format state

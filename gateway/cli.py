@@ -975,12 +975,15 @@ def _run_schedule_migrate(args) -> None:
 
     outcomes = result.get("outcomes", [])
     for outcome in outcomes:
-        mark = "✓" if outcome["changed"] else "·"
+        mark = ("✓" if outcome["changed"]
+                else "✗" if outcome.get("needs_attention") else "·")
         print(f"  {mark} {outcome['job_id']}  {outcome['watcher']}")
         print(f"      {outcome['detail']}")
 
-    unresolved = [o for o in outcomes if not o["changed"]
-                  and "already has" not in o["detail"]]
+    # The flag, not a substring of the human-readable detail — "already up to
+    # date" is not attention-worthy and a reworded sentence must not change a
+    # count.
+    unresolved = [o for o in outcomes if o.get("needs_attention")]
     print()
     print(f"jobs.json migrated {result['from_version']} → {result['to_version']}: "
           f"{result['changed']} of {len(outcomes)} job(s) changed.")

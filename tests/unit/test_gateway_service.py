@@ -177,7 +177,7 @@ class TestTheExpiryExemptionOracleIsGone(unittest.TestCase):
     nothing" — and a job now records the room it targets and resurrects it, so
     there is no record to protect. The cancel-side rule the oracle's fallback
     logic was shared with is still live and still tested (see
-    `test_cancellation_applies_the_same_fallback_rule`).
+    `TestTheCancellationClaimRule` below).
     """
 
     def test_the_service_no_longer_answers_it(self):
@@ -744,10 +744,6 @@ class TestServiceRunFatalHandshake(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ok", payload)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 # ── Appended from test_round7_fixes.py ────────────────────────────────────────
 
 
@@ -790,3 +786,6 @@ class TestStartupFdOnCancel(unittest.IsolatedAsyncioTestCase):
 
         fds_written = [fd for fd, _ in write_signal_calls]
         self.assertIn(5, fds_written, "startup_fd must be written/closed in finally on CancelledError")
+
+if __name__ == "__main__":
+    unittest.main()

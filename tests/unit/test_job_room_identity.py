@@ -53,11 +53,16 @@ def _record(name="rc:general", room_id="room-1", **kw):
     return WatcherState(**{**defaults, **kw})
 
 
-def _manager(*, record=None, resolved=None, record_for_room=None):
+def _manager(*, record=None, resolved=None, record_for_room=None,
+             resident=None):
     """A manager wired for `inject_message` only.
 
-    `get_watcher_state` HONOURS its name argument, so a lookup by the wrong
-    handle misses the way it really would.
+    `get_watcher_state` and `get_processor` both HONOUR their name argument, so a
+    lookup by the wrong handle misses the way it really would. `resident` maps a
+    watcher name to an already-running processor — without it every test reaches
+    `get_or_create`, which is how a guard further down the function went unpinned
+    (review: the "no resolvable room" test was being satisfied by the PROCESSOR
+    guard above it, and passed with the room guard deleted).
     """
     manager = make_bare_session_manager()
     processor = MagicMock()
@@ -68,7 +73,8 @@ def _manager(*, record=None, resolved=None, record_for_room=None):
     manager._lifecycle.get_watcher_state = MagicMock(side_effect=by_name.get)
     manager._lifecycle.record_for_room = MagicMock(
         return_value=record_for_room)
-    manager._lifecycle.get_processor = MagicMock(return_value=None)
+    manager._lifecycle.get_processor = MagicMock(
+        side_effect=(resident or {}).get)
     manager._watcher_manager = MagicMock()
     manager._watcher_manager.get_or_create = AsyncMock(return_value=processor)
     manager._connector = MagicMock()
@@ -381,3 +387,106 @@ class TestTheConnectorsResolveByIdThroughTheirOwnClassifier(
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheHandleNeverPicksTheSession(unittest.IsolatedAsyncioTestCase):
+    """Found by review, after the first fix: the reverted defect had MOVED.
+
+    Addressing the reply by id was fixed, but the PROCESSOR was still looked up
+    by the caller's handle whenever no record was bound to the room — and that
+    handle is the one thing known to be untrustworthy. A resident watcher for
+    another room answered to it, so the job ran in THAT room's agent session
+    (its history, its working directory, its tool policy) while the reply went
+    to the room the id names. `enqueue` returned True, so the fire counted as a
+    success and a finite job burned a run.
+
+    It also bypassed `get_or_create` entirely, which is where pause, the
+    creation cap and the rule match are decided — falsifying the claim, in the
+    code's own comment, that a job cannot reach a room a message could not.
+    """
+
+    RESOLVED_A = RoomRef(id="room-A", kind=RoomKind.CHANNEL, name="eng")
+
+    async def test_another_rooms_resident_processor_is_not_used(self):
+        """Room B took over the handle and is resident; room A's record is gone."""
+        room_b_processor = MagicMock()
+        room_b_processor.enqueue = AsyncMock(return_value=True)
+        manager = _manager(
+            record=None,                       # nothing bound to room A
+            record_for_room=None,
+            resolved=self.RESOLVED_A,
+            resident={"rc:general": room_b_processor},
+        )
+        manager._watcher_manager.get_or_create = AsyncMock(return_value=None)
+
+        result = await manager.inject_message(
+            "rc:general", "poke", room_id="room-A")
+
+        self.assertFalse(result)
+        room_b_processor.enqueue.assert_not_awaited()
+
+    async def test_the_room_is_asked_for_through_get_or_create_instead(self):
+        """Which is what makes pause, the cap and the rule match apply."""
+        room_b_processor = MagicMock()
+        room_b_processor.enqueue = AsyncMock(return_value=True)
+        manager = _manager(
+            record=None, record_for_room=None, resolved=self.RESOLVED_A,
+            resident={"rc:general": room_b_processor},
+        )
+
+        await manager.inject_message("rc:general", "poke", room_id="room-A")
+
+        manager._watcher_manager.get_or_create.assert_awaited_once()
+        _, room = manager._watcher_manager.get_or_create.await_args.args
+        self.assertEqual(room.id, "room-A")
+        # And the message went to the processor get_or_create returned, not B's.
+        room_b_processor.enqueue.assert_not_awaited()
+        _enqueued_room(manager)
+
+    async def test_a_record_bound_to_the_room_may_still_name_its_processor(self):
+        """The legitimate reuse: the record IS the room's, so its name is safe."""
+        record = _record(name="rc:daily-standup", room_id="room-A")
+        resident = MagicMock()
+        resident.enqueue = AsyncMock(return_value=True)
+        manager = _manager(
+            record=record, record_for_room=record,
+            resident={"rc:daily-standup": resident},
+        )
+
+        result = await manager.inject_message(
+            "rc:general", "poke", room_id="room-A")
+
+        self.assertTrue(result)
+        resident.enqueue.assert_awaited_once()
+        manager._watcher_manager.get_or_create.assert_not_awaited()
+
+    async def test_with_no_id_the_handle_may_name_the_processor(self):
+        """A caller with no id has nothing else, which is the pre-schema-2 job."""
+        resident = MagicMock()
+        resident.enqueue = AsyncMock(return_value=True)
+        record = _record()
+        manager = _manager(record=record, resident={"rc:general": resident})
+
+        result = await manager.inject_message("rc:general", "poke")
+
+        self.assertTrue(result)
+        resident.enqueue.assert_awaited_once()
+
+
+class TestTheRoomGuardIsReachedOnItsOwn(unittest.IsolatedAsyncioTestCase):
+    """Review: `test_nothing_is_injected_when_no_room_can_be_resolved` passed
+    with the room guard DELETED, because the processor guard above it returned
+    first. A resident processor is needed to reach the room guard at all."""
+
+    async def test_a_resident_watcher_with_no_resolvable_room_injects_nothing(self):
+        resident = MagicMock()
+        resident.enqueue = AsyncMock(return_value=True)
+        manager = _manager(
+            record=None, record_for_room=None, resolved=None,
+            resident={"rc:general": resident},
+        )
+
+        result = await manager.inject_message("rc:general", "poke")
+
+        self.assertFalse(result, "an unaddressable message must not be injected")
+        resident.enqueue.assert_not_awaited()

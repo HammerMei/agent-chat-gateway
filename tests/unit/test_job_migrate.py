@@ -72,6 +72,14 @@ class TestHandleParsing(unittest.TestCase):
     def test_a_channel_label_is_the_room_name(self):
         self.assertEqual(room_name_for_label("general"), "general")
 
+    def test_a_label_is_percent_decoded_first(self):
+        """`watcher_label` escapes everything outside `[A-Za-z0-9._-]`, so a
+        voice room `a/b` labels as `a%2Fb`. The voice connector echoes whatever
+        name it is given, so asking it to resolve `a%2Fb` would have recorded
+        that as the room id — matching nothing — and reported a success."""
+        self.assertEqual(room_name_for_label("a%2Fb"), "a/b")
+        self.assertEqual(room_name_for_label("dm:al%20ice"), "@al ice")
+
     def test_a_dm_label_becomes_the_at_spelling(self):
         """`@alice` is the spelling `resolve_room` documents for a DM."""
         self.assertEqual(room_name_for_label("dm:alice"), "@alice")
@@ -141,15 +149,41 @@ class TestVersionAwareness(_MigrateCase):
         self.assertTrue(store.needs_migration())
 
     async def test_a_save_does_not_stamp_a_migration_that_did_not_run(self):
-        """Every save writes the code's version into the file, so an unmigrated
-        store would otherwise mark itself current the first time a job fired."""
+        """`save()` used to write the CODE's version unconditionally, so one
+        ordinary fire marked an unmigrated file as current — silencing both the
+        startup warning and the migration itself.
+
+        The file is asserted, not just the in-memory value: the original bug was
+        that `stamp_version` moved only the in-memory version while every save
+        rewrote the file's, and a test looking only at `file_version` passed
+        against it (review).
+        """
         self._write_file(1, [self._job()])
         store = self._store()
 
         store.update(ScheduledJob.from_dict(self._job()))  # an ordinary save
 
-        self.assertEqual(store.file_version, 1, "the in-memory version moved")
-        self.assertTrue(store.needs_migration())
+        self.assertEqual(
+            json.loads(self.path.read_text())["version"], 1,
+            "the FILE was stamped by an ordinary save",
+        )
+        self.assertEqual(store.file_version, 1)
+        self.assertTrue(self._store().needs_migration(), "a restart would skip it")
+
+    async def test_a_save_does_not_stamp_a_newer_file_with_its_own_version(self):
+        """The other direction, and the one the first fix introduced: writing
+        `self._file_version` would claim version N while `to_dict` had already
+        dropped the fields version N carries — a future ACG would then skip the
+        migrations that restore them."""
+        self._write_file(_SCHEMA_VERSION + 5, [self._job()])
+        store = self._store()
+
+        store.update(ScheduledJob.from_dict(self._job()))
+
+        self.assertEqual(
+            json.loads(self.path.read_text())["version"], _SCHEMA_VERSION,
+            "never claim more than this code wrote",
+        )
 
 
 class TestTheOneToTwoStep(_MigrateCase):
@@ -292,3 +326,254 @@ class TestItIsSafeToRunAgain(_MigrateCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheVersionOnlyMovesWhenAMigrationRuns(_MigrateCase):
+    """Found by review: `save()` stamped the code's version unconditionally, so
+    one ordinary fire marked an unmigrated file as current — the startup warning
+    vanished and `schedule migrate` answered "nothing to do" while every job
+    still had an empty `room_id`.
+
+    `stamp_version`'s docstring described that hazard and only half-prevented it:
+    it was the one place that moved the IN-MEMORY version, while every save
+    rewrote the file's.
+    """
+
+    async def test_an_ordinary_save_leaves_the_file_version_alone(self):
+        self._write_file(1, [self._job()])
+        store = self._store()
+
+        job = store.get("acg-1")
+        job.run_count = 1
+        store.update(job)  # what a fire does
+
+        self.assertEqual(json.loads(self.path.read_text())["version"], 1)
+        self.assertEqual(self._store().file_version, 1,
+                         "a restart would see the file as migrated")
+        self.assertTrue(self._store().needs_migration())
+
+    async def test_a_removal_leaves_it_alone_too(self):
+        """`add`/`update`/`remove`/`remove_expired_completed` all save."""
+        self._write_file(1, [self._job()])
+        store = self._store()
+
+        store.remove("acg-1")
+
+        self.assertEqual(json.loads(self.path.read_text())["version"], 1)
+
+    async def test_only_the_migration_moves_it(self):
+        self._write_file(1, [self._job()])
+        store = self._store()
+        entry = _entry(records={"rc:general": _record("rc:general", "room-1")})
+
+        await migrate(store, [entry])
+
+        self.assertEqual(json.loads(self.path.read_text())["version"],
+                         _SCHEMA_VERSION)
+
+
+class TestAnUnfinishedMigrationStaysRunnable(_MigrateCase):
+    """Also from review: stamping over an unresolved job would make the re-run
+    the operator is TOLD to make answer "nothing to do" — and that job could
+    then never be migrated at all."""
+
+    async def test_the_version_does_not_move_while_a_job_needs_attention(self):
+        self._write_file(1, [self._job("acg-1"), self._job("acg-2", "rc:dev")])
+        store = self._store()
+        # 'general' resolves; 'dev' does not.
+        entry = _entry(resolves={"general": _room("room-1")})
+
+        report = await migrate(store, [entry])
+
+        self.assertEqual(report.changed, 1)
+        self.assertEqual(len(report.unresolved), 1)
+        self.assertEqual(json.loads(self.path.read_text())["version"], 1,
+                         "an unfinished migration must stay runnable")
+
+    async def test_the_re_run_after_a_fix_completes_it(self):
+        """The whole point of not stamping early."""
+        self._write_file(1, [self._job("acg-1"), self._job("acg-2", "rc:dev")])
+        store = self._store()
+        await migrate(store, [_entry(resolves={"general": _room("room-1")})])
+
+        # The operator brings the second room back, and re-runs.
+        again = self._store()
+        report = await migrate(
+            again, [_entry(resolves={"general": _room("room-1"),
+                                     "dev": _room("room-dev")})])
+
+        self.assertEqual(again.get("acg-2").room_id, "room-dev")
+        self.assertEqual(report.unresolved, [])
+        self.assertEqual(json.loads(self.path.read_text())["version"],
+                         _SCHEMA_VERSION)
+
+    async def test_a_clean_re_run_is_not_mistaken_for_unfinished_work(self):
+        """A job that already has an id did not change and needs nothing. The
+        two used to be one state, which would have left the version stuck."""
+        self._write_file(1, [self._job(room_id="room-1")])
+        store = self._store()
+
+        report = await migrate(store, [_entry()])
+
+        self.assertEqual(report.changed, 0)
+        self.assertEqual(report.unresolved, [], "'already done' is not 'stuck'")
+        self.assertEqual(json.loads(self.path.read_text())["version"],
+                         _SCHEMA_VERSION)
+
+
+class TestAConcurrentFireCannotUndoTheMigration(_MigrateCase):
+    """Found by review, reproduced both ways.
+
+    `_migrate_1_to_2` reads a job, awaits `resolve_room` (a network round trip),
+    then writes. With `store.update(job)` — a whole-object replace — a fire that
+    completed during that await was silently reverted:
+
+    * the fire's stale copy erased the `room_id` the migration had just written,
+      while the report said `✓`. The command's output IS its contract, and the
+      job could never be migrated again;
+    * or the migration's stale object resurrected a job the fire had just
+      COMPLETED, with `next_run` back in the past — one duplicate delivery.
+
+    `set_room_id` touches only the two fields the migration owns, under the
+    store's lock, on the object the store currently holds.
+    """
+
+    async def _migrate_with_a_fire_in_the_middle(self, store, entry, mutate):
+        """Run the migration, letting `mutate(store)` land during resolution."""
+        resolving = entry.connector.resolve_room
+
+        async def _resolve_then_interleave(name):
+            room = await resolving(name)
+            mutate(store)
+            return room
+
+        entry.connector.resolve_room = _resolve_then_interleave
+        return await migrate(store, [entry])
+
+    async def test_a_fire_completing_mid_resolution_does_not_erase_the_room_id(self):
+        self._write_file(1, [self._job()])
+        store = self._store()
+        entry = _entry(resolves={"general": _room("room-1")})
+
+        def _a_fire_lands(s):
+            fired = s.get("acg-1")
+            fired.run_count = 1
+            fired.last_run = "2026-09-01T09:00:00+00:00"
+            s.update(fired)
+
+        report = await self._migrate_with_a_fire_in_the_middle(
+            store, entry, _a_fire_lands)
+
+        self.assertEqual(report.changed, 1)
+        self.assertEqual(store.get("acg-1").room_id, "room-1",
+                         "the report said it was written")
+        self.assertEqual(
+            json.loads(self.path.read_text())["jobs"][0]["room_id"], "room-1")
+        # And the fire's own progress survived — the migration did not roll it back.
+        self.assertEqual(store.get("acg-1").run_count, 1)
+
+    async def test_a_completed_job_is_not_resurrected(self):
+        self._write_file(1, [self._job(times=5, run_count=4)])
+        store = self._store()
+        entry = _entry(resolves={"general": _room("room-1")})
+
+        def _the_last_fire_completes(s):
+            done = s.get("acg-1")
+            done.run_count = 5
+            done.status = JobStatus.COMPLETED
+            done.next_run = None
+            s.update(done)
+
+        await self._migrate_with_a_fire_in_the_middle(
+            store, entry, _the_last_fire_completes)
+
+        job = store.get("acg-1")
+        self.assertEqual(job.status, JobStatus.COMPLETED, "brought back to life")
+        self.assertIsNone(job.next_run, "would fire again, in the past")
+        self.assertEqual(job.run_count, 5)
+
+    async def test_a_deletion_mid_run_costs_only_that_job(self):
+        """`update` raised `KeyError`, which the control handler turned into a
+        bare error — losing the report for every job already migrated."""
+        self._write_file(1, [self._job("acg-1"), self._job("acg-2", "rc:dev")])
+        store = self._store()
+        entry = _entry(resolves={"general": _room("room-1"),
+                                 "dev": _room("room-dev")})
+
+        def _delete_the_first(s):
+            s.remove("acg-1")
+
+        report = await self._migrate_with_a_fire_in_the_middle(
+            store, entry, _delete_the_first)
+
+        self.assertIsNone(store.get("acg-1"), "stays deleted, not resurrected")
+        self.assertEqual(store.get("acg-2").room_id, "room-dev",
+                         "the other job was still migrated")
+        # Reported, but NOT attention-worthy: the job is gone, so there is
+        # nothing to fix and nothing to hold the schema version back for.
+        deleted = [o for o in report.outcomes if "deleted while" in o.detail]
+        self.assertEqual(len(deleted), 1, report.outcomes)
+        self.assertFalse(deleted[0].needs_attention)
+        self.assertEqual(report.unresolved, [])
+
+
+class TestFinalIsSaidDifferentlyFromRetryable(_MigrateCase):
+    """The operator's next move depends on which it was: delete the job, or run
+    the command again. `Connector.room_ref_by_id`'s docstring makes the same
+    distinction load-bearing, and this module used to collapse both into "the
+    connector could not resolve X" (review).
+
+    It matters more now that the schema version is not stamped while anything
+    needs attention: a permanently unresolvable job pins the file at version 1,
+    so the startup warning never clears until it is dealt with.
+    """
+
+    def _entry_raising(self, exc):
+        entry = _entry()
+        entry.connector.resolve_room = AsyncMock(side_effect=exc)
+        return entry
+
+    async def test_a_room_that_does_not_exist_says_delete_the_job(self):
+        from gateway.connectors.rocketchat.rest import RoomNotFoundError
+
+        self._write_file(1, [self._job()])
+        store = self._store()
+
+        report = await migrate(store, [self._entry_raising(RoomNotFoundError("no"))])
+
+        detail = report.unresolved[0].detail
+        self.assertIn("cannot be migrated", detail)
+        # The exact advice, not the substring "again" — that also appears inside
+        # "recreate it AGAINst a current watcher", which is how a loose
+        # assertion passes for the wrong reason.
+        self.assertNotIn("schedule migrate' again", detail)
+
+    async def test_mattermosts_own_class_is_recognised_too(self):
+        """There are TWO unrelated `RoomNotFoundError` classes. Importing either
+        would have treated the other platform's final answer as retryable."""
+        from gateway.connectors.mattermost.rest import RoomNotFoundError
+
+        self._write_file(1, [self._job()])
+        store = self._store()
+
+        report = await migrate(store, [self._entry_raising(RoomNotFoundError("no"))])
+
+        self.assertIn("cannot be migrated", report.unresolved[0].detail)
+
+    async def test_a_transport_failure_says_run_it_again(self):
+        self._write_file(1, [self._job()])
+        store = self._store()
+
+        report = await migrate(store, [self._entry_raising(OSError("network"))])
+
+        detail = report.unresolved[0].detail
+        self.assertIn("run 'schedule migrate' again", detail)
+        self.assertNotIn("cannot be migrated", detail)
+
+    async def test_either_way_the_version_stays_put(self):
+        self._write_file(1, [self._job()])
+        store = self._store()
+
+        await migrate(store, [self._entry_raising(OSError("network"))])
+
+        self.assertEqual(json.loads(self.path.read_text())["version"], 1)

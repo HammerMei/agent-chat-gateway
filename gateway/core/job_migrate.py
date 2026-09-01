@@ -34,12 +34,20 @@ logger = logging.getLogger("agent-chat-gateway.core.job_migrate")
 
 @dataclass
 class JobOutcome:
-    """What happened to one job, in the operator's terms."""
+    """What happened to one job, in the operator's terms.
+
+    Three states, not two, and the third is why: `changed` and
+    "needs the operator" are different questions, and a job that was already up
+    to date is neither. Carried as a FLAG rather than inferred from `detail` —
+    the CLI used to filter on the substring "already has", which is a sentence
+    anyone could reword into a miscount.
+    """
 
     job_id: str
     watcher: str
     changed: bool
     detail: str
+    needs_attention: bool = False
 
 
 @dataclass
@@ -55,7 +63,14 @@ class MigrationReport:
 
     @property
     def unresolved(self) -> list[JobOutcome]:
-        return [o for o in self.outcomes if not o.changed]
+        """The jobs a human has to do something about.
+
+        NOT "everything that did not change": a job that already had a room id
+        did not change and needs nothing. Conflating the two would leave the
+        schema version un-stamped forever, because a clean re-run reports every
+        job as unchanged.
+        """
+        return [o for o in self.outcomes if o.needs_attention]
 
     def to_dict(self) -> dict:
         return {
@@ -65,7 +80,8 @@ class MigrationReport:
             "changed": self.changed,
             "outcomes": [
                 {"job_id": o.job_id, "watcher": o.watcher,
-                 "changed": o.changed, "detail": o.detail}
+                 "changed": o.changed, "detail": o.detail,
+                 "needs_attention": o.needs_attention}
                 for o in self.outcomes
             ],
         }
@@ -86,17 +102,45 @@ def split_handle(watcher: str) -> tuple[str, str]:
 def room_name_for_label(label: str) -> str | None:
     """The name to ask a connector to resolve, or `None` if the label is not one.
 
-    * a channel label IS the room name;
+    * a channel label is the room name **percent-decoded**. `watcher_label` runs
+      it through `_encode`, which escapes everything outside `[A-Za-z0-9._-]` —
+      so a voice room `a/b` (from `/ask/a/b`, the case `_encode`'s own docstring
+      cites) labels as `a%2Fb`. Asking a connector to resolve `a%2Fb` fails
+      loudly on Rocket.Chat and Mattermost, whose names are slugs, but the voice
+      connector ECHOES whatever it is given — it would have recorded a room id
+      of `a%2Fb`, matching nothing, and reported it as a success;
     * `dm:alice` asks for `@alice`, the spelling `resolve_room` documents;
     * `gdm:<digest>` is a digest of the room id, not a name — nothing can resolve
       it, and inventing something would be a guess. Reported instead.
+
+    A label truncated by `_encode`'s length cap carries a `-<digest>` suffix and
+    is therefore not the name either. It fails loudly at the connector, which is
+    the right outcome; detecting it here would mean re-deriving the cap.
     """
+    from urllib.parse import unquote
+
     if label.startswith("gdm:"):
         return None
     if label.startswith("dm:"):
-        counterpart = label[len("dm:"):]
+        counterpart = unquote(label[len("dm:"):])
         return f"@{counterpart}" if counterpart else None
-    return label or None
+    return unquote(label) or None
+
+
+def _is_room_not_found(exc: BaseException) -> bool:
+    """Is this exception a connector saying "no such room"?
+
+    Matched on the class NAME rather than by importing one. There are two
+    `RoomNotFoundError` classes — `connectors/rocketchat/rest.py` and
+    `connectors/mattermost/rest.py` — and they are unrelated types, so importing
+    either would silently treat the other platform's final answer as retryable,
+    which is the exact confusion this predicate exists to remove. A core module
+    importing a specific connector would also invert the dependency.
+
+    The honest alternative is a shared exception in `core/`, which is a wider
+    change than this increment owns; noted rather than done.
+    """
+    return type(exc).__name__ == "RoomNotFoundError"
 
 
 async def _resolve_room_id(entry, job: ScheduledJob) -> tuple[str, str]:
@@ -126,9 +170,26 @@ async def _resolve_room_id(entry, job: ScheduledJob) -> tuple[str, str]:
     try:
         room = await entry.connector.resolve_room(room_name)
     except Exception as exc:
-        return "", f"the connector could not resolve {room_name!r}: {exc}"
+        if _is_room_not_found(exc):
+            # FINAL. The same distinction `Connector.room_ref_by_id` makes
+            # load-bearing: collapsing it would leave the operator re-running a
+            # command that can never succeed for this job, and — since the
+            # schema version is not stamped while anything needs attention —
+            # chasing a startup warning that will not clear until they delete it.
+            return "", (
+                f"there is no room named {room_name!r} — this job cannot be "
+                f"migrated; delete it, or recreate it against a current watcher"
+            )
+        # RETRYABLE: the ask failed, not the answer.
+        return "", (
+            f"could not reach the connector to resolve {room_name!r} ({exc}) — "
+            f"run 'schedule migrate' again"
+        )
     if room is None or not getattr(room, "id", ""):
-        return "", f"the connector knows no room named {room_name!r}"
+        return "", (
+            f"the connector knows no room named {room_name!r} — this job cannot "
+            f"be migrated; delete it, or recreate it against a current watcher"
+        )
     return room.id, f"resolved {room_name!r}"
 
 
@@ -157,18 +218,29 @@ async def _migrate_1_to_2(store: JobStore, entries) -> list[JobOutcome]:
             outcomes.append(JobOutcome(
                 job.id, job.watcher, False,
                 f"no configured connector named {job.connector or connector_name!r}",
+                needs_attention=True,
             ))
             continue
 
         room_id, detail = await _resolve_room_id(entry, job)
         if not room_id:
-            outcomes.append(JobOutcome(job.id, job.watcher, False, detail))
+            outcomes.append(JobOutcome(
+                job.id, job.watcher, False, detail, needs_attention=True))
             continue
 
-        job.room_id = room_id
-        if not job.connector:
-            job.connector = entry.name
-        store.update(job)
+        # Targeted, not `store.update(job)`: this object was read before the
+        # `resolve_room` await, and a fire that completed during it would be
+        # erased by writing the whole thing back.
+        if not store.set_room_id(job.id, room_id, connector=entry.name):
+            # NOT attention-worthy: the job is gone, so there is nothing left
+            # to fix and nothing to hold the schema version back for. Reported
+            # so the operator can see why a job they expected is absent from
+            # the ✓ list.
+            outcomes.append(JobOutcome(
+                job.id, job.watcher, False,
+                "deleted while the migration was resolving its room",
+            ))
+            continue
         outcomes.append(JobOutcome(
             job.id, job.watcher, True, f"room {room_id} ({detail})"))
 
@@ -206,9 +278,25 @@ async def migrate(store: JobStore, entries) -> MigrationReport:
         report.steps.append(f"{start} → {end}: {description}")
         report.outcomes.extend(await step(store, entries))
 
-    # Stamped last, and only after every step has run: an interrupted migration
-    # leaves the version where it was, so a re-run repeats the steps rather than
-    # skipping them — which is safe precisely because each one is idempotent.
+    # Stamped last, and only when every job was accounted for. Two reasons, and
+    # the second is the one that bites:
+    #
+    # * an interrupted migration leaves the version where it was, so a re-run
+    #   repeats the steps rather than skipping them — safe precisely because
+    #   each step is idempotent;
+    # * a job left UNRESOLVED is unfinished business. Stamping over it would
+    #   make the early return above answer "nothing to do" on the re-run the
+    #   operator is told to make after fixing the cause — bringing the room's
+    #   watcher back, correcting a name — and that job could then never be
+    #   migrated at all. So the version moves only when there is nothing left
+    #   to do, and `schedule migrate` stays worth running again.
+    if report.unresolved:
+        logger.info(
+            "jobs.json left at schema version %d: %d job(s) could not be "
+            "resolved. Fix those and run 'schedule migrate' again.",
+            from_version, len(report.unresolved),
+        )
+        return report
     store.stamp_version(_SCHEMA_VERSION)
     logger.info(
         "jobs.json migrated %d → %d (%d job(s) changed)",

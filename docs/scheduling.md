@@ -232,6 +232,30 @@ watcher is not woken by a job.
 agent-chat-gateway schedule resume acg-bb47e7f4
 ```
 
+### After upgrading: `schedule migrate`
+
+```bash
+agent-chat-gateway schedule migrate
+```
+
+Each job records the room it targets, so it keeps working when the room is
+renamed or its watcher's record is reclaimed. Jobs created before that field
+existed do not have it: they still work, by resolving their watcher's name, but
+they lose the job if that name moves. This records the room id for them.
+
+**Run it before renaming any rooms.** The migration finds each job's room
+*through* its watcher name, so a name that has already moved to a different room
+would point the job at the wrong one. Right after an upgrade is the moment when
+the names still mean what they meant.
+
+Safe to re-run, and it never guesses: a job whose room cannot be identified is
+reported and left exactly as it was, so you can fix the cause and run it again.
+A group DM's watcher name contains a digest of its room id rather than a name —
+nothing can resolve that, so those jobs are named in the output and have to be
+deleted and recreated.
+
+The daemon warns at startup while there is anything to migrate.
+
 ### Delete a job
 
 ```bash

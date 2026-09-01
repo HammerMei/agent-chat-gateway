@@ -978,13 +978,25 @@ class SessionManager:
             room = await self._resolve_room_for_wake(room_id, watcher_name)
 
         # ── The processor ─────────────────────────────────────────────────
-        # By the record's own name when there is one, so a resident watcher is
-        # reused rather than re-created; otherwise through `get_or_create`, which
-        # is where pause, the creation cap and the rule match are all decided.
-        # A job therefore cannot reach a room a message could not.
-        processor = self._lifecycle.get_processor(
-            record.watcher_name if record is not None else watcher_name
-        )
+        # Looked up by NAME only when a name is what identified this watcher.
+        # With a `room_id` in hand and no record bound to it, the caller's handle
+        # is the one thing known to be untrustworthy: another room may have taken
+        # it over, and its processor would then run this job in ITS agent session
+        # — its history, its working directory, its tool policy — while the reply
+        # went to the room the id names. Found by review; it is the same defect
+        # the revert was for, moved from the reply address to the session.
+        #
+        # So: no name lookup on that path. `get_or_create` finds the resident
+        # watcher for the room BY ROOM if there is one, and is also where pause,
+        # the creation cap and the rule match are decided — which is what makes
+        # "a job cannot reach a room a message could not" true rather than
+        # asserted.
+        if record is not None:
+            processor = self._lifecycle.get_processor(record.watcher_name)
+        elif room_id:
+            processor = None
+        else:
+            processor = self._lifecycle.get_processor(watcher_name)
         if processor is None and self._watcher_manager is not None and room is not None:
             processor = await self._watcher_manager.get_or_create(
                 self._connector_name, room,

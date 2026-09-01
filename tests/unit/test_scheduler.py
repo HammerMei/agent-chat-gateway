@@ -130,6 +130,16 @@ def _make_sm_mock(inject_result: bool = True, paused: bool = False, room_id: str
     watcher_state.paused = paused
     watcher_state.room_id = room_id
     sm.get_watcher_state = MagicMock(return_value=watcher_state)
+    # `record_for_room` answers only for the rooms this manager owns. A bare
+    # MagicMock returns a truthy object for ANY room id, which would make
+    # `_get_sm_for_watcher`'s room-first loop match the first manager in the
+    # dict whatever it was asked — so a future multi-manager test would pass
+    # while delivery went to the wrong connector (review called it a loaded
+    # gun, and it was: today the branch is only dead because every fixture
+    # job has an empty `room_id`).
+    sm._owned_rooms = {room_id} if room_id else set()
+    sm.record_for_room = MagicMock(
+        side_effect=lambda rid: watcher_state if rid in sm._owned_rooms else None)
     return sm
 
 
@@ -1379,10 +1389,6 @@ class TestInjectMessageTimestampFormat(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ts:", prefix)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestInjectionResolvesOnceAndReportsFailure(unittest.IsolatedAsyncioTestCase):
     """`_inject` used to re-implement `_get_sm_for_watcher`, and worse than it.
 
@@ -1450,3 +1456,63 @@ class TestInjectionResolvesOnceAndReportsFailure(unittest.IsolatedAsyncioTestCas
         self.assertFalse(delivered)
         self.assertIn("no session manager owns watcher", "\n".join(logs.output))
         stranger.inject_message.assert_not_awaited()
+
+class TestTheManagerIsFoundByRoomBeforeByHandle(unittest.TestCase):
+    """`_get_sh_for_watcher`'s room-first fallback had zero tests: every fixture
+    job has an empty `room_id`, so the branch was dead across the whole suite —
+    and `_make_sm_mock`'s bare `record_for_room` would have made any new test
+    pass whatever manager it picked (review).
+
+    It matters because the handle is the weaker signal: a job whose `connector`
+    is stale must still reach the manager that owns its ROOM, or `inject_message`
+    asks the wrong platform for the room id.
+    """
+
+    def _scheduler(self, managers):
+        scheduler = JobScheduler.__new__(JobScheduler)
+        scheduler._session_managers = managers
+        return scheduler
+
+    def test_a_stale_connector_still_finds_the_room_owner(self):
+        rc = _make_sm_mock(room_id="room-rc")
+        mm = _make_sm_mock(room_id="room-mm")
+        scheduler = self._scheduler({"rc": rc, "mm": mm})
+        job = ScheduledJob(
+            watcher="gone:general", connector="retired", room_id="room-mm")
+
+        self.assertIs(scheduler._get_sm_for_watcher(job), mm)
+
+    def test_the_named_connector_still_wins_when_it_is_configured(self):
+        rc = _make_sm_mock(room_id="room-rc")
+        mm = _make_sm_mock(room_id="room-mm")
+        scheduler = self._scheduler({"rc": rc, "mm": mm})
+        job = ScheduledJob(watcher="rc:general", connector="rc", room_id="room-mm")
+
+        self.assertIs(scheduler._get_sm_for_watcher(job), rc)
+
+    def test_with_no_room_owner_it_falls_through_to_the_handle(self):
+        rc = _make_sm_mock(room_id="room-rc")
+        rc.get_watcher_state = MagicMock(
+            side_effect=lambda n: MagicMock() if n == "gone:general" else None)
+        scheduler = self._scheduler({"rc": rc})
+        job = ScheduledJob(
+            watcher="gone:general", connector="retired", room_id="room-nobody")
+
+        self.assertIs(scheduler._get_sm_for_watcher(job), rc)
+
+    def test_neither_field_naming_a_manager_answers_none(self):
+        """An old job whose connector was renamed away and whose room has no
+        live record. `schedule migrate` records both, which is what makes such
+        a job resolvable again."""
+        rc = _make_sm_mock(room_id="room-rc")
+        rc.get_watcher_state = MagicMock(return_value=None)
+        scheduler = self._scheduler({"rc": rc})
+        job = ScheduledJob(
+            watcher="gone:general", connector="retired", room_id="room-nobody")
+
+        self.assertIsNone(scheduler._get_sm_for_watcher(job))
+
+
+
+if __name__ == "__main__":
+    unittest.main()

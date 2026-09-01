@@ -50,6 +50,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   room it targets, so its next run recreates the watcher a sweep reclaimed.
   Boot runs the same evaluation over was-active records, so a fleet reads
   honestly after a restart instead of `failed`.
+- **A scheduled job records the room it targets**, so it survives a room rename
+  and an `expire`: `jobs.json` gains `room_id` and moves to schema version 2. A
+  fire resolves through that id, not through the watcher's name — a name is a
+  pure function of `(connector, room)` and moves when the room does. Jobs written
+  before this keep working by resolving their name; **run
+  `agent-chat-gateway schedule migrate` to record their room ids**, before
+  renaming any rooms, since the migration finds each room through its job's
+  watcher name. The daemon warns at startup while anything is unmigrated. The
+  command is version-aware and safe to re-run, and it never guesses: a job whose
+  room cannot be identified is reported and left alone.
 - **Operator verbs act on records, and there is a new one**:
   `acg expire <watcher>` clears a room's session and reclaims its record and
   files now (it overrides pause, audibly — the audit line names the room). It

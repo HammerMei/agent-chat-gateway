@@ -172,7 +172,27 @@ class JobStore:
         with self._lock:
             snapshot = [j.to_dict() for j in self._jobs.values()]
         self._file.parent.mkdir(parents=True, exist_ok=True)
-        data = {"version": _SCHEMA_VERSION, "jobs": snapshot}
+        # `self._file_version`, NOT `_SCHEMA_VERSION`. An ordinary save — one per
+        # fire, one per `schedule pause` — would otherwise stamp an unmigrated
+        # file as current, and the operator would lose both the startup warning
+        # and the migration: `schedule migrate` would answer "nothing to do"
+        # while every job still had an empty `room_id`. `stamp_version()` is the
+        # only thing that moves this, and only after a migration has run.
+        # `min(...)`, not either one alone — both directions are wrong on their
+        # own, and both were verified:
+        #
+        # * `_SCHEMA_VERSION` stamps an UNMIGRATED file as current. One ordinary
+        #   fire then silences the startup warning and makes `schedule migrate`
+        #   answer "nothing to do" while every job has an empty `room_id`.
+        # * `self._file_version` stamps a NEWER file with its own version while
+        #   writing content this code shaped — `to_dict` has already dropped the
+        #   fields it does not know, so the file would claim a version whose
+        #   fields it no longer contains, and a future ACG would skip the
+        #   migrations that restore them.
+        #
+        # The floor is honest in both: never claim more than this code wrote, and
+        # never claim more than the file already earned.
+        data = {"version": min(self._file_version, _SCHEMA_VERSION), "jobs": snapshot}
         # Include thread ident so concurrent save() calls from different
         # asyncio.to_thread() workers don't clobber each other's temp file.
         tmp = self._file.with_name(f"{self._file.name}.{os.getpid()}.{_thread_ident()}.tmp")
@@ -211,6 +231,33 @@ class JobStore:
                 raise KeyError(f"Job {job.id!r} not found")
             self._jobs[job.id] = job
         self.save()
+
+    def set_room_id(self, job_id: str, room_id: str, *, connector: str = "") -> bool:
+        """Record a job's room (and connector, if it had none). `False` if gone.
+
+        A targeted mutation instead of `update(job)`, because the migration reads
+        a job, awaits a network round trip to resolve its room, and only then
+        writes. `update` replaces the whole object, so a fire that completed
+        during that await was silently reverted — verified both ways: the fire's
+        stale copy erasing the migration's `room_id` while the report said it had
+        been written, and the migration's stale object resurrecting a job the fire
+        had just COMPLETED, with `next_run` back in the past.
+
+        This touches only the fields the migration owns, under `_lock`, on the
+        object the store currently holds. `False` rather than a raise for a job
+        deleted mid-run, so one `schedule delete` cannot abort the whole
+        migration and lose the report for every job already done.
+        """
+        self._assert_loaded()
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return False
+            job.room_id = room_id
+            if connector and not job.connector:
+                job.connector = connector
+        self.save()
+        return True
 
     def remove(self, job_id: str) -> bool:
         """Remove a job by ID. Returns True if found and removed."""

@@ -510,10 +510,6 @@ class TestRuleDelete:
             # at argument parsing exactly when the operator needed it).
             assert "schedule delete" in message
             assert "schedule-delete" not in message
-            # The job clause must not overpromise: a session with pending
-            # jobs is EXEMPT from expiry (WatcherLifecycle.expire_idle), so
-            # the warning says its jobs keep running, not that the sweeps
-            # will clean everything up.
             # The clause the operator reads before deleting. It used to promise
             # the jobs kept running (the sweep's old exemption); the truth is
             # now that they stop delivering while still listing as active.

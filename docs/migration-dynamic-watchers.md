@@ -139,6 +139,10 @@ Field notes:
    removes the records, NOT the jobs, and an orphaned job re-fires forever
    against a watcher that no longer exists. Then recreate the jobs against
    the new watcher names.
+8. `agent-chat-gateway schedule migrate` — records the room each remaining job
+   targets, so a later room rename cannot orphan it. **Before you rename any
+   rooms**: the migration finds a job's room through its watcher name. Step 7's
+   recreated jobs already have it; this is for anything that survived.
 
 ## Changing a connector's server (or type)
 
