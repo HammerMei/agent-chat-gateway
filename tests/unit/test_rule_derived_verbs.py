@@ -601,7 +601,18 @@ class TestTheExpireVerb(unittest.IsolatedAsyncioTestCase):
         mgr._lifecycle.reclaim_room = AsyncMock(return_value=reclaimed)
         return mgr
 
-    async def test_expire_reclaims_and_cancels_jobs(self):
+    async def test_expire_reclaims_and_leaves_scheduled_jobs_alone(self):
+        """Inverted, owner 2026-08-31.
+
+        Expire used to cancel the watcher's scheduled jobs, borrowed from the
+        membership-removal path whose reason was "a job left in the store would
+        fire forever at a room that cannot answer". After a membership removal
+        that is true. After an operator expire it is not: the room is still
+        there, the bot is still in it, and a watcher handle is a pure function of
+        `(connector, room)` — so the room's next message brings the SAME name
+        back and the job resumes. Cancelling destroyed something self-healing,
+        silently, for an operator who never mentioned their schedules.
+        """
         record = make_rule_derived_record(name="w1")
         cancelled = []
         mgr = self._mgr(record, cancelled=cancelled)
@@ -617,7 +628,7 @@ class TestTheExpireVerb(unittest.IsolatedAsyncioTestCase):
         # active records too.
         self.assertIs(args.kwargs.get("expected"), record)
         self.assertFalse(args.kwargs.get("require_dormant", False))
-        self.assertEqual(cancelled, ["w1"])
+        self.assertEqual(cancelled, [], "expire must not touch the schedules")
 
     async def test_expire_raises_where_the_event_handlers_swallow(self):
         """An operator watching the command must see the failure."""

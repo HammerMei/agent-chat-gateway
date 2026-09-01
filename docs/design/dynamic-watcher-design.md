@@ -1605,6 +1605,24 @@ would orphan it the moment an operator resumes it, and the operator's next
 move after resuming would be wondering why the job fires at nothing. Only a
 completed job stops holding its room.
 
+**The operator's `expire` does not cancel a room's jobs** (owner, 2026-08-31).
+It once did, borrowed from the membership-removal path, whose reason was that a
+job left in the store would fire forever at a room that cannot answer. That is
+true after a removal — the bot is gone from the room. It is false after an
+expire: the room is still there, the bot is still in it, and a watcher handle is
+a pure function of `(connector, room)` (§2.3), so the room's next message brings
+the same handle back and the job resumes. Cancelling destroyed something
+self-healing, and destroyed it silently, for an operator who asked about a
+watcher and said nothing about their schedules.
+
+Until the job carries the room's identity itself, a job whose room has not
+spoken since the expire fails audibly on each fire — logged, `next_run`
+advanced, and a finite job's `run_count` deliberately not consumed. Note the
+asymmetry this leaves with the exemption above: the TTL sweep refuses to expire
+a job-bearing room, while the operator verb expires it and lets the jobs fail
+until the room speaks. That is deliberate — the operator asked, the timer did
+not — but it is the seam the room-id keying above closes.
+
 One interaction worth stating: a room idle for a long time will have had its
 session deleted by the agent backend regardless of what ACG persisted
 (§3, backend retention). The recreation path handles that through the typed

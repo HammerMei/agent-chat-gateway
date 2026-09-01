@@ -832,12 +832,27 @@ class SessionManager:
     async def expire_watcher(self, name: str) -> None:
         """The §2.8 `expire` verb: operator-initiated reclamation, now.
 
-        Runs the same forced-reclamation path a membership removal runs —
-        pause overridden with an audit line, scheduled jobs cancelled — but
-        raises where the event handlers swallow: an operator watching the
-        command must see the failure the connector must not. Only a
-        rule-derived record is expirable; a static watcher's owner is
-        config.yaml, and there is nothing durable to reclaim for it.
+        Runs the same forced-reclamation path a membership removal runs — pause
+        overridden with an audit line — but raises where the event handlers
+        swallow: an operator watching the command must see the failure the
+        connector must not. Only a rule-derived record is expirable; a static
+        watcher's owner is config.yaml, and there is nothing durable to reclaim
+        for it.
+
+        **Scheduled jobs are deliberately NOT cancelled** (owner, 2026-08-31).
+        This shared the membership-removal path's cancellation, whose reason was
+        "a job left in the store would fire forever at a room that cannot
+        answer". That holds when the bot has been removed from the room. It does
+        not hold here: the room is still there, the bot is still in it, and a
+        watcher handle is a pure function of `(connector, room)` — so the room's
+        next message recreates a watcher under the SAME name and the job starts
+        working again. Cancelling destroyed something that recovers on its own,
+        and it destroyed it silently, for an operator who asked about a watcher
+        and said nothing about their schedules.
+
+        A job whose room has not spoken yet fails audibly instead: the scheduler
+        logs the failed injection, advances `next_run`, and — deliberately —
+        does not consume a finite job's `run_count`.
         """
         state = self._lifecycle.get_watcher_state(name)
         if state is None or not state.config or not state.room_id:
@@ -870,14 +885,6 @@ class SessionManager:
                 f"Watcher '{name}' was not reclaimed — its record changed "
                 f"while the expire ran. Re-check 'list' and retry."
             )
-        if self._cancel_jobs is not None:
-            try:
-                self._cancel_jobs(reclaimed)
-            except Exception:
-                logger.exception(
-                    "Could not cancel scheduled jobs for expired watcher "
-                    "'%s' — they will fail audibly when they fire", reclaimed,
-                )
 
     async def inject_message(self, watcher_name: str, text: str) -> bool:
         """Inject a synthetic OWNER-role message directly into a watcher's queue.
