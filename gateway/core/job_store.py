@@ -110,7 +110,46 @@ class JobStore:
         return self._file_version
 
     def needs_migration(self) -> bool:
-        return self._file_version < _SCHEMA_VERSION
+        """Is there migration work outstanding?
+
+        Two signals, because the declared version alone is a claim about the
+        file and the second one is the observable fact.
+
+        The version can say "current" over a job that is not: any interleaving
+        that writes a job back from a copy taken before the migration's write
+        drops the `room_id` after the version has been stamped. `write_fields`
+        closed the one such path this system has, but the failure it produced was
+        SILENT AND PERMANENT — `migrate` early-returns on a current version, so
+        the startup warning never came back and the operator was dead-ended by
+        the system's own advice. A job with no room id is the thing migration
+        exists to fix, so ask about it directly rather than trusting the stamp.
+
+        The cost of the second signal is a re-run that finds nothing, which is
+        what idempotence is for. A COMPLETED job is excluded: it has nothing
+        left to fire, so it has nothing left to migrate — `list_jobs()` already
+        drops those.
+        """
+        return self._file_version < _SCHEMA_VERSION or self.jobs_missing_room_id()
+
+    def jobs_missing_room_id(self) -> bool:
+        """Is any live job still without a room id?
+
+        Defined here, once, because it is a fact about the store's contents —
+        `needs_migration`, the startup warning and `job_migrate`'s step selection
+        all ask it, and three copies of "any job with an empty room_id" is how
+        one of them comes to disagree with the others.
+
+        Reads `_jobs` directly rather than through `list_jobs()`, which asserts
+        the store is loaded: the startup warning asks this from inside `load()`,
+        before `_loaded` is set. Going through `list_jobs` raised there, and
+        `load`'s broad `except` reported it as "Failed to load jobs file —
+        starting with empty list" and skipped the announcement entirely. The
+        COMPLETED exclusion is duplicated instead, deliberately — a completed job
+        has nothing left to fire, so nothing left to migrate.
+        """
+        with self._lock:
+            return any(not job.room_id for job in self._jobs.values()
+                       if job.status != JobStatus.COMPLETED)
 
     def stamp_version(self, version: int) -> None:
         """Record that the file is now at `version`, and write it out.
@@ -144,7 +183,7 @@ class JobStore:
                 "field this version does not know. Upgrade, or move the file "
                 "aside.", self._file, self._file_version, _SCHEMA_VERSION,
             )
-        elif self.needs_migration():
+        elif self._file_version < _SCHEMA_VERSION:
             logger.warning(
                 "%s is at schema version %d; this ACG uses %d. Scheduled jobs "
                 "keep working, with the behaviour of the older version. Run "
@@ -152,6 +191,20 @@ class JobStore:
                 "— do it before renaming any rooms, since the migration reads "
                 "each job's watcher name to find its room.",
                 self._file, self._file_version, _SCHEMA_VERSION,
+            )
+        elif self.jobs_missing_room_id():
+            # The version says current and a job says otherwise. Reported as its
+            # own case rather than folded into the message above, which would
+            # name a version number that is not the problem — and reported at
+            # all because the alternative was a job that quietly stopped
+            # arriving with the warning switched off.
+            logger.warning(
+                "%s declares schema version %d, but at least one scheduled job "
+                "has no recorded room. Such a job cannot bring its watcher back "
+                "once the room's record is reclaimed — it fails at every slot. "
+                "Run 'agent-chat-gateway schedule migrate' to record the rooms; "
+                "it is safe to re-run.",
+                self._file, self._file_version,
             )
 
     # ── Load / save ───────────────────────────────────────────────────────────
@@ -253,26 +306,50 @@ class JobStore:
             self._jobs[job.id] = job
         self.save()
 
+    def write_fields(self, job: ScheduledJob, fields: frozenset[str]) -> bool:
+        """Copy `fields` from `job` onto the STORED job of the same id. `False`
+        if it is gone.
+
+        The safe form of `update` for any writer that holds a job across an
+        `await`. `update` replaces the stored object, so it also writes back
+        every field the holder read BEFORE the await — reverting whatever
+        another writer changed in the meantime. That is not hypothetical:
+        `_fire_once` copies the job on entry, and a `schedule migrate` landing
+        inside its inject window had its `room_id` silently discarded, after
+        reporting success and stamping the schema version.
+
+        `fields` is the caller's declaration of what it owns — see
+        `schedule_types.FIRE_OWNED_FIELDS` and friends, whose union is checked
+        against the dataclass so a new field must pick an owner.
+        """
+        self._assert_loaded()
+        with self._lock:
+            stored = self._jobs.get(job.id)
+            if stored is None:
+                return False
+            for name in fields:
+                setattr(stored, name, getattr(job, name))
+        self.save()
+        return True
+
     def set_room_id(self, job_id: str, room_id: str, *, connector: str = "") -> bool:
         """Record a job's room (and connector, if it had none). `False` if gone.
 
-        One defect, measured. The migration reads a job, awaits a network round
-        trip to resolve its room, and only then writes. If a `schedule delete`
-        lands during that await, `update(job)` raises `KeyError` — which aborts
-        the whole migration and loses the report for every job already done, and
-        the report IS this command's product. Returning `False` reports that one
-        job as gone and carries on.
+        The narrow case of `write_fields` — see there for why a targeted write is
+        the general rule — plus one thing of its own: `False` rather than a raise
+        for a job deleted mid-run. `update` raises `KeyError`, which aborts the
+        whole migration and loses the report for every job already done, and the
+        report IS `schedule migrate`'s product.
 
-        It does NOT protect a concurrent fire's progress from being overwritten,
-        because there is nothing to protect: `get`/`list_jobs` hand out the
-        stored object itself, so the migration and a fire mutate one instance and
-        neither can hold a stale copy of the other's fields. (An earlier version
-        of this docstring claimed both hazards. Reverting to `update(job)` fails
-        exactly one of the three tests below — the deletion one.)
-
-        That aliasing is the current behaviour, not a guarantee this method leans
-        on: it writes only the two fields the migration owns, under `_lock`, so
-        it stays correct if the store ever starts handing out copies.
+        This docstring has been wrong twice, in opposite directions, and both
+        times for the same reason: it reasoned about the store's ACCESSORS and
+        drew a conclusion about its WRITERS. First it claimed a lost-update
+        hazard that `get`-returns-the-live-object rules out. Then it concluded
+        there was therefore nothing to protect — which `core/scheduler.py`'s
+        `copy.copy(job)` refutes, and that copy was discarding `room_id` on a
+        path the release documents. **A claim about concurrent writes is a claim
+        about writers**: enumerate them (fire, `schedule migrate`, `schedule
+        pause`/`resume`) and what each holds across an await, not the getters.
         """
         self._assert_loaded()
         with self._lock:

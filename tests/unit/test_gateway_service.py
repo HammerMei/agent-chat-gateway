@@ -791,6 +791,90 @@ class TestStartupFdOnCancel(unittest.IsolatedAsyncioTestCase):
         fds_written = [fd for fd, _ in write_signal_calls]
         self.assertIn(5, fds_written, "startup_fd must be written/closed in finally on CancelledError")
 
+class TestCancellationRequiresOwnershipNotJustTheRoom(unittest.TestCase):
+    """Cancelling by ROOM alone let one connector delete another's job.
+
+    `_claims_this_room` matched a job by `room_id`, and the surrounding filter
+    admitted it when `j.connector not in configured` — a clause added so a job
+    with a stale connector, deliverable through the scheduler's fallback scan,
+    stayed cancellable too. But a room id does not name an owner: ids are
+    per-server, and the canonical multi-agent setup is one account per agent in
+    the same rooms. So a job belonging to a connector that had been renamed away
+    was deleted by a DIFFERENT connector's membership event, under an audit line
+    saying the bot had been removed from the room. It had not been removed from
+    that agent's account.
+
+    Cancellation is destructive and unappealable, so ambiguity must not resolve
+    to "delete". The job is left instead: it fails loudly at its next fire, which
+    an operator can still repair.
+    """
+
+    def _service_with_jobs(self, jobs):
+        from gateway.schedule_types import JobStatus, ScheduledJob
+
+        service = _make_service()
+        entry = MagicMock()
+        entry.name = "rc"
+        service._entries = [entry]
+        service._job_store = MagicMock()
+        service._job_store.list_jobs = MagicMock(return_value=[
+            ScheduledJob(id=spec[0], watcher=spec[1], connector=spec[2],
+                         room_id=(spec[3] if len(spec) > 3 else ""),
+                         status=JobStatus.ACTIVE)
+            for spec in jobs
+        ])
+        service._job_store.remove = MagicMock(return_value=True)
+        return service
+
+    def _removed(self, service):
+        return [c.args[0] for c in service._job_store.remove.call_args_list]
+
+    def test_another_connectors_job_in_the_same_room_is_left_alone(self):
+        service = self._service_with_jobs([
+            ("acg-mine", "rc:general", "rc", "room-1"),
+            ("acg-theirs", "alice:general", "alice", "room-1"),
+        ])
+
+        service._cancel_jobs_for("rc", "rc:general", "room-1")
+
+        self.assertEqual(self._removed(service), ["acg-mine"])
+
+    def test_a_retired_connectors_job_is_left_alone_too(self):
+        """The exact case the removed escape clause admitted: `alice` is not in
+        `configured`, so the old filter treated its job as fair game."""
+        service = self._service_with_jobs([
+            ("acg-theirs", "alice:general", "alice", "room-1"),
+        ])
+
+        service._cancel_jobs_for("rc", "rc:general", "room-1")
+
+        self.assertEqual(self._removed(service), [])
+
+    def test_a_pre_schema_2_job_is_still_cancelled_by_its_handle(self):
+        """The case the escape clause existed for, kept: the job's `connector`
+        field is empty, so ownership comes from the handle's prefix — which is
+        this connector. Note the handle alone is NOT enough when the connector
+        field names a configured connector; see
+        `TestTheCancellationClaimRule::test_another_configured_connectors_job_is_left_alone`,
+        because delivery reads that field first."""
+        service = self._service_with_jobs([
+            ("acg-old", "rc:general", ""),
+        ])
+
+        service._cancel_jobs_for("rc", "rc:general", "room-1")
+
+        self.assertEqual(self._removed(service), ["acg-old"])
+
+    def test_a_pre_schema_2_job_under_another_connectors_handle_is_left_alone(self):
+        service = self._service_with_jobs([
+            ("acg-old", "alice:general", ""),
+        ])
+
+        service._cancel_jobs_for("rc", "rc:general", "room-1")
+
+        self.assertEqual(self._removed(service), [])
+
+
 class TestCancellationMatchesByRoomNotByHandle(unittest.TestCase):
     """Found by the sweep, after the same defect class appeared three times.
 

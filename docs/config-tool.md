@@ -159,9 +159,13 @@ message — see [docs/user-guide.md](user-guide.md) for how matching works.
   session records on disk still belong to it, and how many scheduled jobs
   target those sessions. The counts are read from the daemon's own files.
   Idle stranded sessions are cleaned up by the daemon's lifecycle sweeps. The
-  scheduled jobs are **not** deleted with the rule, but they stop delivering
-  once no rule claims those rooms — each run then fails and is logged, while the
-  job still lists as active. Remove them with `acg schedule delete <job_id>`.
+  scheduled jobs are **not** deleted with the rule, and they **keep delivering
+  while each room's record lasts**: a room that still has a record is recreated
+  from that record, not from the rules, so the agent goes on replying there for
+  up to `session_expire_days` (default 15) after the rule is gone. Only then does
+  each run fail and get logged, while the job still lists as active. To stop them
+  now, remove the jobs with `acg schedule delete <job_id>`, or expire the
+  watchers. See `docs/scheduling.md` for the full resurrection rules.
 - This tab edits `config.yaml` only. To see or act on the *live* sessions a
   rule has created, use the CLI: `acg list`, `acg pause/resume/reset/expire`.
 - Known limitation: while some rule in the file is broken (its row shows

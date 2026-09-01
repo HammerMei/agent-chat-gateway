@@ -361,34 +361,53 @@ class GatewayService:
         rather than being silently lost here.
         """
         try:
-            # The same fallback claim rule as the exemption oracle and the
-            # scheduler's delivery (Codex round 11, the cancel side of round
-            # 10's exemption fix): a job with an empty or stale connector is
-            # deliverable to this watcher via the fallback scan, so it must
-            # also be CANCELLABLE through it — or the reclaim leaves it
-            # orphaned, failing resolution forever (active) or listed
-            # permanently (paused).
             configured = {e.name for e in self._entries}
 
+            def _owner_of(job) -> str:
+                """Which connector would DELIVER this job.
+
+                The same order `JobScheduler._get_sm_for_watcher` uses, and
+                deliberately so: cancellation must claim exactly the jobs this
+                connector would have fired. `job.connector` when it names a
+                configured connector; otherwise the handle's prefix, the only
+                other thing in a job that names one.
+                """
+                if job.connector in configured:
+                    return job.connector
+                return job.watcher.partition(":")[0]
+
             def _claims_this_room(job) -> bool:
-                # By ROOM when the job records one — a handle can have been taken
-                # over by a different room, and cancelling by it would delete a
-                # live room's jobs while leaving this room's own firing at a room
-                # the bot has left. Both directions were reachable (sweep).
-                #
-                # By handle only for a job written before `room_id` existed,
-                # where it is the only key there is. `schedule migrate` records
-                # the id and moves such a job onto the first branch.
+                """Is this job THIS connector's job for THIS room?
+
+                Both halves, because cancellation is destructive and
+                unappealable. A room id does NOT establish ownership: ids are
+                per-server, not per-connector, and the canonical multi-agent
+                setup is one account per agent in the same rooms, so several
+                connectors' jobs legitimately carry one room id.
+
+                An earlier version admitted any job whose connector was not
+                configured (`or j.connector not in configured`), on the argument
+                that such a job is deliverable here through the fallback scan and
+                so must be cancellable here. The argument was right and the
+                clause too broad: a job belonging to a connector renamed away in
+                `config.yaml` was deleted by a DIFFERENT connector's membership
+                event, under an audit line saying the bot had been removed from
+                the room — it had not been removed from that agent's account.
+                Asking who would deliver it keeps the intent and drops the reach.
+                """
+                if _owner_of(job) != connector_name:
+                    return False
                 if job.room_id:
+                    # A handle can have been taken over by a different room, and
+                    # cancelling by it would delete a live room's jobs while
+                    # leaving this room's own firing at a room the bot has left.
+                    # Both directions were reachable.
                     return job.room_id == room_id
+                # Pre-schema-2: the handle is the only key there is.
                 return job.watcher == watcher_name
 
-            doomed = [
-                j for j in self._job_store.list_jobs()
-                if _claims_this_room(j)
-                and (j.connector == connector_name
-                     or j.connector not in configured)
-            ]
+            doomed = [j for j in self._job_store.list_jobs()
+                      if _claims_this_room(j)]
             for job in doomed:
                 self._job_store.remove(job.id)
                 logger.warning(

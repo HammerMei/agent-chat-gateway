@@ -25,6 +25,24 @@ the room it targets and resurrects it through `get_or_create` like any message,
 so that premise is gone and the exemption with it (owner, 2026-08-31): a 9am job
 on an expired room recreates its watcher at 9am.
 
+**The premise holds for a job that HAS a room id, on a connector that can look a
+room up by one.** Both qualifiers are load-bearing here, because this is the
+module that removed the net:
+
+* a job written before schema 2 has no room id and resolves by watcher name, so
+  once this sweep expires its record it stops delivering permanently. The
+  population is every job in a deployment between the upgrade and a completed
+  `schedule migrate` — which is why the startup warning also fires on "a job with
+  no recorded room", not only on the file's declared version
+  (`JobStore.needs_migration`);
+* the voice and script connectors do not implement `Connector.room_ref_by_id`,
+  so a job cannot resurrect one of their watchers at all. Neither supports
+  unsolicited inbound, so neither is swept — this reaches them only through an
+  operator `expire`.
+
+Stated here rather than only in `docs/scheduling.md` because the exemption was
+removed on the unqualified version of the sentence.
+
 Mechanically: `run_once` is the whole sweep and the only thing tests need —
 they inject `now` and never sleep. The free-running loop is a thin shell over
 it, because a free-running asyncio loop is where the #110 hang lesson lived.

@@ -411,7 +411,21 @@ Three distinct keys, deliberately:
 | Watcher instance, sticky binding, per-room lock | `(connector, room_id)` |
 | Persisted state record | `(connector, room_id)` |
 | Filesystem paths (system prompt, attachment workspace) | `hash(connector, room_id)` — never the raw id |
-| Display and CLI | `<connector>:<room_label>` — cosmetic, never load-bearing |
+| Display and CLI | `<connector>:<room_label>` — the operator's name for a watcher, and a **fallback** resolution key where no room id is available (see §2.8) |
+
+The last row used to read "cosmetic, never load-bearing". It is not, in two
+respects, and calling it cosmetic taught six separate readers that reaching for
+the handle was free:
+
+1. it is the identity `schedule list`/`pause`/`delete` address, so it is
+   load-bearing by design;
+2. more importantly, **the runtime dictionaries in `WatcherLifecycle` — records,
+   processors and per-room locks — are still keyed by the handle**, not by
+   `(connector, room_id)` as the first two rows of this table specify. That
+   re-keying has not happened (`core/watcher_lifecycle.py`, `record_for_room` is
+   a linear scan for exactly this reason). Until it does, the handle is the
+   ergonomic lookup and the room id is the awkward one, which is the wrong way
+   round and is the single cause behind the recurring defect described in §2.8.
 
 The `room_name` on the state record is a **human-readable description of the
 room**, refreshed from inbound messages: the platform's own name for a named
@@ -1583,10 +1597,41 @@ Idle is one flag away when the question is "what does the bot know about"
 rather than "what is it doing".
 
 **A scheduled job keys on `(connector, room_id)`, not on the label.** A watcher
-name is cosmetic and free to change (§2.3), so keying on it means a rename
-orphans every job on that room. The label is kept alongside as display metadata —
-it is what `list`, `pause` and `expire` speak — and `room_id` is what a fire
-resolves through.
+name is free to change (§2.3), so keying on it means a rename orphans every job
+on that room. The label is kept alongside as display metadata — it is what
+`list`, `pause` and `expire` speak — and `room_id` is what a fire resolves
+through.
+
+### The routing rule, stated as a rule
+
+Every site that takes a watcher identity **on behalf of a job** obeys this, and
+it is written here because stating it once is what stops the seventh occurrence:
+
+> A job is addressed by its `room_id`. The handle is consulted **only** when
+> `room_id` is empty — a job written before schema 2 — and **never** once an id
+> exists. A room id that resolves to more than one connector is ambiguous, not a
+> tie to break: refuse and log.
+
+The seam sites, so a reader can check them rather than rediscover them:
+`JobScheduler._get_sm_for_watcher`, `JobScheduler._record_for`,
+`SessionManager.inject_message`, `SessionManager.notify_watcher_room`,
+`GatewayService._cancel_jobs_for`, and `job_migrate._resolve_room_id`.
+
+**Why a rule and not six fixes.** The same defect — code reading the handle where
+a room id was available — was found and fixed six times across four review
+rounds, each time at a different site, each time correctly. It kept coming back
+because §2.3's runtime dictionaries are still keyed by the handle rather than by
+`(connector, room_id)`, so the handle is the cheap lookup and the id is the
+awkward one. Re-keying them is the change that makes the defect unrepresentable;
+it is deliberately **not** in this increment (it touches the state file's shape,
+boot replay and every operator verb), and until it lands this rule plus
+`tests/unit/test_job_room_identity.py` are what hold the line.
+
+**Two conditions on the resurrection promise**, because "a job brings its watcher
+back" is true of neither an un-migrated job nor a connector that cannot look a
+room up by id (voice and script do not implement `Connector.room_ref_by_id`).
+Both are stated for operators in `docs/scheduling.md`; do not repeat the promise
+anywhere without them.
 
 Implemented (owner, 2026-09-01), after a first attempt was reverted for three
 defects worth naming, because each is a way this can be got wrong again:

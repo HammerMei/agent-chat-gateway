@@ -1490,6 +1490,75 @@ class TestTheManagerIsFoundByRoomBeforeByHandle(unittest.TestCase):
 
         self.assertIs(scheduler._get_sm_for_watcher(job), rc)
 
+
+class TestAnAmbiguousRoomIsRefusedRatherThanGuessed(unittest.TestCase):
+    """The by-room fallback took the FIRST manager holding the room, in
+    `config.yaml` order.
+
+    Room ids are per-server, not per-connector, and the canonical multi-agent
+    setup is one account per agent in the SAME rooms (CLAUDE.md) — so several
+    managers holding a record for one room is the normal case. Measured: a job
+    whose connector had been renamed away was handed to another agent's session
+    manager, ran in that agent's processor, and that agent's ACCOUNT posted the
+    reply, while the fire logged an ordinary success.
+
+    Before this branch the same case failed loudly ("no session manager owns
+    watcher …"). Restoring loudness on ambiguity is better than both: the branch
+    keeps the by-room fix for the case it was for, and refuses the case only an
+    operator can decide.
+    """
+
+    def _scheduler(self, managers):
+        scheduler = JobScheduler.__new__(JobScheduler)
+        scheduler._session_managers = managers
+        return scheduler
+
+    def _job(self):
+        return ScheduledJob(id="acg-1", watcher="alice:standup",
+                            connector="alice", room_id="room-shared")
+
+    def test_two_owners_means_no_manager_rather_than_the_first_one(self):
+        first = _make_sm_mock(room_id="room-shared")
+        second = _make_sm_mock(room_id="room-shared")
+        scheduler = self._scheduler({"bob": first, "alice-bot": second})
+
+        self.assertIsNone(scheduler._get_sm_for_watcher(self._job()))
+
+    def test_the_refusal_is_logged_with_what_to_do(self):
+        """A silent `None` would only surface as a job that stopped arriving."""
+        scheduler = self._scheduler({
+            "bob": _make_sm_mock(room_id="room-shared"),
+            "alice-bot": _make_sm_mock(room_id="room-shared"),
+        })
+
+        with self.assertLogs("agent-chat-gateway.core.scheduler", "ERROR") as cm:
+            scheduler._get_sm_for_watcher(self._job())
+
+        logged = "\n".join(cm.output)
+        self.assertIn("room-shared", logged)
+        self.assertIn("Refusing to guess", logged)
+        self.assertIn("delete and recreate", logged)
+
+    def test_one_owner_is_still_resolved(self):
+        """The fence must not cost the fix it guards: a single owner is exactly
+        the case the by-room fallback was added for."""
+        owner = _make_sm_mock(room_id="room-shared")
+        other = _make_sm_mock(room_id="room-elsewhere")
+        scheduler = self._scheduler({"bob": other, "alice-bot": owner})
+
+        self.assertIs(scheduler._get_sm_for_watcher(self._job()), owner)
+
+    def test_ambiguity_does_not_fall_through_to_the_handle(self):
+        """Falling back to the handle after refusing the room would reinstate the
+        guess by another route — and the handle is the WEAKER key. Both mocks
+        answer `get_watcher_state` for any name, so a fall-through would pick
+        `bob`, the first in config order."""
+        first = _make_sm_mock(room_id="room-shared")
+        second = _make_sm_mock(room_id="room-shared")
+        scheduler = self._scheduler({"bob": first, "alice-bot": second})
+
+        self.assertIsNone(scheduler._get_sm_for_watcher(self._job()))
+
     def test_with_no_room_owner_it_falls_through_to_the_handle(self):
         rc = _make_sm_mock(room_id="room-rc")
         rc.get_watcher_state = MagicMock(

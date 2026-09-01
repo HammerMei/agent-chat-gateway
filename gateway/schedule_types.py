@@ -160,3 +160,60 @@ class ScheduledJob:
             last_attempted_at=data.get("last_attempted_at"),
             completed_at=data.get("completed_at"),
         )
+
+
+# ── Who may write which field ──────────────────────────────────────────────────
+#
+# Three writers touch a persisted job, and until this was written down they all
+# used `JobStore.update`, which replaces the stored object wholesale. That is
+# safe only while there is ONE writer. `room_id` made a second, and the two
+# collided in the worst possible way:
+#
+#   `_fire_once` takes `copy.copy(job)` on entry and holds it across the inject
+#   await. `schedule migrate` writes `room_id` during that await. The fire then
+#   writes its copy back — and the room id is gone, in memory and on disk, while
+#   the migration reported `✓` and stamped the schema version. The job is then
+#   permanently unmigratable (`migrate` early-returns "already current") and
+#   routes by handle forever. Measured, not reasoned.
+#
+# So a writer declares its fields and writes only those (`JobStore.write_fields`).
+# The sets below are the declaration; the union check in
+# `tests/unit/test_job_store_roundtrip.py` is what makes a NEW field pick an
+# owner instead of silently joining whichever writer happens to replace last.
+# Same shape as `core/state.py`'s FROZEN_AT_CREATION_FIELDS / LIFECYCLE_CLOCK_FIELDS.
+
+# Written by a fire, once per attempt (`core/scheduler.py::_fire_once`).
+#
+# `status` and `next_run` are in here AND writable by the operator — a fire sets
+# them when it completes a finite job or gives up on an unparseable cron, and
+# `schedule pause/resume` sets them on demand. That contest is pre-existing and
+# out of this increment's scope: a `pause` landing inside a fire's inject window
+# is still reverted by the fire's copy. It is named here rather than left to be
+# rediscovered.
+FIRE_OWNED_FIELDS = frozenset({
+    "run_count",
+    "last_run",
+    "last_attempted_at",
+    "next_run",
+    "status",
+    "completed_at",
+})
+
+# Written by `schedule migrate` (`core/job_migrate.py`), never by a fire.
+MIGRATION_OWNED_FIELDS = frozenset({
+    "room_id",
+    "connector",
+})
+
+# Set when the job is created and never rewritten. Not "unimportant" — the
+# opposite: nothing in the running system may touch them, so a fire that
+# replaced the whole object was one edit-a-job command away from reverting them.
+CREATION_OWNED_FIELDS = frozenset({
+    "id",
+    "watcher",
+    "message",
+    "cron",
+    "timezone",
+    "times",
+    "created_at",
+})

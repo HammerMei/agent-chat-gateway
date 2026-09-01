@@ -220,11 +220,27 @@ agent-chat-gateway schedule pause acg-bb47e7f4
 Paused jobs do not fire until resumed. The `NEXT RUN` column shows `-`.
 
 A job does not keep its watcher's room from being reclaimed, and does not need
-to. Each job records the room it targets, so when the room's watcher goes idle
-or is reclaimed entirely, the job's next run resolves the room and recreates the
-watcher through the same path a message would — a 9am job on a reclaimed room
-brings its watcher back at 9am. Pause still outranks a schedule: a paused
-watcher is not woken by a job.
+to. A job that **records the room it targets** resolves that room on its next run
+and recreates the watcher through the same path a message would — a 9am job on a
+reclaimed room brings its watcher back at 9am. Pause still outranks a schedule: a
+paused watcher is not woken by a job.
+
+Two conditions, and a job that misses either one cannot bring its watcher back —
+it fails at every slot instead, logging each time:
+
+- **it has to have a room id.** Jobs created before that field existed do not,
+  and `schedule migrate` is what records it. Until then such a job resolves its
+  watcher by name, which works only while a live record answers to that name —
+  so once the room's record is reclaimed, the job stops delivering for good.
+  **This is why migrating is not optional and not something to defer:** the same
+  release that made jobs carry a room id also stopped exempting job-bearing rooms
+  from expiry, so an un-migrated job is exposed to a timer that previously could
+  not touch it.
+- **its connector has to be able to look a room up by id.** Rocket.Chat and
+  Mattermost can. The voice and script connectors cannot, so a job cannot
+  recreate one of their watchers after an `expire` — it needs the record to still
+  be there. Neither has an idle sweep, so this only arises from an operator
+  `expire`.
 
 ### Resume a paused job
 

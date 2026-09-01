@@ -19,6 +19,7 @@ Run with:
 
 from __future__ import annotations
 
+import copy
 import json
 import tempfile
 import unittest
@@ -32,7 +33,7 @@ from gateway.core.job_migrate import (
 )
 from gateway.core.job_store import _SCHEMA_VERSION, JobStore
 from gateway.core.state import WatcherState
-from gateway.schedule_types import JobStatus, ScheduledJob
+from gateway.schedule_types import FIRE_OWNED_FIELDS, JobStatus, ScheduledJob
 
 
 def _entry(name="rc", *, records=None, resolves=None):
@@ -583,7 +584,13 @@ class TestAConcurrentFireCannotUndoTheMigration(_MigrateCase):
     """
 
     async def _migrate_with_a_fire_in_the_middle(self, store, entry, mutate):
-        """Run the migration, letting `mutate(store)` land during resolution."""
+        """Run the migration, letting `mutate(store)` land during resolution.
+
+        The fire's copy is taken BEFORE the migration starts, which is the point:
+        `_fire_once` copies on entry and writes back after its inject await, so
+        its copy predates whatever the migration wrote.
+        """
+        self._fire_copy_taken_before = copy.copy(store.get("acg-1"))
         resolving = entry.connector.resolve_room
 
         async def _resolve_then_interleave(name):
@@ -600,10 +607,14 @@ class TestAConcurrentFireCannotUndoTheMigration(_MigrateCase):
         entry = _entry(resolves={"general": _room("room-1")})
 
         def _a_fire_lands(s):
-            fired = s.get("acg-1")
+            # The REAL fire's semantics: a copy taken before the await, written
+            # back through the fields it owns. Re-reading `s.get(...)` here — as
+            # this helper used to — cannot hold a stale copy and so cannot
+            # express the interleaving at all (found by review).
+            fired = copy.copy(self._fire_copy_taken_before)
             fired.run_count = 1
             fired.last_run = "2026-09-01T09:00:00+00:00"
-            s.update(fired)
+            s.write_fields(fired, FIRE_OWNED_FIELDS)
 
         report = await self._migrate_with_a_fire_in_the_middle(
             store, entry, _a_fire_lands)
@@ -622,11 +633,11 @@ class TestAConcurrentFireCannotUndoTheMigration(_MigrateCase):
         entry = _entry(resolves={"general": _room("room-1")})
 
         def _the_last_fire_completes(s):
-            done = s.get("acg-1")
+            done = copy.copy(self._fire_copy_taken_before)
             done.run_count = 5
             done.status = JobStatus.COMPLETED
             done.next_run = None
-            s.update(done)
+            s.write_fields(done, FIRE_OWNED_FIELDS)
 
         await self._migrate_with_a_fire_in_the_middle(
             store, entry, _the_last_fire_completes)

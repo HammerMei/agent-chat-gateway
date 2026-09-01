@@ -21,6 +21,7 @@ Run with:
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import json
 import tempfile
@@ -28,7 +29,13 @@ import unittest
 from pathlib import Path
 
 from gateway.core.job_store import JobStore
-from gateway.schedule_types import JobStatus, ScheduledJob
+from gateway.schedule_types import (
+    CREATION_OWNED_FIELDS,
+    FIRE_OWNED_FIELDS,
+    MIGRATION_OWNED_FIELDS,
+    JobStatus,
+    ScheduledJob,
+)
 
 # A value for every field that is distinguishable from the dataclass default, so
 # "survived" cannot be satisfied by the default happening to match.
@@ -130,6 +137,142 @@ class TestEveryFieldSurvivesTheStore(unittest.TestCase):
 
         reloaded = self._store().get(job.id)
         self.assertEqual(reloaded.message, "changed after creation")
+
+
+class TestEveryFieldHasExactlyOneOwner(unittest.TestCase):
+    """The net for the write-collision class, in the same shape as the
+    round-trip net above: it walks the declared fields, so it cannot be
+    forgotten by whoever forgets to think about ownership.
+
+    Three writers touch a persisted job — a fire, `schedule migrate`, and
+    `schedule pause`/`resume`. All of them used `update`, which replaces the
+    stored object wholesale, and that is safe only while there is ONE. `room_id`
+    made a second, and a fire holding `copy.copy(job)` across its inject await
+    discarded the migration's write — after the migration had reported success
+    and stamped the version, so the job became permanently unmigratable.
+
+    A new field that picks no owner silently joins whichever writer replaces
+    last. That is what these two assertions make impossible.
+    """
+
+    def test_the_sets_partition_every_declared_field(self):
+        declared = {f.name for f in dataclasses.fields(ScheduledJob)}
+        union = FIRE_OWNED_FIELDS | MIGRATION_OWNED_FIELDS | CREATION_OWNED_FIELDS
+
+        self.assertEqual(
+            declared - union, set(),
+            "a new ScheduledJob field must declare who writes it: add it to "
+            "FIRE_OWNED_FIELDS, MIGRATION_OWNED_FIELDS or CREATION_OWNED_FIELDS "
+            "in gateway/schedule_types.py",
+        )
+        self.assertEqual(
+            union - declared, set(),
+            "an ownership set names a field the dataclass no longer has",
+        )
+
+    def test_no_field_is_claimed_by_two_writers(self):
+        """`status` and `next_run` are the interesting case: a fire writes them
+        on a transition it made, and the operator writes them through
+        `schedule pause`/`resume`. They belong to the FIRE set, and the operator
+        writes the live object rather than a copy — so the contest is real but
+        one-directional, and it is named in `schedule_types.py` rather than
+        hidden behind an overlap here."""
+        pairs = [
+            ("fire", FIRE_OWNED_FIELDS, "migration", MIGRATION_OWNED_FIELDS),
+            ("fire", FIRE_OWNED_FIELDS, "creation", CREATION_OWNED_FIELDS),
+            ("migration", MIGRATION_OWNED_FIELDS, "creation", CREATION_OWNED_FIELDS),
+        ]
+        for a_name, a, b_name, b in pairs:
+            with self.subTest(pair=f"{a_name}/{b_name}"):
+                self.assertEqual(a & b, frozenset(),
+                                 f"{a_name} and {b_name} both claim these")
+
+    def test_the_migration_never_claims_a_field_a_fire_writes(self):
+        """The specific direction that produced the defect: if `room_id` were in
+        the fire's set, the fire's pre-await copy would legitimately write it
+        back as `""`."""
+        self.assertIn("room_id", MIGRATION_OWNED_FIELDS)
+        self.assertNotIn("room_id", FIRE_OWNED_FIELDS)
+        self.assertNotIn("connector", FIRE_OWNED_FIELDS)
+
+
+class TestWriteFieldsIsWhatAFireUses(unittest.TestCase):
+    """Reproduces the real fire's semantics, which the previous concurrency
+    tests did not.
+
+    `tests/unit/test_job_migrate.py` simulated a fire as
+    `j = store.get(id); j.run_count = 1; store.update(j)` — a RE-READ of the
+    live object, which cannot hold a stale copy and so cannot lose anything.
+    `core/scheduler.py::_fire_once` does `copy.copy(job)` on entry and writes it
+    back after the inject await. That is the difference between a green suite and
+    a green suite over a live defect.
+    """
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.path = self.dir / "jobs.json"
+        job = ScheduledJob(**{**FULLY_POPULATED, "room_id": ""})
+        self.path.write_text(json.dumps({"version": 1, "jobs": [job.to_dict()]}))
+        self.store = JobStore(self.path)
+        self.store.load()
+
+    def _fire_copy(self) -> ScheduledJob:
+        """What `_fire_once` holds across its await (`scheduler.py:343`)."""
+        return copy.copy(self.store.get("acg-deadbeef"))
+
+    def _on_disk(self) -> dict:
+        return json.loads(self.path.read_text())["jobs"][0]
+
+    def test_a_fires_write_back_does_not_erase_a_room_id_written_during_it(self):
+        fire = self._fire_copy()
+        self.assertEqual(fire.room_id, "", "the copy predates the migration")
+
+        self.store.set_room_id("acg-deadbeef", "room-migrated")
+        fire.run_count = 7
+        self.store.write_fields(fire, FIRE_OWNED_FIELDS)
+
+        self.assertEqual(self.store.get("acg-deadbeef").room_id, "room-migrated")
+        self.assertEqual(self._on_disk()["room_id"], "room-migrated")
+        self.assertEqual(self.store.get("acg-deadbeef").run_count, 7,
+                         "and the fire's own progress still landed")
+
+    def test_update_is_what_lost_it(self):
+        """The counterfactual, so the fix above is not mistaken for a no-op."""
+        fire = self._fire_copy()
+        self.store.set_room_id("acg-deadbeef", "room-migrated")
+        fire.run_count = 7
+        self.store.update(fire)
+
+        self.assertEqual(self.store.get("acg-deadbeef").room_id, "",
+                         "if this ever passes, `update` became safe and this "
+                         "whole ownership scheme can be revisited")
+
+    def test_it_writes_nothing_else(self):
+        """A targeted write must be targeted: a fire that mangled a field it does
+        not own would be exactly as bad in the other direction."""
+        fire = self._fire_copy()
+        fire.message = "the fire has no business changing this"
+        fire.cron = "* * * * *"
+        fire.run_count = 1
+
+        self.store.write_fields(fire, FIRE_OWNED_FIELDS)
+
+        stored = self.store.get("acg-deadbeef")
+        self.assertEqual(stored.message, FULLY_POPULATED["message"])
+        self.assertEqual(stored.cron, FULLY_POPULATED["cron"])
+        self.assertEqual(stored.run_count, 1)
+
+    def test_a_job_deleted_during_the_fire_is_not_resurrected(self):
+        fire = self._fire_copy()
+        self.store.remove("acg-deadbeef")
+        fire.run_count = 1
+
+        self.assertFalse(self.store.write_fields(fire, FIRE_OWNED_FIELDS))
+        self.assertIsNone(self.store.get("acg-deadbeef"))
+
+    def test_it_does_not_stamp_the_schema_version(self):
+        self.store.write_fields(self._fire_copy(), FIRE_OWNED_FIELDS)
+        self.assertEqual(json.loads(self.path.read_text())["version"], 1)
 
 
 class TestSetRoomId(unittest.TestCase):

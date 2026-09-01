@@ -41,7 +41,7 @@ try:
 except ImportError:
     from backports import zoneinfo  # type: ignore[no-redef]
 
-from ..schedule_types import JobStatus, ScheduledJob
+from ..schedule_types import FIRE_OWNED_FIELDS, JobStatus, ScheduledJob
 from .job_store import JobStore
 
 if TYPE_CHECKING:
@@ -426,10 +426,17 @@ class JobScheduler:
 
         try:
             # Offload the file-write to a thread pool so the event loop is not
-            # blocked while jobs.json is being written.  store.update() replaces
-            # _jobs[job.id] under the lock, making the updated copy visible to
-            # all subsequent readers atomically.
-            await asyncio.to_thread(self._store.update, job)
+            # blocked while jobs.json is being written.
+            #
+            # `write_fields`, NOT `update`: `job` is the copy taken at the top of
+            # this method, before the inject await, so writing it back whole also
+            # writes back every field as it was BEFORE the await. A
+            # `schedule migrate` completing in that window had its `room_id`
+            # silently reverted — and since the migration had already stamped the
+            # schema version, the job became permanently unmigratable and routed
+            # by handle forever. The fire declares the fields it owns instead.
+            await asyncio.to_thread(
+                self._store.write_fields, job, FIRE_OWNED_FIELDS)
         except Exception as e:
             logger.error("Failed to persist job %s after fire: %s", job.id, e)
 
@@ -447,12 +454,37 @@ class JobScheduler:
 
         # A job whose `connector` is empty or names a connector that is no longer
         # configured. Two fallbacks, in order of how much they can be trusted.
-        for manager in self._session_managers.values():
-            # By ROOM first: the room id is the job's identity, and a record
-            # bound to it identifies the owning manager even when the room has
-            # been renamed and the handle no longer matches anything.
-            if job.room_id and manager.record_for_room(job.room_id) is not None:
-                return manager
+        # By ROOM first: the room id is the job's identity, and a record bound to
+        # it identifies the owning manager even when the room has been renamed
+        # and the handle no longer matches anything.
+        #
+        # But ONLY when exactly one manager holds it. Room ids are per-server,
+        # not per-connector, and the canonical multi-agent setup is one account
+        # per agent in the SAME rooms (CLAUDE.md) — so several managers holding a
+        # record for one room is the normal case, not the exotic one. Taking the
+        # first match meant `config.yaml` ordering decided which agent ran the
+        # job: measured, a job whose connector was renamed away was delivered
+        # into another agent's processor, and that agent's account posted the
+        # reply, while the fire logged an ordinary success. Before this branch
+        # the same case failed loudly with "no session manager owns watcher …".
+        #
+        # Ambiguity is not a routing problem to solve by guessing; it is a
+        # question only the operator can answer. So: loud.
+        if job.room_id:
+            owners = [m for m in self._session_managers.values()
+                      if m.record_for_room(job.room_id) is not None]
+            if len(owners) == 1:
+                return owners[0]
+            if owners:
+                logger.error(
+                    "Job %s targets room %s, which %d connectors have a record "
+                    "for, and its own connector %r is not configured. Refusing "
+                    "to guess which account should run it — set the job's "
+                    "connector, or delete and recreate the job against a "
+                    "current watcher.",
+                    job.id, job.room_id, len(owners), job.connector,
+                )
+                return None
         for manager in self._session_managers.values():
             # By handle, last: `get_watcher_config` was removed with the static
             # path, and calling it here raised AttributeError before the fire's

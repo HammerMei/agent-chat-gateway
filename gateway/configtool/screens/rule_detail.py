@@ -290,11 +290,23 @@ class RuleDetailScreen(FormScreen):
             # resolves the room, finds no rule claiming it, and delivers nothing.
             # The jobs are not deleted — they just stop working, while still
             # listing as active, which is the part worth saying out loud.
+            # And "once no rule claims those rooms" is NOT when the rule is
+            # deleted. A room that still has a record is recreated from that
+            # record's own persisted config — `WatcherManager._recreate`: "the
+            # current rules are never consulted" (sticky binding, §2.4). So the
+            # jobs keep waking the agent, and it keeps replying in those rooms,
+            # until each room's record expires: `session_expire_days`, 15 by
+            # default. Only after that does a fire find no rule and deliver
+            # nothing. Saying "they stop delivering" to an operator who deleted
+            # the rule IN ORDER to stop the bot is the wrong half of the truth.
             message += (
-                " Its scheduled jobs are NOT deleted, but they stop delivering "
-                "once no rule claims those rooms — each run then fails and is "
-                "logged, and the job still shows as active. Remove them with "
-                "'acg schedule delete <job_id>'."
+                " Its scheduled jobs are NOT deleted, and they keep delivering "
+                "while each room's record lasts — a room with a record is "
+                "recreated from that record, not from the rules, so the agent "
+                "keeps replying there for up to session_expire_days (default "
+                "15). After that each run fails and is logged, while the job "
+                "still shows as active. To stop them now, delete the jobs with "
+                "'acg schedule delete <job_id>', or expire the watchers."
             )
         return message
 

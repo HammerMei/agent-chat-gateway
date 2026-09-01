@@ -282,10 +282,19 @@ async def _migrate_1_to_2(store: JobStore, entries) -> list[JobOutcome]:
     return outcomes
 
 
-# (from_version, to_version, description, step)
-_MIGRATIONS: list[tuple[int, int, str, Callable]] = [
+# (from_version, to_version, description, step, outstanding)
+#
+# `outstanding` asks the store whether this step's work is still undone,
+# independently of what the version claims. Version-awareness alone selects
+# steps by a number the file asserts about itself, and that number can be true
+# while the work is not: any writer holding a job across the migration's write
+# can drop the field after the version was stamped, and `migrate` would then
+# skip the only step that repairs it — silently, permanently, with the startup
+# warning off. The predicate lives on the store (`jobs_missing_room_id`) so this
+# and `needs_migration` cannot drift apart.
+_MIGRATIONS: list[tuple[int, int, str, Callable, Callable]] = [
     (1, 2, "record each job's room id so it survives a rename or an expire",
-     _migrate_1_to_2),
+     _migrate_1_to_2, lambda store: store.jobs_missing_room_id()),
 ]
 
 
@@ -304,13 +313,13 @@ async def migrate(store: JobStore, entries) -> MigrationReport:
         )
 
     report = MigrationReport(from_version=from_version, to_version=_SCHEMA_VERSION)
-    if from_version == _SCHEMA_VERSION:
+    owed = [m for m in _MIGRATIONS
+            if m[0] >= from_version or m[4](store)]
+    if not owed:
         report.stamped = True  # already there; nothing to write
         return report
 
-    for start, end, description, step in _MIGRATIONS:
-        if start < from_version:
-            continue  # already applied by an earlier upgrade
+    for start, end, description, step, _outstanding in owed:
         report.steps.append(f"{start} → {end}: {description}")
         report.outcomes.extend(await step(store, entries))
 

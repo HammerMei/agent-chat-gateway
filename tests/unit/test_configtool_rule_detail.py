@@ -510,11 +510,23 @@ class TestRuleDelete:
             # at argument parsing exactly when the operator needed it).
             assert "schedule delete" in message
             assert "schedule-delete" not in message
-            # The clause the operator reads before deleting. It used to promise
-            # the jobs kept running (the sweep's old exemption); the truth is
-            # now that they stop delivering while still listing as active.
+            # The clause the operator reads before deleting, and it has been
+            # wrong twice. It first promised the jobs kept running forever (the
+            # sweep's old exemption). It was then rewritten to say they "stop
+            # delivering once no rule claims those rooms" — also false, and in
+            # the direction that matters: a room that still has a record is
+            # recreated FROM THAT RECORD, not from the rules
+            # (`WatcherManager._recreate`, sticky binding §2.4; pinned by
+            # `test_watcher_manager_runtime.py::TestStickyBinding`). So the agent
+            # keeps replying in those rooms for up to `session_expire_days` —
+            # 15 by default — after the rule is gone. An operator who deleted the
+            # rule IN ORDER to stop the bot must not be told it has stopped.
             assert "NOT deleted" in message
-            assert "stop delivering" in message
+            assert "keep delivering" in message
+            assert "session_expire_days" in message
+            assert "stop delivering" not in message, (
+                "the old, false claim — deleting a rule does not stop the jobs"
+            )
             assert "exempt from expiry" not in message
 
     async def test_no_strands_means_the_plain_confirm_message(
