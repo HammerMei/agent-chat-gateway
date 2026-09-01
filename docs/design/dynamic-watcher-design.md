@@ -1608,19 +1608,26 @@ before: resolve by handle, fail if no record. Runtime state is not converted
 (§5.3), which is why the schema could take the correct key with no compatibility
 path.
 
-**Rooms with pending scheduled jobs are exempt from expiry, not from
-idling.** Idling such a room is harmless: the job fires, `get` recreates the
-watcher, the injection proceeds. Exempting it from *idling* would be actively
-wrong — a job scheduled a year out would hold a session resident for a year
-for nothing. Expiry is the destructive step, because it deletes the record
-the recreation reads from, leaving the job pointing at nothing. So expiry
-skips any room with a pending job.
+**A pending scheduled job no longer exempts a room from anything** (owner,
+2026-08-31). It used to be exempt from expiry, never from idling, and the reason
+was sound while it held: idling such a room is harmless because the job wakes
+it, but expiry deletes the record the recreation reads from, leaving the job
+pointing at nothing. Exempting it from *idling* would have been actively wrong —
+a job scheduled a year out would hold a session resident for a year for nothing.
 
-"Pending" includes **paused** jobs, not only active ones (owner, 2026-08-17):
-a pause is "not now", not "never" — deleting the record under a paused job
-would orphan it the moment an operator resumes it, and the operator's next
-move after resuming would be wondering why the job fires at nothing. Only a
-completed job stops holding its room.
+A job now carries its room's id and resurrects the room through the ordinary
+rule path, so there is nothing left to protect: a 9am job on an expired room
+recreates its watcher at 9am, which is the feature working rather than a case to
+guard. The sweep therefore has one condition fewer on its destructive leg, and
+it no longer disagrees with the operator's own `expire` about the same
+situation. The oracle that answered it — `GatewayService._has_pending_jobs`,
+which had grown a matching copy of the scheduler's connector-fallback rule — is
+removed rather than left accepted-and-ignored, because an argument a caller
+still passes is an argument it still believes in.
+
+The paused-jobs-count-too rule (owner, 2026-08-17) went with the exemption it
+qualified. Its reasoning survives elsewhere: a pause is "not now", not "never",
+which is why the operator's `expire` no longer cancels a room's jobs either.
 
 **The operator's `expire` does not cancel a room's jobs** (owner, 2026-08-31).
 It once did, borrowed from the membership-removal path, whose reason was that a

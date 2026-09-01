@@ -288,3 +288,94 @@ class TestTheConnectorsResolveByIdWithoutASecondClassifier(unittest.IsolatedAsyn
 
         self.assertEqual(room, RoomRef(id="c1", kind=RoomKind.CHANNEL, name="general"))
         connector._rest.channel_member_usernames.assert_not_awaited()
+
+
+class TestAnOldJobMigratesItselfOnTheNextFire(unittest.IsolatedAsyncioTestCase):
+    """The compatibility path, done lazily (owner, 2026-08-31).
+
+    A job created before `room_id` existed would resolve by handle forever. But
+    every fire that finds a record has the id in hand, so it is written back and
+    the job is migrated from then on — one extra step, on one fire, per old job.
+
+    Lazily is also the only place it CAN be done. A boot-time converter would
+    read records that may not be loaded yet, and could say nothing about a job
+    whose room is already reclaimed — which is precisely the job the id would
+    have saved.
+    """
+
+    def _scheduler(self, *, state, update=None):
+        from gateway.core.scheduler import JobScheduler
+
+        scheduler = JobScheduler.__new__(JobScheduler)
+        manager = MagicMock()
+        manager.inject_message = AsyncMock(return_value=True)
+        manager.get_watcher_state = MagicMock(return_value=state)
+        scheduler._session_managers = {"rc": manager}
+        scheduler._store = MagicMock()
+        if update is not None:
+            scheduler._store.update = update
+        return scheduler, manager
+
+    async def test_the_first_fire_records_the_room_id(self):
+        scheduler, manager = self._scheduler(state=_record(room_id="room-1"))
+        job = ScheduledJob(watcher="rc:general", connector="rc", message="poke")
+
+        await scheduler._inject(job)
+
+        self.assertEqual(job.room_id, "room-1")
+        scheduler._store.update.assert_called_once_with(job)
+        # And THIS fire already benefits — not just the next one.
+        manager.inject_message.assert_awaited_once_with(
+            "rc:general", "poke", room_id="room-1",
+        )
+
+    async def test_a_job_that_already_has_one_is_not_rewritten(self):
+        """No store write on every fire forever — the migration happens once."""
+        scheduler, _ = self._scheduler(state=_record(room_id="room-1"))
+        job = ScheduledJob(
+            watcher="rc:general", connector="rc", room_id="room-1", message="poke")
+
+        await scheduler._inject(job)
+
+        scheduler._store.update.assert_not_called()
+
+    async def test_no_record_means_nothing_to_learn_and_no_write(self):
+        """The room is already reclaimed. There is no id to recover, and the
+        fire fails exactly as it would have — the backfill adds no new failure
+        mode."""
+        scheduler, manager = self._scheduler(state=None)
+        job = ScheduledJob(watcher="rc:general", connector="rc", message="poke")
+
+        await scheduler._inject(job)
+
+        self.assertEqual(job.room_id, "")
+        scheduler._store.update.assert_not_called()
+        manager.inject_message.assert_awaited_once_with(
+            "rc:general", "poke", room_id="",
+        )
+
+    async def test_a_store_that_cannot_be_written_does_not_fail_the_fire(self):
+        """Best-effort: the in-memory field stays set so this fire still
+        benefits, and only the persistence is retried next time."""
+        def _boom(_job):
+            raise OSError("read-only filesystem")
+
+        scheduler, manager = self._scheduler(
+            state=_record(room_id="room-1"), update=MagicMock(side_effect=_boom))
+        job = ScheduledJob(watcher="rc:general", connector="rc", message="poke")
+
+        result = await scheduler._inject(job)
+
+        self.assertTrue(result, "the fire is not failed by a migration problem")
+        self.assertEqual(job.room_id, "room-1")
+
+    async def test_a_lookup_that_raises_does_not_fail_the_fire_either(self):
+        scheduler, manager = self._scheduler(state=None)
+        scheduler._session_managers["rc"].get_watcher_state = MagicMock(
+            side_effect=RuntimeError("state store unavailable"))
+        job = ScheduledJob(watcher="rc:general", connector="rc", message="poke")
+
+        result = await scheduler._inject(job)
+
+        self.assertTrue(result)
+        self.assertEqual(job.room_id, "")

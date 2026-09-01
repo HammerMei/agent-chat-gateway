@@ -57,7 +57,7 @@ def _resident_processor(*, busy=False):
     return processor
 
 
-def _harness(records, *, processors=None, registry=None, pending_jobs=None):
+def _harness(records, *, processors=None, registry=None):
     """A real lifecycle holding real records, its collaborators doubled."""
     from tests.helpers import MockAgentBackend, make_core_config
 
@@ -75,8 +75,7 @@ def _harness(records, *, processors=None, registry=None, pending_jobs=None):
         lifecycle._states[r.watcher_name] = r
     for name, proc in (processors or {}).items():
         lifecycle._processors[name] = proc
-    sweep = LifecycleSweep(lifecycle, now=lambda: NOW,
-                           pending_jobs=pending_jobs)
+    sweep = LifecycleSweep(lifecycle, now=lambda: NOW)
     return sweep, lifecycle, connector
 
 
@@ -289,25 +288,44 @@ class TestTheSweepExpiresAStaleIdleRecord(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await sweep.run_once(), [])
         self.assertIsNotNone(lifecycle.get_watcher_state("w1"))
 
-    async def test_a_pending_job_exempts_from_expiry_but_not_idling(self):
-        """§2.5: idling a job-bearing room is harmless — the job's injection
-        wakes it — but expiry deletes the record the recreation reads from,
-        leaving the job pointing at nothing."""
+    async def test_a_pending_job_no_longer_holds_a_record_back(self):
+        """Inverted, owner 2026-08-31.
+
+        A pending scheduled job used to exempt a room from expiry — never from
+        idling — because "the job's injection wakes an idle room, but it cannot
+        wake a deleted record". A job now carries its room's id and resurrects
+        the room through the ordinary rule path, so the premise is gone: a 9am
+        job on an expired room recreates its watcher at 9am, which is the
+        feature working. The sweep therefore has one condition fewer, and no
+        longer disagrees with the operator's own `expire`.
+
+        There is nothing left to inject here — the oracle it took is gone from
+        the constructor, which is itself part of what this asserts.
+        """
         stale_idle = self._idle_record(name="jobbed")
         active_but_old = _record(name="quiet", age_days=16.0)
         sweep, lifecycle, _ = _harness(
             [stale_idle, active_but_old],
             processors={"quiet": _resident_processor()},
-            pending_jobs=lambda name: True,
         )
 
         transitioned = await sweep.run_once()
 
-        self.assertIsNotNone(lifecycle.get_watcher_state("jobbed"),
-                             "expiry is held by the job")
-        self.assertEqual(transitioned, ["quiet"],
-                         "idling is not held by the job")
-        self.assertTrue(lifecycle.get_watcher_state("quiet").dropped_at)
+        self.assertIsNone(lifecycle.get_watcher_state("jobbed"),
+                          "expiry is no longer held by a job")
+        self.assertIn("jobbed", transitioned)
+
+    def test_the_sweep_takes_no_job_oracle_at_all(self):
+        """The condition is gone from the signature, not merely unused — an
+        argument left accepted-and-ignored is how a caller keeps believing it
+        still protects something."""
+        import inspect
+
+        from gateway.core.lifecycle_sweep import LifecycleSweep
+
+        self.assertNotIn(
+            "pending_jobs", inspect.signature(LifecycleSweep.__init__).parameters
+        )
 
     async def test_a_woken_record_is_not_expired(self):
         """Between the sweep's look and the lock, a wake can make the record

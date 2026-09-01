@@ -482,6 +482,52 @@ class JobScheduler:
                 "Job %s: failed to send injection-failure notification: %s", job.id, e
             )
 
+
+    async def _backfill_room_id(self, job: "ScheduledJob", sm) -> None:
+        """Give a pre-`room_id` job its room's id, once, from the live record.
+
+        The migration, done lazily rather than by a converter (owner,
+        2026-08-31). A job created before the field has an empty `room_id` and
+        would resolve by handle forever; but every fire that finds a record has
+        the id in hand, so it is written back and the job is migrated from then
+        on. One extra step, on one fire, per old job.
+
+        Lazily is also the only place it CAN be done. A converter would have to
+        run at boot, where the records it would read may not be loaded yet, and
+        it could say nothing about a job whose room has already been reclaimed —
+        which is exactly the job the id would have saved. Here the record either
+        exists (backfill, and the fire proceeds as before) or it does not (there
+        is nothing to learn, and the fire fails as it would have anyway).
+
+        Best-effort by construction: a store that cannot be written leaves the
+        job as it was and the next fire tries again. Never fails the fire — the
+        migration is a side benefit of it, not a precondition.
+        """
+        if job.room_id:
+            return
+        try:
+            state = sm.get_watcher_state(job.watcher)
+        except Exception:
+            return
+        room_id = getattr(state, "room_id", "") if state is not None else ""
+        if not room_id:
+            return
+        job.room_id = room_id
+        try:
+            await asyncio.to_thread(self._store.update, job)
+        except Exception as exc:
+            # The in-memory field stays set, so THIS fire still gets the benefit;
+            # only the persistence is retried next time.
+            logger.warning(
+                "Job %s: could not persist the backfilled room id %s: %s",
+                job.id, room_id, exc,
+            )
+        else:
+            logger.info(
+                "Job %s: recorded room id %s for watcher %r — it can now "
+                "outlive that watcher's record", job.id, room_id, job.watcher,
+            )
+
     async def _inject(self, job: ScheduledJob) -> bool:
         """Inject the job message into the target watcher via SessionManager.
 
@@ -497,10 +543,10 @@ class JobScheduler:
             logger.warning(
                 "Job %s: no session manager owns watcher %r", job.id, job.watcher)
             return False
+        await self._backfill_room_id(job, sm)
         try:
-            # The job's own room id, so a fire can resurrect a room whose
-            # record `expire` reclaimed. Empty on jobs predating the field —
-            # those resolve by handle exactly as before.
+            # The job's own room id, so a fire can resurrect a room whose record
+            # `expire` reclaimed.
             return await sm.inject_message(
                 job.watcher, job.message, room_id=job.room_id,
             )
