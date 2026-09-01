@@ -143,9 +143,17 @@ class TestParserHappyPath(unittest.TestCase):
     def test_name_is_stripped(self):
         self.assertEqual(parse({**MINIMAL, "name": "  eng  "}).name, "eng")
 
-    def test_connector_defaults_to_the_first(self):
+    def test_a_rule_must_name_its_connector(self):
+        """Was `test_connector_defaults_to_the_first`. A rule with no connector
+        used to take `connectors[0]` — the first in the file — which is the same
+        silent, document-order binding the agent fallback made, and this
+        module's own resolver docstring already called it worse than a crash."""
         entry = {"name": "eng", "agent": "claude-eng", "rooms": {"include": ["eng-*"]}}
-        self.assertEqual(parse(entry).connector, "mm-home")
+        with self.assertRaises(ValueError) as cm:
+            parse(entry)
+        msg = str(cm.exception)
+        self.assertIn("has no 'connector' set", msg)
+        self.assertIn("mm-home", msg, "the choices are named")
 
     def test_explicit_agent(self):
         self.assertEqual(parse({**MINIMAL, "agent": "claude-ops"}).agent, "claude-ops")
@@ -388,10 +396,15 @@ class TestParserScalarValidation(unittest.TestCase):
             with self.subTest(bad=bad):
                 self._err({**MINIMAL, "connector": bad}, "'connector' must be a string")
 
-    def test_null_connector_defaults_like_an_absent_one(self):
+    def test_null_connector_is_refused_like_an_absent_one(self):
         """`connector:` is legal in a watcher_templates entry, so explicit null is
-        how a rule declines an inherited one."""
-        self.assertEqual(parse({**MINIMAL, "connector": None}).connector, "mm-home")
+        how a rule declines an inherited one. Declining the only source now leaves
+        the rule with no connector at all, and there is nothing to fall back to —
+        so it is the same error as omitting the key, not a way to reach a
+        default. (This test used to assert the opposite.)"""
+        with self.assertRaises(ValueError) as cm:
+            parse({**MINIMAL, "connector": None})
+        self.assertIn("has no 'connector' set", str(cm.exception))
 
     def test_a_non_mapping_history_handoff_is_rejected(self):
         for bad in (True, [1], "yes"):
@@ -565,17 +578,17 @@ class TestTheDenyIdiom(unittest.TestCase):
     contradiction someone should "fix"."""
 
     def test_the_same_pattern_in_both_lists_is_accepted(self):
-        r = parse({"name": "block", "agent": "claude-eng",
+        r = parse({"name": "block", "agent": "claude-eng", "connector": "mm-home",
                    "rooms": {"include": ["eng-old"], "except_for": ["eng-old"]}})
         self.assertIs(r.match("eng-old", RoomKind.CHANNEL), RuleMatch.DECLINED)
 
     def test_it_blocks_later_rules_which_a_plain_omission_would_not(self):
         blocker = parse(
-            {"name": "block", "agent": "claude-eng",
+            {"name": "block", "agent": "claude-eng", "connector": "mm-home",
              "rooms": {"include": ["eng-old"], "except_for": ["eng-old"]}},
             seen=set(),
         )
-        catchall = parse({"name": "all", "agent": "claude-eng",
+        catchall = parse({"name": "all", "agent": "claude-eng", "connector": "mm-home",
                           "rooms": {"include": ["eng-*"]}}, seen=set())
 
         def route(room: str) -> str:
@@ -589,7 +602,7 @@ class TestTheDenyIdiom(unittest.TestCase):
         self.assertEqual(route("eng-new"), "all:CLAIMED")
 
     def test_a_broader_deny_pattern_works_the_same_way(self):
-        r = parse({"name": "block", "agent": "claude-eng",
+        r = parse({"name": "block", "agent": "claude-eng", "connector": "mm-home",
                    "rooms": {"include": ["tmp-*"], "except_for": ["tmp-*"]}})
         self.assertIs(r.match("tmp-anything", RoomKind.CHANNEL), RuleMatch.DECLINED)
 
@@ -763,6 +776,11 @@ class TestSharedHelpersAttributeToTheRuleParser(unittest.TestCase):
     helper. A future merge that reintroduces a shadowing copy fails here instead of
     corrupting error messages silently. See the static counterpart in
     tests/unit/test_config_loading.py.
+
+    The prefix carries the rule's NAME as well as its index (user-requested: an
+    index alone makes an operator count entries in their own file to find the one
+    being complained about). Asserting both keeps this file's original subject —
+    which parser produced the message — and pins the naming too.
     """
 
     def _msg(self, entry) -> str:
@@ -773,22 +791,22 @@ class TestSharedHelpersAttributeToTheRuleParser(unittest.TestCase):
     def test_history_handoff_error_names_the_rule_and_index(self):
         msg = self._msg({**MINIMAL, "history_handoff": {"enable": False}})
         self.assertTrue(
-            msg.startswith("Watcher rule at index 3:"),
-            f"expected a rule-parser prefix, got: {msg}",
+            msg.startswith("Watcher rule at index 3 ('eng')"),
+            f"expected a rule-parser prefix naming the rule, got: {msg}",
         )
 
     def test_connector_error_names_the_rule_and_index(self):
         msg = self._msg({**MINIMAL, "connector": False})
         self.assertTrue(
-            msg.startswith("Watcher rule at index 3:"),
-            f"expected a rule-parser prefix, got: {msg}",
+            msg.startswith("Watcher rule at index 3 ('eng')"),
+            f"expected a rule-parser prefix naming the rule, got: {msg}",
         )
 
     def test_agent_error_names_the_rule_and_index(self):
         msg = self._msg({**MINIMAL, "agent": 3})
         self.assertTrue(
-            msg.startswith("Watcher rule at index 3:"),
-            f"expected a rule-parser prefix, got: {msg}",
+            msg.startswith("Watcher rule at index 3 ('eng')"),
+            f"expected a rule-parser prefix naming the rule, got: {msg}",
         )
 
 
@@ -824,7 +842,7 @@ class TestOmittedTtlsGetTheDefaults(unittest.TestCase):
         return GatewayConfig.from_file(f.name).watcher_rules[0]
 
     def test_omitted_ttls_are_15_15(self):
-        rule = self._load("- name: w1\n  agent: default\n  rooms: {include: [general]}\n")
+        rule = self._load("- name: w1\n  agent: default\n  connector: rc\n  rooms: {include: [general]}\n")
         self.assertEqual(rule.session_idle_days, 15)
         self.assertEqual(rule.session_expire_days, 15)
         # And the frozen snapshot — what the runtime actually judges against —
@@ -837,7 +855,76 @@ class TestOmittedTtlsGetTheDefaults(unittest.TestCase):
 
     def test_explicit_ttls_still_win(self):
         rule = self._load(
-            "- name: w1\n  agent: default\n  rooms: {include: [general]}\n"
+            "- name: w1\n  agent: default\n  connector: rc\n  rooms: {include: [general]}\n"
             "  session_idle_days: 3\n  session_expire_days: 40\n")
         self.assertEqual(rule.session_idle_days, 3)
         self.assertEqual(rule.session_expire_days, 40)
+
+
+class TestEveryRuleErrorNamesTheRule(unittest.TestCase):
+    """A message about a rule says WHICH rule, not just its position.
+
+    User-requested, and it was half-true: some checks built their prefix from
+    the shared `where` (which gained the name) and others hand-wrote
+    `f"Watcher rule at index {index}"`, so an operator got the name for a bad
+    `except_for` and a bare index for a bad `rooms.direct` — in the same file, on
+    the same rule. Counting entries in your own YAML to find the one being
+    complained about is exactly the work an error message exists to save.
+
+    This walks the checks rather than sampling one, because the split was
+    invisible per-message: each looked fine alone. The `_parse_dm_flag` case
+    below is why — unifying the prefix left it reading a `where` that was not in
+    its scope, so a non-boolean `direct:` raised NameError instead of the
+    message, and only an input that reached that one branch showed it.
+    """
+
+    NAME = "eng"
+
+    BAD_ENTRIES = {
+        "rooms is not a mapping": {"rooms": ["general"]},
+        "unknown key in rooms": {"rooms": {"include": ["a"], "nonsense": True}},
+        "include is not a list": {"rooms": {"include": 5}},
+        "include holds a non-string": {"rooms": {"include": [5]}},
+        "an invalid glob": {"rooms": {"include": ["eng-[a"]}},
+        "direct is not a bool": {"rooms": {"include": ["a"], "direct": 3}},
+        "direct in the object form": {"rooms": {"include": ["a"], "direct": {"x": 1}}},
+        "group_direct is not a bool": {"rooms": {"include": ["a"], "group_direct": "yes"}},
+        "a negative ttl": {"rooms": {"include": ["a"]}, "session_idle_days": -1},
+        "a non-list context_inject_files": {
+            "rooms": {"include": ["a"]}, "context_inject_files": "notes.md"},
+        "an unknown rule key": {"rooms": {"include": ["a"]}, "typo": 1},
+        "an inert except_for": {"rooms": {"include": ["eng-a"], "except_for": ["ops-b"]}},
+        "a matcher that claims nothing": {"rooms": {"except_for": ["a"]}},
+        "a missing connector": {"rooms": {"include": ["a"]}, "connector": None},
+        "a missing agent": {"rooms": {"include": ["a"]}, "agent": None},
+        "a bad history_handoff key": {
+            "rooms": {"include": ["a"]}, "history_handoff": {"enable": False}},
+    }
+
+    def test_each_one_names_the_rule(self):
+        for label, overrides in self.BAD_ENTRIES.items():
+            with self.subTest(case=label):
+                entry = {**MINIMAL, "name": self.NAME, **overrides}
+                entry = {k: v for k, v in entry.items() if v is not None or k == "rooms"}
+                if overrides.get("connector", "unset") is None:
+                    entry.pop("connector", None)
+                if overrides.get("agent", "unset") is None:
+                    entry.pop("agent", None)
+                with self.assertRaises(ValueError) as cm:
+                    parse(entry, index=7)
+                message = str(cm.exception)
+                self.assertIn(
+                    f"('{self.NAME}')", message,
+                    f"{label}: the rule is not named — {message}",
+                )
+                self.assertIn("index 7", message, f"{label}: the index is gone")
+
+    def test_a_check_running_before_the_name_exists_still_uses_the_index(self):
+        """The deliberate exception: `name` itself. There is nothing to name a
+        rule by yet, so those messages stay index-only rather than inventing a
+        placeholder."""
+        with self.assertRaises(ValueError) as cm:
+            parse({"connector": "mm-home", "agent": "claude-eng",
+                   "rooms": {"include": ["a"]}}, index=7)
+        self.assertIn("Watcher rule at index 7:", str(cm.exception))
+        self.assertIn("'name' is required", str(cm.exception))

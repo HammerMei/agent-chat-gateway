@@ -40,6 +40,7 @@ class TestWorkingDirectoryValidation(unittest.TestCase):
 {textwrap.indent(agents_block, "              ")}
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -153,6 +154,7 @@ class TestConfigValidationHardening(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -176,6 +178,7 @@ class TestConfigValidationHardening(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -197,10 +200,12 @@ class TestConfigValidationHardening(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: same
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
               - name: same
+                connector: rc
                 agent: default
                 rooms:
                   include: [lobby]
@@ -221,6 +226,7 @@ class TestConfigValidationHardening(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [""]
@@ -242,6 +248,7 @@ class TestConfigValidationHardening(unittest.TestCase):
             max_queue_depth: -1
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -260,6 +267,7 @@ class TestConfigValidationHardening(unittest.TestCase):
               default: claude
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -303,6 +311,7 @@ class TestConfigValidationHardening(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -426,6 +435,7 @@ class TestCacheDirGlobalResolution(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -484,6 +494,7 @@ class TestDollarVarIsALiteralString(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -556,6 +567,7 @@ class TestToolRuleRegexValidation(unittest.TestCase):
 {textwrap.indent(rule_block, "                  ")}
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -678,6 +690,7 @@ class TestBuiltinContextAutoInjection(unittest.TestCase):
                 lazy_instruction_loading: false
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -1175,6 +1188,7 @@ class TestConnectorTemplates(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                connector: rc1
                 agent: default
                 rooms:
                   include: [general]
@@ -1203,6 +1217,7 @@ class TestConnectorTemplates(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                connector: rc1
                 agent: default
                 rooms:
                   include: [general]
@@ -1225,6 +1240,7 @@ class TestConnectorTemplates(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                connector: rc1
                 agent: default
                 rooms:
                   include: [general]
@@ -1256,6 +1272,7 @@ class TestConnectorTemplates(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                connector: rc1
                 agent: default
                 rooms:
                   include: [general]
@@ -1284,6 +1301,7 @@ class TestConnectorTemplates(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                connector: rc1
                 agent: default
                 rooms:
                   include: [general]
@@ -1314,6 +1332,7 @@ class TestConnectorTemplates(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                connector: rc1
                 agent: default
                 rooms:
                   include: [general]
@@ -1351,6 +1370,7 @@ class TestAgentTemplates(unittest.TestCase):
                 timeout: 42
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -1385,6 +1405,7 @@ class TestAgentTemplates(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: agent-a
                 rooms:
                   include: [general]
@@ -1424,6 +1445,7 @@ class TestAgentTemplates(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: agent-a
                 rooms:
                   include: [general]
@@ -1455,6 +1477,7 @@ class TestAgentTemplates(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                connector: rc
                 rooms:
                   include: [general]
                 agent: forgot-inherits
@@ -1483,6 +1506,7 @@ class TestAgentTemplates(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                connector: rc
                 rooms:
                   include: [general]
                 agent: bad-agent
@@ -1514,6 +1538,7 @@ class TestAgentTemplates(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                connector: rc
                 rooms:
                   include: [general]
                 agent: claude-agent
@@ -1540,6 +1565,7 @@ class TestAgentTemplates(unittest.TestCase):
                 permissions: {timeout: 100}
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -1570,6 +1596,7 @@ class TestAgentTemplates(unittest.TestCase):
                   - tool: Write
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -1592,6 +1619,7 @@ class TestAgentTemplates(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -1620,6 +1648,7 @@ class TestAgentTemplates(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -1657,6 +1686,7 @@ class TestAgentSessionLifecycleKeysAreRejected(unittest.TestCase):
 {textwrap.indent(textwrap.dedent(agent_block), "                ")}
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -1706,6 +1736,7 @@ class TestAgentSessionLifecycleKeysAreRejected(unittest.TestCase):
               default: {inherits: standard}
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -1737,6 +1768,7 @@ class TestAgentSessionLifecycleKeysAreRejected(unittest.TestCase):
                 session_expire_days: 30
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -1815,6 +1847,7 @@ class TestWatcherTemplates(unittest.TestCase):
                         {key}: {value!r}
                     watcher_rules:
                       - name: w1
+                        connector: rc
                         agent: default
                         rooms:
                           include: [general]
@@ -1916,6 +1949,7 @@ class TestRemovedDefaultsKeysRejected(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -1940,6 +1974,7 @@ class TestRemovedDefaultsKeysRejected(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -1964,6 +1999,7 @@ class TestRemovedDefaultsKeysRejected(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -2003,6 +2039,7 @@ class TestToolPresets(unittest.TestCase):
                   - readonly
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -2031,6 +2068,7 @@ class TestToolPresets(unittest.TestCase):
                   - tool: Write
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -2053,6 +2091,7 @@ class TestToolPresets(unittest.TestCase):
                   - nonexistent
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -2078,6 +2117,7 @@ class TestToolPresets(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -2102,6 +2142,7 @@ class TestToolPresets(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -2124,6 +2165,7 @@ class TestToolPresets(unittest.TestCase):
                   - tool: '[invalid'
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -2156,6 +2198,7 @@ class TestNotificationFieldsAreRemoved(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -2215,6 +2258,7 @@ class TestDescriptionField(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -2241,6 +2285,7 @@ class TestDescriptionField(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                connector: rc1
                 agent: default
                 rooms:
                   include: [general]
@@ -2275,6 +2320,7 @@ class TestDescriptionField(unittest.TestCase):
                 description: "Shared watcher settings"
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -2367,9 +2413,9 @@ class TestTheOldShapeIsReportedPerKey(unittest.TestCase):
         """A half-migrated config lists all its remaining old entries at once,
         and the rule entries beside them still parse."""
         path = self._write(
-            "- name: a\n  agent: default\n  room: general\n"
-            "- name: ok\n  agent: default\n  rooms:\n    include: [dev]\n"
-            "- name: b\n  agent: default\n  room: ops\n"
+            "- name: a\n  agent: default\n  connector: rc\n  room: general\n"
+            "- name: ok\n  agent: default\n  connector: rc\n  rooms:\n    include: [dev]\n"
+            "- name: b\n  agent: default\n  connector: rc\n  room: ops\n"
         )
         config, issues = collect_config(path)
         leftover = [i for i in issues if "unknown key(s)" in i.message]
@@ -2399,6 +2445,7 @@ class TestContextInjectFileListValidation(unittest.TestCase):
         {agent}
         watcher_rules:
           - name: w1
+            connector: rc
             agent: default
             rooms:
               include: [general]
@@ -2426,7 +2473,7 @@ class TestContextInjectFileListValidation(unittest.TestCase):
                       agent="    context_inject_files: a.md")
 
     def test_a_bare_string_is_rejected_on_a_watcher(self):
-        self._rejects("Watcher rule at index 0: 'context_inject_files'",
+        self._rejects("Watcher rule at index 0 ('w1'): 'context_inject_files'",
                       watcher="    context_inject_files: w.md")
 
     def test_a_non_string_element_is_a_value_error_not_a_type_error(self):

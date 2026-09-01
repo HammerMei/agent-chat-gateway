@@ -315,15 +315,12 @@ class RuleDetailScreen(FormScreen):
         return "watcher"
 
     def _dataclass_defaults(self) -> dict[str, object]:
-        # `connector` mirrors gateway/config.py's own remaining fallback: the
-        # first connector in document order.
-        #
-        # `agent` has NO fallback to mirror any more — a rule states its agent
-        # or inherits one, and the top-level `default_agent:` is gone. The
-        # preselection is still the first agent, because a Select cannot render
-        # blank, but it is now a PRESELECTION rather than a claim about what an
-        # untouched field would evaluate to: create mode writes the selection
-        # explicitly, which is what stops it binding silently.
+        # Neither `connector` nor `agent` has a loader fallback to mirror any
+        # more — a rule states both, or inherits them. What these values are is
+        # a PRESELECTION, because a Select cannot render blank: they are not a
+        # claim about what an untouched field would evaluate to (nothing would;
+        # the load would fail). Create mode writes the selection explicitly,
+        # which is what turns the preselection into a decision on the record.
         #
         # `name` has no default: None (blank) is the honest answer for a
         # required identity field.

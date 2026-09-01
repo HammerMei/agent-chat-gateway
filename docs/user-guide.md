@@ -552,7 +552,7 @@ rest of the rewrite.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `name` | string | Yes | Rule identifier (frozen into each created watcher's record) |
-| `connector` | string | No | Must match a connector name above; defaults to the first connector |
+| `connector` | string | **Yes*** | Must match a connector name above. *Required on the rule as it is finally resolved — a rule may take it from its `inherits:` template instead of stating it. There is no implicit default |
 | `rooms.include` | list[string] | Yes* | Room-name globs this rule claims (e.g. `[eng-*, general]`). *May be empty only when a DM flag below is set |
 | `rooms.except_for` | list[string] | No | Globs subtracted from this rule's `include` |
 | `rooms.direct` | bool | No | Also serve 1:1 DMs (whole class) |
@@ -1106,7 +1106,10 @@ agents:
 
 watcher_rules:
   - name: general
+    connector: rc-main
     agent: claude
+    rooms:
+      include: [general]
     context_inject_files:
       - docs/domain-context.txt      # Layer 3: room-specific context
 ```
@@ -1374,12 +1377,19 @@ agents:
       timeout: 300
 
 watcher_rules:
+  # Each rule names its own connector and agent — neither has a default.
   - name: general
+    connector: rc-main
     agent: claude          # General discussions
+    rooms: {include: [general]}
   - name: development
+    connector: rc-main
     agent: opencode        # Code development
+    rooms: {include: [dev]}
   - name: research
+    connector: rc-main
     agent: claude          # Research tasks
+    rooms: {include: [research]}
 ```
 
 ### Multi-Connector Setup

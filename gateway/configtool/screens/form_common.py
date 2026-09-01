@@ -301,24 +301,17 @@ def find_referencing_watcher_labels(
     so a rule whose `connector:`/`agent:` comes only from a template still
     blocks that connector/agent's deletion.
 
-    A rule with no `connector:` anywhere references the loader's FALLBACK
-    connector (the first in document order) and blocks THAT connector's
-    deletion. Codex review of #129: an earlier version skipped fallback rules
-    on the theory that save()'s validation backstops the deletion — but
-    deleting the fallback entity leaves the config VALID (the fallback silently
-    rebinds to the next entity in line), so nothing blocked and routing changed
-    without a word. Silent rebinding is the exact defect class
-    `_resolve_watcher_connector`'s own docstring calls worse than a crash.
-
-    There is no equivalent for `agent:`, because there is no agent fallback any
-    more — a rule states its agent or inherits one, and one that does neither is
-    a load error. So a rule with no agent anywhere blocks no agent's deletion:
-    it already fails on its own, loudly, which is the outcome the connector
-    paragraph above had to engineer.
+    A rule that names neither anywhere blocks nothing, and that is now the whole
+    story: both fallbacks are gone, so such a rule is a load error in its own
+    right rather than something silently bound to whatever came first in the
+    file. The paragraph this replaces existed to engineer that outcome by hand —
+    it made a fallback rule block the fallback entity's deletion, because
+    deleting it left the config VALID while rebinding the rule without a word
+    (Codex review of #129). Removing the fallbacks removes the need: the config
+    no longer stays valid, so `save()`'s own validation is the backstop it was
+    always claimed to be.
     """
-    fallback_connector = (
-        cfg.connectors_raw[0].get("name") if cfg.connectors_raw else None
-    )
+    fallback_connector = None
     fallback_agent = None
     labels = []
     # The UNFILTERED document list, not `watchers_raw` — the `watchers[i]`

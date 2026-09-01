@@ -321,7 +321,9 @@ watcher_rules:
   #     - gateway/contexts/voice-context.md  # enforces plain-text, no markdown/emoji for Siri
 
   - name: my-rooms
-    connector: rc-home              # must match a connector name above
+    connector: rc-home              # REQUIRED — must match a connector name above
+                                    # (or come from a template via 'inherits:');
+                                    # there is no "first connector" default
     agent: my-agent                 # REQUIRED — must match an agent name above
                                     # (or come from a template via 'inherits:');
                                     # there is no implicit default agent

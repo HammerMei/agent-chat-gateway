@@ -34,10 +34,12 @@ HEADER = """\
 connectors:
   - name: rc-first
     agent: default
+    connector: rc-first
     type: rocketchat
     server: {url: http://localhost:3000, username: bot, password: pw}
   - name: mm-second
     agent: default
+    connector: rc-first
     type: mattermost
     server: {url: http://localhost:8065, token: t, team: lab}
 agents:
@@ -79,9 +81,11 @@ class TestRuleEntries(unittest.TestCase):
             GatewayConfig.from_file(write_config("""\
                 - name: dup
                   agent: default
+                  connector: rc-first
                   rooms: {include: ["a-*"]}
                 - name: dup
                   agent: default
+                  connector: rc-first
                   rooms: {include: ["b-*"]}
                 """))
         self.assertIn("dup", str(cm.exception))
@@ -90,6 +94,7 @@ class TestRuleEntries(unittest.TestCase):
         cfg = GatewayConfig.from_file(write_config(
             """\
             - name: eng
+              connector: rc-first
               rooms: {include: ["eng-*"]}
               inherits: shared
             """,
@@ -107,6 +112,7 @@ class TestRuleErrorsAreAttributedAndSurvivable(unittest.TestCase):
             GatewayConfig.from_file(write_config("""\
                 - name: bad
                   agent: default
+                  connector: rc-first
                   rooms: {include: ["a-*"], nonsense: true}
                 """))
         self.assertIn("Watcher rule at index 0", str(cm.exception))
@@ -115,12 +121,15 @@ class TestRuleErrorsAreAttributedAndSurvivable(unittest.TestCase):
         cfg, issues = collect_config(write_config("""\
             - name: fine
               agent: default
+              connector: rc-first
               rooms: {include: ["ok-*"]}
             - name: broken
               agent: default
+              connector: rc-first
               rooms: {include: ["a-*"], nonsense: true}
             - name: also-fine
               agent: default
+              connector: rc-first
               rooms: {include: ["b-*"]}
             """))
         self.assertEqual(len(issues), 1)
@@ -144,6 +153,7 @@ class TestRuleErrorsAreAttributedAndSurvivable(unittest.TestCase):
         Path(path).write_text(HEADER + textwrap.dedent("""\
             watcher_rules:
               - name: odd
+                connector: rc-first
                 agent: default
                 rooms: {include: ["a-*"]}
                 1: value
@@ -160,9 +170,11 @@ class TestRuleErrorsAreAttributedAndSurvivable(unittest.TestCase):
         cfg, issues = collect_config(write_config("""\
             - name: eng
               agent: default
+              connector: rc-first
               rooms: {include: ["a-*"], nonsense: true}
             - name: eng
               agent: default
+              connector: rc-first
               rooms: {include: ["b-*"]}
             """))
         self.assertEqual(len(issues), 1, f"the second 'eng' was rejected too: {issues}")

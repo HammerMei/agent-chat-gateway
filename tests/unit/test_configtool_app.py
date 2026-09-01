@@ -191,6 +191,7 @@ class TestOverviewRender:
                 working_directory: {work_dir}
             watcher_rules:
               - name: w1
+                connector: rc-home
                 agent: default
                 room: general
         """)
@@ -223,6 +224,7 @@ class TestOverviewRender:
                 working_directory: {work_dir}
             watcher_rules:
               - name: w1
+                connector: rc-home
                 agent: default
                 room: general
         """)
@@ -275,6 +277,7 @@ class TestOverviewRender:
                 working_directory: {work_dir}
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 room: general
         """)
@@ -320,6 +323,7 @@ class TestOverviewRender:
                 timeout: 360
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 room: general
         """)

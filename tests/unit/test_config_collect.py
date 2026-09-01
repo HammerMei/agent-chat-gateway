@@ -292,6 +292,7 @@ class TestCollectConfigNonStringNameHint(_CollectConfigTestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]

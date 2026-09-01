@@ -1310,11 +1310,13 @@ class TestDuplicateSessionIdValidation(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
                 session_id: shared-session-id
               - name: w2
+                connector: rc
                 agent: default
                 rooms:
                   include: [lobby]
@@ -1355,11 +1357,13 @@ class TestDuplicateSessionIdValidation(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
                 session_id: session-aaa
               - name: w2
+                connector: rc
                 agent: default
                 rooms:
                   include: [lobby]
@@ -1398,10 +1402,12 @@ class TestDuplicateSessionIdValidation(unittest.TestCase):
                 working_directory: /tmp
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
               - name: w2
+                connector: rc
                 agent: default
                 rooms:
                   include: [lobby]

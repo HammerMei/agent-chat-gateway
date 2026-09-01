@@ -146,20 +146,24 @@ class TestFindReferencingWatcherLabels(unittest.TestCase):
         )
         self.assertEqual(find_referencing_watcher_labels(cfg, connector_name="rc"), ["my-rule"])
 
-    def test_a_rule_relying_on_the_loader_fallback_blocks_the_fallback_connector(self):
-        """Codex review of #129: a rule with no connector anywhere resolves
-        to the loader's fallback — the FIRST connector in document order —
-        and deleting that connector leaves the config VALID (the fallback
-        silently rebinds to the next connector), so save()'s gate never
-        blocks it. The pre-check must therefore resolve the same fallback
-        the loader does and block the deletion."""
+    def test_a_rule_with_no_connector_blocks_nobody(self):
+        """Inverted with the fallback it was written for.
+
+        Codex review of #129 established that a rule with no connector resolved
+        to the FIRST connector in document order, and that deleting that
+        connector left the config VALID — the fallback silently rebound the rule
+        — so `save()`'s gate never blocked it and this pre-check had to resolve
+        the same fallback by hand. There is no fallback now: such a rule is a
+        load error in its own right, the config does NOT stay valid, and
+        `save()` is the backstop it was always claimed to be. Nothing to
+        resolve, so nothing to block."""
         cfg = self._base(
             "              - name: my-rule\n"
             "                agent: default\n"
             "                rooms:\n"
             "                  include: [general]\n"
         )
-        self.assertEqual(find_referencing_watcher_labels(cfg, connector_name="rc"), ["my-rule"])
+        self.assertEqual(find_referencing_watcher_labels(cfg, connector_name="rc"), [])
 
     def test_the_fallback_rule_does_not_block_a_non_first_connector(self):
         cfg = self._cfg(f"""\
@@ -176,11 +180,13 @@ class TestFindReferencingWatcherLabels(unittest.TestCase):
                 server: {{url: http://localhost:3001, username: bot2, password: pw2}}
             watcher_rules:
               - name: my-rule
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
         """)
-        # The fallback is connectors[0] ('rc') — rc2 is untouched by it.
+        # The rule names 'rc' explicitly, which is the only way to reference one
+        # now — rc2 is untouched.
         self.assertEqual(find_referencing_watcher_labels(cfg, connector_name="rc2"), [])
         self.assertEqual(find_referencing_watcher_labels(cfg, connector_name="rc"), ["my-rule"])
 
@@ -193,8 +199,8 @@ class TestFindReferencingWatcherLabels(unittest.TestCase):
         deleting it left the config valid while silently rebinding the rule.
         `default_agent:` is gone and `agent:` is required, so such a rule is a
         load error in its own right; there is nothing to rebind to and nothing
-        to protect. The connector half of this rule still has its fallback, and
-        `test_a_rule_with_no_connector_blocks_the_first_one` still covers it.
+        to protect. The connector fallback has since gone the same way — see
+        `test_a_rule_with_no_connector_blocks_nobody` above.
         """
         cfg = self._cfg(f"""\
             agents:

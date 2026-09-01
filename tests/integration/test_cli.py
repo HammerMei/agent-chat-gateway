@@ -308,6 +308,7 @@ class TestCLIConfigValidate(_CLITestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -330,6 +331,7 @@ class TestCLIConfigValidate(_CLITestBase):
                 type: claude
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -353,6 +355,7 @@ class TestCLIConfigValidate(_CLITestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -377,6 +380,7 @@ class TestCLIConfigValidate(_CLITestBase):
                 timeout: 360
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -399,6 +403,7 @@ class TestCLIConfigValidate(_CLITestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -445,6 +450,7 @@ class TestCLIConfigValidate(_CLITestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -513,6 +519,7 @@ class TestCLIConfigMigrateEnv(_CLITestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -534,6 +541,7 @@ class TestCLIConfigMigrateEnv(_CLITestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -560,6 +568,7 @@ class TestCLIConfigMigrateEnv(_CLITestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]
@@ -588,6 +597,7 @@ class TestCLIConfigMigrateEnv(_CLITestBase):
                 working_directory: {self.agent_dir}
             watcher_rules:
               - name: w1
+                connector: rc
                 agent: default
                 rooms:
                   include: [general]

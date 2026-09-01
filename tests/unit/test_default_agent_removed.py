@@ -65,7 +65,7 @@ class TestTheTopLevelKeyIsGone(unittest.TestCase):
         path = write("""\
             default_agent: alpha
             watcher_rules:
-              - {name: r1, agent: alpha, rooms: {include: [general]}}
+              - {name: r1, connector: rc, agent: alpha, rooms: {include: [general]}}
         """)
         with self.assertRaises(ValueError) as cm:
             GatewayConfig.from_file(path)
@@ -76,7 +76,7 @@ class TestTheTopLevelKeyIsGone(unittest.TestCase):
     def test_the_config_object_no_longer_carries_it(self):
         path = write("""\
             watcher_rules:
-              - {name: r1, agent: alpha, rooms: {include: [general]}}
+              - {name: r1, connector: rc, agent: alpha, rooms: {include: [general]}}
         """)
         config = GatewayConfig.from_file(path)
         self.assertFalse(hasattr(config, "default_agent"))
@@ -91,30 +91,39 @@ class TestARuleMustNameItsAgent(unittest.TestCase):
         with self.assertRaises(ValueError) as cm:
             GatewayConfig.from_file(write("""\
                 watcher_rules:
-                  - {name: r1, rooms: {include: [general]}}
+                  - {name: r1, connector: rc, rooms: {include: [general]}}
             """))
         msg = str(cm.exception)
-        self.assertIn("'agent' is required", msg)
+        self.assertIn("has no 'agent' set", msg)
+        self.assertIn("('r1')", msg, "the rule is named, not just indexed")
 
     def test_the_error_lists_the_agents_available(self):
         """So the fix is in the message, not in another file."""
         with self.assertRaises(ValueError) as cm:
             GatewayConfig.from_file(write("""\
                 watcher_rules:
-                  - {name: r1, rooms: {include: [general]}}
+                  - {name: r1, connector: rc, rooms: {include: [general]}}
             """))
         msg = str(cm.exception)
         self.assertIn("alpha", msg)
         self.assertIn("beta", msg)
 
-    def test_the_error_points_at_the_template_route(self):
-        """The replacement for the fallback, named where someone hits the wall."""
+    def test_the_error_leads_with_this_rule_and_mentions_templates_second(self):
+        """User-requested ordering. A missing field is first a fact about THIS
+        rule — "add 'agent:' to it" — and only then a hint that several rules
+        sharing one can move it to a template. Leading with the template told
+        someone with one broken rule to go restructure their config."""
         with self.assertRaises(ValueError) as cm:
             GatewayConfig.from_file(write("""\
                 watcher_rules:
-                  - {name: r1, rooms: {include: [general]}}
+                  - {name: r1, connector: rc, rooms: {include: [general]}}
             """))
-        self.assertIn("watcher template", str(cm.exception))
+        msg = str(cm.exception)
+        lead, _, hint = msg.partition("(If several rules")
+        self.assertIn("has no 'agent' set", lead)
+        self.assertIn("Add 'agent:' to it", lead)
+        self.assertIn("watcher_templates", hint, "the template route is the aside")
+        self.assertLess(msg.index("Add 'agent:'"), msg.index("watcher_templates"))
 
     def test_an_explicit_null_does_not_count_as_naming_one(self):
         """`agent: null` is how an entry declines an inherited value — declining
@@ -125,16 +134,16 @@ class TestARuleMustNameItsAgent(unittest.TestCase):
                 watcher_templates:
                   shared: {agent: alpha}
                 watcher_rules:
-                  - {name: r1, inherits: shared, agent: null, rooms: {include: [general]}}
+                  - {name: r1, connector: rc, inherits: shared, agent: null, rooms: {include: [general]}}
             """))
-        self.assertIn("'agent' is required", str(cm.exception))
+        self.assertIn("has no 'agent' set", str(cm.exception))
 
     def test_no_agent_is_picked_by_document_order(self):
         """The actual defect: two agents, and nothing silently chooses the first."""
         with self.assertRaises(ValueError):
             GatewayConfig.from_file(write("""\
                 watcher_rules:
-                  - {name: r1, rooms: {include: [general]}}
+                  - {name: r1, connector: rc, rooms: {include: [general]}}
             """))
 
 
@@ -147,8 +156,8 @@ class TestATemplateStillSharesOne(unittest.TestCase):
             watcher_templates:
               shared: {agent: beta}
             watcher_rules:
-              - {name: r1, inherits: shared, rooms: {include: [eng-*]}}
-              - {name: r2, inherits: shared, rooms: {include: [ops-*]}}
+              - {name: r1, connector: rc, inherits: shared, rooms: {include: [eng-*]}}
+              - {name: r2, connector: rc, inherits: shared, rooms: {include: [ops-*]}}
         """))
         self.assertEqual([r.agent for r in config.watcher_rules], ["beta", "beta"])
 
@@ -157,7 +166,7 @@ class TestATemplateStillSharesOne(unittest.TestCase):
             watcher_templates:
               shared: {agent: beta}
             watcher_rules:
-              - {name: r1, inherits: shared, agent: alpha, rooms: {include: [eng-*]}}
+              - {name: r1, connector: rc, inherits: shared, agent: alpha, rooms: {include: [eng-*]}}
         """))
         self.assertEqual(config.watcher_rules[0].agent, "alpha")
 
@@ -172,7 +181,7 @@ class TestATemplateStillSharesOne(unittest.TestCase):
             watcher_templates:
               shared: {agent: beta}
             watcher_rules:
-              - {name: r1, inherits: shared, rooms: {include: [eng-*]}}
+              - {name: r1, connector: rc, inherits: shared, rooms: {include: [eng-*]}}
         """)
         result = validate_config(path)
         self.assertTrue(result.ok, result.errors)
@@ -182,8 +191,8 @@ class TestThroughTheFaultTolerantLoader(unittest.TestCase):
     def test_the_missing_agent_is_attributed_and_others_keep_parsing(self):
         config, issues = collect_config(write("""\
             watcher_rules:
-              - {name: broken, rooms: {include: [general]}}
-              - {name: fine, agent: alpha, rooms: {include: [dev]}}
+              - {name: broken, connector: rc, rooms: {include: [general]}}
+              - {name: fine, connector: rc, agent: alpha, rooms: {include: [dev]}}
         """))
         self.assertEqual([(i.entity_kind, i.entity_name) for i in issues],
                          [("watcher", "broken")])
@@ -192,10 +201,10 @@ class TestThroughTheFaultTolerantLoader(unittest.TestCase):
     def test_validate_config_reports_it_as_an_error(self):
         result = validate_config(write("""\
             watcher_rules:
-              - {name: r1, rooms: {include: [general]}}
+              - {name: r1, connector: rc, rooms: {include: [general]}}
         """))
         self.assertFalse(result.ok)
-        self.assertTrue(any("'agent' is required" in e for e in result.errors), result.errors)
+        self.assertTrue(any("has no 'agent' set" in e for e in result.errors), result.errors)
 
 
 if __name__ == "__main__":

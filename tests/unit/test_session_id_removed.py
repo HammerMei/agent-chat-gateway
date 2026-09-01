@@ -64,7 +64,7 @@ class TestTheKeyIsRefusedNotIgnored(unittest.TestCase):
     def test_a_pinned_id_is_a_load_error(self):
         with self.assertRaises(ValueError) as cm:
             GatewayConfig.from_file(
-                write_config('- {name: w1, rooms: {include: [general]}, session_id: "x", agent: default}\n')
+                write_config('- {name: w1, connector: rc, rooms: {include: [general]}, session_id: "x", agent: default}\n')
             )
         msg = str(cm.exception)
         self.assertIn("Watcher rule at index 0", msg, "the entry is named")
@@ -77,7 +77,7 @@ class TestTheKeyIsRefusedNotIgnored(unittest.TestCase):
         without anyone maintaining a sentence about it."""
         with self.assertRaises(ValueError) as cm:
             GatewayConfig.from_file(
-                write_config('- {name: w1, rooms: {include: [general]}, session_id: "x", agent: default}\n')
+                write_config('- {name: w1, connector: rc, rooms: {include: [general]}, session_id: "x", agent: default}\n')
             )
         msg = str(cm.exception)
         self.assertIn("Valid keys are", msg)
@@ -103,18 +103,18 @@ class TestTheKeyIsRefusedNotIgnored(unittest.TestCase):
         rule shape is a closed key set, so it does not."""
         with self.assertRaises(ValueError) as cm:
             GatewayConfig.from_file(
-                write_config("- {name: w1, rooms: {include: [general]}, some_future_key: 7, agent: default}\n")
+                write_config("- {name: w1, connector: rc, rooms: {include: [general]}, some_future_key: 7, agent: default}\n")
             )
         self.assertIn("unknown key(s)", str(cm.exception))
 
     def test_a_config_without_it_is_unaffected(self):
-        cfg = GatewayConfig.from_file(write_config("- {name: w1, rooms: {include: [general]}, agent: default}\n"))
+        cfg = GatewayConfig.from_file(write_config("- {name: w1, connector: rc, rooms: {include: [general]}, agent: default}\n"))
         self.assertEqual([r.name for r in cfg.watcher_rules], ["w1"])
 
     def test_a_materialized_watcher_has_no_such_attribute(self):
         """The field is gone from `WatcherConfig`, not merely always None — so the
         runtime cannot read it even by accident."""
-        cfg = GatewayConfig.from_file(write_config("- {name: w1, rooms: {include: [general]}, agent: default}\n"))
+        cfg = GatewayConfig.from_file(write_config("- {name: w1, connector: rc, rooms: {include: [general]}, agent: default}\n"))
         self.assertFalse(hasattr(cfg.watcher_rules[0], "session_id"))
 
 
@@ -125,7 +125,7 @@ class TestItCannotArriveByInheritance(unittest.TestCase):
         with self.assertRaises(ValueError) as cm:
             GatewayConfig.from_file(
                 write_config(
-                    "- {name: w1, inherits: shared, rooms: {include: [general]}, agent: default}\n",
+                    "- {name: w1, connector: rc, inherits: shared, rooms: {include: [general]}, agent: default}\n",
                     extra='watcher_templates:\n  shared:\n    session_id: "x"\n',
                 )
             )
@@ -140,7 +140,7 @@ class TestItCannotArriveByInheritance(unittest.TestCase):
         with self.assertRaises(ValueError) as cm:
             GatewayConfig.from_file(
                 write_config(
-                    "- {name: w1, inherits: shared, rooms: {include: [general]}, agent: default}\n",
+                    "- {name: w1, connector: rc, inherits: shared, rooms: {include: [general]}, agent: default}\n",
                     extra="watcher_templates:\n  shared:\n    name: nope\n",
                 )
             )
@@ -152,15 +152,15 @@ class TestItCannotArriveByInheritance(unittest.TestCase):
 class TestThroughTheFaultTolerantLoader(unittest.TestCase):
     def test_it_is_attributed_and_later_entries_still_parse(self):
         cfg, issues = collect_config(write_config("""\
-            - {name: pinned, rooms: {include: [general]}, session_id: "ses_abc", agent: default}
-            - {name: fine, rooms: {include: [dev]}, agent: default}
+            - {name: pinned, connector: rc, rooms: {include: [general]}, session_id: "ses_abc", agent: default}
+            - {name: fine, connector: rc, rooms: {include: [dev]}, agent: default}
             """))
         self.assertEqual([(i.entity_kind, i.entity_name) for i in issues],
                          [("watcher", "pinned")])
         self.assertEqual([r.name for r in cfg.watcher_rules], ["fine"])
 
     def test_validate_config_reports_it_as_an_error(self):
-        result = validate_config(write_config('- {name: w1, rooms: {include: [general]}, session_id: "x", agent: default}\n'))
+        result = validate_config(write_config('- {name: w1, connector: rc, rooms: {include: [general]}, session_id: "x", agent: default}\n'))
         self.assertFalse(result.ok)
         self.assertTrue(
             any("unknown key(s)" in e and "session_id" in e for e in result.errors),
@@ -172,8 +172,8 @@ class TestThroughTheFaultTolerantLoader(unittest.TestCase):
         entries being refused individually is strictly stronger, and this asserts
         the old hazard cannot reappear as "no issues at all"."""
         cfg, issues = collect_config(write_config("""\
-            - {name: w1, rooms: {include: [general]}, session_id: same, agent: default}
-            - {name: w2, rooms: {include: [dev]}, session_id: same, agent: default}
+            - {name: w1, connector: rc, rooms: {include: [general]}, session_id: same, agent: default}
+            - {name: w2, connector: rc, rooms: {include: [dev]}, session_id: same, agent: default}
             """))
         self.assertEqual(len(issues), 2, [i.message for i in issues])
         self.assertEqual(cfg.watcher_rules, [])

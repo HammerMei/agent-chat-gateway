@@ -45,9 +45,11 @@ AGENTS = {"a1": AgentConfig(name="a1"), "a2": AgentConfig(name="a2")}
 
 
 def parse(entry, *, connectors, index=0):
-    # `agent` is required on every rule now, and none of these cases are about
-    # it — supplied here so each entry below stays about the room matcher.
-    entry = {"agent": "a1", **entry}
+    # `agent` and `connector` are both required on every rule now, and these
+    # cases are about neither — defaults supplied here so each entry below stays
+    # about the room matcher. An entry that names its own connector (several do,
+    # deliberately) still wins, since it is spread in afterwards.
+    entry = {"agent": "a1", "connector": connectors[0].name, **entry}
     return _parse_one_watcher_rule(
         entry,
         index,
