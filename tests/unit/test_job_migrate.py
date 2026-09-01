@@ -234,6 +234,90 @@ class TestTheOneToTwoStep(_MigrateCase):
         self.assertEqual(report.outcomes, [])
 
 
+class TestAStaticEraNameIsNotARoomName(_MigrateCase):
+    """The worst guess this module could make, and it was making it.
+
+    A derived handle always contains a `:` — `watcher_label` builds it as
+    `f"{connector}:{label}"` and config refuses a colon in a connector name. So
+    a colon-less watcher is a STATIC-era name, which is not a room name and
+    never was. The migration was resolving it as one.
+
+    Measured before the fix: a static watcher `stock-bot` that watched #trading
+    bound its job to a channel that merely SHARED the name, reported it as
+    `✓ resolved 'stock-bot'`, and stamped the schema version — so the startup
+    warning went quiet and every later fire delivered into the wrong room, with
+    nothing anywhere saying so.
+    """
+
+    STATIC = "stock-bot"
+
+    def _static_job(self):
+        return self._job(watcher=self.STATIC)
+
+    async def test_it_is_never_resolved_as_a_room_name(self):
+        self._write_file(1, [self._static_job()])
+        store = self._store()
+        # A channel on the server happens to share the static watcher's name.
+        entry = _entry(resolves={self.STATIC: _room("room-someone-elses")})
+
+        report = await migrate(store, [entry])
+
+        self.assertEqual(store.get("acg-1").room_id, "",
+                         "bound to a room that merely shared the name")
+        # Never even asked about: the name was not a room name to begin with.
+        entry.connector.resolve_room.assert_not_awaited()
+        self.assertEqual(len(report.unresolved), 1)
+        self.assertFalse(report.outcomes[0].changed)
+
+    async def test_the_operator_is_told_what_to_do_about_it(self):
+        """"Delete and recreate" — the same instruction step 7 of the migration
+        guide gives. Repeating it here is what makes it hold for an operator who
+        skipped that step."""
+        self._write_file(1, [self._static_job()])
+        entry = _entry(resolves={self.STATIC: _room("room-someone-elses")})
+
+        report = await migrate(self._store(), [entry])
+        detail = report.outcomes[0].detail
+
+        self.assertIn("static-era", detail)
+        self.assertIn("delete this job", detail)
+        self.assertIn(self.STATIC, detail, "name the job's watcher, not a class")
+
+    async def test_it_holds_the_schema_version_back(self):
+        """Silence was the real damage: stamping made the startup warning go
+        quiet, so nothing was left pointing at the job."""
+        self._write_file(1, [self._static_job()])
+        store = self._store()
+
+        report = await migrate(store, [_entry(resolves={self.STATIC: _room("x")})])
+
+        self.assertFalse(report.stamped)
+        self.assertEqual(json.loads(self.path.read_text())["version"], 1)
+
+    async def test_a_live_record_is_still_authoritative(self):
+        """The fence is on GUESSING, not on the static-era job. If a record
+        exists it holds the real room id — no name lookup, no guess — and the
+        job is migrated properly."""
+        self._write_file(1, [self._static_job()])
+        store = self._store()
+        entry = _entry(records={self.STATIC: _record(self.STATIC, "room-trading")})
+
+        report = await migrate(store, [entry])
+
+        self.assertEqual(store.get("acg-1").room_id, "room-trading")
+        self.assertEqual(report.unresolved, [])
+        entry.connector.resolve_room.assert_not_awaited()
+
+    async def test_a_derived_handle_is_unaffected(self):
+        """The fence must not catch the population the migration exists for."""
+        self._write_file(1, [self._job()])  # 'rc:general'
+        store = self._store()
+
+        await migrate(self._store(), [_entry(resolves={"general": _room("room-1")})])
+
+        self.assertEqual(self._store().get("acg-1").room_id, "room-1")
+
+
 class TestNothingIsGuessed(_MigrateCase):
     async def test_an_unresolvable_room_leaves_the_job_untouched(self):
         self._write_file(1, [self._job()])

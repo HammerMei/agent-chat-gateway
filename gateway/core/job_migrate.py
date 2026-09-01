@@ -170,7 +170,29 @@ async def _resolve_room_id(entry, job: ScheduledJob) -> tuple[str, str]:
     if record is not None and record.room_id:
         return record.room_id, "from its watcher's record"
 
-    _connector_name, label = split_handle(job.watcher)
+    connector_name, label = split_handle(job.watcher)
+    if not connector_name:
+        # A derived handle ALWAYS contains a `:` — `watcher_label` builds it as
+        # `f"{connector}:{label}"` and config refuses a connector name with a
+        # colon in it. So a handle without one is a STATIC-era watcher name,
+        # which is not a room name and never was.
+        #
+        # Resolving it as one is the guess this module promises not to make, and
+        # it was the worst kind: a static watcher `stock-bot` watching #trading
+        # bound its job to a channel that merely SHARED the name, was reported
+        # as `✓ resolved 'stock-bot'`, and stamped the schema version — so the
+        # startup warning went quiet and every later fire delivered into the
+        # wrong room, silently. Measured, not reasoned.
+        #
+        # `migration-dynamic-watchers.md` step 7 already says these jobs must be
+        # deleted and recreated. Saying so here is what makes that instruction
+        # hold for an operator who skipped it.
+        return "", (
+            f"{job.watcher!r} is a static-era watcher name, not a derived "
+            f"handle (no connector prefix), so there is no room name to look "
+            f"up — delete this job and recreate it against a current watcher"
+        )
+
     room_name = room_name_for_label(label)
     if room_name is None:
         return "", (
