@@ -148,6 +148,34 @@ class TestVersionAwareness(_MigrateCase):
         self.assertEqual(store.file_version, 1)
         self.assertTrue(store.needs_migration())
 
+    async def test_every_unreadable_version_lands_on_the_fail_safe_side(self):
+        """Enumerated rather than sampled: this value decides whether migrations
+        run at all, so a value that read as NEW would skip one in silence. Every
+        case must come out an `int` >= 1 that still needs migrating."""
+        hostile = [None, "2", "garbage", 2.0, True, False, -1, 0, [], {}]
+        for raw in hostile:
+            with self.subTest(version=raw):
+                self.path.write_text(json.dumps({"version": raw, "jobs": []}))
+                store = self._store()
+
+                self.assertIs(type(store.file_version), int,
+                              "the version is an int or nothing downstream holds")
+                self.assertEqual(store.file_version, 1)
+                self.assertTrue(store.needs_migration())
+
+    async def test_a_boolean_version_does_not_survive_a_save(self):
+        """`bool` is a subclass of `int`, so `{"version": true}` passed the type
+        check and `min(True, 2)` wrote a JSON *boolean* straight back into the
+        schema field."""
+        self.path.write_text(json.dumps({"version": True, "jobs": []}))
+        store = self._store()
+
+        store.save()
+
+        written = json.loads(self.path.read_text())["version"]
+        self.assertIs(type(written), int, f"persisted {written!r}")
+        self.assertEqual(written, 1)
+
 
 class TestTheOneToTwoStep(_MigrateCase):
     async def test_a_record_supplies_the_room_id(self):

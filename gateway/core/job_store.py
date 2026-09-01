@@ -56,8 +56,17 @@ def _coerce_version(raw: object) -> int:
     a missing or corrupt value means "old", and treating it as old only ever
     costs a migration run that finds nothing to do. Guessing NEW would skip a
     migration silently.
+
+    `bool` is excluded explicitly because it is a subclass of `int`: without
+    that, `{"version": true}` returned `True`, which then flowed through
+    `min(...)` in `save` and wrote a JSON *boolean* back into the version field.
+    Harmless in effect — `True < _SCHEMA_VERSION`, so it lands on the fail-safe
+    side — but it contradicted this function's one promise, which is that what
+    comes out is an int.
     """
-    return raw if isinstance(raw, int) and raw > 0 else 1
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return 1
+    return raw if raw > 0 else 1
 
 
 class JobStore:
