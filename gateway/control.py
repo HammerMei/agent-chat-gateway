@@ -472,11 +472,28 @@ class ControlServer:
         # The record is already in hand — `_find_entry_for_watcher` above refuses
         # the create unless one exists — so the room's identity costs nothing to
         # capture here, and capturing it is what lets the job outlive the record.
+        #
+        # Refused rather than defaulted to `""`. A job with no room id cannot
+        # bring its watcher back once the record is reclaimed — it fails at every
+        # slot — and since the daemon now warns at startup about exactly that,
+        # creating one would raise a warning the operator can never clear by
+        # migrating, because there is nothing wrong with the FILE. The empty case
+        # means the watcher's own record is missing its room, which is a broken
+        # record, not a job problem: say so instead of persisting the consequence.
         record = entry.session_manager.get_watcher_state(watcher)
+        if record is None or not record.room_id:
+            return {
+                "ok": False,
+                "error": (
+                    f"Watcher {watcher!r} has no recorded room, so a job created "
+                    f"against it could never deliver. Send a message in the room "
+                    f"to rebuild the record, then create the job."
+                ),
+            }
         job = ScheduledJob(
             watcher=watcher,
             connector=entry.name,
-            room_id=(record.room_id if record is not None else ""),
+            room_id=record.room_id,
             message=message,
             cron=cron,
             timezone=timezone,
