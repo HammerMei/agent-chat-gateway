@@ -498,7 +498,10 @@ class JobScheduler:
                 "Job %s: no session manager owns watcher %r", job.id, job.watcher)
             return False
         try:
-            return await sm.inject_message(job.watcher, job.message)
+            # The job's room id is its identity — the handle is only a label.
+            return await sm.inject_message(
+                job.watcher, job.message, room_id=job.room_id,
+            )
         except Exception as e:
             logger.error(
                 "Job %s: inject_message failed for watcher %r: %s",

@@ -38,7 +38,7 @@ from .state import (
 )
 from .state_store import StateStore
 from .watcher_lifecycle import WatcherLifecycle
-from .watcher_manager import RoomRef, WatcherManager, first_matching_rule
+from .watcher_manager import RoomRef, WatcherManager, first_matching_rule, room_label
 from .watcher_rule import RoomKind
 
 logger = logging.getLogger("agent-chat-gateway.core.session_manager")
@@ -886,7 +886,39 @@ class SessionManager:
                 f"while the expire ran. Re-check 'list' and retry."
             )
 
-    async def inject_message(self, watcher_name: str, text: str) -> bool:
+    async def _resolve_room_for_wake(
+        self, room_id: str, watcher_name: str
+    ) -> "RoomRef | None":
+        """Describe a room well enough to recreate a watcher for it, from its id.
+
+        Separated from the wake so the two failure shapes stay legible, because
+        the connector contract distinguishes them and the caller acts on them
+        differently: `None` is permanent (no such room, not ours, not a member),
+        a raise is transient (could not ask). Both end as "no processor" here,
+        but only after saying which — a permanent absence logged as a retryable
+        blip is how a deleted room looks like a network problem forever.
+        """
+        try:
+            room = await self._connector.room_ref_by_id(room_id)
+        except Exception as exc:
+            logger.warning(
+                "Could not reach the connector to resolve room %s for watcher "
+                "%r — the wake is skipped and the caller retries at its next "
+                "slot: %s", room_id, watcher_name, exc,
+            )
+            return None
+        if room is None:
+            logger.info(
+                "Room %s is not available to this connector — watcher %r will "
+                "not be recreated for it. This is final, not a retry: the room "
+                "is gone, in another team, or this account is no longer in it.",
+                room_id, watcher_name,
+            )
+        return room
+
+    async def inject_message(
+        self, watcher_name: str, text: str, *, room_id: str = ""
+    ) -> bool:
         """Inject a synthetic OWNER-role message directly into a watcher's queue.
 
         Bypasses the connector layer entirely, avoiding the self-message filter
@@ -894,52 +926,81 @@ class SessionManager:
         is treated as if it came from a trusted owner, so it is processed without
         permission approval prompts.
 
+        `room_id` is the caller's own knowledge of WHICH room — a scheduled job
+        carries it. When given it is the IDENTITY: the watcher is found by room
+        rather than by handle, and the reply is addressed from the same
+        resolution. `watcher_name` remains what the caller and the logs call
+        this watcher, and is the only thing to go on when no id is supplied.
+
         Returns True if the message was accepted into the queue, False otherwise
         (e.g. watcher not running, queue full, or watcher not found).
         """
-        processor = self._lifecycle.get_processor(watcher_name)
-        if processor is None and self._watcher_manager is not None:
-            # The wake, from the inside (§2.5): an idle room's record is real
-            # and its session is kept, so a scheduled job due in it recreates
-            # the watcher through the same get_or_create a message would —
-            # the sweep's expiry exemption for job-bearing rooms rests on
-            # exactly this ("idling one is harmless — the job wakes it"), and
-            # without it that sentence was an assumption with no backing.
-            # Paused answers None, so pause still outranks a schedule (§4.4).
+        # ── Which record is this, really ──────────────────────────────────
+        # `room_id`, when the caller has one, decides. A handle is a pure
+        # function of (connector, room) and moves when the room is renamed, so
+        # resolving by handle first can find a DIFFERENT room that has since
+        # taken the name over — and then deliver a scheduled message into it,
+        # successfully and silently. The record is consulted by handle only as
+        # the fallback for a caller with no id.
+        record = None
+        if room_id:
+            record = self._lifecycle.record_for_room(room_id)
+        if record is None and not room_id:
             record = self._lifecycle.get_watcher_state(watcher_name)
-            if record is not None and record.room_id:
-                kind = _room_kind_or_channel(record)
-                processor = await self._watcher_manager.get_or_create(
-                    self._connector_name,
-                    RoomRef(
-                        id=record.room_id,
-                        kind=kind,
-                        name=record.room_name,
-                        participants=tuple(record.participants),
-                    ),
-                )
+
+        # ── The room, described once ──────────────────────────────────────
+        # ONE resolution feeds both the wake and the reply address. Re-reading
+        # the record by handle after the wake is what previously produced an
+        # empty room id for a resurrected-under-a-new-name watcher: the agent
+        # ran a full turn and the reply went nowhere, while `enqueue` returned
+        # True so the fire counted as a success.
+        room: "RoomRef | None" = None
+        if record is not None and record.room_id:
+            room = RoomRef(
+                id=record.room_id,
+                kind=_room_kind_or_channel(record),
+                name=record.room_name,
+                participants=tuple(record.participants),
+            )
+        elif room_id:
+            # No record — `expire` reclaimed it, or it never existed. Re-resolved
+            # from the connector rather than reconstructed from anything
+            # persisted: a name is display-only and a rename frees it for another
+            # room (§2.3), which is the whole reason this path takes an id.
+            room = await self._resolve_room_for_wake(room_id, watcher_name)
+
+        # ── The processor ─────────────────────────────────────────────────
+        # By the record's own name when there is one, so a resident watcher is
+        # reused rather than re-created; otherwise through `get_or_create`, which
+        # is where pause, the creation cap and the rule match are all decided.
+        # A job therefore cannot reach a room a message could not.
+        processor = self._lifecycle.get_processor(
+            record.watcher_name if record is not None else watcher_name
+        )
+        if processor is None and self._watcher_manager is not None and room is not None:
+            processor = await self._watcher_manager.get_or_create(
+                self._connector_name, room,
+            )
         if processor is None:
             logger.warning(
-                "inject_message: no active processor for watcher %r — "
-                "watcher may be paused, stopped, or not configured",
-                watcher_name,
+                "inject_message: no active processor for watcher %r (room %r) — "
+                "it may be paused, claimed by no rule, or unresolvable",
+                watcher_name, room_id or "unknown",
             )
             return False
 
-        # Build a minimal Room from persisted state (room_id + room_type)
-        state = self._lifecycle.get_watcher_state(watcher_name)
-        if state is None:
+        if room is None:
             logger.warning(
-                "inject_message: no persisted state for watcher %r — "
-                "room_id will be empty, which may cause the agent response to "
-                "be posted to the wrong room or dropped. "
-                "Ensure the watcher has been active at least once so its state is persisted.",
+                "inject_message: watcher %r has no resolvable room — the reply "
+                "would have nowhere to go, so the message is not injected. "
+                "A job created before schema 2 carries no room id; "
+                "'agent-chat-gateway schedule migrate' records one.",
                 watcher_name,
             )
-        room_id = state.room_id if state else ""
-        room_name = (state.room_name if state and state.room_name
-                     else watcher_name)
-        room_type = state.room_type if state else "channel"
+            return False
+        resolved_room_id = room.id
+        room_name = room.name or room_label(room)
+        room_type = room.kind.value
 
         msg = IncomingMessage(
             id=f"sched-{secrets.token_hex(8)}",
@@ -949,7 +1010,7 @@ class SessionManager:
             # A plain ISO string here silently drops ts:/day: from the header,
             # which is exactly the "scheduled stock report" scenario in #53.
             timestamp=str(int(datetime.now(UTC).timestamp() * 1000)),
-            room=Room(id=room_id, name=room_name, type=room_type),
+            room=Room(id=resolved_room_id, name=room_name, type=room_type),
             sender=User(id="scheduler", username="scheduler", display_name="Scheduler"),
             role=UserRole.OWNER,
             text=text,

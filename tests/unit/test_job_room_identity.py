@@ -1,0 +1,383 @@
+"""A job's `room_id` is its identity: the wake resolves through it, and so does the reply.
+
+A job used to name only a watcher HANDLE (`<connector>:<room label>`), which is a
+pure function of (connector, room) and moves when the room is renamed. The design
+doc already called it "cosmetic and free to change".
+
+The first attempt at fixing this was reverted (8584029) for three defects, and
+this file is built to fail on each of them:
+
+* the reply was addressed by re-reading the record BY HANDLE after the wake, so
+  a watcher resurrected under a new label produced `room.id == ""` — the agent
+  ran a full turn and the reply went nowhere, while `enqueue` returning True made
+  the fire count as a success and burn a finite job's `run_count`;
+* the handle was consulted BEFORE the id, so a job holding a correct id could
+  deliver into whichever room had taken its handle over;
+* `room_id` never reached `jobs.json` at all (see test_job_store_roundtrip.py).
+
+**Every test here uses `make_bare_session_manager`** rather than a hand-built
+`SessionManager.__new__`. That is not tidiness: the hand-built stub in the
+reverted attempt answered `get_watcher_state` from a list that ignored the name
+argument, which asserted the post-wake re-read succeeds instead of testing
+whether it can — and that is precisely the mechanism that hid the first defect.
+The shared builder is guarded by its own drift test against a real instance.
+
+Run with:
+    uv run python -m pytest tests/unit/test_job_room_identity.py -v
+"""
+
+from __future__ import annotations
+
+import unittest
+from unittest.mock import AsyncMock, MagicMock
+
+from gateway.core.connector import Connector
+from gateway.core.state import WatcherState
+from gateway.core.watcher_manager import RoomRef
+from gateway.core.watcher_rule import RoomKind
+from gateway.schedule_types import ScheduledJob
+from tests.helpers import make_bare_session_manager
+
+
+def _record(name="rc:general", room_id="room-1", **kw):
+    """A real `WatcherState`, not a MagicMock.
+
+    A MagicMock's `.room_id` is truthy whatever attribute production reads, which
+    makes the `record is not None and record.room_id` branch un-falsifiable — the
+    reverted attempt's tests had exactly that hole.
+    """
+    defaults = dict(
+        watcher_name=name, session_id="", room_id=room_id, room_name="general",
+        room_type="channel", room_kind="channel",
+    )
+    return WatcherState(**{**defaults, **kw})
+
+
+def _manager(*, record=None, resolved=None, record_for_room=None):
+    """A manager wired for `inject_message` only.
+
+    `get_watcher_state` HONOURS its name argument, so a lookup by the wrong
+    handle misses the way it really would.
+    """
+    manager = make_bare_session_manager()
+    processor = MagicMock()
+    processor.enqueue = AsyncMock(return_value=True)
+    manager._injected_processor = processor  # type: ignore[attr-defined]
+
+    by_name = {record.watcher_name: record} if record is not None else {}
+    manager._lifecycle.get_watcher_state = MagicMock(side_effect=by_name.get)
+    manager._lifecycle.record_for_room = MagicMock(
+        return_value=record_for_room)
+    manager._lifecycle.get_processor = MagicMock(return_value=None)
+    manager._watcher_manager = MagicMock()
+    manager._watcher_manager.get_or_create = AsyncMock(return_value=processor)
+    manager._connector = MagicMock()
+    manager._connector.room_ref_by_id = AsyncMock(return_value=resolved)
+    return manager
+
+
+def _enqueued_room(manager):
+    processor = manager._injected_processor
+    processor.enqueue.assert_awaited_once()
+    return processor.enqueue.await_args.args[0].room
+
+
+class TestTheContract(unittest.TestCase):
+    def test_the_base_answers_none_rather_than_raising(self):
+        import asyncio
+
+        self.assertIsNone(
+            asyncio.run(Connector.room_ref_by_id(object(), "r1"))  # type: ignore[arg-type]
+        )
+
+    def test_it_returns_a_room_ref_so_kind_and_participants_survive(self):
+        import inspect
+
+        annotation = str(inspect.signature(Connector.room_ref_by_id).return_annotation)
+        self.assertIn("RoomRef", annotation)
+
+
+class TestTheJobCarriesTheRoom(unittest.TestCase):
+    def test_room_id_is_empty_on_a_job_that_predates_the_field(self):
+        self.assertEqual(ScheduledJob(watcher="rc:general").room_id, "")
+
+    def test_the_handle_is_kept_alongside_it(self):
+        job = ScheduledJob(watcher="rc:general", connector="rc", room_id="room-1")
+        self.assertEqual((job.watcher, job.room_id), ("rc:general", "room-1"))
+
+
+class TestTheReplyIsAddressedFromTheSameResolution(unittest.IsolatedAsyncioTestCase):
+    """Defect 1 of the reverted attempt, pinned at the point it was observable.
+
+    The room that ends up on the enqueued message is what decides where the
+    agent's answer goes. Asserting the wake happened is not enough — the reverted
+    version's wake happened correctly and the reply still went nowhere.
+    """
+
+    RESOLVED = RoomRef(id="room-1", kind=RoomKind.CHANNEL, name="daily-standup")
+
+    async def test_a_resurrected_room_addresses_the_reply_by_id(self):
+        """The room was renamed, so the recreated watcher's handle differs from
+        the job's. The reply must still be addressed to the room."""
+        manager = _manager(record=None, resolved=self.RESOLVED)
+
+        result = await manager.inject_message(
+            "rc:general", "poke", room_id="room-1")
+
+        self.assertTrue(result)
+        room = _enqueued_room(manager)
+        self.assertEqual(room.id, "room-1", "the reply had nowhere to go")
+        self.assertEqual(room.name, "daily-standup", "the room's CURRENT name")
+
+    async def test_the_room_id_is_never_empty_on_an_injected_message(self):
+        """The specific observable the reverted version produced: `room.id == ""`
+        with `enqueue` returning True, so the fire counted as a success."""
+        manager = _manager(record=None, resolved=self.RESOLVED)
+
+        await manager.inject_message("rc:general", "poke", room_id="room-1")
+
+        self.assertNotEqual(_enqueued_room(manager).id, "")
+
+    async def test_a_resident_watcher_is_addressed_from_its_record(self):
+        """The ordinary path: a record exists, so it describes the room and no
+        connector round trip happens."""
+        record = _record()
+        manager = _manager(record=record, record_for_room=record)
+
+        await manager.inject_message(
+            "rc:general", "poke", room_id="room-1")
+
+        manager._connector.room_ref_by_id.assert_not_awaited()
+        self.assertEqual(_enqueued_room(manager).id, "room-1")
+
+    async def test_nothing_is_injected_when_no_room_can_be_resolved(self):
+        """Refused rather than sent to an empty address. The reverted version
+        injected anyway, with a warning that said the reply might be dropped."""
+        manager = _manager(record=None, resolved=None)
+
+        result = await manager.inject_message(
+            "rc:general", "poke", room_id="room-1")
+
+        self.assertFalse(result)
+        manager._injected_processor.enqueue.assert_not_awaited()
+
+
+class TestTheIdOutranksTheHandle(unittest.IsolatedAsyncioTestCase):
+    """Defect 2. A handle can come to mean a different room; an id cannot."""
+
+    async def test_a_record_under_the_same_handle_but_another_room_is_not_used(self):
+        """Room B took over the handle `rc:general` after room A expired. The job
+        still targets room A by id, and must not be delivered into B."""
+        room_b = _record(name="rc:general", room_id="room-B")
+        resolved_a = RoomRef(id="room-A", kind=RoomKind.CHANNEL, name="eng")
+        manager = _manager(
+            record=room_b,            # findable by handle
+            record_for_room=None,     # but not bound to room A
+            resolved=resolved_a,
+        )
+
+        await manager.inject_message("rc:general", "poke", room_id="room-A")
+
+        room = _enqueued_room(manager)
+        self.assertEqual(room.id, "room-A", "delivered into the wrong room")
+        manager._lifecycle.record_for_room.assert_called_once_with("room-A")
+
+    async def test_with_no_id_the_handle_is_all_there_is(self):
+        """A job that predates the field, or any caller without an id: the handle
+        is consulted, exactly as before."""
+        record = _record()
+        manager = _manager(record=record)
+
+        await manager.inject_message("rc:general", "poke")
+
+        manager._lifecycle.get_watcher_state.assert_called_with("rc:general")
+        self.assertEqual(_enqueued_room(manager).id, "room-1")
+
+
+class TestTheWakeGoesThroughTheOneEntryPoint(unittest.IsolatedAsyncioTestCase):
+    """Pause, the creation cap and the rule match are all decided inside
+    `get_or_create`, so a job cannot reach a room a message could not."""
+
+    async def test_creation_goes_through_get_or_create(self):
+        resolved = RoomRef(id="room-1", kind=RoomKind.CHANNEL, name="general")
+        manager = _manager(record=None, resolved=resolved)
+
+        await manager.inject_message("rc:general", "poke", room_id="room-1")
+
+        manager._watcher_manager.get_or_create.assert_awaited_once()
+        _, room = manager._watcher_manager.get_or_create.await_args.args
+        self.assertEqual(room, resolved)
+
+    async def test_a_refused_creation_injects_nothing(self):
+        """`get_or_create` answers None for a paused record, a room no rule
+        claims, and a creation over the cap. All three land here."""
+        resolved = RoomRef(id="room-1", kind=RoomKind.CHANNEL, name="general")
+        manager = _manager(record=None, resolved=resolved)
+        manager._watcher_manager.get_or_create = AsyncMock(return_value=None)
+
+        result = await manager.inject_message(
+            "rc:general", "poke", room_id="room-1")
+
+        self.assertFalse(result)
+        manager._injected_processor.enqueue.assert_not_awaited()
+
+
+class TestTheTwoFailureShapesStayApart(unittest.IsolatedAsyncioTestCase):
+    """`None` is permanent, a raise is transient — the caller acts differently."""
+
+    async def test_a_permanent_absence_says_it_is_final(self):
+        import logging
+
+        manager = _manager(record=None, resolved=None)
+
+        with self.assertLogs("agent-chat-gateway.core.session_manager",
+                             level=logging.INFO) as logs:
+            await manager.inject_message("rc:general", "poke", room_id="room-1")
+
+        self.assertTrue([m for m in logs.output if "final, not a retry" in m],
+                        logs.output)
+
+    async def test_a_transport_failure_says_it_will_be_retried(self):
+        import logging
+
+        manager = _manager(record=None, resolved=None)
+        manager._connector.room_ref_by_id = AsyncMock(side_effect=OSError("net"))
+
+        with self.assertLogs("agent-chat-gateway.core.session_manager",
+                             level=logging.WARNING) as logs:
+            result = await manager.inject_message(
+                "rc:general", "poke", room_id="room-1")
+
+        self.assertFalse(result)
+        self.assertTrue([m for m in logs.output if "retries at its next" in m],
+                        logs.output)
+
+
+class TestTheSchedulerPassesTheId(unittest.IsolatedAsyncioTestCase):
+    async def test_the_fire_hands_over_the_jobs_room_id(self):
+        from gateway.core.scheduler import JobScheduler
+
+        scheduler = JobScheduler.__new__(JobScheduler)
+        manager = MagicMock()
+        manager.inject_message = AsyncMock(return_value=True)
+        scheduler._session_managers = {"rc": manager}
+
+        job = ScheduledJob(
+            watcher="rc:general", connector="rc", room_id="room-1", message="poke")
+        await scheduler._inject(job)
+
+        manager.inject_message.assert_awaited_once_with(
+            "rc:general", "poke", room_id="room-1")
+
+
+class TestTheConnectorsResolveByIdThroughTheirOwnClassifier(
+        unittest.IsolatedAsyncioTestCase):
+    """One classifier per connector. On Rocket.Chat the letter `d` covers both DM
+    kinds and the difference decides whether the mention gate applies (§6.4), so a
+    by-id-only classifier would be a second place to get that wrong."""
+
+    async def test_rocketchat_classifies_a_channel_from_its_subscription(self):
+        from gateway.connectors.rocketchat.connector import RocketChatConnector
+
+        connector = RocketChatConnector.__new__(RocketChatConnector)
+        connector._rest = MagicMock()
+        connector._rest.get_subscription = AsyncMock(
+            return_value={"t": "c", "name": "general"})
+
+        self.assertEqual(
+            await connector.room_ref_by_id("room-1"),
+            RoomRef(id="room-1", kind=RoomKind.CHANNEL, name="general"),
+        )
+
+    async def test_rocketchat_asks_who_is_in_a_direct_room(self):
+        from gateway.connectors.rocketchat.connector import RocketChatConnector
+
+        connector = RocketChatConnector.__new__(RocketChatConnector)
+        connector._rest = MagicMock()
+        connector._rest.get_subscription = AsyncMock(return_value={"t": "d"})
+        connector._direct_room_identity = AsyncMock(
+            return_value=(RoomKind.DM, ("alice",)))
+
+        room = await connector.room_ref_by_id("room-1")
+
+        self.assertEqual((room.kind, room.participants), (RoomKind.DM, ("alice",)))
+
+    async def test_rocketchat_answers_none_when_it_has_no_subscription(self):
+        """Which is also how membership is answered: Rocket.Chat drops the
+        subscription when the account leaves or is removed."""
+        from gateway.connectors.rocketchat.connector import RocketChatConnector
+
+        connector = RocketChatConnector.__new__(RocketChatConnector)
+        connector._rest = MagicMock()
+        connector._rest.get_subscription = AsyncMock(return_value=None)
+
+        self.assertIsNone(await connector.room_ref_by_id("room-1"))
+
+    def _mm(self, channel, members=(), member_of=None):
+        from gateway.connectors.mattermost.connector import MattermostConnector
+
+        connector = MattermostConnector.__new__(MattermostConnector)
+        connector._rest = MagicMock()
+        connector._rest.team_id = channel.get("team_id", "")
+        connector._rest.bot_user_id = "bot"
+        connector._rest.get_channel = AsyncMock(return_value=channel)
+        connector._rest.channel_member_usernames = AsyncMock(
+            return_value=list(members))
+        ids = {channel["id"]} if member_of is None else member_of
+        connector._rest.get_member_channel_ids = AsyncMock(return_value=ids)
+        return connector
+
+    async def test_mattermost_keeps_the_members_as_participants(self):
+        connector = self._mm(
+            {"id": "d1", "display_name": "", "type": "dm"}, members=["alice"])
+
+        room = await connector.room_ref_by_id("d1")
+
+        self.assertEqual((room.kind, room.participants), (RoomKind.DM, ("alice",)))
+
+    async def test_mattermost_asks_for_members_once_per_resolution(self):
+        """The reverted version delegated to `resolve_room_by_id` and then read
+        the members again — two identical round trips, and a window in which the
+        two answers could disagree."""
+        connector = self._mm(
+            {"id": "d1", "display_name": "", "type": "dm"}, members=["alice"])
+
+        await connector.room_ref_by_id("d1")
+
+        self.assertEqual(connector._rest.channel_member_usernames.await_count, 1)
+
+    async def test_mattermost_answers_none_for_a_channel_it_has_left(self):
+        """Mattermost, unlike Rocket.Chat, still resolves a channel the bot was
+        removed from — so it has to ask. Without this a resurrection could put
+        the agent back into a room it was kicked out of (§2.7)."""
+        connector = self._mm(
+            {"id": "c1", "name": "eng", "display_name": "", "type": "channel"},
+            member_of=set(),
+        )
+
+        self.assertIsNone(await connector.room_ref_by_id("c1"))
+
+    async def test_mattermost_answers_none_for_a_deleted_channel(self):
+        """A permanent absence, per the contract — not a raise the caller would
+        log as a retryable blip forever."""
+        import httpx
+
+        connector = self._mm({"id": "c1", "name": "eng", "type": "channel"})
+        response = httpx.Response(404, request=httpx.Request("GET", "http://x"))
+        connector._rest.get_channel = AsyncMock(
+            side_effect=httpx.HTTPStatusError("gone", request=response.request,
+                                             response=response))
+
+        self.assertIsNone(await connector.room_ref_by_id("c1"))
+
+    async def test_mattermost_still_raises_on_a_transport_failure(self):
+        """The one case a retry can change."""
+        connector = self._mm({"id": "c1", "name": "eng", "type": "channel"})
+        connector._rest.get_channel = AsyncMock(side_effect=OSError("network"))
+
+        with self.assertRaises(OSError):
+            await connector.room_ref_by_id("c1")
+
+
+if __name__ == "__main__":
+    unittest.main()

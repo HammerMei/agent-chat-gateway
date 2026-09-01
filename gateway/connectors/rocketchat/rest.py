@@ -671,6 +671,33 @@ class RocketChatREST:
             if m.get("username") and m.get("_id") != self.user_id
         ]
 
+    async def get_subscription(self, room_id: str) -> dict[str, Any] | None:
+        """This account's subscription document for a room, or `None` if absent.
+
+        The by-id counterpart to `resolve_room`: the subscription carries the
+        room's type letter (`t`) and its name, which is what classifying a room
+        needs, and Rocket.Chat serves it from the room ID alone. `is_room_member`
+        below already asks this endpoint and keeps only whether the record
+        exists; this returns the record.
+
+        A missing record is a **200 with a null subscription**, not an error —
+        see `is_room_member` for the handler that makes that so. Absent therefore
+        returns `None`. Membership is the same fact: Rocket.Chat removes the
+        subscription when this account is kicked or leaves, so a room this
+        account is no longer in also answers `None`, which is the honest answer
+        for a caller asking whether it can still serve the room.
+
+        A transport or auth failure RAISES, deliberately unlike `is_room_member`
+        (which collapses those into its third answer): the caller here
+        distinguishes "not mine" from "could not ask", and an auth blip must not
+        read as a deleted room.
+        """
+        result = await self._request(
+            "GET", "subscriptions.getOne", params={"roomId": room_id}
+        )
+        subscription = result.get("subscription")
+        return subscription if isinstance(subscription, dict) else None
+
     async def is_room_member(self, room_id: str) -> bool | None:
         """Is this account still in the room — `True`, `False`, or **`None` for unknown**.
 

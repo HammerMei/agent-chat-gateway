@@ -19,10 +19,13 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Awaitable, Callable, Literal
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal
 
 from ..agents.response import AgentEvent, AgentResponse
 from .bot_identity import BotIdentity  # noqa: F401 — used in an annotation
+
+if TYPE_CHECKING:  # `watcher_manager` imports this module, so a runtime
+    from .watcher_manager import RoomRef  # import here would cycle.
 
 # ---------------------------------------------------------------------------
 # Roles
@@ -444,6 +447,34 @@ class Connector(ABC):
             Populated Room dataclass with platform id, name, and type.
         """
         ...
+
+    async def room_ref_by_id(self, room_id: str) -> "RoomRef | None":
+        """The room this id names, described well enough to create a watcher for.
+
+        The inverse of `resolve_room`, and the direction that survives a rename:
+        a name freed by a rename can be reused by a different room, so anything
+        rebuilding a watcher for a room it has seen before must ask by id. The
+        record layer already works this way — `WatcherState.room_name` is
+        documented "display only: resolution goes by `room_id`".
+
+        Returns a `RoomRef`, not a `Room`, because creating a watcher needs the
+        **kind** (it selects the label form and decides whether `require_mention`
+        applies) and, for the DM kinds, the **participants** — a direct room has
+        no name, so they are the only thing that identifies it to a human.
+
+        **`None` means answered-and-absent, and an implementation must not raise
+        instead.** No such room, one this connector does not serve, or one this
+        account is no longer a member of: all three are final answers a caller
+        acts on by giving up on this room. A TRANSPORT failure raises, because
+        that is the one case where retrying later can change the answer (§2.2).
+        Collapsing the two makes a deleted room look like a network blip
+        forever — the same distinction `RocketChatRest.is_room_member` builds
+        three answers for.
+
+        The default is `None`: a connector that cannot look a room up by id
+        cannot resurrect one, and its callers degrade rather than break.
+        """
+        return None
 
     # ── Per-room subscription (pull-based platforms) ─────────────────────────
     # Rocket.Chat DDP requires explicit per-room WebSocket subscriptions.

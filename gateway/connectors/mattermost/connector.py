@@ -25,6 +25,8 @@ import asyncio
 import collections
 import logging
 import re
+
+import httpx
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -547,36 +549,99 @@ class MattermostConnector(Connector):
         `<userid>__<userid>` form, so the display name is used for the DM kinds and the
         channel name otherwise.
         """
-        info = await self._rest.get_channel(room_id)
+        resolved = await self._resolved_channel(room_id)
+        if resolved is None:
+            raise RoomNotFoundError(
+                f"Channel {room_id} is not one this connector can serve"
+            )
+        kind, name, _participants = resolved
+        return Room(id=room_id, name=name, type=kind)
+
+    async def _resolved_channel(
+        self, room_id: str
+    ) -> "tuple[str, str, tuple[str, ...]] | None":
+        """`(type, display name, participants)` for a channel id, or `None`.
+
+        The one place that fetches a channel by id, checks it is one this
+        connector may serve, and — for the DM kinds — reads its membership.
+        Shared by `resolve_room_by_id` and `room_ref_by_id` so the member lookup
+        happens ONCE per resolution: an earlier version had the second method
+        call the first and then re-read the members, which was two identical
+        round trips and a window in which the two answers could disagree.
+
+        `None` for every permanent absence, so `room_ref_by_id` can honour its
+        contract: no such channel, one in a team this connector does not serve,
+        or one this account is no longer a member of. A transport failure still
+        raises out of `self._rest`.
+        """
+        try:
+            info = await self._rest.get_channel(room_id)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in (400, 403, 404):
+                # Gone, or never visible to this account. Final either way — a
+                # retry cannot make a deleted channel exist.
+                logger.info(
+                    "Channel %s is not available to this connector (%s)",
+                    room_id, exc.response.status_code,
+                )
+                return None
+            raise
         kind = info["type"]
 
-        # A channel id is globally unique, so this can reach a channel in a team the
-        # connector no longer serves — the bot account may still belong to both. Rejected
-        # rather than answered, because the caller is usually boot recreating a persisted
-        # record, and recreating one outside the configured team means answering in a room
-        # this connector was reconfigured away from. DMs are exempt: they belong to no team
-        # (§6.3), so there is nothing to compare.
+        # A channel id is globally unique, so this can reach a channel in a team
+        # the connector no longer serves — the bot account may still belong to
+        # both. DMs are exempt: they belong to no team (§6.3), so there is
+        # nothing to compare.
         if kind not in ("dm", "group_dm"):
             team_id = info.get("team_id", "")
             if team_id and self._rest.team_id and team_id != self._rest.team_id:
-                raise RoomNotFoundError(
-                    f"Channel {room_id} belongs to team {team_id}, but this connector "
-                    f"serves {self._rest.team_id}"
+                logger.info(
+                    "Channel %s belongs to team %s, but this connector serves %s",
+                    room_id, team_id, self._rest.team_id,
                 )
+                return None
+
+        # Membership, which Rocket.Chat gets for free (its subscription record IS
+        # membership) and Mattermost does not: a channel the bot was removed from
+        # still resolves by id. Without this a resurrection could put the agent
+        # back into a room it was kicked out of (§2.7). `get_member_channel_ids`
+        # is the probe rather than the per-channel one, because that answers 403
+        # for a non-member indistinguishably from a permissions problem (§6.2).
+        if room_id not in await self._rest.get_member_channel_ids():
+            logger.info(
+                "This account is not a member of channel %s — not resolving it",
+                room_id,
+            )
+            return None
 
         if kind in ("dm", "group_dm"):
-            # The REST channel object's `display_name` is **empty** for a direct channel:
-            # the counterpart handle on a WebSocket event is viewer-specific and is not part
-            # of the channel. Falling back to the id would put an opaque string in the
-            # prompt prefix and the history header, where a human-recognisable room is the
-            # whole point — so the members supply it instead.
-            members = await self._rest.channel_member_usernames(
-                room_id, exclude=self._rest.bot_user_id or "")
+            # The REST channel object's `display_name` is empty for a direct
+            # channel: the counterpart handle on a WebSocket event is
+            # viewer-specific and is not part of the channel. The members supply
+            # it instead.
+            members = tuple(await self._rest.channel_member_usernames(
+                room_id, exclude=self._rest.bot_user_id or ""))
             name = ", ".join(members) or info["display_name"] or room_id
-        else:
-            name = info["name"] or room_id
+            return kind, name, members
+        return kind, info["name"] or room_id, ()
 
-        return Room(id=info["id"], name=name, type=kind)
+    async def room_ref_by_id(self, room_id: str) -> "RoomRef | None":
+        """See `Connector.room_ref_by_id`.
+
+        Keeps the participants `resolve_room_by_id` flattens into a display name
+        — a `Room` has nowhere else to put them, and they are what a 1:1 DM's
+        watcher handle is built from.
+        """
+        resolved = await self._resolved_channel(room_id)
+        if resolved is None:
+            return None
+        kind, name, participants = resolved
+        # `RoomKind`'s values ARE these strings, and `_resolved_channel` has
+        # already normalised the wire letter into one.
+        room_kind = RoomKind(kind)
+        if room_kind in (RoomKind.DM, RoomKind.GROUP_DM):
+            return RoomRef(id=room_id, kind=room_kind, participants=participants)
+        return RoomRef(id=room_id, kind=room_kind, name=name)
 
     # ── Per-channel local bookkeeping (no wire protocol — see websocket.py) ────
 

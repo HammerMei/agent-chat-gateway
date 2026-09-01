@@ -862,6 +862,26 @@ class RocketChatConnector(Connector):
             type=info.get("type", "channel"),
         )
 
+    async def room_ref_by_id(self, room_id: str) -> "RoomRef | None":
+        """See `Connector.room_ref_by_id`.
+
+        Rocket.Chat serves the account's own subscription document from the room
+        id alone, and that document carries exactly what classification needs —
+        the type letter and the name — so this is `_room_ref_from_sub_doc` over a
+        fetched document rather than a pushed one. Reusing that classifier is the
+        point: the DM branch (which asks `im.members`, because the letter `d`
+        covers both DM kinds and the difference decides whether the mention gate
+        applies, §6.4) stays one implementation.
+
+        Membership comes free: Rocket.Chat drops the subscription when this
+        account leaves or is removed, so a room the bot is no longer in has no
+        document and answers `None`.
+        """
+        doc = await self._rest.get_subscription(room_id)
+        if doc is None:
+            return None
+        return await self._room_ref_from_sub_doc(room_id, doc)
+
     # ── Per-room subscription ─────────────────────────────────────────────────
 
     def register_router(self, router) -> None:

@@ -1346,11 +1346,17 @@ class TestResolveRoomById(unittest.IsolatedAsyncioTestCase):
     bind an existing session to the wrong one.
     """
 
-    def _connector(self, channel, members=()):
+    def _connector(self, channel, members=(), *, member_of=None):
         connector = _make_connector()
         connector._rest.team_id = channel.get("team_id", "")
         connector._rest.get_channel = AsyncMock(return_value=channel)
         connector._rest.channel_member_usernames = AsyncMock(return_value=list(members))
+        # Membership is checked on this path now — a channel the bot was removed
+        # from still resolves by id on Mattermost, so resolution asks. Defaults
+        # to "a member of the channel under test" so the cases below stay about
+        # naming; `member_of=set()` exercises the refusal.
+        ids = {channel["id"]} if member_of is None else member_of
+        connector._rest.get_member_channel_ids = AsyncMock(return_value=ids)
         return connector
 
     async def test_a_channel_keeps_its_platform_name(self):
@@ -1390,6 +1396,12 @@ class TestResolveRoomById(unittest.IsolatedAsyncioTestCase):
         Refused rather than answered, because the caller is usually boot recreating a
         persisted record: recreating one outside the configured team means answering in a
         room this connector was reconfigured away from, and nothing else would notice.
+
+        `resolve_room_by_id` still raises, because its callers expect a `Room` or
+        an error. The refusal itself moved into `_resolved_channel`, which
+        answers `None` so that `room_ref_by_id` can honour its own contract —
+        `None` for every PERMANENT absence, a raise only for a transport failure
+        the caller could usefully retry.
         """
         from gateway.connectors.mattermost.rest import RoomNotFoundError
 
@@ -1398,10 +1410,10 @@ class TestResolveRoomById(unittest.IsolatedAsyncioTestCase):
              "team_id": "team-old"})
         connector._rest.team_id = "team-new"
 
-        with self.assertRaises(RoomNotFoundError) as cm:
+        with self.assertRaises(RoomNotFoundError):
             await connector.resolve_room_by_id("c1")
-        self.assertIn("team-old", str(cm.exception))
-        self.assertIn("team-new", str(cm.exception))
+        # And the by-id RoomRef path answers, rather than raising.
+        self.assertIsNone(await connector.room_ref_by_id("c1"))
 
     async def test_a_channel_in_the_configured_team_is_allowed(self):
         connector = self._connector(

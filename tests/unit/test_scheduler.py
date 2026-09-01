@@ -1250,16 +1250,22 @@ class TestInjectMessageWakesAnIdleRoom(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result)
 
 
-class TestInjectMessageStateNone(unittest.IsolatedAsyncioTestCase):
-    """T3: inject_message logs a warning when persisted state is None (room_id unknown)."""
+class TestInjectMessageWithNoResolvableRoom(unittest.IsolatedAsyncioTestCase):
+    """Inverted: no room means no injection, not an injection with no address.
 
-    async def test_inject_message_warns_when_state_is_none(self):
-        """inject_message should log a warning when get_watcher_state() returns None.
+    This asserted the opposite — that a watcher with no persisted state was
+    still injected, with a warning that "room_id will be empty, which may cause
+    the agent response to be posted to the wrong room or dropped". That was
+    honest about the outcome and wrong about the decision: the agent then ran a
+    full turn (tool calls included) and the reply went nowhere, while `enqueue`
+    returning True made the fire count as a SUCCESS — so a finite scheduled job
+    burned a run on an undelivered message, every slot, forever.
 
-        When no state exists (watcher never joined a room), room_id is empty.
-        The message should still be injected (if a processor exists) but a warning
-        must be emitted so operators can diagnose missing room routing.
-        """
+    Nothing is injected without a resolvable room now, and the message says what
+    to do about it.
+    """
+
+    async def test_a_watcher_with_no_room_is_not_injected(self):
         import logging
         from unittest.mock import AsyncMock, MagicMock
 
@@ -1270,16 +1276,41 @@ class TestInjectMessageStateNone(unittest.IsolatedAsyncioTestCase):
 
         sm = make_bare_session_manager()
         sm._lifecycle.get_processor = MagicMock(return_value=mock_processor)
-        sm._lifecycle.get_watcher_state = MagicMock(return_value=None)   # ← no state
-        sm._lifecycle.get_watcher_config = MagicMock(return_value=None)
+        sm._lifecycle.get_watcher_state = MagicMock(return_value=None)
+        sm._lifecycle.record_for_room = MagicMock(return_value=None)
 
-        with self.assertLogs("agent-chat-gateway.core.session_manager", level=logging.WARNING) as log_ctx:
+        with self.assertLogs(
+            "agent-chat-gateway.core.session_manager", level=logging.WARNING
+        ) as log_ctx:
             result = await sm.inject_message("test-watcher", "hello")
 
-        self.assertTrue(result, "inject_message should succeed even without state")
-        # Verify warning was logged about missing state
-        warning_msgs = [r for r in log_ctx.output if "no persisted state" in r]
-        self.assertTrue(warning_msgs, "Expected a warning about missing watcher state")
+        self.assertFalse(result, "an unaddressable message must not be injected")
+        mock_processor.enqueue.assert_not_awaited()
+        self.assertTrue(
+            [r for r in log_ctx.output if "no resolvable room" in r],
+            f"expected the reason to be named: {log_ctx.output}",
+        )
+
+    async def test_the_message_points_at_the_migration(self):
+        """A job created before schema 2 carries no room id, and that is the
+        common way to reach this — so the log says which command fixes it."""
+        import logging
+        from unittest.mock import AsyncMock, MagicMock
+
+        from tests.helpers import make_bare_session_manager
+
+        sm = make_bare_session_manager()
+        sm._lifecycle.get_processor = MagicMock(return_value=MagicMock(
+            enqueue=AsyncMock(return_value=True)))
+        sm._lifecycle.get_watcher_state = MagicMock(return_value=None)
+        sm._lifecycle.record_for_room = MagicMock(return_value=None)
+
+        with self.assertLogs(
+            "agent-chat-gateway.core.session_manager", level=logging.WARNING
+        ) as log_ctx:
+            await sm.inject_message("test-watcher", "hello")
+
+        self.assertTrue([r for r in log_ctx.output if "schedule migrate" in r])
 
 
 class TestInjectMessageTimestampFormat(unittest.IsolatedAsyncioTestCase):
@@ -1306,9 +1337,18 @@ class TestInjectMessageTimestampFormat(unittest.IsolatedAsyncioTestCase):
 
         mock_processor.enqueue = _capture_enqueue
 
+        from gateway.core.state import WatcherState
+
         sm = make_bare_session_manager()
         sm._lifecycle.get_processor = MagicMock(return_value=mock_processor)
-        sm._lifecycle.get_watcher_state = MagicMock(return_value=None)
+        # A real room, because this test is about the TIMESTAMP: injection now
+        # refuses an unaddressable message rather than sending it nowhere, so
+        # `None` here would fail for an unrelated reason and stop exercising the
+        # prompt prefix at all.
+        sm._lifecycle.get_watcher_state = MagicMock(return_value=WatcherState(
+            watcher_name="test-watcher", session_id="", room_id="room-1",
+            room_name="general", room_type="channel", room_kind="channel",
+        ))
         sm._lifecycle.get_watcher_config = MagicMock(return_value=None)
 
         result = await sm.inject_message("test-watcher", "check stock prices")
