@@ -1582,14 +1582,31 @@ by rooms nobody has ever spoken in, burying the handful being worked on.
 Idle is one flag away when the question is "what does the bot know about"
 rather than "what is it doing".
 
-**A scheduled job keys on `(connector, room_id)`, not on the label.** Jobs
-persist a watcher *name* today, which under this design is cosmetic and free to
-change (§2.3) — so a rename would orphan every job on that room, a label
-collision would make lookup ambiguous, and the expiry-exemption check below
-would consult the wrong room. The label is kept alongside as display metadata
-only. Jobs created before the upgrade are not converted; they are re-created by
-the operator (§5.3), which is why the job schema can change to the correct key
-without a compatibility path.
+**A scheduled job keys on `(connector, room_id)`, not on the label.** A watcher
+name is cosmetic and free to change (§2.3), so keying on it means a rename
+orphans every job on that room and the expiry-exemption check consults the wrong
+one. The label is kept alongside as display metadata — it is what `list`,
+`pause` and `expire` speak — and `room_id` is what a fire resolves through.
+
+Implemented (owner, 2026-08-31). `Connector.room_ref_by_id()` is the inverse of
+`resolve_room` and the direction that survives a rename; it returns a `RoomRef`
+rather than a `Room` because creation needs the kind and, for the DM kinds, the
+participants — without them a 1:1 DM labels as a room-id digest and its handle
+changes. Each connector answers through the classifier its message path already
+uses, so the `d`-covers-both-DM-kinds problem (§6.4) has one implementation.
+A connector that cannot look a room up by id answers `None` and its rooms simply
+do not resurrect.
+
+The wake stays where it was: `inject_message` resolves the room — from the
+record when there is one, from the job's id when there is not — and then calls
+the same `get_or_create` a message calls. Pause, the creation cap and the rule
+match are all decided inside it, so a job cannot reach a room a message could
+not, and pause still outranks a schedule (§4.4).
+
+Jobs created before the field carry an empty `room_id` and behave exactly as
+before: resolve by handle, fail if no record. Runtime state is not converted
+(§5.3), which is why the schema could take the correct key with no compatibility
+path.
 
 **Rooms with pending scheduled jobs are exempt from expiry, not from
 idling.** Idling such a room is harmless: the job fires, `get` recreates the
@@ -1615,13 +1632,20 @@ the same handle back and the job resumes. Cancelling destroyed something
 self-healing, and destroyed it silently, for an operator who asked about a
 watcher and said nothing about their schedules.
 
-Until the job carries the room's identity itself, a job whose room has not
-spoken since the expire fails audibly on each fire — logged, `next_run`
-advanced, and a finite job's `run_count` deliberately not consumed. Note the
-asymmetry this leaves with the exemption above: the TTL sweep refuses to expire
-a job-bearing room, while the operator verb expires it and lets the jobs fail
-until the room speaks. That is deliberate — the operator asked, the timer did
-not — but it is the seam the room-id keying above closes.
+A job now carries the room's identity itself, so a fire after an expire
+re-resolves the room and recreates the watcher through the ordinary rule path.
+A fire that cannot — the room is gone, the connector disowns it, or the rules no
+longer claim it — fails audibly: logged, `next_run` advanced, and a finite job's
+`run_count` deliberately not consumed (owner: "let the schedule job throw an
+error, it is a lot better than auto remove it").
+
+**One consequence to weigh separately.** The expiry exemption above rests on
+"expiry deletes the record the recreation reads from, leaving the job pointing
+at nothing". That premise no longer holds — a job can now resurrect its room —
+so whether the TTL sweep should still exempt job-bearing rooms is an open
+question with its own trade-offs, and deliberately NOT decided here. Exempting
+them costs a held record; not exempting them means a 9am job recreates a watcher
+at 9am, which is arguably the feature working.
 
 One interaction worth stating: a room idle for a long time will have had its
 session deleted by the agent backend regardless of what ACG persisted

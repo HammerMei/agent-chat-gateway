@@ -39,8 +39,25 @@ class ScheduledJob:
     Fields
     ------
     id               : Unique job identifier (``acg-<8hex>``).
-    watcher          : Watcher name as defined in config.yaml.
+    watcher          : The watcher's derived handle (`<connector>:<room label>`).
+                       NOT a config.yaml name — rule-derived watchers are not named
+                       in config at all, and the handle is a pure function of
+                       (connector, room), free to change when the room is renamed.
+                       Kept as the display and CLI identity; `room_id` below is what
+                       the job actually resolves through.
     connector        : Connector name the watcher belongs to.
+    room_id          : The platform room the job targets. THE identity half of the
+                       pair, added because `watcher` is not one: a handle derived
+                       from a room name goes stale on a rename, and a watcher record
+                       deleted by `expire` takes the only thing a fire could resolve
+                       through with it. With the id the fire re-resolves the room
+                       from the connector and recreates the watcher through the
+                       ordinary rule path.
+
+                       Empty on jobs created before this field existed. Those keep
+                       the old behaviour exactly — resolve by handle, fail if no
+                       record — because runtime state is not converted (§5.3); an
+                       operator who wants the new behaviour recreates the job.
     message          : Text injected directly into the agent session when fired.
     cron             : 5-field POSIX cron expression (e.g. ``"0 9 * * 1-5"``).
     timezone         : IANA timezone name used when interpreting the cron expression
@@ -67,6 +84,7 @@ class ScheduledJob:
     id: str = field(default_factory=_new_job_id)
     watcher: str = ""
     connector: str = ""
+    room_id: str = ""
     message: str = ""
     cron: str = ""
     timezone: str = "UTC"

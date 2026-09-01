@@ -886,7 +886,40 @@ class SessionManager:
                 f"while the expire ran. Re-check 'list' and retry."
             )
 
-    async def inject_message(self, watcher_name: str, text: str) -> bool:
+    async def _resolve_room_for_wake(
+        self, room_id: str, watcher_name: str
+    ) -> "RoomRef | None":
+        """Describe a room well enough to recreate a watcher for it, from its id.
+
+        Separated from the wake itself so the failure shapes stay legible: the
+        connector distinguishes "no such room, or not mine" (None) from "I could
+        not ask" (raises), and both become "no processor" here — but only after
+        saying which happened. The caller's contract is a boolean, and a silent
+        False that meant a network blip would be indistinguishable from a room
+        that is genuinely gone.
+        """
+        resolve = getattr(self._connector, "room_ref_by_id", None)
+        if resolve is None:
+            return None
+        try:
+            room = await resolve(room_id)
+        except Exception as exc:
+            logger.warning(
+                "Could not resolve room %s for watcher %r — the wake is skipped "
+                "and the caller retries at its next slot: %s",
+                room_id, watcher_name, exc,
+            )
+            return None
+        if room is None:
+            logger.info(
+                "Room %s is not available to this connector — watcher %r cannot "
+                "be recreated for it", room_id, watcher_name,
+            )
+        return room
+
+    async def inject_message(
+        self, watcher_name: str, text: str, *, room_id: str = ""
+    ) -> bool:
         """Inject a synthetic OWNER-role message directly into a watcher's queue.
 
         Bypasses the connector layer entirely, avoiding the self-message filter
@@ -894,29 +927,49 @@ class SessionManager:
         is treated as if it came from a trusted owner, so it is processed without
         permission approval prompts.
 
+        `room_id` is the caller's own knowledge of WHICH room, used only when no
+        record exists — a scheduled job carries it so an expired room can still
+        be resurrected. Omitted, this behaves exactly as before.
+
         Returns True if the message was accepted into the queue, False otherwise
         (e.g. watcher not running, queue full, or watcher not found).
         """
         processor = self._lifecycle.get_processor(watcher_name)
         if processor is None and self._watcher_manager is not None:
-            # The wake, from the inside (§2.5): an idle room's record is real
-            # and its session is kept, so a scheduled job due in it recreates
-            # the watcher through the same get_or_create a message would —
-            # the sweep's expiry exemption for job-bearing rooms rests on
-            # exactly this ("idling one is harmless — the job wakes it"), and
+            # The wake, from the inside (§2.5): a scheduled job due in a room
+            # recreates its watcher through the same `get_or_create` a message
+            # would — the sweep's expiry exemption for job-bearing rooms rests
+            # on exactly this ("idling one is harmless — the job wakes it"), and
             # without it that sentence was an assumption with no backing.
-            # Paused answers None, so pause still outranks a schedule (§4.4).
+            #
+            # ONE entry point, two ways to describe the room. Pause, the
+            # creation cap and the rule match are all decided inside
+            # `get_or_create`, so a job cannot reach a room a message could not
+            # — in particular pause still outranks a schedule (§4.4). That is
+            # the property this shape exists to keep: a wake must not mean
+            # something different because a job asked for it.
             record = self._lifecycle.get_watcher_state(watcher_name)
+            room = None
             if record is not None and record.room_id:
-                kind = _room_kind_or_channel(record)
+                room = RoomRef(
+                    id=record.room_id,
+                    kind=_room_kind_or_channel(record),
+                    name=record.room_name,
+                    participants=tuple(record.participants),
+                )
+            elif room_id:
+                # No record — `expire` reclaimed it, or it never existed. The
+                # caller (a scheduled job) knows the ROOM, which is the identity
+                # a handle only approximates, so the room is re-resolved from the
+                # connector and creation runs against the CURRENT rules.
+                #
+                # Re-resolved rather than reconstructed from anything persisted:
+                # a name is display-only and a rename frees it for another room
+                # (§2.3), which is the whole reason this path takes an id.
+                room = await self._resolve_room_for_wake(room_id, watcher_name)
+            if room is not None:
                 processor = await self._watcher_manager.get_or_create(
-                    self._connector_name,
-                    RoomRef(
-                        id=record.room_id,
-                        kind=kind,
-                        name=record.room_name,
-                        participants=tuple(record.participants),
-                    ),
+                    self._connector_name, room,
                 )
         if processor is None:
             logger.warning(
